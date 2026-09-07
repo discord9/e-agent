@@ -4233,6 +4233,58 @@ impl Model for BlockingContextCaptureModel {
     }
 }
 
+/// Records request contexts and blocks exactly one selected provider call.
+/// The focused maintenance tests use the gate to distinguish a permitted
+/// compaction request from a fabricated follow-up provider request.
+struct GatedContextCaptureModel {
+    replies: VecDeque<(AssistantMessage, Option<Usage>)>,
+    block_call: usize,
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+    calls: Arc<Mutex<Vec<Vec<Message>>>>,
+    call_count: usize,
+}
+
+#[async_trait]
+impl Model for GatedContextCaptureModel {
+    async fn complete(
+        &mut self,
+        messages: &[Message],
+        _: &[ToolSpec],
+        _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        self.call_count += 1;
+        self.calls.lock().unwrap().push(messages.to_vec());
+        let reply = self.replies.pop_front().expect("unexpected model call");
+        if self.call_count == self.block_call {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        Ok(reply)
+    }
+}
+
+/// Proves that a maintenance Resume does not start a new Agent turn, which
+/// would reset per-turn tool state such as the poll guard.
+struct TurnStartMarkerTool(Arc<AtomicUsize>);
+
+#[async_trait]
+impl Tool for TurnStartMarkerTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "turn_start_marker".into(),
+            description: "test only".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+    async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
+        Ok(ToolOutput::text("marker"))
+    }
+    fn on_turn_start(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 fn background_bash_call(command: &str, detached: bool) -> ToolCall {
     let mut arguments = serde_json::json!({"command": command, "background": true});
     if detached {
@@ -6810,9 +6862,11 @@ async fn get_goal_returns_full_snapshot_and_update_reads_revision_from_it() {
 #[tokio::test]
 async fn update_goal_rejects_wrong_typed_criteria_and_evidence() {
     // `success_criteria` / `evidence` present but not a string array: a
-    // plain tool error, never a silent filter.
+    // plain tool error, never a silent filter. Keep the fixture paused so
+    // this schema test does not start unrelated automatic continuations.
     let temp = tempfile::tempdir().unwrap();
-    let goal = crate::agent::create_goal(None, "build it".into(), vec![]).unwrap();
+    let mut goal = crate::agent::create_goal(None, "build it".into(), vec![]).unwrap();
+    goal.status = crate::agent::GoalStatus::Paused;
     let id = goal.id.clone();
     let rev = goal.revision;
     let model = ScriptedAssistantModel {
@@ -6908,9 +6962,12 @@ async fn update_goal_rejects_wrong_typed_criteria_and_evidence() {
 async fn update_goal_rejects_unknown_fields_without_commit() {
     // Misspelled / arbitrary extra keys are rejected BEFORE any transition
     // or commit: a plain model-facing tool error naming the field(s), the
-    // revision untouched, and no GoalUpdated entry appended.
+    // revision untouched, and no GoalUpdated entry appended. Keep the
+    // fixture paused so this schema test does not start unrelated automatic
+    // continuations.
     let temp = tempfile::tempdir().unwrap();
-    let goal = crate::agent::create_goal(None, "build it".into(), vec![]).unwrap();
+    let mut goal = crate::agent::create_goal(None, "build it".into(), vec![]).unwrap();
+    goal.status = crate::agent::GoalStatus::Paused;
     let id = goal.id.clone();
     let rev = goal.revision;
     let model = ScriptedAssistantModel {
@@ -6966,14 +7023,14 @@ async fn update_goal_rejects_unknown_fields_without_commit() {
     let mut status = handle.status();
     wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
 
-    // No successful transition: revision untouched, status still active,
-    // no progress applied.
+    // No successful transition: revision and paused fixture status are
+    // untouched, with no progress applied.
     let final_goal = handle.goal().unwrap();
     assert_eq!(
         final_goal.revision, rev,
         "unknown fields must never bump the revision"
     );
-    assert_eq!(final_goal.status, crate::agent::GoalStatus::Active);
+    assert_eq!(final_goal.status, crate::agent::GoalStatus::Paused);
     assert_eq!(final_goal.progress, "", "no progress applied");
     // Persisted: no GoalUpdated entry; both calls errored naming the exact
     // unknown field(s).
@@ -7023,9 +7080,11 @@ async fn update_goal_rejects_unknown_fields_without_commit() {
 async fn get_goal_rejects_unknown_arguments_and_non_object() {
     // get_goal is a read: only the empty JSON object is accepted. Any
     // extra key (or a non-object payload) is a plain tool error naming the
-    // field — never silently ignored.
+    // field — never silently ignored. Keep the fixture paused so this schema
+    // test does not start unrelated automatic continuations.
     let temp = tempfile::tempdir().unwrap();
-    let goal = crate::agent::create_goal(None, "build it".into(), vec![]).unwrap();
+    let mut goal = crate::agent::create_goal(None, "build it".into(), vec![]).unwrap();
+    goal.status = crate::agent::GoalStatus::Paused;
     let model = ScriptedAssistantModel {
         replies: VecDeque::from(vec![
             AssistantMessage {
@@ -7105,6 +7164,11 @@ async fn get_goal_rejects_unknown_arguments_and_non_object() {
     assert_eq!(handle.goal().unwrap().id, goal.id);
 }
 
+// Goal continuation is intentionally runner-local and is covered by the
+// focused driver tests in this section. Persistence/reconstruction tests do
+// not inspect or manufacture continuation state.
+
+/// Small blocking tool retained for the poll-guard runner tests.
 struct SlowTool {
     millis: u64,
 }
@@ -7118,6 +7182,7 @@ impl Tool for SlowTool {
             parameters: serde_json::json!({"type": "object"}),
         }
     }
+
     async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
         tokio::time::sleep(std::time::Duration::from_millis(self.millis)).await;
         Ok(ToolOutput::text("slow done"))
@@ -7742,4 +7807,1572 @@ fn switch_model_command_carries_context_window() {
         commands.try_recv(),
         Ok(SessionCommand::SwitchModel(_, Some(32_000)))
     ));
+}
+
+// Focused `/goal continue` contract tests. Continuation state is deliberately
+// runner-local: these tests assert provider-call behavior and durable history,
+// not an invented persisted driver record.
+
+fn test_goal_entry() -> SessionEntry {
+    SessionEntry::GoalUpdated {
+        goal: Some(crate::agent::GoalSnapshot {
+            id: "goal-test".into(),
+            revision: 1,
+            objective: "test continuation".into(),
+            success_criteria: vec!["the test decides when to stop".into()],
+            status: crate::agent::GoalStatus::Active,
+            progress: String::new(),
+            evidence: Vec::new(),
+            blocked_reason: None,
+        }),
+    }
+}
+
+#[tokio::test]
+async fn goal_continue_explicit_only_unarmed() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![(
+                AssistantMessage {
+                    content: Some("one ordinary answer".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                None,
+            )]
+            .into(),
+            calls: calls.clone(),
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-continue-unarmed".into(),
+        IdlePolicy::WaitForInput,
+    );
+    handle.goal_command(GoalCommand::Create {
+        objective: "ordinary prompt must not auto-run".into(),
+        success_criteria: vec![],
+    });
+    let task = runner.start(Some("ordinary prompt".into()));
+    wait_for_goal(&handle, |goal| goal.is_some()).await;
+    wait_for_status(&mut handle.status(), |status| {
+        matches!(status, SessionStatus::Idle)
+    })
+    .await;
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn goal_continue_indefinite_ignores_empty_and_unchanged_output_until_cancelled() {
+    let temp = tempfile::tempdir().unwrap();
+    let entered = Arc::new(Notify::new());
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let model = BlockingContextCaptureModel {
+        replies: vec![
+            AssistantMessage {
+                content: None,
+                tool_calls: vec![],
+                reasoning: None,
+            },
+            AssistantMessage {
+                content: Some("same".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            },
+            AssistantMessage {
+                content: Some("same".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            },
+            AssistantMessage {
+                content: Some("same".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            },
+        ]
+        .into(),
+        block_call: 4,
+        entered: entered.clone(),
+        release: Arc::new(Notify::new()),
+        dropped: None,
+        calls: calls.clone(),
+        call_count: 0,
+    };
+    let agent = Agent::new(
+        Box::new(model),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-continue-indefinite".into(),
+        IdlePolicy::WaitForInput,
+    );
+    handle.goal_command(GoalCommand::Create {
+        objective: "continue until cancelled".into(),
+        success_criteria: vec![],
+    });
+    let task = runner.start(None);
+    wait_for_goal(&handle, |goal| goal.is_some()).await;
+    handle.continue_goal(None);
+    entered.notified().await;
+    assert!(calls.lock().unwrap().len() >= 4);
+    handle.cancel();
+    wait_for_status(&mut handle.status(), |status| {
+        matches!(status, SessionStatus::Idle)
+    })
+    .await;
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn goal_continue_cumulative_cap_overshoot_and_missing_usage_fail_closed() {
+    async fn run_case(replies: Vec<(AssistantMessage, Option<Usage>)>, session: &str) -> usize {
+        let reply_count = replies.len();
+        let temp = tempfile::tempdir().unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let agent = Agent::new(
+            Box::new(ScriptedContextCaptureModel {
+                replies: replies.into(),
+                calls: calls.clone(),
+            }),
+            vec![Box::new(KeepAliveTool { sender: None })],
+        );
+        let (runner, handle) = SessionRunner::new(
+            agent,
+            SessionStore::Jsonl,
+            temp.path().into(),
+            session.into(),
+            IdlePolicy::WaitForInput,
+        );
+        handle.goal_command(GoalCommand::Create {
+            objective: "token cap".into(),
+            success_criteria: vec![],
+        });
+        let task = runner.start(None);
+        wait_for_goal(&handle, |goal| goal.is_some()).await;
+        handle.continue_goal(Some(5));
+        for _ in 0..400 {
+            if !calls.lock().unwrap().is_empty() {
+                // A capped continuation with 3 tokens per call needs two
+                // calls; a missing usage call fails closed after one.
+                if calls.lock().unwrap().len() >= 2 || reply_count == 1 {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let count = calls.lock().unwrap().len();
+        drop(handle);
+        task.join().await.unwrap();
+        count
+    }
+
+    let reply = |text: &str| {
+        (
+            AssistantMessage {
+                content: Some(text.into()),
+                tool_calls: vec![],
+                reasoning: None,
+            },
+            Some(Usage {
+                input_tokens: 3,
+                output_tokens: 0,
+                ..Usage::default()
+            }),
+        )
+    };
+    assert_eq!(
+        run_case(
+            vec![reply("first"), reply("overshoots")],
+            "goal-cap-overshoot"
+        )
+        .await,
+        2
+    );
+    assert_eq!(
+        run_case(
+            vec![(
+                AssistantMessage {
+                    content: Some("unknown usage".into()),
+                    tool_calls: vec![],
+                    reasoning: None
+                },
+                None,
+            )],
+            "goal-cap-missing",
+        )
+        .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn goal_continue_idle_background_followup_then_resume() {
+    // Arm before ordinary work starts. The owned task suspends (rather than
+    // clears) the driver; completion receives one Background follow-up, then
+    // the next call is again automatic Goal work. Block that next automatic
+    // call so Cancel can stop and join the runner without an ignored panic.
+    let temp = tempfile::tempdir().unwrap();
+    let sender = Arc::new(Mutex::new(None));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let entered = Arc::new(Notify::new());
+    let model = BlockingContextCaptureModel {
+        replies: vec![
+            AssistantMessage {
+                content: None,
+                tool_calls: vec![background_bash_call("job", false)],
+                reasoning: None,
+            },
+            AssistantMessage {
+                content: Some("waiting".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            },
+            AssistantMessage {
+                content: Some("completion handled".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            },
+            AssistantMessage {
+                content: Some("goal resumed".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            },
+            AssistantMessage {
+                content: Some("blocked automatic call".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            },
+        ]
+        .into(),
+        block_call: 5,
+        entered: entered.clone(),
+        release: Arc::new(Notify::new()),
+        dropped: None,
+        calls: calls.clone(),
+        call_count: 0,
+    };
+    let agent = Agent::new(
+        Box::new(model),
+        vec![Box::new(MockBackgroundBash {
+            id: 41,
+            label: "job",
+            sender: sender.clone(),
+        })],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-bg-resume".into(),
+        IdlePolicy::WaitForInput,
+    );
+    handle.goal_command(GoalCommand::Create {
+        objective: "background then continue".into(),
+        success_criteria: vec![],
+    });
+    let task = runner.start(None);
+    wait_for_goal(&handle, |goal| goal.is_some()).await;
+    handle.continue_goal(None);
+    handle.prompt("start job");
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "waiting"),
+    )
+    .await;
+    sender
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .send(AgentEvent::BackgroundCompleted {
+            id: 41,
+            output: "job done".into(),
+            label: Some("job".into()),
+            started_at_ms: None,
+            duration_ms: None,
+            exit_code: None,
+            signal: None,
+            status: None,
+            kind: None,
+        })
+        .unwrap();
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "goal resumed"),
+    )
+    .await;
+    entered.notified().await;
+    assert_eq!(calls.lock().unwrap().len(), 5);
+    handle.cancel();
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::Notice(text) if text == "turn cancelled"),
+    )
+    .await;
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn goal_continue_mid_turn_completion_preserves_user_turn_and_resumes_goal() {
+    let temp = tempfile::tempdir().unwrap();
+    let sender = Arc::new(Mutex::new(None));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![
+                (
+                    AssistantMessage {
+                        content: None,
+                        tool_calls: vec![background_bash_call("job", false)],
+                        reasoning: None,
+                    },
+                    Some(Usage {
+                        input_tokens: 1,
+                        output_tokens: 0,
+                        ..Usage::default()
+                    }),
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("user turn ended".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    Some(Usage {
+                        input_tokens: 1,
+                        output_tokens: 0,
+                        ..Usage::default()
+                    }),
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("goal turn continued".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    Some(Usage {
+                        input_tokens: 1,
+                        output_tokens: 0,
+                        ..Usage::default()
+                    }),
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("goal final".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    Some(Usage {
+                        input_tokens: 1,
+                        output_tokens: 0,
+                        ..Usage::default()
+                    }),
+                ),
+            ]
+            .into(),
+            calls: calls.clone(),
+        }),
+        vec![Box::new(SelfCompletingBash {
+            id: 42,
+            sender: sender.clone(),
+        })],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-mid-turn".into(),
+        IdlePolicy::WaitForInput,
+    );
+    handle.goal_command(GoalCommand::Create {
+        objective: "preserve turn origin".into(),
+        success_criteria: vec![],
+    });
+    let task = runner.start(Some("user work".into()));
+    wait_for_goal(&handle, |goal| goal.is_some()).await;
+    handle.continue_goal(Some(2));
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "goal turn continued"),
+    )
+    .await;
+    {
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 3);
+        assert!(calls[0].iter().any(|message| matches!(
+            message, Message::User { content, .. } if content == "user work"
+        )));
+    }
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "goal-mid-turn")
+        .await
+        .unwrap();
+    assert!(loaded.entries.iter().any(|entry| matches!(
+        entry,
+        SessionEntry::BackgroundCompletion { output, .. } if output == "build ok"
+    )));
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn goal_continue_prompt_before_start_wins_without_goal_call() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let entered = Arc::new(Notify::new());
+    let agent = Agent::new(
+        Box::new(BlockingContextCaptureModel {
+            replies: vec![
+                AssistantMessage {
+                    content: Some("prompt won".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("goal after prompt".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+            ]
+            .into(),
+            block_call: 2,
+            entered: entered.clone(),
+            release: Arc::new(Notify::new()),
+            dropped: None,
+            calls: calls.clone(),
+            call_count: 0,
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-prompt-boundary".into(),
+        IdlePolicy::WaitForInput,
+    );
+    handle.goal_command(GoalCommand::Create {
+        objective: "boundary".into(),
+        success_criteria: vec![],
+    });
+    let task = runner.start(None);
+    wait_for_goal(&handle, |goal| goal.is_some()).await;
+    handle.continue_goal(None);
+    handle.prompt("prompt wins");
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "prompt won"),
+    )
+    .await;
+    entered.notified().await;
+    {
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(calls[0].iter().any(|message| matches!(
+            message,
+            Message::User { content, .. } if content == "prompt wins"
+        )));
+    }
+    handle.cancel();
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::Notice(text) if text == "turn cancelled"),
+    )
+    .await;
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn goal_continue_cancel_before_start_wins_without_goal_call() {
+    // Continue precedes Cancel in the same command stream. The later prompt
+    // proves the Cancel was actually consumed (not merely an initial Idle
+    // observation), and that the discarded Continue cannot add a Goal call.
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![(
+                AssistantMessage {
+                    content: Some("ordinary after cancel".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                None,
+            )]
+            .into(),
+            calls: calls.clone(),
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-cancel-boundary".into(),
+        IdlePolicy::WaitForInput,
+    );
+    handle.goal_command(GoalCommand::Create {
+        objective: "boundary".into(),
+        success_criteria: vec![],
+    });
+    let task = runner.start(None);
+    wait_for_goal(&handle, |goal| goal.is_some()).await;
+    handle.continue_goal(None);
+    handle.cancel();
+    handle.prompt("ordinary after cancel");
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "ordinary after cancel"),
+    )
+    .await;
+    {
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].iter().any(|message| matches!(
+            message, Message::User { content, .. } if content == "ordinary after cancel"
+        )));
+    }
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn goal_continue_restart_is_unarmed_and_has_no_persisted_driver_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![(
+                AssistantMessage {
+                    content: Some("restart answer".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                None,
+            )]
+            .into(),
+            calls: calls.clone(),
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    let (runner, handle) = SessionRunner::new_with_bootstrap(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-restart".into(),
+        IdlePolicy::WaitForInput,
+        SessionBootstrap {
+            recovery_tasks: vec![],
+            legacy: false,
+            initial_entries: vec![test_goal_entry()],
+        },
+    )
+    .await
+    .unwrap();
+    let task = runner.start(Some("after restart".into()));
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "restart answer"),
+    )
+    .await;
+    wait_for_status(&mut handle.status(), |status| {
+        matches!(status, SessionStatus::Idle)
+    })
+    .await;
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "goal-restart")
+        .await
+        .unwrap();
+    let serialized = serde_json::to_string(&loaded.entries).unwrap();
+    assert!(!serialized.contains("goal continuation"));
+    assert!(!serialized.contains("continuation stopped"));
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn goal_continue_inflight_cancel_discards_transferred_continue_and_fresh_continue_rearms() {
+    // The first Continue is received with the completed provider round and
+    // transferred into runner pending state before its tool blocks. Cancel
+    // must discard that transferred command, preserve the queued prompt, and
+    // allow an explicitly later Continue to arm again.
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let tool_entered = Arc::new(Notify::new());
+    let goal_entered = Arc::new(Notify::new());
+    let agent = Agent::new(
+        Box::new(BlockingContextCaptureModel {
+            replies: vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "first-tool".into(),
+                        name: "read_image".into(),
+                        arguments: "{}".into(),
+                    }],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("preserved prompt answer".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("fresh continuation".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+            ]
+            .into(),
+            block_call: 3,
+            entered: goal_entered.clone(),
+            release: Arc::new(Notify::new()),
+            dropped: None,
+            calls: calls.clone(),
+            call_count: 0,
+        }),
+        vec![
+            Box::new(BlockingMarkerTool {
+                entered: tool_entered.clone(),
+                release: Arc::new(Notify::new()),
+            }),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    let (runner, handle) = SessionRunner::new_with_bootstrap(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-inflight-cancel".into(),
+        IdlePolicy::WaitForInput,
+        SessionBootstrap {
+            recovery_tasks: vec![],
+            legacy: false,
+            initial_entries: vec![test_goal_entry()],
+        },
+    )
+    .await
+    .unwrap();
+    let task = runner.start(Some("tool turn".into()));
+    tool_entered.notified().await;
+    handle.continue_goal(None);
+    handle.prompt("prompt survives cancel");
+    handle.cancel();
+    wait_for_log_event(&handle, |event| {
+        matches!(event,
+        AgentEvent::AssistantText(text) if text == "preserved prompt answer")
+    })
+    .await;
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        2,
+        "the transferred Continue must not run"
+    );
+    handle.continue_goal(None);
+    goal_entered.notified().await;
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        3,
+        "a later Continue must re-arm"
+    );
+    handle.cancel();
+    wait_for_status(&mut handle.status(), |status| {
+        matches!(status, SessionStatus::Idle)
+    })
+    .await;
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn goal_continue_capped_missing_usage_commits_tools_without_another_provider_call() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![(
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "real-tool".into(),
+                        name: "keep_alive".into(),
+                        arguments: "{}".into(),
+                    }],
+                    reasoning: None,
+                },
+                None,
+            )]
+            .into(),
+            calls: calls.clone(),
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    let (runner, handle) = SessionRunner::new_with_bootstrap(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-missing-tool-usage".into(),
+        IdlePolicy::WaitForInput,
+        SessionBootstrap {
+            recovery_tasks: vec![],
+            legacy: false,
+            initial_entries: vec![test_goal_entry()],
+        },
+    )
+    .await
+    .unwrap();
+    let task = runner.start(None);
+    handle.continue_goal(Some(10));
+    wait_for_log_event(&handle, |event| {
+        matches!(event,
+        AgentEvent::ToolResult { content, is_error: false } if content.is_empty())
+    })
+    .await;
+    wait_for_status(&mut handle.status(), |status| {
+        matches!(status, SessionStatus::Idle)
+    })
+    .await;
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "goal-missing-tool-usage")
+        .await
+        .unwrap();
+    assert!(loaded.entries.iter().any(|entry| matches!(entry,
+        SessionEntry::Message { message: Message::Tool { call_id, synthetic: false, .. } } if call_id == "real-tool")));
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn goal_continue_capped_compaction_missing_usage_stops_before_goal_provider_call() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![(
+                AssistantMessage {
+                    content: Some("compacted summary".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                None,
+            )]
+            .into(),
+            calls: calls.clone(),
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    history_for_compaction(&mut agent);
+    let (runner, handle) = SessionRunner::new_with_bootstrap(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-missing-compact-usage".into(),
+        IdlePolicy::WaitForInput,
+        SessionBootstrap {
+            recovery_tasks: vec![],
+            legacy: false,
+            initial_entries: vec![test_goal_entry()],
+        },
+    )
+    .await
+    .unwrap();
+    let task = runner.start(None);
+    handle.continue_goal(Some(10));
+    handle.compact();
+    wait_for_log_event(&handle, |event| {
+        matches!(event,
+        AgentEvent::Notice(text) if text == "compacted: compacted summary")
+    })
+    .await;
+    wait_for_status(&mut handle.status(), |status| {
+        matches!(status, SessionStatus::Idle)
+    })
+    .await;
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        1,
+        "only the compaction request may run"
+    );
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn goal_continue_tools_queued_compaction_keeps_goal_driver_alive() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let tool_entered = Arc::new(Notify::new());
+    let release_tool = Arc::new(Notify::new());
+    let resumed = Arc::new(Notify::new());
+    let agent = Agent::new(
+        Box::new(BlockingContextCaptureModel {
+            replies: vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "tool".into(),
+                        name: "read_image".into(),
+                        arguments: "{}".into(),
+                    }],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("maintenance summary".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("goal resumed".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+            ]
+            .into(),
+            block_call: 3,
+            entered: resumed.clone(),
+            release: Arc::new(Notify::new()),
+            dropped: None,
+            calls: calls.clone(),
+            call_count: 0,
+        }),
+        vec![
+            Box::new(BlockingMarkerTool {
+                entered: tool_entered.clone(),
+                release: release_tool.clone(),
+            }),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    let (runner, handle) = SessionRunner::new_with_bootstrap(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-tools-maintenance".into(),
+        IdlePolicy::WaitForInput,
+        SessionBootstrap {
+            recovery_tasks: vec![],
+            legacy: false,
+            initial_entries: vec![test_goal_entry()],
+        },
+    )
+    .await
+    .unwrap();
+    let task = runner.start(None);
+    handle.continue_goal(None);
+    tool_entered.notified().await;
+    handle.compact();
+    release_tool.notify_one();
+    resumed.notified().await;
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        3,
+        "goal call, compaction, resumed goal call"
+    );
+    handle.cancel();
+    wait_for_status(&mut handle.status(), |status| {
+        matches!(status, SessionStatus::Idle)
+    })
+    .await;
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn ordinary_tools_queued_compaction_keeps_required_resume_turn() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let tool_entered = Arc::new(Notify::new());
+    let release_tool = Arc::new(Notify::new());
+    let mut agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![
+                (
+                    AssistantMessage {
+                        content: None,
+                        tool_calls: vec![ToolCall {
+                            id: "tool".into(),
+                            name: "read_image".into(),
+                            arguments: "{}".into(),
+                        }],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("ordinary maintenance summary".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("ordinary resumed".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+            ]
+            .into(),
+            calls: calls.clone(),
+        }),
+        vec![
+            Box::new(BlockingMarkerTool {
+                entered: tool_entered.clone(),
+                release: release_tool.clone(),
+            }),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    history_for_compaction(&mut agent);
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "ordinary-tools-maintenance".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let task = runner.start(Some("ordinary".into()));
+    tool_entered.notified().await;
+    handle.compact();
+    release_tool.notify_one();
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "ordinary resumed"),
+    )
+    .await;
+    assert_eq!(calls.lock().unwrap().len(), 3);
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn sibling_safe_point_preserves_fifo_prompt_pause_and_clear_after_durable_tools() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let tool_entered = Arc::new(Notify::new());
+    let release_tool = Arc::new(Notify::new());
+    let agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![
+                (
+                    AssistantMessage {
+                        content: None,
+                        tool_calls: vec![ToolCall {
+                            id: "tool".into(),
+                            name: "read_image".into(),
+                            arguments: "{}".into(),
+                        }],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("prompt before mutations".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+            ]
+            .into(),
+            calls: calls.clone(),
+        }),
+        vec![
+            Box::new(BlockingMarkerTool {
+                entered: tool_entered.clone(),
+                release: release_tool.clone(),
+            }),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    let (runner, handle) = SessionRunner::new_with_bootstrap(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "sibling-fifo-goal-actions".into(),
+        IdlePolicy::WaitForInput,
+        SessionBootstrap {
+            recovery_tasks: vec![],
+            legacy: false,
+            initial_entries: vec![test_goal_entry()],
+        },
+    )
+    .await
+    .unwrap();
+    let task = runner.start(None);
+    handle.continue_goal(None);
+    tool_entered.notified().await;
+    handle.prompt("queued first");
+    handle.goal_command(GoalCommand::Action(crate::agent::GoalAction::Pause));
+    handle.goal_command(GoalCommand::Action(crate::agent::GoalAction::Clear));
+    release_tool.notify_one();
+    wait_for_log_event(&handle, |event| matches!(event, AgentEvent::AssistantText(text) if text == "prompt before mutations")).await;
+    wait_for_goal(&handle, |goal| goal.is_none()).await;
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "sibling-fifo-goal-actions")
+        .await
+        .unwrap();
+    let tool = loaded.entries.iter().position(|entry| matches!(entry, SessionEntry::Message { message: Message::Tool { call_id, .. } } if call_id == "tool")).unwrap();
+    let prompt = loaded.entries.iter().position(|entry| matches!(entry, SessionEntry::Message { message: Message::User { content, .. } } if content == "queued first")).unwrap();
+    let paused = loaded.entries.iter().position(|entry| matches!(entry, SessionEntry::GoalUpdated { goal: Some(goal) } if goal.status == crate::agent::GoalStatus::Paused)).unwrap();
+    let cleared = loaded
+        .entries
+        .iter()
+        .position(|entry| matches!(entry, SessionEntry::GoalUpdated { goal: None }))
+        .unwrap();
+    assert!(tool < prompt && prompt < paused && paused < cleared);
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn capped_goal_skipping_auto_compaction_leaves_latch_for_next_human_turn() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![
+                (
+                    AssistantMessage {
+                        content: Some("capped goal".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    Some(Usage {
+                        input_tokens: 800,
+                        output_tokens: 0,
+                        ..Usage::default()
+                    }),
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("human answer".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    Some(Usage {
+                        input_tokens: 800,
+                        output_tokens: 0,
+                        ..Usage::default()
+                    }),
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("human compacted summary".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    Some(Usage::default()),
+                ),
+            ]
+            .into(),
+            calls: calls.clone(),
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    agent.set_context_window(1000);
+    history_for_compaction(&mut agent);
+    let (runner, handle) = SessionRunner::new_with_bootstrap(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-auto-compact-latch".into(),
+        IdlePolicy::WaitForInput,
+        SessionBootstrap {
+            recovery_tasks: vec![],
+            legacy: false,
+            initial_entries: vec![test_goal_entry()],
+        },
+    )
+    .await
+    .unwrap();
+    let task = runner.start(None);
+    handle.continue_goal(Some(800));
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "capped goal"),
+    )
+    .await;
+    handle.prompt("human after cap");
+    wait_for_log_event(&handle, |event| matches!(event, AgentEvent::Notice(text) if text == "compacted: human compacted summary")).await;
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        3,
+        "goal, human, then retained auto-compaction"
+    );
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn goal_continue_poll_guard_safe_point_remounts_after_committed_completion() {
+    // The poll guard ends the Goal turn only after every sibling result and
+    // the owned background completion are durable. That nonterminal safe
+    // point must still remount the armed driver for its next Goal call.
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = crate::workspace::Workspace::new(temp.path()).unwrap();
+    let (_main_tools, background) = crate::tools::builtins(workspace.clone(), None, false, None);
+    let mut tools =
+        crate::tools::builtins_with_background(workspace, background, None, false, true, None);
+    tools.push(Box::new(SlowTool { millis: 2500 }));
+    let entered = Arc::new(Notify::new());
+    let agent = Agent::new(
+        Box::new(BlockingContextCaptureModel {
+            replies: vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![
+                        ToolCall {
+                            id: "bash".into(),
+                            name: "bash".into(),
+                            arguments: r#"{"command":"sleep 2; echo done","background":true}"#
+                                .into(),
+                        },
+                        poll_call("poll-1"),
+                        poll_call("poll-2"),
+                        poll_call("poll-3"),
+                        ToolCall {
+                            id: "slow".into(),
+                            name: "slow_test".into(),
+                            arguments: "{}".into(),
+                        },
+                    ],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("resumed after poll guard".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+            ]
+            .into(),
+            block_call: 2,
+            entered: entered.clone(),
+            release: Arc::new(Notify::new()),
+            dropped: None,
+            calls: Arc::new(Mutex::new(Vec::new())),
+            call_count: 0,
+        }),
+        tools,
+    );
+    let (runner, handle) = SessionRunner::new_with_bootstrap(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-poll-guard-remount".into(),
+        IdlePolicy::WaitForInput,
+        SessionBootstrap {
+            recovery_tasks: vec![],
+            legacy: false,
+            initial_entries: vec![test_goal_entry()],
+        },
+    )
+    .await
+    .unwrap();
+    let task = runner.start(None);
+    handle.continue_goal(None);
+    entered.notified().await;
+    let snapshot = handle.snapshot();
+    let completion = snapshot
+        .iter()
+        .position(|event| matches!(event, AgentEvent::BackgroundCompletionNotice { id: 1, .. }))
+        .expect("completion must commit at the poll safe point");
+    let termination = snapshot
+        .iter()
+        .position(|event| matches!(event, AgentEvent::Notice(text) if text == POLL_GUARD_TERMINATION_NOTICE))
+        .expect("poll guard must end the first Goal turn");
+    assert!(completion < termination);
+    handle.cancel();
+    wait_for_status(&mut handle.status(), |status| {
+        matches!(status, SessionStatus::Idle)
+    })
+    .await;
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn oracle393_continue_then_compact_charges_and_reaches_goal_request() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let entered = Arc::new(Notify::new());
+    let mut agent = Agent::new(
+        Box::new(GatedContextCaptureModel {
+            replies: vec![
+                (
+                    AssistantMessage {
+                        content: Some("maintenance summary".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    Some(Usage {
+                        input_tokens: 3,
+                        output_tokens: 0,
+                        ..Usage::default()
+                    }),
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("goal request".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    Some(Usage::default()),
+                ),
+            ]
+            .into(),
+            block_call: 2,
+            entered: entered.clone(),
+            release: Arc::new(Notify::new()),
+            calls: calls.clone(),
+            call_count: 0,
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    history_for_compaction(&mut agent);
+    let (runner, handle) = SessionRunner::new_with_bootstrap(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "oracle393-continue-compact".into(),
+        IdlePolicy::WaitForInput,
+        SessionBootstrap {
+            recovery_tasks: vec![],
+            legacy: false,
+            initial_entries: vec![test_goal_entry()],
+        },
+    )
+    .await
+    .unwrap();
+    // Queue before start: Continue must become the owner of the following
+    // FIFO maintenance item rather than wait for a natural turn end.
+    handle.continue_goal(Some(10));
+    handle.compact();
+    let task = runner.start(None);
+    entered.notified().await;
+    {
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            2,
+            "valid charged maintenance must reach the Goal request"
+        );
+        assert!(calls[1].iter().any(|message| matches!(message,
+            Message::User { content, .. } if content.contains("compacted summary") || content == "[compacted summary of earlier conversation]\nmaintenance summary")),
+            "the second request must be the post-maintenance Goal context: {:?}", calls[1]);
+    }
+    handle.cancel();
+    wait_for_status(&mut handle.status(), |status| {
+        matches!(status, SessionStatus::Idle)
+    })
+    .await;
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn oracle393_goal_tool_compact_prompt_keeps_charge_but_runs_user_turn() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let tool_entered = Arc::new(Notify::new());
+    let release_tool = Arc::new(Notify::new());
+    let fourth_entered = Arc::new(Notify::new());
+    let mut agent = Agent::new(
+        Box::new(GatedContextCaptureModel {
+            replies: vec![
+                (
+                    AssistantMessage {
+                        content: None,
+                        tool_calls: vec![ToolCall {
+                            id: "tool".into(),
+                            name: "read_image".into(),
+                            arguments: "{}".into(),
+                        }],
+                        reasoning: None,
+                    },
+                    Some(Usage {
+                        input_tokens: 1,
+                        output_tokens: 0,
+                        ..Usage::default()
+                    }),
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("charged summary".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    Some(Usage {
+                        input_tokens: 9,
+                        output_tokens: 0,
+                        ..Usage::default()
+                    }),
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("human answer".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    Some(Usage::default()),
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("fabricated automatic goal".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    Some(Usage::default()),
+                ),
+            ]
+            .into(),
+            block_call: 4,
+            entered: fourth_entered.clone(),
+            release: Arc::new(Notify::new()),
+            calls: calls.clone(),
+            call_count: 0,
+        }),
+        vec![
+            Box::new(BlockingMarkerTool {
+                entered: tool_entered.clone(),
+                release: release_tool.clone(),
+            }),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    history_for_compaction(&mut agent);
+    let (runner, handle) = SessionRunner::new_with_bootstrap(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "oracle393-goal-tool-prompt".into(),
+        IdlePolicy::WaitForInput,
+        SessionBootstrap {
+            recovery_tasks: vec![],
+            legacy: false,
+            initial_entries: vec![test_goal_entry()],
+        },
+    )
+    .await
+    .unwrap();
+    let task = runner.start(None);
+    handle.continue_goal(Some(10));
+    tool_entered.notified().await;
+    handle.compact();
+    handle.prompt("real human prompt");
+    release_tool.notify_one();
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "human answer"),
+    )
+    .await;
+    wait_for_status(&mut handle.status(), |status| {
+        matches!(status, SessionStatus::Idle)
+    })
+    .await;
+    {
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            3,
+            "exhausted compaction must not fabricate a fourth Goal request"
+        );
+        assert!(calls[2].iter().any(|message| matches!(message, Message::User { content, .. } if content == "real human prompt")),
+            "the post-maintenance provider call must be the real user turn: {:?}", calls[2]);
+    }
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            fourth_entered.notified()
+        )
+        .await
+        .is_err()
+    );
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn oracle393_missing_usage_tool_compact_never_resumes_as_ordinary() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let tool_entered = Arc::new(Notify::new());
+    let release_tool = Arc::new(Notify::new());
+    let fabricated_entered = Arc::new(Notify::new());
+    let mut agent = Agent::new(
+        Box::new(GatedContextCaptureModel {
+            replies: vec![
+                (
+                    AssistantMessage {
+                        content: None,
+                        tool_calls: vec![ToolCall {
+                            id: "tool".into(),
+                            name: "read_image".into(),
+                            arguments: "{}".into(),
+                        }],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("manual summary".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    Some(Usage::default()),
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("fabricated ordinary request".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    Some(Usage::default()),
+                ),
+            ]
+            .into(),
+            block_call: 3,
+            entered: fabricated_entered.clone(),
+            release: Arc::new(Notify::new()),
+            calls: calls.clone(),
+            call_count: 0,
+        }),
+        vec![
+            Box::new(BlockingMarkerTool {
+                entered: tool_entered.clone(),
+                release: release_tool.clone(),
+            }),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    history_for_compaction(&mut agent);
+    let (runner, handle) = SessionRunner::new_with_bootstrap(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "oracle393-missing-usage-compact".into(),
+        IdlePolicy::WaitForInput,
+        SessionBootstrap {
+            recovery_tasks: vec![],
+            legacy: false,
+            initial_entries: vec![test_goal_entry()],
+        },
+    )
+    .await
+    .unwrap();
+    let task = runner.start(None);
+    handle.continue_goal(Some(10));
+    tool_entered.notified().await;
+    handle.compact();
+    release_tool.notify_one();
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::Notice(text) if text == "compacted: manual summary"),
+    )
+    .await;
+    wait_for_status(&mut handle.status(), |status| {
+        matches!(status, SessionStatus::Idle)
+    })
+    .await;
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        2,
+        "tool sibling plus compaction are allowed; ordinary resume is not"
+    );
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            fabricated_entered.notified()
+        )
+        .await
+        .is_err()
+    );
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn oracle393_ordinary_resume_does_not_restart_turn_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let starts = Arc::new(AtomicUsize::new(0));
+    let tool_entered = Arc::new(Notify::new());
+    let release_tool = Arc::new(Notify::new());
+    let mut agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "tool".into(),
+                        name: "read_image".into(),
+                        arguments: "{}".into(),
+                    }],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("summary".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("same ordinary turn".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+            ]
+            .into(),
+        }),
+        vec![
+            Box::new(BlockingMarkerTool {
+                entered: tool_entered.clone(),
+                release: release_tool.clone(),
+            }),
+            Box::new(TurnStartMarkerTool(starts.clone())),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    history_for_compaction(&mut agent);
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "oracle393-resume-turn".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let task = runner.start(Some("ordinary".into()));
+    tool_entered.notified().await;
+    handle.compact();
+    release_tool.notify_one();
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "same ordinary turn"),
+    )
+    .await;
+    assert_eq!(
+        starts.load(Ordering::SeqCst),
+        1,
+        "maintenance Resume must not reset per-turn poll state"
+    );
+    drop(handle);
+    task.join().await.unwrap();
 }

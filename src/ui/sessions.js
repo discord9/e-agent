@@ -802,7 +802,7 @@ const SLASH_COMMANDS = [
   { name: "/model", desc: "切换当前会话模型", args: "<profile>" },
   { name: "/rename", desc: "重命名当前会话", args: "<标题>" },
   { name: "/btw", desc: "fork 旁路 subagent 继续探讨", args: "<问题>" },
-  { name: "/goal", desc: "查看/设置当前 goal（人类创建）", args: "[set <目标>|pause|resume|clear]" },
+  { name: "/goal", desc: "查看/设置当前 goal（人类创建）", args: "[set <目标>|pause|resume|clear|continue [N]]" },
   { name: "/fork", desc: "从历史消息 fork 出新会话", args: "" },
   { name: "/undo", desc: "撤销最近的文件操作", args: "" },
   { name: "/help", desc: "显示所有命令及用法", args: "[命令]" },
@@ -1178,7 +1178,7 @@ async function sendPrompt() {
       compact: "/compact - 压缩上下文（触发上下文压缩），释放 token 继续长对话。\n用法：/compact（无参数）。",
       rename: "/rename <标题> - 重命名当前会话。\n用法：/rename 新标题；/rename（无参数）显示用法；/rename 后只跟空白则清除标题。",
       btw: "/btw <问题> - fork 旁路 subagent 继续探讨。\n用法：/btw 为什么……？\n注意：主会话不受影响，新 subagent 可在侧边栏切换。",
-      goal: "/goal [set <目标>|pause|resume|clear] - 查看/设置当前 goal。\n用法：/goal（查看）；/goal set <目标>（创建，需无当前 goal 或旧 goal 已完成）；/goal pause|resume|clear（状态操作）。\n注意：goal 每次变化以完整快照追加进会话历史；模型只能通过 get_goal/update_goal 更新，只有人能创建。",
+      goal: "/goal [set <目标>|pause|resume|clear|continue [N]] - 查看/设置当前 goal。\n用法：/goal（查看）；/goal set <目标>（创建，需无当前 goal 或旧 goal 已完成）；/goal pause|resume|clear（状态操作）；/goal continue [N]（arm live continuation; optional cumulative token cap）。\n注意：goal 每次变化以完整快照追加进会话历史；continue 仅为 live runner 操作，不持久化；模型只能通过 get_goal/update_goal 更新，只有人能创建。",
       fork: "/fork [N] - 从历史消息 fork 出新会话。\n用法：/fork（默认最近完成的回合边界）或 /fork N（从最新往上第 N 个完成的回合边界）。\n注意：网页端 /fork 会弹出面板选择 fork 边界。",
       undo: "/undo - 撤销最近一次文件操作（edit_file / write_file）。\n用法：/undo（无参数）。\n注意：撤销后该操作不可重做；连续 /undo 可逐条向前撤销。",
       help: "/help [命令] - 显示帮助。\n用法：/help（命令列表）或 /help <命令>（如 /help fork）。",
@@ -1189,7 +1189,7 @@ async function sendPrompt() {
         "/compact - 压缩上下文",
         "/rename <标题> - 重命名会话",
         "/btw <问题> - fork 旁路 subagent",
-        "/goal [set <目标>|pause|resume|clear] - 当前 goal",
+        "/goal [set <目标>|pause|resume|clear|continue [N]] - 当前 goal",
         "/fork - 从历史消息 fork",
         "/undo - 撤销文件操作",
       ].join("\n"));
@@ -1298,15 +1298,22 @@ async function sendPrompt() {
   }
   if (raw.startsWith("/goal ")) {
     const rest = raw.slice("/goal ".length).trim();
-    const isAction = rest === "pause" || rest === "resume" || rest === "clear";
+    const continueMatch = /^continue(?:\s+(\S+))?$/.exec(rest);
+    const isAction = rest === "pause" || rest === "resume" || rest === "clear" || !!continueMatch;
     if (rest === "set" || (!isAction && !rest.startsWith("set "))) {
-      setBanner("用法：/goal set <目标>（创建）；/goal pause|resume|clear（状态操作）；/goal（查看）");
+      setBanner("用法：/goal set <目标>（创建）；/goal pause|resume|clear|continue（状态操作）；/goal（查看）");
       return;   // 保留输入框
     }
-    const action = isAction ? rest : "set";
+    const action = continueMatch ? "continue" : (isAction ? rest : "set");
     const objective = action === "set" ? rest.slice(4).trim() : "";
+    const budgetText = continueMatch && continueMatch[1];
+    const budget = budgetText === undefined ? undefined : Number(budgetText);
+    if (action === "continue" && (!Number.isSafeInteger(budget) || budget <= 0) && budgetText !== undefined) {
+      setBanner("用法：/goal continue [N]（N 必须为正整数）");
+      return;
+    }
     if (action === "set" && !objective) {
-      setBanner("用法：/goal set <目标>（创建）；/goal pause|resume|clear（状态操作）；/goal（查看）");
+      setBanner("用法：/goal set <目标>（创建）；/goal pause|resume|clear|continue（状态操作）；/goal（查看）");
       return;   // 保留输入框
     }
     // POST 前同步捕获三元组；URL 只用捕获的 sid。迟到响应（await 后用户
@@ -1316,7 +1323,8 @@ async function sendPrompt() {
     const stillCurrent = () =>
       state.sessionId === sid && state.workspace.id === wid && sessionOpenEpoch === ep;
     try {
-      const body = action === "set" ? { action: "set", objective } : { action };
+      const body = action === "set" ? { action: "set", objective } :
+        (action === "continue" && budgetText !== undefined ? { action, budget } : { action });
       const res = await api("/api/sessions/" + encodeURIComponent(sid) + "/goal",
         { method: "POST", body: JSON.stringify(body) });
       if (res.status === 401 || res.status === 403) {

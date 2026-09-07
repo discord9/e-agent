@@ -438,9 +438,9 @@ command set through its slash-command menu):
 - `/fork [N]` — fork a new session from the last (or the N-th) completed
   turn boundary.
 - `/undo` — undo the most recent file operation (`edit_file` / `write_file`).
-- `/goal` / `/goal set <目标>` / `/goal pause|resume|clear` — view the
-  session's goal, create a new one (human-only), or pause/resume/clear the
-  current one.
+- `/goal` / `/goal set <目标>` / `/goal pause|resume|clear` / `/goal continue [N]`
+  — view the session's goal, create a new one (human-only), pause/resume/clear
+  the current one, or arm live continuation with an optional token cap.
 - `/help [命令]` — show the command list, or per-command usage detail
   (`/help fork`); an unknown command name prints a hint back to the list.
 - `/model <profile>` — switch the session's model at runtime (not listed by
@@ -716,7 +716,7 @@ profile provides a context window, the agent also compacts automatically at
 ## Session goals
 
 Every session can carry at most one current goal — a minimal persistence
-layer (a deliberate subset of a DSH-style goal system, no scheduler/rounds/
+layer (a deliberate subset of a DSH-style goal system, with no scheduler or
 verifier). Fields: `id`, `revision`, `objective`, `success_criteria`,
 `status` (`active|paused|blocked|completed`), `progress`, `evidence`,
 `blocked_reason`.
@@ -745,6 +745,7 @@ verifier). Fields: `id`, `revision`, `objective`, `success_criteria`,
 - **Forks inherit**: `--fork`/`/fork`/btw forks copy the source prefix up to
   the fork boundary, including goal updates before it; the forked session
   folds the newest snapshot naturally.
+- **Explicit goal continuation**: `/goal continue` arms an in-memory indefinite driver; `/goal continue N` arms it with a cumulative actual-token soft cap. An active goal alone never auto-arms. The driver continues after ordinary text, empty text, no-tool rounds, and unchanged revisions, and resumes after required background follow-up. Usage is charged as input plus output tokens with saturation; a capped driver may overshoot on its final call but never starts another call after reaching the cap. Missing usage under an explicit cap fails closed. Driver state and notices are live-only and never persisted; restart starts unarmed. A prompt takes precedence over the next automatic call without implicitly disarming the driver; Cancel, inactive/cleared goals, errors, closed sessions, and budget exhaustion disarm it.
 - **Subagent isolation**: subagents get the goal tools but their runner
   applies them against the subagent's own (usually empty) goal state — a
   subagent can never take a mutable reference to its parent's goal.
@@ -752,10 +753,10 @@ verifier). Fields: `id`, `revision`, `objective`, `success_criteria`,
   fixed GoalBar (`🎯 [status] objective`); the UI shows evidence/`unverified`
   only, never a claim of independent verification.
 
-Non-goals (deliberately out of scope): todo/plan/workflow stages, auto goal
-rounds / max rounds, deadlines, reminders, goal DAGs / multiple goals per
-session, and goal-specific verification (the verifier role independently
-checks risky product changes before integration).
+Non-goals (deliberately out of scope): todo/plan/workflow stages, deadlines,
+reminders, goal DAGs / multiple goals per session, and goal-specific
+verification (the verifier role independently checks risky product changes
+before integration).
 
 ## Session output receipts (`eout1`) and the `read_output` tool
 
@@ -1325,10 +1326,9 @@ main-agent-only: subagents and btw forks neither inherit the index nor the
 read capability. The same-name override is a full replacement, not a merge
 or concatenation.
 Session goals are a single-current-goal persistence layer only: no
-todo/plan/workflow stages, no auto goal rounds / max rounds, no deadlines,
-no reminders, no goal DAGs / multiple goals per session, no goal verifier
-agent, and no scheduler/driver — the goal is a snapshot with a CAS, not a
-task runner.
+todo/plan/workflow stages, no deadlines, no reminders, no goal DAGs /
+multiple goals per session, no goal verifier agent, and no scheduler/driver —
+the goal is a snapshot with a CAS, not a task runner.
 
 GreptimeDB-specific non-goals (when built with `--features greptime`):
 
