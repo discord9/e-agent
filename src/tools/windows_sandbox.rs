@@ -1543,9 +1543,10 @@ pub(super) async fn run(
     let stderr_task =
         tokio::task::spawn_blocking(move || read_pipe(spawned.stderr, output_slot, spool));
     let wait_task = tokio::task::spawn_blocking({
+        let wait_stall_state = stall_state.clone();
         move || {
             let result = wait_process(process);
-            if let Some(state) = &stall_state {
+            if let Some(state) = &wait_stall_state {
                 state.lock().unwrap().eligible = false;
             }
             result
