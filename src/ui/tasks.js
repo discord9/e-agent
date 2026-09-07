@@ -242,27 +242,50 @@ function taskKey(t) {
   return (t.session_id || "") + ":" + (t.id != null ? t.id : "");
 }
 
-/* Visual-only live-task depth. A non-delegate child is indented only when one
-   currently listed delegate in its own workspace uniquely owns its session. */
-function liveTaskDepths(tasks) {
+/* Visual-only live-task projection. A non-delegate child belongs to exactly one
+   live delegate in the same workspace when owner_session exactly equals that
+   delegate's subagent_session_id. Delegates remain roots; ambiguous/missing
+   matches remain roots too. The projection never changes API/state order: it
+   stably orders roots, then stably appends each parent's direct children. */
+function projectLiveTasks(tasks) {
   const candidates = new Map();
   for (const t of tasks || []) {
     const subId = t && t.subagent_session_id;
     if (t && t.kind === "delegate" && typeof subId === "string" && subId.trim() !== "") {
       const inWorkspace = candidates.get(t._ws) || new Map();
-      inWorkspace.set(subId, (inWorkspace.get(subId) || 0) + 1);
+      const parents = inWorkspace.get(subId) || [];
+      parents.push(t);
+      inWorkspace.set(subId, parents);
       candidates.set(t._ws, inWorkspace);
     }
   }
-  const depths = new Map();
+
+  const parentByChild = new Map();
+  const childrenByParent = new Map();
   for (const t of tasks || []) {
     const inWorkspace = t && candidates.get(t._ws);
-    if (t && t.kind !== "delegate" && typeof t.owner_session === "string"
-        && inWorkspace && inWorkspace.get(t.owner_session) === 1) {
-      depths.set(t, 1);
+    const parents = t && t.kind !== "delegate" && typeof t.owner_session === "string"
+      && t.owner_session.trim() !== "" && inWorkspace ? inWorkspace.get(t.owner_session) : null;
+    if (!parents || parents.length !== 1) continue;
+    const parent = parents[0];
+    parentByChild.set(t, parent);
+    const children = childrenByParent.get(parent) || [];
+    children.push(t);
+    childrenByParent.set(parent, children);
+  }
+
+  const ordered = [];
+  const depths = new Map();
+  for (const t of tasks || []) {
+    if (parentByChild.has(t)) continue;
+    ordered.push(t);
+    depths.set(t, 0);
+    for (const child of childrenByParent.get(t) || []) {
+      ordered.push(child);
+      depths.set(child, 1);
     }
   }
-  return depths;
+  return { ordered, depths };
 }
 
 function tasksListSig(list) {
@@ -694,10 +717,14 @@ function handleTaskStreamBlock(block, streamEl, key) {
    openSession(该 subagent 的会话)，那边有完整消息/工具卡片/思考块渲染；
    解析不到 subagent 会话时回退为就地展开内嵌 SSE 流式区 .task-stream。
    keyed 就地更新：元数据未变的行原样保留（展开态/轮询/流不打断），只重建
-   变化/新增的行（按 prevExpanded 恢复展开）、移除消失的行；行顺序跟随
-   tasks 数组。整列表未变时由 renderComposerTasks 的签名提前跳过。 */
+   变化/新增的行（按 prevExpanded 恢复展开）、移除消失的行；行顺序来自
+   精确所有权投影（父任务后紧跟其直接子任务）。整列表未变时由
+   renderComposerTasks 的签名提前跳过。 */
 function renderTaskList(tasks, container) {
   const list = container;
+  const projection = projectLiveTasks(tasks);
+  const orderedTasks = projection.ordered;
+  const depths = projection.depths;
   if (!list) return;
   const rows = [...list.querySelectorAll(".task-row")];
   const byKey = new Map();
@@ -716,20 +743,19 @@ function renderTaskList(tasks, container) {
   // 消失的任务：清理已累积的流式文本缓冲与降级标记（轮询/流在下方移除
   // 循环里停掉）。放在空列表早退之前：任务全部结束时也要清理，防泄漏。
   const activeKeys = new Set();
-  for (const t of tasks) activeKeys.add(taskKey(t));
+  for (const t of orderedTasks) activeKeys.add(taskKey(t));
   for (const k of Array.from(state.tasks.streamText.keys())) {
     if (!activeKeys.has(k)) state.tasks.streamText.delete(k);
   }
   for (const k of Array.from(state.tasks.degraded.keys())) {
     if (!activeKeys.has(k)) state.tasks.degraded.delete(k);
   }
-  if (!tasks.length) {
+  if (!orderedTasks.length) {
     for (const [key, row] of byKey) { stopTaskPoller(key); stopTaskStream(key); row.remove(); }
     return;   // 组件已由 renderComposerTasks 在 n===0 时整体隐藏，不再渲染空态
   }
-  const depths = liveTaskDepths(tasks);
-  let prev = null;   // 前一个已处理的行（插入锚点，保持 tasks 数组顺序）
-  for (const t of tasks) {
+  let prev = null;   // 前一个已处理的行（插入锚点，保持投影顺序）
+  for (const t of orderedTasks) {
     const key = taskKey(t);
     const depth = depths.get(t) || 0;
     const sig = taskKeySig(t);

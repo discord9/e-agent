@@ -1939,7 +1939,18 @@
     cursor: pointer;
   }
   .task-row:hover { border-color: var(--blue); }
-  .task-row[data-task-depth="1"] > * { margin-inline-start: 8px; }
+  /* Indent the complete child card, including its border and background. The
+     reduced width stays inside the scrolling panel, so no horizontal overflow. */
+  .task-row[data-task-depth="1"] {
+    margin-inline-start: 24px;
+    width: calc(100% - 24px);
+  }
+  @media (max-width: 640px) {
+    .task-row[data-task-depth="1"] {
+      margin-inline-start: 16px;
+      width: calc(100% - 16px);
+    }
+  }
   /* 当前会话发起的任务：左侧 cyan accent bar + hover 同色，扫一眼可辨 */
   .task-row.task-row-current {
     border-left: 3px solid var(--cyan);
