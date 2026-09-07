@@ -1297,6 +1297,7 @@ impl Tool for Delegate {
                         exit_code: None,
                         signal: None,
                         status: Some(if completed { "completed" } else { "failed" }.into()),
+                        cancellation_source: None,
                     };
                     finish_child_cleanup(cleanup, &child_background, &child_record).await;
                     format!(

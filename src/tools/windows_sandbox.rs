@@ -1582,6 +1582,7 @@ pub(super) async fn run(
                         exit_code: None,
                         signal: Some("SIGKILL".into()),
                         status: Some("killed".into()),
+                        cancellation_source: Some(crate::agent::CancellationSource::System),
                     };
                 }
                 return Err(format!(
@@ -1602,6 +1603,7 @@ pub(super) async fn run(
             exit_code: Some(code),
             signal: None,
             status: Some(if code == 0 { "completed" } else { "failed" }.into()),
+            cancellation_source: None,
         };
     }
     let text = format_output(Some(code), &stdout, &stderr);

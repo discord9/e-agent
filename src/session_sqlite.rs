@@ -1817,6 +1817,7 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM {selected_from} WH
                 signal,
                 status,
                 kind,
+                cancellation_source,
                 ..
             } = entry
             else {
@@ -1844,6 +1845,7 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM {selected_from} WH
                 signal,
                 status,
                 kind,
+                cancellation_source,
             });
         }
         Ok(out)

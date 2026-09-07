@@ -100,6 +100,7 @@ impl Tool for ScriptedBackgroundTool {
                 signal: None,
                 status: None,
                 kind: None,
+                cancellation_source: None,
             });
             if let Some(sent) = completion_sent {
                 sent.notify_one();
@@ -148,6 +149,7 @@ impl Tool for NoticeBackgroundTool {
                     signal: None,
                     status: None,
                     kind: None,
+                    cancellation_source: None,
                 });
             }
         });
@@ -1828,6 +1830,7 @@ fn background_completion_entry_serde_old_and_new() {
         signal: None,
         status: None,
         kind: None,
+        cancellation_source: None,
     };
     let json = serde_json::to_string(&entry).unwrap();
     assert!(
@@ -1847,6 +1850,7 @@ fn background_completion_entry_serde_old_and_new() {
         signal: None,
         status: None,
         kind: None,
+        cancellation_source: None,
     };
     let json_none = serde_json::to_string(&entry_none).unwrap();
     assert!(
@@ -1872,6 +1876,7 @@ fn background_completion_trace_fields_serde_roundtrip() {
             signal,
             status,
             kind,
+            cancellation_source,
             ..
         } => {
             assert_eq!(id, 7);
@@ -1881,6 +1886,10 @@ fn background_completion_trace_fields_serde_roundtrip() {
             assert_eq!(signal, None, "legacy row: signal is None");
             assert_eq!(status, None, "legacy row: status is None");
             assert_eq!(kind, None, "legacy row: kind is None");
+            assert_eq!(
+                cancellation_source, None,
+                "legacy row: cancellation source is None"
+            );
         }
         other => panic!("expected BackgroundCompletion, got {other:?}"),
     }
@@ -1897,6 +1906,7 @@ fn background_completion_trace_fields_serde_roundtrip() {
         signal: Some("SIGTERM".into()),
         status: Some("killed".into()),
         kind: Some("bash".into()),
+        cancellation_source: Some(CancellationSource::User),
     };
     let json = serde_json::to_value(&full).unwrap();
     let obj = json.as_object().unwrap();
@@ -1906,6 +1916,7 @@ fn background_completion_trace_fields_serde_roundtrip() {
     assert_eq!(obj["signal"], "SIGTERM");
     assert_eq!(obj["status"], "killed");
     assert_eq!(obj["kind"], "bash");
+    assert_eq!(obj["cancellation_source"], "user");
     let back: SessionEntry = serde_json::from_value(json).unwrap();
     assert_eq!(back, full);
 
@@ -1920,6 +1931,7 @@ fn background_completion_trace_fields_serde_roundtrip() {
         signal: None,
         status: None,
         kind: None,
+        cancellation_source: None,
     };
     let json_min = serde_json::to_string(&minimal).unwrap();
     for field in [
@@ -1929,6 +1941,7 @@ fn background_completion_trace_fields_serde_roundtrip() {
         "signal",
         "status",
         "kind",
+        "cancellation_source",
     ] {
         assert!(
             !json_min.contains(field),
@@ -1971,6 +1984,7 @@ fn context_formats_background_completion_with_label_variants() {
             signal: None,
             status: None,
             kind: None,
+            cancellation_source: None,
         }]);
         let msgs = agent.context();
         assert_eq!(msgs.len(), 1);
@@ -2011,6 +2025,7 @@ fn background_completion_and_notice_coexist_in_context() {
             signal: None,
             status: None,
             kind: None,
+            cancellation_source: None,
         },
     ]);
     let msgs = agent.context();
@@ -2075,6 +2090,7 @@ fn context_is_full_and_lossless_for_background_completions() {
         signal: None,
         status: None,
         kind: None,
+        cancellation_source: None,
     }]);
     let msgs = agent.context();
     assert_eq!(msgs.len(), 1);
@@ -2146,6 +2162,7 @@ fn context_request_passes_small_outputs_through_byte_identical() {
         signal: None,
         status: None,
         kind: None,
+        cancellation_source: None,
     })
     .unwrap();
     location.entry_hash = crate::session_store::entry_payload_hash(&payload);
@@ -2160,6 +2177,7 @@ fn context_request_passes_small_outputs_through_byte_identical() {
             signal: None,
             status: None,
             kind: None,
+            cancellation_source: None,
         }],
         vec![Some(location)],
     );
@@ -2202,6 +2220,7 @@ fn context_request_bounds_oversized_background_completion_with_receipt() {
         signal: None,
         status: None,
         kind: None,
+        cancellation_source: None,
     })
     .unwrap();
     location.entry_hash = crate::session_store::entry_payload_hash(&payload);
@@ -2216,6 +2235,7 @@ fn context_request_bounds_oversized_background_completion_with_receipt() {
             signal: None,
             status: None,
             kind: None,
+            cancellation_source: None,
         }],
         vec![Some(location.clone())],
     );
@@ -2566,6 +2586,7 @@ async fn compaction_retained_stays_full_and_request_is_bounded() {
         signal: None,
         status: None,
         kind: None,
+        cancellation_source: None,
     };
     loc.entry_hash =
         crate::session_store::entry_payload_hash(&serde_json::to_string(&completion).unwrap());
@@ -2743,6 +2764,7 @@ async fn compaction_split_uses_actual_user_not_background_completion() {
             signal: None,
             status: None,
             kind: None,
+            cancellation_source: None,
         },
     ]);
 
@@ -2946,6 +2968,7 @@ async fn compaction_request_bounds_oversized_completion_before_later_user() {
         signal: None,
         status: None,
         kind: None,
+        cancellation_source: None,
     };
     loc.entry_hash =
         crate::session_store::entry_payload_hash(&serde_json::to_string(&completion).unwrap());
@@ -3127,6 +3150,7 @@ fn fork_prefix_default_cuts_at_last_completed_turn_and_drops_tail() {
         signal: None,
         status: None,
         kind: None,
+        cancellation_source: None,
     });
     entries.push(SessionEntry::ForkedFrom {
         source: "other".into(),

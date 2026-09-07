@@ -796,6 +796,8 @@ pub struct FinishedTask {
     pub status: Option<String>,
     /// "bash" | "delegate"
     pub kind: Option<String>,
+    /// Explicit cancellation source, absent for normal/legacy completion.
+    pub cancellation_source: Option<crate::agent::CancellationSource>,
 }
 
 /// Where a live agent records its in-flight background tasks: the workspace
@@ -3180,6 +3182,7 @@ mod shared_helpers {
             signal: None,
             status: Some(status.into()),
             kind: Some("bash".into()),
+            cancellation_source: None,
         })
         .unwrap()
     }
@@ -3450,6 +3453,7 @@ mod shared_helpers {
                 signal: None,
                 status: None,
                 kind: None,
+                cancellation_source: None,
             },
             SessionEntry::ForkedFrom {
                 source: "src".into(),
