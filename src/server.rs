@@ -1564,17 +1564,19 @@ async fn session_goal_get(
 #[serde(deny_unknown_fields)]
 struct GoalBody {
     /// "set" (create, human-only) | "pause" | "resume" | "clear" |
-    /// "continue" (reset the runner-local continuation budget).
+    /// "continue" arms the runner-local continuation driver.
     action: String,
     /// Required for `set`.
     objective: Option<String>,
     success_criteria: Option<Vec<String>>,
+    /// Optional positive cumulative actual-token cap for `continue`.
+    budget: Option<u64>,
 }
 
 /// `POST /api/sessions/{id}/goal` — human goal mutation, applied by the
 /// runner (which re-validates atomically and persists a `GoalUpdated`
 /// entry; results/errors fan out over SSE). The `continue` action is the
-/// exception: it only resets the live runner's continuation budget and does
+/// exception: it only arms the live runner's continuation driver and does
 /// not mutate or persist the goal. 202 Accepted (async, like prompt/compact);
 /// 400/409 for input the runner would reject, 409 when the session is
 /// finished or its command channel is closed (the operation could never
@@ -1611,13 +1613,25 @@ async fn session_goal_post(
                 "goal continue does not accept objective or success_criteria",
             ));
         }
-        if !handle.reset_goal_continuation() {
+        if let Some(0) = body.budget {
+            return Err(error(
+                StatusCode::BAD_REQUEST,
+                "goal continuation budget must be a positive integer",
+            ));
+        }
+        if !handle.continue_goal(body.budget) {
             return Err(error(
                 StatusCode::CONFLICT,
                 "session is finished or its command channel is closed: goal continuation not accepted",
             ));
         }
         return Ok(StatusCode::ACCEPTED);
+    }
+    if body.budget.is_some() {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "budget is only accepted for goal continue",
+        ));
     }
     let command = match body.action.as_str() {
         "set" => {
@@ -5117,22 +5131,14 @@ model = "deepseek-chat"
         }
 
         // `continue` is a live-only runner command: with no goal it is
-        // accepted, but it must not change the snapshot or append an entry.
+        // accepted, but it must not change the snapshot, append an entry, or
+        // manufacture a policy notice.
         let before_continue = handle.snapshot();
-        let (_, mut live, _) = handle.attach();
         assert_eq!(
             post_goal(app.clone(), r#"{"action":"continue"}"#.to_owned()).await,
             StatusCode::ACCEPTED
         );
-        let acknowledgement = tokio::time::timeout(std::time::Duration::from_secs(5), live.recv())
-            .await
-            .expect("continue acknowledgement timeout")
-            .expect("continue live event");
-        assert!(matches!(
-            acknowledgement,
-            AgentEvent::Notice(text)
-                if text.contains("budget reset") && text.contains("no goal is set")
-        ));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert!(handle.goal().is_none());
         assert_eq!(handle.snapshot(), before_continue);
         let after_continue = SessionStore::Jsonl
@@ -5140,6 +5146,32 @@ model = "deepseek-chat"
             .await
             .unwrap();
         assert!(after_continue.entries.is_empty());
+        // Handler parsing: omitted budget is indefinite, a positive integer
+        // is accepted, and zero/type errors never enter the command stream.
+        assert_eq!(
+            post_goal(
+                app.clone(),
+                r#"{"action":"continue","budget":7}"#.to_owned()
+            )
+            .await,
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(
+            post_goal(
+                app.clone(),
+                r#"{"action":"continue","budget":0}"#.to_owned()
+            )
+            .await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            post_goal(
+                app.clone(),
+                r#"{"action":"continue","budget":"bad"}"#.to_owned()
+            )
+            .await,
+            StatusCode::BAD_REQUEST
+        );
 
         // Fresh session: GET → null.
         assert!(get_goal(app.clone()).await["goal"].is_null());

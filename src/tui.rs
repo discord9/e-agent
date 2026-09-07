@@ -647,7 +647,7 @@ const HELP_TEXT: &str = "\
 /btw <问题> - fork 旁路 subagent
 /fork - 从历史消息 fork
 /undo - 撤销文件操作
-/goal - 查看/设置当前 goal（/goal set <目标>，/goal pause|resume|clear，/goal continue：重置 runner 本地 10 回合预算；符合条件时立即继续，仅实时不持久化）";
+/goal - 查看/设置当前 goal（/goal set <目标>，/goal pause|resume|clear，/goal continue [N]：启动实时继续（可选累计 token 上限）；符合条件时立即继续，仅实时不持久化）";
 
 /// Detailed per-command help, shown by `/help <命令>` (kept in sync with
 /// the web UI's `/help <命令>` in `src/ui/sessions.js`). Each entry is
@@ -679,7 +679,7 @@ const HELP_DETAILS: &[(&str, &str)] = &[
     ),
     (
         "goal",
-        "/goal - 查看/设置当前 goal。\n用法：/goal（查看）；/goal set <目标>（创建，需无当前 goal 或旧 goal 已完成）；/goal pause|resume|clear（暂停/恢复/清除）；/goal continue（重置 runner 本地 10 回合预算）。\n注意：continue 仅在当前符合条件时请求立即继续，实时有效且不持久化；其他 goal 状态会跨压缩/恢复/重开保留。模型可通过 get_goal/update_goal 工具读取和更新，但只有人能创建。",
+        "/goal - 查看/设置当前 goal。\n用法：/goal（查看）；/goal set <目标>（创建，需无当前 goal 或旧 goal 已完成）；/goal pause|resume|clear（暂停/恢复/清除）；/goal continue [N]（启动实时继续，可选累计 token 上限）。\n注意：continue 仅在当前符合条件时请求立即继续，实时有效且不持久化；其他 goal 状态会跨压缩/恢复/重开保留。模型可通过 get_goal/update_goal 工具读取和更新，但只有人能创建。",
     ),
 ];
 
@@ -1052,8 +1052,8 @@ enum GoalCommand {
     Set(String),
     /// `/goal pause|resume|clear` — act on the current goal.
     Action(crate::agent::GoalAction),
-    /// `/goal continue` — reset the runner-local continuation budget.
-    Continue,
+    /// `/goal continue [N]` — arm the runner-local continuation driver.
+    Continue(Option<u64>),
     /// Unrecognized argument — show usage.
     Usage,
 }
@@ -1072,7 +1072,19 @@ fn parse_goal(prompt: &str) -> Option<GoalCommand> {
         "pause" => Some(GoalCommand::Action(crate::agent::GoalAction::Pause)),
         "resume" => Some(GoalCommand::Action(crate::agent::GoalAction::Resume)),
         "clear" => Some(GoalCommand::Action(crate::agent::GoalAction::Clear)),
-        "continue" => Some(GoalCommand::Continue),
+        "continue" => Some(GoalCommand::Continue(None)),
+        _ if rest.strip_prefix("continue ").is_some() => {
+            let value = rest
+                .strip_prefix("continue ")
+                .unwrap()
+                .trim()
+                .parse::<u64>()
+                .ok();
+            match value {
+                Some(n) if n > 0 => Some(GoalCommand::Continue(Some(n))),
+                _ => Some(GoalCommand::Usage),
+            }
+        }
         _ => rest
             .strip_prefix("set ")
             .filter(|objective| !objective.trim().is_empty())
@@ -1110,11 +1122,11 @@ fn handle_goal(command: GoalCommand, state: &mut TuiState, handle: &RunnerHandle
         GoalCommand::Action(action) => {
             queued = handle.goal_command(crate::runner::GoalCommand::Action(action));
         }
-        GoalCommand::Continue => {
-            queued = handle.reset_goal_continuation();
+        GoalCommand::Continue(budget) => {
+            queued = handle.continue_goal(budget);
         }
         GoalCommand::Usage => state.push_agent_event(AgentEvent::Notice(
-            "用法：/goal（查看）；/goal set <目标>（创建）；/goal pause|resume|clear（状态操作）；/goal continue（重置继续预算）"
+            "用法：/goal（查看）；/goal set <目标>（创建）；/goal pause|resume|clear（状态操作）；/goal continue [N]（启动实时继续，可选累计 token 上限）"
                 .to_owned(),
         )),
     }

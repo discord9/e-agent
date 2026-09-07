@@ -1192,7 +1192,7 @@ fn parse_goal_distinguishes_show_set_and_actions() {
     );
     assert_eq!(
         parse_goal("  /goal continue  "),
-        Some(GoalCommand::Continue)
+        Some(GoalCommand::Continue(None))
     );
     assert_eq!(parse_goal("/goal continue now"), Some(GoalCommand::Usage));
     assert_eq!(parse_goal("/goal nope"), Some(GoalCommand::Usage));
@@ -1301,7 +1301,7 @@ fn attached_goal_commands_use_the_attached_handle_never_prompt_history() {
     state.handle_attached_key(enter, 80);
     assert!(matches!(
         source.try_recv(),
-        Ok(crate::runner::SessionCommand::ResetGoalContinuation)
+        Ok(crate::runner::SessionCommand::Continue(None))
     ));
     assert!(
         source.try_recv().is_err(),

@@ -662,9 +662,22 @@ async fn repl(
                 ),
                 None => eprintln!("no goal set（创建：/goal set <目标>）"),
             },
-            "/goal continue" => {
-                if !handle.reset_goal_continuation() {
-                    eprintln!("goal command not accepted: session is finished or closed");
+            command if command == "/goal continue" || command.starts_with("/goal continue ") => {
+                let raw = command.strip_prefix("/goal continue").unwrap().trim();
+                let budget = if raw.is_empty() {
+                    Some(None)
+                } else {
+                    match raw.parse::<u64>() {
+                        Ok(0) | Err(_) => None,
+                        Ok(value) => Some(Some(value)),
+                    }
+                };
+                if let Some(budget) = budget {
+                    if !handle.continue_goal(budget) {
+                        eprintln!("goal command not accepted: session is finished or closed");
+                    }
+                } else {
+                    eprintln!("用法：/goal continue [N]（N 必须为正整数）");
                 }
             }
             command if command.starts_with("/goal ") => {
@@ -691,7 +704,7 @@ async fn repl(
                         handle.goal_command(e_agent::runner::GoalCommand::Action(action));
                     }
                     _ => eprintln!(
-                        "用法：/goal set <目标>（创建）；/goal pause|resume|clear（状态操作）；/goal continue（重置 runner 本地 10 回合预算）；/goal（查看）"
+                        "用法：/goal set <目标>（创建）；/goal pause|resume|clear（状态操作）；/goal continue [N]（启动实时继续；N 为可选累计 token 上限）；/goal（查看）"
                     ),
                 }
             }
