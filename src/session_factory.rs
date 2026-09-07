@@ -470,21 +470,29 @@ impl SessionFactory {
     /// `--base-url`/`--model` overrides the main model was built with and
     /// resolves against the CURRENT (possibly hot-reloaded) config. Errors
     /// when there is no config or the profile is unknown — the caller turns
-    /// that into a 400. Note: a runtime switch does not touch the agent's
-    /// context window (that stays the build-time `main_context_window`).
-    pub fn resolve_profile(&self, profile: &str) -> anyhow::Result<ConfiguredModel> {
+    /// that into a 400. The context window accompanies the concrete model so
+    /// a runtime switch updates both runner observations together.
+    pub fn resolve_profile(&self, profile: &str) -> anyhow::Result<(ConfiguredModel, Option<u64>)> {
         let state = self.reloadable.read().unwrap();
         let config = state
             .config
             .as_ref()
             .ok_or_else(|| anyhow!("no config file; cannot resolve model profile `{profile}`"))?;
         let resolved = config.resolve_profile(profile)?;
-        configured_model(
+        // A `--model` override replaces the profile's wire model, so its
+        // context-window declaration cannot describe the active model.
+        let context_window = self
+            .model
+            .as_ref()
+            .map(|_| None)
+            .unwrap_or(resolved.context_window);
+        let model = configured_model(
             resolved,
             state.auth.as_ref(),
             self.base_url.clone(),
             self.model.clone(),
-        )
+        )?;
+        Ok((model, context_window))
     }
 
     /// Every switchable model profile name (`[models]` keys + `[roles]`
@@ -1784,14 +1792,40 @@ api_key_env = "PATH"
         // display name is the short form (after the last '/'), per
         // `ConfiguredModel::display_name`.
         assert_eq!(
-            factory.resolve_profile("p2/m2").unwrap().display_name(),
+            factory.resolve_profile("p2/m2").unwrap().0.display_name(),
             "m2"
+        );
+        assert_eq!(
+            factory.resolve_profile("p2/m2").unwrap().1,
+            None,
+            "profiles without context_window carry None to runtime switches"
         );
         assert_eq!(factory.main_model().display_name(), "m1");
         assert_eq!(
             factory.current_config().unwrap().model_profiles(),
             vec!["p1/m1", "p2/m2"]
         );
+    }
+
+    #[test]
+    fn resolve_profile_returns_profile_context_window() {
+        let temp = tempfile::tempdir().unwrap();
+        let factory = SessionFactory::test_factory_with_config(
+            temp.path().to_path_buf(),
+            Some(test_config(
+                "p1/m1",
+                r#"[models."p2/m2"]
+model = "m2"
+context_window = 32768
+[providers.p2]
+base_url = "http://two"
+api_key_env = "PATH"
+"#,
+            )),
+        );
+
+        assert_eq!(factory.resolve_profile("p2/m2").unwrap().1, Some(32_768));
+        assert_eq!(factory.resolve_profile("p1/m1").unwrap().1, None);
     }
 
     #[test]
@@ -1882,7 +1916,7 @@ api_key_env = "PATH"
         };
         assert!(matches!(result, ReloadResult::Reloaded), "{result:?}");
         assert_eq!(
-            factory.resolve_profile("p2/m2").unwrap().display_name(),
+            factory.resolve_profile("p2/m2").unwrap().0.display_name(),
             "m2"
         );
     }

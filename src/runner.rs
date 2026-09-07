@@ -129,9 +129,9 @@ pub enum SessionCommand {
     Cancel,
     Compact,
     /// Runtime model switch (web/TUI `/model <profile>`): the caller
-    /// resolves the profile to a concrete model and hands it over; the
-    /// runner only installs it on the agent.
-    SwitchModel(Box<dyn Model>),
+    /// resolves the profile to a concrete model and its context window;
+    /// the runner installs both on the agent together.
+    SwitchModel(Box<dyn Model>, Option<u64>),
     /// Human-issued goal mutation (`/goal` commands, web API). The model
     /// never creates goals; its `update_goal` tool is intercepted by the
     /// runner with the same transition rules under an id + revision CAS.
@@ -349,16 +349,16 @@ impl SessionHandle {
             shared.commands_open = false;
         }
     }
-    /// Switch the session's model at runtime. The caller resolves the
-    /// profile (web `/model`, TUI `/model`); the runner installs the new
-    /// model on the agent from its next call on.
-    pub fn switch_model(&self, model: Box<dyn Model>) {
+    /// Switch the session's model and context window at runtime. The caller
+    /// resolves the profile (web/TUI `/model`); the runner installs both from
+    /// its next call on.
+    pub fn switch_model(&self, model: Box<dyn Model>, context_window: Option<u64>) {
         let mut shared = self.shared.lock().unwrap();
         if shared.commands_open
             && !self.commands.is_closed()
             && self
                 .commands
-                .send(SessionCommand::SwitchModel(model))
+                .send(SessionCommand::SwitchModel(model, context_window))
                 .is_err()
         {
             shared.commands_open = false;
@@ -1232,10 +1232,10 @@ impl SessionRunner {
                 self.pending.push_back(PendingCommand::Goal(command));
                 Steering::None
             }
-            SessionCommand::SwitchModel(model) => {
+            SessionCommand::SwitchModel(model, context_window) => {
                 // Instant, not queued: the new model applies to the next
                 // model call (a call already in flight keeps its model).
-                self.agent.set_model(model);
+                self.agent.set_model(model, context_window);
                 Steering::None
             }
             SessionCommand::Cancel => self.release_steering(),
@@ -1367,7 +1367,9 @@ impl SessionRunner {
         let mut deferred = Vec::with_capacity(pending.len());
         for command in pending {
             match command {
-                SessionCommand::SwitchModel(model) => self.agent.set_model(model),
+                SessionCommand::SwitchModel(model, context_window) => {
+                    self.agent.set_model(model, context_window)
+                }
                 other => deferred.push(other),
             }
         }

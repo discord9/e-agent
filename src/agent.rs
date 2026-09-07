@@ -1235,13 +1235,14 @@ impl Agent {
         self.context_window = Some(window);
     }
 
-    /// Switch the session's model at runtime (web `/model`, TUI `/model`).
-    /// The replacement applies from the next model call on: `complete`,
-    /// `prepare_compaction` and `supports_vision` all read
-    /// `self.model`, so behavior follows the new model without further
-    /// wiring.
-    pub fn set_model(&mut self, model: Box<dyn Model>) {
+    /// Switch the session's model and context window at runtime (web/TUI
+    /// `/model`). The replacement applies from the next model call on.
+    /// Usage from the prior model is not a baseline for the new profile.
+    pub fn set_model(&mut self, model: Box<dyn Model>, context_window: Option<u64>) {
         self.model = model;
+        self.context_window = context_window;
+        self.last_context_input = 0;
+        self.auto_compacted = false;
     }
 
     /// The current model's wire name ([`Model::name`]; the display name is

@@ -1537,14 +1537,16 @@ async fn session_model(
             "model profile must be provider/model (e.g. chatgpt/sol)",
         ));
     }
-    let configured = state.factory.resolve_profile(profile).map_err(|e| {
+    let (configured, context_window) = state.factory.resolve_profile(profile).map_err(|e| {
         error(
             StatusCode::BAD_REQUEST,
             format!("unknown model profile `{profile}`: {e:#}"),
         )
     })?;
     let name = configured.profile_key();
-    session.handle().switch_model(Box::new(configured));
+    session
+        .handle()
+        .switch_model(Box::new(configured), context_window);
     // Mirror the new model into the registry metadata so `GET /api/sessions`
     // (sidebar / composer meta) reflects the switch immediately. Subagent
     // sessions keep their spawn-time display name (the delegate entry is

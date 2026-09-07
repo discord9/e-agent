@@ -896,7 +896,8 @@ fn parse_model(prompt: &str) -> Option<ModelCommand> {
 /// (the same config + `--base-url`/`--model` overrides the process started
 /// with) and switch the session's model at runtime. The runner installs the
 /// new model on its agent; the display name is mirrored into the input
-/// border immediately. Success and failure are both surfaced as a Notice.
+/// border immediately. Resolution success queues the switch and a Notice;
+/// resolution failure is surfaced as a Notice.
 fn handle_model(command: ModelCommand, state: &mut TuiState, handle: &RunnerHandle) {
     match command {
         ModelCommand::Usage => {
@@ -913,11 +914,12 @@ fn handle_model(command: ModelCommand, state: &mut TuiState, handle: &RunnerHand
                 return;
             };
             match factory.resolve_profile(&profile) {
-                Ok(configured) => {
+                Ok((configured, context_window)) => {
                     let name = configured.display_name().to_owned();
                     state.model_name = name.clone();
                     state.model = Some(configured.clone());
-                    handle.switch_model(Box::new(configured));
+                    state.context_window = context_window;
+                    handle.switch_model(Box::new(configured), context_window);
                     state.push_agent_event(AgentEvent::Notice(format!("已切换到 {name}")));
                 }
                 Err(error) => {

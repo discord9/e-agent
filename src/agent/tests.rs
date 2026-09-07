@@ -4710,15 +4710,18 @@ async fn switching_back_to_vision_restores_images_in_requests() {
         } if !images.is_empty()
     )));
     // Switch back to a vision model: the image is restored on the wire.
-    agent.set_model(Box::new(VisionScriptedModel(ScriptedModel {
-        replies: vec![AssistantMessage {
-            content: Some("second".into()),
-            tool_calls: vec![],
-            reasoning: None,
-        }],
-        requests: requests.clone(),
-        delays: Default::default(),
-    })));
+    agent.set_model(
+        Box::new(VisionScriptedModel(ScriptedModel {
+            replies: vec![AssistantMessage {
+                content: Some("second".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            }],
+            requests: requests.clone(),
+            delays: Default::default(),
+        })),
+        None,
+    );
     agent.complete_round(&[]).await.unwrap();
     let calls = requests.lock().unwrap();
     assert!(calls[1].iter().any(|message| matches!(
@@ -5727,4 +5730,88 @@ fn latest_read_output_result_stays_full_in_request_context() {
         panic!("expected tool result")
     };
     assert_eq!(content, &huge);
+}
+
+#[test]
+fn runtime_model_switch_replaces_window_and_invalidates_context_baseline() {
+    let new_model = || {
+        Box::new(ScriptedModel {
+            replies: vec![],
+            requests: Arc::new(Mutex::new(Vec::new())),
+            delays: Default::default(),
+        }) as Box<dyn Model>
+    };
+    let mut agent = Agent::new(new_model(), vec![]);
+
+    agent.set_context_window(128_000);
+    agent.apply_usage(
+        Some(Usage {
+            input_tokens: 110_000,
+            output_tokens: 7,
+            ..Default::default()
+        }),
+        true,
+    );
+    assert!(agent.take_auto_compact_request());
+    let cumulative_input = agent.session_input_tokens;
+
+    // A 128k baseline must not immediately trigger under a 32k profile.
+    agent.set_model(new_model(), Some(32_000));
+    assert_eq!(agent.last_context_input, 0);
+    assert_eq!(agent.session_input_tokens, cumulative_input);
+    assert!(!agent.take_auto_compact_request());
+    agent.apply_usage(
+        Some(Usage {
+            input_tokens: 25_599,
+            ..Default::default()
+        }),
+        true,
+    );
+    assert!(!agent.take_auto_compact_request());
+    agent.apply_usage(
+        Some(Usage {
+            input_tokens: 25_600,
+            ..Default::default()
+        }),
+        true,
+    );
+    assert!(agent.take_auto_compact_request());
+
+    // Likewise a 32k baseline cannot trigger under 128k; the new threshold
+    // is evaluated only from usage reported by the new model.
+    agent.set_model(new_model(), Some(128_000));
+    assert_eq!(agent.last_context_input, 0);
+    assert!(!agent.take_auto_compact_request());
+    agent.apply_usage(
+        Some(Usage {
+            input_tokens: 102_399,
+            ..Default::default()
+        }),
+        true,
+    );
+    assert!(!agent.take_auto_compact_request());
+    agent.apply_usage(
+        Some(Usage {
+            input_tokens: 102_400,
+            ..Default::default()
+        }),
+        true,
+    );
+    assert!(agent.take_auto_compact_request());
+
+    // Profiles without a context window disable this trigger, without
+    // changing the session's cumulative accounting.
+    let cumulative_input = agent.session_input_tokens;
+    agent.set_model(new_model(), None);
+    assert_eq!(agent.last_context_input, 0);
+    assert_eq!(agent.session_input_tokens, cumulative_input);
+    assert!(!agent.take_auto_compact_request());
+    agent.apply_usage(
+        Some(Usage {
+            input_tokens: 1_000_000,
+            ..Default::default()
+        }),
+        true,
+    );
+    assert!(!agent.take_auto_compact_request());
 }
