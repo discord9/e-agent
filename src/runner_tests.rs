@@ -10317,3 +10317,271 @@ async fn oracle_followup_arm_and_missing_usage_notices_are_live_only_and_late_at
         .expect("runner must join")
         .unwrap();
 }
+
+async fn exhausted_goal_input_answer_continues(usage: Option<Usage>, session: &str) {
+    let usage_missing = usage.is_none();
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let starts = Arc::new(AtomicUsize::new(0));
+    let agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![
+                (
+                    AssistantMessage {
+                        content: None,
+                        tool_calls: vec![
+                            ToolCall {
+                                id: "input".into(),
+                                name: "request_user_input".into(),
+                                arguments: r#"{"questions":[{"id":"answer","prompt":"answer?"}]}"#
+                                    .into(),
+                            },
+                            ToolCall {
+                                id: "sibling".into(),
+                                name: "read_image".into(),
+                                arguments: "{}".into(),
+                            },
+                        ],
+                        reasoning: None,
+                    },
+                    usage,
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("answer processed".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    Some(Usage::default()),
+                ),
+            ]
+            .into(),
+            calls: calls.clone(),
+        }),
+        vec![
+            Box::new(crate::tools::user_input::RequestUserInput),
+            Box::new(MarkerTool),
+            Box::new(TurnStartMarkerTool(starts.clone())),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    let (runner, handle) = SessionRunner::new_with_bootstrap(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        session.into(),
+        IdlePolicy::WaitForInput,
+        SessionBootstrap {
+            recovery_tasks: vec![],
+            legacy: false,
+            initial_entries: vec![test_goal_entry()],
+        },
+    )
+    .await
+    .unwrap();
+    let task = runner.start(None);
+    let mut status = handle.status();
+    handle.continue_goal(Some(10));
+    wait_for_status(&mut status, |status| {
+        matches!(status, SessionStatus::WaitingInput(_))
+    })
+    .await;
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("input".into()), "yes".into()),
+        PromptSubmission::Answered
+    );
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "answer processed"),
+    )
+    .await;
+    wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)).await;
+    assert_eq!(
+        starts.load(Ordering::SeqCst),
+        1,
+        "answer keeps its tool turn"
+    );
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        2,
+        "answer gets one required model round"
+    );
+    let snapshot = handle.snapshot();
+    let stop_notice = if !usage_missing {
+        "goal continuation stopped: token cap exhausted"
+    } else {
+        "goal continuation stopped: model usage unavailable"
+    };
+    assert_eq!(
+        snapshot
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Notice(text) if text == stop_notice))
+            .count(),
+        1,
+        "continuation stop is one live-only notice"
+    );
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), session)
+        .await
+        .unwrap()
+        .entries;
+    assert!(entries.iter().all(|entry| !matches!(entry,
+        SessionEntry::Notice { text } if text == "goal continuation stopped: token cap exhausted"
+    )));
+    let real_results: Vec<_> = tool_entries(&entries)
+        .into_iter()
+        .filter_map(|message| match message {
+            Message::Tool {
+                name,
+                is_error,
+                synthetic,
+                ..
+            } => Some((name, is_error, synthetic)),
+            _ => None,
+        })
+        .collect();
+    assert!(real_results.iter().any(|(name, error, synthetic)| {
+        *name == "request_user_input" && !*error && !*synthetic
+    }));
+    assert!(
+        real_results
+            .iter()
+            .any(|(name, error, synthetic)| { *name == "read_image" && !*error && !*synthetic })
+    );
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn oracle644_exhausted_goal_input_answer_is_budget_exempt() {
+    exhausted_goal_input_answer_continues(
+        Some(Usage {
+            input_tokens: 10,
+            ..Usage::default()
+        }),
+        "oracle644-input-exhausted",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn oracle644_missing_usage_goal_input_answer_is_budget_exempt() {
+    exhausted_goal_input_answer_continues(None, "oracle644-input-missing-usage").await;
+}
+
+async fn exhausted_maintenance_fresh_continue_starts_turn(usage: Option<Usage>, session: &str) {
+    let temp = tempfile::tempdir().unwrap();
+    let tool_entered = Arc::new(Notify::new());
+    let release_tool = Arc::new(Notify::new());
+    let fresh_entered = Arc::new(Notify::new());
+    let starts = Arc::new(AtomicUsize::new(0));
+    let mut agent = Agent::new(
+        Box::new(GatedContextCaptureModel {
+            replies: vec![
+                (
+                    AssistantMessage {
+                        content: None,
+                        tool_calls: vec![ToolCall {
+                            id: "tool".into(),
+                            name: "read_image".into(),
+                            arguments: "{}".into(),
+                        }],
+                        reasoning: None,
+                    },
+                    Some(Usage::default()),
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("maintenance summary".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    usage,
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("fresh continuation".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    Some(Usage::default()),
+                ),
+            ]
+            .into(),
+            block_call: 3,
+            entered: fresh_entered.clone(),
+            release: Arc::new(Notify::new()),
+            calls: Arc::new(Mutex::new(Vec::new())),
+            call_count: 0,
+        }),
+        vec![
+            Box::new(BlockingMarkerTool {
+                entered: tool_entered.clone(),
+                release: release_tool.clone(),
+            }),
+            Box::new(TurnStartMarkerTool(starts.clone())),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    history_for_compaction(&mut agent);
+    let (runner, handle) = SessionRunner::new_with_bootstrap(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        session.into(),
+        IdlePolicy::WaitForInput,
+        SessionBootstrap {
+            recovery_tasks: vec![],
+            legacy: false,
+            initial_entries: vec![test_goal_entry()],
+        },
+    )
+    .await
+    .unwrap();
+    let task = runner.start(None);
+    let mut status = handle.status();
+    handle.continue_goal(Some(10));
+    tool_entered.notified().await;
+    handle.compact();
+    release_tool.notify_one();
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::Notice(text) if text == "compacted: maintenance summary"),
+    )
+    .await;
+    wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)).await;
+    assert_eq!(
+        starts.load(Ordering::SeqCst),
+        1,
+        "stopped maintenance did not resume"
+    );
+    handle.continue_goal(None);
+    fresh_entered.notified().await;
+    assert_eq!(
+        starts.load(Ordering::SeqCst),
+        2,
+        "fresh Continue starts a fresh turn"
+    );
+    handle.cancel();
+    wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)).await;
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn oracle644_exhausted_maintenance_clears_resume_before_fresh_continue() {
+    exhausted_maintenance_fresh_continue_starts_turn(
+        Some(Usage {
+            input_tokens: 10,
+            ..Usage::default()
+        }),
+        "oracle644-maintenance-exhausted",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn oracle644_missing_usage_maintenance_clears_resume_before_fresh_continue() {
+    exhausted_maintenance_fresh_continue_starts_turn(None, "oracle644-maintenance-missing-usage")
+        .await;
+}
