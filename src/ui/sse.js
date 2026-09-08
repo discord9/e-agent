@@ -265,11 +265,17 @@ function normalizeHistoryForSplice(entries) {
     if (m.User) { flush(); out.push(spliceRecord("history", index, "user", raw, { part:"user", text:m.User.content || "" })); }
     else if (m.System) { flush(); out.push(spliceRecord("history", index, "system", raw, { part:"system", text:m.System.content || "" })); }
     else if (m.Assistant) {
-      flush(); const a = m.Assistant;
-      if (a.reasoning != null) out.push(spliceRecord("history", index, "reasoning", raw, { part:"reasoning", text:a.reasoning, sparse:true }));
-      if (a.content != null && (a.content !== "" || !(a.tool_calls || []).length)) out.push(spliceRecord("history", index, "assistant", raw, { part:"text", text:a.content }));
-      for (let callIndex = 0; callIndex < (a.tool_calls || []).length; callIndex++) {
-        const c = a.tool_calls[callIndex], args = typeof c.arguments === "string" ? c.arguments : JSON.stringify(c.arguments || {});
+      flush(); const a = m.Assistant, calls = a.tool_calls || [];
+      if (a.reasoning != null) out.push(spliceRecord("history", index, "reasoning", raw,
+        { part:"reasoning", text:a.reasoning, sparse:true }));
+      if (a.content != null && (a.content !== "" || !calls.length)) out.push(spliceRecord("history", index,
+        "assistant", raw, { part:"text", text:a.content }));
+      // "empty" is a renderer placeholder for an Assistant with no content,
+      // reasoning, or calls. It has no snapshot counterpart and is not match evidence.
+      if (a.content == null && a.reasoning == null && !calls.length) out.push(spliceRecord("history", index,
+        "assistant_empty", raw, { part:"empty", placeholder:true }));
+      for (let callIndex = 0; callIndex < calls.length; callIndex++) {
+        const c = calls[callIndex], args = typeof c.arguments === "string" ? c.arguments : JSON.stringify(c.arguments || {});
         pending.set(c.id, { id:c.id, index, raw, callIndex, name:c.name || "", arguments:args }); order.push(c.id);
       }
     } else if (m.Tool) {
@@ -322,6 +328,12 @@ function walkSplice(history, startH, snapshot, startS) {
     while (s < snapshot.length && snapshot[s].neutral) s++;
     if (s >= snapshot.length) break;
 
+    // Placeholder-only assistant records render from H but deliberately carry
+    // no S matching evidence, so they do not require an empty S counterpart.
+    if (history[h].placeholder) {
+      h++;
+      continue;
+    }
     if (history[h].kind === "reasoning" && snapshot[s].kind !== "reasoning") {
       h++;
       continue;
@@ -401,10 +413,23 @@ function splicePlan(historyEntries, snapshotEvents, history, snapshot, match) {
 }
 function spliceAlignedRecords(historyEntries, snapshotEvents) {
   const history=normalizeHistoryForSplice(historyEntries), snapshot=normalizeSnapshotForSplice(snapshotEvents), candidates=[];
-  for (let s=0;s<snapshot.length;s++) if (history.length && spliceSame(history[0],snapshot[s])) { const w=walkSplice(history,0,snapshot,s); if (w.pairs.length>=2 && w.endH===history.length) candidates.push({mode:"window",hStart:0,sStart:s,pairs:w.pairs}); }
-  if (snapshot.length) for (let h=0;h<history.length;h++) if (spliceSame(history[h],snapshot[0])) { const w=walkSplice(history,h,snapshot,0); if (w.pairs.length>=2 && w.endH===history.length) candidates.push({mode:"suffix",hStart:h,sStart:0,pairs:w.pairs}); }
-  const max=candidates.reduce((n,c)=>Math.max(n,c.pairs.length),0), best=candidates.filter(c=>c.pairs.length===max), windows=best.filter(c=>c.mode==="window"), chosen=windows.length?windows:best;
-  const match=chosen.length===1?chosen[0]:null;
+  for (let s=0;s<snapshot.length;s++) {
+    const w=walkSplice(history,0,snapshot,s);
+    if (w.pairs.length>=2 && w.endH===history.length) candidates.push({mode:"window",hStart:0,sStart:s,pairs:w.pairs});
+  }
+  for (let h=0;h<history.length;h++) {
+    const w=walkSplice(history,h,snapshot,0);
+    if (w.pairs.length>=2 && w.endH===history.length) candidates.push({mode:"suffix",hStart:h,sStart:0,pairs:w.pairs});
+  }
+  const max=candidates.reduce((n,c)=>Math.max(n,c.pairs.length),0);
+  const best=candidates.filter(c=>c.pairs.length===max), windows=best.filter(c=>c.mode==="window");
+  const chosen=windows.length?windows:best;
+  const unique=[];
+  for (const candidate of chosen) {
+    const key=candidate.pairs.map(p=>p.h+":"+p.s).join("|");
+    if (!unique.some(item=>item.key===key)) unique.push({key,candidate});
+  }
+  const match=unique.length===1?unique[0].candidate:null;
   if (match) match.length = match.pairs.length;
   return {comparison:{history,snapshot},match,output:splicePlan(historyEntries,snapshotEvents,history,snapshot,match)};
 }

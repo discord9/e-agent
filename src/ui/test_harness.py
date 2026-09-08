@@ -725,6 +725,9 @@ async function main(){
         .map((x) => x.entry + ":" + x.part);
       const normalizedParts = result.comparison.history
         .map((x) => x.index + ":" + x.part);
+      const historyEntries = [...new Set(result.output.components
+        .filter((x) => x.source === "history").map((x) => x.entry))];
+      const originalEntries = history.map((_entry, index) => index);
       const snapshotIndices = result.output.components.filter((x) => x.source === "snapshot")
         .map((x) => x.index);
       const historyOk = historyParts.join("|") === normalizedParts.join("|");
@@ -733,6 +736,9 @@ async function main(){
       const snapshotOk = snapshotIndices.join(",") === result.output.snapshot.extras.join(",");
       chk("splice plan snapshot components are exactly unmatched S indices in source order", snapshotOk,
         snapshotOk ? "" : snapshotIndices.join(",") + " != " + result.output.snapshot.extras.join(","));
+      const entriesOk = historyEntries.join(",") === originalEntries.join(",");
+      chk("splice plan keeps every original H entry in order", entriesOk,
+        entriesOk ? "" : historyEntries.join(",") + " != " + originalEntries.join(","));
       return result;
     };
     const componentSequence = (result) => result.output.components.map((x) =>
@@ -789,6 +795,19 @@ async function main(){
       && r.output.history.entries.length === 200 && r.output.snapshot.extras.join(",") === "0,1,2,3,4",
       JSON.stringify({match:r.match && {mode:r.match.mode, length:r.match.length}, extras:r.output.snapshot.extras.slice(0,8)}));
 
+    console.log("RED window walker must enter through a sparse first H reasoning part");
+    const sparseFirstReasonH = [
+      {type:"message", message:{Assistant:{content:"a", reasoning:"why", tool_calls:[]}}},
+      {type:"message", message:{User:{content:"next"}}},
+      {type:"message", message:{Assistant:{content:"b", tool_calls:[]}}},
+    ];
+    r = plan(sparseFirstReasonH, [{type:"user_prompt",data:"older"},
+      {type:"assistant_text",data:"older answer"}, {type:"assistant_text",data:"a"},
+      {type:"user_prompt",data:"next"}, {type:"assistant_text",data:"b"}]);
+    chk("GREEN sparse-first-reason window finds unique overlap and preserves prefix extras", r.match
+      && r.match.mode === "window" && r.output.snapshot.extras.join(",") === "0,1"
+      && componentSequence(r) === "S0|S1|H0:reasoning|H0:text|H1:user|H2:text");
+
     const completeTurnsH = [{type:"message", message:{User:{content:"one"}}}, {type:"message", message:{Assistant:{content:"a", tool_calls:[]}}},
       {type:"message", message:{User:{content:"two"}}}, {type:"message", message:{Assistant:{content:"b", tool_calls:[]}}}];
     const completeTurnsS = [{type:"user_prompt", data:"one"}, {type:"assistant_delta", data:"a"},
@@ -814,6 +833,11 @@ async function main(){
     r = plan(opaqueH, []);
     chk("splice output preserves empty assistant and unknown original H entries once", r.output.history.entries.length === 2
       && r.output.history.entries[0] === opaqueH[0] && r.output.history.entries[1] === opaqueH[1]);
+
+    console.log("RED placeholder-only Assistant must render from original H without S evidence");
+    r = plan([{type:"message", message:{Assistant:{content:null, reasoning:null, tool_calls:[]}}}], []);
+    chk("GREEN placeholder-only Assistant emits the renderer empty part", !r.match
+      && componentSequence(r) === "H0:empty" && r.comparison.history[0].placeholder === true);
 
     r = plan([{type:"notice", text:"history notice"}], [{type:"notice", data:{text:"snapshot notice"}}]);
     chk("splice unmatched notice is retained", !r.match && r.output.snapshot.extras.length === 1);
