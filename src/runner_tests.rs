@@ -9645,6 +9645,161 @@ async fn oracle393_goal_tool_compact_prompt_keeps_charge_but_runs_user_turn() {
 }
 
 #[tokio::test]
+async fn oracle393_goal_manual_compact_resumes_turn_and_charges_budget() {
+    // A Goal call spends one token, then a manual compaction spends two more.
+    // Its successful summary therefore leaves seven tokens for the resumed
+    // Goal call. That call spends exactly those seven; an omitted compaction
+    // charge would instead mount a fourth automatic Goal call.
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let tool_entered = Arc::new(Notify::new());
+    let release_tool = Arc::new(Notify::new());
+    let resumed_goal = Arc::new(Notify::new());
+    let release_resumed_goal = Arc::new(Notify::new());
+    let starts = Arc::new(AtomicUsize::new(0));
+    let mut agent = Agent::new(
+        Box::new(GatedContextCaptureModel {
+            replies: vec![
+                (
+                    AssistantMessage {
+                        content: None,
+                        tool_calls: vec![ToolCall {
+                            id: "tool".into(),
+                            name: "read_image".into(),
+                            arguments: "{}".into(),
+                        }],
+                        reasoning: None,
+                    },
+                    Some(Usage {
+                        input_tokens: 1,
+                        output_tokens: 0,
+                        ..Usage::default()
+                    }),
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("charged manual summary".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    Some(Usage {
+                        input_tokens: 2,
+                        output_tokens: 0,
+                        ..Usage::default()
+                    }),
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("resumed Goal exhausted its cap".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    Some(Usage {
+                        input_tokens: 7,
+                        output_tokens: 0,
+                        ..Usage::default()
+                    }),
+                ),
+            ]
+            .into(),
+            block_call: 3,
+            entered: resumed_goal.clone(),
+            release: release_resumed_goal.clone(),
+            calls: calls.clone(),
+            call_count: 0,
+        }),
+        vec![
+            Box::new(BlockingMarkerTool {
+                entered: tool_entered.clone(),
+                release: release_tool.clone(),
+            }),
+            Box::new(TurnStartMarkerTool(starts.clone())),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    history_for_compaction(&mut agent);
+    let (runner, handle) = SessionRunner::new_with_bootstrap(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "oracle393-goal-manual-compact-resume".into(),
+        IdlePolicy::WaitForInput,
+        SessionBootstrap {
+            recovery_tasks: vec![],
+            legacy: false,
+            initial_entries: vec![test_goal_entry()],
+        },
+    )
+    .await
+    .unwrap();
+    // The seeded compaction history projects its pre-existing User entries
+    // into the attach log. Record that baseline so this assertion addresses
+    // only commands accepted during this scenario.
+    let initial_user_prompt_count = handle
+        .snapshot()
+        .iter()
+        .filter(|event| matches!(event, AgentEvent::UserPrompt(_)))
+        .count();
+    let task = runner.start(None);
+    handle.continue_goal(Some(10));
+    wait_for_notify(&tool_entered, "initial Goal tool entry").await;
+    handle.compact();
+    release_tool.notify_one();
+
+    // This gate is the actual post-compaction Goal provider request, not a
+    // human prompt turn. Maintenance resume must retain the original turn.
+    wait_for_notify(&resumed_goal, "resumed Goal provider call").await;
+    assert_eq!(
+        starts.load(Ordering::SeqCst),
+        1,
+        "Goal -> manual Compact -> Goal must preserve the original turn state"
+    );
+    let snapshot = handle.snapshot();
+    assert!(snapshot.iter().any(|event| matches!(event,
+        AgentEvent::ToolCall { name, .. } if name == "read_image"
+    )));
+    assert!(snapshot.iter().any(|event| matches!(event,
+        AgentEvent::ToolResult { is_error: false, content }
+            if content.contains("[image read: pic.png]")
+    )));
+    assert!(snapshot.iter().any(|event| matches!(event,
+        AgentEvent::Notice(text) if text == "compacted: charged manual summary"
+    )));
+    assert_eq!(
+        snapshot
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::UserPrompt(_)))
+            .count(),
+        initial_user_prompt_count,
+        "no human prompt may account for the resumed turn"
+    );
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        3,
+        "the resumed Goal request must follow the initial call and compaction"
+    );
+
+    release_resumed_goal.notify_one();
+    let mut status = handle.status();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)),
+    )
+    .await
+    .expect("resumed Goal must return to idle after exhausting its cap");
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        3,
+        "1 + 2 + 7 token charges exhaust the cap; no fourth Goal call is allowed"
+    );
+    drop(handle);
+    tokio::time::timeout(std::time::Duration::from_secs(5), task.join())
+        .await
+        .expect("runner must join")
+        .unwrap();
+}
+
+#[tokio::test]
 async fn oracle393_missing_usage_tool_compact_never_resumes_as_ordinary() {
     let temp = tempfile::tempdir().unwrap();
     let calls = Arc::new(Mutex::new(Vec::new()));
