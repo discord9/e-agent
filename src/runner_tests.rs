@@ -4543,6 +4543,43 @@ impl Model for GatedContextCaptureModel {
     }
 }
 
+/// Delivers commands while a provider round is still completing, before the
+/// runner receives its `waited.pending`; this pins transferred-Continue tests
+/// to the runner-local pending path rather than a later blocked tool.
+struct QueueBeforeReturnModel {
+    replies: VecDeque<AssistantMessage>,
+    commands: Arc<Mutex<Option<mpsc::UnboundedSender<SessionCommand>>>>,
+    queued_before_return: Arc<Notify>,
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Model for QueueBeforeReturnModel {
+    async fn complete(
+        &mut self,
+        _: &[Message],
+        _: &[ToolSpec],
+        _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if call == 1 {
+            let commands = self.commands.lock().unwrap().as_ref().unwrap().clone();
+            commands.send(SessionCommand::Continue(None)).unwrap();
+            // The runner drains this Continue into waited.pending before it
+            // begins the following blocked tool.
+            self.queued_before_return.notify_one();
+        }
+        let reply = self.replies.pop_front().expect("unexpected model call");
+        if call == 3 {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        Ok((reply, None))
+    }
+}
+
 /// Proves that a maintenance Resume does not start a new Agent turn, which
 /// would reset per-turn tool state such as the poll guard.
 struct TurnStartMarkerTool(Arc<AtomicUsize>);
@@ -6583,6 +6620,12 @@ async fn wait_for_goal(
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     panic!("goal condition not met in time");
+}
+
+async fn wait_for_notify(notify: &Notify, label: &str) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), notify.notified())
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {label}"));
 }
 
 async fn wait_for_log_event(handle: &SessionHandle, expected: impl Fn(&AgentEvent) -> bool) {
@@ -9389,6 +9432,7 @@ async fn oracle393_continue_then_compact_charges_and_reaches_goal_request() {
     let temp = tempfile::tempdir().unwrap();
     let calls = Arc::new(Mutex::new(Vec::new()));
     let entered = Arc::new(Notify::new());
+    let starts = Arc::new(AtomicUsize::new(0));
     let mut agent = Agent::new(
         Box::new(GatedContextCaptureModel {
             replies: vec![
@@ -9420,7 +9464,10 @@ async fn oracle393_continue_then_compact_charges_and_reaches_goal_request() {
             calls: calls.clone(),
             call_count: 0,
         }),
-        vec![Box::new(KeepAliveTool { sender: None })],
+        vec![
+            Box::new(TurnStartMarkerTool(starts.clone())),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
     );
     history_for_compaction(&mut agent);
     let (runner, handle) = SessionRunner::new_with_bootstrap(
@@ -9444,6 +9491,11 @@ async fn oracle393_continue_then_compact_charges_and_reaches_goal_request() {
     let task = runner.start(None);
     entered.notified().await;
     {
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            1,
+            "first Continue -> Compact still starts exactly one Goal turn"
+        );
         let calls = calls.lock().unwrap();
         assert_eq!(
             calls.len(),
@@ -9470,6 +9522,7 @@ async fn oracle393_goal_tool_compact_prompt_keeps_charge_but_runs_user_turn() {
     let tool_entered = Arc::new(Notify::new());
     let release_tool = Arc::new(Notify::new());
     let fourth_entered = Arc::new(Notify::new());
+    let starts = Arc::new(AtomicUsize::new(0));
     let mut agent = Agent::new(
         Box::new(GatedContextCaptureModel {
             replies: vec![
@@ -9530,6 +9583,7 @@ async fn oracle393_goal_tool_compact_prompt_keeps_charge_but_runs_user_turn() {
                 entered: tool_entered.clone(),
                 release: release_tool.clone(),
             }),
+            Box::new(TurnStartMarkerTool(starts.clone())),
             Box::new(KeepAliveTool { sender: None }),
         ],
     );
@@ -9563,6 +9617,11 @@ async fn oracle393_goal_tool_compact_prompt_keeps_charge_but_runs_user_turn() {
         matches!(status, SessionStatus::Idle)
     })
     .await;
+    assert_eq!(
+        starts.load(Ordering::SeqCst),
+        2,
+        "Goal-owned Compact must preserve its turn; only the later human prompt starts again"
+    );
     {
         let calls = calls.lock().unwrap();
         assert_eq!(
@@ -9749,4 +9808,357 @@ async fn oracle393_ordinary_resume_does_not_restart_turn_state() {
     );
     drop(handle);
     task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn oracle_followup_goal_command_maintenance_error_keeps_driver_live() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let tool_entered = Arc::new(Notify::new());
+    let release_tool = Arc::new(Notify::new());
+    let resumed = Arc::new(Notify::new());
+    let agent = Agent::new(
+        Box::new(GatedContextCaptureModel {
+            replies: vec![
+                (
+                    AssistantMessage {
+                        content: None,
+                        tool_calls: vec![ToolCall {
+                            id: "tool".into(),
+                            name: "read_image".into(),
+                            arguments: "{}".into(),
+                        }],
+                        reasoning: None,
+                    },
+                    Some(Usage::default()),
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("goal resumed after invalid command".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    Some(Usage::default()),
+                ),
+            ]
+            .into(),
+            block_call: 2,
+            entered: resumed.clone(),
+            release: Arc::new(Notify::new()),
+            calls: calls.clone(),
+            call_count: 0,
+        }),
+        vec![
+            Box::new(BlockingMarkerTool {
+                entered: tool_entered.clone(),
+                release: release_tool.clone(),
+            }),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    let (runner, handle) = SessionRunner::new_with_bootstrap(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "oracle-followup-goal-error".into(),
+        IdlePolicy::WaitForInput,
+        SessionBootstrap {
+            recovery_tasks: vec![],
+            legacy: false,
+            initial_entries: vec![test_goal_entry()],
+        },
+    )
+    .await
+    .unwrap();
+    let task = runner.start(None);
+    handle.continue_goal(None);
+    wait_for_notify(&tool_entered, "blocked tool entry").await;
+    handle.goal_command(GoalCommand::Action(crate::agent::GoalAction::Resume));
+    release_tool.notify_one();
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::Error(text) if text.contains("cannot resume")),
+    )
+    .await;
+    wait_for_notify(&resumed, "resumed Goal provider call").await;
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        2,
+        "invalid maintenance Goal command must not strand the armed driver"
+    );
+    handle.cancel();
+    wait_for_status(&mut handle.status(), |status| {
+        matches!(status, SessionStatus::Idle)
+    })
+    .await;
+    drop(handle);
+    tokio::time::timeout(std::time::Duration::from_secs(5), task.join())
+        .await
+        .expect("runner must join")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn oracle_followup_goal_maintenance_keeps_goal_turn_state_and_human_resets() {
+    let temp = tempfile::tempdir().unwrap();
+    let starts = Arc::new(AtomicUsize::new(0));
+    let tool_entered = Arc::new(Notify::new());
+    let release_tool = Arc::new(Notify::new());
+    let resumed = Arc::new(Notify::new());
+    let agent = Agent::new(
+        Box::new(GatedContextCaptureModel {
+            replies: vec![
+                (
+                    AssistantMessage {
+                        content: None,
+                        tool_calls: vec![ToolCall {
+                            id: "tool".into(),
+                            name: "read_image".into(),
+                            arguments: "{}".into(),
+                        }],
+                        reasoning: None,
+                    },
+                    Some(Usage::default()),
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("same goal turn".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    Some(Usage::default()),
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("fresh human turn".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    Some(Usage::default()),
+                ),
+            ]
+            .into(),
+            block_call: 2,
+            entered: resumed.clone(),
+            release: Arc::new(Notify::new()),
+            calls: Arc::new(Mutex::new(Vec::new())),
+            call_count: 0,
+        }),
+        vec![
+            Box::new(BlockingMarkerTool {
+                entered: tool_entered.clone(),
+                release: release_tool.clone(),
+            }),
+            Box::new(TurnStartMarkerTool(starts.clone())),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    let (runner, handle) = SessionRunner::new_with_bootstrap(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "oracle-followup-goal-turn-state".into(),
+        IdlePolicy::WaitForInput,
+        SessionBootstrap {
+            recovery_tasks: vec![],
+            legacy: false,
+            initial_entries: vec![test_goal_entry()],
+        },
+    )
+    .await
+    .unwrap();
+    let task = runner.start(None);
+    handle.continue_goal(None);
+    wait_for_notify(&tool_entered, "blocked tool entry").await;
+    handle.goal_command(GoalCommand::Action(crate::agent::GoalAction::Resume));
+    release_tool.notify_one();
+    // The resumed Goal provider call is deliberately gated before it can
+    // naturally mount another automatic Goal call.
+    wait_for_notify(&resumed, "resumed Goal provider call").await;
+    assert_eq!(
+        starts.load(Ordering::SeqCst),
+        1,
+        "Goal maintenance must not reset same-turn state"
+    );
+    handle.prompt("fresh human");
+    handle.cancel();
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "fresh human turn"),
+    )
+    .await;
+    assert_eq!(
+        starts.load(Ordering::SeqCst),
+        2,
+        "real human prompt must start a fresh turn"
+    );
+    wait_for_status(&mut handle.status(), |status| {
+        matches!(status, SessionStatus::Idle)
+    })
+    .await;
+    drop(handle);
+    tokio::time::timeout(std::time::Duration::from_secs(5), task.join())
+        .await
+        .expect("runner must join")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn oracle_followup_transferred_continue_precedes_blocked_tool_cancel_and_rearms() {
+    let temp = tempfile::tempdir().unwrap();
+    let commands = Arc::new(Mutex::new(None));
+    let queued_before_return = Arc::new(Notify::new());
+    let tool_entered = Arc::new(Notify::new());
+    let release_tool = Arc::new(Notify::new());
+    let rearmed_call = Arc::new(Notify::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let agent = Agent::new(
+        Box::new(QueueBeforeReturnModel {
+            replies: vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "tool".into(),
+                        name: "read_image".into(),
+                        arguments: "{}".into(),
+                    }],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("prompt answer".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("later continuation".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+            ]
+            .into(),
+            commands: commands.clone(),
+            queued_before_return: queued_before_return.clone(),
+            entered: rearmed_call.clone(),
+            release: Arc::new(Notify::new()),
+            calls: calls.clone(),
+        }),
+        vec![
+            Box::new(BlockingMarkerTool {
+                entered: tool_entered.clone(),
+                release: release_tool.clone(),
+            }),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    let (runner, handle) = SessionRunner::new_with_bootstrap(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "oracle-followup-transferred-cancel".into(),
+        IdlePolicy::WaitForInput,
+        SessionBootstrap {
+            recovery_tasks: vec![],
+            legacy: false,
+            initial_entries: vec![test_goal_entry()],
+        },
+    )
+    .await
+    .unwrap();
+    *commands.lock().unwrap() = Some(handle.commands.clone());
+    let task = runner.start(Some("ordinary tool turn".into()));
+    wait_for_notify(&queued_before_return, "provider-side Continue queue").await;
+    wait_for_notify(&tool_entered, "blocked tool entry").await;
+    // The Continue has already crossed provider -> waited.pending -> runner
+    // pending before the real tool blocks.
+    handle.prompt("prompt survives cancel");
+    handle.cancel();
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "prompt answer"),
+    )
+    .await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "Cancel must discard transferred Continue before another provider request"
+    );
+    handle.continue_goal(None);
+    wait_for_notify(&rearmed_call, "post-Cancel Continue provider call").await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "later Continue must actually re-arm the provider call"
+    );
+    handle.cancel();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        wait_for_status(&mut handle.status(), |status| {
+            matches!(status, SessionStatus::Idle)
+        }),
+    )
+    .await
+    .expect("Cancel must release the rearmed provider call to Idle");
+    *commands.lock().unwrap() = None;
+    drop(handle);
+    tokio::time::timeout(std::time::Duration::from_secs(5), task.join())
+        .await
+        .expect("runner must join after the bounded Cancel")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn oracle_followup_arm_and_missing_usage_notices_are_live_only_and_late_attachable() {
+    let temp = tempfile::tempdir().unwrap();
+    let agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: vec![AssistantMessage {
+                content: Some("unknown usage".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            }]
+            .into(),
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    let (runner, handle) = SessionRunner::new_with_bootstrap(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "oracle-followup-live-notices".into(),
+        IdlePolicy::WaitForInput,
+        SessionBootstrap {
+            recovery_tasks: vec![],
+            legacy: false,
+            initial_entries: vec![test_goal_entry()],
+        },
+    )
+    .await
+    .unwrap();
+    let task = runner.start(None);
+    handle.continue_goal(Some(5));
+    wait_for_log_event(&handle, |event| matches!(event, AgentEvent::Notice(text) if text == "goal continuation armed (token cap: 5)")).await;
+    wait_for_log_event(&handle, |event| matches!(event, AgentEvent::Notice(text) if text == "goal continuation stopped: model usage unavailable")).await;
+    let (snapshot, _, _) = handle.attach();
+    assert!(snapshot.iter().any(|event| matches!(event, AgentEvent::Notice(text) if text == "goal continuation armed (token cap: 5)")));
+    assert!(snapshot.iter().any(|event| matches!(event, AgentEvent::Notice(text) if text == "goal continuation stopped: model usage unavailable")));
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "oracle-followup-live-notices")
+        .await
+        .unwrap();
+    assert!(
+        !serde_json::to_string(&loaded.entries)
+            .unwrap()
+            .contains("goal continuation"),
+        "driver notices must not become durable history"
+    );
+    handle.cancel();
+    wait_for_status(&mut handle.status(), |status| {
+        matches!(status, SessionStatus::Idle)
+    })
+    .await;
+    drop(handle);
+    tokio::time::timeout(std::time::Duration::from_secs(5), task.join())
+        .await
+        .expect("runner must join")
+        .unwrap();
 }
