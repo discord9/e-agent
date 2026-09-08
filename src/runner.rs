@@ -511,6 +511,9 @@ pub struct SessionRunner {
     goal_continuation_usage_unavailable: bool,
     /// A natural turn end is the only mount point for the driver.
     turn_just_ended: bool,
+    /// FIFO maintenance interrupted a live turn; resume it without resetting
+    /// per-turn tool state. The Goal trigger still carries its charge class.
+    maintenance_resume: bool,
     bootstrap: Option<SessionBootstrap>,
     #[cfg(test)]
     before_finalize: Option<Box<dyn FnOnce() + Send>>,
@@ -567,6 +570,7 @@ impl SessionRunner {
                 last_answer: None,
                 armed_trigger: None,
                 turn_just_ended: false,
+                maintenance_resume: false,
                 goal_continuation_remaining: None,
                 goal_continuation_usage_unavailable: false,
                 goal_continuation_armed: false,
@@ -782,6 +786,13 @@ impl SessionRunner {
         self.goal_continuation_armed = true;
         self.goal_continuation_remaining = budget;
         self.goal_continuation_usage_unavailable = false;
+        self.shared
+            .lock()
+            .unwrap()
+            .emit(AgentEvent::Notice(match budget {
+                Some(budget) => format!("goal continuation armed (token cap: {budget})"),
+                None => "goal continuation armed".into(),
+            }));
         if !self.agent.has_blocking_background() {
             // Continue owns FIFO maintenance already queued before the next
             // provider call. Prompt intake still clears this trigger, so a
@@ -831,6 +842,7 @@ impl SessionRunner {
             self.goal_continuation_remaining = None;
             self.goal_continuation_usage_unavailable = false;
             self.armed_trigger = None;
+            self.maintenance_resume = false;
             self.turn_just_ended = false;
         }
         Ok(())
@@ -1098,6 +1110,7 @@ impl SessionRunner {
         self.goal_continuation_remaining = None;
         self.goal_continuation_usage_unavailable = false;
         self.armed_trigger = None;
+        self.maintenance_resume = false;
         self.turn_just_ended = false;
         if let SessionResult::Failed(text) = &result {
             self.commit_error(text.clone()).await;
@@ -1189,9 +1202,16 @@ impl SessionRunner {
         }
     }
 
-    /// A real prompt always wins over an armed continuation.
+    /// Cancel disarms the live continuation without affecting background work.
     fn invalidate_trigger_for_cancel(&mut self) {
+        if self.goal_continuation_armed {
+            self.shared
+                .lock()
+                .unwrap()
+                .emit(AgentEvent::Notice("goal continuation cancelled".into()));
+        }
         self.turn_just_ended = false;
+        self.maintenance_resume = false;
         self.armed_trigger = None;
         self.goal_continuation_armed = false;
         self.goal_continuation_remaining = None;
@@ -1434,12 +1454,9 @@ impl SessionRunner {
                             self.goal_continuation_remaining = None;
                             self.goal_continuation_usage_unavailable = true;
                             self.armed_trigger = None;
-                            self.shared
-                                .lock()
-                                .unwrap()
-                                .emit_transient(AgentEvent::Notice(
-                                    "goal continuation stopped: model usage unavailable".into(),
-                                ));
+                            self.shared.lock().unwrap().emit(AgentEvent::Notice(
+                                "goal continuation stopped: model usage unavailable".into(),
+                            ));
                         }
                     }
                 }
@@ -1778,7 +1795,9 @@ impl SessionRunner {
             // the Goal trigger behind it.
             let trigger = self.armed_trigger.take();
             let goal_turn = consumed.is_empty() && trigger == Some(RunnerTrigger::Goal);
-            let resume_turn = consumed.is_empty() && trigger == Some(RunnerTrigger::Resume);
+            let resume_turn = consumed.is_empty()
+                && (trigger == Some(RunnerTrigger::Resume) || self.maintenance_resume);
+            self.maintenance_resume = false;
             self.turn_just_ended = false;
 
             self.status(SessionStatus::Busy);
@@ -1889,12 +1908,9 @@ impl SessionRunner {
                             self.goal_continuation_armed = false;
                             self.goal_continuation_remaining = None;
                             self.armed_trigger = None;
-                            self.shared
-                                .lock()
-                                .unwrap()
-                                .emit_transient(AgentEvent::Notice(
-                                    "goal continuation stopped: model usage unavailable".into(),
-                                ));
+                            self.shared.lock().unwrap().emit(AgentEvent::Notice(
+                                "goal continuation stopped: model usage unavailable".into(),
+                            ));
                         }
                         None => {}
                     }
@@ -2218,15 +2234,20 @@ impl SessionRunner {
                     // A queued compact is maintenance inside this existing
                     // turn, not its conclusion. Reopen a blank ordinary or
                     // Goal turn after the FIFO compaction completes.
-                    if matches!(self.pending.front(), Some(PendingCommand::Compact)) {
-                        if goal_turn
-                            && self.goal_continuation_armed
-                            && self.goal_continuation_remaining != Some(0)
-                        {
-                            self.armed_trigger = Some(RunnerTrigger::Goal);
-                        } else if !goal_turn {
-                            self.armed_trigger = Some(RunnerTrigger::Resume);
-                        }
+                    if goal_turn
+                        && self.goal_continuation_armed
+                        && self.goal_continuation_remaining != Some(0)
+                    {
+                        // Goal commands and compaction are FIFO maintenance
+                        // within this interrupted Goal turn. A successful
+                        // pause/clear clears the trigger in apply_goal_command.
+                        self.armed_trigger = Some(RunnerTrigger::Goal);
+                        self.maintenance_resume = true;
+                    } else if !goal_turn
+                        && matches!(self.pending.front(), Some(PendingCommand::Compact))
+                    {
+                        self.armed_trigger = Some(RunnerTrigger::Resume);
+                        self.maintenance_resume = true;
                     }
                     break 'turn;
                 }

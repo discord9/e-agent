@@ -745,7 +745,7 @@ verifier). Fields: `id`, `revision`, `objective`, `success_criteria`,
 - **Forks inherit**: `--fork`/`/fork`/btw forks copy the source prefix up to
   the fork boundary, including goal updates before it; the forked session
   folds the newest snapshot naturally.
-- **Explicit goal continuation**: `/goal continue` arms an in-memory indefinite driver; `/goal continue N` arms it with a cumulative actual-token soft cap. An active goal alone never auto-arms. The driver continues after ordinary text, empty text, no-tool rounds, and unchanged revisions, and resumes after required background follow-up. Usage is charged as input plus output tokens with saturation; a capped driver may overshoot on its final call but never starts another call after reaching the cap. Missing usage under an explicit cap fails closed. Driver state and notices are live-only and never persisted; restart starts unarmed. A prompt takes precedence over the next automatic call without implicitly disarming the driver; Cancel, inactive/cleared goals, errors, closed sessions, and budget exhaustion disarm it.
+- **Explicit goal continuation**: `/goal continue` arms an in-memory indefinite driver; `/goal continue N` arms it with a cumulative actual-token soft cap. An active goal alone never auto-arms. The driver continues after ordinary text, empty text, no-tool rounds, and unchanged revisions, and resumes after required background follow-up. Usage is charged as input plus output tokens with saturation; a capped driver may overshoot on its final call but never starts another call after reaching the cap. Missing usage under an explicit cap fails closed. Driver state and notices are live-only and never persisted; restart starts unarmed. A prompt takes precedence over the next automatic call without implicitly disarming the driver; Cancel, inactive/cleared goals, unrecoverable errors, closed sessions, and budget exhaustion disarm it.
 - **Subagent isolation**: subagents get the goal tools but their runner
   applies them against the subagent's own (usually empty) goal state — a
   subagent can never take a mutable reference to its parent's goal.
@@ -1315,8 +1315,8 @@ read capability. The same-name override is a full replacement, not a merge
 or concatenation.
 Session goals are a single-current-goal persistence layer only: no
 todo/plan/workflow stages, no deadlines, no reminders, no goal DAGs /
-multiple goals per session, no goal verifier agent, and no scheduler/driver —
-the goal is a snapshot with a CAS, not a task runner.
+multiple goals per session, no goal verifier agent, and no scheduler or persistent workflow driver —
+`/goal continue` is only a process-local runner loop; the goal remains a snapshot with a CAS, not a task runner.
 
 GreptimeDB-specific non-goals (when built with `--features greptime`):
 
