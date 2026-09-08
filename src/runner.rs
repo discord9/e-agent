@@ -1129,12 +1129,15 @@ impl SessionRunner {
         &mut self,
         call: &ToolCall,
         already_compacted: bool,
+        suppressed_for_goal_budget: bool,
     ) -> Result<ToolOutput, String> {
         let arguments: serde_json::Value = serde_json::from_str(&call.arguments)
             .map_err(|error| format!("invalid JSON arguments: {error}"))?;
         match arguments.as_object() {
             Some(object) if object.is_empty() => Ok(ToolOutput::text(if already_compacted {
                 "compaction request already satisfied by automatic compaction."
+            } else if suppressed_for_goal_budget {
+                "compaction request suppressed: goal continuation budget is exhausted or usage is unavailable."
             } else {
                 "compaction request accepted for this tool batch."
             })),
@@ -2303,7 +2306,8 @@ impl SessionRunner {
                             }
                             WaitOutcome::Released => {
                                 self.clear_waiting_input(SessionStatus::Idle);
-                                self.intake_after_operation(waited.pending);
+                                self.invalidate_trigger_for_cancel();
+                                self.intake_after_cancel(waited.pending);
                                 self.shared
                                     .lock()
                                     .unwrap()
@@ -2344,8 +2348,17 @@ impl SessionRunner {
                         continue;
                     }
                     if call.name == "request_compaction" {
-                        let result = self.execute_request_compaction(&call, auto_compacted).await;
-                        if result.is_ok() {
+                        let request_compaction_allowed = !goal_turn
+                            || (self.goal_continuation_remaining != Some(0)
+                                && !self.goal_continuation_usage_unavailable);
+                        let result = self
+                            .execute_request_compaction(
+                                &call,
+                                auto_compacted,
+                                !request_compaction_allowed,
+                            )
+                            .await;
+                        if result.is_ok() && request_compaction_allowed {
                             requested_compaction = true;
                         }
                         match self.finish_intercepted_tool(&call, result).await {
@@ -2567,6 +2580,23 @@ impl SessionRunner {
                     break 'turn;
                 }
                 if self.has_work() {
+                    if requested_compaction
+                        && !auto_compacted
+                        && !self
+                            .pending
+                            .iter()
+                            .any(|command| matches!(command, PendingCommand::Compact))
+                        && self.pending.iter().any(|command| {
+                            matches!(
+                                command,
+                                PendingCommand::Prompt { .. } | PendingCommand::Goal(_)
+                            )
+                        })
+                    {
+                        self.shared.lock().unwrap().emit(AgentEvent::Notice(
+                            "compaction request superseded by queued human work".into(),
+                        ));
+                    }
                     // A queued compact is maintenance inside this existing
                     // turn, not its conclusion. Reopen a blank ordinary or
                     // Goal turn after the FIFO compaction completes.

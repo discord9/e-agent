@@ -97,6 +97,40 @@ struct InputRecordingModel {
     saw_result: Arc<Mutex<bool>>,
 }
 
+struct GoalInputModel {
+    calls: Arc<AtomicUsize>,
+    entered: Arc<Notify>,
+}
+
+#[async_trait]
+impl Model for GoalInputModel {
+    async fn complete(
+        &mut self,
+        _: &[Message],
+        _: &[ToolSpec],
+        _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        match self.calls.fetch_add(1, Ordering::SeqCst) {
+            0 => Ok((
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "goal-input".into(),
+                        name: "request_user_input".into(),
+                        arguments: r#"{"questions":[{"id":"answer","prompt":"answer?"}]}"#.into(),
+                    }],
+                    reasoning: None,
+                },
+                None,
+            )),
+            _ => {
+                self.entered.notify_one();
+                std::future::pending().await
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl Model for InputRecordingModel {
     async fn complete(
@@ -604,6 +638,75 @@ async fn request_user_input_cancel_claim_wins_then_answer_conflicts() {
         |message| !matches!(message, Message::Tool { content, .. } if content.contains("late"))
     ));
     drop(task);
+}
+
+#[tokio::test]
+async fn request_user_input_cancel_discards_goal_continue_until_fresh_continue() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let entered = Arc::new(Notify::new());
+    let agent = Agent::new(
+        Box::new(GoalInputModel {
+            calls: calls.clone(),
+            entered: entered.clone(),
+        }),
+        vec![
+            Box::new(crate::tools::user_input::RequestUserInput),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    let (runner, handle) = SessionRunner::new_with_bootstrap(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "input-cancel-goal".into(),
+        IdlePolicy::WaitForInput,
+        SessionBootstrap {
+            recovery_tasks: vec![],
+            legacy: false,
+            initial_entries: vec![test_goal_entry()],
+        },
+    )
+    .await
+    .unwrap();
+    let task = runner.start(None);
+    let mut status = handle.status();
+    handle.continue_goal(None);
+    wait_for_status(&mut status, |status| {
+        matches!(status, SessionStatus::WaitingInput(_))
+    })
+    .await;
+    // This is a second Continue buffered behind an already-armed Goal turn.
+    handle.continue_goal(None);
+    handle.cancel();
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("goal-input".into()), "late".into()),
+        PromptSubmission::Conflict
+    );
+    wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)).await;
+    handle.prompt("human after cancel");
+    tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+        .await
+        .expect("human prompt did not start its provider call");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "cancelled Continue must not re-arm before human work"
+    );
+    handle.cancel();
+    wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)).await;
+    handle.continue_goal(None);
+    tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+        .await
+        .expect("fresh Continue did not re-arm");
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    handle.cancel();
+    wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)).await;
+    drop(handle);
+    tokio::time::timeout(std::time::Duration::from_secs(2), task.join())
+        .await
+        .expect("runner did not stop")
+        .unwrap();
 }
 
 #[tokio::test]
@@ -2383,6 +2486,182 @@ async fn request_compaction_pairs_every_call_then_compacts_once_after_the_batch(
             .count(),
         1
     );
+}
+
+#[tokio::test]
+async fn request_compaction_is_superseded_by_queued_human_prompt_after_siblings() {
+    let temp = tempfile::tempdir().unwrap();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![
+                (
+                    AssistantMessage {
+                        content: None,
+                        tool_calls: vec![
+                            ToolCall {
+                                id: "request".into(),
+                                name: "request_compaction".into(),
+                                arguments: "{}".into(),
+                            },
+                            ToolCall {
+                                id: "sibling".into(),
+                                name: "read_image".into(),
+                                arguments: "{}".into(),
+                            },
+                        ],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("human handled".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+            ]
+            .into(),
+            calls: calls.clone(),
+        }),
+        vec![
+            Box::new(crate::tools::RequestCompaction),
+            Box::new(BlockingMarkerTool {
+                entered: entered.clone(),
+                release: release.clone(),
+            }),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    history_for_compaction(&mut agent);
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "request-superseded-prompt".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let task = runner.start(Some("start".into()));
+    entered.notified().await;
+    handle.prompt("human wins");
+    release.notify_one();
+    wait_for_log_event(&handle, |event| {
+        matches!(event, AgentEvent::Notice(text) if text == "compaction request superseded by queued human work")
+    })
+    .await;
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "human handled"),
+    )
+    .await;
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "request-superseded-prompt")
+        .await
+        .unwrap()
+        .entries;
+    assert!(entries.iter().any(|entry| matches!(entry,
+        SessionEntry::Message { message: Message::Tool { call_id, synthetic: false, .. } }
+        if call_id == "request")));
+    assert!(entries.iter().any(|entry| matches!(entry,
+        SessionEntry::Message { message: Message::Tool { call_id, synthetic: false, .. } }
+        if call_id == "sibling")));
+    assert!(entries.iter().any(|entry| matches!(entry,
+        SessionEntry::Message { message: Message::User { content, .. } }
+        if content == "human wins")));
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| matches!(entry, SessionEntry::Compaction { .. }))
+    );
+    assert_eq!(calls.lock().unwrap().len(), 2);
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn request_compaction_is_superseded_by_queued_goal_after_siblings() {
+    let temp = tempfile::tempdir().unwrap();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let mut agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: vec![AssistantMessage {
+                content: None,
+                tool_calls: vec![
+                    ToolCall {
+                        id: "request".into(),
+                        name: "request_compaction".into(),
+                        arguments: "{}".into(),
+                    },
+                    ToolCall {
+                        id: "sibling".into(),
+                        name: "read_image".into(),
+                        arguments: "{}".into(),
+                    },
+                ],
+                reasoning: None,
+            }]
+            .into(),
+        }),
+        vec![
+            Box::new(crate::tools::RequestCompaction),
+            Box::new(BlockingMarkerTool {
+                entered: entered.clone(),
+                release: release.clone(),
+            }),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    history_for_compaction(&mut agent);
+    let (runner, handle) = SessionRunner::new_with_bootstrap(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "request-superseded-goal".into(),
+        IdlePolicy::WaitForInput,
+        SessionBootstrap {
+            recovery_tasks: vec![],
+            legacy: false,
+            initial_entries: vec![test_goal_entry()],
+        },
+    )
+    .await
+    .unwrap();
+    let task = runner.start(Some("start".into()));
+    entered.notified().await;
+    assert!(handle.goal_command(GoalCommand::Action(crate::agent::GoalAction::Pause)));
+    release.notify_one();
+    wait_for_log_event(&handle, |event| {
+        matches!(event, AgentEvent::Notice(text) if text == "compaction request superseded by queued human work")
+    })
+    .await;
+    wait_for_goal(
+        &handle,
+        |goal| matches!(goal, Some(goal) if goal.status == GoalStatus::Paused),
+    )
+    .await;
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "request-superseded-goal")
+        .await
+        .unwrap()
+        .entries;
+    assert!(entries.iter().any(|entry| matches!(entry,
+        SessionEntry::Message { message: Message::Tool { call_id, synthetic: false, .. } }
+        if call_id == "request")));
+    assert!(entries.iter().any(|entry| matches!(entry,
+        SessionEntry::Message { message: Message::Tool { call_id, synthetic: false, .. } }
+        if call_id == "sibling")));
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| matches!(entry, SessionEntry::Compaction { .. }))
+    );
+    drop(handle);
+    task.join().await.unwrap();
 }
 
 #[tokio::test]
@@ -8555,6 +8834,101 @@ async fn goal_continue_capped_missing_usage_commits_tools_without_another_provid
         SessionEntry::Message { message: Message::Tool { call_id, synthetic: false, .. } } if call_id == "real-tool")));
     drop(handle);
     task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn goal_request_compaction_suppresses_after_exhausted_or_missing_usage() {
+    async fn run_case(usage: Option<Usage>, session: &str) {
+        let temp = tempfile::tempdir().unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut agent = Agent::new(
+            Box::new(ScriptedContextCaptureModel {
+                replies: vec![(
+                    AssistantMessage {
+                        content: None,
+                        tool_calls: vec![
+                            ToolCall {
+                                id: "request".into(),
+                                name: "request_compaction".into(),
+                                arguments: "{}".into(),
+                            },
+                            ToolCall {
+                                id: "sibling".into(),
+                                name: "keep_alive".into(),
+                                arguments: "{}".into(),
+                            },
+                        ],
+                        reasoning: None,
+                    },
+                    usage,
+                )]
+                .into(),
+                calls: calls.clone(),
+            }),
+            vec![
+                Box::new(crate::tools::RequestCompaction),
+                Box::new(KeepAliveTool { sender: None }),
+            ],
+        );
+        history_for_compaction(&mut agent);
+        let (runner, handle) = SessionRunner::new_with_bootstrap(
+            agent,
+            SessionStore::Jsonl,
+            temp.path().into(),
+            session.into(),
+            IdlePolicy::WaitForInput,
+            SessionBootstrap {
+                recovery_tasks: vec![],
+                legacy: false,
+                initial_entries: vec![test_goal_entry()],
+            },
+        )
+        .await
+        .unwrap();
+        let task = runner.start(None);
+        handle.continue_goal(Some(10));
+        wait_for_log_event(&handle, |event| {
+            matches!(event, AgentEvent::ToolResult { content, is_error: false }
+                if content.contains("suppressed"))
+        })
+        .await;
+        wait_for_status(&mut handle.status(), |status| {
+            matches!(status, SessionStatus::Idle)
+        })
+        .await;
+        assert_eq!(calls.lock().unwrap().len(), 1, "no summary provider call");
+        let entries = SessionStore::Jsonl
+            .load(temp.path(), session)
+            .await
+            .unwrap()
+            .entries;
+        assert!(entries.iter().any(|entry| matches!(entry,
+            SessionEntry::Message { message: Message::Tool { call_id, name, content, is_error: false, synthetic: false, .. } }
+            if call_id == "request" && name == "request_compaction" && content.contains("suppressed"))));
+        assert!(entries.iter().any(|entry| matches!(entry,
+            SessionEntry::Message { message: Message::Tool { call_id, name, is_error: false, synthetic: false, .. } }
+            if call_id == "sibling" && name == "keep_alive")));
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| matches!(entry, SessionEntry::Compaction { .. }))
+        );
+        drop(handle);
+        tokio::time::timeout(std::time::Duration::from_secs(2), task.join())
+            .await
+            .expect("runner did not stop")
+            .unwrap();
+    }
+
+    run_case(
+        Some(Usage {
+            input_tokens: 10,
+            ..Usage::default()
+        }),
+        "goal-request-exhausted",
+    )
+    .await;
+    run_case(None, "goal-request-missing").await;
 }
 
 #[tokio::test]
