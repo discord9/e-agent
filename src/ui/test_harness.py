@@ -18,7 +18,7 @@ js = "\n".join(open(os.path.join(HERE, f), encoding='utf-8').read() for f in JS_
 vendor_js = open(os.path.join(HERE, 'vendor', 'marked.min.js'), encoding='utf-8').read()
 usage_dashboard_js = open(os.path.join(HERE, 'usage-dashboard.js'), encoding='utf-8').read()
 
-MODE = os.environ.get('MODE', 'open')   # 'open' = full suite; 'markdown' = focused DOM-safety/rendering checks; 'composer-history' = focused ArrowUp checks
+MODE = os.environ.get('MODE', 'open')   # 'open' = full suite; 'splice' = pure H/S matching checks
 DEEP_LINK = os.environ.get('DEEP_LINK', '')
 CROSS_PAYLOAD = os.environ.get('CROSS_PAYLOAD', '')   # 注入 ?session=<id> 到 location.search（init 启动时解析）
 TRACE = os.environ.get('TRACE') == '1'
@@ -27,7 +27,7 @@ TRACE = os.environ.get('TRACE') == '1'
 # startTaskStream 里的同名行；这里带 2 空格缩进精确匹配 readSSEStream（唯一 2 空格缩进的
 # 那处），保持与拆分前一致的注入目标（startTaskStream 的 TextDecoder 在 harness 中从不执行）。
 js = js.replace('  const decoder = new TextDecoder();', '  const decoder = makeTextDecoder();')
-if MODE == 'fragment': js = js.replace('init();\n', 'if (!globalThis.__fragmentHarness) init();\n')
+if MODE in ('fragment', 'splice'): js = js.replace('init();\n', 'if (!globalThis.__fragmentHarness) init();\n')
 if TRACE:
     js = js.replace('async function readSSEStream(reader, id, wsId, epoch, ctrl) {',
         'async function readSSEStream(reader, id) {\n  console.log("SSE: stream start");')
@@ -718,6 +718,89 @@ async function flush(){ for(let i=0;i<200;i++) await Promise.resolve(); }
 async function main(){
   let fail=0;
   const chk=(name, ok, extra)=>{ if(!ok) fail++; console.log((ok?"PASS":"FAIL")+" "+name+(extra?"  "+extra:"")); };
+  if (MODE === 'splice') {
+    const H = [
+      {type:"message", message:{User:{content:"ask"}}},
+      {type:"message", message:{Assistant:{content:"done", reasoning:"why", tool_calls:[]}}},
+    ];
+    const S = [
+      {type:"user_prompt", data:{text:"ask"}},
+      {type:"reasoning_delta", data:{delta:"why"}},
+      {type:"assistant_delta", data:{delta:"done"}},
+    ];
+    let r = spliceHistorySnapshot(H, S);
+    chk("splice ordinary completed stream returns one rich H coverage plus no S extras", r.match && r.match.length === 3
+      && r.output.history.entries.length === 2 && r.output.snapshot.extras.length === 0
+      && r.output.snapshot.matched.length === 3);
+
+    const H2 = [
+      {type:"message", message:{Assistant:{content:"run", tool_calls:[
+        {id:"c1", name:"one", arguments:"{}"}, {id:"c2", name:"two", arguments:"{}"}]}}},
+      {type:"message", message:{Tool:{call_id:"c1", content:"r1", is_error:false}}},
+      {type:"message", message:{Tool:{call_id:"c2", content:"r2", is_error:false}}},
+    ];
+    const S2 = [
+      {type:"assistant_delta", data:{delta:"run"}},
+      {type:"tool_call", data:{name:"one", arguments:"{}"}},
+      {type:"tool_result", data:{content:"r1", is_error:false}},
+      {type:"tool_call", data:{name:"two", arguments:"{}"}},
+      {type:"tool_result", data:{content:"r2", is_error:false}},
+    ];
+    r = spliceHistorySnapshot(H2, S2);
+    chk("splice two bundled calls normalize at later execution results", r.match && r.match.length === 5
+      && r.output.history.entries.length === 3 && r.output.snapshot.extras.length === 0
+      && r.comparison.history.map(x => x.kind + ":" + (x.name || x.content || x.text)).join("|")
+        === "assistant:run|tool_call:one|tool_result:r1|tool_call:two|tool_result:r2");
+
+    // A lone text record is never enough proof, including a structural notice.
+    r = spliceHistorySnapshot([{type:"notice", text:"retry"}], [{type:"notice", data:{text:"retry"}}]);
+    chk("splice single repeated notice remains ambiguous", !r.match && r.output.snapshot.extras.length === 1);
+    r = spliceHistorySnapshot([{type:"message", message:{Assistant:{content:"same", tool_calls:[]}}}],
+      [{type:"assistant_delta", data:{delta:"same"}}, {type:"assistant_delta", data:{delta:"same"}}]);
+    chk("splice repeated standalone output is not globally suppressed", !r.match && r.output.snapshot.extras.length === 2);
+
+    const old = Array.from({length:205}, (_, i) => ({type:"message", message:i % 2
+      ? {Assistant:{content:"a" + i, tool_calls:[]}} : {User:{content:"u" + i}}}));
+    const windowH = old.slice(5);
+    const fullS = old.map((x, i) => i % 2 ? {type:"assistant_text", data:{text:"a" + i}}
+      : {type:"user_prompt", data:{text:"u" + i}});
+    r = spliceHistorySnapshot(windowH, fullS);
+    chk("splice H200 typical user/assistant window retains older S coverage", r.match && r.match.mode === "window"
+      && r.output.history.entries.length === 200 && r.output.snapshot.extras.join(",") === "0,1,2,3,4");
+
+    const usageS = [{type:"user_prompt", data:{text:"u"}}, {type:"assistant_delta", data:{delta:"a"}},
+      {type:"usage", data:{context_input:9}}, {type:"tool_call", data:{name:"x", arguments:"{}"}}];
+    const usageH = [{type:"message", message:{User:{content:"u"}}}, {type:"message", message:{Assistant:{content:"a", tool_calls:[{id:"x", name:"x", arguments:"{}"}]}}}];
+    r = spliceHistorySnapshot(usageH, usageS);
+    chk("splice usage is neutral for matching but retained UI-only", r.match && r.match.length === 3
+      && r.output.snapshot.uiOnly.length === 1 && r.output.snapshot.extras.length === 0);
+
+    r = spliceHistorySnapshot([{type:"message", message:{Tool:{call_id:"x", content:"!ok", is_error:false}}},
+      {type:"message", message:{Tool:{call_id:"y", content:"ok", is_error:true}}}],
+      [{type:"tool_result", data:{content:"ok", is_error:true}}]);
+    chk("splice tool result compares error flag separately from content", !r.match && r.output.snapshot.extras.length === 1);
+
+    const opaqueH = [{type:"message", message:{Assistant:{content:"", reasoning:null, tool_calls:[]}}},
+      {type:"message", message:{Odd:{future:"shape"}}}];
+    r = spliceHistorySnapshot(opaqueH, []);
+    chk("splice output preserves empty assistant and unknown original H entries once", r.output.history.entries.length === 2
+      && r.output.history.entries[0] === opaqueH[0] && r.output.history.entries[1] === opaqueH[1]);
+
+    r = spliceHistorySnapshot([{type:"notice", text:"history notice"}], [{type:"notice", data:{text:"snapshot notice"}}]);
+    chk("splice unmatched notice is retained", !r.match && r.output.snapshot.extras.length === 1);
+
+    r = spliceHistorySnapshot([], [{type:"assistant_text", data:"boot prefix"},
+      {type:"notice", data:{text:"live boundary"}}, {type:"assistant_delta", data:" live tail"}]);
+    chk("splice sparse bootstrap actual AssistantText and live tail retain raw events", r.output.snapshot.extras.length === 3
+      && r.comparison.snapshot[0].text === "boot prefix" && r.comparison.snapshot[2].text === " live tail"
+      && r.comparison.snapshot.every(x => x.source === "snapshot" && x.raw));
+
+    r = spliceHistorySnapshot([{type:"message", message:{Assistant:{content:"hello", tool_calls:[]}}}],
+      [{type:"assistant_delta", data:"hello world"}]);
+    chk("splice active sparse prefix remains unresolved and retained", !r.match && r.output.snapshot.extras.length === 1);
+    console.log(fail===0 ? "ALL PASS" : fail+" FAILURES");
+    imports.system.exit(0);
+  }
   if (MODE === 'fragment') {
     const crossPayload = "__CROSS_PAYLOAD__";
     const payload = {version:1, source:"http://127.0.0.1:19001", primary:"a", workspaces:[
@@ -8454,10 +8537,11 @@ main();
    .replace("MODE === 'markdown'", 'true' if MODE == 'markdown' else 'false') \
    .replace("MODE === 'waiting-input'", 'true' if MODE == 'waiting-input' else 'false') \
    .replace("MODE === 'refresh-deep-link'", 'true' if MODE == 'refresh-deep-link' else 'false') \
-   .replace("MODE === 'fragment'", 'true' if MODE == 'fragment' else 'false')
+   .replace("MODE === 'fragment'", 'true' if MODE in ('fragment', 'splice') else 'false') \
+   .replace("MODE === 'splice'", 'true' if MODE == 'splice' else 'false')
 
 # DEEP_LINK env → location.search 注入（init() 启动时 URL 解析入口）
-HARNESS = HARNESS.replace('globalThis.location={ pathname:', 'globalThis.__fragmentHarness=' + ('true' if MODE == 'fragment' else 'false') + '; globalThis.location={ pathname:')
+HARNESS = HARNESS.replace('globalThis.location={ pathname:', 'globalThis.__fragmentHarness=' + ('true' if MODE in ('fragment', 'splice') else 'false') + '; globalThis.location={ pathname:')
 TAIL = TAIL.replace('__CROSS_PAYLOAD__', json.dumps(CROSS_PAYLOAD)[1:-1])
 HARNESS = HARNESS.replace('__DEEP_LINK_SEARCH__', ('?session=' + DEEP_LINK) if DEEP_LINK else '')
 

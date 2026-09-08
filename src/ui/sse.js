@@ -245,6 +245,131 @@ function restoreUsageFromSnapshot(events) {
   }
 }
 
+/* Pure phase-1 matching: no DOM/state ownership.  The return plan keeps each
+   original history entry once and classifies every snapshot event for phase 2. */
+function spliceRecord(source, index, kind, text, raw, fields) {
+  return Object.assign({ source, index, kind, text: String(text == null ? "" : text), raw,
+    indices: [index] }, fields || {});
+}
+function eventText(data, keys) { return pickText(data, keys); }
+function normalizeHistoryForSplice(entries) {
+  const out = [], pending = new Map(), order = [];
+  const callRecord = (call) => spliceRecord("history", call.index, "tool_call", "", call.raw,
+    { name: call.name, arguments: call.arguments, owner: call.id });
+  const flushCalls = () => { for (const id of order.splice(0)) {
+    const call = pending.get(id); pending.delete(id); if (call) out.push(callRecord(call));
+  }};
+  for (let index = 0; index < (entries || []).length; index++) {
+    const entry = entries[index]; if (!entry) continue;
+    if (entry.type !== "message") {
+      flushCalls();
+      if (entry.type === "notice") out.push(spliceRecord("history", index, "notice", entry.text, entry));
+      else if (entry.type === "error") out.push(spliceRecord("history", index, "error", entry.text, entry));
+      else if (entry.type === "compaction") out.push(spliceRecord("history", index, "compaction", entry.summary, entry));
+      else out.push(spliceRecord("history", index, entry.type || "unknown", JSON.stringify(entry), entry));
+      continue;
+    }
+    const message = entry.message || {};
+    if (message.User) { flushCalls(); out.push(spliceRecord("history", index, "user", message.User.content, entry)); }
+    else if (message.System) { flushCalls(); out.push(spliceRecord("history", index, "system", message.System.content, entry)); }
+    else if (message.Assistant) {
+      flushCalls(); const a = message.Assistant;
+      if (a.reasoning != null) out.push(spliceRecord("history", index, "reasoning", a.reasoning, entry));
+      // Empty AssistantText is meaningful evidence, and the original entry remains once in output.
+      out.push(spliceRecord("history", index, "assistant", a.content == null ? "" : a.content, entry));
+      for (const call of a.tool_calls || []) {
+        const args = typeof call.arguments === "string" ? call.arguments : JSON.stringify(call.arguments || {});
+        pending.set(call.id, { id: call.id, name: call.name || "", arguments: args, raw: entry, index }); order.push(call.id);
+      }
+    } else if (message.Tool) {
+      const tool = message.Tool, call = pending.get(tool.call_id);
+      if (call) { pending.delete(tool.call_id); order.splice(order.indexOf(tool.call_id), 1); out.push(callRecord(call)); }
+      out.push(spliceRecord("history", index, "tool_result", "", entry,
+        { content: tool.content || "", isError: tool.is_error === true, owner: tool.call_id || "" }));
+    } else { flushCalls(); out.push(spliceRecord("history", index, "message_unknown", JSON.stringify(message), entry)); }
+  }
+  flushCalls(); return out;
+}
+function normalizeSnapshotForSplice(events) {
+  const out = []; let lane = "", text = "", first = -1, raw = [], indices = [];
+  const flush = () => { if (lane) { const r = spliceRecord("snapshot", first, lane, text, raw.slice()); r.indices = indices.slice(); out.push(r); }
+    lane = ""; text = ""; first = -1; raw = []; indices = []; };
+  for (let index = 0; index < (events || []).length; index++) {
+    const event = events[index] || {}, type = String(event.type || "").toLowerCase();
+    const data = event.data !== undefined ? event.data : event;
+    const next = (type === "assistant_delta" || type === "assistantdelta") ? "assistant"
+      : (type === "reasoning_delta" || type === "reasoningdelta") ? "reasoning" : "";
+    if (next) { if (lane && lane !== next) flush(); if (!lane) { lane = next; first = index; }
+      text += eventText(data, ["delta", "text", "content", "reasoning"]); raw.push(event); indices.push(index); continue; }
+    flush();
+    if (type === "assistant_text" || type === "assistanttext") out.push(spliceRecord("snapshot", index, "assistant", eventText(data, ["text", "content"]), event));
+    else if (type === "user_prompt" || type === "userprompt") out.push(spliceRecord("snapshot", index, "user", eventText(data, ["text", "prompt", "content"]), event));
+    else if (type === "tool_call" || type === "toolcall") { const p = data && typeof data === "object" ? data : {};
+      out.push(spliceRecord("snapshot", index, "tool_call", "", event, { name: eventText(p, ["name"]), arguments: typeof p.arguments === "string" ? p.arguments : JSON.stringify(p.arguments || {}) }));
+    } else if (type === "tool_result" || type === "toolresult") { const p = data && typeof data === "object" ? data : {};
+      out.push(spliceRecord("snapshot", index, "tool_result", "", event, { content: eventText(p, ["content", "text", "result", "error"]), isError: p.is_error === true || p.error === true }));
+    } else if (type === "notice") out.push(spliceRecord("snapshot", index, "notice", eventText(data, ["text", "message"]), event));
+    else if (type === "error") out.push(spliceRecord("snapshot", index, "error", eventText(data, ["error", "message", "text"]), event));
+    else if (type === "usage") { const r = spliceRecord("snapshot", index, "usage", "", event); r.neutral = true; out.push(r); }
+    else out.push(spliceRecord("snapshot", index, type || "unknown", JSON.stringify(data), event));
+  }
+  flush(); return out;
+}
+function spliceSame(a, b) {
+  if (!a || !b || a.kind !== b.kind || (a.owner && b.owner && a.owner !== b.owner)) return false;
+  if (a.kind === "tool_call") return a.name === b.name && a.arguments === b.arguments;
+  if (a.kind === "tool_result") return a.isError === b.isError && a.content === b.content;
+  return a.text === b.text;
+}
+function longestAt(history, hi, snapshot, si) {
+  const matched = []; let h = hi, s = si;
+  while (h < history.length) {
+    while (s < snapshot.length && snapshot[s].neutral) s++;
+    if (s >= snapshot.length || !spliceSame(history[h], snapshot[s])) break;
+    matched.push({ h: h++, s: s++ });
+  }
+  return { length: matched.length, end: s, matched };
+}
+function prefixAt(history, hi, snapshot, si) {
+  const got = longestAt(history, hi, snapshot, si);
+  return got.length ? got : null;
+}
+function splicePlan(historyEntries, snapshotEvents, match) {
+  const matched = new Set(), neutral = new Set();
+  const snapshot = normalizeSnapshotForSplice(snapshotEvents);
+  for (const r of snapshot) for (const i of r.indices) { if (r.neutral) neutral.add(i); }
+  if (match) for (const pair of match.pairs) for (const i of snapshot[pair.s].indices) matched.add(i);
+  const extras = [], uiOnly = [];
+  for (let i = 0; i < snapshotEvents.length; i++) {
+    if (neutral.has(i)) uiOnly.push(i);
+    else if (!matched.has(i)) extras.push(i);
+  }
+  return { history: { entries: historyEntries.slice(), indices: historyEntries.map((_v, i) => i) },
+    snapshot: { events: snapshotEvents.slice(), matched: [...matched], extras, uiOnly } };
+}
+function spliceAlignedRecords(historyEntries, snapshotEvents) {
+  const history = normalizeHistoryForSplice(historyEntries), snapshot = normalizeSnapshotForSplice(snapshotEvents), candidates = [];
+  if (history.length) {
+    for (let s = 0; s < snapshot.length; s++) if (spliceSame(history[0], snapshot[s])) {
+      const got = prefixAt(history, 0, snapshot, s);
+      // A bounded H window can begin with assistant/reasoning text only when
+      // surrounding agreement proves the occurrence; lone matches stay ambiguous.
+      if (got && got.length >= 2) candidates.push({ mode: "window", hStart: 0, sStart: s, length: got.length, pairs: got.matched });
+    }
+    for (let h = 0; h < history.length; h++) {
+      const got = prefixAt(history, h, snapshot, 0);
+      if (got && got.length >= 2) candidates.push({ mode: "suffix", hStart: h, sStart: 0, length: got.length, pairs: got.matched });
+    }
+  }
+  const max = candidates.reduce((n, c) => Math.max(n, c.length), 0);
+  const best = candidates.filter(c => c.length === max);
+  const distinct = best.filter((c, i) => best.findIndex((d) => d.hStart === c.hStart && d.sStart === c.sStart && d.length === c.length) === i);
+  // Equal-length matches at different locations are intentionally ambiguous.
+  const match = distinct.length === 1 ? distinct[0] : null;
+  return { comparison: { history, snapshot }, match, output: splicePlan(historyEntries, snapshotEvents, match) };
+}
+function spliceHistorySnapshot(historyEntries, snapshotEvents) { return spliceAlignedRecords(historyEntries || [], snapshotEvents || []); }
+
 /* 初始 snapshot 只补回缓存视图中仍在流式的助手尾巴。history 是已完成
    transcript 的权威来源；snapshot 的完整事件尾部则只用于把当前 in-flight
    accumulator 从切走前的缓存前缀接到最新位置，不能整体重放（snapshot 有界）。 */
