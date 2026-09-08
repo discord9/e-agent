@@ -907,6 +907,14 @@ impl SessionRunner {
         }
     }
 
+    /// Cap exhaustion is a runner-local live event: it stays available to
+    /// late attaches through Shared's log without becoming a durable entry.
+    fn emit_goal_cap_exhausted(&self) {
+        self.shared.lock().unwrap().emit(AgentEvent::Notice(
+            "goal continuation stopped: token cap exhausted".into(),
+        ));
+    }
+
     /// Apply + persist one human goal command. Errors are plain strings
     /// (the caller emits them as `AgentEvent::Error`); the model tool path
     /// reuses the same transition rules under an id + revision CAS.
@@ -1654,8 +1662,18 @@ impl SessionRunner {
                     match usage.as_ref() {
                         Some(usage) => {
                             let used = usage.input_tokens.saturating_add(usage.output_tokens);
-                            if let Some(remaining) = &mut self.goal_continuation_remaining {
-                                *remaining = remaining.saturating_sub(used);
+                            let exhausted =
+                                if let Some(remaining) = &mut self.goal_continuation_remaining {
+                                    *remaining = remaining.saturating_sub(used);
+                                    *remaining == 0
+                                } else {
+                                    false
+                                };
+                            if exhausted {
+                                self.emit_goal_cap_exhausted();
+                                // This maintenance operation cannot resume the
+                                // interrupted turn after consuming its cap.
+                                self.maintenance_resume = false;
                             }
                         }
                         None => {
@@ -1663,6 +1681,9 @@ impl SessionRunner {
                             self.goal_continuation_remaining = None;
                             self.goal_continuation_usage_unavailable = true;
                             self.armed_trigger = None;
+                            // The charged maintenance cannot resume its
+                            // interrupted turn after usage is unavailable.
+                            self.maintenance_resume = false;
                             self.shared.lock().unwrap().emit(AgentEvent::Notice(
                                 "goal continuation stopped: model usage unavailable".into(),
                             ));
@@ -1823,6 +1844,12 @@ impl SessionRunner {
                 if self.goal_continuation_remaining == Some(0) {
                     self.goal_continuation_armed = false;
                     self.goal_continuation_remaining = None;
+                    // A human-required continuation may be resuming through
+                    // this FIFO compaction; do not discard its genuine
+                    // same-turn resume while resolving the exhausted driver.
+                    if self.armed_trigger != Some(RunnerTrigger::Resume) {
+                        self.maintenance_resume = false;
+                    }
                     self.armed_trigger = None;
                 }
                 match self
@@ -2037,11 +2064,16 @@ impl SessionRunner {
                 self.agent.start_turn();
             }
             let specs = self.agent.tool_specs();
+            // A valid answer is human-owned work required to complete the
+            // already-committed tool call. It may make one (or more tool-
+            // coupled) model rounds even when the Goal driver's cap stopped.
+            let mut human_required_continuation = false;
             'turn: loop {
                 // A capped continuation may overshoot on the call that spends
                 // its final tokens. This guard applies only to its own Goal
                 // turn; a queued human prompt always starts a regular turn.
                 if goal_turn
+                    && !human_required_continuation
                     && self.goal_continuation_armed
                     && self.goal_continuation_remaining == Some(0)
                 {
@@ -2051,7 +2083,10 @@ impl SessionRunner {
                     self.armed_trigger = None;
                     break 'turn;
                 }
-                if goal_turn && self.goal_continuation_usage_unavailable {
+                if goal_turn
+                    && !human_required_continuation
+                    && self.goal_continuation_usage_unavailable
+                {
                     break 'turn;
                 }
                 let waited = await_round(&mut self.agent, &specs, &mut self.commands).await;
@@ -2104,12 +2139,19 @@ impl SessionRunner {
                 let assistant = round.assistant;
                 let usage = round.usage;
                 let streamed = round.produced_content_delta;
-                if goal_turn && self.goal_continuation_armed {
+                if goal_turn && !human_required_continuation && self.goal_continuation_armed {
                     match usage.as_ref() {
                         Some(usage) => {
                             let used = usage.input_tokens.saturating_add(usage.output_tokens);
-                            if let Some(remaining) = &mut self.goal_continuation_remaining {
-                                *remaining = remaining.saturating_sub(used);
+                            let exhausted =
+                                if let Some(remaining) = &mut self.goal_continuation_remaining {
+                                    *remaining = remaining.saturating_sub(used);
+                                    *remaining == 0
+                                } else {
+                                    false
+                                };
+                            if exhausted {
+                                self.emit_goal_cap_exhausted();
                             }
                         }
                         None if self.goal_continuation_remaining.is_some() => {
@@ -2310,6 +2352,7 @@ impl SessionRunner {
                                     return;
                                 }
                                 self.clear_waiting_input(SessionStatus::Busy);
+                                human_required_continuation = true;
                                 self.agent.emit_event(AgentEvent::ToolResult {
                                     is_error: false,
                                     content,
@@ -2616,7 +2659,13 @@ impl SessionRunner {
                     // A queued compact is maintenance inside this existing
                     // turn, not its conclusion. Reopen a blank ordinary or
                     // Goal turn after the FIFO compaction completes.
-                    if goal_turn
+                    if human_required_continuation && !self.has_prompt_work() {
+                        // Accepted input remains owned by this tool turn even
+                        // when FIFO maintenance follows an exhausted Goal
+                        // driver. Resume without rearming or resetting tools.
+                        self.armed_trigger = Some(RunnerTrigger::Resume);
+                        self.maintenance_resume = true;
+                    } else if goal_turn
                         && self.goal_continuation_armed
                         && self.goal_continuation_remaining != Some(0)
                     {
