@@ -1784,7 +1784,11 @@ impl SessionRunner {
             let goal_boundary = self.armed_trigger == Some(RunnerTrigger::Goal);
             if !goal_boundary {
                 match self.commit_backgrounds().await {
-                    Ok(true) if !self.has_prompt_work() => {
+                    Ok(true)
+                        if !self.has_prompt_work()
+                            && !(self.armed_trigger == Some(RunnerTrigger::Resume)
+                                && self.maintenance_resume) =>
+                    {
                         // A completion gets exactly one ordinary follow-up even
                         // when maintenance is queued. A later real prompt
                         // clears this marker and consumes the completion in
@@ -1808,7 +1812,11 @@ impl SessionRunner {
                 // the User call; it must not get a separate Background turn.
                 match self.commit_backgrounds().await {
                     Ok(committed) => {
-                        if committed && !self.has_prompt_work() {
+                        if committed
+                            && !self.has_prompt_work()
+                            && !(self.armed_trigger == Some(RunnerTrigger::Resume)
+                                && self.maintenance_resume)
+                        {
                             self.armed_trigger = Some(RunnerTrigger::Background);
                         }
                     }
@@ -1902,7 +1910,10 @@ impl SessionRunner {
                 // Background follow-up and supersedes the Goal charge.
                 match self.commit_backgrounds().await {
                     Ok(committed) => {
-                        if committed {
+                        if committed
+                            && !(self.armed_trigger == Some(RunnerTrigger::Resume)
+                                && self.maintenance_resume)
+                        {
                             self.armed_trigger = Some(RunnerTrigger::Background);
                         }
                     }
@@ -2650,6 +2661,24 @@ impl SessionRunner {
                     }
                     break 'turn;
                 }
+                // An inactive goal must disarm before FIFO maintenance
+                // can hand the turn off. A valid answer may still resume its
+                // own tool turn; ordinary Goal work stops after this batch.
+                let goal_inactive = goal_turn
+                    && !matches!(
+                        self.agent.goal().as_ref().map(|goal| goal.status),
+                        Some(GoalStatus::Active)
+                    );
+                if goal_inactive {
+                    self.goal_continuation_armed = false;
+                    self.goal_continuation_remaining = None;
+                    self.goal_continuation_usage_unavailable = false;
+                    self.turn_just_ended = false;
+                    if !human_required_continuation {
+                        self.armed_trigger = None;
+                        self.maintenance_resume = false;
+                    }
+                }
                 if self.has_work() {
                     if requested_compaction
                         && !auto_compacted
@@ -2696,21 +2725,8 @@ impl SessionRunner {
                 // A goal update in this sibling batch can make the driver
                 // ineligible. Stop only after every sibling result and any
                 // background completion have been committed.
-                if goal_turn
-                    && !matches!(
-                        self.agent.goal().as_ref().map(|goal| goal.status),
-                        Some(GoalStatus::Active)
-                    )
-                {
-                    self.goal_continuation_armed = false;
-                    self.goal_continuation_remaining = None;
-                    self.goal_continuation_usage_unavailable = false;
-                    self.turn_just_ended = false;
-                    if !human_required_continuation {
-                        self.armed_trigger = None;
-                        self.maintenance_resume = false;
-                        break 'turn;
-                    }
+                if goal_inactive && !human_required_continuation {
+                    break 'turn;
                 }
                 // Poll-guard termination: the full sibling batch is durably
                 // committed and the safe point ran — only now emit the

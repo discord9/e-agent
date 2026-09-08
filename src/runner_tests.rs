@@ -11527,3 +11527,338 @@ async fn oracle677_positive_answer_auto_compaction_missing_usage_does_not_fail_c
     )
     .await;
 }
+
+#[tokio::test]
+async fn oracle718_answer_pause_compact_resume_does_not_rearm_driver() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![
+                (
+                    AssistantMessage {
+                        content: None,
+                        tool_calls: vec![
+                            ToolCall {
+                                id: "input".into(),
+                                name: "request_user_input".into(),
+                                arguments: r#"{"questions":[{"id":"answer","prompt":"answer?"}]}"#.into(),
+                            },
+                            ToolCall {
+                                id: "pause".into(),
+                                name: "update_goal".into(),
+                                arguments: serde_json::json!({"id":"goal-test","revision":1,"action":"pause"}).to_string(),
+                            },
+                        ],
+                        reasoning: None,
+                    },
+                    Some(Usage { input_tokens: 1, ..Usage::default() }),
+                ),
+                (
+                    AssistantMessage { content: Some("summary".into()), tool_calls: vec![], reasoning: None },
+                    Some(Usage::default()),
+                ),
+                (
+                    AssistantMessage { content: Some("answer after pause".into()), tool_calls: vec![], reasoning: None },
+                    Some(Usage::default()),
+                ),
+                (
+                    AssistantMessage { content: Some("unexpected auto goal".into()), tool_calls: vec![], reasoning: None },
+                    Some(Usage::default()),
+                ),
+            ].into(),
+            calls: calls.clone(),
+        }),
+        vec![Box::new(crate::tools::user_input::RequestUserInput), Box::new(KeepAliveTool { sender: None })],
+    );
+    let mut agent = agent;
+    history_for_compaction(&mut agent);
+    let (runner, handle) = SessionRunner::new_with_bootstrap(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "oracle718-answer-pause".into(),
+        IdlePolicy::WaitForInput,
+        SessionBootstrap {
+            recovery_tasks: vec![],
+            legacy: false,
+            initial_entries: vec![test_goal_entry()],
+        },
+    )
+    .await
+    .unwrap();
+    let task = runner.start(None);
+    let mut status = handle.status();
+    handle.continue_goal(Some(10));
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        wait_for_status(&mut status, |status| {
+            matches!(status, SessionStatus::WaitingInput(_))
+        }),
+    )
+    .await
+    .unwrap();
+    handle.compact();
+    assert!(handle.goal_command(GoalCommand::Action(crate::agent::GoalAction::Resume)));
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("input".into()), "yes".into()),
+        PromptSubmission::Answered
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(2), wait_for_log_event(&handle, |event| matches!(event, AgentEvent::AssistantText(text) if text == "answer after pause"))).await.unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        3,
+        "paused driver stays disarmed after required answer"
+    );
+    assert!(matches!(handle.goal(), Some(goal) if goal.status == GoalStatus::Active));
+    drop(handle);
+    tokio::time::timeout(std::time::Duration::from_secs(2), task.join())
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn oracle718_ordinary_pause_compact_resume_does_not_rearm_driver() {
+    let temp = tempfile::tempdir().unwrap();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let starts = Arc::new(AtomicUsize::new(0));
+    let mut agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![
+                (AssistantMessage {
+                    content: None,
+                    tool_calls: vec![
+                        ToolCall { id: "pause".into(), name: "update_goal".into(), arguments: serde_json::json!({"id":"goal-test","revision":1,"action":"pause"}).to_string() },
+                        ToolCall { id: "sibling".into(), name: "read_image".into(), arguments: "{}".into() },
+                    ],
+                    reasoning: None,
+                }, Some(Usage::default())),
+                (AssistantMessage { content: Some("ordinary summary".into()), tool_calls: vec![], reasoning: None }, Some(Usage::default())),
+                (AssistantMessage { content: Some("unexpected auto goal".into()), tool_calls: vec![], reasoning: None }, Some(Usage::default())),
+            ].into(),
+            calls: calls.clone(),
+        }),
+        vec![
+            Box::new(BlockingMarkerTool { entered: entered.clone(), release: release.clone() }),
+            Box::new(TurnStartMarkerTool(starts.clone())),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    history_for_compaction(&mut agent);
+    let (runner, handle) = SessionRunner::new_with_bootstrap(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "oracle718-ordinary-pause".into(),
+        IdlePolicy::WaitForInput,
+        SessionBootstrap {
+            recovery_tasks: vec![],
+            legacy: false,
+            initial_entries: vec![test_goal_entry()],
+        },
+    )
+    .await
+    .unwrap();
+    let task = runner.start(None);
+    let mut status = handle.status();
+    handle.continue_goal(Some(10));
+    tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+        .await
+        .unwrap();
+    handle.compact();
+    assert!(handle.goal_command(GoalCommand::Action(crate::agent::GoalAction::Resume)));
+    release.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(2), wait_for_log_event(&handle, |event| matches!(event, AgentEvent::Notice(text) if text == "compacted: ordinary summary"))).await.unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        2,
+        "ordinary pause must not auto-rearm after human Resume"
+    );
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
+    assert!(matches!(handle.goal(), Some(goal) if goal.status == GoalStatus::Active));
+    drop(handle);
+    tokio::time::timeout(std::time::Duration::from_secs(2), task.join())
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+async fn oracle718_background_during_answer_compact_keeps_resume(
+    action: crate::agent::GoalAction,
+    session: &str,
+) {
+    let temp = tempfile::tempdir().unwrap();
+    let sender = Arc::new(Mutex::new(None));
+    let compact_entered = Arc::new(Notify::new());
+    let compact_release = Arc::new(Notify::new());
+    let starts = Arc::new(AtomicUsize::new(0));
+    let mut agent = Agent::new(
+        Box::new(GatedContextCaptureModel {
+            replies: vec![
+                (
+                    AssistantMessage {
+                        content: None,
+                        tool_calls: vec![background_bash_call("job", false)],
+                        reasoning: None,
+                    },
+                    Some(Usage::default()),
+                ),
+                (
+                    AssistantMessage {
+                        content: None,
+                        tool_calls: vec![ToolCall {
+                            id: "input".into(),
+                            name: "request_user_input".into(),
+                            arguments: r#"{"questions":[{"id":"answer","prompt":"answer?"}]}"#
+                                .into(),
+                        }],
+                        reasoning: None,
+                    },
+                    Some(Usage::default()),
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("gated summary".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    Some(Usage::default()),
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("answer with completion".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    Some(Usage::default()),
+                ),
+            ]
+            .into(),
+            block_call: 3,
+            entered: compact_entered.clone(),
+            release: compact_release.clone(),
+            calls: Arc::new(Mutex::new(Vec::new())),
+            call_count: 0,
+        }),
+        vec![
+            Box::new(MockBackgroundBash {
+                id: 9,
+                label: "job",
+                sender: sender.clone(),
+            }),
+            Box::new(crate::tools::user_input::RequestUserInput),
+            Box::new(TurnStartMarkerTool(starts.clone())),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    history_for_compaction(&mut agent);
+    let (runner, handle) = SessionRunner::new_with_bootstrap(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        session.into(),
+        IdlePolicy::WaitForInput,
+        SessionBootstrap {
+            recovery_tasks: vec![],
+            legacy: false,
+            initial_entries: vec![test_goal_entry()],
+        },
+    )
+    .await
+    .unwrap();
+    let task = runner.start(None);
+    let mut status = handle.status();
+    handle.continue_goal(None);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        wait_for_status(&mut status, |status| {
+            matches!(status, SessionStatus::WaitingInput(_))
+        }),
+    )
+    .await
+    .unwrap();
+    handle.compact();
+    assert!(handle.goal_command(GoalCommand::Action(action)));
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("input".into()), "yes".into()),
+        PromptSubmission::Answered
+    );
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        compact_entered.notified(),
+    )
+    .await
+    .unwrap();
+    sender
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .send(AgentEvent::BackgroundCompleted {
+            id: 9,
+            output: "done".into(),
+            label: Some("job".into()),
+            started_at_ms: None,
+            duration_ms: None,
+            exit_code: Some(0),
+            signal: None,
+            status: None,
+            kind: None,
+        })
+        .unwrap();
+    compact_release.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(2), wait_for_log_event(&handle, |event| matches!(event, AgentEvent::AssistantText(text) if text == "answer with completion"))).await.unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
+    assert!(handle.snapshot().iter().any(|event| matches!(event, AgentEvent::BackgroundCompletionNotice { id: 9, output, .. } if output == "done")));
+    assert!(!matches!(handle.goal(), Some(goal) if goal.status == GoalStatus::Active));
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), session)
+        .await
+        .unwrap()
+        .entries;
+    assert!(entries.iter().any(|entry| matches!(entry, SessionEntry::BackgroundCompletion { id: 9, output, .. } if output == "done")));
+    drop(handle);
+    tokio::time::timeout(std::time::Duration::from_secs(2), task.join())
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn oracle718_background_during_answer_compact_pause_keeps_resume() {
+    oracle718_background_during_answer_compact_keeps_resume(
+        crate::agent::GoalAction::Pause,
+        "oracle718-background-pause",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn oracle718_background_during_answer_compact_clear_keeps_resume() {
+    oracle718_background_during_answer_compact_keeps_resume(
+        crate::agent::GoalAction::Clear,
+        "oracle718-background-clear",
+    )
+    .await;
+}
