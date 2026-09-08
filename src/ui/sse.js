@@ -274,9 +274,12 @@ function normalizeHistoryForSplice(entries) {
     else if (message.System) { flushCalls(); out.push(spliceRecord("history", index, "system", message.System.content, entry)); }
     else if (message.Assistant) {
       flushCalls(); const a = message.Assistant;
-      if (a.reasoning != null) out.push(spliceRecord("history", index, "reasoning", a.reasoning, entry));
-      // Empty AssistantText is meaningful evidence, and the original entry remains once in output.
-      out.push(spliceRecord("history", index, "assistant", a.content == null ? "" : a.content, entry));
+      if (a.reasoning != null) { const r = spliceRecord("history", index, "reasoning", a.reasoning, entry); r.neutral = true; out.push(r); }
+      // The original rich entry remains in output.  A tool-only assistant has
+      // no S AssistantText counterpart, so its empty content is not comparison evidence.
+      if (a.content != null && (a.content !== "" || !(a.tool_calls || []).length)) {
+        out.push(spliceRecord("history", index, "assistant", a.content, entry));
+      }
       for (const call of a.tool_calls || []) {
         const args = typeof call.arguments === "string" ? call.arguments : JSON.stringify(call.arguments || {});
         pending.set(call.id, { id: call.id, name: call.name || "", arguments: args, raw: entry, index }); order.push(call.id);
@@ -325,16 +328,35 @@ function longestAt(history, hi, snapshot, si) {
   const matched = []; let h = hi, s = si;
   while (h < history.length) {
     while (s < snapshot.length && snapshot[s].neutral) s++;
-    if (s >= snapshot.length || !spliceSame(history[h], snapshot[s])) break;
-    matched.push({ h: h++, s: s++ });
+    if (h >= history.length || s >= snapshot.length) break;
+    // Rich H reasoning is optional in sparse S, but remains exact evidence when
+    // S did send its reasoning lane.
+    if (history[h].neutral && !spliceSame(history[h], snapshot[s])) { h++; continue; }
+    if (spliceSame(history[h], snapshot[s])) { matched.push({ h: h++, s: s++ }); continue; }
+    // Skip only an S event demonstrably between two H anchors.  Never skip a
+    // mismatch before the first match or after the matched S prefix.
+    if (matched.length && s + 1 < snapshot.length && spliceSame(history[h], snapshot[s + 1])) { s++; continue; }
+    break;
   }
-  return { length: matched.length, end: s, matched };
+  while (h < history.length && history[h].neutral) h++;
+  return { length: matched.length, end: s, endHistory: h, matched };
 }
 function prefixAt(history, hi, snapshot, si) {
   const got = longestAt(history, hi, snapshot, si);
   return got.length ? got : null;
 }
-function splicePlan(historyEntries, snapshotEvents, match) {
+function windowAt(history, snapshot, si) {
+  let h = 0, s = si, pairs = [];
+  while (h < history.length && s < snapshot.length) {
+    while (h < history.length && history[h].neutral) h++;
+    while (s < snapshot.length && snapshot[s].neutral) s++;
+    if (h >= history.length || s >= snapshot.length || !spliceSame(history[h], snapshot[s])) break;
+    pairs.push({ h: h++, s: s++ });
+  }
+  while (h < history.length && history[h].neutral) h++;
+  return pairs.length ? { length: pairs.length, endHistory: h, matched: pairs } : null;
+}
+function splicePlan(historyEntries, snapshotEvents, match, history) {
   const matched = new Set(), neutral = new Set();
   const snapshot = normalizeSnapshotForSplice(snapshotEvents);
   for (const r of snapshot) for (const i of r.indices) { if (r.neutral) neutral.add(i); }
@@ -344,29 +366,53 @@ function splicePlan(historyEntries, snapshotEvents, match) {
     if (neutral.has(i)) uiOnly.push(i);
     else if (!matched.has(i)) extras.push(i);
   }
-  return { history: { entries: historyEntries.slice(), indices: historyEntries.map((_v, i) => i) },
-    snapshot: { events: snapshotEvents.slice(), matched: [...matched], extras, uiOnly } };
+  const extraPlan = extras.map((index) => {
+    const record = snapshot.find((r) => r.indices.includes(index));
+    let after = -1, before = historyEntries.length;
+    if (match && record) {
+      const prior = match.pairs.filter((p) => p.s < snapshot.indexOf(record)).pop();
+      const next = match.pairs.find((p) => p.s > snapshot.indexOf(record));
+      if (prior) after = history[prior.h].index;
+      if (next) before = history[next.h].index;
+    }
+    return { index, after, before };
+  });
+  return { history: {
+    entries: historyEntries.slice(), indices: historyEntries.map((_v, i) => i),
+    // Phase 2 can seed pending tool cards in this execution order, rather than
+    // pairing an ownerless S result with the latest arbitrary card.
+    execution: history.filter((r) => r.kind === "tool_call" || r.kind === "tool_result")
+      .map((r) => ({ kind: r.kind, entry: r.index, owner: r.owner || "" }))
+  }, snapshot: { events: snapshotEvents.slice(), matched: [...matched], extras, uiOnly, extraPlan } };
 }
 function spliceAlignedRecords(historyEntries, snapshotEvents) {
   const history = normalizeHistoryForSplice(historyEntries), snapshot = normalizeSnapshotForSplice(snapshotEvents), candidates = [];
   if (history.length) {
     for (let s = 0; s < snapshot.length; s++) if (spliceSame(history[0], snapshot[s])) {
-      const got = prefixAt(history, 0, snapshot, s);
+      const got = windowAt(history, snapshot, s);
       // A bounded H window can begin with assistant/reasoning text only when
       // surrounding agreement proves the occurrence; lone matches stay ambiguous.
-      if (got && got.length >= 2) candidates.push({ mode: "window", hStart: 0, sStart: s, length: got.length, pairs: got.matched });
+      if (got && got.length >= 2 && got.endHistory === history.length) {
+        candidates.push({ mode: "window", hStart: 0, sStart: s, length: got.length, pairs: got.matched });
+      }
     }
-    for (let h = 0; h < history.length; h++) {
-      const got = prefixAt(history, h, snapshot, 0);
-      if (got && got.length >= 2) candidates.push({ mode: "suffix", hStart: h, sStart: 0, length: got.length, pairs: got.matched });
+    // S-prefix overlap is a suffix only when it reaches H's actual end.
+    for (let start = 0; start < history.length; start++) {
+      const got = prefixAt(history, start, snapshot, 0);
+      if (got && got.length >= 2 && got.endHistory === history.length) {
+        candidates.push({ mode: "suffix", hStart: start, sStart: 0, length: got.length, pairs: got.matched });
+      }
     }
   }
   const max = candidates.reduce((n, c) => Math.max(n, c.length), 0);
   const best = candidates.filter(c => c.length === max);
-  const distinct = best.filter((c, i) => best.findIndex((d) => d.hStart === c.hStart && d.sStart === c.sStart && d.length === c.length) === i);
+  // A full H-window match is more specific than the same pairs viewed as a
+  // suffix; otherwise different maximum locations remain ambiguous.
+  const preferred = best.some((c) => c.mode === "window") ? best.filter((c) => c.mode === "window") : best;
+  const distinct = preferred.filter((c, i) => preferred.findIndex((d) => d.hStart === c.hStart && d.sStart === c.sStart && d.length === c.length) === i);
   // Equal-length matches at different locations are intentionally ambiguous.
   const match = distinct.length === 1 ? distinct[0] : null;
-  return { comparison: { history, snapshot }, match, output: splicePlan(historyEntries, snapshotEvents, match) };
+  return { comparison: { history, snapshot }, match, output: splicePlan(historyEntries, snapshotEvents, match, history) };
 }
 function spliceHistorySnapshot(historyEntries, snapshotEvents) { return spliceAlignedRecords(historyEntries || [], snapshotEvents || []); }
 

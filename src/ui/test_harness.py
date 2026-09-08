@@ -750,7 +750,9 @@ async function main(){
     chk("splice two bundled calls normalize at later execution results", r.match && r.match.length === 5
       && r.output.history.entries.length === 3 && r.output.snapshot.extras.length === 0
       && r.comparison.history.map(x => x.kind + ":" + (x.name || x.content || x.text)).join("|")
-        === "assistant:run|tool_call:one|tool_result:r1|tool_call:two|tool_result:r2");
+        === "assistant:run|tool_call:one|tool_result:r1|tool_call:two|tool_result:r2"
+      && r.output.history.execution.map(x => x.kind + ":" + x.owner).join("|")
+        === "tool_call:c1|tool_result:c1|tool_call:c2|tool_result:c2");
 
     // A lone text record is never enough proof, including a structural notice.
     r = spliceHistorySnapshot([{type:"notice", text:"retry"}], [{type:"notice", data:{text:"retry"}}]);
@@ -766,7 +768,16 @@ async function main(){
       : {type:"user_prompt", data:{text:"u" + i}});
     r = spliceHistorySnapshot(windowH, fullS);
     chk("splice H200 typical user/assistant window retains older S coverage", r.match && r.match.mode === "window"
-      && r.output.history.entries.length === 200 && r.output.snapshot.extras.join(",") === "0,1,2,3,4");
+      && r.output.history.entries.length === 200 && r.output.snapshot.extras.join(",") === "0,1,2,3,4",
+      JSON.stringify({match:r.match && {mode:r.match.mode, length:r.match.length}, extras:r.output.snapshot.extras.slice(0,8)}));
+
+    const completeTurnsH = [{type:"message", message:{User:{content:"one"}}}, {type:"message", message:{Assistant:{content:"a", tool_calls:[]}}},
+      {type:"message", message:{User:{content:"two"}}}, {type:"message", message:{Assistant:{content:"b", tool_calls:[]}}}];
+    const completeTurnsS = [{type:"user_prompt", data:"one"}, {type:"assistant_delta", data:"a"},
+      {type:"usage", data:{context_input:3}}, {type:"user_prompt", data:"two"}, {type:"assistant_text", data:"b"}];
+    r = spliceHistorySnapshot(completeTurnsH, completeTurnsS);
+    chk("splice two complete actual snake-case string turns match across Usage", r.match && r.match.length === 4
+      && r.output.snapshot.extras.length === 0 && r.output.snapshot.uiOnly.length === 1);
 
     const usageS = [{type:"user_prompt", data:{text:"u"}}, {type:"assistant_delta", data:{delta:"a"}},
       {type:"usage", data:{context_input:9}}, {type:"tool_call", data:{name:"x", arguments:"{}"}}];
@@ -794,6 +805,29 @@ async function main(){
     chk("splice sparse bootstrap actual AssistantText and live tail retain raw events", r.output.snapshot.extras.length === 3
       && r.comparison.snapshot[0].text === "boot prefix" && r.comparison.snapshot[2].text === " live tail"
       && r.comparison.snapshot.every(x => x.source === "snapshot" && x.raw));
+
+    r = spliceHistorySnapshot([{type:"message", message:{User:{content:"old"}}}, {type:"message", message:{User:{content:"x"}}},
+      {type:"message", message:{Assistant:{content:"y", tool_calls:[]}}}, {type:"message", message:{User:{content:"later"}}}],
+      [{type:"user_prompt", data:"x"}, {type:"assistant_delta", data:"y"}, {type:"user_prompt", data:"new"}]);
+    chk("splice suffix never accepts interior H overlap", !r.match && r.output.snapshot.extras.length === 3);
+
+    const repeatedH = [{type:"message", message:{User:{content:"x"}}}, {type:"message", message:{Assistant:{content:"y", tool_calls:[]}}},
+      {type:"message", message:{User:{content:"x"}}}, {type:"message", message:{Assistant:{content:"y", tool_calls:[]}}}];
+    r = spliceHistorySnapshot(repeatedH, [{type:"user_prompt", data:"x"}, {type:"assistant_delta", data:"y"}]);
+    chk("splice repeated H picks only genuine suffix", r.match && r.match.mode === "suffix" && r.match.hStart === 2);
+
+    const sparseH = [{type:"message", message:{User:{content:"go"}}},
+      {type:"message", message:{Assistant:{content:null, reasoning:null, tool_calls:[{id:"c", name:"x", arguments:"{}"}]}}},
+      {type:"message", message:{Tool:{call_id:"c", content:"ok", is_error:false}}}];
+    r = spliceHistorySnapshot(sparseH, [{type:"user_prompt", data:"go"}, {type:"usage", data:{context_input:1}},
+      {type:"tool_call", data:{name:"x", arguments:"{}"}}, {type:"tool_result", data:{content:"ok", is_error:false}}]);
+    chk("splice empty assistant tool-only H matches actual S around Usage", r.match && r.output.snapshot.extras.length === 0 && r.output.snapshot.uiOnly.length === 1);
+
+    const turnsH = [{type:"message", message:{User:{content:"one"}}}, {type:"message", message:{Assistant:{content:"a", tool_calls:[]}}},
+      {type:"message", message:{User:{content:"two"}}}, {type:"message", message:{Assistant:{content:"b", tool_calls:[]}}}];
+    r = spliceHistorySnapshot(turnsH, [{type:"user_prompt", data:"one"}, {type:"assistant_delta", data:"a"},
+      {type:"notice", data:{text:"extra"}}, {type:"user_prompt", data:"two"}, {type:"assistant_delta", data:"b"}]);
+    chk("splice plan anchors S notice between retained H turns", r.match && r.output.snapshot.extraPlan[0].after === 1 && r.output.snapshot.extraPlan[0].before === 2);
 
     r = spliceHistorySnapshot([{type:"message", message:{Assistant:{content:"hello", tool_calls:[]}}}],
       [{type:"assistant_delta", data:"hello world"}]);
