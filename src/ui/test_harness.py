@@ -8533,9 +8533,9 @@ _status_rules_ok = bool(
         '.status-chip.compacting { color: var(--status-red)',
         '.status-chip.error      { color: var(--status-yellow)',
         '.status-chip.finished   { color: var(--status-inactive)',
-        '.busy-dot-wrap .orbit-badge text {',
-        'fill: var(--base01);',
     ])
+    and re.search(r'\.busy-dot-wrap\s+\.orbit-badge\s+circle\s*\{[^}]*stroke:\s*var\(--red\)', _css)
+    and re.search(r'\.busy-dot-wrap\s+\.orbit-badge\s+text\s*\{[^}]*fill:\s*var\(--red\)', _css)
     and re.search(r'\.composer-status\.finished\s*\{\s*color:\s*var\(--status-inactive\)', _css)
     and re.search(r'\.tree-status\.waiting\s*\{\s*color:\s*var\(--status-cyan\)', _css)
     and re.search(r'\.conn-state\.err\s*\{\s*color:\s*var\(--status-yellow\)', _css)

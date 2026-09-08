@@ -327,14 +327,14 @@
   /* 「+N」溢出徽章：SVG 圆形，放在右上 60° 环绕槽位（N>6 时环绕点只画 5
      个、空出此位），作为环的「第 6 个节点」。圆形 + 与圆点同一 viewBox
      坐标系，比旧 HTML 矩形徽章更协调，且不再压正上/右上环绕点。 */
-  /* 描边式中性计数角标，不把 aggregate count 误作错误状态。 */
+  /* 红色描边的「+N」溢出计数角标，表示额外活跃任务。 */
   .busy-dot-wrap .orbit-badge circle {
     fill: var(--base3);
-    stroke: var(--base01);
+    stroke: var(--red);
     stroke-width: 0.75px;
   }
   .busy-dot-wrap .orbit-badge text {
-    fill: var(--base01);
+    fill: var(--red);
     font-size: 5.5px;
     font-weight: bold;
     text-anchor: middle;           /* 水平居中于 x */
