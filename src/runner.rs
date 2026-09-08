@@ -955,8 +955,13 @@ impl SessionRunner {
             self.goal_continuation_armed = false;
             self.goal_continuation_remaining = None;
             self.goal_continuation_usage_unavailable = false;
-            self.armed_trigger = None;
-            self.maintenance_resume = false;
+            if self.armed_trigger == Some(RunnerTrigger::Resume) && self.maintenance_resume {
+                // FIFO maintenance interrupted a human-required tool turn.
+                // It resumes that turn, never the now-disarmed driver.
+            } else {
+                self.armed_trigger = None;
+                self.maintenance_resume = false;
+            }
             self.turn_just_ended = false;
         }
         Ok(())
@@ -1849,8 +1854,8 @@ impl SessionRunner {
                     // same-turn resume while resolving the exhausted driver.
                     if self.armed_trigger != Some(RunnerTrigger::Resume) {
                         self.maintenance_resume = false;
+                        self.armed_trigger = None;
                     }
-                    self.armed_trigger = None;
                 }
                 match self
                     .compact_operation(CompactionSource::Manual, charge_goal_continuation)
@@ -2067,7 +2072,9 @@ impl SessionRunner {
             // A valid answer is human-owned work required to complete the
             // already-committed tool call. It may make one (or more tool-
             // coupled) model rounds even when the Goal driver's cap stopped.
-            let mut human_required_continuation = false;
+            // FIFO maintenance resumes that same work through Resume.
+            let mut human_required_continuation =
+                resume_turn && trigger == Some(RunnerTrigger::Resume);
             'turn: loop {
                 // A capped continuation may overshoot on the call that spends
                 // its final tokens. This guard applies only to its own Goal
@@ -2222,6 +2229,7 @@ impl SessionRunner {
                 }
                 let mut auto_compacted = false;
                 let auto_compaction_allowed = !goal_turn
+                    || human_required_continuation
                     || (self.goal_continuation_remaining != Some(0)
                         && !self.goal_continuation_usage_unavailable);
                 if auto_compaction_allowed && self.agent.take_auto_compact_request() {
@@ -2230,7 +2238,10 @@ impl SessionRunner {
                         .unwrap()
                         .emit(AgentEvent::Notice("──── auto-compacting… ────".into()));
                     match self
-                        .compact_operation(CompactionSource::Auto, goal_turn)
+                        .compact_operation(
+                            CompactionSource::Auto,
+                            goal_turn && !human_required_continuation,
+                        )
                         .await
                     {
                         OperationFlow::Done(steering, committed) => {
@@ -2408,6 +2419,7 @@ impl SessionRunner {
                     }
                     if call.name == "request_compaction" {
                         let request_compaction_allowed = !goal_turn
+                            || human_required_continuation
                             || (self.goal_continuation_remaining != Some(0)
                                 && !self.goal_continuation_usage_unavailable);
                         let result = self
@@ -2659,7 +2671,7 @@ impl SessionRunner {
                     // A queued compact is maintenance inside this existing
                     // turn, not its conclusion. Reopen a blank ordinary or
                     // Goal turn after the FIFO compaction completes.
-                    if human_required_continuation && !self.has_prompt_work() {
+                    if human_required_continuation {
                         // Accepted input remains owned by this tool turn even
                         // when FIFO maintenance follows an exhausted Goal
                         // driver. Resume without rearming or resetting tools.
@@ -2678,14 +2690,13 @@ impl SessionRunner {
                         && matches!(self.pending.front(), Some(PendingCommand::Compact))
                     {
                         self.armed_trigger = Some(RunnerTrigger::Resume);
-                        self.maintenance_resume = true;
                     }
                     break 'turn;
                 }
                 // A goal update in this sibling batch can make the driver
                 // ineligible. Stop only after every sibling result and any
                 // background completion have been committed.
-                if self.goal_continuation_armed
+                if goal_turn
                     && !matches!(
                         self.agent.goal().as_ref().map(|goal| goal.status),
                         Some(GoalStatus::Active)
@@ -2693,9 +2704,13 @@ impl SessionRunner {
                 {
                     self.goal_continuation_armed = false;
                     self.goal_continuation_remaining = None;
-                    self.armed_trigger = None;
+                    self.goal_continuation_usage_unavailable = false;
                     self.turn_just_ended = false;
-                    break 'turn;
+                    if !human_required_continuation {
+                        self.armed_trigger = None;
+                        self.maintenance_resume = false;
+                        break 'turn;
+                    }
                 }
                 // Poll-guard termination: the full sibling batch is durably
                 // committed and the safe point ran — only now emit the
@@ -2713,7 +2728,10 @@ impl SessionRunner {
                 }
                 if requested_compaction && !auto_compacted {
                     match self
-                        .compact_operation(CompactionSource::Requested, goal_turn)
+                        .compact_operation(
+                            CompactionSource::Requested,
+                            goal_turn && !human_required_continuation,
+                        )
                         .await
                     {
                         OperationFlow::Done(steering, _) => {
