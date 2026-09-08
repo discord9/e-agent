@@ -789,28 +789,55 @@ to fields that are certainly already persisted before replay.
 
 ## History tool
 
-The always-available `history` tool reads only the current runner-bound
-workspace and session. It has three actions: `list`, `read`, and `search`; it
-accepts no workspace or session selector. `list` returns the newest logical
-entries ordered by logical `seq`, using bounded `limit` (default 20, maximum
-100), with no cursor or pagination fields. `read` takes `seq` and returns that
-complete logical entry, or a plain `history entry not found` error.
+The always-available `history` tool has `list`, `read`, and `search` actions.
+Without selectors it preserves the current runner-bound session API: `list`
+returns newest logical entries by `seq` (default limit 20, maximum 100), `read`
+returns one complete entry by `seq`, and literal, case-sensitive `search`
+examines User/Assistant/Notice text in the newest 100 entries. Default calls
+have no pagination fields.
 
-`search` takes a non-empty, case-sensitive literal `query` and optional bounded
-`limit`. It scans only the newest 100 logical entries and searches only User
-content, Assistant content, and Notice text. Matching complete entries are
-returned newest-first. Whitespace is significant; there is no regex or case
-folding.
+Explicit scopes query the same configured store read-only:
 
-This reflects the existing logical transcript and current logical winner:
-physical duplicate writes and same-seq replacements are not exposed as
-physical versions. Backend failures are logged internally but sanitized to a
-plain model-facing error. There is no History-specific receipt or output
-paging behavior.
+- `scope: "global"`: list/search transcripts across workspace IDs in that store.
+- `scope: "workspace"`: list/search one `workspace_id` (defaults to current).
+- `scope: "session"`: list/search/read the required `session_id`, within
+  `workspace_id` (defaults to current). IDs require an explicit scope.
 
-Non-goals (deliberately out of scope): physical-row inspection,
-backend-specific queries, cross-workspace/session access, and a separate
-history storage or truncation layer.
+```json
+{"action":"search","scope":"global","query":"9004","limit":20}
+{"action":"search","scope":"workspace","workspace_id":"/work/db","query":"9004"}
+{"action":"read","scope":"session","workspace_id":"/work/db","session_id":"review","seq":42}
+```
+
+Scoped results include `workspace_id`, `session_id`, `seq`, and the complete
+logical `entry`. Scoped list/search return `next_cursor`; pass a non-null cursor
+with the same action, scope, selectors and query to continue. Ordering is
+workspace ID ascending, session ID ascending, then sequence descending—not
+cross-session chronological order. Explicit search scans beyond the legacy
+100-entry window, using the same searchable text projection. This is a live
+view, not a frozen snapshot: new entries before the cursor require a fresh
+query. No scan-depth cutoff silently hides older matches. Session identities
+are queried in bounded batches; one complete transcript is loaded at a time
+for logical winner resolution, so a very large individual session can still
+require substantial memory. Entry-count limits are not byte limits.
+
+Database scopes use only the existing connection; they do not create/resume
+sessions, run schema setup, or select another database. SQLite global scope
+covers only the configured database file. JSONL has no cross-workspace catalog:
+its global scope covers transcript files in the current root, including those
+without metadata sidecars; foreign workspace selectors return an error and
+never open model-supplied filesystem paths.
+
+Physical duplicate writes and same-seq replacements use existing logical
+winner/conflict semantics before filtering. Backend failures are logged
+internally but sanitized in model-facing errors. No History-specific content
+truncation is introduced.
+
+Non-goals: physical-row inspection, arbitrary SQL or backend selection,
+federating database instances or JSONL roots, searching Tool/reasoning or other
+non-User/Assistant/Notice fields, persistent search indexes, and a separate
+history storage or truncation layer. Cross-session/workspace access, formerly
+excluded, is now explicitly available through scopes within the configured store.
 
 ## Web UI / headless server
 

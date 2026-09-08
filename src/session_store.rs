@@ -810,6 +810,17 @@ pub struct BackgroundRecord {
     pub store: SessionStore,
 }
 
+/// A logical transcript entry with the namespace that produced it. This is
+/// read-only history plumbing; it is intentionally not a second transcript
+/// representation.
+#[derive(Clone, Debug)]
+pub struct HistoryEntry {
+    pub workspace_id: String,
+    pub session_id: String,
+    pub seq: i64,
+    pub entry: SessionEntry,
+}
+
 impl SessionStore {
     /// Create a new store based on the configured backend.
     ///
@@ -1263,6 +1274,104 @@ impl SessionStore {
                 .lock()
                 .await
                 .load_with_seq()
+                .await
+                .map_err(anyhow::Error::msg),
+        }
+    }
+
+    /// Page identities from this configured store only. JSONL has no catalog
+    /// outside the current root; selectors never grant filesystem traversal.
+    pub async fn history_session_keys(
+        &self,
+        root: &Path,
+        workspace_id: Option<&str>,
+        session_id: Option<&str>,
+        after: Option<(&str, &str)>,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>> {
+        if let Some(id) = session_id {
+            crate::session::validate_session_name(id)?;
+        }
+        match self {
+            SessionStore::Jsonl => {
+                let workspace = derive_workspace_id(root);
+                if workspace_id.is_some_and(|id| id != workspace) {
+                    anyhow::bail!("JSONL history is limited to the current workspace");
+                }
+                let dir = root.join(".e-agent/sessions");
+                let files = match std::fs::read_dir(dir) {
+                    Ok(files) => files,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(Vec::new());
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                let mut keys = std::collections::BTreeSet::new();
+                for file in files {
+                    let path = file?.path();
+                    if path.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+                        continue;
+                    }
+                    let Some(name) = path.file_stem().and_then(|x| x.to_str()) else {
+                        continue;
+                    };
+                    if crate::session::validate_session_name(name).is_err()
+                        || session_id.is_some_and(|id| id != name)
+                        || after.is_some_and(|key| (workspace.as_str(), name) <= key)
+                    {
+                        continue;
+                    }
+                    keys.insert((workspace.clone(), name.to_owned()));
+                    if keys.len() > limit.min(100) {
+                        keys.pop_last();
+                    }
+                }
+                Ok(keys.into_iter().collect())
+            }
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session, .. } => {
+                session
+                    .history_session_keys(workspace_id, session_id, after, limit)
+                    .await
+            }
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite { session, .. } => session
+                .lock()
+                .await
+                .history_session_keys(workspace_id, session_id, after, limit)
+                .await
+                .map_err(anyhow::Error::msg),
+        }
+    }
+
+    /// Read a selected transcript without changing the runner's binding or
+    /// creating a target session. Winner resolution precedes History filtering.
+    pub async fn load_history_session(
+        &self,
+        root: &Path,
+        workspace_id: &str,
+        session_id: &str,
+    ) -> Result<Vec<(i64, SessionEntry)>> {
+        crate::session::validate_session_name(session_id)?;
+        match self {
+            SessionStore::Jsonl => {
+                anyhow::ensure!(
+                    workspace_id == derive_workspace_id(root),
+                    "JSONL history is limited to the current workspace"
+                );
+                self.load_with_seq(root, session_id).await
+            }
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session, .. } => {
+                session
+                    .load_history_with_seq(workspace_id, session_id)
+                    .await
+            }
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite { session, .. } => session
+                .lock()
+                .await
+                .load_history_with_seq(workspace_id, session_id)
                 .await
                 .map_err(anyhow::Error::msg),
         }
