@@ -573,29 +573,76 @@ impl GreptimeSession {
     ///
     /// 3. Output is ordered by the winning event_time ASC, then seq ASC.
     pub async fn load_with_seq(&self) -> Result<Vec<(i64, SessionEntry)>> {
-        let rows = self
-            .client
-            .query(
-                "SELECT seq, event_time, payload FROM session_entries \
-                 WHERE workspace_id = $1 AND session_id = $2 \
-                 ORDER BY event_time ASC, seq ASC",
-                &[&self.workspace_id, &self.session_id],
-            )
+        self.load_history_with_seq(&self.workspace_id, &self.session_id)
             .await
-            .context("cannot load session entries")?;
+    }
 
-        let raw: Vec<(i64, chrono::NaiveDateTime, String)> = rows
+    /// Read one explicitly scoped transcript using this existing connection;
+    /// no schema setup, migration, or write is performed.
+    pub async fn load_history_with_seq(
+        &self,
+        workspace_id: &str,
+        session_id: &str,
+    ) -> Result<Vec<(i64, SessionEntry)>> {
+        let rows = self.client.query(
+            "SELECT seq, event_time, payload FROM session_entries WHERE workspace_id = $1 AND session_id = $2 ORDER BY event_time ASC, seq ASC",
+            &[&workspace_id, &session_id],
+        ).await.context("cannot load session entries")?;
+        let raw = rows
             .iter()
             .map(|r| {
                 let seq: i64 = r.get("seq");
-                let et: chrono::NaiveDateTime = r.get("event_time");
-                let p: String = r.get("payload");
-                (seq, et, p)
+                let event_time: chrono::NaiveDateTime = r.get("event_time");
+                let payload: String = r.get("payload");
+                (seq, event_time, payload)
             })
-            .collect();
+            .collect::<Vec<_>>();
+        dedup_raw_entries(&raw, session_id, workspace_id, "event_time").map_err(anyhow::Error::msg)
+    }
 
-        dedup_raw_entries(&raw, &self.session_id, &self.workspace_id, "event_time")
-            .map_err(anyhow::Error::msg)
+    /// Page transcript identities, including transcripts without metadata.
+    pub async fn history_session_keys(
+        &self,
+        workspace_id: Option<&str>,
+        session_id: Option<&str>,
+        after: Option<(&str, &str)>,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>> {
+        let mut sql =
+            "SELECT DISTINCT workspace_id, session_id FROM session_entries WHERE TRUE".to_owned();
+        let mut values = Vec::<String>::new();
+        for (column, value) in [("workspace_id", workspace_id), ("session_id", session_id)] {
+            if let Some(value) = value {
+                values.push(value.to_owned());
+                sql.push_str(&format!(" AND {column} = ${}", values.len()));
+            }
+        }
+        if let Some((workspace, session)) = after {
+            let w = values.len() + 1;
+            let s = w + 1;
+            values.extend([workspace.to_owned(), session.to_owned()]);
+            sql.push_str(&format!(
+                " AND (workspace_id > ${w} OR (workspace_id = ${w} AND session_id > ${s}))"
+            ));
+        }
+        // The only interpolated value is an internal integer bound, never text.
+        sql.push_str(&format!(
+            " ORDER BY workspace_id, session_id LIMIT {}",
+            limit.min(100)
+        ));
+        let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = values
+            .iter()
+            .map(|value| value as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+        let rows = self
+            .client
+            .query(&sql, &params)
+            .await
+            .context("cannot enumerate session history")?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect())
     }
 
     /// Load every entry paired with its EXACT physical located key

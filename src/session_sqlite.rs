@@ -628,14 +628,111 @@ impl SqliteSession {
     ///
     /// 3. Output is ordered by the winning event_time ASC, then seq ASC.
     pub async fn load_with_seq(&self) -> Result<Vec<(i64, SessionEntry)>, String> {
-        let raw = self
-            .query_raw_entries(
-                "SELECT seq, event_time_us, payload FROM session_entries \
-                 WHERE workspace_id = ?1 AND session_id = ?2 \
-                 ORDER BY event_time_us ASC, seq ASC",
-            )
-            .await?;
-        dedup_raw_entries(&raw, &self.session_id, &self.workspace_id, "event_time_us")
+        self.load_history_with_seq(&self.workspace_id, &self.session_id)
+            .await
+    }
+
+    /// Read one explicitly scoped transcript through this existing database
+    /// connection. This is SELECT-only and does not create a session binding.
+    pub async fn load_history_with_seq(
+        &self,
+        workspace_id: &str,
+        session_id: &str,
+    ) -> Result<Vec<(i64, SessionEntry)>, String> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn.query(
+            "SELECT seq, event_time_us, payload FROM session_entries WHERE workspace_id = ?1 AND session_id = ?2 ORDER BY event_time_us ASC, seq ASC",
+            (workspace_id, session_id),
+        ).await.map_err(|e| format!("cannot load session entries: {e}"))?;
+        let mut raw = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| format!("cannot load session entries: {e}"))?
+        {
+            let seq = row
+                .get_value(0)
+                .map_err(|e| format!("cannot load session entries: {e}"))?
+                .as_integer()
+                .copied()
+                .ok_or_else(|| "cannot load session entries: seq is not an integer".to_owned())?;
+            let event_time = row
+                .get_value(1)
+                .map_err(|e| format!("cannot load session entries: {e}"))?
+                .as_integer()
+                .copied()
+                .ok_or_else(|| {
+                    "cannot load session entries: event_time is not an integer".to_owned()
+                })?;
+            let payload = row
+                .get_value(2)
+                .map_err(|e| format!("cannot load session entries: {e}"))?
+                .as_text()
+                .map(|v| v.to_string())
+                .ok_or_else(|| "cannot load session entries: payload is not text".to_owned())?;
+            raw.push((seq, us_to_datetime(event_time), payload));
+        }
+        dedup_raw_entries(&raw, session_id, workspace_id, "event_time_us")
+    }
+
+    /// Page transcript identities without relying on metadata sidecars.
+    pub async fn history_session_keys(
+        &self,
+        workspace_id: Option<&str>,
+        session_id: Option<&str>,
+        after: Option<(&str, &str)>,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>, String> {
+        let mut sql =
+            "SELECT DISTINCT workspace_id, session_id FROM session_entries WHERE TRUE".to_owned();
+        let mut params = Vec::<turso::Value>::new();
+        for (column, value) in [("workspace_id", workspace_id), ("session_id", session_id)] {
+            if let Some(value) = value {
+                params.push(turso::Value::Text(value.to_owned()));
+                sql.push_str(&format!(" AND {column} = ?{}", params.len()));
+            }
+        }
+        if let Some((workspace, session)) = after {
+            let w = params.len() + 1;
+            let s = w + 1;
+            params.extend([
+                turso::Value::Text(workspace.to_owned()),
+                turso::Value::Text(session.to_owned()),
+            ]);
+            sql.push_str(&format!(
+                " AND (workspace_id > ?{w} OR (workspace_id = ?{w} AND session_id > ?{s}))"
+            ));
+        }
+        sql.push_str(&format!(
+            " ORDER BY workspace_id, session_id LIMIT {}",
+            limit.min(100)
+        ));
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(&sql, turso::params_from_iter(params))
+            .await
+            .map_err(|e| format!("cannot enumerate session history: {e}"))?;
+        let mut keys = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| format!("cannot enumerate session history: {e}"))?
+        {
+            let workspace = row
+                .get_value(0)
+                .map_err(|e| e.to_string())?
+                .as_text()
+                .ok_or("history workspace_id is not text")?
+                .to_owned();
+            let session = row
+                .get_value(1)
+                .map_err(|e| e.to_string())?
+                .as_text()
+                .ok_or("history session_id is not text")?
+                .to_owned();
+            keys.push((workspace, session));
+        }
+        Ok(keys)
     }
 
     /// Load every entry paired with its EXACT physical located key
