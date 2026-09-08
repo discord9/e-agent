@@ -1785,8 +1785,8 @@ impl SessionRunner {
             if !goal_boundary {
                 match self.commit_backgrounds().await {
                     Ok(true)
-                        if !self.has_prompt_work()
-                            && !(self.armed_trigger == Some(RunnerTrigger::Resume)
+                        if !(self.has_prompt_work()
+                            || self.armed_trigger == Some(RunnerTrigger::Resume)
                                 && self.maintenance_resume) =>
                     {
                         // A completion gets exactly one ordinary follow-up even
