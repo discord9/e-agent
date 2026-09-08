@@ -245,176 +245,170 @@ function restoreUsageFromSnapshot(events) {
   }
 }
 
-/* Pure phase-1 matching: no DOM/state ownership.  The return plan keeps each
-   original history entry once and classifies every snapshot event for phase 2. */
-function spliceRecord(source, index, kind, text, raw, fields) {
-  return Object.assign({ source, index, kind, text: String(text == null ? "" : text), raw,
-    indices: [index] }, fields || {});
+/* Pure phase-1 ordered H/S matcher.  It returns raw entry/event references and
+   part-level placement only; it deliberately owns no DOM, cache, or lifecycle. */
+function spliceRecord(source, index, kind, raw, fields) {
+  return Object.assign({ source, index, kind, raw, indices: [index] }, fields || {});
 }
 function eventText(data, keys) { return pickText(data, keys); }
 function normalizeHistoryForSplice(entries) {
   const out = [], pending = new Map(), order = [];
-  const callRecord = (call) => spliceRecord("history", call.index, "tool_call", "", call.raw,
-    { name: call.name, arguments: call.arguments, owner: call.id });
-  const flushCalls = () => { for (const id of order.splice(0)) {
-    const call = pending.get(id); pending.delete(id); if (call) out.push(callRecord(call));
-  }};
+  const call = (c) => spliceRecord("history", c.index, "tool_call", c.raw,
+    { part: "call:" + c.callIndex, owner: c.id, name: c.name, arguments: c.arguments });
+  const flush = () => { for (const id of order.splice(0)) { const c = pending.get(id); pending.delete(id); if (c) out.push(call(c)); } };
   for (let index = 0; index < (entries || []).length; index++) {
-    const entry = entries[index]; if (!entry) continue;
-    if (entry.type !== "message") {
-      flushCalls();
-      if (entry.type === "notice") out.push(spliceRecord("history", index, "notice", entry.text, entry));
-      else if (entry.type === "error") out.push(spliceRecord("history", index, "error", entry.text, entry));
-      else if (entry.type === "compaction") out.push(spliceRecord("history", index, "compaction", entry.summary, entry));
-      else out.push(spliceRecord("history", index, entry.type || "unknown", JSON.stringify(entry), entry));
-      continue;
+    const raw = entries[index]; if (!raw) continue;
+    if (raw.type !== "message") {
+      flush(); out.push(spliceRecord("history", index, raw.type || "unknown", raw, { part: raw.type || "unknown", text: raw.text || raw.summary || JSON.stringify(raw) })); continue;
     }
-    const message = entry.message || {};
-    if (message.User) { flushCalls(); out.push(spliceRecord("history", index, "user", message.User.content, entry)); }
-    else if (message.System) { flushCalls(); out.push(spliceRecord("history", index, "system", message.System.content, entry)); }
-    else if (message.Assistant) {
-      flushCalls(); const a = message.Assistant;
-      if (a.reasoning != null) { const r = spliceRecord("history", index, "reasoning", a.reasoning, entry); r.neutral = true; out.push(r); }
-      // The original rich entry remains in output.  A tool-only assistant has
-      // no S AssistantText counterpart, so its empty content is not comparison evidence.
-      if (a.content != null && (a.content !== "" || !(a.tool_calls || []).length)) {
-        out.push(spliceRecord("history", index, "assistant", a.content, entry));
+    const m = raw.message || {};
+    if (m.User) { flush(); out.push(spliceRecord("history", index, "user", raw, { part:"user", text:m.User.content || "" })); }
+    else if (m.System) { flush(); out.push(spliceRecord("history", index, "system", raw, { part:"system", text:m.System.content || "" })); }
+    else if (m.Assistant) {
+      flush(); const a = m.Assistant;
+      if (a.reasoning != null) out.push(spliceRecord("history", index, "reasoning", raw, { part:"reasoning", text:a.reasoning, sparse:true }));
+      if (a.content != null && (a.content !== "" || !(a.tool_calls || []).length)) out.push(spliceRecord("history", index, "assistant", raw, { part:"text", text:a.content }));
+      for (let callIndex = 0; callIndex < (a.tool_calls || []).length; callIndex++) {
+        const c = a.tool_calls[callIndex], args = typeof c.arguments === "string" ? c.arguments : JSON.stringify(c.arguments || {});
+        pending.set(c.id, { id:c.id, index, raw, callIndex, name:c.name || "", arguments:args }); order.push(c.id);
       }
-      for (const call of a.tool_calls || []) {
-        const args = typeof call.arguments === "string" ? call.arguments : JSON.stringify(call.arguments || {});
-        pending.set(call.id, { id: call.id, name: call.name || "", arguments: args, raw: entry, index }); order.push(call.id);
-      }
-    } else if (message.Tool) {
-      const tool = message.Tool, call = pending.get(tool.call_id);
-      if (call) { pending.delete(tool.call_id); order.splice(order.indexOf(tool.call_id), 1); out.push(callRecord(call)); }
-      out.push(spliceRecord("history", index, "tool_result", "", entry,
-        { content: tool.content || "", isError: tool.is_error === true, owner: tool.call_id || "" }));
-    } else { flushCalls(); out.push(spliceRecord("history", index, "message_unknown", JSON.stringify(message), entry)); }
-  }
-  flushCalls(); return out;
-}
-function normalizeSnapshotForSplice(events) {
-  const out = []; let lane = "", text = "", first = -1, raw = [], indices = [];
-  const flush = () => { if (lane) { const r = spliceRecord("snapshot", first, lane, text, raw.slice()); r.indices = indices.slice(); out.push(r); }
-    lane = ""; text = ""; first = -1; raw = []; indices = []; };
-  for (let index = 0; index < (events || []).length; index++) {
-    const event = events[index] || {}, type = String(event.type || "").toLowerCase();
-    const data = event.data !== undefined ? event.data : event;
-    const next = (type === "assistant_delta" || type === "assistantdelta") ? "assistant"
-      : (type === "reasoning_delta" || type === "reasoningdelta") ? "reasoning" : "";
-    if (next) { if (lane && lane !== next) flush(); if (!lane) { lane = next; first = index; }
-      text += eventText(data, ["delta", "text", "content", "reasoning"]); raw.push(event); indices.push(index); continue; }
-    flush();
-    if (type === "assistant_text" || type === "assistanttext") out.push(spliceRecord("snapshot", index, "assistant", eventText(data, ["text", "content"]), event));
-    else if (type === "user_prompt" || type === "userprompt") out.push(spliceRecord("snapshot", index, "user", eventText(data, ["text", "prompt", "content"]), event));
-    else if (type === "tool_call" || type === "toolcall") { const p = data && typeof data === "object" ? data : {};
-      out.push(spliceRecord("snapshot", index, "tool_call", "", event, { name: eventText(p, ["name"]), arguments: typeof p.arguments === "string" ? p.arguments : JSON.stringify(p.arguments || {}) }));
-    } else if (type === "tool_result" || type === "toolresult") { const p = data && typeof data === "object" ? data : {};
-      out.push(spliceRecord("snapshot", index, "tool_result", "", event, { content: eventText(p, ["content", "text", "result", "error"]), isError: p.is_error === true || p.error === true }));
-    } else if (type === "notice") out.push(spliceRecord("snapshot", index, "notice", eventText(data, ["text", "message"]), event));
-    else if (type === "error") out.push(spliceRecord("snapshot", index, "error", eventText(data, ["error", "message", "text"]), event));
-    else if (type === "usage") { const r = spliceRecord("snapshot", index, "usage", "", event); r.neutral = true; out.push(r); }
-    else out.push(spliceRecord("snapshot", index, type || "unknown", JSON.stringify(data), event));
+    } else if (m.Tool) {
+      const t = m.Tool, c = pending.get(t.call_id);
+      if (c) { pending.delete(t.call_id); order.splice(order.indexOf(t.call_id), 1); out.push(call(c)); }
+      out.push(spliceRecord("history", index, "tool_result", raw, { part:"result", owner:t.call_id || "", content:t.content || "", isError:t.is_error === true }));
+    } else { flush(); out.push(spliceRecord("history", index, "message_unknown", raw, { part:"unknown", text:JSON.stringify(m) })); }
   }
   flush(); return out;
 }
-function spliceSame(a, b) {
-  if (!a || !b || a.kind !== b.kind || (a.owner && b.owner && a.owner !== b.owner)) return false;
-  if (a.kind === "tool_call") return a.name === b.name && a.arguments === b.arguments;
-  if (a.kind === "tool_result") return a.isError === b.isError && a.content === b.content;
-  return a.text === b.text;
+function normalizeSnapshotForSplice(events) {
+  const out = []; let lane = "", text = "", raw = [], indices = [];
+  const flush = () => { if (lane) out.push(Object.assign(spliceRecord("snapshot", indices[0], lane, raw.slice(), { part:lane, text }), { indices:indices.slice() })); lane=""; text=""; raw=[]; indices=[]; };
+  for (let index = 0; index < (events || []).length; index++) {
+    const event = events[index] || {}, type = String(event.type || "").toLowerCase(), data = event.data !== undefined ? event.data : event;
+    const next = type === "assistant_delta" || type === "assistantdelta" ? "assistant" : type === "reasoning_delta" || type === "reasoningdelta" ? "reasoning" : "";
+    if (next) { if (lane && lane !== next) flush(); if (!lane) lane=next; text += eventText(data,["delta","text","content","reasoning"]); raw.push(event); indices.push(index); continue; }
+    flush();
+    if (type === "assistant_text" || type === "assistanttext") out.push(spliceRecord("snapshot", index, "assistant", event, { part:"text", text:eventText(data,["text","content"]) }));
+    else if (type === "user_prompt" || type === "userprompt") out.push(spliceRecord("snapshot", index, "user", event, { part:"user", text:eventText(data,["text","prompt","content"]) }));
+    else if (type === "tool_call" || type === "toolcall") { const p=data && typeof data === "object" ? data : {}; out.push(spliceRecord("snapshot",index,"tool_call",event,{part:"call",name:eventText(p,["name"]),arguments:typeof p.arguments === "string" ? p.arguments : JSON.stringify(p.arguments || {})})); }
+    else if (type === "tool_result" || type === "toolresult") { const p=data && typeof data === "object" ? data : {}; out.push(spliceRecord("snapshot",index,"tool_result",event,{part:"result",content:eventText(p,["content","text","result","error"]),isError:p.is_error === true || p.error === true})); }
+    else if (type === "usage") out.push(spliceRecord("snapshot",index,"usage",event,{part:"usage",neutral:true}));
+    else if (type === "notice") out.push(spliceRecord("snapshot",index,"notice",event,{part:"notice",text:eventText(data,["text","message"]),display:true}));
+    else if (type === "error") out.push(spliceRecord("snapshot",index,"error",event,{part:"error",text:eventText(data,["error","message","text"])}));
+    else out.push(spliceRecord("snapshot",index,type || "unknown",event,{part:type || "unknown",text:JSON.stringify(data)}));
+  }
+  flush(); return out;
 }
-function longestAt(history, hi, snapshot, si) {
-  const matched = []; let h = hi, s = si;
+function spliceSame(h, s) {
+  if (!h || !s || h.kind !== s.kind) return false;
+  if (h.kind === "tool_call") return h.name === s.name && h.arguments === s.arguments;
+  if (h.kind === "tool_result") return h.isError === s.isError && h.content === s.content;
+  return h.text === s.text;
+}
+function sparseCallCanOmit(history, h, snapshot, s) {
+  if (history[h].kind !== "tool_call" || snapshot[s].kind !== "tool_result") return false;
+  for (let i=h+1; i<history.length; i++) {
+    if (history[i].kind === "tool_call") continue;
+    return history[i].kind === "tool_result" && spliceSame(history[i], snapshot[s]);
+  }
+  return false;
+}
+/* One walker: exact substantive pairs; Usage is neutral; missing H reasoning and
+   calls are sparse only under the documented conditions; only notice may gap two
+   established anchors.  Error/U/tool/content mismatches stop the candidate. */
+function walkSplice(history, startH, snapshot, startS) {
+  let h = startH, s = startS, pairs = [];
   while (h < history.length) {
     while (s < snapshot.length && snapshot[s].neutral) s++;
-    if (h >= history.length || s >= snapshot.length) break;
-    // Rich H reasoning is optional in sparse S, but remains exact evidence when
-    // S did send its reasoning lane.
-    if (history[h].neutral && !spliceSame(history[h], snapshot[s])) { h++; continue; }
-    if (spliceSame(history[h], snapshot[s])) { matched.push({ h: h++, s: s++ }); continue; }
-    // Skip only an S event demonstrably between two H anchors.  Never skip a
-    // mismatch before the first match or after the matched S prefix.
-    if (matched.length && s + 1 < snapshot.length && spliceSame(history[h], snapshot[s + 1])) { s++; continue; }
+    if (s >= snapshot.length) break;
+
+    if (history[h].kind === "reasoning" && snapshot[s].kind !== "reasoning") {
+      h++;
+      continue;
+    }
+    // A differing S reasoning lane is display data, not evidence for H's rich
+    // reasoning. Retain it as an extra and resume at the following H part.
+    if (history[h].kind === "reasoning" && snapshot[s].kind === "reasoning"
+        && !spliceSame(history[h], snapshot[s])) {
+      h++;
+      s++;
+      continue;
+    }
+    if (history[h].kind === "tool_call" && sparseCallCanOmit(history, h, snapshot, s)) {
+      h++;
+      continue;
+    }
+    if (spliceSame(history[h], snapshot[s])) {
+      pairs.push({h:h++, s:s++});
+      continue;
+    }
+    // Notices, and an ownerless result between two matched calls, are retained
+    // as S extras rather than ending an otherwise anchored comparison. A call
+    // is still not omitted: the later S call must itself match this H call.
+    const canGap = (record) => record.display
+      || (history[h].kind === "tool_call" && record.kind === "tool_result");
+    if (pairs.length && canGap(snapshot[s])) {
+      let next = s;
+      while (next < snapshot.length && canGap(snapshot[next])) next++;
+      if (next < snapshot.length && spliceSame(history[h], snapshot[next])) {
+        s = next;
+        continue;
+      }
+    }
     break;
   }
-  while (h < history.length && history[h].neutral) h++;
-  return { length: matched.length, end: s, endHistory: h, matched };
+  return { pairs, endH:h, endS:s };
 }
-function prefixAt(history, hi, snapshot, si) {
-  const got = longestAt(history, hi, snapshot, si);
-  return got.length ? got : null;
-}
-function windowAt(history, snapshot, si) {
-  let h = 0, s = si, pairs = [];
-  while (h < history.length && s < snapshot.length) {
-    while (h < history.length && history[h].neutral) h++;
-    while (s < snapshot.length && snapshot[s].neutral) s++;
-    if (h >= history.length || s >= snapshot.length || !spliceSame(history[h], snapshot[s])) break;
-    pairs.push({ h: h++, s: s++ });
+function splicePlan(historyEntries, snapshotEvents, history, snapshot, match) {
+  const matched=new Set(), uiOnly=new Set(), pairsByHistory=new Map();
+  for (const s of snapshot) for (const i of s.indices) if (s.neutral) uiOnly.add(i);
+  if (match) for (const pair of match.pairs) {
+    pairsByHistory.set(pair.h, pair);
+    for (const i of snapshot[pair.s].indices) matched.add(i);
   }
-  while (h < history.length && history[h].neutral) h++;
-  return pairs.length ? { length: pairs.length, endHistory: h, matched: pairs } : null;
-}
-function splicePlan(historyEntries, snapshotEvents, match, history) {
-  const matched = new Set(), neutral = new Set();
-  const snapshot = normalizeSnapshotForSplice(snapshotEvents);
-  for (const r of snapshot) for (const i of r.indices) { if (r.neutral) neutral.add(i); }
-  if (match) for (const pair of match.pairs) for (const i of snapshot[pair.s].indices) matched.add(i);
-  const extras = [], uiOnly = [];
-  for (let i = 0; i < snapshotEvents.length; i++) {
-    if (neutral.has(i)) uiOnly.push(i);
-    else if (!matched.has(i)) extras.push(i);
-  }
-  const extraPlan = extras.map((index) => {
-    const record = snapshot.find((r) => r.indices.includes(index));
-    let after = -1, before = historyEntries.length;
-    if (match && record) {
-      const prior = match.pairs.filter((p) => p.s < snapshot.indexOf(record)).pop();
-      const next = match.pairs.find((p) => p.s > snapshot.indexOf(record));
-      if (prior) after = history[prior.h].index;
-      if (next) before = history[next.h].index;
+  const extras=[];
+  for (let i=0;i<snapshotEvents.length;i++) if (!matched.has(i) && !uiOnly.has(i)) extras.push(i);
+
+  // Matched S records are anchors, never output.  Advance S only toward the
+  // next anchor: unmatched records stay between the surrounding H components,
+  // and an H component without a pair cannot consume a later matched S record.
+  const components=[]; let si=0;
+  const emitSnapshot = (record) => {
+    for (const index of record.indices) {
+      if (!matched.has(index) && !uiOnly.has(index)) {
+        components.push({source:"snapshot",index,raw:snapshotEvents[index]});
+      }
     }
-    return { index, after, before };
-  });
-  return { history: {
-    entries: historyEntries.slice(), indices: historyEntries.map((_v, i) => i),
-    // Phase 2 can seed pending tool cards in this execution order, rather than
-    // pairing an ownerless S result with the latest arbitrary card.
-    execution: history.filter((r) => r.kind === "tool_call" || r.kind === "tool_result")
-      .map((r) => ({ kind: r.kind, entry: r.index, owner: r.owner || "" }))
-  }, snapshot: { events: snapshotEvents.slice(), matched: [...matched], extras, uiOnly, extraPlan } };
+  };
+  for (let h=0; h<history.length; h++) {
+    const pair=pairsByHistory.get(h);
+    if (pair) {
+      while (si < pair.s) emitSnapshot(snapshot[si++]);
+      // Pairs are monotonic, so this only skips the current matched anchor.
+      si = pair.s + 1;
+    } else if (match) {
+      const next=match.pairs.find((p) => p.h > h);
+      // Extras after the last anchor belong before the following unpaired H
+      // component (not after every H); without anchors, H remains before S.
+      const limit=next ? next.s : snapshot.length;
+      while (si < limit) emitSnapshot(snapshot[si++]);
+    }
+    components.push({source:"history",entry:history[h].index,part:history[h].part,
+      raw:history[h].raw,owner:history[h].owner || ""});
+  }
+  while (si < snapshot.length) emitSnapshot(snapshot[si++]);
+  return { history:{entries:historyEntries.slice(), execution:history.filter(r=>r.kind==="tool_call"||r.kind==="tool_result").map(r=>({kind:r.kind,entry:r.index,part:r.part,owner:r.owner||""}))}, snapshot:{events:snapshotEvents.slice(),matched:[...matched],extras,uiOnly:[...uiOnly]}, components };
 }
 function spliceAlignedRecords(historyEntries, snapshotEvents) {
-  const history = normalizeHistoryForSplice(historyEntries), snapshot = normalizeSnapshotForSplice(snapshotEvents), candidates = [];
-  if (history.length) {
-    for (let s = 0; s < snapshot.length; s++) if (spliceSame(history[0], snapshot[s])) {
-      const got = windowAt(history, snapshot, s);
-      // A bounded H window can begin with assistant/reasoning text only when
-      // surrounding agreement proves the occurrence; lone matches stay ambiguous.
-      if (got && got.length >= 2 && got.endHistory === history.length) {
-        candidates.push({ mode: "window", hStart: 0, sStart: s, length: got.length, pairs: got.matched });
-      }
-    }
-    // S-prefix overlap is a suffix only when it reaches H's actual end.
-    for (let start = 0; start < history.length; start++) {
-      const got = prefixAt(history, start, snapshot, 0);
-      if (got && got.length >= 2 && got.endHistory === history.length) {
-        candidates.push({ mode: "suffix", hStart: start, sStart: 0, length: got.length, pairs: got.matched });
-      }
-    }
-  }
-  const max = candidates.reduce((n, c) => Math.max(n, c.length), 0);
-  const best = candidates.filter(c => c.length === max);
-  // A full H-window match is more specific than the same pairs viewed as a
-  // suffix; otherwise different maximum locations remain ambiguous.
-  const preferred = best.some((c) => c.mode === "window") ? best.filter((c) => c.mode === "window") : best;
-  const distinct = preferred.filter((c, i) => preferred.findIndex((d) => d.hStart === c.hStart && d.sStart === c.sStart && d.length === c.length) === i);
-  // Equal-length matches at different locations are intentionally ambiguous.
-  const match = distinct.length === 1 ? distinct[0] : null;
-  return { comparison: { history, snapshot }, match, output: splicePlan(historyEntries, snapshotEvents, match, history) };
+  const history=normalizeHistoryForSplice(historyEntries), snapshot=normalizeSnapshotForSplice(snapshotEvents), candidates=[];
+  for (let s=0;s<snapshot.length;s++) if (history.length && spliceSame(history[0],snapshot[s])) { const w=walkSplice(history,0,snapshot,s); if (w.pairs.length>=2 && w.endH===history.length) candidates.push({mode:"window",hStart:0,sStart:s,pairs:w.pairs}); }
+  if (snapshot.length) for (let h=0;h<history.length;h++) if (spliceSame(history[h],snapshot[0])) { const w=walkSplice(history,h,snapshot,0); if (w.pairs.length>=2 && w.endH===history.length) candidates.push({mode:"suffix",hStart:h,sStart:0,pairs:w.pairs}); }
+  const max=candidates.reduce((n,c)=>Math.max(n,c.pairs.length),0), best=candidates.filter(c=>c.pairs.length===max), windows=best.filter(c=>c.mode==="window"), chosen=windows.length?windows:best;
+  const match=chosen.length===1?chosen[0]:null;
+  if (match) match.length = match.pairs.length;
+  return {comparison:{history,snapshot},match,output:splicePlan(historyEntries,snapshotEvents,history,snapshot,match)};
 }
-function spliceHistorySnapshot(historyEntries, snapshotEvents) { return spliceAlignedRecords(historyEntries || [], snapshotEvents || []); }
+function spliceHistorySnapshot(historyEntries,snapshotEvents) { return spliceAlignedRecords(historyEntries||[],snapshotEvents||[]); }
 
 /* 初始 snapshot 只补回缓存视图中仍在流式的助手尾巴。history 是已完成
    transcript 的权威来源；snapshot 的完整事件尾部则只用于把当前 in-flight

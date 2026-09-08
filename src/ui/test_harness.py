@@ -719,6 +719,24 @@ async function main(){
   let fail=0;
   const chk=(name, ok, extra)=>{ if(!ok) fail++; console.log((ok?"PASS":"FAIL")+" "+name+(extra?"  "+extra:"")); };
   if (MODE === 'splice') {
+    const plan = (history, snapshot) => {
+      const result = spliceHistorySnapshot(history, snapshot);
+      const historyParts = result.output.components.filter((x) => x.source === "history")
+        .map((x) => x.entry + ":" + x.part);
+      const normalizedParts = result.comparison.history
+        .map((x) => x.index + ":" + x.part);
+      const snapshotIndices = result.output.components.filter((x) => x.source === "snapshot")
+        .map((x) => x.index);
+      const historyOk = historyParts.join("|") === normalizedParts.join("|");
+      chk("splice plan keeps every normalized H part once in H order", historyOk,
+        historyOk ? "" : historyParts.join("|") + " != " + normalizedParts.join("|"));
+      const snapshotOk = snapshotIndices.join(",") === result.output.snapshot.extras.join(",");
+      chk("splice plan snapshot components are exactly unmatched S indices in source order", snapshotOk,
+        snapshotOk ? "" : snapshotIndices.join(",") + " != " + result.output.snapshot.extras.join(","));
+      return result;
+    };
+    const componentSequence = (result) => result.output.components.map((x) =>
+      x.source === "history" ? "H" + x.entry + ":" + x.part : "S" + x.index).join("|");
     const H = [
       {type:"message", message:{User:{content:"ask"}}},
       {type:"message", message:{Assistant:{content:"done", reasoning:"why", tool_calls:[]}}},
@@ -728,7 +746,7 @@ async function main(){
       {type:"reasoning_delta", data:{delta:"why"}},
       {type:"assistant_delta", data:{delta:"done"}},
     ];
-    let r = spliceHistorySnapshot(H, S);
+    let r = plan(H, S);
     chk("splice ordinary completed stream returns one rich H coverage plus no S extras", r.match && r.match.length === 3
       && r.output.history.entries.length === 2 && r.output.snapshot.extras.length === 0
       && r.output.snapshot.matched.length === 3);
@@ -746,7 +764,7 @@ async function main(){
       {type:"tool_call", data:{name:"two", arguments:"{}"}},
       {type:"tool_result", data:{content:"r2", is_error:false}},
     ];
-    r = spliceHistorySnapshot(H2, S2);
+    r = plan(H2, S2);
     chk("splice two bundled calls normalize at later execution results", r.match && r.match.length === 5
       && r.output.history.entries.length === 3 && r.output.snapshot.extras.length === 0
       && r.comparison.history.map(x => x.kind + ":" + (x.name || x.content || x.text)).join("|")
@@ -755,9 +773,9 @@ async function main(){
         === "tool_call:c1|tool_result:c1|tool_call:c2|tool_result:c2");
 
     // A lone text record is never enough proof, including a structural notice.
-    r = spliceHistorySnapshot([{type:"notice", text:"retry"}], [{type:"notice", data:{text:"retry"}}]);
+    r = plan([{type:"notice", text:"retry"}], [{type:"notice", data:{text:"retry"}}]);
     chk("splice single repeated notice remains ambiguous", !r.match && r.output.snapshot.extras.length === 1);
-    r = spliceHistorySnapshot([{type:"message", message:{Assistant:{content:"same", tool_calls:[]}}}],
+    r = plan([{type:"message", message:{Assistant:{content:"same", tool_calls:[]}}}],
       [{type:"assistant_delta", data:{delta:"same"}}, {type:"assistant_delta", data:{delta:"same"}}]);
     chk("splice repeated standalone output is not globally suppressed", !r.match && r.output.snapshot.extras.length === 2);
 
@@ -766,7 +784,7 @@ async function main(){
     const windowH = old.slice(5);
     const fullS = old.map((x, i) => i % 2 ? {type:"assistant_text", data:{text:"a" + i}}
       : {type:"user_prompt", data:{text:"u" + i}});
-    r = spliceHistorySnapshot(windowH, fullS);
+    r = plan(windowH, fullS);
     chk("splice H200 typical user/assistant window retains older S coverage", r.match && r.match.mode === "window"
       && r.output.history.entries.length === 200 && r.output.snapshot.extras.join(",") === "0,1,2,3,4",
       JSON.stringify({match:r.match && {mode:r.match.mode, length:r.match.length}, extras:r.output.snapshot.extras.slice(0,8)}));
@@ -775,61 +793,130 @@ async function main(){
       {type:"message", message:{User:{content:"two"}}}, {type:"message", message:{Assistant:{content:"b", tool_calls:[]}}}];
     const completeTurnsS = [{type:"user_prompt", data:"one"}, {type:"assistant_delta", data:"a"},
       {type:"usage", data:{context_input:3}}, {type:"user_prompt", data:"two"}, {type:"assistant_text", data:"b"}];
-    r = spliceHistorySnapshot(completeTurnsH, completeTurnsS);
+    r = plan(completeTurnsH, completeTurnsS);
     chk("splice two complete actual snake-case string turns match across Usage", r.match && r.match.length === 4
       && r.output.snapshot.extras.length === 0 && r.output.snapshot.uiOnly.length === 1);
 
     const usageS = [{type:"user_prompt", data:{text:"u"}}, {type:"assistant_delta", data:{delta:"a"}},
       {type:"usage", data:{context_input:9}}, {type:"tool_call", data:{name:"x", arguments:"{}"}}];
     const usageH = [{type:"message", message:{User:{content:"u"}}}, {type:"message", message:{Assistant:{content:"a", tool_calls:[{id:"x", name:"x", arguments:"{}"}]}}}];
-    r = spliceHistorySnapshot(usageH, usageS);
+    r = plan(usageH, usageS);
     chk("splice usage is neutral for matching but retained UI-only", r.match && r.match.length === 3
       && r.output.snapshot.uiOnly.length === 1 && r.output.snapshot.extras.length === 0);
 
-    r = spliceHistorySnapshot([{type:"message", message:{Tool:{call_id:"x", content:"!ok", is_error:false}}},
+    r = plan([{type:"message", message:{Tool:{call_id:"x", content:"!ok", is_error:false}}},
       {type:"message", message:{Tool:{call_id:"y", content:"ok", is_error:true}}}],
       [{type:"tool_result", data:{content:"ok", is_error:true}}]);
     chk("splice tool result compares error flag separately from content", !r.match && r.output.snapshot.extras.length === 1);
 
     const opaqueH = [{type:"message", message:{Assistant:{content:"", reasoning:null, tool_calls:[]}}},
       {type:"message", message:{Odd:{future:"shape"}}}];
-    r = spliceHistorySnapshot(opaqueH, []);
+    r = plan(opaqueH, []);
     chk("splice output preserves empty assistant and unknown original H entries once", r.output.history.entries.length === 2
       && r.output.history.entries[0] === opaqueH[0] && r.output.history.entries[1] === opaqueH[1]);
 
-    r = spliceHistorySnapshot([{type:"notice", text:"history notice"}], [{type:"notice", data:{text:"snapshot notice"}}]);
+    r = plan([{type:"notice", text:"history notice"}], [{type:"notice", data:{text:"snapshot notice"}}]);
     chk("splice unmatched notice is retained", !r.match && r.output.snapshot.extras.length === 1);
 
-    r = spliceHistorySnapshot([], [{type:"assistant_text", data:"boot prefix"},
+    r = plan([], [{type:"assistant_text", data:"boot prefix"},
       {type:"notice", data:{text:"live boundary"}}, {type:"assistant_delta", data:" live tail"}]);
     chk("splice sparse bootstrap actual AssistantText and live tail retain raw events", r.output.snapshot.extras.length === 3
       && r.comparison.snapshot[0].text === "boot prefix" && r.comparison.snapshot[2].text === " live tail"
       && r.comparison.snapshot.every(x => x.source === "snapshot" && x.raw));
 
-    r = spliceHistorySnapshot([{type:"message", message:{User:{content:"old"}}}, {type:"message", message:{User:{content:"x"}}},
+    r = plan([{type:"message", message:{User:{content:"old"}}}, {type:"message", message:{User:{content:"x"}}},
       {type:"message", message:{Assistant:{content:"y", tool_calls:[]}}}, {type:"message", message:{User:{content:"later"}}}],
       [{type:"user_prompt", data:"x"}, {type:"assistant_delta", data:"y"}, {type:"user_prompt", data:"new"}]);
     chk("splice suffix never accepts interior H overlap", !r.match && r.output.snapshot.extras.length === 3);
 
     const repeatedH = [{type:"message", message:{User:{content:"x"}}}, {type:"message", message:{Assistant:{content:"y", tool_calls:[]}}},
       {type:"message", message:{User:{content:"x"}}}, {type:"message", message:{Assistant:{content:"y", tool_calls:[]}}}];
-    r = spliceHistorySnapshot(repeatedH, [{type:"user_prompt", data:"x"}, {type:"assistant_delta", data:"y"}]);
+    r = plan(repeatedH, [{type:"user_prompt", data:"x"}, {type:"assistant_delta", data:"y"}]);
     chk("splice repeated H picks only genuine suffix", r.match && r.match.mode === "suffix" && r.match.hStart === 2);
 
     const sparseH = [{type:"message", message:{User:{content:"go"}}},
       {type:"message", message:{Assistant:{content:null, reasoning:null, tool_calls:[{id:"c", name:"x", arguments:"{}"}]}}},
       {type:"message", message:{Tool:{call_id:"c", content:"ok", is_error:false}}}];
-    r = spliceHistorySnapshot(sparseH, [{type:"user_prompt", data:"go"}, {type:"usage", data:{context_input:1}},
+    r = plan(sparseH, [{type:"user_prompt", data:"go"}, {type:"usage", data:{context_input:1}},
       {type:"tool_call", data:{name:"x", arguments:"{}"}}, {type:"tool_result", data:{content:"ok", is_error:false}}]);
     chk("splice empty assistant tool-only H matches actual S around Usage", r.match && r.output.snapshot.extras.length === 0 && r.output.snapshot.uiOnly.length === 1);
 
+    const terminalCallH = [{type:"message", message:{User:{content:"go"}}},
+      {type:"message", message:{Assistant:{content:"done", tool_calls:[{id:"c1", name:"x", arguments:"{}"}]}}}];
+    r = plan(terminalCallH, [{type:"user_prompt",data:"go"}, {type:"assistant_text",data:"done"}]);
+    chk("splice terminal unmatched H call cannot complete overlap", !r.match
+      && r.output.snapshot.extras.join(",") === "0,1"
+      && componentSequence(r) === "H0:user|H1:text|H1:call:0|S0|S1");
+
+    const terminalReasonH = [{type:"message", message:{User:{content:"go"}}},
+      {type:"message", message:{Assistant:{content:null, reasoning:"why", tool_calls:[]}}}];
+    r = plan(terminalReasonH, [{type:"user_prompt",data:"go"}]);
+    chk("splice terminal absent H reasoning cannot complete overlap", !r.match
+      && r.output.snapshot.extras.join(",") === "0"
+      && componentSequence(r) === "H0:user|H1:reasoning|S0");
+
     const turnsH = [{type:"message", message:{User:{content:"one"}}}, {type:"message", message:{Assistant:{content:"a", tool_calls:[]}}},
       {type:"message", message:{User:{content:"two"}}}, {type:"message", message:{Assistant:{content:"b", tool_calls:[]}}}];
-    r = spliceHistorySnapshot(turnsH, [{type:"user_prompt", data:"one"}, {type:"assistant_delta", data:"a"},
+    r = plan(turnsH, [{type:"user_prompt", data:"one"}, {type:"assistant_delta", data:"a"},
       {type:"notice", data:{text:"extra"}}, {type:"user_prompt", data:"two"}, {type:"assistant_delta", data:"b"}]);
-    chk("splice plan anchors S notice between retained H turns", r.match && r.output.snapshot.extraPlan[0].after === 1 && r.output.snapshot.extraPlan[0].before === 2);
+    chk("splice plan emits S notice between retained H turn components", r.match
+      && componentSequence(r) === "H0:user|H1:text|S2|H2:user|H3:text");
 
-    r = spliceHistorySnapshot([{type:"message", message:{Assistant:{content:"hello", tool_calls:[]}}}],
+    const suffixPlanH = [{type:"message", message:{User:{content:"old"}}},
+      {type:"message", message:{Assistant:{content:"old answer", tool_calls:[]}}},
+      {type:"message", message:{User:{content:"x"}}},
+      {type:"message", message:{Assistant:{content:"y", tool_calls:[]}}}];
+    r = plan(suffixPlanH, [{type:"user_prompt",data:"x"}, {type:"assistant_text",data:"y"},
+      {type:"user_prompt",data:"new"}]);
+    chk("splice suffix full component sequence keeps H prefix then H suffix then S tail", r.match
+      && componentSequence(r) === "H0:user|H1:text|H2:user|H3:text|S2");
+
+    const sparseReasonH = [{type:"message", message:{User:{content:"u"}}},
+      {type:"message", message:{Assistant:{content:"done", reasoning:"why", tool_calls:[]}}}];
+    r = plan(sparseReasonH, [{type:"user_prompt",data:"u"},
+      {type:"assistant_text",data:"done"}, {type:"notice",data:"after"}]);
+    chk("splice sparse reasoning full sequence keeps matched assistant out of S extras", r.match
+      && componentSequence(r) === "H0:user|H1:reasoning|H1:text|S2");
+
+    r = plan([{type:"message", message:{User:{content:"first"}}},
+      {type:"message", message:{Assistant:{content:"second", tool_calls:[]}}}],
+      [{type:"notice",data:"boot"}, {type:"assistant_text",data:"tail"}]);
+    chk("splice bootstrap full component sequence puts explicit H before unmatched S", !r.match
+      && componentSequence(r) === "H0:user|H1:text|S0|S1");
+
+    const interleavedNoticesH = [{type:"message", message:{User:{content:"one"}}},
+      {type:"message", message:{Assistant:{content:"a", tool_calls:[]}}},
+      {type:"message", message:{User:{content:"two"}}},
+      {type:"message", message:{Assistant:{content:"b", tool_calls:[]}}}];
+    r = plan(interleavedNoticesH, [{type:"notice",data:"before"}, {type:"user_prompt",data:"one"},
+      {type:"notice",data:"middle"}, {type:"assistant_text",data:"a"},
+      {type:"notice",data:"later"}, {type:"user_prompt",data:"two"}, {type:"assistant_text",data:"b"},
+      {type:"notice",data:"after"}]);
+    chk("splice interleaved notices full component sequence follows matched anchors", r.match
+      && componentSequence(r) === "S0|H0:user|S2|H1:text|S4|H2:user|H3:text|S7");
+
+    const richBootH = [{type:"message", message:{User:{content:"go"}}},
+      {type:"message", message:{Assistant:{content:"run", reasoning:null, tool_calls:[{id:"c1", name:"one", arguments:"{}"},{id:"c2", name:"two", arguments:"{}"}]}}},
+      {type:"message", message:{Tool:{call_id:"c1", content:"r1", is_error:false}}}, {type:"message", message:{Tool:{call_id:"c2", content:"r2", is_error:false}}}];
+    r = plan(richBootH, [{type:"user_prompt", data:"go"}, {type:"assistant_text", data:"run"},
+      {type:"tool_result", data:{content:"r1", is_error:false}}, {type:"tool_result", data:{content:"r2", is_error:false}}]);
+    chk("splice sparse bootstrap omits H calls only when following H results prove order", r.match && r.output.snapshot.extras.length === 0
+      && r.output.history.execution.map(x=>x.kind+":"+x.owner).join("|") === "tool_call:c1|tool_result:c1|tool_call:c2|tool_result:c2");
+
+    const reasonH = [{type:"message", message:{User:{content:"go"}}}, {type:"message", message:{Assistant:{content:"done", reasoning:"why", tool_calls:[]}}}];
+    r = plan(reasonH, [{type:"user_prompt", data:"go"}, {type:"reasoning_delta", data:"different"}, {type:"assistant_text", data:"done"}]);
+    chk("splice differing reasoning stays raw S extra rather than covered", r.match && r.output.snapshot.extras.join(",") === "1");
+
+    r = plan([{type:"message", message:{User:{content:"go"}}}, {type:"message", message:{Assistant:{content:"run", tool_calls:[{id:"c1",name:"one",arguments:"{}"},{id:"c2",name:"two",arguments:"{}"}]}}}],
+      [{type:"user_prompt",data:"go"},{type:"assistant_text",data:"run"},{type:"tool_call",data:{name:"one",arguments:"{}"}},{type:"tool_result",data:{content:"r1",is_error:false}},{type:"tool_call",data:{name:"two",arguments:"{}"}}]);
+    chk("splice unmatched ownerless result component follows matched c1 not latest c2", r.match
+      && r.output.components.map(x=>x.source==="history" ? "H:"+x.part+":"+x.owner : "S:"+x.index).join("|").includes("H:call:0:c1|S:3"));
+
+    r = plan([{type:"message", message:{Assistant:{content:"answer", tool_calls:[]}}}],
+      [{type:"assistant_text",data:"answer"},{type:"error",data:"partial failed"}]);
+    chk("splice persisted answer plus unpersisted error retains error", !r.match && r.output.snapshot.extras.length === 2);
+
+    r = plan([{type:"message", message:{Assistant:{content:"hello", tool_calls:[]}}}],
       [{type:"assistant_delta", data:"hello world"}]);
     chk("splice active sparse prefix remains unresolved and retained", !r.match && r.output.snapshot.extras.length === 1);
     console.log(fail===0 ? "ALL PASS" : fail+" FAILURES");
