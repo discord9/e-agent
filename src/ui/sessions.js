@@ -2405,18 +2405,18 @@ function buildTreeRoot(s, kids, wsId) {
   const hasTitle = !!s.title;
   const titleEl = el("span", "tree-id" + (hasTitle ? " has-title" : ""),
     hasTitle ? "" : s.id);
-  titleEl.title = s.title || s.id;        // hover 显示完整 title/id
+  const countHint = (s.entry_count ?? 0) + " 条";
+  titleEl.title = (s.title || s.id) + " · " + countHint; // titleEl 自有 title，需保留计数
   if (hasTitle) {
     titleEl.append(
       el("span", "tree-title", s.title),
       el("span", "tree-idline", s.id),
     );
   }
-  const count = el("span", "tree-count", (s.entry_count ?? 0) + " 条");
   const statusBadge = s.status === "WaitingInput"
     ? el("span", "tree-status waiting", "等待回答") : null;
   if (statusBadge) statusBadge.setAttribute("aria-label", "会话状态：等待回答");
-  // 📌 置顶按钮（仅主会话根节点）：放行尾 count 后。subagent 子节点不加——
+  // 📌 置顶按钮（仅主会话根节点）：放行尾。subagent 子节点不加——
   // pin 是会话级操作，subagent 的置顶语义后续需要时再单独支持。
   const pin = el("button", "pin-btn" + (s.pinned === true ? " on" : ""));
   pin.innerHTML = pinSvg();   // SVG 图钉：状态色跟随 currentColor
@@ -2444,8 +2444,8 @@ function buildTreeRoot(s, kids, wsId) {
   });
   row.append(toggle, dot, titleEl);
   if (statusBadge) row.append(statusBadge);
-  row.append(count, pin, archive);
-  row.title = (s.title || s.id) + (s.model ? " · " + s.model : "")
+  row.append(pin, archive);
+  row.title = (s.title || s.id) + " · " + countHint + (s.model ? " · " + s.model : "")
     + (s.status === "WaitingInput" ? "（等待回答）" : s.busy ? "（处理中）" : "")
     + (hasRunningKids ? "（任务处理中）" : "");
   row.addEventListener("click", (ev) => {

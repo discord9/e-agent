@@ -16,10 +16,10 @@ import json
 
 import common
 
-def S(id_, parent, title, active, label=None, busy=False, status="Idle", model="flash"):
+def S(id_, parent, title, active, label=None, busy=False, status="Idle", model="flash", entry_count=2):
     d = {"id": id_, "model": model, "role": "fixer" if parent else "main",
          "status": status, "busy": busy, "parent_session_id": parent,
-         "title": title, "entry_count": 2, "created_at": "2026-01-01T00:00:00Z"}
+         "title": title, "entry_count": entry_count, "created_at": "2026-01-01T00:00:00Z"}
     if active is not None:
         d["active"] = active
     if label is not None:
@@ -31,7 +31,7 @@ def S(id_, parent, title, active, label=None, busy=False, status="Idle", model="
 # root-c: 无 label（title 回退）+ 无 label 无 title（shortId 回退，非活跃）
 # 孤儿：活跃带 label + 非活跃带 label（parent 不在列表）
 SESSIONS = [
-    S("root-a", None, "根会话A", True),
+    S("root-a", None, "根会话A", True, status="WaitingInput", entry_count=1234),
     S("root-b", None, "根会话B", True),
     S("root-c", None, "根会话C", True),
     S("sub-a1-cccc", "root-a", "子A1标题", True, label="任务A-1"),
@@ -75,6 +75,17 @@ async def run_sidebar_tree(c):
     # ---------- A：root-a（live 直显：busy + Idle 存活 + 旧 server 兼容；
     #              inactive（active === false）收进历史组） ----------
     root_a = tree().locator(".tree-row", has_text="根会话A").first
+    root_a_title = root_a.locator(".tree-id")
+    c.check("A 根行不显示条目计数",
+            await root_a.locator(".tree-count").count() == 0
+            and "1234 条" not in (await root_a.text_content()), "")
+    c.check("A 根行和标题自身 native hover 均保留条目计数",
+            await root_a.get_attribute("title") == "根会话A · 1234 条 · flash（等待回答）"
+            and await root_a_title.get_attribute("title") == "根会话A · 1234 条", "")
+    c.check("A 根行保留标题、id 和等待回答状态提示",
+            "根会话A" in (await root_a.text_content())
+            and "root-a" in (await root_a.text_content())
+            and await root_a.locator(".tree-status.waiting", has_text="等待回答").count() == 1, "")
     await root_a.locator("button.tree-toggle").click()
     await c.page.wait_for_timeout(200)
     a_node = root_a.locator("xpath=..")
