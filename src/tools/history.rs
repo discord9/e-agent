@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::agent::{Message, SessionEntry, Tool, ToolOutput, ToolSpec};
-use crate::session_store::{HistoryEntry, SessionStore, derive_workspace_id};
+use crate::session_store::{HistoryEntry, HistoryQuery, SessionStore, derive_workspace_id};
 
 pub const HISTORY_DEFAULT_LIMIT: usize = 20;
 pub const HISTORY_MAX_LIMIT: usize = 100;
@@ -83,6 +83,25 @@ async fn execute_current(
     session: &str,
     args: Args,
 ) -> Result<String, String> {
+    if store.supports_history_query() {
+        let entries = store
+            .query_history(&HistoryQuery {
+                workspace_id: Some(derive_workspace_id(root)),
+                session_id: Some(session.to_owned()),
+                query: args.query.clone(),
+                after: None,
+                exact_seq: args.seq,
+                limit: args.limit,
+                default_search_window: args.action == "search",
+            })
+            .await
+            .map_err(history_load_error)?;
+        return match args.action.as_str() {
+            "list" | "search" => Ok(json!({"entries":entries.into_iter().map(|e| json!({"seq":e.seq,"entry":e.entry})).collect::<Vec<_>>()}).to_string()),
+            "read" => entries.into_iter().next().map(|e| json!({"seq":e.seq,"entry":e.entry}).to_string()).ok_or_else(|| "history entry not found".into()),
+            _ => unreachable!(),
+        };
+    }
     let entries = store
         .load_with_seq(root, session)
         .await
@@ -129,6 +148,24 @@ async fn execute_scoped(
         _ => None,
     };
     if args.action == "read" {
+        if store.supports_history_query() {
+            let entries = store
+                .query_history(&HistoryQuery {
+                    workspace_id: workspace_id.clone(),
+                    session_id: session_id.clone(),
+                    query: None,
+                    after: None,
+                    exact_seq: args.seq,
+                    limit: 1,
+                    default_search_window: false,
+                })
+                .await
+                .map_err(history_load_error)?;
+            let Some(entry) = entries.into_iter().next() else {
+                return Err("history entry not found".into());
+            };
+            return Ok(json!({"workspace_id":entry.workspace_id,"session_id":entry.session_id,"seq":entry.seq,"entry":entry.entry}).to_string());
+        }
         let entries = store
             .load_history_session(
                 root,
@@ -162,6 +199,9 @@ async fn execute_scoped(
         {
             return Err("history cursor does not match this request".into());
         }
+        if cursor.after_workspace.is_empty() || cursor.after_session.is_empty() {
+            return Err("invalid history cursor".into());
+        }
         crate::session::validate_session_name(&cursor.after_session)
             .map_err(|_| "invalid history cursor")?;
         if workspace_id
@@ -173,6 +213,46 @@ async fn execute_scoped(
         {
             return Err("history cursor is outside selected scope".into());
         }
+    }
+    if store.supports_history_query() {
+        let entries = store
+            .query_history(&HistoryQuery {
+                workspace_id: workspace_id.clone(),
+                session_id: session_id.clone(),
+                query: args.query.clone(),
+                after: cursor.as_ref().map(|c| {
+                    (
+                        c.after_workspace.clone(),
+                        c.after_session.clone(),
+                        c.after_seq,
+                    )
+                }),
+                exact_seq: None,
+                limit: args.limit + 1,
+                default_search_window: false,
+            })
+            .await
+            .map_err(history_load_error)?;
+        let more = entries.len() > args.limit;
+        let page = entries.into_iter().take(args.limit).collect::<Vec<_>>();
+        let next_cursor = more.then(|| {
+            page.last()
+                .map(|e| {
+                    serde_json::to_string(&Cursor {
+                        action: args.action.clone(),
+                        scope,
+                        workspace_id,
+                        session_id,
+                        query: args.query.clone(),
+                        after_workspace: e.workspace_id.clone(),
+                        after_session: e.session_id.clone(),
+                        after_seq: e.seq,
+                    })
+                    .expect("cursor serializes")
+                })
+                .expect("nonempty page")
+        });
+        return Ok(json!({"entries":page.iter().map(scoped_entry).collect::<Vec<_>>(),"next_cursor":next_cursor}).to_string());
     }
     let mut entries = Vec::new();
     let mut after = cursor
