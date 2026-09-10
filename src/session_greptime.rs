@@ -2244,14 +2244,7 @@ impl GreptimeSession {
         let rows = self
             .client
             .query(
-                "SELECT s.session_id \
-                 FROM sessions s \
-                 INNER JOIN ( \
-                     SELECT session_id, MAX(last_active_at) AS max_ts \
-                     FROM sessions WHERE workspace_id = $1 GROUP BY session_id \
-                 ) latest \
-                   ON latest.session_id = s.session_id AND latest.max_ts = s.last_active_at \
-                 WHERE s.workspace_id = $1 AND s.parent_session_id = $2",
+                "SELECT session_id FROM sessions WHERE workspace_id=$1::string GROUP BY session_id HAVING last_value(ARRAY[parent_session_id] ORDER BY last_active_at)[1]=$2::string",
                 &[&self.workspace_id, &parent_session_id],
             )
             .await
@@ -5787,6 +5780,54 @@ mod tests {
             .find(|m| m.session_id == sid)
             .expect("session still listed after touch");
         assert_eq!(latest.entry_count, 5, "touch carries next_seq");
+    }
+
+    #[tokio::test]
+    async fn child_session_ids_uses_latest_parent_snapshot() {
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let root = format!("test-gt-child-root-{}", crate::session::new_id());
+        let other = format!("test-gt-child-other-{}", crate::session::new_id());
+        let old_root_to_null = format!("test-gt-child-old-root-{}", crate::session::new_id());
+        let other_to_root = format!("test-gt-child-other-root-{}", crate::session::new_id());
+        let latest_other = format!("test-gt-child-latest-other-{}", crate::session::new_id());
+        let session = GreptimeSession::connect(&conn, &wid, &root).await.unwrap();
+
+        // Each pair is an append-only metadata history. The query must use
+        // only the latest parent: old root -> NULL is excluded, other ->
+        // root is included, and root -> other is excluded.
+        for (child_id, parent) in [
+            (&old_root_to_null, Some(root.as_str())),
+            (&old_root_to_null, None),
+            (&other_to_root, Some(other.as_str())),
+            (&other_to_root, Some(root.as_str())),
+            (&latest_other, Some(root.as_str())),
+            (&latest_other, Some(other.as_str())),
+        ] {
+            let timestamp = us_to_datetime(next_event_time_us());
+            session
+                .client
+                .execute(
+                    "INSERT INTO sessions \
+                     (workspace_id, session_id, created_at, last_active_at, entry_count, parent_session_id) \
+                     VALUES ($1, $2, $3, $4, $5, $6)",
+                    &[&wid, child_id, &timestamp, &timestamp, &0i64, &parent],
+                )
+                .await
+                .unwrap();
+        }
+
+        let mut children = session.child_session_ids(&root).await.unwrap();
+        children.sort();
+        assert_eq!(children, vec![other_to_root.clone()]);
+
+        for child_id in [&old_root_to_null, &other_to_root, &latest_other] {
+            session.delete_meta(child_id).await.unwrap();
+        }
     }
 
     #[tokio::test]
