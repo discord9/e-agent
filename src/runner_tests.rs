@@ -7920,12 +7920,12 @@ async fn historical_notice_replay_does_not_arm_regular_reaction() {
         "historical-notice".into(),
         IdlePolicy::FinishWhenIdle,
     );
-    runner
-        .start(Some("new prompt".into()))
-        .join()
-        .await
-        .unwrap();
-    assert_eq!(calls.lock().unwrap().len(), 1);
+    runner.start(None).join().await.unwrap();
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        0,
+        "replaying a historical notice must not invoke the model"
+    );
 }
 
 #[tokio::test]
@@ -8579,6 +8579,7 @@ async fn goal_continue_mid_turn_completion_preserves_user_turn_and_resumes_goal(
         "goal-mid-turn".into(),
         IdlePolicy::WaitForInput,
     );
+    let mut status = handle.status();
     handle.goal_command(GoalCommand::Create {
         objective: "preserve turn origin".into(),
         success_criteria: vec![],
@@ -8588,15 +8589,16 @@ async fn goal_continue_mid_turn_completion_preserves_user_turn_and_resumes_goal(
     handle.continue_goal(Some(2));
     wait_for_log_event(
         &handle,
-        |event| matches!(event, AgentEvent::AssistantText(text) if text == "goal turn continued"),
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "goal final"),
     )
     .await;
+    wait_for_status(&mut status, |state| matches!(state, SessionStatus::Idle)).await;
     {
         let calls = calls.lock().unwrap();
         assert_eq!(
             calls.len(),
             4,
-            "the mid-turn completion receives its independent regular reaction before Goal resumes"
+            "the completion gets one ordinary uncharged reaction before the two-token Goal continuation, not an additional turn"
         );
         assert!(calls[0].iter().any(|message| matches!(
             message, Message::User { content, .. } if content == "user work"
