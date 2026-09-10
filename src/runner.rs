@@ -618,6 +618,11 @@ pub struct SessionRunner {
     /// FIFO maintenance interrupted a live turn; resume it without resetting
     /// per-turn tool state. The Goal trigger still carries its charge class.
     maintenance_resume: bool,
+    /// A freshly durably committed background Notice or Completion needs one
+    /// ordinary provider request. This is intentionally separate from the
+    /// Goal/Resume driver state: maintenance and a stopped driver must not
+    /// consume it, and multiple fresh entries coalesce into one request.
+    pending_regular_reaction: bool,
     bootstrap: Option<SessionBootstrap>,
     #[cfg(test)]
     before_finalize: Option<Box<dyn FnOnce() + Send>>,
@@ -677,6 +682,7 @@ impl SessionRunner {
                 armed_trigger: None,
                 turn_just_ended: false,
                 maintenance_resume: false,
+                pending_regular_reaction: false,
                 goal_continuation_remaining: None,
                 goal_continuation_usage_unavailable: false,
                 goal_continuation_armed: false,
@@ -731,6 +737,9 @@ impl SessionRunner {
                     .join("\n")
             );
             self.commit(SessionEntry::Notice { text }).await?;
+            // This notice was created during this recovery and is now durable,
+            // unlike replayed historical entries. Give it one normal request.
+            self.pending_regular_reaction = true;
             self.store
                 .consume_unfinished_background(&self.root, &self.session, &bootstrap.recovery_tasks)
                 .await?;
@@ -899,7 +908,11 @@ impl SessionRunner {
                 Some(budget) => format!("goal continuation armed (token cap: {budget})"),
                 None => "goal continuation armed".into(),
             }));
-        if !self.agent.has_blocking_background() {
+        if self.pending_regular_reaction {
+            // A fresh durable ingress gets its ordinary reaction before a
+            // continuation can spend another Goal call.
+            self.armed_trigger = Some(RunnerTrigger::Background);
+        } else if !self.agent.has_blocking_background() {
             // Continue owns FIFO maintenance already queued before the next
             // provider call. Prompt intake still clears this trigger, so a
             // real user message remains a User turn.
@@ -948,6 +961,15 @@ impl SessionRunner {
             }
         };
         self.commit(entry).await.map_err(|e| format!("{e:#}"))?;
+        // A Goal command is maintenance, never a notification reaction.
+        // Preserve an accepted-input Resume: it is already human-required
+        // work and its next regular request consumes fresh ingress in
+        // context. Other maintenance leaves the independent reaction armed.
+        if self.pending_regular_reaction
+            && !(self.armed_trigger == Some(RunnerTrigger::Resume) && self.maintenance_resume)
+        {
+            self.armed_trigger = Some(RunnerTrigger::Background);
+        }
         if !matches!(
             self.agent.goal().as_ref().map(|goal| goal.status),
             Some(GoalStatus::Active)
@@ -1433,6 +1455,8 @@ impl SessionRunner {
         self.turn_just_ended = false;
         self.maintenance_resume = false;
         self.armed_trigger = None;
+        // An explicit release is the sole non-request consumption path.
+        self.pending_regular_reaction = false;
         self.goal_continuation_armed = false;
         self.goal_continuation_remaining = None;
         self.goal_continuation_usage_unavailable = false;
@@ -1486,10 +1510,16 @@ impl SessionRunner {
                 },
                 _ => unreachable!("peek_background_entry returns a background entry"),
             };
-            let completion = matches!(&entry, SessionEntry::BackgroundCompletion { .. });
+            let fresh_ingress = matches!(
+                &entry,
+                SessionEntry::Notice { .. } | SessionEntry::BackgroundCompletion { .. }
+            );
             self.agent.apply_entry_located(entry, location);
             self.agent.emit_event(event);
-            if completion {
+            if fresh_ingress {
+                // Arm only after append + owner acknowledgement + apply. A
+                // replayed historical row never passes through this path.
+                self.pending_regular_reaction = true;
                 any = true;
             }
         }
@@ -1900,6 +1930,16 @@ impl SessionRunner {
                 self.arm_goal_continuation(budget);
                 continue;
             }
+            // A fresh durable ingress is independent of Goal maintenance.
+            // Once FIFO commands ahead of it have run, it owns one ordinary
+            // request; an accepted human-answer Resume supplies that request
+            // itself, preserving answer priority without a second empty turn.
+            if self.pending.is_empty()
+                && self.pending_regular_reaction
+                && !(self.armed_trigger == Some(RunnerTrigger::Resume) && self.maintenance_resume)
+            {
+                self.armed_trigger = Some(RunnerTrigger::Background);
+            }
             if self.pending.is_empty() && goal_boundary {
                 // Finish the Goal precedence boundary exactly once. A
                 // committed completion coalesces all ready entries into one
@@ -1957,6 +1997,13 @@ impl SessionRunner {
                     }
                     continue;
                 }
+            }
+            if self.pending.is_empty()
+                && self.armed_trigger.is_none()
+                && self.pending_regular_reaction
+            {
+                self.armed_trigger = Some(RunnerTrigger::Background);
+                continue;
             }
             if self.pending.is_empty() && self.armed_trigger.is_none() {
                 // An operation may complete in the same scheduling turn as a sender
@@ -2099,6 +2146,21 @@ impl SessionRunner {
                     && self.goal_continuation_usage_unavailable
                 {
                     break 'turn;
+                }
+                // This is the regular-request linearization point. A prompt
+                // coalesces fresh ingress; Background is its empty request.
+                // A resumed accepted answer is ordinary human-required work,
+                // not a Goal call, and consumes ingress already committed
+                // before it. That preserves answer priority without issuing a
+                // second empty Background request afterward.
+                let reaction_request = self.pending_regular_reaction && !goal_turn;
+                // The request boundary, rather than a successful provider
+                // response, consumes the already-durable ingress: this call's
+                // context includes it even if the provider fails or is later
+                // released. Entries that arrive while it is in flight are
+                // committed afterward and arm the flag again.
+                if reaction_request {
+                    self.pending_regular_reaction = false;
                 }
                 let waited = await_round(&mut self.agent, &specs, &mut self.commands).await;
                 let round = match waited.outcome {
@@ -2734,6 +2796,17 @@ impl SessionRunner {
                         .emit(AgentEvent::Notice(POLL_GUARD_TERMINATION_NOTICE.into()));
                     break 'turn;
                 }
+                // A Goal driver cannot consume fresh ingress. Preserve a
+                // model-requested compaction first (it is already accepted
+                // for this batch), then hand off to the regular reaction.
+                if self.pending_regular_reaction
+                    && goal_turn
+                    && !human_required_continuation
+                    && (!requested_compaction || auto_compacted)
+                {
+                    self.armed_trigger = Some(RunnerTrigger::Background);
+                    break 'turn;
+                }
                 if requested_compaction && !auto_compacted {
                     match self
                         .compact_operation(
@@ -2758,6 +2831,13 @@ impl SessionRunner {
                                 )
                                 .await;
                                 return;
+                            }
+                            if goal_turn
+                                && !human_required_continuation
+                                && self.pending_regular_reaction
+                            {
+                                self.armed_trigger = Some(RunnerTrigger::Background);
+                                break 'turn;
                             }
                         }
                         OperationFlow::Released(steering) => {

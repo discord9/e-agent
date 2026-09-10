@@ -7805,7 +7805,11 @@ async fn poll_guard_runner_durable_batch_safe_point_and_next_turn_reset() {
         .await
         .unwrap();
     let tools = tool_entries(&loaded.entries);
-    assert_eq!(tools.len(), 5, "all first-batch sibling calls committed");
+    assert_eq!(
+        tools.len(),
+        8,
+        "the completion's fresh normal reaction runs after all first-batch siblings"
+    );
     assert!(matches!(
         tools[0],
         Message::Tool { call_id, content, is_error: false, synthetic: false, .. }
@@ -7888,6 +7892,43 @@ async fn poll_guard_runner_durable_batch_safe_point_and_next_turn_reset() {
     drop(task);
 }
 #[tokio::test]
+async fn historical_notice_replay_does_not_arm_regular_reaction() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![(
+                AssistantMessage {
+                    content: Some("only prompt reaction".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                None,
+            )]
+            .into(),
+            calls: calls.clone(),
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    agent.restore_history(vec![SessionEntry::Notice {
+        text: "old warning".into(),
+    }]);
+    let (runner, _) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "historical-notice".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    runner
+        .start(Some("new prompt".into()))
+        .join()
+        .await
+        .unwrap();
+    assert_eq!(calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn oracle449_runner_persists_notice_before_completion_and_keeps_owner_until_completion() {
     let temp = tempfile::tempdir().unwrap();
     let sender = Arc::new(Mutex::new(None));
@@ -7906,6 +7947,14 @@ async fn oracle449_runner_persists_notice_before_completion_and_keeps_owner_unti
                 (
                     AssistantMessage {
                         content: Some("started".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("notice reacted".into()),
                         tool_calls: vec![],
                         reasoning: None,
                     },
@@ -7964,8 +8013,13 @@ async fn oracle449_runner_persists_notice_before_completion_and_keeps_owner_unti
             break;
         }
     }
-    assert!(matches!(*status.borrow(), SessionStatus::Idle));
-    assert_eq!(calls.lock().unwrap().len(), calls_before_notice);
+    loop {
+        if matches!(live.recv().await.unwrap(), AgentEvent::AssistantText(text) if text == "notice reacted")
+        {
+            break;
+        }
+    }
+    assert_eq!(calls.lock().unwrap().len(), calls_before_notice + 1);
     let owner = SessionStore::Jsonl
         .peek_unfinished_background(temp.path(), "oracle449")
         .await
@@ -7991,7 +8045,7 @@ async fn oracle449_runner_persists_notice_before_completion_and_keeps_owner_unti
             break;
         }
     }
-    assert_eq!(calls.lock().unwrap().len(), calls_before_notice + 1);
+    assert_eq!(calls.lock().unwrap().len(), calls_before_notice + 2);
     let loaded = SessionStore::Jsonl
         .load(temp.path(), "oracle449")
         .await
@@ -8013,6 +8067,13 @@ async fn oracle449_runner_persists_notice_before_completion_and_keeps_owner_unti
             .await
             .unwrap()
             .is_empty()
+    );
+    assert!(
+        calls.lock().unwrap()[calls_before_notice]
+            .iter()
+            .any(|message| {
+                matches!(message, Message::User { content, .. } if content == "stalled warning")
+            })
     );
     assert!(calls.lock().unwrap().last().unwrap().iter().any(|message| {
         matches!(
@@ -8532,7 +8593,11 @@ async fn goal_continue_mid_turn_completion_preserves_user_turn_and_resumes_goal(
     .await;
     {
         let calls = calls.lock().unwrap();
-        assert_eq!(calls.len(), 3);
+        assert_eq!(
+            calls.len(),
+            4,
+            "the mid-turn completion receives its independent regular reaction before Goal resumes"
+        );
         assert!(calls[0].iter().any(|message| matches!(
             message, Message::User { content, .. } if content == "user work"
         )));
