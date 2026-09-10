@@ -52,6 +52,8 @@ struct Cursor {
     after_session: String,
     after_seq: i64,
     #[serde(default)]
+    after_event_time: Option<chrono::NaiveDateTime>,
+    #[serde(default)]
     offset: Option<i64>,
 }
 
@@ -92,6 +94,7 @@ async fn execute_current(
                 session_id: Some(session.to_owned()),
                 query: args.query.clone(),
                 after: None,
+                after_event_time: None,
                 offset: None,
                 exact_seq: args.seq,
                 limit: args.limit,
@@ -158,6 +161,7 @@ async fn execute_scoped(
                     session_id: session_id.clone(),
                     query: None,
                     after: None,
+                    after_event_time: None,
                     offset: None,
                     exact_seq: args.seq,
                     limit: 1,
@@ -205,7 +209,11 @@ async fn execute_scoped(
         }
         if cursor.after_workspace.is_empty()
             || cursor.after_session.is_empty()
-            || (store.history_query_uses_offset()
+            || (store.history_query_uses_cross_scope_offset()
+                && session_id.is_some()
+                && cursor.after_event_time.is_none())
+            || (store.history_query_uses_cross_scope_offset()
+                && session_id.is_none()
                 && !matches!(cursor.offset, Some(offset) if offset >= 0 && offset <= i64::MAX - args.limit as i64))
         {
             return Err("invalid history cursor".into());
@@ -235,8 +243,11 @@ async fn execute_scoped(
                         c.after_seq,
                     )
                 }),
-                offset: store
-                    .history_query_uses_offset()
+                after_event_time: session_id
+                    .as_ref()
+                    .and_then(|_| cursor.as_ref().and_then(|c| c.after_event_time)),
+                offset: session_id
+                    .is_none()
                     .then(|| cursor.as_ref().and_then(|c| c.offset))
                     .flatten(),
                 exact_seq: None,
@@ -250,6 +261,7 @@ async fn execute_scoped(
         let next_cursor = more.then(|| {
             page.last()
                 .map(|e| {
+                    let session_cursor = session_id.is_some();
                     serde_json::to_string(&Cursor {
                         action: args.action.clone(),
                         scope,
@@ -259,9 +271,12 @@ async fn execute_scoped(
                         after_workspace: e.workspace_id.clone(),
                         after_session: e.session_id.clone(),
                         after_seq: e.seq,
-                        offset: store.history_query_uses_offset().then_some(
-                            cursor.as_ref().and_then(|c| c.offset).unwrap_or(0) + args.limit as i64,
-                        ),
+                        after_event_time: session_cursor.then_some(e.event_time).flatten(),
+                        offset: (store.history_query_uses_cross_scope_offset() && !session_cursor)
+                            .then_some(
+                                cursor.as_ref().and_then(|c| c.offset).unwrap_or(0)
+                                    + args.limit as i64,
+                            ),
                     })
                     .expect("cursor serializes")
                 })
@@ -316,6 +331,7 @@ async fn execute_scoped(
                     workspace_id: workspace.clone(),
                     session_id: session.clone(),
                     seq,
+                    event_time: None,
                     entry: entry.clone(),
                 });
                 if entries.len() > args.limit {
@@ -338,6 +354,7 @@ async fn execute_scoped(
                 after_workspace: e.workspace_id.clone(),
                 after_session: e.session_id.clone(),
                 after_seq: e.seq,
+                after_event_time: e.event_time,
                 offset: None,
             })
             .expect("cursor serializes")
@@ -983,7 +1000,7 @@ mod tests {
                 (ws_b.clone(), "z".into(), 0)
             ]
         );
-        let second_page: Value = serde_json::from_str(&execute(&current, &a, "same", &json!({"action":"search","scope":"global","query":"needle","limit":1,"cursor":serde_json::to_string(&Cursor { action: "search".into(), scope: Scope::Global, workspace_id: None, session_id: None, query: Some("needle".into()), after_workspace: ws_a.clone(), after_session: "same".into(), after_seq: 0, offset: None }) .unwrap()})).await.unwrap()).unwrap();
+        let second_page: Value = serde_json::from_str(&execute(&current, &a, "same", &json!({"action":"search","scope":"global","query":"needle","limit":1,"cursor":serde_json::to_string(&Cursor { action: "search".into(), scope: Scope::Global, workspace_id: None, session_id: None, query: Some("needle".into()), after_workspace: ws_a.clone(), after_session: "same".into(), after_seq: 0, after_event_time: None, offset: None }) .unwrap()})).await.unwrap()).unwrap();
         assert!(!second_page["entries"].as_array().unwrap().is_empty());
         let selected: Value = serde_json::from_str(&execute(&current,&a,"same",&json!({"action":"read","scope":"session","workspace_id":ws_b,"session_id":"same","seq":0})).await.unwrap()).unwrap();
         assert_eq!(selected["entry"]["text"], "needle b0");

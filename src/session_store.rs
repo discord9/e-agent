@@ -818,6 +818,7 @@ pub struct HistoryEntry {
     pub workspace_id: String,
     pub session_id: String,
     pub seq: i64,
+    pub event_time: Option<chrono::NaiveDateTime>,
     pub entry: SessionEntry,
 }
 
@@ -829,6 +830,7 @@ pub struct HistoryQuery {
     pub session_id: Option<String>,
     pub query: Option<String>,
     pub after: Option<(String, String, i64)>,
+    pub after_event_time: Option<chrono::NaiveDateTime>,
     pub offset: Option<i64>,
     pub exact_seq: Option<i64>,
     pub limit: usize,
@@ -867,6 +869,7 @@ pub(crate) fn decode_history_rows(
             workspace_id: workspace_id.clone(),
             session_id: session_id.clone(),
             seq: *seq,
+            event_time: Some(raw[0].1),
             entry,
         });
     }
@@ -878,7 +881,7 @@ impl SessionStore {
         !matches!(self, SessionStore::Jsonl)
     }
 
-    pub fn history_query_uses_offset(&self) -> bool {
+    pub fn history_query_uses_cross_scope_offset(&self) -> bool {
         match self {
             #[cfg(feature = "greptime")]
             SessionStore::Greptime { .. } => true,
