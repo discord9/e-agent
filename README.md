@@ -1,9 +1,43 @@
 # e-agent
 
-e-agent is a small streaming Rust coding agent for OpenAI-compatible
-`/chat/completions` APIs and the ChatGPT Codex `/responses` API. It sends a
-prompt to a model, executes requested tools one at a time inside a workspace,
-returns each result to the model, and prints the model's final answer.
+e-agent is a Rust coding agent with async subagents, goal-driven continuous
+execution, and terminal and web UIs. It is a small, single-crate program that
+streams requests to OpenAI-compatible `/chat/completions` APIs or the ChatGPT
+Codex `/responses` API, executes the model's requested workspace tools one at
+a time, returns results to the model, and prints its final answer.
+
+Use it as a one-shot CLI command, an interactive terminal UI (the default with
+no prompt in a terminal), or a line-based REPL. `e-agent web` starts the local
+web UI and HTTP API. Sessions retain conversation history in the workspace by
+default; SQLite and GreptimeDB storage are also available. The built-in tools
+cover workspace files and shell commands, background work, and asynchronous
+subagent tasks. Background and subagent completion notifications are delivered
+to the session when they finish. A human can explicitly arm goal continuation
+with `/goal continue` indefinitely or `/goal continue N` with an actual-token
+soft cap; active goals and restarts do not arm it, and Cancel stops the driver
+without stopping existing background tasks. See [Session goals](#session-goals)
+for the full behavior. Local stdio MCP servers can optionally add tools.
+
+## Quick start
+
+Install a Rust toolchain with Cargo, configure a provider in [Run](#run), then
+from this repository checkout run one of these commands, replacing
+`/path/to/workspace` with the workspace the agent should use:
+
+```sh
+cargo run -- --workspace /path/to/workspace "inspect src/main.rs and explain it" # one prompt
+cargo run -- --workspace /path/to/workspace --repl                                # line-based REPL
+cargo run -- --workspace /path/to/workspace web                                   # web UI at http://127.0.0.1:8766
+```
+
+With no prompt, `cargo run -- --workspace /path/to/workspace` opens the terminal
+UI when stdout is a terminal.
+For session IDs, storage, and CLI options, continue in [Run](#run). See
+[Safety boundaries](#safety-boundaries) before enabling or relying on sandbox
+settings; [Background tasks](#background-tasks) and [Subagents](#subagents)
+explain asynchronous work. Further reference: [session history](#history-tool),
+[web server](#web-ui--headless-server), [local MCP](#mcp-local-servers), and
+[storage backends](#sqlite-session-backend).
 
 ## Run
 
