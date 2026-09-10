@@ -8702,12 +8702,21 @@ HARNESS = HARNESS.replace('__DEEP_LINK_SEARCH__', ('?session=' + DEEP_LINK) if D
 out = os.path.join(HERE, '.test_harness.js')
 with open(out, 'w', encoding='utf-8') as f:
     f.write(HARNESS + vendor_js + "\n" + js + "\n" + usage_dashboard_js + TAIL)
-r = subprocess.run(['gjs', out], capture_output=not RAW_GJS, text=True)
 if RAW_GJS:
-    # Output inherited by the caller: a shell timeout can retain the exact last
-    # callback marker instead of killing Python while its pipes are still buffered.
-    r_stdout = r_stderr = ""
+    # Stream and retain the same bytes.  A shell timeout therefore leaves the
+    # last GJS callback in its redirected log, while a successful run still
+    # supplies ALL PASS to the ordinary verdict below.
+    proc = subprocess.Popen(['gjs', out], stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True)
+    raw_lines = []
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        raw_lines.append(line)
+        print(line, end="", flush=True)
+    r = subprocess.CompletedProcess(proc.args, proc.wait())
+    r_stdout, r_stderr = "".join(raw_lines), ""
 else:
+    r = subprocess.run(['gjs', out], capture_output=True, text=True)
     r_stdout, r_stderr = r.stdout, r.stderr
     print(r_stdout, end="")
     if r_stderr.strip():
