@@ -9103,7 +9103,7 @@ async fn goal_continue_tools_queued_compaction_keeps_goal_driver_alive() {
     let tool_entered = Arc::new(Notify::new());
     let release_tool = Arc::new(Notify::new());
     let resumed = Arc::new(Notify::new());
-    let agent = Agent::new(
+    let mut agent = Agent::new(
         Box::new(BlockingContextCaptureModel {
             replies: vec![
                 AssistantMessage {
@@ -9142,6 +9142,7 @@ async fn goal_continue_tools_queued_compaction_keeps_goal_driver_alive() {
             Box::new(KeepAliveTool { sender: None }),
         ],
     );
+    history_for_compaction(&mut agent);
     let (runner, handle) = SessionRunner::new_with_bootstrap(
         agent,
         SessionStore::Jsonl,
@@ -9158,10 +9159,14 @@ async fn goal_continue_tools_queued_compaction_keeps_goal_driver_alive() {
     .unwrap();
     let task = runner.start(None);
     handle.continue_goal(None);
-    tool_entered.notified().await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), tool_entered.notified())
+        .await
+        .unwrap();
     handle.compact();
     release_tool.notify_one();
-    resumed.notified().await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), resumed.notified())
+        .await
+        .unwrap();
     assert_eq!(
         calls.lock().unwrap().len(),
         3,
@@ -12034,4 +12039,494 @@ async fn oracle731_resumed_answer_pause_queued_resume_disarms_driver() {
         .await
         .unwrap()
         .unwrap();
+}
+
+/// Captures compaction calls and fails one selected call. The optional gate
+/// makes an unwanted follow-up provider call observable without consuming it.
+struct FailAtCallContextCaptureModel {
+    replies: VecDeque<AssistantMessage>,
+    fail_call: usize,
+    gate_call: usize,
+    entered: Arc<Notify>,
+    calls: Arc<Mutex<Vec<Vec<Message>>>>,
+    call_count: usize,
+    usage: Option<Usage>,
+}
+
+#[async_trait]
+impl Model for FailAtCallContextCaptureModel {
+    async fn complete(
+        &mut self,
+        messages: &[Message],
+        _: &[ToolSpec],
+        _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        self.call_count += 1;
+        self.calls.lock().unwrap().push(messages.to_vec());
+        if self.call_count == self.fail_call {
+            anyhow::bail!("compaction provider failed");
+        }
+        if self.call_count == self.gate_call {
+            self.entered.notify_one();
+            std::future::pending().await
+        }
+        Ok((
+            self.replies.pop_front().expect("unexpected model call"),
+            self.usage.clone(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn oracle120_continue_preserves_accepted_input_resume() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let starts = Arc::new(AtomicUsize::new(0));
+    let mut agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![
+                (AssistantMessage { content: None, tool_calls: vec![
+                    ToolCall { id: "oracle120-input".into(), name: "request_user_input".into(), arguments: r#"{"questions":[{"id":"requested-answer","prompt":"answer?"}]}"#.into() },
+                    ToolCall { id: "oracle120-sibling".into(), name: "read_image".into(), arguments: "{}".into() },
+                ], reasoning: None }, Some(Usage { input_tokens: 10, ..Usage::default() })),
+                (AssistantMessage { content: Some("maintenance summary".into()), tool_calls: vec![], reasoning: None }, Some(Usage::default())),
+                (AssistantMessage { content: Some("accepted answer processed".into()), tool_calls: vec![], reasoning: None }, Some(Usage::default())),
+            ].into(),
+            calls: calls.clone(),
+        }),
+        vec![
+            Box::new(crate::tools::user_input::RequestUserInput),
+            Box::new(MarkerTool),
+            Box::new(TurnStartMarkerTool(starts.clone())),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    history_for_compaction(&mut agent);
+    let (runner, handle) = SessionRunner::new_with_bootstrap(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "oracle120-input-resume".into(),
+        IdlePolicy::WaitForInput,
+        SessionBootstrap {
+            recovery_tasks: vec![],
+            legacy: false,
+            initial_entries: vec![test_goal_entry()],
+        },
+    )
+    .await
+    .unwrap();
+    let task = runner.start(None);
+    let mut status = handle.status();
+    handle.continue_goal(Some(10));
+    wait_for_status(&mut status, |status| {
+        matches!(status, SessionStatus::WaitingInput(_))
+    })
+    .await;
+    // The compaction creates maintenance_resume; pause + Continue then run
+    // while Resume owns the accepted answer's original tool turn.
+    handle.compact();
+    assert!(handle.goal_command(GoalCommand::Action(crate::agent::GoalAction::Pause)));
+    assert!(handle.continue_goal(Some(10)));
+    assert_eq!(
+        handle.submit_prompt_with_call_id(
+            Some("oracle120-input".into()),
+            "precise accepted answer".into()
+        ),
+        PromptSubmission::Answered
+    );
+    wait_for_log_event(&handle, |event| matches!(event, AgentEvent::AssistantText(text) if text == "accepted answer processed")).await;
+    wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)).await;
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        3,
+        "compaction then the accepted answer own the only provider calls"
+    );
+    assert_eq!(
+        starts.load(Ordering::SeqCst),
+        1,
+        "the answer resumes its original turn without a fresh Goal turn"
+    );
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "oracle120-input-resume")
+        .await
+        .unwrap()
+        .entries;
+    assert_eq!(tool_entries(&entries).iter().filter(|message| matches!(message,
+        Message::Tool { call_id, name, content, is_error: false, synthetic: false, .. }
+        if call_id == "oracle120-input" && name == "request_user_input" && content.contains("requested-answer") && content.contains("precise accepted answer")
+    )).count(), 1, "the requested call-id receives the accepted answer exactly once");
+    assert!(
+        tool_entries(&entries)
+            .iter()
+            .any(|message| matches!(message,
+                Message::Tool { call_id, name, is_error: false, synthetic: false, .. }
+                if call_id == "oracle120-sibling" && name == "read_image"
+            )),
+        "the sibling batch completes before maintenance"
+    );
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn oracle120_inactive_goal_tool_commit_disarms_before_later_resume_sibling() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let starts = Arc::new(AtomicUsize::new(0));
+    let agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![
+                (AssistantMessage { content: None, tool_calls: vec![
+                    ToolCall { id: "pause".into(), name: "update_goal".into(), arguments: serde_json::json!({"id":"goal-test","revision":1,"action":"pause"}).to_string() },
+                    ToolCall { id: "resume".into(), name: "update_goal".into(), arguments: serde_json::json!({"id":"goal-test","revision":2,"action":"resume"}).to_string() },
+                    ToolCall { id: "sibling".into(), name: "read_image".into(), arguments: "{}".into() },
+                ], reasoning: None }, Some(Usage::default())),
+                (AssistantMessage { content: Some("siblings completed".into()), tool_calls: vec![], reasoning: None }, Some(Usage::default())),
+                (AssistantMessage { content: Some("unexpected automatic goal".into()), tool_calls: vec![], reasoning: None }, Some(Usage::default())),
+            ].into(), calls: calls.clone(),
+        }),
+        vec![Box::new(MarkerTool), Box::new(TurnStartMarkerTool(starts.clone())), Box::new(KeepAliveTool { sender: None })],
+    );
+    let (runner, handle) = SessionRunner::new_with_bootstrap(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "oracle120-tool-inactive".into(),
+        IdlePolicy::WaitForInput,
+        SessionBootstrap {
+            recovery_tasks: vec![],
+            legacy: false,
+            initial_entries: vec![test_goal_entry()],
+        },
+    )
+    .await
+    .unwrap();
+    let task = runner.start(None);
+    let mut status = handle.status();
+    handle.continue_goal(None);
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "siblings completed"),
+    )
+    .await;
+    wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)).await;
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        2,
+        "resume alone does not re-arm a driver disarmed by the successful pause commit"
+    );
+    assert_eq!(
+        starts.load(Ordering::SeqCst),
+        1,
+        "the later resume and sibling stay in the original turn"
+    );
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "oracle120-tool-inactive")
+        .await
+        .unwrap()
+        .entries;
+    assert!(tool_entries(&entries).iter().any(|message| matches!(message, Message::Tool { call_id, name, is_error: false, synthetic: false, .. } if call_id == "sibling" && name == "read_image")));
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn oracle120_goal_compaction_error_disarms_automatic_follow_up() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let entered = Arc::new(Notify::new());
+    let mut agent = Agent::new(
+        Box::new(FailAtCallContextCaptureModel {
+            replies: vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "compact".into(),
+                        name: "request_compaction".into(),
+                        arguments: "{}".into(),
+                    }],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("unexpected charged goal".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+            ]
+            .into(),
+            fail_call: 2,
+            gate_call: 3,
+            entered: entered.clone(),
+            calls: calls.clone(),
+            call_count: 0,
+            usage: Some(Usage::default()),
+        }),
+        vec![
+            Box::new(crate::tools::RequestCompaction),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    history_for_compaction(&mut agent);
+    let (runner, handle) = SessionRunner::new_with_bootstrap(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "oracle120-compaction-error".into(),
+        IdlePolicy::WaitForInput,
+        SessionBootstrap {
+            recovery_tasks: vec![],
+            legacy: false,
+            initial_entries: vec![test_goal_entry()],
+        },
+    )
+    .await
+    .unwrap();
+    let task = runner.start(None);
+    let mut status = handle.status();
+    handle.continue_goal(None);
+    wait_for_log_event(&handle, |event| matches!(event, AgentEvent::Error(text) if text.contains("compaction provider failed"))).await;
+    wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)).await;
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        2,
+        "a failed charged compaction must not issue another automatic Goal request"
+    );
+    assert!(handle.snapshot().iter().any(
+        |event| matches!(event, AgentEvent::Error(text) if text.contains("compaction error"))
+    ));
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "oracle120-compaction-error")
+        .await
+        .unwrap()
+        .entries;
+    assert!(entries.iter().any(|entry| matches!(entry, SessionEntry::Error { text } if text.contains("compaction provider failed"))));
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+/// Queues FIFO work while its first provider call completes, so an automatic
+/// compaction failure can be checked without racing frontend admission.
+struct QueueWorkModel {
+    replies: VecDeque<(AssistantMessage, Option<Usage>)>,
+    commands: Arc<Mutex<Option<mpsc::UnboundedSender<SessionCommand>>>>,
+    calls: Arc<Mutex<Vec<Vec<Message>>>>,
+    call_count: usize,
+}
+
+#[async_trait]
+impl Model for QueueWorkModel {
+    async fn complete(
+        &mut self,
+        messages: &[Message],
+        _: &[ToolSpec],
+        _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        self.call_count += 1;
+        self.calls.lock().unwrap().push(messages.to_vec());
+        if self.call_count == 1 {
+            let commands = self.commands.lock().unwrap().take().unwrap();
+            commands.send(SessionCommand::Compact).unwrap();
+            commands
+                .send(SessionCommand::Prompt("preserved human work".into()))
+                .unwrap();
+        }
+        Ok(self.replies.pop_front().expect("unexpected model call"))
+    }
+}
+
+#[tokio::test]
+async fn oracle481_auto_compaction_failure_commits_siblings_without_follow_up() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = Agent::new(
+        Box::new(FailAtCallContextCaptureModel {
+            replies: vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![
+                        ToolCall {
+                            id: "requested".into(),
+                            name: "request_compaction".into(),
+                            arguments: "{}".into(),
+                        },
+                        ToolCall {
+                            id: "sibling".into(),
+                            name: "read_image".into(),
+                            arguments: "{}".into(),
+                        },
+                    ],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("unexpected automatic goal".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+            ]
+            .into(),
+            fail_call: 2,
+            gate_call: 3,
+            entered: Arc::new(Notify::new()),
+            calls: calls.clone(),
+            call_count: 0,
+            usage: Some(Usage {
+                input_tokens: 80,
+                ..Usage::default()
+            }),
+        }),
+        vec![
+            Box::new(crate::tools::RequestCompaction),
+            Box::new(MarkerTool),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    agent.set_context_window(100);
+    history_for_compaction(&mut agent);
+    let (runner, handle) = SessionRunner::new_with_bootstrap(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "oracle481-auto-failure".into(),
+        IdlePolicy::WaitForInput,
+        SessionBootstrap {
+            recovery_tasks: vec![],
+            legacy: false,
+            initial_entries: vec![test_goal_entry()],
+        },
+    )
+    .await
+    .unwrap();
+    let task = runner.start(None);
+    let mut status = handle.status();
+    handle.continue_goal(None);
+    wait_for_log_event(&handle, |event| matches!(event, AgentEvent::Error(text) if text.contains("compaction provider failed"))).await;
+    wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)).await;
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        2,
+        "failed automatic compaction must not reach another automatic provider call"
+    );
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "oracle481-auto-failure")
+        .await
+        .unwrap()
+        .entries;
+    assert!(
+        tool_entries(&entries)
+            .iter()
+            .any(|message| matches!(message,
+                Message::Tool { call_id, name, content, is_error: false, synthetic: false, .. }
+                if call_id == "requested" && name == "request_compaction" && content.contains("suppressed")
+            ))
+    );
+    assert!(
+        tool_entries(&entries)
+            .iter()
+            .any(|message| matches!(message,
+                Message::Tool { call_id, name, is_error: false, synthetic: false, .. }
+                if call_id == "sibling" && name == "read_image"
+            )),
+        "normal siblings still commit"
+    );
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn oracle481_auto_nothing_to_compact_preserves_queued_manual_and_human_work() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let commands = Arc::new(Mutex::new(None));
+    let mut agent = Agent::new(
+        Box::new(QueueWorkModel {
+            replies: vec![
+                (
+                    AssistantMessage {
+                        content: None,
+                        tool_calls: vec![ToolCall {
+                            id: "sibling".into(),
+                            name: "read_image".into(),
+                            arguments: "{}".into(),
+                        }],
+                        reasoning: None,
+                    },
+                    Some(Usage {
+                        input_tokens: 80,
+                        ..Usage::default()
+                    }),
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("preserved human completed".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    Some(Usage::default()),
+                ),
+            ]
+            .into(),
+            commands: commands.clone(),
+            calls: calls.clone(),
+            call_count: 0,
+        }),
+        vec![
+            Box::new(MarkerTool),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    agent.set_context_window(100);
+    let (runner, handle) = SessionRunner::new_with_bootstrap(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "oracle481-nothing-queued".into(),
+        IdlePolicy::WaitForInput,
+        SessionBootstrap {
+            recovery_tasks: vec![],
+            legacy: false,
+            initial_entries: vec![test_goal_entry()],
+        },
+    )
+    .await
+    .unwrap();
+    *commands.lock().unwrap() = Some(handle.commands.clone());
+    let task = runner.start(None);
+    let mut status = handle.status();
+    handle.continue_goal(None);
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::Error(text) if text.contains("nothing to compact")),
+    )
+    .await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        wait_for_log_event(&handle, |event| matches!(event, AgentEvent::AssistantText(text) if text == "preserved human completed")),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("status={:?} events={:?}", *status.borrow(), handle.snapshot()));
+    wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)).await;
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        2,
+        "automatic failure stops while queued manual failure and human work run FIFO"
+    );
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "oracle481-nothing-queued")
+        .await
+        .unwrap()
+        .entries;
+    assert!(
+        tool_entries(&entries)
+            .iter()
+            .any(|message| matches!(message,
+                Message::Tool { call_id, name, is_error: false, synthetic: false, .. }
+                if call_id == "sibling" && name == "read_image"
+            ))
+    );
+    assert!(entries.iter().any(|entry| matches!(entry,
+        SessionEntry::Message { message: Message::User { content, .. } } if content == "preserved human work"
+    )));
+    drop(handle);
+    task.join().await.unwrap();
 }

@@ -895,7 +895,11 @@ impl SessionRunner {
             self.goal_continuation_armed = false;
             self.goal_continuation_remaining = None;
             self.goal_continuation_usage_unavailable = false;
-            self.armed_trigger = None;
+            // Continue changes only the driver. An accepted input answer
+            // remains owned by its interrupted tool turn.
+            if self.armed_trigger != Some(RunnerTrigger::Resume) || !self.maintenance_resume {
+                self.armed_trigger = None;
+            }
             return;
         }
         self.goal_continuation_armed = true;
@@ -908,6 +912,10 @@ impl SessionRunner {
                 Some(budget) => format!("goal continuation armed (token cap: {budget})"),
                 None => "goal continuation armed".into(),
             }));
+        if self.armed_trigger == Some(RunnerTrigger::Resume) && self.maintenance_resume {
+            // The accepted answer's regular request also consumes pending ingress.
+            return;
+        }
         if self.pending_regular_reaction {
             // A fresh durable ingress gets its ordinary reaction before a
             // continuation can spend another Goal call.
@@ -915,7 +923,8 @@ impl SessionRunner {
         } else if !self.agent.has_blocking_background() {
             // Continue owns FIFO maintenance already queued before the next
             // provider call. Prompt intake still clears this trigger, so a
-            // real user message remains a User turn.
+            // real user message remains a User turn. It cannot replace an
+            // accepted input answer's maintenance resume.
             self.armed_trigger = Some(RunnerTrigger::Goal);
         }
     }
@@ -1127,6 +1136,22 @@ impl SessionRunner {
                     .await
                     .map_err(|error| format!("{error:#}"))
                     .map(|_| ())?;
+                // A successful inactive transition disarms immediately, so
+                // a later sibling resume cannot revive this continuation.
+                if !matches!(
+                    next.as_ref().map(|goal| goal.status),
+                    Some(GoalStatus::Active)
+                ) {
+                    self.goal_continuation_armed = false;
+                    self.goal_continuation_remaining = None;
+                    self.goal_continuation_usage_unavailable = false;
+                    self.turn_just_ended = false;
+                    if self.armed_trigger != Some(RunnerTrigger::Resume) || !self.maintenance_resume
+                    {
+                        self.armed_trigger = None;
+                        self.maintenance_resume = false;
+                    }
+                }
                 match next {
                     Some(goal) => Ok(ToolOutput::text(format!(
                         "goal updated:\n{}",
@@ -1773,6 +1798,14 @@ impl SessionRunner {
             }
             WaitOutcome::Completed(Err(error)) => {
                 self.agent.reset_auto_compact_request();
+                if charge_goal_continuation {
+                    self.goal_continuation_armed = false;
+                    self.goal_continuation_remaining = None;
+                    self.goal_continuation_usage_unavailable = false;
+                    self.armed_trigger = None;
+                    self.maintenance_resume = false;
+                    self.turn_just_ended = false;
+                }
                 let text = format!("{}compaction error: {error:#}", source.prefix());
                 // Both manual and auto compaction failures are real harness
                 // errors: persisted as an Error entry and fanned out as an
@@ -2294,6 +2327,10 @@ impl SessionRunner {
                     break 'turn;
                 }
                 let mut auto_compacted = false;
+                // A failed charged auto-compaction still lets this assistant's
+                // complete tool batch commit, but no later automatic or
+                // requested compaction may issue another provider call.
+                let mut charged_compaction_failed = false;
                 let auto_compaction_allowed = !goal_turn
                     || human_required_continuation
                     || (self.goal_continuation_remaining != Some(0)
@@ -2312,6 +2349,8 @@ impl SessionRunner {
                     {
                         OperationFlow::Done(steering, committed) => {
                             auto_compacted = committed;
+                            charged_compaction_failed =
+                                !committed && goal_turn && !human_required_continuation;
                             if steering != Steering::None {
                                 // The compaction completed (its projection was
                                 // committed), but the release still stops the
@@ -2484,10 +2523,11 @@ impl SessionRunner {
                         continue;
                     }
                     if call.name == "request_compaction" {
-                        let request_compaction_allowed = !goal_turn
-                            || human_required_continuation
-                            || (self.goal_continuation_remaining != Some(0)
-                                && !self.goal_continuation_usage_unavailable);
+                        let request_compaction_allowed = !charged_compaction_failed
+                            && (!goal_turn
+                                || human_required_continuation
+                                || (self.goal_continuation_remaining != Some(0)
+                                    && !self.goal_continuation_usage_unavailable));
                         let result = self
                             .execute_request_compaction(
                                 &call,
@@ -2779,7 +2819,9 @@ impl SessionRunner {
                 // A goal update in this sibling batch can make the driver
                 // ineligible. Stop only after every sibling result and any
                 // background completion have been committed.
-                if goal_turn && goal_inactive && !human_required_continuation {
+                if (goal_turn && goal_inactive || charged_compaction_failed)
+                    && !human_required_continuation
+                {
                     break 'turn;
                 }
                 // Poll-guard termination: the full sibling batch is durably
@@ -2815,11 +2857,17 @@ impl SessionRunner {
                         )
                         .await
                     {
-                        OperationFlow::Done(steering, _) => {
+                        OperationFlow::Done(steering, committed) => {
                             if steering != Steering::None {
                                 if self.release_after_preempt(steering) {
                                     return;
                                 }
+                                break 'turn;
+                            }
+                            // A charged Goal compaction error disarms the
+                            // automatic driver and ends this automatic turn.
+                            // Human-answer work remains exempt above.
+                            if !committed && goal_turn && !human_required_continuation {
                                 break 'turn;
                             }
                             // Completion may arrive while compaction was in
