@@ -22,6 +22,9 @@ MODE = os.environ.get('MODE', 'open')   # 'open' = full suite; 'splice' = pure H
 DEEP_LINK = os.environ.get('DEEP_LINK', '')
 CROSS_PAYLOAD = os.environ.get('CROSS_PAYLOAD', '')   # 注入 ?session=<id> 到 location.search（init 启动时解析）
 TRACE = os.environ.get('TRACE') == '1'
+# Bounded external timeout must still retain GJS console output while diagnosing
+# an async harness boundary; normal runs keep captured summary handling below.
+RAW_GJS = os.environ.get('RAW_GJS') == '1'
 # gjs 内置 TextDecoder 不可覆盖且不支持 stream 选项；页面 JS 里的 new TextDecoder() 换成桩工厂。
 # 注意：拆分后 tasks.js（startTaskStream）在 sse.js 之前拼接，无缩进的搜索串会先命中
 # startTaskStream 里的同名行；这里带 2 空格缩进精确匹配 readSSEStream（唯一 2 空格缩进的
@@ -44,7 +47,6 @@ if TRACE:
         'console.log("SSE: response ok");\n    setConn("ok", "● 已连接");')
     js = js.replace('if (!res.ok || !res.body) throw new Error("HTTP " + res.status);',
         'if (!res.ok || !res.body) throw new Error("HTTP " + res.status);\n    console.log("SSE: body ok, has getReader:", typeof res.body.getReader);')
-
 HARNESS = r'''
 /* 极简 HTML 序列化/解析：让 innerHTML 读-写往返与真实浏览器行为一致
    （restored 分支的缓存恢复、resync 的离屏容器替换都依赖 innerHTML）。 */
@@ -2042,18 +2044,19 @@ async function main(){
     const _resyncTaskSeqBefore = state.tasks.seq;
     handleSSEBlock("event: resync\ndata: [{\"type\":\"user_prompt\",\"data\":\"重放-用户\"},{\"type\":\"assistant_delta\",\"data\":\"重放-\"},{\"type\":\"assistant_delta\",\"data\":\"增量\"}]\n\n",
       state.sessionId, state.workspace.id, sessionOpenEpoch);
+    await flush(); await flush();
     chk("resync does not refresh tasks", state.tasks.seq === _resyncTaskSeqBefore,
         "before=" + _resyncTaskSeqBefore + " after=" + state.tasks.seq);
     const t3 = allText();
-    console.log("DBG t3=" + JSON.stringify(t3.slice(0, 200)));
-    console.log("DBG msgs children=" + elsById["messages"]._children.length
-      + " html=" + (elsById["messages"].innerHTML || "").slice(0, 150));
-    chk("resync replaces transcript", !t3.includes("你好，帮我看看") && t3.includes("重放-用户"));
+    // A resync goes through the same conservative H/S splice as snapshot.
+    // When this deliberately sparse S has no proven H overlap, it must retain
+    // the rich H prefix rather than erase it, while still showing the S tail.
+    chk("resync keeps unresolved rich history", t3.includes("你好，帮我看看") && t3.includes("重放-用户"));
     chk("resync replayed deltas", t3.includes("重放-") && t3.includes("增量"));
     chk("resync rerenders", elsById["messages"]._children.length >= 2,
         "n=" + elsById["messages"]._children.length);
-    // resync 用离屏 temp 重放再以 innerHTML 提交；提交后 accumulator 不得
-    // 继续引用 temp 的旧节点。紧随其后的 delta 必须落入真实 messages。
+    // resync fetches a fresh H tail then commits its merged offscreen nodes;
+    // the following delta must target a node now moved into real messages.
     handleSSEBlock("event: AssistantDelta\ndata: {\"delta\":\"-同步后续写\"}\n\n",
       state.sessionId, state.workspace.id, sessionOpenEpoch);
     const postResyncEl = elsById["messages"].querySelectorAll(".msg-assistant")
@@ -2159,11 +2162,11 @@ async function main(){
     }
     function openRestored(){           // 从另一会话切回 → restored 分支
       state.sessionId = null;          // 避免 saveSessionState 覆盖上面的缓存
-      openSession("s1");
+      return new Promise((resolve) => openSession("s1", resolve));
     }
     let iv = buildInflightView();
     cacheCurrentView();
-    openRestored();
+    const firstRestoredReady = openRestored();
     chk("restored initSource", state.initSource === "restored", "="+state.initSource);
     const rDets = elsById["messages"].querySelectorAll("details.thinking");
     const rAs = elsById["messages"].querySelectorAll(".msg-assistant");
@@ -2188,6 +2191,9 @@ async function main(){
     const abAfter = elsById["messages"].querySelector(".msg-assistant").querySelector(".msg-body");
     chk("restored assistant continues", state.acc.assistantBody === abAfter
         && abAfter._children.some((c) => c.text === "续写回复"));
+    await firstRestoredReady;  // existing first openSession onReady before ToolResult task refresh
+    chk("first restored open completes before ToolResult", state.initSource === "history-ready",
+        "=" + state.initSource);
     handleSSEBlock("event: ToolResult\ndata: {\"type\":\"tool_result\",\"session_id\":\"s1\",\"seq\":101,\"is_error\":false,\"content\":\"结果内容\"}\n\n", "s1", state.workspace.id, sessionOpenEpoch);
     chk("restored tool result fills old card", state.acc.toolStack.length === 1
         && state.acc.toolStack[0].filled === true
@@ -2198,7 +2204,10 @@ async function main(){
     iv.dot.className = "think-dot done";
     iv.ab.appendChild(document.createElement("em"));   // 模拟 markdown 渲染出的子元素
     cacheCurrentView();
-    openRestored();
+    const restoredReady = openRestored();
+    await restoredReady;  // existing openSession onReady: loadHistory + connectSSE setup complete
+    chk("restored open completes before task fixture", state.initSource === "history-ready",
+        "=" + state.initSource);
     chk("restored done thinking not bound", state.acc.thinkingEl === null,
         "="+String(state.acc.thinkingEl));
     chk("restored rendered assistant not bound",
@@ -8693,16 +8702,22 @@ HARNESS = HARNESS.replace('__DEEP_LINK_SEARCH__', ('?session=' + DEEP_LINK) if D
 out = os.path.join(HERE, '.test_harness.js')
 with open(out, 'w', encoding='utf-8') as f:
     f.write(HARNESS + vendor_js + "\n" + js + "\n" + usage_dashboard_js + TAIL)
-r = subprocess.run(['gjs', out], capture_output=True, text=True)
-print(r.stdout, end="")
-if r.stderr.strip():
-    print(r.stderr[:12000])
-    # gjs 的 PASS/FAIL/ALL PASS 都走 stderr，且总输出可能超过 12000 字符：
-    # 只打印头部会把结尾的 "ALL PASS"/"N FAILURES" 截掉，导致 exit code
-    # 误报（"ALL PASS" 判据找不到）。补打尾部，保证总判定永远可见。
-    if len(r.stderr) > 12000:
-        print("... [stderr tail] ...")
-        print(r.stderr[-3000:])
+r = subprocess.run(['gjs', out], capture_output=not RAW_GJS, text=True)
+if RAW_GJS:
+    # Output inherited by the caller: a shell timeout can retain the exact last
+    # callback marker instead of killing Python while its pipes are still buffered.
+    r_stdout = r_stderr = ""
+else:
+    r_stdout, r_stderr = r.stdout, r.stderr
+    print(r_stdout, end="")
+    if r_stderr.strip():
+        print(r_stderr[:12000])
+        # gjs 的 PASS/FAIL/ALL PASS 都走 stderr，且总输出可能超过 12000 字符：
+        # 只打印头部会把结尾的 "ALL PASS"/"N FAILURES" 截掉，导致 exit code
+        # 误报（"ALL PASS" 判据找不到）。补打尾部，保证总判定永远可见。
+        if len(r_stderr) > 12000:
+            print("... [stderr tail] ...")
+            print(r_stderr[-3000:])
 if os.environ.get('KEEP') != '1':
     os.unlink(out)
 
@@ -8983,7 +8998,7 @@ if not (_usage_shell_ok and _usage_contract_ok and _usage_states_ok and _usage_r
 
 
 if MODE == 'connector':
-    sys.exit(0 if ("ALL PASS" in r.stdout + r.stderr) and _task_card_indent_ok and _task_connector_ok else 1)
+    sys.exit(0 if ("ALL PASS" in r_stdout + r_stderr) and _task_card_indent_ok and _task_connector_ok else 1)
 if MODE == 'header':
-    sys.exit(0 if ("ALL PASS" in r.stdout + r.stderr) and _header_busy_ok else 1)
-sys.exit(0 if ("ALL PASS" in r.stdout + r.stderr) and _css_ok and _spin_ok and _status_rules_ok and _status_contrast_ok and _status_scope_ok and _header_busy_ok and _marker_ok and _empty_ok and _diagram_font_ok and _usage_mobile_ok and _chip_ok and _diff_rules_ok and _txt_ok and _contrast_ok and _viewport_ok and _zoom_guard_ok and _icon_ok and _usage_shell_ok and _usage_contract_ok and _usage_states_ok and _usage_responsive_ok else 1)
+    sys.exit(0 if ("ALL PASS" in r_stdout + r_stderr) and _header_busy_ok else 1)
+sys.exit(0 if ("ALL PASS" in r_stdout + r_stderr) and _css_ok and _spin_ok and _status_rules_ok and _status_contrast_ok and _status_scope_ok and _header_busy_ok and _marker_ok and _empty_ok and _diagram_font_ok and _usage_mobile_ok and _chip_ok and _diff_rules_ok and _txt_ok and _contrast_ok and _viewport_ok and _zoom_guard_ok and _icon_ok and _usage_shell_ok and _usage_contract_ok and _usage_states_ok and _usage_responsive_ok else 1)

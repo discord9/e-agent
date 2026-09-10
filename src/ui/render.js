@@ -950,6 +950,13 @@ function appendToolResult(isError, content, acc, callId) {
   if (callId && acc.pendingByCall.has(callId)) {
     card = acc.pendingByCall.get(callId);
   }
+  if (!card && acc.spliceLastCard) {
+    // A merged snapshot's ownerless result follows the call selected by the
+    // splice plan.  Do not let the normal live fallback steal a later call.
+    card = acc.spliceLastCard;
+    for (const t of acc.toolStack) if (t.el === card) t.filled = true;
+    acc.spliceLastCard = null;
+  }
   if (!card) {
     // 从后往前找最近一个未填充的卡片
     for (let i = acc.toolStack.length - 1; i >= 0; i--) {
@@ -1433,6 +1440,90 @@ function pruneMessages() {
 function renderHistory(entries) {
   renderEntries(entries, false);
   scrollBottom(true);
+}
+
+/* Render the splice helper's ordered components into a real offscreen DOM, then
+   move those nodes into the visible list.  Moving (rather than innerHTML) keeps
+   accumulator/card references valid for the live event immediately after a
+   snapshot. */
+function renderSpliceComponents(components) {
+  const real = els.messages, temp = real.cloneNode(false), prior = state.acc;
+  const acc = newAccumulator(), pending = acc.pendingByCall;
+  let lastCard = null;
+  temp.innerHTML = "";
+  els.messages = temp;
+  state.acc = acc;
+  suppressScroll = true;
+  try {
+    for (const component of components || []) {
+      if (component.source === "history") {
+        const entry = component.raw || {};
+        const message = entry.message || {};
+        if (component.part === "user") {
+          const u = message.User || {}; appendUserMsg(u.content || ""); appendUserImages(u.images || []);
+        } else if (component.part === "system") {
+          appendSystemMsg((message.System || {}).content || "");
+        } else if (component.part === "reasoning") {
+          const a = message.Assistant || {}, det = el("details", "thinking");
+          det.open = false;
+          const sum = el("summary", "", ""), dot = el("span", "think-dot done"), label = el("span", "think-label", "思考");
+          sum.append(dot, label); det.append(sum, el("div", "think-body", a.reasoning || "")); temp.appendChild(det);
+        } else if (component.part === "text" || component.part === "empty") {
+          const a = message.Assistant || {}; freezeAssistant(acc);
+          const body = assistantBubble(acc, true);
+          if (component.part === "empty") body.innerHTML = "<span class=\"dim\">（空回复）</span>";
+          else { body.innerHTML = renderMarkdown(a.content || ""); acc.assistantText = a.content || ""; }
+        } else if (component.part && component.part.startsWith("call:")) {
+          const calls = (message.Assistant || {}).tool_calls || [];
+          const tc = calls[Number(component.part.slice(5))] || {};
+          freezeAssistant(acc);
+          const card = buildToolCard(tc.name, tc.arguments, "等待结果…", "pending", null);
+          temp.appendChild(card); pending.set(tc.id, card); acc.toolStack.push({el:card, filled:false}); lastCard = card;
+        } else if (component.part === "result") {
+          const t = message.Tool || {}; const card = pending.get(t.call_id);
+          if (card) { acc.spliceLastCard = card; appendToolResult(t.is_error === true, t.content || "", acc, t.call_id); lastCard = card; }
+          else appendToolResult(t.is_error === true, t.content || "", acc, t.call_id);
+        } else renderEntry(entry, acc, pending);
+      } else {
+        const event = component.raw || {}, type = String(event.type || "").toLowerCase();
+        const data = event.data !== undefined ? event.data : event;
+        if (type === "user_prompt" || type === "userprompt") appendUserMsg(pickText(data, ["text", "prompt", "content"]));
+        else if (type === "assistant_text" || type === "assistanttext") setAssistantText(pickText(data, ["text", "content"]), acc);
+        else if (type === "assistant_delta" || type === "assistantdelta") appendAssistantDelta(pickText(data, ["delta", "text", "content"]), acc);
+        else if (type === "reasoning_delta" || type === "reasoningdelta") appendReasoningDelta(pickText(data, ["delta", "text", "reasoning"]), acc);
+        else if (type === "tool_call" || type === "toolcall") {
+          const p = data && typeof data === "object" ? data : {};
+          appendToolCall(pickText(p,["name"]), typeof p.arguments === "string" ? p.arguments : JSON.stringify(p.arguments || {}), acc, p.call_id);
+          lastCard = acc.toolStack[acc.toolStack.length - 1].el;
+        } else if (type === "tool_result" || type === "toolresult") {
+          const p = data && typeof data === "object" ? data : {};
+          // Snapshot results can be ownerless.  The splice order puts one after
+          // its matched H call; use that card, never the generic latest card.
+          acc.spliceLastCard = lastCard;
+          appendToolResult(p.is_error === true || p.error === true, pickText(p,["content","text","result","error"]), acc, p.call_id);
+        } else if (type === "notice") appendNotice(pickText(data,["text","message"]));
+        else if (type === "error") appendError(pickText(data,["error","message","text"]));
+        else if (type === "background_completed" || type === "backgroundcompletionnotice") {
+          const p = data && typeof data === "object" ? data : {}; appendBackgroundCompletion(p.id ?? "?", p.label, pickText(p,["output","text","content"]));
+        }
+      }
+    }
+  } finally {
+    suppressScroll = false;
+    els.messages = real;
+  }
+  while (real.firstChild) real.firstChild.remove();
+  while (temp.firstChild) real.appendChild(temp.firstChild); // move nodes; do not serialize/recreate
+  state.acc = acc;
+  pruneMessages();
+  scrollBottom(true);
+  return prior;
+}
+
+function renderMergedHistorySnapshot(historyEntries, snapshotEvents) {
+  const plan = spliceHistorySnapshot(historyEntries || [], snapshotEvents || []).output;
+  renderSpliceComponents(plan.components);
+  return plan;
 }
 
 /* =====================================================================

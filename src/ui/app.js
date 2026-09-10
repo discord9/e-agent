@@ -55,6 +55,7 @@ const state = {
   validateBannerUp: false,   // 当前 banner 是否由校验提示占用（恢复数据后只清自己的）
   sse: { ctrl: null, retryTimer: null, stopped: false },
   acc: null,                 // 增量渲染累积器（见 newAccumulator）
+  historyEntries: null,      // 当前尾页 H：只供下一份 snapshot/resync 与它拼接；分页仍直接前置渲染
   nextBeforeSeq: null,       // 历史分页游标：下一段更早历史的 before_seq（loadHistory 响应里取；null=没有更多）
   sessionUsage: null,        // 当前会话持久化累计用量 {input_tokens, output_tokens}（含子会话，重启不清零）；
                              // 打开会话时拉 /usage 填充，切换/关闭时置 null；null → 用量行回退 live 进程计数

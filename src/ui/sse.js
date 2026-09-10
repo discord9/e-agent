@@ -21,6 +21,9 @@ function setConn(stateName, text) {
 function stillCurrent(id, wsId, epoch) {
   return epoch === sessionOpenEpoch && state.workspace.id === wsId && state.sessionId === id;
 }
+function streamCurrent(id, wsId, epoch, ctrl) {
+  return stillCurrent(id, wsId, epoch) && (!ctrl || state.sse.ctrl === ctrl);
+}
 
 /* 会话已知状态：区分 SSE 404 的两种含义（历史无流 vs 真不存在）。
    /api/sessions/<id>/events 只服务 live 会话；历史/已结束会话保持 404
@@ -105,11 +108,19 @@ function connectSSE(id, wsId, epoch) {
     },
     signal: ctrl.signal,
   }).then((res) => {
+    // Authentication/EOF/error from a replaced connection is not authoritative.
+    if (!streamCurrent(id, wsId, epoch, ctrl)) return;
     if (res.status === 401 || res.status === 403) {
       setBanner("⚠ 认证失败：请检查 Token。");
       throw new Error("auth");
     }
     if (res.status === 404) {
+      // Ended sessions have no snapshot stream.  H is then the complete,
+      // validated replacement and may be committed once without an S replay.
+      if (state.initSource === "history-ready" && state.historyEntries) {
+        renderHistory(state.historyEntries);
+        state.initSource = "history";
+      }
       // 404 的两种含义，按会话已知状态区分（判定见 sessionKnownState）：
       // - 已知历史/已结束（active===false）或不在任何列表（任务面板直连
       //   刚结束的子会话）：SSE 端点只服务 live 会话，404 = 没有实时流，
@@ -169,7 +180,7 @@ function connectSSE(id, wsId, epoch) {
     }
     if (!res.ok || !res.body) throw new Error("HTTP " + res.status);
     // 响应回来时上下文可能已被取代（新打开/切换）：不起流、不画连接状态
-    if (!stillCurrent(id, wsId, epoch)) { try { ctrl.abort(); } catch (e) { /* 忽略 */ } return; }
+    if (!streamCurrent(id, wsId, epoch, ctrl)) { try { ctrl.abort(); } catch (e) { /* 忽略 */ } return; }
     setConn("ok", "● 已连接");
     // 深链 attempt 已完成（live 流建立）：清标记
     state.deepLink.probing = false;
@@ -177,15 +188,17 @@ function connectSSE(id, wsId, epoch) {
     return readSSEStream(res.body.getReader(), id, wsId, epoch, ctrl);
   }).then(() => {
     // 正常结束（后端关闭流）→ 按断线处理
+    if (!streamCurrent(id, wsId, epoch, ctrl)) return;
     throw new Error("stream end");
   }).catch((err) => {
+    if (!streamCurrent(id, wsId, epoch, ctrl)) return;
     if (err && err.name === "AbortError") return;   // 主动停止
     if (state.sse.stopped) return;
     if (err && (err.message === "auth" || err.message === "gone" || err.message === "silent-gone")) {
       state.sse.stopped = true;   // 认证失败 / 会话不存在 / 历史无流：都不重连（404 重连也 404）
       return;
     }
-    scheduleReconnect(id, wsId, epoch);   // 携带断线流的三元组：重连前必须仍是同一上下文
+    if (state.sse.ctrl === ctrl) scheduleReconnect(id, wsId, epoch); // stale connection cannot reopen a newer stream
   });
 }
 
@@ -196,16 +209,16 @@ async function readSSEStream(reader, id, wsId, epoch, ctrl) {
   const decoder = new TextDecoder();
   let buf = "";
   for (;;) {
-    if (!stillCurrent(id, wsId, epoch)) { try { ctrl && ctrl.abort(); } catch (e) { /* 忽略 */ } return; }
+    if (!streamCurrent(id, wsId, epoch, ctrl)) { try { ctrl && ctrl.abort(); } catch (e) { /* 忽略 */ } return; }
     const { done, value } = await reader.read();
     if (done) break;
-    if (!stillCurrent(id, wsId, epoch)) { try { ctrl && ctrl.abort(); } catch (e) { /* 忽略 */ } return; }
+    if (!streamCurrent(id, wsId, epoch, ctrl)) { try { ctrl && ctrl.abort(); } catch (e) { /* 忽略 */ } return; }
     buf += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
     let idx;
     while ((idx = buf.indexOf("\n\n")) !== -1) {
       const block = buf.slice(0, idx);
       buf = buf.slice(idx + 2);
-      handleSSEBlock(block, id, wsId, epoch);
+      handleSSEBlock(block, id, wsId, epoch, ctrl);
     }
   }
 }
@@ -455,14 +468,15 @@ function snapshotAssistantDeltaTail(events) {
 
 function cachedInFlightAssistantText(id) {
   const cached = state.sessionStates[state.workspace.id + ":" + id];
-  if (!cached || typeof cached.html !== "string") return "";
+  if (!cached) return "";
+  if (typeof cached.inFlightText === "string") return cached.inFlightText;
+  // Compatibility with a pre-node-cache entry kept only for this page lifetime.
+  if (typeof cached.html !== "string") return "";
   const holder = document.createElement("div");
   holder.innerHTML = cached.html;
   const assistants = holder.querySelectorAll(".msg-assistant");
   const last = assistants[assistants.length - 1];
   const body = last && last.querySelector(".msg-body");
-  // A plain body is the same in-flight marker used by reattachInFlight;
-  // completed AssistantText history has markdown child elements.
   return body && !body.querySelector("*") ? body.textContent : "";
 }
 
@@ -500,8 +514,8 @@ function reconcileSnapshotAssistantTail(entries, id) {
 
 /* 解析单个 SSE 事件块：任何分支（snapshot/status/resync/live）动手改 UI 前
    必须通过三重校验——陈旧流的块整块丢弃，绝不画进当前会话/workspace。 */
-function handleSSEBlock(block, id, wsId, epoch) {
-  if (!stillCurrent(id, wsId, epoch)) return;
+function handleSSEBlock(block, id, wsId, epoch, ctrl) {
+  if (!streamCurrent(id, wsId, epoch, ctrl)) return;
   let eventName = "message";
   const dataLines = [];
   for (const line of block.split("\n")) {
@@ -523,18 +537,21 @@ function handleSSEBlock(block, id, wsId, epoch) {
       // 模型请求的 context_input/context_window），不等下一次模型调用；
       // 复用 applyUsage 路径（state.lastUsage + renderUsageLine）。
       restoreUsageFromSnapshot(entries);
-      // history/restored 已经拥有权威的持久化 DOM；只把缓存中仍在途的
-      // assistant delta 尾巴接回来。普通首开没有缓存前缀，因此不会重放
-      // snapshot，也不会产生重复助手块。
-      if (state.initSource === "history" || state.initSource === "restored") {
-        reconcileSnapshotAssistantTail(entries, id);
-      }
-      // 已用 history 渲染过则跳过（避免重复）；恢复的会话（initSource="restored"，
-      // 视图来自缓存）也跳过——缓存内容与 snapshot 等价，重放会造成重复；
-      // history 加载失败时仍作为兜底
-      if (state.initSource !== "history" && state.initSource !== "restored") {
-        renderHistory(entries);
+      // H is fetched first.  Merge its rich components with the snapshot in
+      // one render pass: matched snapshot prefix is covered by H, while only
+      // unmatched snapshot parts (including the active tail) are replayed.
+      // A failed history request has no H and therefore cleanly falls back to
+      // the same path with every snapshot event retained.
+      if (state.historyEntries) {
+        renderMergedHistorySnapshot(state.historyEntries, entries);
         state.initSource = "snapshot";
+      } else if (state.initSource !== "history" && state.initSource !== "history-ready" && state.initSource !== "restored") {
+        renderMergedHistorySnapshot([], entries);
+        state.initSource = "snapshot";
+      } else {
+        // Old/empty history fixtures have no merge input.  Preserve the
+        // already-rendered cache/history instead of replaying an unanchored S.
+        reconcileSnapshotAssistantTail(entries, id);
       }
       // GoalBar：snapshot 里最新的 goal_updated（set 或 clear 墓碑）折叠
       // 出来刷新 GoalBar——history 失败走 snapshot 兜底时 GET /goal 可能
@@ -560,53 +577,18 @@ function handleSSEBlock(block, id, wsId, epoch) {
   }
   if (id !== state.sessionId) return;  // 已切换会话
   if (eventName === "resync") {
-    // Lag 追平：后端重发完整事件日志（AgentEvent 数组，{type,data} 形状）。
-    // 与 snapshot 不同，无论初始渲染来源都强制整体替换 transcript。
-    // 渲染到离屏容器，成功才一次性替换；失败回滚旧内容。避免「先清空再
-    // 重放」在手机上（可上千条事件）造成消息区空白、像消息消失一样。
-    const real = els.messages;
-    const backup = real.innerHTML;
-    const temp = real.cloneNode(false);   // 同 class/id，无子节点
-    temp.innerHTML = "";
-    els.messages = temp;
-    state.acc = newAccumulator();
-    // 排队提示是「当下」状态，重放的是过去事件：清空 queueBar 并跳过重放
-    state.queue.length = 0;
-    renderQueueBar();
-    const NAME = {
-      prompt_queued: "PromptQueued", prompt_consumed: "PromptConsumed",
-      user_prompt: "UserPrompt", assistant_text: "AssistantText",
-      assistant_delta: "AssistantDelta", reasoning_delta: "ReasoningDelta",
-      tool_call: "ToolCall", tool_result: "ToolResult",
-      notice: "Notice", error: "Error",
-      background_completed: "BackgroundCompleted",
-      background_completion_notice: "BackgroundCompletionNotice",
-      goal_updated: "GoalUpdated",   // set 与 clear（goal:null）都刷新 GoalBar
-      usage: "Usage",
-    };
+    // A resync log is not itself a replacement transcript.  Fetch its matching
+    // current H tail first, then use the exact same splice commit as snapshot.
+    // Until that H validates, leave nodes, accumulator, and paging cursor alone.
+    let events;
     try {
       const parsed = JSON.parse(data);
-      const events = Array.isArray(parsed) ? parsed : (parsed.events || []);
-      for (const ev of events) {
-        const name = (ev && NAME[ev.type]) || "Notice";
-        // 已过去的排队事件：不重放（它们不该出现在 queueBar；已在上方清空）
-        if (name === "PromptQueued" || name === "PromptConsumed") continue;
-        const payload = (ev && ev.data !== undefined) ? ev.data : (ev || {});
-        applyLiveEvent(name, payload);
-      }
-      real.innerHTML = temp.innerHTML;
-      els.messages = real;
-      // innerHTML 会在 real 下创建全新的节点；重放时 acc 绑定的是离屏 temp
-      // 的旧节点，不能让后续 delta 继续写入孤儿 DOM。
-      state.acc = newAccumulator();
-      state.initSource = "snapshot";
+      events = Array.isArray(parsed) ? parsed : (parsed.events || []);
     } catch (e) {
-      els.messages = real;
-      real.innerHTML = backup;
-      // 回滚同样通过 innerHTML 重建节点，不能保留离屏重放期间的引用。
-      state.acc = newAccumulator();
       appendNotice("⚠ 会话同步失败，已保留原内容");
+      return;
     }
+    void mergeResyncHistory(events, id, wsId, epoch, ctrl);
     return;
   }
   if (state.initSource === null) return;   // 初始渲染未完成前的 live 事件丢弃
@@ -620,6 +602,33 @@ function handleSSEBlock(block, id, wsId, epoch) {
     });
   }
   applyLiveEvent(eventName, payload);
+}
+
+/* Resync needs a fresh H tail: the locally cached tail can be behind the S log
+   and would retain obsolete prefix nodes.  This is deliberately one fetch and
+   one merged DOM commit; it neither replays queue operations nor mutates paging
+   until the response has passed every active-stream guard. */
+async function mergeResyncHistory(events, id, wsId, epoch, ctrl) {
+  const ws = state.workspaces.find((w) => w.id === wsId) || state.workspace;
+  try {
+    const res = await apiFor(ws, "/api/sessions/" + encodeURIComponent(id)
+      + "/history?limit=" + HISTORY_PAGE);
+    if (!streamCurrent(id, wsId, epoch, ctrl)) return;
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    if (!streamCurrent(id, wsId, epoch, ctrl)) return;
+    const history = Array.isArray(data) ? data : (data.entries || []);
+    const next = data.next_before_seq !== undefined ? data.next_before_seq : null;
+    renderMergedHistorySnapshot(history, events);
+    // Commit pagination only with the corresponding successful replacement.
+    state.historyEntries = history;
+    state.nextBeforeSeq = next;
+    state.olderDone = next === null;
+    state.initSource = "snapshot";
+  } catch (e) {
+    if (!streamCurrent(id, wsId, epoch, ctrl)) return;
+    appendNotice("⚠ 会话同步失败，已保留原内容");
+  }
 }
 
 /* live AgentEvent → 增量渲染 */
