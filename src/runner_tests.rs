@@ -12063,19 +12063,20 @@ async fn oracle739_notice_during_answer_compact_active_continue_zero_keeps_resum
     )
     .await
     .unwrap();
-    let calls = calls.lock().unwrap();
-    assert_eq!(
-        calls.len(),
-        3,
-        "the accepted answer consumes the Notice; Continue(Some(0)) prevents a later Goal or Background request"
-    );
-    assert!(calls[2].iter().any(|message| matches!(message,
-        Message::Tool { call_id, .. } if call_id == "oracle739-answer"
-    )));
-    assert!(calls[2].iter().any(|message| matches!(message,
-        Message::User { content, .. } if content == "oracle739 fresh notice"
-    )));
-    drop(calls);
+    {
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            3,
+            "the accepted answer consumes the Notice; Continue(Some(0)) prevents a later Goal or Background request"
+        );
+        assert!(calls[2].iter().any(|message| matches!(message,
+            Message::Tool { call_id, .. } if call_id == "oracle739-answer"
+        )));
+        assert!(calls[2].iter().any(|message| matches!(message,
+            Message::User { content, .. } if content == "oracle739 fresh notice"
+        )));
+    }
     assert_eq!(
         starts.load(Ordering::SeqCst),
         1,
