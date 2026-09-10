@@ -22,22 +22,52 @@ class Handler(BaseHTTPRequestHandler):
         names = {tool.get("function", {}).get("name") for tool in tools}
         has_tool_result = any(message.get("role") == "tool" for message in messages)
 
+        user_messages = [
+            message["content"]
+            for message in messages
+            if message.get("role") == "user" and isinstance(message.get("content"), str)
+        ]
+        user_text = "\n".join(user_messages)
+        latest_user = user_messages[-1] if user_messages else ""
+        model = request.get("model")
+        profile = {"mock-parent-regular": "parent", "mock-child-regular": "child"}.get(model)
+        if profile is None:
+            raise AssertionError(f"unexpected wire model/profile: {model!r}")
+        summary = "Summarize the earlier conversation." in latest_user
+        notice = "no output for five minutes" in latest_user
+        completion = "[background task" in latest_user and "completed" in latest_user
+        # The parent asks for a delegate; the child receives the delegated
+        # task text. Distinct wire models make ownership independently
+        # observable; these phase labels identify the exact regular request
+        # which consumed a durable notice or completion.
+        child_task = "requested silent child-owned" in user_text
+        if summary:
+            phase = f"{profile}-summary"
+        elif child_task and not has_tool_result:
+            phase = "child-start"
+        elif notice:
+            phase = "child-stall-notice"
+        elif completion:
+            phase = f"{profile}-completion"
+        elif has_tool_result:
+            phase = f"{profile}-tool-followup"
+        else:
+            phase = f"{profile}-regular"
         with self.server.call_lock:
             self.server.call_count += 1
             number = self.server.call_count
             with open(self.server.calls_file, "a", encoding="utf-8") as calls:
-                calls.write(json.dumps({"number": number, "path": self.path}) + "\n")
+                calls.write(json.dumps({
+                    "number": number,
+                    "path": self.path,
+                    "model": model,
+                    "profile": profile,
+                    "request_kind": "summary" if summary else "regular",
+                    "phase": phase,
+                    "messages": messages,
+                }, separators=(",", ":")) + "\n")
 
-        user_text = " ".join(
-            message.get("content", "")
-            for message in messages
-            if message.get("role") == "user" and isinstance(message.get("content"), str)
-        )
-        # The parent asks for a delegate; the child receives the delegated
-        # task text.  Both tool lists contain delegate+bash, so the task text
-        # is the deterministic boundary between the two real calls.
-        child_task = "requested silent child-owned" in user_text
-        if not child_task and "delegate" in names and not has_tool_result:
+        if profile == "parent" and not child_task and "delegate" in names and not has_tool_result:
             arguments = {
                 "workspace": ".",
                 "task": "Start the requested silent child-owned background command, then finish.",
@@ -60,11 +90,9 @@ class Handler(BaseHTTPRequestHandler):
             # The completion-driven follow-up is intentionally delayed a little.
             # This leaves an observable interval in which the child's durable
             # completion exists while its parent delegate row still exists.
-            if any(
-                isinstance(message.get("content"), str)
-                and "[background task" in message["content"]
-                for message in messages
-            ):
+            if completion:
+                # Keep the completion boundary observable before the parent
+                # delegate task naturally returns.
                 time.sleep(2)
             payload = self.text("subagent stall E2E turn complete")
 
@@ -84,7 +112,7 @@ class Handler(BaseHTTPRequestHandler):
             "id": "subagent-stall-e2e",
             "object": "chat.completion.chunk",
             "created": 1,
-            "model": "mock-subagent-stall",
+            "model": "mock-e2e",
             "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
         }
 

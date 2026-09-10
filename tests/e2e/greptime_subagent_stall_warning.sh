@@ -175,12 +175,16 @@ echo "safety diagnostics: all six ports are distinct dynamic localhost ports; re
 echo "safety diagnostics: database=public, workspace=$WORKSPACE, no inherited endpoint variables"
 
 cat >"$XDG_CONFIG_HOME/e-agent/config.toml" <<EOF
- default = "mock/mock"
+ default = "mock/parent"
 [providers.mock]
 base_url = "http://127.0.0.1:$MOCK_PORT/v1"
 api_key_env = "STALL_E2E_KEY"
-[models."mock/mock"]
-model = "mock-subagent-stall"
+[models."mock/parent"]
+model = "mock-parent-regular"
+[models."mock/child"]
+model = "mock-child-regular"
+[roles]
+subagent = "mock/child"
 [session]
 backend = "greptime"
 conn = "host=127.0.0.1 port=$GT_PG dbname=public"
@@ -224,15 +228,6 @@ wait_for 90 curl -fsS "${AUTH[@]}" "$BASE/api/sessions" >/dev/null
 
 api_get() { curl -fsS --max-time 10 "${AUTH[@]}" "$BASE$1"; }
 api_post() { curl -fsS --max-time 10 "${AUTH[@]}" -X POST "$BASE$1" -d "$2"; }
-provider_count() { python3 - "$MOCK_CALLS_FILE" <<'PY'
-import json, sys
-try:
-    with open(sys.argv[1], encoding="utf-8") as stream:
-        print(sum(1 for line in stream if line.strip() and json.loads(line)))
-except FileNotFoundError:
-    print(0)
-PY
-}
 PARENT_ID="stall-parent"
 api_post "/api/sessions" '{"id":"stall-parent","initial_prompt":"Delegate a child that starts the requested silent background command."}' \
     >"$ROOT/create.json"
@@ -293,19 +288,23 @@ PY
 echo "assertion: no child stall Notice before the production five-minute threshold"
 FULL_COMMAND_MARKER="${RUN_MARKER}-full-command-marker-${RUN_MARKER}"
 OUTPUT_TAIL_MARKER="${RUN_MARKER}-child-output"
-warning_provider_count=$(provider_count)
+FULL_COMMAND="printf '%s\\n' ${OUTPUT_TAIL_MARKER}; exec -a ${RUN_MARKER}-child-silent sleep 330 # ${FULL_COMMAND_MARKER}"
+OUTPUT_TAIL="${OUTPUT_TAIL_MARKER}"$'\n'
 polling_deadline=$((SECONDS + 400))
 
 stall_count_in_history() {
-    python3 - "$1" "$child_task_id" "$FULL_COMMAND_MARKER" "$OUTPUT_TAIL_MARKER" <<'PY'
-import json, sys
+    python3 - "$1" "$child_task_id" "$FULL_COMMAND" "$OUTPUT_TAIL" <<'PY'
+import json, re, sys
 h = json.load(open(sys.argv[1], encoding="utf-8"))
-n, command_marker, output_marker = sys.argv[2:]
+task_id, command, output = sys.argv[2:]
+pattern = re.compile(
+    rf"^background task {re.escape(task_id)} has had no output for five minutes; "
+    rf"runtime [^;]+; silence duration [^;]+; full command: {re.escape(command)}; "
+    rf"current latest output tail: {re.escape(output)}$")
 notices = [e.get("text", "") for e in h.get("entries", []) if e.get("type") == "notice"
-           and "no output for five minutes" in e.get("text", "") and n in e.get("text", "")]
+           and "no output for five minutes" in e.get("text", "") and task_id in e.get("text", "")]
 for text in notices:
-    assert "runtime " in text and "silence duration " in text, text
-    assert command_marker in text and output_marker in text, text
+    assert pattern.fullmatch(text), f"unexpected durable stall Notice: {text!r}"
 print(len(notices))
 PY
 }
@@ -331,13 +330,76 @@ child_row=$(sql "SELECT count(*) FROM running_tasks WHERE workspace_id='$WORKSPA
     echo "ASSERTION FAILED: owner rows changed at warning: parent=$parent_row child=$child_row" >&2
     exit 1
 }
-[[ "$(provider_count)" == "$warning_provider_count" ]] || {
-    echo "ASSERTION FAILED: provider request count changed because of the Notice" >&2
+# The fresh durable Notice must wake only its owning child.  Wait for its
+# regular request while the 330-second process and both durable owners still
+# exist; the mock's wire log records the selected profile and every message.
+warning_text_file="$ROOT/exact-child-stall-notice.txt"
+python3 - "$warning_history" "$child_task_id" "$warning_text_file" <<'PY'
+import json, sys
+h = json.load(open(sys.argv[1], encoding="utf-8"))
+rows = [e["text"] for e in h["entries"] if e.get("type") == "notice"
+        and sys.argv[2] in e.get("text", "")
+        and "no output for five minutes" in e.get("text", "")]
+assert len(rows) == 1, rows
+open(sys.argv[3], "w", encoding="utf-8").write(rows[0])
+PY
+assert_child_stall_wake() {
+    python3 - "$MOCK_CALLS_FILE" "$warning_text_file" <<'PY'
+import json, sys
+path, warning_path = sys.argv[1:]
+warning = open(warning_path, encoding="utf-8").read()
+try:
+    with open(path, encoding="utf-8") as stream:
+        calls = [json.loads(line) for line in stream if line.strip()]
+except FileNotFoundError:
+    calls = []
+for call in calls:
+    assert call["model"] in {"mock-parent-regular", "mock-child-regular"}, call
+    assert call["profile"] in {"parent", "child"}, call
+noticed = [call for call in calls if call["phase"] == "child-stall-notice"]
+assert len(noticed) == 1, noticed
+call = noticed[0]
+assert call["model"] == "mock-child-regular" and call["profile"] == "child", call
+assert call["request_kind"] == "regular", call
+users = [m.get("content") for m in call["messages"] if m.get("role") == "user"]
+assert users and users[-1] == warning, (users, warning)
+assert not any(call["profile"] == "parent" and warning in "\n".join(
+    m.get("content", "") for m in call["messages"] if m.get("role") == "user"
+) for call in calls), calls
+print(call["number"])
+PY
+}
+stall_wake_call=""
+stall_wake_deadline=$((SECONDS + 10))
+while (( SECONDS < stall_wake_deadline )); do
+    stall_wake_call=$(assert_child_stall_wake 2>/dev/null || true)
+    [[ -n "$stall_wake_call" ]] && break
+    sleep 0.2
+done
+[[ -n "$stall_wake_call" ]] || {
+    echo "ASSERTION FAILED: fresh child stall Notice did not cause exactly one child regular provider request" >&2
     exit 1
 }
+child_live_pids=$(marker_rows | awk '$3 !~ /^Z/ {print $1}')
+[[ -n "$child_live_pids" ]] || {
+    echo "ASSERTION FAILED: child command PID is not alive when its stall request is first observed" >&2
+    exit 1
+}
+parent_row=$(sql "SELECT count(*) FROM running_tasks WHERE workspace_id='$WORKSPACE' AND session_id='$PARENT_ID' AND task_id=$parent_task_id")
+child_row=$(sql "SELECT count(*) FROM running_tasks WHERE workspace_id='$WORKSPACE' AND session_id='$child_id' AND task_id=$child_task_id AND subagent_session_id IS NULL")
+[[ "$child_row" == 1 && "$parent_row" == 1 ]] || {
+    echo "ASSERTION FAILED: owner rows were not retained at the child stall request: parent=$parent_row child=$child_row" >&2
+    exit 1
+}
+api_get "/api/sessions/$child_id/history" >"$warning_history"
+python3 - "$warning_history" <<'PY'
+import json, sys
+h = json.load(open(sys.argv[1], encoding="utf-8"))
+assert not any(e.get("type") == "background_completion" for e in h["entries"]), h["entries"]
+PY
 warning_history_count=$(stall_count_in_history "$warning_history")
-echo "warning: elapsed_from_child_observed_ms=${elapsed_from_child_observed_ms} provider_calls=$warning_provider_count child_notice_count=$warning_history_count"
-echo "assertion: child owner row and parent delegate row remain; Notice caused no provider request"
+echo "warning: elapsed_from_child_observed_ms=${elapsed_from_child_observed_ms} child_stall_wake_call=$stall_wake_call child_live_pids=${child_live_pids//$'\n'/,} child_notice_count=$warning_history_count"
+echo "assertion: exact durable child Notice caused one child-profile regular request, never parent; both owner rows remain and the child PID is alive before completion"
 
 # The already-attached stream must receive exactly one named Notice.  A fresh
 # attach's snapshot must independently contain exactly one durable projection.
@@ -445,35 +507,79 @@ else:
 done
 [[ "$completion_seen" == 1 ]] || { echo "ASSERTION FAILED: natural background completion did not appear" >&2; exit 1; }
 
-python3 - "$completion_file" "$child_task_id" "$FULL_COMMAND_MARKER" "$OUTPUT_TAIL_MARKER" <<'PY'
-import json, sys
-h = json.load(open(sys.argv[1], encoding="utf-8"))
-n, command_marker, output_marker = sys.argv[2:]
-entries = h.get("entries", [])
-notice = [i for i, e in enumerate(entries) if e.get("type") == "notice" and n in e.get("text", "") and "no output for five minutes" in e.get("text", "")]
-for index in notice:
-    text = entries[index]["text"]
-    assert "runtime " in text and "silence duration " in text
-    assert command_marker in text and output_marker in text
-completion = [i for i, e in enumerate(entries) if e.get("type") == "background_completion"]
-assert len(notice) == 1, f"duplicate stall Notice(s): {notice}"
-assert completion, "missing background completion"
-assert notice[0] < completion[0], f"durable ordering is Notice={notice[0]} completion={completion[0]}"
-print(f"notice_index={notice[0]} completion_index={completion[0]}")
-PY
+# Child completion has its own durable boundary: it must clear only the
+# child-owned bash row before the still-running parent delegate completes.
 child_row=$(sql "SELECT count(*) FROM running_tasks WHERE workspace_id='$WORKSPACE' AND session_id='$child_id' AND task_id=$child_task_id AND subagent_session_id IS NULL")
 parent_row=$(sql "SELECT count(*) FROM running_tasks WHERE workspace_id='$WORKSPACE' AND session_id='$PARENT_ID' AND task_id=$parent_task_id")
 [[ "$child_row" == 0 && "$parent_row" == 1 ]] || {
-    echo "ASSERTION FAILED: completion boundary rows child=$child_row parent_delegate=$parent_row" >&2
+    echo "ASSERTION FAILED: child completion boundary rows child=$child_row parent_delegate=$parent_row" >&2
     exit 1
 }
-echo "assertion: child completion follows the warning, clears only the child owner row, and parent remains owned"
+
+parent_completion_file="$ROOT/parent-completion.json"
+parent_completion_seen=0
+while (( SECONDS < polling_deadline )); do
+    api_get "/api/sessions/$PARENT_ID/history" >"$parent_completion_file" 2>/dev/null || true
+    if [[ -s "$parent_completion_file" ]] && python3 - "$parent_completion_file" <<'PY'
+import json, sys
+h = json.load(open(sys.argv[1], encoding="utf-8"))
+raise SystemExit(0 if any(e.get("type") == "background_completion" for e in h.get("entries", [])) else 1)
+PY
+    then
+        parent_completion_seen=1
+        break
+    fi
+    sleep 0.2
+done
+[[ "$parent_completion_seen" == 1 ]] || {
+    echo "ASSERTION FAILED: natural parent delegate completion did not appear" >&2
+    exit 1
+}
+python3 - "$completion_file" "$parent_completion_file" "$child_task_id" "$FULL_COMMAND" "$OUTPUT_TAIL" <<'PY'
+import json, re, sys
+child = json.load(open(sys.argv[1], encoding="utf-8"))["entries"]
+parent = json.load(open(sys.argv[2], encoding="utf-8"))["entries"]
+task_id, command, output = sys.argv[3:]
+notice_pattern = re.compile(
+    rf"^background task {re.escape(task_id)} has had no output for five minutes; "
+    rf"runtime [^;]+; silence duration [^;]+; full command: {re.escape(command)}; "
+    rf"current latest output tail: {re.escape(output)}$")
+notice = [i for i, e in enumerate(child) if e.get("type") == "notice"
+          and task_id in e.get("text", "") and "no output for five minutes" in e.get("text", "")]
+assert len(notice) == 1, f"duplicate stall Notice(s): {notice}"
+assert notice_pattern.fullmatch(child[notice[0]]["text"]), child[notice[0]]
+completion = [i for i, e in enumerate(child) if e.get("type") == "background_completion"]
+assert completion, "missing child background completion"
+assert notice[0] < completion[0], f"child durable ordering is Notice={notice[0]} completion={completion[0]}"
+# Parent owns the delegate completion, but never receives the child bash
+# Notice; its delegate tool call/result must also remain ordered.
+parent_completion = [i for i, e in enumerate(parent) if e.get("type") == "background_completion"]
+assert parent_completion, "missing parent delegate completion"
+assert not any("no output for five minutes" in e.get("text", "") for e in parent), parent
+def parent_message(kind):
+    return [i for i, e in enumerate(parent) if e.get("type") == "message"
+            and kind in e.get("message", {})]
+delegate_call = [i for i in parent_message("Assistant")
+                 if any(c.get("name") == "delegate" for c in parent[i]["message"]["Assistant"].get("tool_calls", []))]
+delegate_result = [i for i in parent_message("Tool")
+                   if parent[i]["message"]["Tool"].get("name") == "delegate"]
+assert len(delegate_call) == 1 and len(delegate_result) == 1, (delegate_call, delegate_result)
+assert delegate_call[0] < delegate_result[0] < parent_completion[0], (
+    delegate_call, delegate_result, parent_completion)
+print(f"child_notice_index={notice[0]} child_completion_index={completion[0]} parent_delegate_call_index={delegate_call[0]} parent_delegate_result_index={delegate_result[0]} parent_completion_index={parent_completion[0]}")
+PY
+child_row=$(sql "SELECT count(*) FROM running_tasks WHERE workspace_id='$WORKSPACE' AND session_id='$child_id' AND task_id=$child_task_id AND subagent_session_id IS NULL")
+parent_row=$(sql "SELECT count(*) FROM running_tasks WHERE workspace_id='$WORKSPACE' AND session_id='$PARENT_ID' AND task_id=$parent_task_id")
+[[ "$child_row" == 0 && "$parent_row" == 0 ]] || {
+    echo "ASSERTION FAILED: eventual completion rows child=$child_row parent_delegate=$parent_row" >&2
+    exit 1
+}
+echo "assertion: child completion follows its exact warning, clears the child owner first, and eventual delegate completion clears the parent owner while both histories retain durable order"
 
 # The child owner clear above is the feature-specific durable lifecycle proof;
-# generic session convergence and provider-count assertions are covered by
-# the shared lifecycle suite.
+# generic session convergence is covered by the shared lifecycle suite.
 stop_exact "$SSE_PID" SSE "$SSE_STARTTIME" || CLEANUP_OK=0
 SSE_PID=""
 SSE_STARTTIME=""
 
-echo "PASS: subagent-owned five-minute stall warning (runtime=$((SECONDS))s; warning_elapsed_from_child_observed_ms=${elapsed_from_child_observed_ms}; event_order=Notice<BackgroundCompletionNotice; live_sse_notice=1; late_attach_notice=1; child_owner_cleared=1)"
+echo "PASS: subagent-owned five-minute stall warning (runtime=$((SECONDS))s; warning_elapsed_from_child_observed_ms=${elapsed_from_child_observed_ms}; child_regular_stall_wake_call=${stall_wake_call}; event_order=Notice<BackgroundCompletionNotice; live_sse_notice=1; late_attach_notice=1; child_owner_cleared=1; parent_owner_cleared=1)"
