@@ -124,6 +124,14 @@ class BuildEpubTests(unittest.TestCase):
             self.assertEqual(top_links[2].find("x:a", ns).get("href"), "chap_003.xhtml")
             self.assertIsNotNone(top_links[1].find("x:ol", ns))
             self.assertIsNone(top_links[2].find("x:ol", ns))
+            self.assertEqual(toc.xpath(".//x:ol[not(x:li)]", namespaces=ns), [])
+            ncx_root = etree.fromstring(archive.read("EPUB/toc.ncx"))
+            ncx_ns = {"n": "http://www.daisy.org/z3986/2005/ncx/"}
+            ncx_links = [content.get("src") for content in
+                         ncx_root.findall(".//n:content", ncx_ns)]
+            self.assertEqual(ncx_links,
+                             ["preface.xhtml", "chap_001.xhtml",
+                              "chap_002.xhtml", "chap_003.xhtml"])
             self.assertIn("chap_001.xhtml", nav)
             self.assertLess(nav.index("chap_001.xhtml"), nav.index("chap_002.xhtml"))
             chapter_link = nav.index('href="chap_001.xhtml"')

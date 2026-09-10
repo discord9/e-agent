@@ -1042,7 +1042,7 @@ def main() -> None:
             if section["kind"] == "discussion":
                 continue
             children = [
-                (child_item, [])
+                child_item
                 for child, child_item in zip(chapters, chapter_items)
                 if child.get("parent_id") == section["id"]
             ]
