@@ -1128,6 +1128,27 @@ struct KeepAliveTool {
     sender: Option<mpsc::UnboundedSender<AgentEvent>>,
 }
 
+struct NoticeEmitter {
+    sender: Arc<Mutex<Option<mpsc::UnboundedSender<AgentEvent>>>>,
+}
+
+#[async_trait]
+impl Tool for NoticeEmitter {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "notice_emitter".into(),
+            description: "test only".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+    async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
+        Ok(ToolOutput::text("ready"))
+    }
+    fn set_event_sender(&mut self, sender: mpsc::UnboundedSender<AgentEvent>) {
+        *self.sender.lock().unwrap() = Some(sender);
+    }
+}
+
 #[async_trait]
 impl Tool for KeepAliveTool {
     fn spec(&self) -> ToolSpec {
@@ -11914,6 +11935,153 @@ async fn oracle718_background_during_answer_compact_keeps_resume(
     assert!(calls.lock().unwrap().iter().any(|context| context.iter().any(|message| matches!(message,
         Message::User { content, .. } if content.contains("background task 9 completed") && content.contains("done")
     ))));
+    drop(handle);
+    tokio::time::timeout(std::time::Duration::from_secs(2), task.join())
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn oracle739_notice_during_answer_compact_active_continue_zero_keeps_resume() {
+    let temp = tempfile::tempdir().unwrap();
+    let sender = Arc::new(Mutex::new(None));
+    let compact_entered = Arc::new(Notify::new());
+    let compact_release = Arc::new(Notify::new());
+    let starts = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = Agent::new(
+        Box::new(GatedContextCaptureModel {
+            replies: vec![
+                (
+                    AssistantMessage {
+                        content: None,
+                        tool_calls: vec![ToolCall {
+                            id: "oracle739-answer".into(),
+                            name: "request_user_input".into(),
+                            arguments: r#"{"questions":[{"id":"answer","prompt":"answer?"}]}"#
+                                .into(),
+                        }],
+                        reasoning: None,
+                    },
+                    Some(Usage::default()),
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("oracle739 summary".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    Some(Usage::default()),
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("oracle739 accepted answer".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    Some(Usage::default()),
+                ),
+            ]
+            .into(),
+            block_call: 2,
+            entered: compact_entered.clone(),
+            release: compact_release.clone(),
+            calls: calls.clone(),
+            call_count: 0,
+        }),
+        vec![
+            Box::new(NoticeEmitter {
+                sender: sender.clone(),
+            }),
+            Box::new(crate::tools::user_input::RequestUserInput),
+            Box::new(TurnStartMarkerTool(starts.clone())),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    history_for_compaction(&mut agent);
+    let (runner, handle) = SessionRunner::new_with_bootstrap(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "oracle739-active-notice".into(),
+        IdlePolicy::WaitForInput,
+        SessionBootstrap {
+            recovery_tasks: vec![],
+            legacy: false,
+            initial_entries: vec![test_goal_entry()],
+        },
+    )
+    .await
+    .unwrap();
+    let task = runner.start(None);
+    let mut status = handle.status();
+    assert!(handle.continue_goal(None));
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        wait_for_status(&mut status, |status| {
+            matches!(status, SessionStatus::WaitingInput(_))
+        }),
+    )
+    .await
+    .unwrap();
+    handle.compact();
+    assert_eq!(
+        handle.submit_prompt_with_call_id(
+            Some("oracle739-answer".into()),
+            "oracle739 precise answer".into(),
+        ),
+        PromptSubmission::Answered
+    );
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        compact_entered.notified(),
+    )
+    .await
+    .unwrap();
+    sender
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .send(AgentEvent::Notice("oracle739 fresh notice".into()))
+        .unwrap();
+    assert!(matches!(handle.goal(), Some(goal) if goal.status == GoalStatus::Active));
+    assert!(handle.continue_goal(Some(0)));
+    compact_release.notify_one();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        wait_for_log_event(&handle, |event| {
+            matches!(event, AgentEvent::AssistantText(text) if text == "oracle739 accepted answer")
+        }),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)),
+    )
+    .await
+    .unwrap();
+    let calls = calls.lock().unwrap();
+    assert_eq!(
+        calls.len(),
+        3,
+        "the accepted answer consumes the Notice; Continue(Some(0)) prevents a later Goal or Background request"
+    );
+    assert!(calls[2].iter().any(|message| matches!(message,
+        Message::Tool { call_id, .. } if call_id == "oracle739-answer"
+    )));
+    assert!(calls[2].iter().any(|message| matches!(message,
+        Message::User { content, .. } if content == "oracle739 fresh notice"
+    )));
+    drop(calls);
+    assert_eq!(
+        starts.load(Ordering::SeqCst),
+        1,
+        "the accepted answer resumes its original turn"
+    );
+    assert!(matches!(handle.goal(), Some(goal) if goal.status == GoalStatus::Active));
     drop(handle);
     tokio::time::timeout(std::time::Duration::from_secs(2), task.join())
         .await
