@@ -6,6 +6,7 @@ use std::sync::{
 
 use async_trait::async_trait;
 use cap_std::fs::Dir;
+use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::agent::{Tool, ToolOutput, ToolSpec};
@@ -25,7 +26,19 @@ struct Cursor {
     token: String,
     kind: CursorKind,
     items: Vec<String>,
+    errors: Vec<NoteError>,
     position: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct NoteError {
+    path: String,
+    reason: String,
+}
+
+struct Files {
+    paths: Vec<String>,
+    errors: Vec<NoteError>,
 }
 
 pub struct Notes {
@@ -55,8 +68,12 @@ impl Notes {
             return Err("notes `path` must be a non-empty string".into());
         }
         let text = text.unwrap_or("");
-        if text.is_empty() && !required {
-            return Ok(PathBuf::new());
+        if text.is_empty() {
+            return if required {
+                Err("notes `path` must be a non-empty string".into())
+            } else {
+                Ok(PathBuf::new())
+            };
         }
         let path = Path::new(text);
         if path.is_absolute()
@@ -105,51 +122,100 @@ impl Notes {
         format!("notes-{}", self.next_token.fetch_add(1, Ordering::Relaxed))
     }
 
-    fn list_files(directory: &Dir, prefix: &Path, output: &mut Vec<String>) -> Result<(), String> {
-        let mut entries = directory
-            .entries()
-            .map_err(|error| format!("notes list failed: {error}"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("notes list failed: {error}"))?;
+    fn path_label(path: &Path) -> String {
+        if path.as_os_str().is_empty() {
+            ".".into()
+        } else {
+            path.to_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("{path:?}"))
+        }
+    }
+
+    fn error(errors: &mut Vec<NoteError>, path: &Path, reason: impl Into<String>) {
+        errors.push(NoteError {
+            path: Self::path_label(path),
+            reason: reason.into(),
+        });
+    }
+
+    fn list_files(
+        directory: &Dir,
+        prefix: &Path,
+        output: &mut Vec<String>,
+        errors: &mut Vec<NoteError>,
+    ) {
+        let entries = match directory.entries() {
+            Ok(entries) => entries,
+            Err(error) => {
+                Self::error(errors, prefix, format!("list failed: {error}"));
+                return;
+            }
+        };
+        let mut entries = entries
+            .filter_map(|entry| match entry {
+                Ok(entry) => Some(entry),
+                Err(error) => {
+                    Self::error(errors, prefix, format!("directory entry failed: {error}"));
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
         entries.sort_by_key(|entry| entry.file_name());
         for entry in entries {
-            let kind = entry
-                .file_type()
-                .map_err(|error| format!("notes metadata failed: {error}"))?;
+            let name = entry.file_name();
+            let path = prefix.join(&name);
+            let kind = match entry.file_type() {
+                Ok(kind) => kind,
+                Err(error) => {
+                    Self::error(errors, &path, format!("metadata failed: {error}"));
+                    continue;
+                }
+            };
             if kind.is_symlink() {
                 continue;
             }
-            let name = entry
-                .file_name()
-                .into_string()
-                .map_err(|_| "note path is not valid UTF-8".to_owned())?;
+            let Some(name) = name.to_str() else {
+                Self::error(errors, &path, "path is not valid UTF-8");
+                continue;
+            };
             let path = prefix.join(name);
             if kind.is_dir() {
-                let child = entry
-                    .open_dir()
-                    .map_err(|error| format!("notes list failed: {error}"))?;
-                Self::list_files(&child, &path, output)?;
+                match entry.open_dir() {
+                    Ok(child) => Self::list_files(&child, &path, output, errors),
+                    Err(error) => {
+                        Self::error(errors, &path, format!("open directory failed: {error}"));
+                    }
+                }
             } else if kind.is_file() {
-                output.push(path.to_string_lossy().into_owned());
+                output.push(path.to_str().expect("listed paths are UTF-8").to_owned());
             }
         }
-        Ok(())
     }
 
-    fn files(&self, scope: &Path) -> Result<Option<Vec<String>>, String> {
-        let Some(root) = self.workspace.try_open_dir(".e-agent/notes")? else {
+    fn files(&self, scope: &Path) -> Result<Option<Files>, String> {
+        let Some(root) = self
+            .workspace
+            .try_open_dir(".e-agent/notes")
+            .map_err(|error| format!("notes root failed: {error}"))?
+        else {
             return Ok(None);
         };
         let directory = if scope.as_os_str().is_empty() {
             root
         } else {
-            root.open_dir(scope)
-                .map_err(|error| format!("notes directory failed: {error}"))?
+            root.open_dir(scope).map_err(|error| {
+                format!(
+                    "notes directory `{}` failed: {error}",
+                    Self::path_label(scope)
+                )
+            })?
         };
-        let mut files = Vec::new();
-        Self::list_files(&directory, scope, &mut files)?;
-        files.sort();
-        Ok(Some(files))
+        let mut paths = Vec::new();
+        let mut errors = Vec::new();
+        Self::list_files(&directory, scope, &mut paths, &mut errors);
+        paths.sort();
+        Ok(Some(Files { paths, errors }))
     }
 
     fn page_locked(
@@ -171,6 +237,8 @@ impl Notes {
             .saturating_add(limit)
             .min(cursor.items.len());
         let page = cursor.items[cursor.position..end].to_vec();
+        let errors = cursor.errors.clone();
+        let incomplete = !errors.is_empty();
         let has_more = end < cursor.items.len();
         cursor.position = end;
         let token = cursor.token.clone();
@@ -183,8 +251,14 @@ impl Notes {
             "results"
         };
         Ok(ToolOutput::text(
-            json!({key: page, "has_more": has_more, "cursor": has_more.then_some(token)})
-                .to_string(),
+            json!({
+                key: page,
+                "has_more": has_more,
+                "cursor": has_more.then_some(token),
+                "incomplete": incomplete,
+                "errors": errors,
+            })
+            .to_string(),
         ))
     }
 
@@ -192,6 +266,7 @@ impl Notes {
         &self,
         kind: CursorKind,
         items: Vec<String>,
+        errors: Vec<NoteError>,
         limit: usize,
     ) -> Result<ToolOutput, String> {
         let mut slot = self
@@ -202,6 +277,7 @@ impl Notes {
             token: self.next_token(),
             kind,
             items,
+            errors,
             position: 0,
         });
         Self::page_locked(&mut slot, kind, limit)
@@ -239,22 +315,23 @@ impl Notes {
                 .lock()
                 .map_err(|_| "notes cursor lock is poisoned".to_owned())? = None;
             return Ok(ToolOutput::text(
-                json!({"notes": [], "has_more": false, "cursor": null}).to_string(),
+                json!({"notes": [], "has_more": false, "cursor": null, "incomplete": false, "errors": []}).to_string(),
             ));
         };
-        self.start_page(CursorKind::List, items, limit)
+        self.start_page(CursorKind::List, items.paths, items.errors, limit)
     }
 
     fn note_text(&self, path: &Path) -> Result<String, String> {
+        let label = Self::path_label(path);
         let logical = Path::new(".e-agent/notes").join(path);
         let bytes = self
             .workspace
             .read(&logical.to_string_lossy())
-            .map_err(|error| format!("note read failed: {error}"))?;
+            .map_err(|error| format!("note `{label}` read failed: {error}"))?;
         if bytes.len() > READ_LIMIT {
-            return Err("note exceeds the 64 KiB read limit".into());
+            return Err(format!("note `{label}` exceeds the 64 KiB read limit"));
         }
-        String::from_utf8(bytes).map_err(|_| "note is not valid UTF-8".into())
+        String::from_utf8(bytes).map_err(|_| format!("note `{label}` is not valid UTF-8"))
     }
 
     fn search(&self, object: &serde_json::Map<String, Value>) -> Result<ToolOutput, String> {
@@ -277,18 +354,24 @@ impl Notes {
                 .lock()
                 .map_err(|_| "notes cursor lock is poisoned".to_owned())? = None;
             return Ok(ToolOutput::text(
-                json!({"results": [], "has_more": false, "cursor": null}).to_string(),
+                json!({"results": [], "has_more": false, "cursor": null, "incomplete": false, "errors": []}).to_string(),
             ));
         };
         let mut results = Vec::new();
-        for path in files {
-            for (line, content) in self.note_text(Path::new(&path))?.lines().enumerate() {
-                if content.to_lowercase().contains(&query) {
-                    results.push(format!("{path}:{}: {content}", line + 1));
+        let mut errors = files.errors;
+        for path in files.paths {
+            match self.note_text(Path::new(&path)) {
+                Ok(text) => {
+                    for (line, content) in text.lines().enumerate() {
+                        if content.to_lowercase().contains(&query) {
+                            results.push(format!("{path}:{}: {content}", line + 1));
+                        }
+                    }
                 }
+                Err(reason) => Self::error(&mut errors, Path::new(&path), reason),
             }
         }
-        self.start_page(CursorKind::Search, results, limit)
+        self.start_page(CursorKind::Search, results, errors, limit)
     }
 
     fn read(&self, object: &serde_json::Map<String, Value>) -> Result<ToolOutput, String> {
@@ -296,14 +379,23 @@ impl Notes {
         let offset = super::optional_usize(&Value::Object(object.clone()), "offset")?.unwrap_or(0);
         let limit = Self::limit(object.get("limit"), READ_LIMIT)?;
         if limit > READ_LIMIT {
-            return Err(format!("notes `limit` must not exceed {READ_LIMIT}"));
+            return Err(format!(
+                "notes `limit` must not exceed {READ_LIMIT} for note `{}`",
+                Self::path_label(&path)
+            ));
         }
         let text = self.note_text(&path)?;
         if offset > text.len() {
-            return Err("notes `offset` is past the end of the note".into());
+            return Err(format!(
+                "notes `offset` is past the end of note `{}`",
+                Self::path_label(&path)
+            ));
         }
         if !text.is_char_boundary(offset) {
-            return Err("notes `offset` must be a UTF-8 byte boundary".into());
+            return Err(format!(
+                "notes `offset` must be a UTF-8 byte boundary in note `{}`",
+                Self::path_label(&path)
+            ));
         }
         let mut end = offset.saturating_add(limit).min(text.len());
         while end > offset && !text.is_char_boundary(end) {
@@ -629,11 +721,214 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn notes_list_does_not_decode_note_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let notes = tool(&temp, false);
+        let root = temp.path().join(".e-agent/notes");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("binary"), [0xff]).unwrap();
+        fs::write(root.join("healthy"), "text").unwrap();
+
+        let listed = output(notes.execute(json!({"action":"list"})).await.unwrap());
+        assert_eq!(listed["notes"], json!(["binary", "healthy"]));
+        assert_eq!(listed["incomplete"], false);
+        assert_eq!(listed["errors"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn notes_list_specified_scope_failure_is_not_empty_success() {
+        let temp = tempfile::tempdir().unwrap();
+        let notes = tool(&temp, false);
+        let root = temp.path().join(".e-agent/notes");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("file"), "not a directory").unwrap();
+
+        let error = notes
+            .execute(json!({"action":"list","path":"file"}))
+            .await
+            .unwrap_err();
+        assert!(error.contains("notes directory `file` failed"));
+    }
+
+    #[tokio::test]
+    async fn notes_search_keeps_healthy_results_and_reports_bad_notes() {
+        let temp = tempfile::tempdir().unwrap();
+        let notes = tool(&temp, false);
+        let root = temp.path().join(".e-agent/notes");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a"), "match first").unwrap();
+        fs::write(root.join("b"), [0xff]).unwrap();
+        fs::write(root.join("c"), "match last").unwrap();
+
+        let result = output(
+            notes
+                .execute(json!({"action":"search","query":"match"}))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            result["results"],
+            json!(["a:1: match first", "c:1: match last"])
+        );
+        assert_eq!(result["incomplete"], true);
+        assert_eq!(
+            result["errors"],
+            json!([{
+                "path": "b",
+                "reason": "note `b` is not valid UTF-8"
+            }])
+        );
+    }
+
+    #[tokio::test]
+    async fn notes_search_distinguishes_invalid_notes_from_no_matches_and_oversize() {
+        let temp = tempfile::tempdir().unwrap();
+        let notes = tool(&temp, false);
+        let root = temp.path().join(".e-agent/notes");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("invalid"), [0xff]).unwrap();
+        fs::write(root.join("large"), vec![b'x'; READ_LIMIT + 1]).unwrap();
+
+        let incomplete = output(
+            notes
+                .execute(json!({"action":"search","query":"missing"}))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(incomplete["results"], json!([]));
+        assert_eq!(incomplete["incomplete"], true);
+        assert_eq!(incomplete["errors"].as_array().unwrap().len(), 2);
+        assert_eq!(incomplete["errors"][0]["path"], "invalid");
+        assert!(
+            incomplete["errors"][1]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("64 KiB")
+        );
+
+        fs::remove_file(root.join("invalid")).unwrap();
+        fs::remove_file(root.join("large")).unwrap();
+        fs::write(root.join("plain"), "unrelated").unwrap();
+        let complete = output(
+            notes
+                .execute(json!({"action":"search","query":"missing"}))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(complete["results"], json!([]));
+        assert_eq!(complete["incomplete"], false);
+        assert_eq!(complete["errors"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn notes_search_preserves_diagnostics_on_cursor_pages() {
+        let temp = tempfile::tempdir().unwrap();
+        let notes = tool(&temp, false);
+        let root = temp.path().join(".e-agent/notes");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a"), "hit").unwrap();
+        fs::write(root.join("b"), [0xff]).unwrap();
+        fs::write(root.join("b-large"), vec![b'x'; READ_LIMIT + 1]).unwrap();
+        fs::write(root.join("c"), "hit").unwrap();
+
+        let first = output(
+            notes
+                .execute(json!({"action":"search","query":"hit","limit":1}))
+                .await
+                .unwrap(),
+        );
+        let second = output(
+            notes
+                .execute(json!({"action":"search","cursor":first["cursor"],"limit":1}))
+                .await
+                .unwrap(),
+        );
+        let errors = json!([
+            {"path": "b", "reason": "note `b` is not valid UTF-8"},
+            {"path": "b-large", "reason": "note `b-large` exceeds the 64 KiB read limit"}
+        ]);
+        assert_eq!(first["results"], json!(["a:1: hit"]));
+        assert_eq!(second["results"], json!(["c:1: hit"]));
+        assert_eq!(first["errors"], errors);
+        assert_eq!(second["errors"], errors);
+        assert_eq!(first["incomplete"], true);
+        assert_eq!(second["incomplete"], true);
+        assert_eq!(second["has_more"], false);
+        assert_eq!(second["cursor"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn notes_list_reports_non_utf8_name_without_lossy_access() {
+        #[cfg(unix)]
+        {
+            use std::ffi::OsString;
+            use std::os::unix::ffi::OsStringExt;
+
+            let temp = tempfile::tempdir().unwrap();
+            let notes = tool(&temp, false);
+            let root = temp.path().join(".e-agent/notes");
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join("healthy"), "content").unwrap();
+            fs::write(root.join("later"), "content").unwrap();
+            fs::write(
+                root.join(OsString::from_vec(b"bad-\xff".to_vec())),
+                "content",
+            )
+            .unwrap();
+
+            let listed = output(
+                notes
+                    .execute(json!({"action":"list","limit":1}))
+                    .await
+                    .unwrap(),
+            );
+            let continued = output(
+                notes
+                    .execute(json!({"action":"list","cursor":listed["cursor"],"limit":1}))
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(listed["notes"], json!(["healthy"]));
+            assert_eq!(continued["notes"], json!(["later"]));
+            assert_eq!(listed["incomplete"], true);
+            assert_eq!(listed["errors"], continued["errors"]);
+            let path = listed["errors"][0]["path"].as_str().unwrap();
+            assert!(path.contains("bad-") && path.contains("\\x"));
+            assert_eq!(listed["errors"][0]["reason"], "path is not valid UTF-8");
+        }
+    }
+
+    #[tokio::test]
+    async fn notes_read_bad_note_is_strict_and_names_the_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let notes = tool(&temp, false);
+        let root = temp.path().join(".e-agent/notes");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("bad"), [0xff]).unwrap();
+
+        let error = notes
+            .execute(json!({"action":"read","path":"bad"}))
+            .await
+            .unwrap_err();
+        assert!(error.contains("note `bad` is not valid UTF-8"));
+
+        fs::write(root.join("oversized"), vec![b'x'; READ_LIMIT + 1]).unwrap();
+        let error = notes
+            .execute(json!({"action":"read","path":"oversized"}))
+            .await
+            .unwrap_err();
+        assert!(error.contains("note `oversized` exceeds the 64 KiB read limit"));
+    }
+
+    #[tokio::test]
     async fn notes_read_only_and_missing_root_are_safe() {
         let temp = tempfile::tempdir().unwrap();
         let notes = tool(&temp, true);
         let empty = output(notes.execute(json!({"action":"list"})).await.unwrap());
-        assert_eq!(empty, json!({"notes":[],"has_more":false,"cursor":null}));
+        assert_eq!(
+            empty,
+            json!({"notes":[],"has_more":false,"cursor":null,"incomplete":false,"errors":[]})
+        );
         assert!(
             notes
                 .execute(json!({"action":"write","path":"x","content":"x"}))

@@ -470,7 +470,10 @@ unavailable to read-only roles). List and search return deterministic pages and
 keep at most one process-local cursor per tool instance; starting another list
 or search replaces it. Cursors are not persisted or shared across restarts.
 `read` uses stateless UTF-8 byte-offset paging and rejects offsets inside a
-codepoint. Paths are relative to the notes root and use the existing Workspace
+codepoint. List and search retain their normal `notes`/`results` arrays while
+adding `incomplete` and machine-readable `errors` (`path`, `reason`) when a
+note or traversal entry cannot be processed; those diagnostics remain on every
+cursor page. Paths are relative to the notes root and use the existing Workspace
 capability and symlink authorization; notes do not add a second path subsystem.
 
 The built-in local tool set always includes the capability-relative file tools
