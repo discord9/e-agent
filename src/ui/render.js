@@ -1062,9 +1062,15 @@ function parseToolArgs(name, argsText) {
    元素重新绑定到新的累积器上：后续 ReasoningDelta / AssistantDelta /
    ToolResult 续写进旧块，而不是另起一块（否则同一个思考/助手/工具卡片会
    重复出现多个）。历史/已完成（dot.done / 已 markdown 化）的元素绝不绑定。 */
-function reattachInFlight(acc) {
+function reattachInFlight(acc, roots) {
+  // When history has just replaced a restored view, only the explicitly moved
+  // in-flight roots are eligible.  A plain-text historical Assistant must not
+  // become a live accumulator merely because it happens to be the last node.
+  const scope = roots || [els.messages];
+  const found = (selector, rootMatches) => scope.flatMap((root) =>
+    (rootMatches(root) ? [root] : []).concat([...root.querySelectorAll(selector)]));
   // 1. thinking：最后一个 details.thinking，且其 .think-dot 没有 .done（进行中）才绑定
-  const thinks = [...els.messages.querySelectorAll("details.thinking")];
+  const thinks = found("details.thinking", (root) => (root.tagName === "DETAILS" || root.tag === "details") && root.classList.contains("thinking"));
   const t = thinks[thinks.length - 1];
   if (t && !t.querySelector(".think-dot.done")) {
     acc.thinkingEl = t;
@@ -1073,7 +1079,7 @@ function reattachInFlight(acc) {
   }
   // 2. assistant：最后一个 .msg-assistant，且其 .msg-body 是纯文本（流式期间
   //    未 markdown 化，无元素子节点）→ 进行中，绑定并把 textContent 取回
-  const as = [...els.messages.querySelectorAll(".msg-assistant")];
+  const as = found(".msg-assistant", (root) => root.classList.contains("msg-assistant"));
   const a = as[as.length - 1];
   if (a) {
     const body = a.querySelector(".msg-body");
@@ -1085,7 +1091,7 @@ function reattachInFlight(acc) {
   }
   // 3. 工具卡片：所有 .tool-state 文本为 "执行中…" 的 details.tool-card →
   //    push 进 acc.toolStack（filled:false），供 appendToolResult 的 fallback 配对
-  for (const c of [...els.messages.querySelectorAll("details.tool-card")]) {
+  for (const c of found("details.tool-card", (root) => (root.tagName === "DETAILS" || root.tag === "details") && root.classList.contains("tool-card"))) {
     const st = c.querySelector(".tool-state");
     if (st && st.textContent === "执行中…") acc.toolStack.push({ el: c, filled: false });
   }
@@ -1452,6 +1458,8 @@ function renderHistory(entries) {
    snapshot. */
 function renderSpliceComponents(components) {
   const real = els.messages, temp = real.cloneNode(false), prior = state.acc;
+  const offset = real.scrollHeight - real.scrollTop - real.clientHeight;
+  const wasFollowing = offset <= 4;
   const acc = newAccumulator(), pending = acc.pendingByCall;
   let lastCard = null;
   temp.innerHTML = "";
@@ -1520,7 +1528,13 @@ function renderSpliceComponents(components) {
   while (temp.firstChild) real.appendChild(temp.firstChild); // move nodes; do not serialize/recreate
   state.acc = acc;
   pruneMessages();
-  scrollBottom(true);
+  if (wasFollowing) {
+    scrollBottom(true);
+  } else {
+    real.scrollTop = Math.max(0, real.scrollHeight - real.clientHeight - offset);
+    userScrolled = true;
+    els.jumpBottomBtn.hidden = false;
+  }
   return prior;
 }
 

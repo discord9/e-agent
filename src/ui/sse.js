@@ -115,12 +115,6 @@ function connectSSE(id, wsId, epoch) {
       throw new Error("auth");
     }
     if (res.status === 404) {
-      // Ended sessions have no snapshot stream.  H is then the complete,
-      // validated replacement and may be committed once without an S replay.
-      if (state.initSource === "history-ready" && state.historyEntries) {
-        renderHistory(state.historyEntries);
-        state.initSource = "history";
-      }
       // 404 的两种含义，按会话已知状态区分（判定见 sessionKnownState）：
       // - 已知历史/已结束（active===false）或不在任何列表（任务面板直连
       //   刚结束的子会话）：SSE 端点只服务 live 会话，404 = 没有实时流，
@@ -186,16 +180,9 @@ function connectSSE(id, wsId, epoch) {
     state.deepLink.probing = false;
     state.deepLink.attemptEpoch = -1;
     return readSSEStream(res.body.getReader(), id, wsId, epoch, ctrl);
-  }).then((sawBlock) => {
-    if (!streamCurrent(id, wsId, epoch, ctrl)) return;
-    // A restored cache plus validated H must not remain visible forever when
-    // its stream closes without ever yielding an SSE block. Streams that did
-    // yield a block keep their existing live/reconnect behavior.
-    if (!sawBlock && state.initSource === "history-ready" && state.historyEntries) {
-      renderHistory(state.historyEntries);
-      state.initSource = "history";
-    }
+  }).then(() => {
     // 正常结束（后端关闭流）→ 按断线处理
+    if (!streamCurrent(id, wsId, epoch, ctrl)) return;
     throw new Error("stream end");
   }).catch((err) => {
     if (!streamCurrent(id, wsId, epoch, ctrl)) return;
@@ -214,7 +201,7 @@ function connectSSE(id, wsId, epoch) {
    本流自己的 ctrl——绝不能动 state.sse.ctrl，那可能已是新流的控制器）。 */
 async function readSSEStream(reader, id, wsId, epoch, ctrl) {
   const decoder = new TextDecoder();
-  let buf = "", sawBlock = false;
+  let buf = "";
   for (;;) {
     if (!streamCurrent(id, wsId, epoch, ctrl)) { try { ctrl && ctrl.abort(); } catch (e) { /* 忽略 */ } return; }
     const { done, value } = await reader.read();
@@ -225,11 +212,9 @@ async function readSSEStream(reader, id, wsId, epoch, ctrl) {
     while ((idx = buf.indexOf("\n\n")) !== -1) {
       const block = buf.slice(0, idx);
       buf = buf.slice(idx + 2);
-      sawBlock = true;
-      handleSSEBlock(block, id, wsId, epoch, ctrl);
+      await handleSSEBlock(block, id, wsId, epoch, ctrl);
     }
   }
-  return sawBlock;
 }
 
 /* 从初始 snapshot 事件数组恢复 current usage：取最后一个 Usage 事件（最近
@@ -523,7 +508,7 @@ function reconcileSnapshotAssistantTail(entries, id) {
 
 /* 解析单个 SSE 事件块：任何分支（snapshot/status/resync/live）动手改 UI 前
    必须通过三重校验——陈旧流的块整块丢弃，绝不画进当前会话/workspace。 */
-function handleSSEBlock(block, id, wsId, epoch, ctrl) {
+async function handleSSEBlock(block, id, wsId, epoch, ctrl) {
   if (!streamCurrent(id, wsId, epoch, ctrl)) return;
   let eventName = "message";
   const dataLines = [];
@@ -554,7 +539,7 @@ function handleSSEBlock(block, id, wsId, epoch, ctrl) {
       if (state.historyEntries) {
         renderMergedHistorySnapshot(state.historyEntries, entries);
         state.initSource = "snapshot";
-      } else if (state.initSource !== "history" && state.initSource !== "history-ready" && state.initSource !== "restored") {
+      } else if (state.initSource !== "history" && state.initSource !== "restored") {
         renderMergedHistorySnapshot([], entries);
         state.initSource = "snapshot";
       } else {
@@ -597,7 +582,7 @@ function handleSSEBlock(block, id, wsId, epoch, ctrl) {
       appendNotice("⚠ 会话同步失败，已保留原内容");
       return;
     }
-    void mergeResyncHistory(events, id, wsId, epoch, ctrl);
+    await mergeResyncHistory(events, id, wsId, epoch, ctrl);
     return;
   }
   if (state.initSource === null) return;   // 初始渲染未完成前的 live 事件丢弃

@@ -2069,6 +2069,28 @@ async function main(){
     await flush();
     chk("reconnect reconnected", state.sse.ctrl!=null);
 
+    // A delayed resync must finish its authoritative H/S replacement before a
+    // later live block is applied, otherwise that replacement can erase it.
+    historyOverrides.set("s1", { delay: true });
+    historyResolve = null;
+    let resyncRead = 0;
+    const resyncThenLive = readSSEStream({ read: async () => {
+      if (resyncRead++ === 0) return {done:false, value:
+        "event: resync\ndata: [{\"type\":\"assistant_delta\",\"data\":\"RESYNC-TAIL\"}]\n\n"};
+      if (resyncRead === 2) return {done:false, value:
+        "event: AssistantDelta\ndata: {\"delta\":\"LIVE-AFTER-RESYNC\"}\n\n"};
+      return {done:true};
+    } }, state.sessionId, state.workspace.id, sessionOpenEpoch, state.sse.ctrl);
+    await flush();
+    chk("delayed resync holds later live block", !elsById["messages"].textContent.includes("LIVE-AFTER-RESYNC"));
+    historyResolve(resp(200, historyData));
+    await resyncThenLive;
+    historyOverrides.delete("s1");
+    chk("delayed resync then live renders exactly once",
+        elsById["messages"].textContent.includes("RESYNC-TAIL")
+        && elsById["messages"].textContent.split("LIVE-AFTER-RESYNC").length === 2,
+        "text=" + JSON.stringify(elsById["messages"].textContent));
+
     // resync 追平：注入一个 resync 块，验证强制整体替换 transcript 并按事件日志重放
     const _resyncTaskSeqBefore = state.tasks.seq;
     handleSSEBlock("event: resync\ndata: [{\"type\":\"user_prompt\",\"data\":\"重放-用户\"},{\"type\":\"assistant_delta\",\"data\":\"重放-\"},{\"type\":\"assistant_delta\",\"data\":\"增量\"}]\n\n",
@@ -2151,6 +2173,26 @@ async function main(){
     await flush(); await flush();       // 陈旧响应返回：finally 必须无条件复位
     chk("stale loadOlder resets loadingOlder", state.loadingOlder === false,
         "=" + state.loadingOlder);
+    // Replacement preserves a reader's offset from bottom, while a following
+    // reader stays following the replaced merged transcript.
+    const viewport = elsById["messages"];
+    viewport.scrollHeight = 1000; viewport.clientHeight = 200; viewport.scrollTop = 350;
+    const viewportOffset = viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight;
+    userScrolled = false;
+    renderSpliceComponents([{source:"snapshot", raw:{type:"notice", data:{text:"viewport-preserved"}}}]);
+    chk("merged replacement preserves non-following viewport",
+        viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight === viewportOffset
+        && userScrolled === true && elsById["jumpBottomBtn"].hidden === false,
+        "top=" + viewport.scrollTop + " offset=" + (viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight)
+        + " scrolled=" + userScrolled + " jump=" + elsById["jumpBottomBtn"].hidden);
+    viewport.scrollHeight = 1000; viewport.clientHeight = 200; viewport.scrollTop = 800;
+    userScrolled = false;
+    renderSpliceComponents([{source:"snapshot", raw:{type:"notice", data:{text:"viewport-following"}}}]);
+    chk("merged replacement keeps following viewport", viewport.scrollTop === viewport.scrollHeight
+        && userScrolled === false && elsById["jumpBottomBtn"].hidden === true,
+        "top=" + viewport.scrollTop + " height=" + viewport.scrollHeight + " jump=" + elsById["jumpBottomBtn"].hidden);
+
+
     // ---- 回归：restored 分支 reattachInFlight（切回缓存会话不重复思考块） ----
     function buildInflightView(){
       const m = elsById["messages"];
@@ -2221,13 +2263,15 @@ async function main(){
     chk("restored assistant continues", state.acc.assistantBody === abAfter
         && abAfter._children.some((c) => c.text === "续写回复"));
     await firstRestoredReady;  // existing first openSession onReady before ToolResult task refresh
-    chk("first restored open completes before ToolResult", state.initSource === "history-ready",
+    chk("first restored history is readable before ToolResult", state.initSource === "history",
         "=" + state.initSource);
     handleSSEBlock("event: ToolResult\ndata: {\"type\":\"tool_result\",\"session_id\":\"s1\",\"seq\":101,\"is_error\":false,\"content\":\"结果内容\"}\n\n", "s1", state.workspace.id, sessionOpenEpoch);
-    chk("restored tool result fills old card", state.acc.toolStack.length === 1
+    chk("restored tool result preserves and fills cached card", state.acc.toolStack.length === 1
         && state.acc.toolStack[0].filled === true
-        && elsById["messages"].querySelector(".tool-state").textContent === "完成"
-        && elsById["messages"].querySelectorAll("details.tool-card").length === 1);
+        && state.acc.toolStack[0].el.querySelector(".tool-state").textContent === "完成"
+        // History's completed bash card remains, alongside the restored
+        // unpersisted read_file card; the ownerless live result fills only it.
+        && elsById["messages"].querySelectorAll("details.tool-card").length === 2);
     // 已完成（dot done）的 thinking 绝不绑定；已 markdown 化（有子元素）的助手消息绝不绑定
     iv = buildInflightView();
     iv.dot.className = "think-dot done";
@@ -2235,7 +2279,7 @@ async function main(){
     cacheCurrentView();
     const restoredReady = openRestored();
     await restoredReady;  // existing openSession onReady: loadHistory + connectSSE setup complete
-    chk("restored open completes before task fixture", state.initSource === "history-ready",
+    chk("restored history is readable before task fixture", state.initSource === "history",
         "=" + state.initSource);
     chk("restored done thinking not bound", state.acc.thinkingEl === null,
         "="+String(state.acc.thinkingEl));
@@ -2612,10 +2656,9 @@ async function main(){
         elsById["messages"].textContent.includes("完成。")
         && !elsById["messages"].textContent.includes("旧缓存消息"),
         "text=" + elsById["messages"].textContent.slice(0, 140));
-    // 进行中的增量块（未落盘、只活在缓存/SSE 里）不再重挂：切回时 fresh
-    // 尾部整体替换过期缓存，缓存里的旧进行中块不 append 回底部（否则很久
-    // 以前的卡片会出现在最新位置、与尾部历史重复、且永不折叠）。live 续写
-    // 靠重新连接的 SSE 新建块。
+    // Unpersisted in-flight tails stay visible after the independently
+    // authoritative history replacement. A later snapshot reconciles their
+    // cached prefix; without a snapshot they remain a truthful live tail.
     state.sessionId = null;
     state.sessionStates[state.workspace.id + ":restored-test2"] = {
       html: "<div class='msg msg-assistant'><div class='msg-body'>正在流式</div></div>",
@@ -2623,13 +2666,13 @@ async function main(){
     };
     openSession("restored-test2");
     await flush(); await flush();
-    chk("restored drops cached in-flight block (no re-append to bottom)",
-        !elsById["messages"].textContent.includes("正在流式")
+    chk("restored preserves cached in-flight assistant tail",
+        elsById["messages"].textContent.includes("正在流式")
         && elsById["messages"].textContent.includes("完成。")
-        && !(state.acc && state.acc.assistantEl),
+        && !!(state.acc && state.acc.assistantEl),
         "has=" + elsById["messages"].textContent.includes("正在流式")
         + " acc=" + !!(state.acc && state.acc.assistantEl));
-    // live 续写靠 SSE：AssistantDelta 在 fresh 尾部之后新建气泡
+    // The following live delta continues the retained unpersisted tail.
     handleSSEBlock("event: AssistantDelta\ndata: {\"type\":\"assistant_delta\",\"session_id\":\"restored-test2\",\"seq\":201,\"delta\":\"续写回复\"}\n\n",
         "restored-test2", state.workspace.id, sessionOpenEpoch);
     chk("restored live delta creates new assistant block",
@@ -2637,9 +2680,8 @@ async function main(){
         && state.acc.assistantEl.isConnected
         && elsById["messages"].textContent.includes("续写回复"),
         "connected=" + (state.acc && state.acc.assistantEl && state.acc.assistantEl.isConnected));
-    // 主 bug 回归：缓存里的「执行中…」tool 卡片绝不重挂到底部——fresh 尾部
-    // 整体替换后，消息区最后一个子节点是尾部最新条目（forked 行），而不是
-    // 切走瞬间还在执行的旧 bash 卡片（否则它出现在最新位置、永不折叠）。
+    // An unpersisted in-flight tool card likewise remains available for its
+    // later ownerless result instead of being silently lost at history render.
     state.sessionId = null;
     state.sessionStates[state.workspace.id + ":restored-test3"] = {
       html: "<div class='msg msg-user'><span class='who'>you&gt;</span>"
@@ -2652,10 +2694,10 @@ async function main(){
     await flush(); await flush();
     const msgs3 = elsById["messages"];
     const last3 = msgs3.children[msgs3.children.length - 1];
-    chk("restored does not re-append cached in-flight tool card to bottom",
-        !msgs3.textContent.includes("执行中…")
-        && !!last3 && last3.className.includes("forked")
-        && !(state.acc && state.acc.toolStack && state.acc.toolStack.length),
+    chk("restored preserves cached in-flight tool card",
+        msgs3.textContent.includes("执行中…")
+        && !!last3 && last3.className.includes("tool-card")
+        && state.acc && state.acc.toolStack && state.acc.toolStack.length === 1,
         "last=" + (last3 ? last3.className : "none")
         + " inflight=" + msgs3.textContent.includes("执行中…")
         + " stack=" + (state.acc && state.acc.toolStack ? state.acc.toolStack.length : "-"));

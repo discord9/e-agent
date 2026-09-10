@@ -415,6 +415,23 @@ function deepLinkTimeoutFor(epoch) {
     ? DEEP_LINK_HISTORY_TIMEOUT_MS : undefined;
 }
 
+function restoredInflightNodes(acc, entries) {
+  if (!acc) return [];
+  const persistedAssistant = new Set((entries || []).flatMap((e) => {
+    const a = e && e.message && e.message.Assistant;
+    return a && a.content != null ? [a.content] : [];
+  }));
+  const persistedReasoning = new Set((entries || []).flatMap((e) => {
+    const a = e && e.message && e.message.Assistant;
+    return a && a.reasoning != null ? [a.reasoning] : [];
+  }));
+  const nodes = [];
+  if (acc.thinkingEl && !persistedReasoning.has(acc.thinkBody && acc.thinkBody.textContent)) nodes.push(acc.thinkingEl);
+  if (acc.assistantEl && !persistedAssistant.has(acc.assistantText)) nodes.push(acc.assistantEl);
+  for (const item of acc.toolStack || []) if (!item.filled && item.el) nodes.push(item.el);
+  return [...new Set(nodes)];
+}
+
 async function loadHistory(id, wsId, epoch, timeoutMs) {
   const ws = state.workspaces.find((w) => w.id === wsId) || state.workspace;
   try {
@@ -456,11 +473,18 @@ async function loadHistory(id, wsId, epoch, timeoutMs) {
     state.historyEntries = entries;
     state.nextBeforeSeq = (data.next_before_seq !== undefined ? data.next_before_seq : null);
     state.olderDone = (state.nextBeforeSeq === null);
-    // Do not render H as complete entries and then replay it from S.  Keep the
-    // validated rich tail until its initial snapshot arrives, when the splice
-    // plan renders every H component exactly once.  Existing cached nodes stay
-    // visible meanwhile; a historical 404 commits H without S below.
-    if (state.initSource !== "snapshot") state.initSource = "history-ready";
+    // History is independently authoritative and must be readable even while
+    // SSE is pending, errors, sends only comments, or closes before snapshot.
+    // A later snapshot reconciles this projection through the existing H/S
+    // splice path. Explicitly retained unpersisted in-flight roots stay live
+    // until that reconciliation, rather than being silently discarded.
+    if (state.initSource !== "snapshot") {
+      const inflight = state.initSource === "restored" ? restoredInflightNodes(state.acc, entries) : [];
+      renderHistory(entries);
+      for (const node of inflight) els.messages.appendChild(node);
+      reattachInFlight(state.acc, inflight);
+      state.initSource = "history";
+    }
     return "ok";
   } catch (e) {
     if (epoch !== sessionOpenEpoch || state.workspace.id !== wsId || state.sessionId !== id) return "stale";
