@@ -676,10 +676,9 @@ impl SqliteSession {
         dedup_raw_entries(&raw, session_id, workspace_id, "event_time_us")
     }
 
-    /// Resolve and select only logical history winners in SQL. The final join
-    /// deliberately returns every same-time physical tie for a selected key;
-    /// `decode_history_rows` then performs the existing identical/conflict
-    /// check without touching unrelated corrupted records.
+    /// Resolve and select only logical history winners in SQL. The schema's
+    /// `(workspace_id, session_id, seq, event_time_us)` primary key makes each
+    /// selected winner physical row unique; decoding remains selected-only.
     pub async fn query_history(&self, query: &HistoryQuery) -> Result<Vec<HistoryEntry>, String> {
         let text = r#"CASE WHEN json_valid(payload) THEN CASE json_extract(payload,'$.type')
  WHEN 'message' THEN CASE
@@ -699,7 +698,7 @@ impl SqliteSession {
             "workspace_id ASC, session_id ASC, seq DESC"
         };
         let source = if query.default_search_window {
-            "newest_keys AS (SELECT workspace_id,session_id,seq,event_time_us FROM winner_rows GROUP BY workspace_id,session_id,seq,event_time_us ORDER BY seq DESC LIMIT 100), window_rows AS (SELECT w.workspace_id,w.session_id,w.seq,w.event_time_us,w.payload FROM winner_rows w JOIN newest_keys n ON w.workspace_id=n.workspace_id AND w.session_id=n.session_id AND w.seq=n.seq AND w.event_time_us=n.event_time_us),"
+            ", window_rows AS (SELECT * FROM winner_rows ORDER BY seq DESC LIMIT 100)"
         } else {
             ""
         };
@@ -716,15 +715,9 @@ impl SqliteSession {
 ), winner_rows AS (
  SELECT e.workspace_id,e.session_id,e.seq,e.event_time_us,e.payload FROM session_entries e JOIN latest l
  ON e.workspace_id=l.workspace_id AND e.session_id=l.session_id AND e.seq=l.seq AND e.event_time_us=l.winner_time
-), {source} selected_keys AS (
- SELECT workspace_id,session_id,seq,event_time_us FROM {selected_from} WHERE 1=1{predicate}
- GROUP BY workspace_id,session_id,seq,event_time_us ORDER BY {key_order}
-), page_keys AS (
- SELECT * FROM selected_keys ORDER BY {key_order} LIMIT ?8
-)
-SELECT w.workspace_id,w.session_id,w.seq,w.event_time_us,w.payload FROM winner_rows w JOIN page_keys p
- ON w.workspace_id=p.workspace_id AND w.session_id=p.session_id AND w.seq=p.seq AND w.event_time_us=p.event_time_us
- ORDER BY w.workspace_id ASC,w.session_id ASC,w.seq DESC,w.payload ASC"#
+){source}
+SELECT workspace_id,session_id,seq,event_time_us,payload FROM {selected_from} WHERE 1=1{predicate}
+ ORDER BY {key_order} LIMIT ?8"#
         );
         let mut params = vec![
             query

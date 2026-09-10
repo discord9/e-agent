@@ -51,6 +51,10 @@ struct Cursor {
     after_workspace: String,
     after_session: String,
     after_seq: i64,
+    #[serde(default)]
+    after_event_time_us: Option<i64>,
+    #[serde(default)]
+    after_payload: Option<String>,
 }
 
 struct Args {
@@ -90,6 +94,8 @@ async fn execute_current(
                 session_id: Some(session.to_owned()),
                 query: args.query.clone(),
                 after: None,
+                after_event_time: None,
+                after_payload: None,
                 exact_seq: args.seq,
                 limit: args.limit,
                 default_search_window: args.action == "search",
@@ -155,6 +161,8 @@ async fn execute_scoped(
                     session_id: session_id.clone(),
                     query: None,
                     after: None,
+                    after_event_time: None,
+                    after_payload: None,
                     exact_seq: args.seq,
                     limit: 1,
                     default_search_window: false,
@@ -199,7 +207,10 @@ async fn execute_scoped(
         {
             return Err("history cursor does not match this request".into());
         }
-        if cursor.after_workspace.is_empty() || cursor.after_session.is_empty() {
+        if cursor.after_workspace.is_empty()
+            || cursor.after_session.is_empty()
+            || (store.history_query_uses_timestamp_cursor() && cursor.after_event_time_us.is_none())
+        {
             return Err("invalid history cursor".into());
         }
         crate::session::validate_session_name(&cursor.after_session)
@@ -227,6 +238,15 @@ async fn execute_scoped(
                         c.after_seq,
                     )
                 }),
+                after_event_time: store
+                    .history_query_uses_timestamp_cursor()
+                    .then(|| cursor.as_ref().and_then(|c| c.after_event_time_us))
+                    .flatten()
+                    .map(crate::session_store::us_to_datetime),
+                after_payload: store
+                    .history_query_uses_timestamp_cursor()
+                    .then(|| cursor.as_ref().and_then(|c| c.after_payload.clone()))
+                    .flatten(),
                 exact_seq: None,
                 limit: args.limit + 1,
                 default_search_window: false,
@@ -247,6 +267,8 @@ async fn execute_scoped(
                         after_workspace: e.workspace_id.clone(),
                         after_session: e.session_id.clone(),
                         after_seq: e.seq,
+                        after_event_time_us: e.event_time.map(crate::session_store::datetime_to_us),
+                        after_payload: e.cursor_payload.clone(),
                     })
                     .expect("cursor serializes")
                 })
@@ -301,6 +323,8 @@ async fn execute_scoped(
                     workspace_id: workspace.clone(),
                     session_id: session.clone(),
                     seq,
+                    event_time: None,
+                    cursor_payload: None,
                     entry: entry.clone(),
                 });
                 if entries.len() > args.limit {
@@ -323,6 +347,8 @@ async fn execute_scoped(
                 after_workspace: e.workspace_id.clone(),
                 after_session: e.session_id.clone(),
                 after_seq: e.seq,
+                after_event_time_us: e.event_time.map(crate::session_store::datetime_to_us),
+                after_payload: e.cursor_payload.clone(),
             })
             .expect("cursor serializes")
         })
@@ -967,6 +993,8 @@ mod tests {
                 (ws_b.clone(), "z".into(), 0)
             ]
         );
+        let second_page: Value = serde_json::from_str(&execute(&current, &a, "same", &json!({"action":"search","scope":"global","query":"needle","limit":1,"cursor":serde_json::to_string(&Cursor { action: "search".into(), scope: Scope::Global, workspace_id: None, session_id: None, query: Some("needle".into()), after_workspace: ws_a.clone(), after_session: "same".into(), after_seq: 0, after_event_time_us: None, after_payload: None }) .unwrap()})).await.unwrap()).unwrap();
+        assert!(!second_page["entries"].as_array().unwrap().is_empty());
         let selected: Value = serde_json::from_str(&execute(&current,&a,"same",&json!({"action":"read","scope":"session","workspace_id":ws_b,"session_id":"same","seq":0})).await.unwrap()).unwrap();
         assert_eq!(selected["entry"]["text"], "needle b0");
         let default: Value = serde_json::from_str(

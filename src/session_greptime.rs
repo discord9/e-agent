@@ -16,9 +16,9 @@ use crate::output_receipt::{
 };
 use crate::session_store::{
     EntryLocation, HistoryEntry, HistoryQuery, LocatedKey, SessionMeta, UsageRow, datetime_to_us,
-    decode_history_rows, dedup_finished_rows, dedup_raw_entries, dedup_raw_located, entry_kind,
-    entry_payload_hash, format_conflict_error, is_error, next_event_time_us, process_identity,
-    us_to_datetime, workspace_id_fingerprint,
+    dedup_finished_rows, dedup_raw_entries, dedup_raw_located, entry_kind, entry_payload_hash,
+    format_conflict_error, is_error, next_event_time_us, process_identity, us_to_datetime,
+    workspace_id_fingerprint,
 };
 // Public path preserved for `src/bin/import_jsonl.rs` (was a `pub fn`
 // defined here before the shared-helper extraction).
@@ -601,9 +601,9 @@ impl GreptimeSession {
         dedup_raw_entries(&raw, session_id, workspace_id, "event_time").map_err(anyhow::Error::msg)
     }
 
-    /// Resolve winners and select logical search keys in Greptime before
-    /// decoding. `TRY_CAST(... AS BYTEA)` is the v1.2 verified tolerant JSON
-    /// input: malformed unselected payloads yield NULL rather than aborting.
+    /// Direct physical-record history search. Greptime search intentionally
+    /// does not reconstruct latest seq winners: older matching versions remain
+    /// searchable. `TRY_CAST(... AS BYTEA)` keeps malformed payloads NULL.
     pub async fn query_history(&self, query: &HistoryQuery) -> Result<Vec<HistoryEntry>> {
         let text = r#"CASE json_get_string(TRY_CAST(payload AS BYTEA),'type')
  WHEN 'notice' THEN json_get_string(TRY_CAST(payload AS BYTEA),'text')
@@ -613,46 +613,23 @@ impl GreptimeSession {
             .as_ref()
             .map(|_| format!(" AND strpos({text},$3::string)>0"))
             .unwrap_or_default();
-        let exact = " AND ($4::bigint IS NULL OR seq=$4::bigint)";
-        let cursor = " AND ($5::string IS NULL OR workspace_id>$5::string OR (workspace_id=$5::string AND (session_id>$6::string OR (session_id=$6::string AND seq<$7::bigint))))";
-        let source = if query.default_search_window {
-            "newest_keys AS (SELECT workspace_id,session_id,seq,event_time FROM winner_rows GROUP BY workspace_id,session_id,seq,event_time ORDER BY seq DESC LIMIT 100), window_rows AS (SELECT w.workspace_id,w.session_id,w.seq,w.event_time,w.payload FROM winner_rows w JOIN newest_keys n ON w.workspace_id=n.workspace_id AND w.session_id=n.session_id AND w.seq=n.seq AND w.event_time=n.event_time),"
-        } else {
-            ""
-        };
-        let selected_from = if query.default_search_window {
-            "window_rows"
-        } else {
-            "winner_rows"
-        };
-        let key_order = if query.default_search_window {
-            "seq DESC"
-        } else {
-            "workspace_id ASC,session_id ASC,seq DESC"
-        };
         let sql = format!(
-            r#"WITH latest AS (
- SELECT workspace_id,session_id,seq,MAX(event_time) winner_time FROM session_entries
- WHERE ($1::string IS NULL OR workspace_id=$1::string) AND ($2::string IS NULL OR session_id=$2::string)
- AND ($3::string IS NULL OR $3::string IS NOT NULL){exact}{cursor}
- GROUP BY workspace_id,session_id,seq
-), winner_rows AS (
- SELECT e.workspace_id,e.session_id,e.seq,e.event_time,e.payload FROM session_entries e JOIN latest l
- ON e.workspace_id=l.workspace_id AND e.session_id=l.session_id AND e.seq=l.seq AND e.event_time=l.winner_time
-), {source} selected_keys AS (
- SELECT workspace_id,session_id,seq,event_time FROM {selected_from} WHERE 1=1{predicate}
- GROUP BY workspace_id,session_id,seq,event_time ORDER BY {key_order} LIMIT $8::bigint
-)
-SELECT w.workspace_id,w.session_id,w.seq,w.event_time,w.payload FROM winner_rows w JOIN selected_keys s
- ON w.workspace_id=s.workspace_id AND w.session_id=s.session_id AND w.seq=s.seq AND w.event_time=s.event_time
- ORDER BY w.workspace_id ASC,w.session_id ASC,w.seq DESC,w.payload ASC"#
+            r#"SELECT workspace_id,session_id,seq,event_time,payload FROM session_entries
+WHERE ($1::string IS NULL OR workspace_id=$1::string) AND ($2::string IS NULL OR session_id=$2::string)
+{predicate}
+AND ($3::string IS NULL OR $3::string IS NOT NULL)
+AND ($9::bigint IS NULL OR seq=$9::bigint)
+AND ($4::timestamp IS NULL OR event_time<$4::timestamp OR (event_time=$4::timestamp AND (workspace_id>$5::string OR (workspace_id=$5::string AND (session_id>$6::string OR (session_id=$6::string AND (seq<$7::bigint OR (seq=$7::bigint AND payload>$8::string))))))))
+ORDER BY event_time DESC,workspace_id ASC,session_id ASC,seq DESC,payload ASC LIMIT $10::bigint"#
         );
         let workspace = query.workspace_id.as_deref();
         let session = query.session_id.as_deref();
-        let exact_seq = query.exact_seq;
+        let after_time = query.after_event_time;
         let after_workspace = query.after.as_ref().map(|v| v.0.as_str());
         let after_session = query.after.as_ref().map(|v| v.1.as_str());
         let after_seq = query.after.as_ref().map(|v| v.2);
+        let after_payload = query.after_payload.as_deref();
+        let exact_seq = query.exact_seq;
         let limit = query.limit as i64;
         let rows = self
             .client
@@ -662,28 +639,26 @@ SELECT w.workspace_id,w.session_id,w.seq,w.event_time,w.payload FROM winner_rows
                     &workspace,
                     &session,
                     &query.query.as_deref(),
-                    &exact_seq,
+                    &after_time,
                     &after_workspace,
                     &after_session,
                     &after_seq,
+                    &after_payload,
+                    &exact_seq,
                     &limit,
                 ],
             )
             .await
             .context("cannot query session history")?;
-        let raw = rows
-            .into_iter()
-            .map(|row| {
-                (
-                    row.get("workspace_id"),
-                    row.get("session_id"),
-                    row.get("seq"),
-                    row.get("event_time"),
-                    row.get("payload"),
-                )
-            })
-            .collect();
-        decode_history_rows(raw, "event_time").map_err(anyhow::Error::msg)
+        rows.into_iter().map(|row| {
+            let workspace_id: String = row.get("workspace_id");
+            let session_id: String = row.get("session_id");
+            let seq: i64 = row.get("seq");
+            let event_time: chrono::NaiveDateTime = row.get("event_time");
+            let payload: String = row.get("payload");
+            let entry = serde_json::from_str(&payload).map_err(|error| anyhow::anyhow!("cannot decode session {session_id} (seq {seq} event_time {event_time}): {error}"))?;
+            Ok(HistoryEntry { workspace_id, session_id, seq, event_time: Some(event_time), cursor_payload: Some(payload), entry })
+        }).collect()
     }
 
     /// Page transcript identities, including transcripts without metadata.
@@ -4268,7 +4243,7 @@ mod tests {
             "INSERT INTO session_entries (workspace_id,session_id,seq,event_time,entry_kind,payload,schema_version,is_error) VALUES ($1,$2,9,$3,'message',$4,1,false)",
             &[&wid,&sid,&us_to_datetime(next_event_time_us()),&"not json"],
         ).await.unwrap();
-        // An old matching version must not survive a newer nonmatching winner.
+        // Direct history search keeps matching physical versions, including old ones.
         let old = us_to_datetime(next_event_time_us());
         let new = us_to_datetime(next_event_time_us());
         session.client.execute(
@@ -4295,31 +4270,63 @@ mod tests {
                 session_id: Some(sid.clone()),
                 query: Some(needle.into()),
                 after: None,
+                after_event_time: None,
+                after_payload: None,
                 exact_seq: None,
                 limit: 5,
                 default_search_window: false,
             })
             .await
             .unwrap();
-        assert_eq!(
-            found.iter().map(|entry| entry.seq).collect::<Vec<_>>(),
-            vec![3, 2, 1, 0]
-        );
-        let page_two = session
+        assert!(found.iter().any(|entry| entry.seq == 4));
+        let first = session
             .query_history(&HistoryQuery {
                 workspace_id: Some(wid.clone()),
                 session_id: Some(sid.clone()),
                 query: Some(needle.into()),
-                after: Some((wid.clone(), sid.clone(), 3)),
+                after: None,
+                after_event_time: None,
+                after_payload: None,
                 exact_seq: None,
-                limit: 5,
+                limit: 1,
                 default_search_window: false,
             })
             .await
             .unwrap();
-        assert_eq!(
-            page_two.iter().map(|entry| entry.seq).collect::<Vec<_>>(),
-            vec![2, 1, 0]
+        let boundary = first.first().unwrap();
+        let second = session
+            .query_history(&HistoryQuery {
+                workspace_id: Some(wid.clone()),
+                session_id: Some(sid.clone()),
+                query: Some(needle.into()),
+                after: Some((
+                    boundary.workspace_id.clone(),
+                    boundary.session_id.clone(),
+                    boundary.seq,
+                )),
+                after_event_time: boundary.event_time,
+                after_payload: boundary.cursor_payload.clone(),
+                exact_seq: None,
+                limit: 1,
+                default_search_window: false,
+            })
+            .await
+            .unwrap();
+        assert_ne!(
+            second.first().map(|entry| (
+                entry.event_time,
+                entry.workspace_id.as_str(),
+                entry.session_id.as_str(),
+                entry.seq,
+                entry.cursor_payload.as_deref()
+            )),
+            first.first().map(|entry| (
+                entry.event_time,
+                entry.workspace_id.as_str(),
+                entry.session_id.as_str(),
+                entry.seq,
+                entry.cursor_payload.as_deref()
+            ))
         );
         let selected_bad = session
             .query_history(&HistoryQuery {
@@ -4327,6 +4334,8 @@ mod tests {
                 session_id: Some(sid),
                 query: None,
                 after: None,
+                after_event_time: None,
+                after_payload: None,
                 exact_seq: Some(9),
                 limit: 1,
                 default_search_window: false,
