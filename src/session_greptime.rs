@@ -4298,16 +4298,34 @@ mod tests {
             "INSERT INTO session_entries (workspace_id,session_id,seq,event_time,entry_kind,payload,schema_version,is_error) VALUES ($1,'other',0,$2,'notice',$3,1,false)",
             &[&other_workspace, &us_to_datetime(next_event_time_us()), &notice],
         ).await.unwrap();
-        let cross_first = session.query_history(&HistoryQuery {
-            workspace_id: None, session_id: None, query: Some(needle.into()),
-            after: None, after_event_time: None, offset: Some(0), exact_seq: None,
-            limit: 1, default_search_window: false,
-        }).await.unwrap();
-        let cross_second = session.query_history(&HistoryQuery {
-            workspace_id: None, session_id: None, query: Some(needle.into()),
-            after: None, after_event_time: None, offset: Some(1), exact_seq: None,
-            limit: 1, default_search_window: false,
-        }).await.unwrap();
+        let cross_first = session
+            .query_history(&HistoryQuery {
+                workspace_id: None,
+                session_id: None,
+                query: Some(needle.into()),
+                after: None,
+                after_event_time: None,
+                offset: Some(0),
+                exact_seq: None,
+                limit: 1,
+                default_search_window: false,
+            })
+            .await
+            .unwrap();
+        let cross_second = session
+            .query_history(&HistoryQuery {
+                workspace_id: None,
+                session_id: None,
+                query: Some(needle.into()),
+                after: None,
+                after_event_time: None,
+                offset: Some(1),
+                exact_seq: None,
+                limit: 1,
+                default_search_window: false,
+            })
+            .await
+            .unwrap();
         assert_ne!(cross_first[0].event_time, cross_second[0].event_time);
         let selected_bad = session
             .query_history(&HistoryQuery {
