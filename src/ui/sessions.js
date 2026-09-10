@@ -415,19 +415,15 @@ function deepLinkTimeoutFor(epoch) {
     ? DEEP_LINK_HISTORY_TIMEOUT_MS : undefined;
 }
 
-function restoredInflightNodes(acc, entries) {
+function restoredInflightNodes(acc) {
   if (!acc) return [];
-  const persistedAssistant = new Set((entries || []).flatMap((e) => {
-    const a = e && e.message && e.message.Assistant;
-    return a && a.content != null ? [a.content] : [];
-  }));
-  const persistedReasoning = new Set((entries || []).flatMap((e) => {
-    const a = e && e.message && e.message.Assistant;
-    return a && a.reasoning != null ? [a.reasoning] : [];
-  }));
+  // History text is not a stable identity: an earlier completed turn may have
+  // exactly the same content/reasoning as the current unpersisted tail. Keep
+  // every unresolved restored root provisionally; the existing H/S splice is
+  // the only authority that later resolves duplicate transcript projection.
   const nodes = [];
-  if (acc.thinkingEl && !persistedReasoning.has(acc.thinkBody && acc.thinkBody.textContent)) nodes.push(acc.thinkingEl);
-  if (acc.assistantEl && !persistedAssistant.has(acc.assistantText)) nodes.push(acc.assistantEl);
+  if (acc.thinkingEl) nodes.push(acc.thinkingEl);
+  if (acc.assistantEl) nodes.push(acc.assistantEl);
   for (const item of acc.toolStack || []) if (!item.filled && item.el) nodes.push(item.el);
   return [...new Set(nodes)];
 }
@@ -479,10 +475,21 @@ async function loadHistory(id, wsId, epoch, timeoutMs) {
     // splice path. Explicitly retained unpersisted in-flight roots stay live
     // until that reconciliation, rather than being silently discarded.
     if (state.initSource !== "snapshot") {
-      const inflight = state.initSource === "restored" ? restoredInflightNodes(state.acc, entries) : [];
+      const inflight = state.initSource === "restored" ? restoredInflightNodes(state.acc) : [];
+      const messages = els.messages;
+      const offset = messages.scrollHeight - messages.scrollTop - messages.clientHeight;
+      const wasFollowing = offset <= 4;
       renderHistory(entries);
-      for (const node of inflight) els.messages.appendChild(node);
+      for (const node of inflight) messages.appendChild(node);
       reattachInFlight(state.acc, inflight);
+      if (!wasFollowing) {
+        messages.scrollTop = Math.max(0, messages.scrollHeight - messages.clientHeight - offset);
+        userScrolled = true;
+        els.jumpBottomBtn.hidden = false;
+      } else {
+        userScrolled = false;
+        scrollBottom(true);
+      }
       state.initSource = "history";
     }
     return "ok";

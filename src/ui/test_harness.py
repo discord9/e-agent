@@ -414,6 +414,14 @@ function streamManualNotice(){
     return { done: true };
   } }; } };
 }
+function streamOracleDelayed(){
+  let phase = 0;
+  return { getReader(){ return { read: async () => {
+    if (phase++ === 0) return new Promise((resolve) => { oracleSseReadResolve = resolve; });
+    if (phase === 2) return { done:false, value: oracleSnapshot };
+    return { done:true };
+  } }; } };
+}
 /* 带 abort 感知的响应 Promise：signal 已 abort → 立即 reject AbortError；
    pending 期间 abort → reject AbortError（resolve 后迟到 abort 是 no-op，
    与真实 fetch 一致）。 */
@@ -528,6 +536,10 @@ let historyOverrides = new Map();
 let sseOkIds = new Set();
 let historyResolve = null;
 let a1StreamManualNotice = false;
+// Oracle 1044: successful H is released independently from a later snapshot.
+let oracleSseReadResolve = null;
+let oracleSnapshot = "";
+let oracleHistory = null;
 // fork 面板测试用：/fork-candidates 候选与 /fork POST 响应（测试中可变）
 let forkCandidatesData = [
   {at:2, seq:2, preview:"用户：你好，帮我看看"},
@@ -672,6 +684,9 @@ globalThis.fetch=(url,opts={})=>{
     entries: [{type:"message", message:{User:{content:"persisted A history", images:[]}}}],
     next_before_seq: null,
   }, signal);
+  if(url.startsWith("/api/sessions/oracle1044/history")) {
+    return abortable(new Promise((resolve) => { oracleHistory = resolve; }), signal);
+  }
   if(url==="/api/sessions/s1/events") return resp(200, stream(), signal);
   if(url==="/api/sessions/s2/events") return resp(200, stream(), signal);
   if(url==="/api/sessions/s3/events") return resp(200, streamSnapshotUsage(), signal);
@@ -683,6 +698,7 @@ globalThis.fetch=(url,opts={})=>{
   if(url.startsWith("/api/sessions/restored-test2/events")) return resp(200, streamEmpty(), signal);
   if(url.startsWith("/api/sessions/restored-test3/events")) return resp(200, streamEmpty(), signal);
   if(url.startsWith("/api/sessions/stream-switch-a/events")) return resp(200, streamEmpty(), signal);
+  if(url.startsWith("/api/sessions/oracle1044/events")) return resp(200, streamOracleDelayed(), signal);
   // 持久化用量端点（本分支新增）：usageData 命中 → 200；置 null → 404 旧后端
   const _mUsage = /^\/api\/sessions\/([^/]+)\/usage$/.exec(url);
   if (_mUsage) {
@@ -2701,6 +2717,77 @@ async function main(){
         "last=" + (last3 ? last3.className : "none")
         + " inflight=" + msgs3.textContent.includes("执行中…")
         + " stack=" + (state.acc && state.acc.toolStack ? state.acc.toolStack.length : "-"));
+
+    // Identical historical text/reasoning is not identity for a current tail.
+    // Both roots remain until the subsequent snapshot produces one projection.
+    state.sessionId = null;
+    state.sessionStates[state.workspace.id + ":oracle1044"] = {
+      html: "<details class='thinking'><summary><span class='think-dot active'></span></summary>"
+        + "<div class='think-body'>当前尾推理</div></details>"
+        + "<div class='msg msg-assistant'><div class='msg-body'>当前尾正文</div></div>"
+        + "<details class='tool-card'><summary>read_file</summary><span class='tool-state'>执行中…</span></details>",
+      scrollTop: 350, nextBeforeSeq: null, olderDone: true, draft: "",
+    };
+    const oracleViewport = elsById["messages"];
+    oracleViewport.scrollHeight = 1000; oracleViewport.clientHeight = 200;
+    oracleViewport.scrollTop = 350; userScrolled = true; elsById["jumpBottomBtn"].hidden = false;
+    oracleHistory = null; oracleSseReadResolve = null;
+    openSession("oracle1044");
+    await flush();
+    chk("oracle1044 delayed history leaves restored tail visible", state.initSource === "restored"
+        && elsById["messages"].textContent.includes("当前尾正文") && oracleHistory !== null);
+    oracleHistory(resp(200, {entries:[
+      {type:"message", message:{User:{content:"H user", images:[]}}},
+      {type:"message", message:{Assistant:{content:"历史重复正文", reasoning:"历史重复推理"}}},
+      {type:"message", message:{Assistant:{content:"历史重复正文", reasoning:"历史重复推理"}}},
+    ], next_before_seq:null}));
+    await flush(); await flush();
+    chk("oracle1044 repeated historical text retains distinct current roots provisionally",
+        elsById["messages"].querySelectorAll(".msg-assistant").length === 3
+        && elsById["messages"].querySelectorAll("details.thinking").length === 3
+        && elsById["messages"].textContent.includes("当前尾正文")
+        && elsById["messages"].textContent.includes("当前尾推理")
+        && elsById["messages"].querySelectorAll("details.tool-card").length === 1
+        && state.acc.toolStack.length === 1);
+    chk("oracle1044 H replacement restores non-following viewport",
+        oracleViewport.scrollHeight - oracleViewport.scrollTop - oracleViewport.clientHeight === 450
+        && userScrolled === true && elsById["jumpBottomBtn"].hidden === false,
+        "top=" + oracleViewport.scrollTop + " offset="
+        + (oracleViewport.scrollHeight - oracleViewport.scrollTop - oracleViewport.clientHeight));
+    oracleSnapshot = 'event: snapshot\ndata: [{"type":"user_prompt","data":{"text":"H user"}},'
+      + '{"type":"reasoning_delta","data":{"delta":"历史重复推理"}},'
+      + '{"type":"assistant_text","data":{"text":"历史重复正文"}},'
+      + '{"type":"reasoning_delta","data":{"delta":"历史重复推理"}},'
+      + '{"type":"assistant_text","data":{"text":"历史重复正文"}}]\n\n';
+    oracleSseReadResolve({done:false, value:""});
+    await flush(); await flush();
+    chk("oracle1044 snapshot resolves identical roots once",
+        elsById["messages"].querySelectorAll(".msg-assistant").length === 2
+        && elsById["messages"].querySelectorAll("details.thinking").length === 2
+        && !elsById["messages"].textContent.includes("当前尾正文")
+        && !elsById["messages"].textContent.includes("当前尾推理")
+        && !elsById["messages"].textContent.includes("执行中…"),
+        "a=" + elsById["messages"].querySelectorAll(".msg-assistant").length
+        + " t=" + elsById["messages"].querySelectorAll("details.thinking").length
+        + " text=" + JSON.stringify(elsById["messages"].textContent));
+
+    // Bottom-following control exercises the same real open -> delayed H -> delayed S path.
+    state.sessionId = null;
+    state.sessionStates[state.workspace.id + ":oracle1044"] = {
+      html: "<div class='notice'>cached control</div>", scrollTop: 800,
+      nextBeforeSeq: null, olderDone: true, draft: "",
+    };
+    oracleViewport.scrollHeight = 1000; oracleViewport.clientHeight = 200;
+    oracleViewport.scrollTop = 800; userScrolled = false; elsById["jumpBottomBtn"].hidden = true;
+    oracleHistory = null; oracleSseReadResolve = null;
+    openSession("oracle1044"); await flush();
+    oracleHistory(resp(200, {entries:[{type:"message", message:{User:{content:"bottom H", images:[]}}}], next_before_seq:null}));
+    await flush(); await flush();
+    chk("oracle1044 H replacement keeps bottom follower", oracleViewport.scrollTop === oracleViewport.scrollHeight
+        && userScrolled === false && elsById["jumpBottomBtn"].hidden === true,
+        "top=" + oracleViewport.scrollTop + " height=" + oracleViewport.scrollHeight);
+    oracleSnapshot = 'event: snapshot\ndata: [{"type":"message","message":{"User":{"content":"bottom H","images":[]}}}]\n\n';
+    oracleSseReadResolve({done:false, value:""}); await flush(); await flush();
 
     // ---- restored streaming tail reconciliation ----
     // Cache A after ABC, leave it while B is active, then return. The initial
