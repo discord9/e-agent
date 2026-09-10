@@ -677,6 +677,7 @@ function saveSessionState() {
   if (state.waitingInput) {
     state.waitingDrafts[waitingDraftKey(state.waitingInput.callId)] = els.promptInput.value;
   }
+  const scrollTop = els.messages.scrollTop;
   const cacheHost = document.createElement("div");
   while (els.messages.firstChild) cacheHost.appendChild(els.messages.firstChild);
   const lastAssistant = cacheHost.querySelectorAll(".msg-assistant");
@@ -689,7 +690,7 @@ function saveSessionState() {
     // Keep the active plain-text prefix separately: restoring moves the nodes
     // back into the real DOM before snapshot reconciliation.
     inFlightText: lastBody && !lastBody.querySelector("*") ? lastBody.textContent : "",
-    scrollTop: els.messages.scrollTop,
+    scrollTop,
     nextBeforeSeq: state.nextBeforeSeq,
     olderDone: state.olderDone,
     // The answer draft is call-bound above; the ordinary composer draft stays separate.

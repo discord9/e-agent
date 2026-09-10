@@ -185,7 +185,13 @@ class El {
   set innerHTML(v){ /* 与真实 DOM 一致：替换会断开旧子节点（isConnected → false） */
     for (const c of this._children) { if (c instanceof El) c._parent = null; }
     if(String(v)==="") { this._children=[]; this._innerHTML=""; }
-    else { this._children = parseHtml(v); this._innerHTML=""; } }
+    else {
+      this._children = parseHtml(v);
+      // parseHtml returns detached roots; innerHTML installs them under this
+      // element, so remove()/appendChild() observe normal parent ownership.
+      for (const c of this._children) if (c instanceof El) c._parent = this;
+      this._innerHTML="";
+    } }
   /* 与真实 DOM 一致：textContent 取文本后代拼接；赋值则整体替换（清子节点） */
   get textContent(){ if (this._children.length) {
       let out = "";
@@ -211,8 +217,13 @@ class El {
       this._children.push({ text: this._text }); this._text = ""; } }
   append(...nodes){ for(const n of nodes){ if(n==null) continue;
     this._materializeText();
-    const c=typeof n==="string"?{text:n}:n; this._children.push(c);
-    if(c._parent==null) c._parent=this; } }
+    const c=typeof n==="string"?{text:n}:n;
+    // Element.append moves an existing node just like appendChild; otherwise
+    // a restored/live node can remain in two fake parents at once.
+    const p=c._parent;
+    if(p){ const i=p._children.indexOf(c); if(i>=0) p._children.splice(i,1); }
+    this._children.push(c); c._parent=this;
+  } }
   appendChild(n){ const p=n._parent;   /* 真实 DOM 语义：移动=先从旧父节点移除 */
     if(p){ const j=p._children.indexOf(n); if(j>=0) p._children.splice(j,1); }
     this._materializeText();
@@ -720,6 +731,22 @@ async function flush(){ for(let i=0;i<200;i++) await Promise.resolve(); }
 async function main(){
   let fail=0;
   const chk=(name, ok, extra)=>{ if(!ok) fail++; console.log((ok?"PASS":"FAIL")+" "+name+(extra?"  "+extra:"")); };
+  // Parsed innerHTML roots are installed children: remove must empty the
+  // receiver, and a subsequent move must detach it from its former parent.
+  const parsedParentProbe = document.createElement("div");
+  parsedParentProbe.innerHTML = "<div class='notice'>cached</div>";
+  const parsedRootProbe = parsedParentProbe.firstChild;
+  parsedRootProbe.remove();
+  const parsedRemoveOk = parsedParentProbe.firstChild === null
+    && parsedRootProbe.parentNode === null;
+  parsedParentProbe.innerHTML = "<div class='notice'>cached</div>";
+  const parsedMoveProbe = parsedParentProbe.firstChild;
+  const parsedMoveTarget = document.createElement("div");
+  parsedMoveTarget.append(parsedMoveProbe);
+  chk("innerHTML roots remove and move with parent ownership", parsedRemoveOk
+      && parsedParentProbe.firstChild === null && parsedMoveTarget.firstChild === parsedMoveProbe
+      && parsedMoveProbe.parentNode === parsedMoveTarget,
+      "removed=" + parsedRemoveOk + " old=" + parsedParentProbe.children.length);
   if (MODE === 'splice') {
     const plan = (history, snapshot) => {
       const result = spliceHistorySnapshot(history, snapshot);
