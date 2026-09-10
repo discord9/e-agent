@@ -186,9 +186,16 @@ function connectSSE(id, wsId, epoch) {
     state.deepLink.probing = false;
     state.deepLink.attemptEpoch = -1;
     return readSSEStream(res.body.getReader(), id, wsId, epoch, ctrl);
-  }).then(() => {
-    // 正常结束（后端关闭流）→ 按断线处理
+  }).then((sawBlock) => {
     if (!streamCurrent(id, wsId, epoch, ctrl)) return;
+    // A restored cache plus validated H must not remain visible forever when
+    // its stream closes without ever yielding an SSE block. Streams that did
+    // yield a block keep their existing live/reconnect behavior.
+    if (!sawBlock && state.initSource === "history-ready" && state.historyEntries) {
+      renderHistory(state.historyEntries);
+      state.initSource = "history";
+    }
+    // 正常结束（后端关闭流）→ 按断线处理
     throw new Error("stream end");
   }).catch((err) => {
     if (!streamCurrent(id, wsId, epoch, ctrl)) return;
@@ -207,7 +214,7 @@ function connectSSE(id, wsId, epoch) {
    本流自己的 ctrl——绝不能动 state.sse.ctrl，那可能已是新流的控制器）。 */
 async function readSSEStream(reader, id, wsId, epoch, ctrl) {
   const decoder = new TextDecoder();
-  let buf = "";
+  let buf = "", sawBlock = false;
   for (;;) {
     if (!streamCurrent(id, wsId, epoch, ctrl)) { try { ctrl && ctrl.abort(); } catch (e) { /* 忽略 */ } return; }
     const { done, value } = await reader.read();
@@ -218,9 +225,11 @@ async function readSSEStream(reader, id, wsId, epoch, ctrl) {
     while ((idx = buf.indexOf("\n\n")) !== -1) {
       const block = buf.slice(0, idx);
       buf = buf.slice(idx + 2);
+      sawBlock = true;
       handleSSEBlock(block, id, wsId, epoch, ctrl);
     }
   }
+  return sawBlock;
 }
 
 /* 从初始 snapshot 事件数组恢复 current usage：取最后一个 Usage 事件（最近

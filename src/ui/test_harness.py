@@ -1530,7 +1530,9 @@ async function main(){
         "errN=" + elsById["messages"].querySelectorAll(".msg-error").length);
     chk("history error not unknown-entry wrapped", !t.includes("未知条目"),
         "hasUnknown=" + t.includes("未知条目"));
-    chk("snapshot skipped", !t.includes("SNAPSHOT-SHOULD-BE-SKIPPED"));
+    // The initial snapshot is merged with validated H: unmatched UI events
+    // remain visible instead of being discarded with the duplicate transcript.
+    chk("snapshot preserves unmatched notice", t.includes("SNAPSHOT-SHOULD-BE-SKIPPED"));
     chk("status Busy", elsById["chatStatus"].textContent==="处理中", "="+elsById["chatStatus"].textContent);
     chk("cancel enabled when busy", elsById["cancelBtn"].disabled===false);
 

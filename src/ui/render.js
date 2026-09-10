@@ -949,6 +949,10 @@ function appendToolResult(isError, content, acc, callId) {
   let card = null;
   if (callId && acc.pendingByCall.has(callId)) {
     card = acc.pendingByCall.get(callId);
+    // spliceLastCard is only an ownerless-snapshot fallback. An explicit
+    // call result must consume its own card and cannot arm a later live
+    // ownerless result to overwrite this completed history card.
+    acc.spliceLastCard = null;
   }
   if (!card && acc.spliceLastCard) {
     // A merged snapshot's ownerless result follows the call selected by the
