@@ -2720,11 +2720,12 @@ async function main(){
 
     // Identical historical text/reasoning is not identity for a current tail.
     // Both roots remain until the subsequent snapshot produces one projection.
+    const oracleSameText = "历史重复正文", oracleSameReasoning = "历史重复推理";
     state.sessionId = null;
     state.sessionStates[state.workspace.id + ":oracle1044"] = {
       html: "<details class='thinking'><summary><span class='think-dot active'></span></summary>"
-        + "<div class='think-body'>当前尾推理</div></details>"
-        + "<div class='msg msg-assistant'><div class='msg-body'>当前尾正文</div></div>"
+        + "<div class='think-body'>" + oracleSameReasoning + "</div></details>"
+        + "<div class='msg msg-assistant'><div class='msg-body'>" + oracleSameText + "</div></div>"
         + "<details class='tool-card'><summary>read_file</summary><span class='tool-state'>执行中…</span></details>",
       scrollTop: 350, nextBeforeSeq: null, olderDone: true, draft: "",
     };
@@ -2735,41 +2736,50 @@ async function main(){
     openSession("oracle1044");
     await flush();
     chk("oracle1044 delayed history leaves restored tail visible", state.initSource === "restored"
-        && elsById["messages"].textContent.includes("当前尾正文") && oracleHistory !== null);
+        && elsById["messages"].textContent.includes(oracleSameText) && oracleHistory !== null);
     oracleHistory(resp(200, {entries:[
       {type:"message", message:{User:{content:"H user", images:[]}}},
-      {type:"message", message:{Assistant:{content:"历史重复正文", reasoning:"历史重复推理"}}},
-      {type:"message", message:{Assistant:{content:"历史重复正文", reasoning:"历史重复推理"}}},
+      {type:"message", message:{Assistant:{content:oracleSameText, reasoning:oracleSameReasoning}}},
+      {type:"message", message:{Assistant:{content:oracleSameText, reasoning:oracleSameReasoning}}},
     ], next_before_seq:null}));
     await flush(); await flush();
-    chk("oracle1044 repeated historical text retains distinct current roots provisionally",
-        elsById["messages"].querySelectorAll(".msg-assistant").length === 3
-        && elsById["messages"].querySelectorAll("details.thinking").length === 3
-        && elsById["messages"].textContent.includes("当前尾正文")
-        && elsById["messages"].textContent.includes("当前尾推理")
+    const oracleAssistantTexts = elsById["messages"].querySelectorAll(".msg-assistant")
+      .map((m) => m.querySelector(".msg-body").textContent.trim());
+    const oracleReasoningTexts = elsById["messages"].querySelectorAll("details.thinking")
+      .map((d) => d.querySelector(".think-body").textContent);
+    chk("oracle1044 same H occurrence retains distinct current roots provisionally",
+        oracleAssistantTexts.length === 3
+        && oracleAssistantTexts.filter((t) => t === oracleSameText).length === 3
+        && oracleReasoningTexts.length === 3
+        && oracleReasoningTexts.filter((t) => t === oracleSameReasoning).length === 3
         && elsById["messages"].querySelectorAll("details.tool-card").length === 1
-        && state.acc.toolStack.length === 1);
+        && state.acc.toolStack.length === 1,
+        "a=" + JSON.stringify(oracleAssistantTexts)
+        + " r=" + JSON.stringify(oracleReasoningTexts));
     chk("oracle1044 H replacement restores non-following viewport",
         oracleViewport.scrollHeight - oracleViewport.scrollTop - oracleViewport.clientHeight === 450
         && userScrolled === true && elsById["jumpBottomBtn"].hidden === false,
         "top=" + oracleViewport.scrollTop + " offset="
         + (oracleViewport.scrollHeight - oracleViewport.scrollTop - oracleViewport.clientHeight));
     oracleSnapshot = 'event: snapshot\ndata: [{"type":"user_prompt","data":{"text":"H user"}},'
-      + '{"type":"reasoning_delta","data":{"delta":"历史重复推理"}},'
-      + '{"type":"assistant_text","data":{"text":"历史重复正文"}},'
-      + '{"type":"reasoning_delta","data":{"delta":"历史重复推理"}},'
-      + '{"type":"assistant_text","data":{"text":"历史重复正文"}}]\n\n';
+      + '{"type":"reasoning_delta","data":{"delta":"' + oracleSameReasoning + '"}},'
+      + '{"type":"assistant_text","data":{"text":"' + oracleSameText + '"}},'
+      + '{"type":"reasoning_delta","data":{"delta":"' + oracleSameReasoning + '"}},'
+      + '{"type":"assistant_text","data":{"text":"' + oracleSameText + '"}}]\n\n';
     oracleSseReadResolve({done:false, value:""});
     await flush(); await flush();
-    chk("oracle1044 snapshot resolves identical roots once",
-        elsById["messages"].querySelectorAll(".msg-assistant").length === 2
-        && elsById["messages"].querySelectorAll("details.thinking").length === 2
-        && !elsById["messages"].textContent.includes("当前尾正文")
-        && !elsById["messages"].textContent.includes("当前尾推理")
+    const oracleFinalAssistants = elsById["messages"].querySelectorAll(".msg-assistant")
+      .map((m) => m.querySelector(".msg-body").textContent.trim());
+    const oracleFinalReasoning = elsById["messages"].querySelectorAll("details.thinking")
+      .map((d) => d.querySelector(".think-body").textContent);
+    chk("oracle1044 snapshot resolves same-text roots to H/S occurrences once",
+        oracleFinalAssistants.length === 2
+        && oracleFinalAssistants.filter((t) => t === oracleSameText).length === 2
+        && oracleFinalReasoning.length === 2
+        && oracleFinalReasoning.filter((t) => t === oracleSameReasoning).length === 2
         && !elsById["messages"].textContent.includes("执行中…"),
-        "a=" + elsById["messages"].querySelectorAll(".msg-assistant").length
-        + " t=" + elsById["messages"].querySelectorAll("details.thinking").length
-        + " text=" + JSON.stringify(elsById["messages"].textContent));
+        "a=" + JSON.stringify(oracleFinalAssistants)
+        + " r=" + JSON.stringify(oracleFinalReasoning));
 
     // Bottom-following control exercises the same real open -> delayed H -> delayed S path.
     state.sessionId = null;
