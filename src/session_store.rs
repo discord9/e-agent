@@ -818,10 +818,77 @@ pub struct HistoryEntry {
     pub workspace_id: String,
     pub session_id: String,
     pub seq: i64,
+    pub event_time: Option<chrono::NaiveDateTime>,
     pub entry: SessionEntry,
 }
 
+/// One bounded logical-history selection. SQL backends resolve winners and
+/// select keys in the database; JSONL retains its existing file fallback.
+#[derive(Clone, Debug)]
+pub struct HistoryQuery {
+    pub workspace_id: Option<String>,
+    pub session_id: Option<String>,
+    pub query: Option<String>,
+    pub after: Option<(String, String, i64)>,
+    pub after_event_time: Option<chrono::NaiveDateTime>,
+    pub offset: Option<i64>,
+    pub exact_seq: Option<i64>,
+    pub limit: usize,
+    /// Preserve the no-scope search contract: consider newest 100 logical
+    /// records in the current session before applying the text predicate.
+    pub default_search_window: bool,
+}
+
+/// Decode only SQL-selected winner ties. Rows must be ordered so physical
+/// ties are adjacent; an unrelated record is deliberately never decoded.
+pub(crate) fn decode_history_rows(
+    rows: Vec<(String, String, i64, chrono::NaiveDateTime, String)>,
+    event_time_col: &str,
+) -> Result<Vec<HistoryEntry>, String> {
+    let mut out = Vec::new();
+    let mut index = 0;
+    while index < rows.len() {
+        let (workspace_id, session_id, seq, _, _) = &rows[index];
+        let start = index;
+        while index < rows.len()
+            && rows[index].0 == *workspace_id
+            && rows[index].1 == *session_id
+            && rows[index].2 == *seq
+        {
+            index += 1;
+        }
+        let raw = rows[start..index]
+            .iter()
+            .map(|(_, _, seq, event_time, payload)| (*seq, *event_time, payload.clone()))
+            .collect::<Vec<_>>();
+        let (_, entry) = dedup_raw_entries(&raw, session_id, workspace_id, event_time_col)?
+            .into_iter()
+            .next()
+            .expect("selected history key has a row");
+        out.push(HistoryEntry {
+            workspace_id: workspace_id.clone(),
+            session_id: session_id.clone(),
+            seq: *seq,
+            event_time: Some(raw[0].1),
+            entry,
+        });
+    }
+    Ok(out)
+}
+
 impl SessionStore {
+    pub fn supports_history_query(&self) -> bool {
+        !matches!(self, SessionStore::Jsonl)
+    }
+
+    pub fn history_query_uses_cross_scope_offset(&self) -> bool {
+        match self {
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { .. } => true,
+            _ => false,
+        }
+    }
+
     /// Create a new store based on the configured backend.
     ///
     /// For `Jsonl` this is a zero-cost marker; for `Greptime`/`Sqlite` it
@@ -1372,6 +1439,24 @@ impl SessionStore {
                 .lock()
                 .await
                 .load_history_with_seq(workspace_id, session_id)
+                .await
+                .map_err(anyhow::Error::msg),
+        }
+    }
+
+    /// Select logical history rows without loading unrelated payloads on SQL
+    /// backends. The JSONL fallback is intentionally left to the tool's
+    /// existing file traversal.
+    pub async fn query_history(&self, query: &HistoryQuery) -> Result<Vec<HistoryEntry>> {
+        match self {
+            SessionStore::Jsonl => anyhow::bail!("JSONL history query is unsupported"),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session, .. } => session.query_history(query).await,
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite { session, .. } => session
+                .lock()
+                .await
+                .query_history(query)
                 .await
                 .map_err(anyhow::Error::msg),
         }
@@ -3348,6 +3433,43 @@ mod shared_helpers {
                 text: "harness exploded".into(),
             },
         ]
+    }
+
+    #[test]
+    fn decode_history_rows_only_decodes_selected_winner_ties() {
+        let time = us_to_datetime(1);
+        let notice = r#"{"type":"notice","text":"selected"}"#.to_owned();
+        let selected = decode_history_rows(
+            vec![
+                ("w".into(), "s".into(), 2, time, notice.clone()),
+                ("w".into(), "s".into(), 2, time, notice),
+            ],
+            "event_time_us",
+        )
+        .unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].seq, 2);
+        let error = decode_history_rows(
+            vec![
+                (
+                    "w".into(),
+                    "s".into(),
+                    2,
+                    time,
+                    r#"{"type":"notice","text":"one"}"#.into(),
+                ),
+                (
+                    "w".into(),
+                    "s".into(),
+                    2,
+                    time,
+                    r#"{"type":"notice","text":"two"}"#.into(),
+                ),
+            ],
+            "event_time_us",
+        )
+        .unwrap_err();
+        assert!(error.contains("divergent physical duplicates"));
     }
 
     #[test]

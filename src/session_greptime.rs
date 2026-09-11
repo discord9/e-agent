@@ -15,9 +15,10 @@ use crate::output_receipt::{
     ReceiptError, ReceiptErrorKind, VerifiedRef, field_bytes, validate_location_for_store,
 };
 use crate::session_store::{
-    EntryLocation, LocatedKey, SessionMeta, UsageRow, datetime_to_us, dedup_finished_rows,
-    dedup_raw_entries, dedup_raw_located, entry_kind, entry_payload_hash, format_conflict_error,
-    is_error, next_event_time_us, process_identity, us_to_datetime, workspace_id_fingerprint,
+    EntryLocation, HistoryEntry, HistoryQuery, LocatedKey, SessionMeta, UsageRow, datetime_to_us,
+    dedup_finished_rows, dedup_raw_entries, dedup_raw_located, entry_kind, entry_payload_hash,
+    format_conflict_error, is_error, next_event_time_us, process_identity, us_to_datetime,
+    workspace_id_fingerprint,
 };
 // Public path preserved for `src/bin/import_jsonl.rs` (was a `pub fn`
 // defined here before the shared-helper extraction).
@@ -598,6 +599,51 @@ impl GreptimeSession {
             })
             .collect::<Vec<_>>();
         dedup_raw_entries(&raw, session_id, workspace_id, "event_time").map_err(anyhow::Error::msg)
+    }
+
+    /// Direct physical-record history search. Greptime search intentionally
+    /// does not reconstruct latest seq winners: older matching versions remain
+    /// searchable. `TRY_CAST(... AS BYTEA)` keeps malformed payloads NULL.
+    pub async fn query_history(&self, query: &HistoryQuery) -> Result<Vec<HistoryEntry>> {
+        let text = r#"CASE json_get_string(TRY_CAST(payload AS BYTEA),'type')
+ WHEN 'notice' THEN json_get_string(TRY_CAST(payload AS BYTEA),'text')
+ WHEN 'message' THEN coalesce(json_get_string(TRY_CAST(payload AS BYTEA),'message.User.content'),json_get_string(TRY_CAST(payload AS BYTEA),'message.Assistant.content')) END"#;
+        let workspace = query.workspace_id.as_deref();
+        let session = query.session_id.as_deref();
+        let limit = query.limit as i64;
+        let rows = if let (Some(workspace), Some(session), Some(seq)) = (workspace, session, query.exact_seq) {
+            self.client.query(
+                "SELECT workspace_id,session_id,seq,event_time,payload FROM session_entries WHERE workspace_id=$1::string AND session_id=$2::string AND seq=$3::bigint ORDER BY event_time DESC LIMIT 1",
+                &[&workspace, &session, &seq],
+            ).await
+        } else if let Some(session) = session {
+            let predicate = query.query.as_ref().map(|_| format!(" AND strpos({text},$3::string)>0")).unwrap_or_default();
+            let sql = format!(r#"SELECT workspace_id,session_id,seq,event_time,payload FROM session_entries
+WHERE workspace_id=$1::string AND session_id=$2::string{predicate}
+AND ($3::string IS NULL OR $3::string IS NOT NULL)
+AND ($4::timestamp IS NULL OR event_time<$4::timestamp OR (event_time=$4::timestamp AND seq<$5::bigint))
+ORDER BY event_time DESC,seq DESC LIMIT $6::bigint"#);
+            let after_time = query.after_event_time;
+            let after_seq = query.after.as_ref().map(|entry| entry.2);
+            self.client.query(&sql, &[&workspace.expect("session has workspace"), &session, &query.query.as_deref(), &after_time, &after_seq, &limit]).await
+        } else {
+            let predicate = query.query.as_ref().map(|_| format!(" AND strpos({text},$2::string)>0")).unwrap_or_default();
+            let sql = format!(r#"SELECT workspace_id,session_id,seq,event_time,payload FROM session_entries
+WHERE ($1::string IS NULL OR workspace_id=$1::string){predicate}
+AND ($2::string IS NULL OR $2::string IS NOT NULL)
+ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#);
+            let offset = query.offset.unwrap_or(0);
+            self.client.query(&sql, &[&workspace, &query.query.as_deref(), &limit, &offset]).await
+        }.context("cannot query session history")?;
+        rows.into_iter().map(|row| {
+            let workspace_id: String = row.get("workspace_id");
+            let session_id: String = row.get("session_id");
+            let seq: i64 = row.get("seq");
+            let event_time: chrono::NaiveDateTime = row.get("event_time");
+            let payload: String = row.get("payload");
+            let entry = serde_json::from_str(&payload).map_err(|error| anyhow::anyhow!("cannot decode session {session_id} (seq {seq} event_time {event_time}): {error}"))?;
+            Ok(HistoryEntry { workspace_id, session_id, seq, event_time: Some(event_time), entry })
+        }).collect()
     }
 
     /// Page transcript identities, including transcripts without metadata.
@@ -4158,6 +4204,144 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bytes, b"variant");
+    }
+
+    #[tokio::test]
+    async fn history_query_uses_tolerant_bytea_json_search() {
+        let conn = conn_str();
+        if conn == "skipped" {
+            return;
+        }
+        let wid = workspace_id();
+        let sid = format!("test-gt-history-{}", crate::session::new_id());
+        let session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        let needle = "Needle % _ \\ line\n☃";
+        session
+            .append(&[Message::User {
+                content: needle.into(),
+                images: vec![],
+            }
+            .into()])
+            .await
+            .unwrap();
+        session.client.execute(
+            "INSERT INTO session_entries (workspace_id,session_id,seq,event_time,entry_kind,payload,schema_version,is_error) VALUES ($1,$2,9,$3,'message',$4,1,false)",
+            &[&wid,&sid,&us_to_datetime(next_event_time_us()),&"not json"],
+        ).await.unwrap();
+        // Direct history search keeps matching physical versions, including old ones.
+        let old = us_to_datetime(next_event_time_us());
+        let new = us_to_datetime(next_event_time_us());
+        session.client.execute(
+            "INSERT INTO session_entries (workspace_id,session_id,seq,event_time,entry_kind,payload,schema_version,is_error) VALUES ($1,$2,4,$3,'message',$4,1,false),($1,$2,4,$5,'message',$6,1,false)",
+            &[&wid,&sid,&old,&r#"{"type":"message","message":{"User":{"content":"Needle % _ \\ line\n☃"}}}"#,&new,&r#"{"type":"message","message":{"User":{"content":"replacement"}}}"#],
+        ).await.unwrap();
+        let tied = us_to_datetime(next_event_time_us());
+        let notice = r#"{"type":"notice","text":"Needle % _ \\ line\n☃"}"#;
+        let assistant = serde_json::to_string(&SessionEntry::Message {
+            message: Message::Assistant(AssistantMessage {
+                content: Some(needle.into()),
+                tool_calls: vec![],
+                reasoning: None,
+            }),
+        })
+        .unwrap();
+        session.client.execute(
+            "INSERT INTO session_entries (workspace_id,session_id,seq,event_time,entry_kind,payload,schema_version,is_error) VALUES ($1,$2,3,$3,'notice',$4,1,false),($1,$2,2,$5,'message',$6,1,false),($1,$2,1,$7,'notice',$4,1,false),($1,$2,1,$7,'notice',$4,1,false)",
+            &[&wid,&sid,&us_to_datetime(next_event_time_us()),&notice,&us_to_datetime(next_event_time_us()),&assistant,&tied],
+        ).await.unwrap();
+        let found = session
+            .query_history(&HistoryQuery {
+                workspace_id: Some(wid.clone()),
+                session_id: Some(sid.clone()),
+                query: Some(needle.into()),
+                after: None,
+                after_event_time: None,
+                offset: None,
+                exact_seq: None,
+                limit: 5,
+                default_search_window: false,
+            })
+            .await
+            .unwrap();
+        assert!(found.iter().any(|entry| entry.seq == 4));
+        let first = session
+            .query_history(&HistoryQuery {
+                workspace_id: Some(wid.clone()),
+                session_id: Some(sid.clone()),
+                query: Some(needle.into()),
+                after: None,
+                after_event_time: None,
+                offset: None,
+                exact_seq: None,
+                limit: 1,
+                default_search_window: false,
+            })
+            .await
+            .unwrap();
+        let second = session
+            .query_history(&HistoryQuery {
+                workspace_id: Some(wid.clone()),
+                session_id: Some(sid.clone()),
+                query: Some(needle.into()),
+                after: Some((wid.clone(), sid.clone(), first[0].seq)),
+                after_event_time: first[0].event_time,
+                offset: None,
+                exact_seq: None,
+                limit: 1,
+                default_search_window: false,
+            })
+            .await
+            .unwrap();
+        assert_ne!(second[0].seq, first[0].seq);
+        let other_workspace = format!("{wid}-other");
+        session.client.execute(
+            "INSERT INTO session_entries (workspace_id,session_id,seq,event_time,entry_kind,payload,schema_version,is_error) VALUES ($1,'other',0,$2,'notice',$3,1,false)",
+            &[&other_workspace, &us_to_datetime(next_event_time_us()), &notice],
+        ).await.unwrap();
+        let cross_first = session
+            .query_history(&HistoryQuery {
+                workspace_id: None,
+                session_id: None,
+                query: Some(needle.into()),
+                after: None,
+                after_event_time: None,
+                offset: Some(0),
+                exact_seq: None,
+                limit: 1,
+                default_search_window: false,
+            })
+            .await
+            .unwrap();
+        let cross_second = session
+            .query_history(&HistoryQuery {
+                workspace_id: None,
+                session_id: None,
+                query: Some(needle.into()),
+                after: None,
+                after_event_time: None,
+                offset: Some(1),
+                exact_seq: None,
+                limit: 1,
+                default_search_window: false,
+            })
+            .await
+            .unwrap();
+        assert_ne!(cross_first[0].event_time, cross_second[0].event_time);
+        let selected_bad = session
+            .query_history(&HistoryQuery {
+                workspace_id: Some(wid),
+                session_id: Some(sid),
+                query: None,
+                after: None,
+                after_event_time: None,
+                offset: None,
+                exact_seq: Some(9),
+                limit: 1,
+                default_search_window: false,
+            })
+            .await
+            .unwrap_err();
+        assert!(selected_bad.to_string().contains("cannot decode"));
     }
 
     #[tokio::test]

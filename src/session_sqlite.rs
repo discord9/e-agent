@@ -23,9 +23,10 @@ use crate::output_receipt::{
     ReceiptError, ReceiptErrorKind, VerifiedRef, field_bytes, validate_location_for_store,
 };
 use crate::session_store::{
-    EntryLocation, LocatedKey, SessionMeta, UsageRow, datetime_to_us, dedup_raw_entries,
-    dedup_raw_located, entry_kind, entry_payload_hash, format_conflict_error, is_error,
-    next_event_time_us, process_identity, us_to_datetime, workspace_id_fingerprint,
+    EntryLocation, HistoryEntry, HistoryQuery, LocatedKey, SessionMeta, UsageRow, datetime_to_us,
+    decode_history_rows, dedup_raw_entries, dedup_raw_located, entry_kind, entry_payload_hash,
+    format_conflict_error, is_error, next_event_time_us, process_identity, us_to_datetime,
+    workspace_id_fingerprint,
 };
 // Public path preserved for symmetry with `session_greptime` (the function
 // was a `pub fn` defined here before the shared-helper extraction).
@@ -673,6 +674,126 @@ impl SqliteSession {
             raw.push((seq, us_to_datetime(event_time), payload));
         }
         dedup_raw_entries(&raw, session_id, workspace_id, "event_time_us")
+    }
+
+    /// Resolve and select only logical history winners in SQL. The schema's
+    /// `(workspace_id, session_id, seq, event_time_us)` primary key makes each
+    /// selected winner physical row unique; decoding remains selected-only.
+    pub async fn query_history(&self, query: &HistoryQuery) -> Result<Vec<HistoryEntry>, String> {
+        let text = r#"CASE WHEN json_valid(payload) THEN CASE json_extract(payload,'$.type')
+ WHEN 'message' THEN CASE
+  WHEN json_type(payload,'$.message.User.content')='text' THEN json_extract(payload,'$.message.User.content')
+  WHEN json_type(payload,'$.message.Assistant.content')='text' THEN json_extract(payload,'$.message.Assistant.content') END
+ WHEN 'notice' THEN CASE WHEN json_type(payload,'$.text')='text' THEN json_extract(payload,'$.text') END END END"#;
+        let predicate = query
+            .query
+            .as_ref()
+            .map(|_| format!(" AND instr({text}, ?3) > 0"))
+            .unwrap_or_default();
+        let exact = " AND (?7 IS NULL OR seq = ?7)";
+        let cursor = " AND (?4 IS NULL OR workspace_id > ?4 OR (workspace_id = ?4 AND (session_id > ?5 OR (session_id = ?5 AND seq < ?6))))";
+        let key_order = if query.default_search_window {
+            "seq DESC"
+        } else {
+            "workspace_id ASC, session_id ASC, seq DESC"
+        };
+        let source = if query.default_search_window {
+            ", window_rows AS (SELECT * FROM winner_rows ORDER BY seq DESC LIMIT 100)"
+        } else {
+            ""
+        };
+        let selected_from = if query.default_search_window {
+            "window_rows"
+        } else {
+            "winner_rows"
+        };
+        let sql = format!(
+            r#"WITH latest AS (
+ SELECT workspace_id,session_id,seq,MAX(event_time_us) winner_time FROM session_entries
+ WHERE (?1 IS NULL OR workspace_id=?1) AND (?2 IS NULL OR session_id=?2){exact}{cursor}
+ GROUP BY workspace_id,session_id,seq
+), winner_rows AS (
+ SELECT e.workspace_id,e.session_id,e.seq,e.event_time_us,e.payload FROM session_entries e JOIN latest l
+ ON e.workspace_id=l.workspace_id AND e.session_id=l.session_id AND e.seq=l.seq AND e.event_time_us=l.winner_time
+){source}
+SELECT workspace_id,session_id,seq,event_time_us,payload FROM {selected_from} WHERE 1=1{predicate}
+ ORDER BY {key_order} LIMIT ?8"#
+        );
+        let mut params = vec![
+            query
+                .workspace_id
+                .clone()
+                .map(turso::Value::Text)
+                .unwrap_or(turso::Value::Null),
+            query
+                .session_id
+                .clone()
+                .map(turso::Value::Text)
+                .unwrap_or(turso::Value::Null),
+            query
+                .query
+                .clone()
+                .map(turso::Value::Text)
+                .unwrap_or(turso::Value::Null),
+            query
+                .after
+                .as_ref()
+                .map(|v| turso::Value::Text(v.0.clone()))
+                .unwrap_or(turso::Value::Null),
+            query
+                .after
+                .as_ref()
+                .map(|v| turso::Value::Text(v.1.clone()))
+                .unwrap_or(turso::Value::Null),
+            query
+                .after
+                .as_ref()
+                .map(|v| turso::Value::Integer(v.2))
+                .unwrap_or(turso::Value::Null),
+            query
+                .exact_seq
+                .map(turso::Value::Integer)
+                .unwrap_or(turso::Value::Null),
+            turso::Value::Integer(query.limit as i64),
+        ];
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(&sql, turso::params_from_iter(params.drain(..)))
+            .await
+            .map_err(|e| format!("cannot query session history: {e}"))?;
+        let mut raw = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| format!("cannot query session history: {e}"))?
+        {
+            let text_at = |n| {
+                row.get_value(n)
+                    .map_err(|e| format!("cannot query session history: {e}"))?
+                    .as_text()
+                    .cloned()
+                    .ok_or_else(|| {
+                        "cannot query session history: text column is not text".to_owned()
+                    })
+            };
+            let integer_at = |n| {
+                row.get_value(n)
+                    .map_err(|e| format!("cannot query session history: {e}"))?
+                    .as_integer()
+                    .copied()
+                    .ok_or_else(|| {
+                        "cannot query session history: integer column is not integer".to_owned()
+                    })
+            };
+            raw.push((
+                text_at(0)?,
+                text_at(1)?,
+                integer_at(2)?,
+                us_to_datetime(integer_at(3)?),
+                text_at(4)?,
+            ));
+        }
+        decode_history_rows(raw, "event_time_us")
     }
 
     /// Page transcript identities without relying on metadata sidecars.

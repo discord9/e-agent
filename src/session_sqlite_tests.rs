@@ -507,6 +507,132 @@ async fn retry_latest_event_time_wins_per_seq() {
 }
 
 #[tokio::test]
+async fn history_query_search_is_literal_and_ignores_unselected_bad_json() {
+    let (_dir, session, _sid) = fresh_session().await;
+    let needle = "Needle % _ \\ line\n☃";
+    session
+        .append(&[Message::User {
+            content: needle.into(),
+            images: vec![],
+        }
+        .into()])
+        .await
+        .unwrap();
+    let conn = session.conn.lock().await;
+    conn.execute(
+        "INSERT INTO session_entries (workspace_id,session_id,seq,event_time_us,entry_kind,payload,schema_version,is_error) VALUES (?1,?2,?3,?4,?5,?6,1,0)",
+        (session.workspace_id.as_str(), session.session_id.as_str(), 9_i64, next_event_time_us(), "message", "not json"),
+    ).await.unwrap();
+    conn.execute(
+        "INSERT INTO session_entries (workspace_id,session_id,seq,event_time_us,entry_kind,payload,schema_version,is_error) VALUES (?1,?2,?3,?4,?5,?6,1,0),(?1,?2,?7,?8,?5,?9,1,0),(?1,?2,?10,?11,?5,?12,1,0)",
+        (session.workspace_id.as_str(), session.session_id.as_str(), 8_i64, next_event_time_us(), "notice", r#"{"type":"notice","text":42}"#, 7_i64, next_event_time_us(), r#"{"type":"notice","text":{"content":"Needle % _ \\ line\n☃"}}"#, 6_i64, next_event_time_us(), r#"{"type":"notice","text":"Needle % _ \\ line\n☃"}"#),
+    ).await.unwrap();
+    conn.execute(
+        "INSERT INTO session_entries (workspace_id,session_id,seq,event_time_us,entry_kind,payload,schema_version,is_error) VALUES (?1,?2,5,?3,'notice',?4,1,0),(?1,?2,4,?5,'notice',?6,1,0),(?1,?2,3,?7,'notice',?8,1,0),(?1,?2,2,?9,'notice',?10,1,0)",
+        (session.workspace_id.as_str(), session.session_id.as_str(), next_event_time_us(), r#"{"type":"notice","text":42}"#, next_event_time_us(), r#"{"type":"notice","text":{"content":"42"}}"#, next_event_time_us(), r#"{"type":"notice","text":["42"]}"#, next_event_time_us(), r#"{"type":"notice","text":"42"}"#),
+    ).await.unwrap();
+    // The matching old version must not survive this newer winner.
+    conn.execute(
+        "INSERT INTO session_entries (workspace_id,session_id,seq,event_time_us,entry_kind,payload,schema_version,is_error) VALUES (?1,?2,10,?3,'notice',?4,1,0),(?1,?2,10,?5,'notice',?6,1,0)",
+        (session.workspace_id.as_str(), session.session_id.as_str(), next_event_time_us(), r#"{"type":"notice","text":"Needle % _ \\ line\n☃"}"#, next_event_time_us(), r#"{"type":"notice","text":"replacement"}"#),
+    ).await.unwrap();
+    drop(conn);
+    let found = session
+        .query_history(&HistoryQuery {
+            workspace_id: Some(session.workspace_id.clone()),
+            session_id: Some(session.session_id.clone()),
+            query: Some(needle.into()),
+            after: None,
+            after_event_time: None,
+            offset: None,
+            exact_seq: None,
+            limit: 2,
+            default_search_window: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        found.iter().map(|entry| entry.seq).collect::<Vec<_>>(),
+        vec![6, 0]
+    );
+    let default_window = session
+        .query_history(&HistoryQuery {
+            workspace_id: Some(session.workspace_id.clone()),
+            session_id: Some(session.session_id.clone()),
+            query: Some(needle.into()),
+            after: None,
+            after_event_time: None,
+            offset: None,
+            exact_seq: None,
+            limit: 4,
+            default_search_window: true,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        default_window
+            .iter()
+            .map(|entry| entry.seq)
+            .collect::<Vec<_>>(),
+        vec![6, 0]
+    );
+    let cursor_page = session
+        .query_history(&HistoryQuery {
+            workspace_id: Some(session.workspace_id.clone()),
+            session_id: Some(session.session_id.clone()),
+            query: Some(needle.into()),
+            after: Some((session.workspace_id.clone(), session.session_id.clone(), 6)),
+            after_event_time: None,
+            offset: None,
+            exact_seq: None,
+            limit: 4,
+            default_search_window: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        cursor_page
+            .iter()
+            .map(|entry| entry.seq)
+            .collect::<Vec<_>>(),
+        vec![0]
+    );
+    let notices = session
+        .query_history(&HistoryQuery {
+            workspace_id: Some(session.workspace_id.clone()),
+            session_id: Some(session.session_id.clone()),
+            query: Some("42".into()),
+            after: None,
+            after_event_time: None,
+            offset: None,
+            exact_seq: None,
+            limit: 4,
+            default_search_window: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        notices.iter().map(|entry| entry.seq).collect::<Vec<_>>(),
+        vec![2]
+    );
+    let selected_bad = session
+        .query_history(&HistoryQuery {
+            workspace_id: Some(session.workspace_id.clone()),
+            session_id: Some(session.session_id.clone()),
+            query: None,
+            after: None,
+            after_event_time: None,
+            offset: None,
+            exact_seq: Some(9),
+            limit: 1,
+            default_search_window: false,
+        })
+        .await
+        .unwrap_err();
+    assert!(selected_bad.contains("cannot decode"));
+}
+
+#[tokio::test]
 async fn retry_different_payload_rejected_as_conflict() {
     let (_dir, session, _sid) = fresh_session().await;
     let old_entry: SessionEntry = Message::User {
