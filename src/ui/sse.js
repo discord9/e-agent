@@ -409,13 +409,15 @@ function splicePlan(historyEntries, snapshotEvents, history, snapshot, match) {
     }
   };
   for (let h=0; h<history.length; h++) {
-    const pair=pairsByHistory.get(h);
+    const pair=pairsByHistory.get(h), next=match && match.pairs.find((p) => p.h > h);
+    // The bounded truncated-prefix fallback keeps its one raw delta after the
+    // entire unmatched H prefix, immediately before its first exact user anchor.
+    const holdLeading = match && match.leadingAssistantPrefix && h < match.hStart && si === 0;
     if (pair) {
       while (si < pair.s) emitSnapshot(snapshot[si++]);
       // Pairs are monotonic, so this only skips the current matched anchor.
       si = pair.s + 1;
-    } else if (match) {
-      const next=match.pairs.find((p) => p.h > h);
+    } else if (match && !holdLeading) {
       // Extras after the last anchor belong before the following unpaired H
       // component (not after every H); without anchors, H remains before S.
       const limit=next ? next.s : snapshot.length;
@@ -429,6 +431,8 @@ function splicePlan(historyEntries, snapshotEvents, history, snapshot, match) {
 }
 function spliceAlignedRecords(historyEntries, snapshotEvents) {
   const history=normalizeHistoryForSplice(historyEntries), snapshot=normalizeSnapshotForSplice(snapshotEvents), candidates=[];
+  const isAssistantDeltaLane = (record) => Array.isArray(record.raw)
+    && record.raw.every((e) => /^(assistant_delta|assistantdelta)$/i.test(String(e.type || "")));
   for (let s=0;s<snapshot.length;s++) {
     const w=walkSplice(history,0,snapshot,s);
     if (w.pairs.length>=2 && w.endH===history.length) candidates.push({mode:"window",hStart:0,sStart:s,pairs:w.pairs});
@@ -445,7 +449,21 @@ function spliceAlignedRecords(historyEntries, snapshotEvents) {
     const key=candidate.pairs.map(p=>p.h+":"+p.s).join("|");
     if (!unique.some(item=>item.key===key)) unique.push({key,candidate});
   }
-  const match=unique.length===1?unique[0].candidate:null;
+  let match=unique.length===1?unique[0].candidate:null;
+  // One deliberately narrow recovery for a capped assistant-delta prefix:
+  // reuse the exact walker from an H user only; never compare suffix text.
+  if (unique.length === 0 && snapshot.length >= 3 && snapshot[0].kind === "assistant"
+      && isAssistantDeltaLane(snapshot[0]) && snapshot[1].kind === "user"
+      && snapshot.slice(1).every((r) => !isAssistantDeltaLane(r))) {
+    const fallback=[];
+    for (let h=0;h<history.length;h++) if (history[h].kind === "user" && spliceSame(history[h], snapshot[1])) {
+      const w=walkSplice(history,h,snapshot,1);
+      if (w.pairs.length >= 2 && w.pairs[0].h === h && w.pairs[0].s === 1 && w.endH === history.length)
+        fallback.push({mode:"truncated_prefix",hStart:h,sStart:1,pairs:w.pairs,leadingAssistantPrefix:true});
+    }
+    const keys=[...new Set(fallback.map((c) => c.pairs.map((p) => p.h+":"+p.s).join("|")))];
+    if (keys.length === 1) match=fallback[0];
+  }
   if (match) match.length = match.pairs.length;
   return {comparison:{history,snapshot},match,output:splicePlan(historyEntries,snapshotEvents,history,snapshot,match)};
 }

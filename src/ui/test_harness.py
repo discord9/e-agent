@@ -1020,13 +1020,37 @@ async function main(){
       [{type:"assistant_delta", data:"hello world"}]);
     chk("splice active sparse prefix remains unresolved and retained", !r.match && r.output.snapshot.extras.length === 1);
 
-    // Source-review counterexamples: record the conservative current outcome;
-    // this repair does not broaden matching or hide their snapshot data.
-    r = plan([{type:"message", message:{Assistant:{content:"hello world", tool_calls:[]}}},
+    // Bounded truncated assistant-delta prefix fallback: exact user and tail
+    // anchors prove only the tail; the prefix remains a visible raw extra.
+    const prefixH = [{type:"message", message:{Assistant:{content:"hello world", tool_calls:[]}}},
       {type:"message", message:{User:{content:"next"}}},
-      {type:"message", message:{Assistant:{content:"answer", tool_calls:[]}}}],
-      [{type:"assistant_delta",data:"world"},{type:"user_prompt",data:"next"},{type:"assistant_text",data:"answer"}]);
-    chk("source review truncated assistant prefix remains unmatched and visible", !r.match && r.output.snapshot.extras.length === 3);
+      {type:"message", message:{Assistant:{content:"answer", tool_calls:[]}}}];
+    const prefixS = [{type:"assistant_delta",data:"world"},{type:"user_prompt",data:"next"},{type:"assistant_text",data:"answer"}];
+    r = plan(prefixH, prefixS);
+    chk("splice truncated assistant prefix recovers exact user/answer tail", r.match && r.match.mode === "truncated_prefix"
+      && r.output.snapshot.matched.join(",") === "1,2" && r.output.snapshot.extras.join(",") === "0"
+      && componentSequence(r) === "H0:text|S0|H1:user|H2:text");
+    // Rich persisted reasoning is retained from H; a leading S reasoning lane
+    // is deliberately outside this assistant-delta-only fallback.
+    const richPrefixH = [{type:"message",message:{Assistant:{content:"hello world",reasoning:"rich",tool_calls:[]}}}, ...prefixH.slice(1)];
+    r = plan(richPrefixH, prefixS);
+    chk("splice rich H reasoning stays beside truncated-prefix extra", r.match && r.output.snapshot.extras.join(",") === "0"
+      && componentSequence(r) === "H0:reasoning|H0:text|S0|H1:user|H2:text");
+    r = plan(richPrefixH, [{type:"reasoning_delta",data:"partial"},...prefixS]);
+    chk("splice leading partial reasoning remains unmatched", !r.match && r.output.snapshot.extras.join(",") === "0,1,2,3");
+    r = plan([{type:"message",message:{Assistant:{content:"one",tool_calls:[]}}},{type:"message",message:{User:{content:"next"}}},{type:"message",message:{Assistant:{content:"answer",tool_calls:[]}}},
+      {type:"message",message:{User:{content:"next"}}},{type:"message",message:{Assistant:{content:"answer",tool_calls:[]}}}], prefixS);
+    chk("splice repeated H tail keeps a unique existing mapping", r.match && r.match.length === 2);
+    r = plan(prefixH.slice(1), [...prefixS, {type:"user_prompt",data:"next"},{type:"assistant_text",data:"answer"}]);
+    chk("splice repeated snapshot tail preserves existing ambiguity", !r.match && r.output.snapshot.extras.join(",") === "0,1,2,3,4");
+    const noPrefixFallback = (name, h, s) => { r = plan(h,s); chk(name, !r.match); };
+    noPrefixFallback("splice truncated prefix refuses single anchor", prefixH, [{type:"assistant_delta",data:"world"},{type:"user_prompt",data:"next"}]);
+    noPrefixFallback("splice truncated prefix refuses different answer", prefixH, [{type:"assistant_delta",data:"world"},{type:"user_prompt",data:"next"},{type:"assistant_text",data:"different"}]);
+    noPrefixFallback("splice truncated prefix refuses non-H-end tail", [...prefixH,{type:"message",message:{User:{content:"later"}}}], prefixS);
+    noPrefixFallback("splice truncated prefix refuses AssistantText start", prefixH, [{type:"assistant_text",data:"world"},{type:"user_prompt",data:"next"},{type:"assistant_text",data:"answer"}]);
+    noPrefixFallback("splice truncated prefix refuses nonleading delta", prefixH, [{type:"user_prompt",data:"next"},{type:"assistant_delta",data:"world"},{type:"assistant_text",data:"answer"}]);
+    noPrefixFallback("splice truncated prefix refuses separated delta lanes", prefixH, [{type:"assistant_delta",data:"world"},{type:"user_prompt",data:"next"},{type:"assistant_delta",data:"again"},{type:"assistant_text",data:"answer"}]);
+
     r = plan([{type:"message", message:{Assistant:{content:"answer",reasoning:"complete reasoning",tool_calls:[]}}},
       {type:"message", message:{User:{content:"next"}}},
       {type:"message", message:{Assistant:{content:"done",tool_calls:[]}}}],
