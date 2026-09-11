@@ -21,6 +21,9 @@ function setConn(stateName, text) {
 function stillCurrent(id, wsId, epoch) {
   return epoch === sessionOpenEpoch && state.workspace.id === wsId && state.sessionId === id;
 }
+function streamCurrent(id, wsId, epoch, ctrl) {
+  return stillCurrent(id, wsId, epoch) && (!ctrl || state.sse.ctrl === ctrl);
+}
 
 /* 会话已知状态：区分 SSE 404 的两种含义（历史无流 vs 真不存在）。
    /api/sessions/<id>/events 只服务 live 会话；历史/已结束会话保持 404
@@ -105,6 +108,8 @@ function connectSSE(id, wsId, epoch) {
     },
     signal: ctrl.signal,
   }).then((res) => {
+    // Authentication/EOF/error from a replaced connection is not authoritative.
+    if (!streamCurrent(id, wsId, epoch, ctrl)) return;
     if (res.status === 401 || res.status === 403) {
       setBanner("⚠ 认证失败：请检查 Token。");
       throw new Error("auth");
@@ -169,7 +174,7 @@ function connectSSE(id, wsId, epoch) {
     }
     if (!res.ok || !res.body) throw new Error("HTTP " + res.status);
     // 响应回来时上下文可能已被取代（新打开/切换）：不起流、不画连接状态
-    if (!stillCurrent(id, wsId, epoch)) { try { ctrl.abort(); } catch (e) { /* 忽略 */ } return; }
+    if (!streamCurrent(id, wsId, epoch, ctrl)) { try { ctrl.abort(); } catch (e) { /* 忽略 */ } return; }
     setConn("ok", "● 已连接");
     // 深链 attempt 已完成（live 流建立）：清标记
     state.deepLink.probing = false;
@@ -177,15 +182,17 @@ function connectSSE(id, wsId, epoch) {
     return readSSEStream(res.body.getReader(), id, wsId, epoch, ctrl);
   }).then(() => {
     // 正常结束（后端关闭流）→ 按断线处理
+    if (!streamCurrent(id, wsId, epoch, ctrl)) return;
     throw new Error("stream end");
   }).catch((err) => {
+    if (!streamCurrent(id, wsId, epoch, ctrl)) return;
     if (err && err.name === "AbortError") return;   // 主动停止
     if (state.sse.stopped) return;
     if (err && (err.message === "auth" || err.message === "gone" || err.message === "silent-gone")) {
       state.sse.stopped = true;   // 认证失败 / 会话不存在 / 历史无流：都不重连（404 重连也 404）
       return;
     }
-    scheduleReconnect(id, wsId, epoch);   // 携带断线流的三元组：重连前必须仍是同一上下文
+    if (state.sse.ctrl === ctrl) scheduleReconnect(id, wsId, epoch); // stale connection cannot reopen a newer stream
   });
 }
 
@@ -196,16 +203,16 @@ async function readSSEStream(reader, id, wsId, epoch, ctrl) {
   const decoder = new TextDecoder();
   let buf = "";
   for (;;) {
-    if (!stillCurrent(id, wsId, epoch)) { try { ctrl && ctrl.abort(); } catch (e) { /* 忽略 */ } return; }
+    if (!streamCurrent(id, wsId, epoch, ctrl)) { try { ctrl && ctrl.abort(); } catch (e) { /* 忽略 */ } return; }
     const { done, value } = await reader.read();
     if (done) break;
-    if (!stillCurrent(id, wsId, epoch)) { try { ctrl && ctrl.abort(); } catch (e) { /* 忽略 */ } return; }
+    if (!streamCurrent(id, wsId, epoch, ctrl)) { try { ctrl && ctrl.abort(); } catch (e) { /* 忽略 */ } return; }
     buf += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
     let idx;
     while ((idx = buf.indexOf("\n\n")) !== -1) {
       const block = buf.slice(0, idx);
       buf = buf.slice(idx + 2);
-      handleSSEBlock(block, id, wsId, epoch);
+      await handleSSEBlock(block, id, wsId, epoch, ctrl);
     }
   }
 }
@@ -245,6 +252,223 @@ function restoreUsageFromSnapshot(events) {
   }
 }
 
+/* Pure phase-1 ordered H/S matcher.  It returns raw entry/event references and
+   part-level placement only; it deliberately owns no DOM, cache, or lifecycle. */
+function spliceRecord(source, index, kind, raw, fields) {
+  return Object.assign({ source, index, kind, raw, indices: [index] }, fields || {});
+}
+function eventText(data, keys) { return pickText(data, keys); }
+function normalizeHistoryForSplice(entries) {
+  const out = [], pending = new Map(), order = [];
+  const call = (c) => spliceRecord("history", c.index, "tool_call", c.raw,
+    { part: "call:" + c.callIndex, owner: c.id, name: c.name, arguments: c.arguments });
+  const flush = () => { for (const id of order.splice(0)) { const c = pending.get(id); pending.delete(id); if (c) out.push(call(c)); } };
+  for (let index = 0; index < (entries || []).length; index++) {
+    const raw = entries[index]; if (!raw) continue;
+    if (raw.type !== "message") {
+      flush(); out.push(spliceRecord("history", index, raw.type || "unknown", raw, { part: raw.type || "unknown", text: raw.text || raw.summary || JSON.stringify(raw) })); continue;
+    }
+    const m = raw.message || {};
+    if (m.User) { flush(); out.push(spliceRecord("history", index, "user", raw, { part:"user", text:m.User.content || "" })); }
+    else if (m.System) { flush(); out.push(spliceRecord("history", index, "system", raw, { part:"system", text:m.System.content || "" })); }
+    else if (m.Assistant) {
+      flush(); const a = m.Assistant, calls = a.tool_calls || [];
+      if (a.reasoning != null) out.push(spliceRecord("history", index, "reasoning", raw,
+        { part:"reasoning", text:a.reasoning, sparse:true }));
+      if (a.content != null && (a.content !== "" || !calls.length)) out.push(spliceRecord("history", index,
+        "assistant", raw, { part:"text", text:a.content }));
+      // "empty" is a renderer placeholder for an Assistant with no content,
+      // reasoning, or calls. It has no snapshot counterpart and is not match evidence.
+      if (a.content == null && a.reasoning == null && !calls.length) out.push(spliceRecord("history", index,
+        "assistant_empty", raw, { part:"empty", placeholder:true }));
+      for (let callIndex = 0; callIndex < calls.length; callIndex++) {
+        const c = calls[callIndex], args = typeof c.arguments === "string" ? c.arguments : JSON.stringify(c.arguments || {});
+        pending.set(c.id, { id:c.id, index, raw, callIndex, name:c.name || "", arguments:args }); order.push(c.id);
+      }
+    } else if (m.Tool) {
+      const t = m.Tool, c = pending.get(t.call_id);
+      if (c) { pending.delete(t.call_id); order.splice(order.indexOf(t.call_id), 1); out.push(call(c)); }
+      out.push(spliceRecord("history", index, "tool_result", raw, { part:"result", owner:t.call_id || "", content:t.content || "", isError:t.is_error === true }));
+    } else { flush(); out.push(spliceRecord("history", index, "message_unknown", raw, { part:"unknown", text:JSON.stringify(m) })); }
+  }
+  flush(); return out;
+}
+function normalizeSnapshotForSplice(events) {
+  const out = []; let lane = "", text = "", raw = [], indices = [];
+  const flush = () => { if (lane) out.push(Object.assign(spliceRecord("snapshot", indices[0], lane, raw.slice(), { part:lane, text }), { indices:indices.slice() })); lane=""; text=""; raw=[]; indices=[]; };
+  for (let index = 0; index < (events || []).length; index++) {
+    const event = events[index] || {}, type = String(event.type || "").toLowerCase(), data = event.data !== undefined ? event.data : event;
+    const next = type === "assistant_delta" || type === "assistantdelta" ? "assistant" : type === "reasoning_delta" || type === "reasoningdelta" ? "reasoning" : "";
+    if (next) { if (lane && lane !== next) flush(); if (!lane) lane=next; text += eventText(data,["delta","text","content","reasoning"]); raw.push(event); indices.push(index); continue; }
+    flush();
+    if (type === "assistant_text" || type === "assistanttext") out.push(spliceRecord("snapshot", index, "assistant", event, { part:"text", text:eventText(data,["text","content"]) }));
+    else if (type === "user_prompt" || type === "userprompt") out.push(spliceRecord("snapshot", index, "user", event, { part:"user", text:eventText(data,["text","prompt","content"]) }));
+    else if (type === "tool_call" || type === "toolcall") { const p=data && typeof data === "object" ? data : {}; out.push(spliceRecord("snapshot",index,"tool_call",event,{part:"call",name:eventText(p,["name"]),arguments:typeof p.arguments === "string" ? p.arguments : JSON.stringify(p.arguments || {})})); }
+    else if (type === "tool_result" || type === "toolresult") { const p=data && typeof data === "object" ? data : {}; out.push(spliceRecord("snapshot",index,"tool_result",event,{part:"result",owner:p.call_id || "",content:eventText(p,["content","text","result","error"]),isError:p.is_error === true || p.error === true})); }
+    else if (type === "usage") out.push(spliceRecord("snapshot",index,"usage",event,{part:"usage",neutral:true}));
+    else if (type === "notice") out.push(spliceRecord("snapshot",index,"notice",event,{part:"notice",text:eventText(data,["text","message"]),display:true}));
+    else if (type === "error") out.push(spliceRecord("snapshot",index,"error",event,{part:"error",text:eventText(data,["error","message","text"])}));
+    else out.push(spliceRecord("snapshot",index,type || "unknown",event,{part:type || "unknown",text:JSON.stringify(data)}));
+  }
+  flush(); return out;
+}
+function spliceSame(h, s) {
+  if (!h || !s || h.kind !== s.kind) return false;
+  if (h.kind === "tool_call") return h.name === s.name && h.arguments === s.arguments;
+  if (h.kind === "tool_result") return h.isError === s.isError && h.content === s.content;
+  return h.text === s.text;
+}
+function sparseCallCanOmit(history, h, snapshot, s) {
+  if (history[h].kind !== "tool_call" || snapshot[s].kind !== "tool_result") return false;
+  for (let i=h+1; i<history.length; i++) {
+    if (history[i].kind === "tool_call") continue;
+    return history[i].kind === "tool_result" && spliceSame(history[i], snapshot[s]);
+  }
+  return false;
+}
+/* One walker: exact substantive pairs; Usage is neutral; missing H reasoning and
+   calls are sparse only under the documented conditions; only notice may gap two
+   established anchors.  Error/U/tool/content mismatches stop the candidate. */
+function walkSplice(history, startH, snapshot, startS) {
+  let h = startH, s = startS, pairs = [];
+  while (h < history.length) {
+    while (s < snapshot.length && snapshot[s].neutral) s++;
+    if (s >= snapshot.length) break;
+
+    // Placeholder-only assistant records render from H but deliberately carry
+    // no S matching evidence, so they do not require an empty S counterpart.
+    if (history[h].placeholder) {
+      h++;
+      continue;
+    }
+    if (history[h].kind === "reasoning" && snapshot[s].kind !== "reasoning") {
+      h++;
+      continue;
+    }
+    // A differing S reasoning lane is display data, not evidence for H's rich
+    // reasoning. Retain it as an extra and resume at the following H part.
+    if (history[h].kind === "reasoning" && snapshot[s].kind === "reasoning"
+        && !spliceSame(history[h], snapshot[s])) {
+      h++;
+      s++;
+      continue;
+    }
+    if (history[h].kind === "tool_call" && sparseCallCanOmit(history, h, snapshot, s)) {
+      h++;
+      continue;
+    }
+    if (spliceSame(history[h], snapshot[s])) {
+      pairs.push({h:h++, s:s++});
+      continue;
+    }
+    // Notices, and an ownerless result between two matched calls, are retained
+    // as S extras rather than ending an otherwise anchored comparison. A call
+    // is still not omitted: the later S call must itself match this H call.
+    const canGap = (record) => record.display
+      || (history[h].kind === "tool_call" && record.kind === "tool_result");
+    if (pairs.length && canGap(snapshot[s])) {
+      let next = s;
+      while (next < snapshot.length && canGap(snapshot[next])) next++;
+      if (next < snapshot.length && spliceSame(history[h], snapshot[next])) {
+        s = next;
+        continue;
+      }
+    }
+    break;
+  }
+  return { pairs, endH:h, endS:s };
+}
+function splicePlan(historyEntries, snapshotEvents, history, snapshot, match) {
+  const matched=new Set(), uiOnly=new Set(), pairsByHistory=new Map();
+  for (const s of snapshot) for (const i of s.indices) if (s.neutral) uiOnly.add(i);
+  if (match) for (const pair of match.pairs) {
+    pairsByHistory.set(pair.h, pair);
+    for (const i of snapshot[pair.s].indices) matched.add(i);
+  }
+  const extras=[];
+  for (let i=0;i<snapshotEvents.length;i++) if (!matched.has(i) && !uiOnly.has(i)) extras.push(i);
+
+  // Matched S records are anchors, never output.  Advance S only toward the
+  // next anchor: unmatched records stay between the surrounding H components,
+  // and an H component without a pair cannot consume a later matched S record.
+  const components=[]; let si=0;
+  const emitSnapshot = (record) => {
+    for (const index of record.indices) {
+      if (!matched.has(index) && !uiOnly.has(index)) {
+        const previous = components[components.length - 1];
+        // An ownerless snapshot result is eligible for a card only when this
+        // already-ordered plan places it directly after its H call component.
+        // A completed H result, assistant, or any S component proves nothing.
+        const owner = record.kind === "tool_result" && !record.owner
+          // Adjacency alone is not ownership: the preceding H call must itself
+          // be an exact H/S match anchor in this splice plan.
+          && previous && previous.source === "history" && previous.matched
+          && String(previous.part || "").startsWith("call:") ? previous.owner : "";
+        components.push({source:"snapshot",index,raw:snapshotEvents[index],owner});
+      }
+    }
+  };
+  for (let h=0; h<history.length; h++) {
+    const pair=pairsByHistory.get(h), next=match && match.pairs.find((p) => p.h > h);
+    // The bounded truncated-prefix fallback keeps its one raw delta after the
+    // entire unmatched H prefix, immediately before its first exact user anchor.
+    const holdLeading = match && match.leadingAssistantPrefix && h < match.hStart && si === 0;
+    if (pair) {
+      while (si < pair.s) emitSnapshot(snapshot[si++]);
+      // Pairs are monotonic, so this only skips the current matched anchor.
+      si = pair.s + 1;
+    } else if (match && !holdLeading) {
+      // Extras after the last anchor belong before the following unpaired H
+      // component (not after every H); without anchors, H remains before S.
+      const limit=next ? next.s : snapshot.length;
+      while (si < limit) emitSnapshot(snapshot[si++]);
+    }
+    components.push({source:"history",entry:history[h].index,part:history[h].part,
+      raw:history[h].raw,owner:history[h].owner || "",matched:pairsByHistory.has(h)});
+  }
+  while (si < snapshot.length) emitSnapshot(snapshot[si++]);
+  return { history:{entries:historyEntries.slice(), execution:history.filter(r=>r.kind==="tool_call"||r.kind==="tool_result").map(r=>({kind:r.kind,entry:r.index,part:r.part,owner:r.owner||""}))}, snapshot:{events:snapshotEvents.slice(),matched:[...matched],extras,uiOnly:[...uiOnly]}, components };
+}
+function spliceAlignedRecords(historyEntries, snapshotEvents) {
+  const history=normalizeHistoryForSplice(historyEntries), snapshot=normalizeSnapshotForSplice(snapshotEvents), candidates=[];
+  const isAssistantDeltaLane = (record) => Array.isArray(record.raw)
+    && record.raw.every((e) => /^(assistant_delta|assistantdelta)$/i.test(String(e.type || "")));
+  for (let s=0;s<snapshot.length;s++) {
+    const w=walkSplice(history,0,snapshot,s);
+    if (w.pairs.length>=2 && w.endH===history.length) candidates.push({mode:"window",hStart:0,sStart:s,pairs:w.pairs});
+  }
+  for (let h=0;h<history.length;h++) {
+    const w=walkSplice(history,h,snapshot,0);
+    if (w.pairs.length>=2 && w.endH===history.length) candidates.push({mode:"suffix",hStart:h,sStart:0,pairs:w.pairs});
+  }
+  const max=candidates.reduce((n,c)=>Math.max(n,c.pairs.length),0);
+  const best=candidates.filter(c=>c.pairs.length===max), windows=best.filter(c=>c.mode==="window");
+  const chosen=windows.length?windows:best;
+  const unique=[];
+  for (const candidate of chosen) {
+    const key=candidate.pairs.map(p=>p.h+":"+p.s).join("|");
+    if (!unique.some(item=>item.key===key)) unique.push({key,candidate});
+  }
+  let match=unique.length===1?unique[0].candidate:null;
+  // One deliberately narrow recovery for a capped assistant-delta prefix:
+  // reuse the exact walker from an H user only; never compare suffix text.
+  if (unique.length === 0 && snapshot.length >= 3 && snapshot[0].kind === "assistant"
+      && isAssistantDeltaLane(snapshot[0]) && snapshot[1].kind === "user"
+      && snapshot.slice(1).every((r) => !isAssistantDeltaLane(r))) {
+    const fallback=[];
+    for (let h=0;h<history.length;h++) if (history[h].kind === "user" && spliceSame(history[h], snapshot[1])) {
+      const w=walkSplice(history,h,snapshot,1);
+      if (w.pairs.length >= 2 && w.pairs[0].h === h && w.pairs[0].s === 1 && w.endH === history.length)
+        fallback.push({mode:"truncated_prefix",hStart:h,sStart:1,pairs:w.pairs,leadingAssistantPrefix:true});
+    }
+    const keys=[...new Set(fallback.map((c) => c.pairs.map((p) => p.h+":"+p.s).join("|")))];
+    if (keys.length === 1) match=fallback[0];
+  }
+  if (match) match.length = match.pairs.length;
+  return {comparison:{history,snapshot},match,output:splicePlan(historyEntries,snapshotEvents,history,snapshot,match)};
+}
+function spliceHistorySnapshot(historyEntries,snapshotEvents) { return spliceAlignedRecords(historyEntries||[],snapshotEvents||[]); }
+
 /* 初始 snapshot 只补回缓存视图中仍在流式的助手尾巴。history 是已完成
    transcript 的权威来源；snapshot 的完整事件尾部则只用于把当前 in-flight
    accumulator 从切走前的缓存前缀接到最新位置，不能整体重放（snapshot 有界）。 */
@@ -265,14 +489,15 @@ function snapshotAssistantDeltaTail(events) {
 
 function cachedInFlightAssistantText(id) {
   const cached = state.sessionStates[state.workspace.id + ":" + id];
-  if (!cached || typeof cached.html !== "string") return "";
+  if (!cached) return "";
+  if (typeof cached.inFlightText === "string") return cached.inFlightText;
+  // Compatibility with a pre-node-cache entry kept only for this page lifetime.
+  if (typeof cached.html !== "string") return "";
   const holder = document.createElement("div");
   holder.innerHTML = cached.html;
   const assistants = holder.querySelectorAll(".msg-assistant");
   const last = assistants[assistants.length - 1];
   const body = last && last.querySelector(".msg-body");
-  // A plain body is the same in-flight marker used by reattachInFlight;
-  // completed AssistantText history has markdown child elements.
   return body && !body.querySelector("*") ? body.textContent : "";
 }
 
@@ -310,8 +535,8 @@ function reconcileSnapshotAssistantTail(entries, id) {
 
 /* 解析单个 SSE 事件块：任何分支（snapshot/status/resync/live）动手改 UI 前
    必须通过三重校验——陈旧流的块整块丢弃，绝不画进当前会话/workspace。 */
-function handleSSEBlock(block, id, wsId, epoch) {
-  if (!stillCurrent(id, wsId, epoch)) return;
+async function handleSSEBlock(block, id, wsId, epoch, ctrl) {
+  if (!streamCurrent(id, wsId, epoch, ctrl)) return;
   let eventName = "message";
   const dataLines = [];
   for (const line of block.split("\n")) {
@@ -333,18 +558,21 @@ function handleSSEBlock(block, id, wsId, epoch) {
       // 模型请求的 context_input/context_window），不等下一次模型调用；
       // 复用 applyUsage 路径（state.lastUsage + renderUsageLine）。
       restoreUsageFromSnapshot(entries);
-      // history/restored 已经拥有权威的持久化 DOM；只把缓存中仍在途的
-      // assistant delta 尾巴接回来。普通首开没有缓存前缀，因此不会重放
-      // snapshot，也不会产生重复助手块。
-      if (state.initSource === "history" || state.initSource === "restored") {
-        reconcileSnapshotAssistantTail(entries, id);
-      }
-      // 已用 history 渲染过则跳过（避免重复）；恢复的会话（initSource="restored"，
-      // 视图来自缓存）也跳过——缓存内容与 snapshot 等价，重放会造成重复；
-      // history 加载失败时仍作为兜底
-      if (state.initSource !== "history" && state.initSource !== "restored") {
-        renderHistory(entries);
+      // H is fetched first.  Merge its rich components with the snapshot in
+      // one render pass: matched snapshot prefix is covered by H, while only
+      // unmatched snapshot parts (including the active tail) are replayed.
+      // A failed history request has no H and therefore cleanly falls back to
+      // the same path with every snapshot event retained.
+      if (state.historyEntries) {
+        renderMergedHistorySnapshot(state.historyEntries, entries);
         state.initSource = "snapshot";
+      } else if (state.initSource !== "history" && state.initSource !== "restored") {
+        renderMergedHistorySnapshot([], entries);
+        state.initSource = "snapshot";
+      } else {
+        // Old/empty history fixtures have no merge input.  Preserve the
+        // already-rendered cache/history instead of replaying an unanchored S.
+        reconcileSnapshotAssistantTail(entries, id);
       }
       // GoalBar：snapshot 里最新的 goal_updated（set 或 clear 墓碑）折叠
       // 出来刷新 GoalBar——history 失败走 snapshot 兜底时 GET /goal 可能
@@ -370,53 +598,18 @@ function handleSSEBlock(block, id, wsId, epoch) {
   }
   if (id !== state.sessionId) return;  // 已切换会话
   if (eventName === "resync") {
-    // Lag 追平：后端重发完整事件日志（AgentEvent 数组，{type,data} 形状）。
-    // 与 snapshot 不同，无论初始渲染来源都强制整体替换 transcript。
-    // 渲染到离屏容器，成功才一次性替换；失败回滚旧内容。避免「先清空再
-    // 重放」在手机上（可上千条事件）造成消息区空白、像消息消失一样。
-    const real = els.messages;
-    const backup = real.innerHTML;
-    const temp = real.cloneNode(false);   // 同 class/id，无子节点
-    temp.innerHTML = "";
-    els.messages = temp;
-    state.acc = newAccumulator();
-    // 排队提示是「当下」状态，重放的是过去事件：清空 queueBar 并跳过重放
-    state.queue.length = 0;
-    renderQueueBar();
-    const NAME = {
-      prompt_queued: "PromptQueued", prompt_consumed: "PromptConsumed",
-      user_prompt: "UserPrompt", assistant_text: "AssistantText",
-      assistant_delta: "AssistantDelta", reasoning_delta: "ReasoningDelta",
-      tool_call: "ToolCall", tool_result: "ToolResult",
-      notice: "Notice", error: "Error",
-      background_completed: "BackgroundCompleted",
-      background_completion_notice: "BackgroundCompletionNotice",
-      goal_updated: "GoalUpdated",   // set 与 clear（goal:null）都刷新 GoalBar
-      usage: "Usage",
-    };
+    // A resync log is not itself a replacement transcript.  Fetch its matching
+    // current H tail first, then use the exact same splice commit as snapshot.
+    // Until that H validates, leave nodes, accumulator, and paging cursor alone.
+    let events;
     try {
       const parsed = JSON.parse(data);
-      const events = Array.isArray(parsed) ? parsed : (parsed.events || []);
-      for (const ev of events) {
-        const name = (ev && NAME[ev.type]) || "Notice";
-        // 已过去的排队事件：不重放（它们不该出现在 queueBar；已在上方清空）
-        if (name === "PromptQueued" || name === "PromptConsumed") continue;
-        const payload = (ev && ev.data !== undefined) ? ev.data : (ev || {});
-        applyLiveEvent(name, payload);
-      }
-      real.innerHTML = temp.innerHTML;
-      els.messages = real;
-      // innerHTML 会在 real 下创建全新的节点；重放时 acc 绑定的是离屏 temp
-      // 的旧节点，不能让后续 delta 继续写入孤儿 DOM。
-      state.acc = newAccumulator();
-      state.initSource = "snapshot";
+      events = Array.isArray(parsed) ? parsed : (parsed.events || []);
     } catch (e) {
-      els.messages = real;
-      real.innerHTML = backup;
-      // 回滚同样通过 innerHTML 重建节点，不能保留离屏重放期间的引用。
-      state.acc = newAccumulator();
       appendNotice("⚠ 会话同步失败，已保留原内容");
+      return;
     }
+    await mergeResyncHistory(events, id, wsId, epoch, ctrl);
     return;
   }
   if (state.initSource === null) return;   // 初始渲染未完成前的 live 事件丢弃
@@ -430,6 +623,33 @@ function handleSSEBlock(block, id, wsId, epoch) {
     });
   }
   applyLiveEvent(eventName, payload);
+}
+
+/* Resync needs a fresh H tail: the locally cached tail can be behind the S log
+   and would retain obsolete prefix nodes.  This is deliberately one fetch and
+   one merged DOM commit; it neither replays queue operations nor mutates paging
+   until the response has passed every active-stream guard. */
+async function mergeResyncHistory(events, id, wsId, epoch, ctrl) {
+  const ws = state.workspaces.find((w) => w.id === wsId) || state.workspace;
+  try {
+    const res = await apiFor(ws, "/api/sessions/" + encodeURIComponent(id)
+      + "/history?limit=" + HISTORY_PAGE);
+    if (!streamCurrent(id, wsId, epoch, ctrl)) return;
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    if (!streamCurrent(id, wsId, epoch, ctrl)) return;
+    const history = Array.isArray(data) ? data : (data.entries || []);
+    const next = data.next_before_seq !== undefined ? data.next_before_seq : null;
+    renderMergedHistorySnapshot(history, events);
+    // Commit pagination only with the corresponding successful replacement.
+    state.historyEntries = history;
+    state.nextBeforeSeq = next;
+    state.olderDone = next === null;
+    state.initSource = "snapshot";
+  } catch (e) {
+    if (!streamCurrent(id, wsId, epoch, ctrl)) return;
+    appendNotice("⚠ 会话同步失败，已保留原内容");
+  }
 }
 
 /* live AgentEvent → 增量渲染 */

@@ -415,6 +415,19 @@ function deepLinkTimeoutFor(epoch) {
     ? DEEP_LINK_HISTORY_TIMEOUT_MS : undefined;
 }
 
+function restoredInflightNodes(acc) {
+  if (!acc) return [];
+  // History text is not a stable identity: an earlier completed turn may have
+  // exactly the same content/reasoning as the current unpersisted tail. Keep
+  // every unresolved restored root provisionally; the existing H/S splice is
+  // the only authority that later resolves duplicate transcript projection.
+  const nodes = [];
+  if (acc.thinkingEl) nodes.push(acc.thinkingEl);
+  if (acc.assistantEl) nodes.push(acc.assistantEl);
+  for (const item of acc.toolStack || []) if (!item.filled && item.el) nodes.push(item.el);
+  return [...new Set(nodes)];
+}
+
 async function loadHistory(id, wsId, epoch, timeoutMs) {
   const ws = state.workspaces.find((w) => w.id === wsId) || state.workspace;
   try {
@@ -453,30 +466,29 @@ async function loadHistory(id, wsId, epoch, timeoutMs) {
     const data = await res.json();
     if (epoch !== sessionOpenEpoch || state.workspace.id !== wsId || state.sessionId !== id) return "stale";
     const entries = Array.isArray(data) ? data : (data.entries || []);
+    state.historyEntries = entries;
     state.nextBeforeSeq = (data.next_before_seq !== undefined ? data.next_before_seq : null);
     state.olderDone = (state.nextBeforeSeq === null);
+    // History is independently authoritative and must be readable even while
+    // SSE is pending, errors, sends only comments, or closes before snapshot.
+    // A later snapshot reconciles this projection through the existing H/S
+    // splice path. Explicitly retained unpersisted in-flight roots stay live
+    // until that reconciliation, rather than being silently discarded.
     if (state.initSource !== "snapshot") {
-      if (state.initSource === "restored") {
-        // 缓存的视图可能过期（切走期间会话有新消息）：用最新尾部替换，
-        // 而不是追加（追加会与缓存内容重复）。缓存里的进行中增量块
-        // （thinking/assistant/tool 卡片——未落盘只活在内存/SSE 增量里，
-        // history 里没有它们）也一律不重挂：fresh 尾部已渲染已落盘的版本，
-        // live 续写靠重新连接的 SSE。重挂只会把切走瞬间还在执行的旧卡片
-        // 无条件 append 到消息区最底部——很久以前的 bash 命令突然出现在
-        // 最新位置，甚至与尾部历史重复；且该卡永不折叠（pruneMessages
-        // 跳过 in-flight）而永久残留。保留滚动位置（距底部偏移）。
-        const offset = els.messages.scrollHeight - els.messages.scrollTop - els.messages.clientHeight;
-        state.acc.toolStack = [];   // 防重：替换后 reattachInFlight 重新收集
-        renderHistory(entries);     // 清空 + 渲染最新尾部
-        reattachInFlight(state.acc);   // 按渲染后的 DOM 现状重绑进行中块（若
-                                       // 尾部自身含未完成条目），增量续写不中断
-        if (offset > 4) {
-          els.messages.scrollTop = els.messages.scrollHeight - offset - els.messages.clientHeight;
-          userScrolled = true;
-          els.jumpBottomBtn.hidden = false;
-        }
+      const inflight = state.initSource === "restored" ? restoredInflightNodes(state.acc) : [];
+      const messages = els.messages;
+      const offset = messages.scrollHeight - messages.scrollTop - messages.clientHeight;
+      const wasFollowing = offset <= 4;
+      renderHistory(entries);
+      for (const node of inflight) messages.appendChild(node);
+      reattachInFlight(state.acc, inflight);
+      if (!wasFollowing) {
+        messages.scrollTop = Math.max(0, messages.scrollHeight - messages.clientHeight - offset);
+        userScrolled = true;
+        els.jumpBottomBtn.hidden = false;
       } else {
-        renderHistory(entries);
+        userScrolled = false;
+        scrollBottom(true);
       }
       state.initSource = "history";
     }
@@ -487,6 +499,7 @@ async function loadHistory(id, wsId, epoch, timeoutMs) {
     if (!state.acc || !els.messages.children.length) {
       setBanner("⚠ 加载历史失败：" + e.message + "（等待 SSE 快照…）", true);
     }
+    state.historyEntries = null;
     return "fail";
   }
 }
@@ -695,9 +708,20 @@ function saveSessionState() {
   if (state.waitingInput) {
     state.waitingDrafts[waitingDraftKey(state.waitingInput.callId)] = els.promptInput.value;
   }
+  const scrollTop = els.messages.scrollTop;
+  const cacheHost = document.createElement("div");
+  while (els.messages.firstChild) cacheHost.appendChild(els.messages.firstChild);
+  const lastAssistant = cacheHost.querySelectorAll(".msg-assistant");
+  const lastBody = lastAssistant.length && lastAssistant[lastAssistant.length - 1].querySelector(".msg-body");
   state.sessionStates[state.workspace.id + ":" + state.sessionId] = {
-    html: els.messages.innerHTML,
-    scrollTop: els.messages.scrollTop,
+    nodes: cacheHost,
+    // Legacy serialization remains only for old in-memory harness/cache consumers;
+    // restore uses nodes and never recreates their live references.
+    html: cacheHost.innerHTML,
+    // Keep the active plain-text prefix separately: restoring moves the nodes
+    // back into the real DOM before snapshot reconciliation.
+    inFlightText: lastBody && !lastBody.querySelector("*") ? lastBody.textContent : "",
+    scrollTop,
     nextBeforeSeq: state.nextBeforeSeq,
     olderDone: state.olderDone,
     // The answer draft is call-bound above; the ordinary composer draft stays separate.
@@ -752,11 +776,17 @@ function openSession(id, onReady, epoch, timeoutMs) {
     // 切走期间会话可能继续产生消息（缓存已过期），必须用最新 history
     // 替换渲染，否则那些消息（snapshot 也被跳过）永远不会显示。
     state.initSource = "restored";
+    state.historyEntries = null;
     state.nextBeforeSeq = cached.nextBeforeSeq;
     state.loadingOlder = false;
     state.olderDone = cached.olderDone;
     state.acc = newAccumulator();
-    els.messages.innerHTML = cached.html;
+    if (cached.nodes) {
+      while (cached.nodes.firstChild) els.messages.appendChild(cached.nodes.firstChild);
+    } else {
+      // Compatibility with an in-memory cache created before DOM-node caching.
+      els.messages.innerHTML = cached.html || "";
+    }
     reattachInFlight(state.acc);   // 重新绑定缓存里「进行中」的思考/助手/工具卡片，
                                    // 使增量续写而不是新建（防止重复出现多个块）
     pruneMessages();               // 缓存快照也可能超上限（功能上线前的旧快照）：维持有界
@@ -773,6 +803,7 @@ function openSession(id, onReady, epoch, timeoutMs) {
   } else {
     // 首次打开：走既有流程（加载历史 + SSE）
     state.initSource = null;
+    state.historyEntries = null;
     state.nextBeforeSeq = null;
     state.loadingOlder = false;
     state.olderDone = false;

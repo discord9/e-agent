@@ -18,16 +18,19 @@ js = "\n".join(open(os.path.join(HERE, f), encoding='utf-8').read() for f in JS_
 vendor_js = open(os.path.join(HERE, 'vendor', 'marked.min.js'), encoding='utf-8').read()
 usage_dashboard_js = open(os.path.join(HERE, 'usage-dashboard.js'), encoding='utf-8').read()
 
-MODE = os.environ.get('MODE', 'open')   # 'open' = full suite; 'markdown' = focused DOM-safety/rendering checks; 'composer-history' = focused ArrowUp checks
+MODE = os.environ.get('MODE', 'open')   # 'open' = full suite; 'splice' = pure H/S matching checks
 DEEP_LINK = os.environ.get('DEEP_LINK', '')
 CROSS_PAYLOAD = os.environ.get('CROSS_PAYLOAD', '')   # 注入 ?session=<id> 到 location.search（init 启动时解析）
 TRACE = os.environ.get('TRACE') == '1'
+# Bounded external timeout must still retain GJS console output while diagnosing
+# an async harness boundary; normal runs keep captured summary handling below.
+RAW_GJS = os.environ.get('RAW_GJS') == '1'
 # gjs 内置 TextDecoder 不可覆盖且不支持 stream 选项；页面 JS 里的 new TextDecoder() 换成桩工厂。
 # 注意：拆分后 tasks.js（startTaskStream）在 sse.js 之前拼接，无缩进的搜索串会先命中
 # startTaskStream 里的同名行；这里带 2 空格缩进精确匹配 readSSEStream（唯一 2 空格缩进的
 # 那处），保持与拆分前一致的注入目标（startTaskStream 的 TextDecoder 在 harness 中从不执行）。
 js = js.replace('  const decoder = new TextDecoder();', '  const decoder = makeTextDecoder();')
-if MODE == 'fragment': js = js.replace('init();\n', 'if (!globalThis.__fragmentHarness) init();\n')
+if MODE in ('fragment', 'splice'): js = js.replace('init();\n', 'if (!globalThis.__fragmentHarness) init();\n')
 if TRACE:
     js = js.replace('async function readSSEStream(reader, id, wsId, epoch, ctrl) {',
         'async function readSSEStream(reader, id) {\n  console.log("SSE: stream start");')
@@ -44,7 +47,6 @@ if TRACE:
         'console.log("SSE: response ok");\n    setConn("ok", "● 已连接");')
     js = js.replace('if (!res.ok || !res.body) throw new Error("HTTP " + res.status);',
         'if (!res.ok || !res.body) throw new Error("HTTP " + res.status);\n    console.log("SSE: body ok, has getReader:", typeof res.body.getReader);')
-
 HARNESS = r'''
 /* 极简 HTML 序列化/解析：让 innerHTML 读-写往返与真实浏览器行为一致
    （restored 分支的缓存恢复、resync 的离屏容器替换都依赖 innerHTML）。 */
@@ -183,7 +185,13 @@ class El {
   set innerHTML(v){ /* 与真实 DOM 一致：替换会断开旧子节点（isConnected → false） */
     for (const c of this._children) { if (c instanceof El) c._parent = null; }
     if(String(v)==="") { this._children=[]; this._innerHTML=""; }
-    else { this._children = parseHtml(v); this._innerHTML=""; } }
+    else {
+      this._children = parseHtml(v);
+      // parseHtml returns detached roots; innerHTML installs them under this
+      // element, so remove()/appendChild() observe normal parent ownership.
+      for (const c of this._children) if (c instanceof El) c._parent = this;
+      this._innerHTML="";
+    } }
   /* 与真实 DOM 一致：textContent 取文本后代拼接；赋值则整体替换（清子节点） */
   get textContent(){ if (this._children.length) {
       let out = "";
@@ -209,8 +217,13 @@ class El {
       this._children.push({ text: this._text }); this._text = ""; } }
   append(...nodes){ for(const n of nodes){ if(n==null) continue;
     this._materializeText();
-    const c=typeof n==="string"?{text:n}:n; this._children.push(c);
-    if(c._parent==null) c._parent=this; } }
+    const c=typeof n==="string"?{text:n}:n;
+    // Element.append moves an existing node just like appendChild; otherwise
+    // a restored/live node can remain in two fake parents at once.
+    const p=c._parent;
+    if(p){ const i=p._children.indexOf(c); if(i>=0) p._children.splice(i,1); }
+    this._children.push(c); c._parent=this;
+  } }
   appendChild(n){ const p=n._parent;   /* 真实 DOM 语义：移动=先从旧父节点移除 */
     if(p){ const j=p._children.indexOf(n); if(j>=0) p._children.splice(j,1); }
     this._materializeText();
@@ -401,6 +414,14 @@ function streamManualNotice(){
     return { done: true };
   } }; } };
 }
+function streamOracleDelayed(){
+  let phase = 0;
+  return { getReader(){ return { read: async () => {
+    if (phase++ === 0) return new Promise((resolve) => { oracleSseReadResolve = resolve; });
+    if (phase === 2) return { done:false, value: oracleSnapshot };
+    return { done:true };
+  } }; } };
+}
 /* 带 abort 感知的响应 Promise：signal 已 abort → 立即 reject AbortError；
    pending 期间 abort → reject AbortError（resolve 后迟到 abort 是 no-op，
    与真实 fetch 一致）。 */
@@ -515,6 +536,10 @@ let historyOverrides = new Map();
 let sseOkIds = new Set();
 let historyResolve = null;
 let a1StreamManualNotice = false;
+// Oracle 1044: successful H is released independently from a later snapshot.
+let oracleSseReadResolve = null;
+let oracleSnapshot = "";
+let oracleHistory = null;
 // fork 面板测试用：/fork-candidates 候选与 /fork POST 响应（测试中可变）
 let forkCandidatesData = [
   {at:2, seq:2, preview:"用户：你好，帮我看看"},
@@ -659,6 +684,9 @@ globalThis.fetch=(url,opts={})=>{
     entries: [{type:"message", message:{User:{content:"persisted A history", images:[]}}}],
     next_before_seq: null,
   }, signal);
+  if(url.startsWith("/api/sessions/oracle1044/history")) {
+    return abortable(new Promise((resolve) => { oracleHistory = resolve; }), signal);
+  }
   if(url==="/api/sessions/s1/events") return resp(200, stream(), signal);
   if(url==="/api/sessions/s2/events") return resp(200, stream(), signal);
   if(url==="/api/sessions/s3/events") return resp(200, streamSnapshotUsage(), signal);
@@ -670,6 +698,7 @@ globalThis.fetch=(url,opts={})=>{
   if(url.startsWith("/api/sessions/restored-test2/events")) return resp(200, streamEmpty(), signal);
   if(url.startsWith("/api/sessions/restored-test3/events")) return resp(200, streamEmpty(), signal);
   if(url.startsWith("/api/sessions/stream-switch-a/events")) return resp(200, streamEmpty(), signal);
+  if(url.startsWith("/api/sessions/oracle1044/events")) return resp(200, streamOracleDelayed(), signal);
   // 持久化用量端点（本分支新增）：usageData 命中 → 200；置 null → 404 旧后端
   const _mUsage = /^\/api\/sessions\/([^/]+)\/usage$/.exec(url);
   if (_mUsage) {
@@ -718,6 +747,319 @@ async function flush(){ for(let i=0;i<200;i++) await Promise.resolve(); }
 async function main(){
   let fail=0;
   const chk=(name, ok, extra)=>{ if(!ok) fail++; console.log((ok?"PASS":"FAIL")+" "+name+(extra?"  "+extra:"")); };
+  // Parsed innerHTML roots are installed children: remove must empty the
+  // receiver, and a subsequent move must detach it from its former parent.
+  const parsedParentProbe = document.createElement("div");
+  parsedParentProbe.innerHTML = "<div class='notice'>cached</div>";
+  const parsedRootProbe = parsedParentProbe.firstChild;
+  parsedRootProbe.remove();
+  const parsedRemoveOk = parsedParentProbe.firstChild === null
+    && parsedRootProbe.parentNode === null;
+  parsedParentProbe.innerHTML = "<div class='notice'>cached</div>";
+  const parsedMoveProbe = parsedParentProbe.firstChild;
+  const parsedMoveTarget = document.createElement("div");
+  parsedMoveTarget.append(parsedMoveProbe);
+  chk("innerHTML roots remove and move with parent ownership", parsedRemoveOk
+      && parsedParentProbe.firstChild === null && parsedMoveTarget.firstChild === parsedMoveProbe
+      && parsedMoveProbe.parentNode === parsedMoveTarget,
+      "removed=" + parsedRemoveOk + " old=" + parsedParentProbe.children.length);
+  if (MODE === 'splice') {
+    const plan = (history, snapshot) => {
+      const result = spliceHistorySnapshot(history, snapshot);
+      const historyParts = result.output.components.filter((x) => x.source === "history")
+        .map((x) => x.entry + ":" + x.part);
+      const normalizedParts = result.comparison.history
+        .map((x) => x.index + ":" + x.part);
+      const historyEntries = [...new Set(result.output.components
+        .filter((x) => x.source === "history").map((x) => x.entry))];
+      const originalEntries = history.map((_entry, index) => index);
+      const snapshotIndices = result.output.components.filter((x) => x.source === "snapshot")
+        .map((x) => x.index);
+      const historyOk = historyParts.join("|") === normalizedParts.join("|");
+      chk("splice plan keeps every normalized H part once in H order", historyOk,
+        historyOk ? "" : historyParts.join("|") + " != " + normalizedParts.join("|"));
+      const snapshotOk = snapshotIndices.join(",") === result.output.snapshot.extras.join(",");
+      chk("splice plan snapshot components are exactly unmatched S indices in source order", snapshotOk,
+        snapshotOk ? "" : snapshotIndices.join(",") + " != " + result.output.snapshot.extras.join(","));
+      const entriesOk = historyEntries.join(",") === originalEntries.join(",");
+      chk("splice plan keeps every original H entry in order", entriesOk,
+        entriesOk ? "" : historyEntries.join(",") + " != " + originalEntries.join(","));
+      return result;
+    };
+    const componentSequence = (result) => result.output.components.map((x) =>
+      x.source === "history" ? "H" + x.entry + ":" + x.part : "S" + x.index).join("|");
+    const H = [
+      {type:"message", message:{User:{content:"ask"}}},
+      {type:"message", message:{Assistant:{content:"done", reasoning:"why", tool_calls:[]}}},
+    ];
+    const S = [
+      {type:"user_prompt", data:{text:"ask"}},
+      {type:"reasoning_delta", data:{delta:"why"}},
+      {type:"assistant_delta", data:{delta:"done"}},
+    ];
+    let r = plan(H, S);
+    chk("splice ordinary completed stream returns one rich H coverage plus no S extras", r.match && r.match.length === 3
+      && r.output.history.entries.length === 2 && r.output.snapshot.extras.length === 0
+      && r.output.snapshot.matched.length === 3);
+
+    const H2 = [
+      {type:"message", message:{Assistant:{content:"run", tool_calls:[
+        {id:"c1", name:"one", arguments:"{}"}, {id:"c2", name:"two", arguments:"{}"}]}}},
+      {type:"message", message:{Tool:{call_id:"c1", content:"r1", is_error:false}}},
+      {type:"message", message:{Tool:{call_id:"c2", content:"r2", is_error:false}}},
+    ];
+    const S2 = [
+      {type:"assistant_delta", data:{delta:"run"}},
+      {type:"tool_call", data:{name:"one", arguments:"{}"}},
+      {type:"tool_result", data:{content:"r1", is_error:false}},
+      {type:"tool_call", data:{name:"two", arguments:"{}"}},
+      {type:"tool_result", data:{content:"r2", is_error:false}},
+    ];
+    r = plan(H2, S2);
+    chk("splice two bundled calls normalize at later execution results", r.match && r.match.length === 5
+      && r.output.history.entries.length === 3 && r.output.snapshot.extras.length === 0
+      && r.comparison.history.map(x => x.kind + ":" + (x.name || x.content || x.text)).join("|")
+        === "assistant:run|tool_call:one|tool_result:r1|tool_call:two|tool_result:r2"
+      && r.output.history.execution.map(x => x.kind + ":" + x.owner).join("|")
+        === "tool_call:c1|tool_result:c1|tool_call:c2|tool_result:c2");
+
+    // A lone text record is never enough proof, including a structural notice.
+    r = plan([{type:"notice", text:"retry"}], [{type:"notice", data:{text:"retry"}}]);
+    chk("splice single repeated notice remains ambiguous", !r.match && r.output.snapshot.extras.length === 1);
+    r = plan([{type:"message", message:{Assistant:{content:"same", tool_calls:[]}}}],
+      [{type:"assistant_delta", data:{delta:"same"}}, {type:"assistant_delta", data:{delta:"same"}}]);
+    chk("splice repeated standalone output is not globally suppressed", !r.match && r.output.snapshot.extras.length === 2);
+
+    const old = Array.from({length:205}, (_, i) => ({type:"message", message:i % 2
+      ? {Assistant:{content:"a" + i, tool_calls:[]}} : {User:{content:"u" + i}}}));
+    const windowH = old.slice(5);
+    const fullS = old.map((x, i) => i % 2 ? {type:"assistant_text", data:{text:"a" + i}}
+      : {type:"user_prompt", data:{text:"u" + i}});
+    r = plan(windowH, fullS);
+    chk("splice H200 typical user/assistant window retains older S coverage", r.match && r.match.mode === "window"
+      && r.output.history.entries.length === 200 && r.output.snapshot.extras.join(",") === "0,1,2,3,4",
+      JSON.stringify({match:r.match && {mode:r.match.mode, length:r.match.length}, extras:r.output.snapshot.extras.slice(0,8)}));
+
+    console.log("RED window walker must enter through a sparse first H reasoning part");
+    const sparseFirstReasonH = [
+      {type:"message", message:{Assistant:{content:"a", reasoning:"why", tool_calls:[]}}},
+      {type:"message", message:{User:{content:"next"}}},
+      {type:"message", message:{Assistant:{content:"b", tool_calls:[]}}},
+    ];
+    r = plan(sparseFirstReasonH, [{type:"user_prompt",data:"older"},
+      {type:"assistant_text",data:"older answer"}, {type:"assistant_text",data:"a"},
+      {type:"user_prompt",data:"next"}, {type:"assistant_text",data:"b"}]);
+    chk("GREEN sparse-first-reason window finds unique overlap and preserves prefix extras", r.match
+      && r.match.mode === "window" && r.output.snapshot.extras.join(",") === "0,1"
+      && componentSequence(r) === "S0|S1|H0:reasoning|H0:text|H1:user|H2:text");
+
+    const completeTurnsH = [{type:"message", message:{User:{content:"one"}}}, {type:"message", message:{Assistant:{content:"a", tool_calls:[]}}},
+      {type:"message", message:{User:{content:"two"}}}, {type:"message", message:{Assistant:{content:"b", tool_calls:[]}}}];
+    const completeTurnsS = [{type:"user_prompt", data:"one"}, {type:"assistant_delta", data:"a"},
+      {type:"usage", data:{context_input:3}}, {type:"user_prompt", data:"two"}, {type:"assistant_text", data:"b"}];
+    r = plan(completeTurnsH, completeTurnsS);
+    chk("splice two complete actual snake-case string turns match across Usage", r.match && r.match.length === 4
+      && r.output.snapshot.extras.length === 0 && r.output.snapshot.uiOnly.length === 1);
+
+    const usageS = [{type:"user_prompt", data:{text:"u"}}, {type:"assistant_delta", data:{delta:"a"}},
+      {type:"usage", data:{context_input:9}}, {type:"tool_call", data:{name:"x", arguments:"{}"}}];
+    const usageH = [{type:"message", message:{User:{content:"u"}}}, {type:"message", message:{Assistant:{content:"a", tool_calls:[{id:"x", name:"x", arguments:"{}"}]}}}];
+    r = plan(usageH, usageS);
+    chk("splice usage is neutral for matching but retained UI-only", r.match && r.match.length === 3
+      && r.output.snapshot.uiOnly.length === 1 && r.output.snapshot.extras.length === 0);
+
+    r = plan([{type:"message", message:{Tool:{call_id:"x", content:"!ok", is_error:false}}},
+      {type:"message", message:{Tool:{call_id:"y", content:"ok", is_error:true}}}],
+      [{type:"tool_result", data:{content:"ok", is_error:true}}]);
+    chk("splice tool result compares error flag separately from content", !r.match && r.output.snapshot.extras.length === 1);
+
+    const opaqueH = [{type:"message", message:{Assistant:{content:"", reasoning:null, tool_calls:[]}}},
+      {type:"message", message:{Odd:{future:"shape"}}}];
+    r = plan(opaqueH, []);
+    chk("splice output preserves empty assistant and unknown original H entries once", r.output.history.entries.length === 2
+      && r.output.history.entries[0] === opaqueH[0] && r.output.history.entries[1] === opaqueH[1]);
+
+    console.log("RED placeholder-only Assistant must render from original H without S evidence");
+    r = plan([{type:"message", message:{Assistant:{content:null, reasoning:null, tool_calls:[]}}}], []);
+    chk("GREEN placeholder-only Assistant emits the renderer empty part", !r.match
+      && componentSequence(r) === "H0:empty" && r.comparison.history[0].placeholder === true);
+
+    r = plan([{type:"notice", text:"history notice"}], [{type:"notice", data:{text:"snapshot notice"}}]);
+    chk("splice unmatched notice is retained", !r.match && r.output.snapshot.extras.length === 1);
+
+    r = plan([], [{type:"assistant_text", data:"boot prefix"},
+      {type:"notice", data:{text:"live boundary"}}, {type:"assistant_delta", data:" live tail"}]);
+    chk("splice sparse bootstrap actual AssistantText and live tail retain raw events", r.output.snapshot.extras.length === 3
+      && r.comparison.snapshot[0].text === "boot prefix" && r.comparison.snapshot[2].text === " live tail"
+      && r.comparison.snapshot.every(x => x.source === "snapshot" && x.raw));
+
+    r = plan([{type:"message", message:{User:{content:"old"}}}, {type:"message", message:{User:{content:"x"}}},
+      {type:"message", message:{Assistant:{content:"y", tool_calls:[]}}}, {type:"message", message:{User:{content:"later"}}}],
+      [{type:"user_prompt", data:"x"}, {type:"assistant_delta", data:"y"}, {type:"user_prompt", data:"new"}]);
+    chk("splice suffix never accepts interior H overlap", !r.match && r.output.snapshot.extras.length === 3);
+
+    const repeatedH = [{type:"message", message:{User:{content:"x"}}}, {type:"message", message:{Assistant:{content:"y", tool_calls:[]}}},
+      {type:"message", message:{User:{content:"x"}}}, {type:"message", message:{Assistant:{content:"y", tool_calls:[]}}}];
+    r = plan(repeatedH, [{type:"user_prompt", data:"x"}, {type:"assistant_delta", data:"y"}]);
+    chk("splice repeated H picks only genuine suffix", r.match && r.match.mode === "suffix" && r.match.hStart === 2);
+
+    const sparseH = [{type:"message", message:{User:{content:"go"}}},
+      {type:"message", message:{Assistant:{content:null, reasoning:null, tool_calls:[{id:"c", name:"x", arguments:"{}"}]}}},
+      {type:"message", message:{Tool:{call_id:"c", content:"ok", is_error:false}}}];
+    r = plan(sparseH, [{type:"user_prompt", data:"go"}, {type:"usage", data:{context_input:1}},
+      {type:"tool_call", data:{name:"x", arguments:"{}"}}, {type:"tool_result", data:{content:"ok", is_error:false}}]);
+    chk("splice empty assistant tool-only H matches actual S around Usage", r.match && r.output.snapshot.extras.length === 0 && r.output.snapshot.uiOnly.length === 1);
+
+    const terminalCallH = [{type:"message", message:{User:{content:"go"}}},
+      {type:"message", message:{Assistant:{content:"done", tool_calls:[{id:"c1", name:"x", arguments:"{}"}]}}}];
+    r = plan(terminalCallH, [{type:"user_prompt",data:"go"}, {type:"assistant_text",data:"done"}]);
+    chk("splice terminal unmatched H call cannot complete overlap", !r.match
+      && r.output.snapshot.extras.join(",") === "0,1"
+      && componentSequence(r) === "H0:user|H1:text|H1:call:0|S0|S1");
+
+    const terminalReasonH = [{type:"message", message:{User:{content:"go"}}},
+      {type:"message", message:{Assistant:{content:null, reasoning:"why", tool_calls:[]}}}];
+    r = plan(terminalReasonH, [{type:"user_prompt",data:"go"}]);
+    chk("splice terminal absent H reasoning cannot complete overlap", !r.match
+      && r.output.snapshot.extras.join(",") === "0"
+      && componentSequence(r) === "H0:user|H1:reasoning|S0");
+
+    const turnsH = [{type:"message", message:{User:{content:"one"}}}, {type:"message", message:{Assistant:{content:"a", tool_calls:[]}}},
+      {type:"message", message:{User:{content:"two"}}}, {type:"message", message:{Assistant:{content:"b", tool_calls:[]}}}];
+    r = plan(turnsH, [{type:"user_prompt", data:"one"}, {type:"assistant_delta", data:"a"},
+      {type:"notice", data:{text:"extra"}}, {type:"user_prompt", data:"two"}, {type:"assistant_delta", data:"b"}]);
+    chk("splice plan emits S notice between retained H turn components", r.match
+      && componentSequence(r) === "H0:user|H1:text|S2|H2:user|H3:text");
+
+    const suffixPlanH = [{type:"message", message:{User:{content:"old"}}},
+      {type:"message", message:{Assistant:{content:"old answer", tool_calls:[]}}},
+      {type:"message", message:{User:{content:"x"}}},
+      {type:"message", message:{Assistant:{content:"y", tool_calls:[]}}}];
+    r = plan(suffixPlanH, [{type:"user_prompt",data:"x"}, {type:"assistant_text",data:"y"},
+      {type:"user_prompt",data:"new"}]);
+    chk("splice suffix full component sequence keeps H prefix then H suffix then S tail", r.match
+      && componentSequence(r) === "H0:user|H1:text|H2:user|H3:text|S2");
+
+    const sparseReasonH = [{type:"message", message:{User:{content:"u"}}},
+      {type:"message", message:{Assistant:{content:"done", reasoning:"why", tool_calls:[]}}}];
+    r = plan(sparseReasonH, [{type:"user_prompt",data:"u"},
+      {type:"assistant_text",data:"done"}, {type:"notice",data:"after"}]);
+    chk("splice sparse reasoning full sequence keeps matched assistant out of S extras", r.match
+      && componentSequence(r) === "H0:user|H1:reasoning|H1:text|S2");
+
+    r = plan([{type:"message", message:{User:{content:"first"}}},
+      {type:"message", message:{Assistant:{content:"second", tool_calls:[]}}}],
+      [{type:"notice",data:"boot"}, {type:"assistant_text",data:"tail"}]);
+    chk("splice bootstrap full component sequence puts explicit H before unmatched S", !r.match
+      && componentSequence(r) === "H0:user|H1:text|S0|S1");
+
+    const interleavedNoticesH = [{type:"message", message:{User:{content:"one"}}},
+      {type:"message", message:{Assistant:{content:"a", tool_calls:[]}}},
+      {type:"message", message:{User:{content:"two"}}},
+      {type:"message", message:{Assistant:{content:"b", tool_calls:[]}}}];
+    r = plan(interleavedNoticesH, [{type:"notice",data:"before"}, {type:"user_prompt",data:"one"},
+      {type:"notice",data:"middle"}, {type:"assistant_text",data:"a"},
+      {type:"notice",data:"later"}, {type:"user_prompt",data:"two"}, {type:"assistant_text",data:"b"},
+      {type:"notice",data:"after"}]);
+    chk("splice interleaved notices full component sequence follows matched anchors", r.match
+      && componentSequence(r) === "S0|H0:user|S2|H1:text|S4|H2:user|H3:text|S7");
+
+    const richBootH = [{type:"message", message:{User:{content:"go"}}},
+      {type:"message", message:{Assistant:{content:"run", reasoning:null, tool_calls:[{id:"c1", name:"one", arguments:"{}"},{id:"c2", name:"two", arguments:"{}"}]}}},
+      {type:"message", message:{Tool:{call_id:"c1", content:"r1", is_error:false}}}, {type:"message", message:{Tool:{call_id:"c2", content:"r2", is_error:false}}}];
+    r = plan(richBootH, [{type:"user_prompt", data:"go"}, {type:"assistant_text", data:"run"},
+      {type:"tool_result", data:{content:"r1", is_error:false}}, {type:"tool_result", data:{content:"r2", is_error:false}}]);
+    chk("splice sparse bootstrap omits H calls only when following H results prove order", r.match && r.output.snapshot.extras.length === 0
+      && r.output.history.execution.map(x=>x.kind+":"+x.owner).join("|") === "tool_call:c1|tool_result:c1|tool_call:c2|tool_result:c2");
+
+    const reasonH = [{type:"message", message:{User:{content:"go"}}}, {type:"message", message:{Assistant:{content:"done", reasoning:"why", tool_calls:[]}}}];
+    r = plan(reasonH, [{type:"user_prompt", data:"go"}, {type:"reasoning_delta", data:"different"}, {type:"assistant_text", data:"done"}]);
+    chk("splice differing reasoning stays raw S extra rather than covered", r.match && r.output.snapshot.extras.join(",") === "1");
+
+    r = plan([{type:"message", message:{User:{content:"go"}}}, {type:"message", message:{Assistant:{content:"run", tool_calls:[{id:"c1",name:"one",arguments:"{}"},{id:"c2",name:"two",arguments:"{}"}]}}}],
+      [{type:"user_prompt",data:"go"},{type:"assistant_text",data:"run"},{type:"tool_call",data:{name:"one",arguments:"{}"}},{type:"tool_result",data:{content:"r1",is_error:false}},{type:"tool_call",data:{name:"two",arguments:"{}"}}]);
+    chk("splice unmatched ownerless result component follows matched c1 not latest c2", r.match
+      && r.output.components.map(x=>x.source==="history" ? "H:"+x.part+":"+x.owner : "S:"+x.index).join("|").includes("H:call:0:c1|S:3"));
+
+    r = plan([{type:"message",message:{Assistant:{content:"H-UNMATCHED",tool_calls:[{id:"pending",name:"bash",arguments:"{}"}]}}}],
+      [{type:"tool_result",data:{content:"S-UNRELATED-OWNERLESS",is_error:false}}]);
+    const unrelated = r.output.components.find(x=>x.source === "snapshot");
+    chk("splice unmatched pending H call does not own unrelated S result", !r.match && unrelated && !unrelated.owner);
+    elsById["messages"].innerHTML = ""; state.acc = newAccumulator();
+    renderSpliceComponents(r.output.components);
+    const unrelatedCards = elsById["messages"].querySelectorAll(".tool-card");
+    chk("splice unrelated ownerless result stays independent of unmatched pending H call", unrelatedCards.length === 2
+      && unrelatedCards[0].textContent.includes("等待结果") && unrelatedCards[1].textContent.includes("S-UNRELATED-OWNERLESS"));
+
+    const ownerlessH = [{type:"message", message:{User:{content:"old"}}},
+      {type:"message", message:{Assistant:{content:"first", tool_calls:[{id:"h1",name:"one",arguments:"{}"}]}}},
+      {type:"message", message:{Tool:{call_id:"h1",content:"H-FIRST-RESULT",is_error:false}}},
+      {type:"message", message:{User:{content:"next"}}},
+      {type:"message", message:{Assistant:{content:"second", tool_calls:[{id:"h2",name:"two",arguments:"{}"}]}}},
+      {type:"message", message:{Tool:{call_id:"h2",content:"H-SECOND-RESULT",is_error:false}}}];
+    const ownerlessS = [{type:"user_prompt",data:"old"},{type:"assistant_text",data:"first"},
+      {type:"tool_call",data:{name:"one",arguments:"{}"}},{type:"tool_result",data:{content:"H-FIRST-RESULT",is_error:false}},
+      {type:"user_prompt",data:"next"},{type:"assistant_text",data:"second"},{type:"tool_call",data:{name:"two",arguments:"{}"}},
+      {type:"tool_result",data:{content:"H-SECOND-RESULT",is_error:false}},{type:"tool_result",data:{content:"S-OWNERLESS",is_error:false}},
+      {type:"tool_call",data:{call_id:"live",name:"live",arguments:"{}"}},{type:"tool_result",data:{call_id:"live",content:"S-LIVE",is_error:false}}];
+    r = plan(ownerlessH, ownerlessS);
+    const ownerlessComponent = r.output.components.find(x=>x.source === "snapshot" && x.index === 8);
+    chk("splice unmatched ownerless result has no inferred owner after completed H cards", r.match && ownerlessComponent && !ownerlessComponent.owner);
+    elsById["messages"].innerHTML = ""; state.acc = newAccumulator();
+    renderSpliceComponents(r.output.components);
+    const ownerlessCards = elsById["messages"].querySelectorAll(".tool-card");
+    chk("splice ownerless result is independent and later live call/result still pair", ownerlessCards.length === 4
+      && ownerlessCards[0].textContent.includes("H-FIRST-RESULT") && ownerlessCards[1].textContent.includes("H-SECOND-RESULT")
+      && ownerlessCards[2].textContent.includes("S-OWNERLESS") && ownerlessCards[3].textContent.includes("S-LIVE"));
+
+    r = plan([{type:"message", message:{Assistant:{content:"answer", tool_calls:[]}}}],
+      [{type:"assistant_text",data:"answer"},{type:"error",data:"partial failed"}]);
+    chk("splice persisted answer plus unpersisted error retains error", !r.match && r.output.snapshot.extras.length === 2);
+
+    r = plan([{type:"message", message:{Assistant:{content:"hello", tool_calls:[]}}}],
+      [{type:"assistant_delta", data:"hello world"}]);
+    chk("splice active sparse prefix remains unresolved and retained", !r.match && r.output.snapshot.extras.length === 1);
+
+    // Bounded truncated assistant-delta prefix fallback: exact user and tail
+    // anchors prove only the tail; the prefix remains a visible raw extra.
+    const prefixH = [{type:"message", message:{Assistant:{content:"hello world", tool_calls:[]}}},
+      {type:"message", message:{User:{content:"next"}}},
+      {type:"message", message:{Assistant:{content:"answer", tool_calls:[]}}}];
+    const prefixS = [{type:"assistant_delta",data:"world"},{type:"user_prompt",data:"next"},{type:"assistant_text",data:"answer"}];
+    r = plan(prefixH, prefixS);
+    chk("splice truncated assistant prefix recovers exact user/answer tail", r.match && r.match.mode === "truncated_prefix"
+      && r.output.snapshot.matched.join(",") === "1,2" && r.output.snapshot.extras.join(",") === "0"
+      && componentSequence(r) === "H0:text|S0|H1:user|H2:text");
+    // Rich persisted reasoning is retained from H; a leading S reasoning lane
+    // is deliberately outside this assistant-delta-only fallback.
+    const richPrefixH = [{type:"message",message:{Assistant:{content:"hello world",reasoning:"rich",tool_calls:[]}}}, ...prefixH.slice(1)];
+    r = plan(richPrefixH, prefixS);
+    chk("splice rich H reasoning stays beside truncated-prefix extra", r.match && r.output.snapshot.extras.join(",") === "0"
+      && componentSequence(r) === "H0:reasoning|H0:text|S0|H1:user|H2:text");
+    r = plan(richPrefixH, [{type:"reasoning_delta",data:"partial"},...prefixS]);
+    chk("splice leading partial reasoning remains unmatched", !r.match && r.output.snapshot.extras.join(",") === "0,1,2,3");
+    r = plan([{type:"message",message:{Assistant:{content:"one",tool_calls:[]}}},{type:"message",message:{User:{content:"next"}}},{type:"message",message:{Assistant:{content:"answer",tool_calls:[]}}},
+      {type:"message",message:{User:{content:"next"}}},{type:"message",message:{Assistant:{content:"answer",tool_calls:[]}}}], prefixS);
+    chk("splice repeated H tail keeps a unique existing mapping", r.match && r.match.length === 2);
+    r = plan(prefixH.slice(1), [...prefixS, {type:"user_prompt",data:"next"},{type:"assistant_text",data:"answer"}]);
+    chk("splice repeated snapshot tail preserves existing ambiguity", !r.match && r.output.snapshot.extras.join(",") === "0,1,2,3,4");
+    const noPrefixFallback = (name, h, s) => { r = plan(h,s); chk(name, !r.match); };
+    noPrefixFallback("splice truncated prefix refuses single anchor", prefixH, [{type:"assistant_delta",data:"world"},{type:"user_prompt",data:"next"}]);
+    noPrefixFallback("splice truncated prefix refuses different answer", prefixH, [{type:"assistant_delta",data:"world"},{type:"user_prompt",data:"next"},{type:"assistant_text",data:"different"}]);
+    noPrefixFallback("splice truncated prefix refuses non-H-end tail", [...prefixH,{type:"message",message:{User:{content:"later"}}}], prefixS);
+    noPrefixFallback("splice truncated prefix refuses AssistantText start", prefixH, [{type:"assistant_text",data:"world"},{type:"user_prompt",data:"next"},{type:"assistant_text",data:"answer"}]);
+    noPrefixFallback("splice truncated prefix refuses nonleading delta", prefixH, [{type:"user_prompt",data:"next"},{type:"assistant_delta",data:"world"},{type:"assistant_text",data:"answer"}]);
+    noPrefixFallback("splice truncated prefix refuses separated delta lanes", prefixH, [{type:"assistant_delta",data:"world"},{type:"user_prompt",data:"next"},{type:"assistant_delta",data:"again"},{type:"assistant_text",data:"answer"}]);
+
+    r = plan([{type:"message", message:{Assistant:{content:"answer",reasoning:"complete reasoning",tool_calls:[]}}},
+      {type:"message", message:{User:{content:"next"}}},
+      {type:"message", message:{Assistant:{content:"done",tool_calls:[]}}}],
+      [{type:"reasoning_delta",data:"partial reasoning"},{type:"assistant_text",data:"answer"},
+        {type:"user_prompt",data:"next"},{type:"assistant_text",data:"done"}]);
+    chk("source review partial reasoning remains raw and visible", r.match && r.output.snapshot.extras.join(",") === "0");
+    console.log(fail===0 ? "ALL PASS" : fail+" FAILURES");
+    imports.system.exit(0);
+  }
   if (MODE === 'fragment') {
     const crossPayload = "__CROSS_PAYLOAD__";
     const payload = {version:1, source:"http://127.0.0.1:19001", primary:"a", workspaces:[
@@ -1273,7 +1615,9 @@ async function main(){
         "errN=" + elsById["messages"].querySelectorAll(".msg-error").length);
     chk("history error not unknown-entry wrapped", !t.includes("未知条目"),
         "hasUnknown=" + t.includes("未知条目"));
-    chk("snapshot skipped", !t.includes("SNAPSHOT-SHOULD-BE-SKIPPED"));
+    // The initial snapshot is merged with validated H: unmatched UI events
+    // remain visible instead of being discarded with the duplicate transcript.
+    chk("snapshot preserves unmatched notice", t.includes("SNAPSHOT-SHOULD-BE-SKIPPED"));
     chk("status Busy", elsById["chatStatus"].textContent==="处理中", "="+elsById["chatStatus"].textContent);
     chk("cancel enabled when busy", elsById["cancelBtn"].disabled===false);
 
@@ -1810,22 +2154,45 @@ async function main(){
     await flush();
     chk("reconnect reconnected", state.sse.ctrl!=null);
 
+    // A delayed resync must finish its authoritative H/S replacement before a
+    // later live block is applied, otherwise that replacement can erase it.
+    historyOverrides.set("s1", { delay: true });
+    historyResolve = null;
+    let resyncRead = 0;
+    const resyncThenLive = readSSEStream({ read: async () => {
+      if (resyncRead++ === 0) return {done:false, value:
+        "event: resync\ndata: [{\"type\":\"assistant_delta\",\"data\":\"RESYNC-TAIL\"}]\n\n"};
+      if (resyncRead === 2) return {done:false, value:
+        "event: AssistantDelta\ndata: {\"delta\":\"LIVE-AFTER-RESYNC\"}\n\n"};
+      return {done:true};
+    } }, state.sessionId, state.workspace.id, sessionOpenEpoch, state.sse.ctrl);
+    await flush();
+    chk("delayed resync holds later live block", !elsById["messages"].textContent.includes("LIVE-AFTER-RESYNC"));
+    historyResolve(resp(200, historyData));
+    await resyncThenLive;
+    historyOverrides.delete("s1");
+    chk("delayed resync then live renders exactly once",
+        elsById["messages"].textContent.includes("RESYNC-TAIL")
+        && elsById["messages"].textContent.split("LIVE-AFTER-RESYNC").length === 2,
+        "text=" + JSON.stringify(elsById["messages"].textContent));
+
     // resync 追平：注入一个 resync 块，验证强制整体替换 transcript 并按事件日志重放
     const _resyncTaskSeqBefore = state.tasks.seq;
     handleSSEBlock("event: resync\ndata: [{\"type\":\"user_prompt\",\"data\":\"重放-用户\"},{\"type\":\"assistant_delta\",\"data\":\"重放-\"},{\"type\":\"assistant_delta\",\"data\":\"增量\"}]\n\n",
       state.sessionId, state.workspace.id, sessionOpenEpoch);
+    await flush(); await flush();
     chk("resync does not refresh tasks", state.tasks.seq === _resyncTaskSeqBefore,
         "before=" + _resyncTaskSeqBefore + " after=" + state.tasks.seq);
     const t3 = allText();
-    console.log("DBG t3=" + JSON.stringify(t3.slice(0, 200)));
-    console.log("DBG msgs children=" + elsById["messages"]._children.length
-      + " html=" + (elsById["messages"].innerHTML || "").slice(0, 150));
-    chk("resync replaces transcript", !t3.includes("你好，帮我看看") && t3.includes("重放-用户"));
+    // A resync goes through the same conservative H/S splice as snapshot.
+    // When this deliberately sparse S has no proven H overlap, it must retain
+    // the rich H prefix rather than erase it, while still showing the S tail.
+    chk("resync keeps unresolved rich history", t3.includes("你好，帮我看看") && t3.includes("重放-用户"));
     chk("resync replayed deltas", t3.includes("重放-") && t3.includes("增量"));
     chk("resync rerenders", elsById["messages"]._children.length >= 2,
         "n=" + elsById["messages"]._children.length);
-    // resync 用离屏 temp 重放再以 innerHTML 提交；提交后 accumulator 不得
-    // 继续引用 temp 的旧节点。紧随其后的 delta 必须落入真实 messages。
+    // resync fetches a fresh H tail then commits its merged offscreen nodes;
+    // the following delta must target a node now moved into real messages.
     handleSSEBlock("event: AssistantDelta\ndata: {\"delta\":\"-同步后续写\"}\n\n",
       state.sessionId, state.workspace.id, sessionOpenEpoch);
     const postResyncEl = elsById["messages"].querySelectorAll(".msg-assistant")
@@ -1891,6 +2258,26 @@ async function main(){
     await flush(); await flush();       // 陈旧响应返回：finally 必须无条件复位
     chk("stale loadOlder resets loadingOlder", state.loadingOlder === false,
         "=" + state.loadingOlder);
+    // Replacement preserves a reader's offset from bottom, while a following
+    // reader stays following the replaced merged transcript.
+    const viewport = elsById["messages"];
+    viewport.scrollHeight = 1000; viewport.clientHeight = 200; viewport.scrollTop = 350;
+    const viewportOffset = viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight;
+    userScrolled = false;
+    renderSpliceComponents([{source:"snapshot", raw:{type:"notice", data:{text:"viewport-preserved"}}}]);
+    chk("merged replacement preserves non-following viewport",
+        viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight === viewportOffset
+        && userScrolled === true && elsById["jumpBottomBtn"].hidden === false,
+        "top=" + viewport.scrollTop + " offset=" + (viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight)
+        + " scrolled=" + userScrolled + " jump=" + elsById["jumpBottomBtn"].hidden);
+    viewport.scrollHeight = 1000; viewport.clientHeight = 200; viewport.scrollTop = 800;
+    userScrolled = false;
+    renderSpliceComponents([{source:"snapshot", raw:{type:"notice", data:{text:"viewport-following"}}}]);
+    chk("merged replacement keeps following viewport", viewport.scrollTop === viewport.scrollHeight
+        && userScrolled === false && elsById["jumpBottomBtn"].hidden === true,
+        "top=" + viewport.scrollTop + " height=" + viewport.scrollHeight + " jump=" + elsById["jumpBottomBtn"].hidden);
+
+
     // ---- 回归：restored 分支 reattachInFlight（切回缓存会话不重复思考块） ----
     function buildInflightView(){
       const m = elsById["messages"];
@@ -1931,11 +2318,11 @@ async function main(){
     }
     function openRestored(){           // 从另一会话切回 → restored 分支
       state.sessionId = null;          // 避免 saveSessionState 覆盖上面的缓存
-      openSession("s1");
+      return new Promise((resolve) => openSession("s1", resolve));
     }
     let iv = buildInflightView();
     cacheCurrentView();
-    openRestored();
+    const firstRestoredReady = openRestored();
     chk("restored initSource", state.initSource === "restored", "="+state.initSource);
     const rDets = elsById["messages"].querySelectorAll("details.thinking");
     const rAs = elsById["messages"].querySelectorAll(".msg-assistant");
@@ -1960,17 +2347,25 @@ async function main(){
     const abAfter = elsById["messages"].querySelector(".msg-assistant").querySelector(".msg-body");
     chk("restored assistant continues", state.acc.assistantBody === abAfter
         && abAfter._children.some((c) => c.text === "续写回复"));
+    await firstRestoredReady;  // existing first openSession onReady before ToolResult task refresh
+    chk("first restored history is readable before ToolResult", state.initSource === "history",
+        "=" + state.initSource);
     handleSSEBlock("event: ToolResult\ndata: {\"type\":\"tool_result\",\"session_id\":\"s1\",\"seq\":101,\"is_error\":false,\"content\":\"结果内容\"}\n\n", "s1", state.workspace.id, sessionOpenEpoch);
-    chk("restored tool result fills old card", state.acc.toolStack.length === 1
+    chk("restored tool result preserves and fills cached card", state.acc.toolStack.length === 1
         && state.acc.toolStack[0].filled === true
-        && elsById["messages"].querySelector(".tool-state").textContent === "完成"
-        && elsById["messages"].querySelectorAll("details.tool-card").length === 1);
+        && state.acc.toolStack[0].el.querySelector(".tool-state").textContent === "完成"
+        // History's completed bash card remains, alongside the restored
+        // unpersisted read_file card; the ownerless live result fills only it.
+        && elsById["messages"].querySelectorAll("details.tool-card").length === 2);
     // 已完成（dot done）的 thinking 绝不绑定；已 markdown 化（有子元素）的助手消息绝不绑定
     iv = buildInflightView();
     iv.dot.className = "think-dot done";
     iv.ab.appendChild(document.createElement("em"));   // 模拟 markdown 渲染出的子元素
     cacheCurrentView();
-    openRestored();
+    const restoredReady = openRestored();
+    await restoredReady;  // existing openSession onReady: loadHistory + connectSSE setup complete
+    chk("restored history is readable before task fixture", state.initSource === "history",
+        "=" + state.initSource);
     chk("restored done thinking not bound", state.acc.thinkingEl === null,
         "="+String(state.acc.thinkingEl));
     chk("restored rendered assistant not bound",
@@ -2346,10 +2741,9 @@ async function main(){
         elsById["messages"].textContent.includes("完成。")
         && !elsById["messages"].textContent.includes("旧缓存消息"),
         "text=" + elsById["messages"].textContent.slice(0, 140));
-    // 进行中的增量块（未落盘、只活在缓存/SSE 里）不再重挂：切回时 fresh
-    // 尾部整体替换过期缓存，缓存里的旧进行中块不 append 回底部（否则很久
-    // 以前的卡片会出现在最新位置、与尾部历史重复、且永不折叠）。live 续写
-    // 靠重新连接的 SSE 新建块。
+    // Unpersisted in-flight tails stay visible after the independently
+    // authoritative history replacement. A later snapshot reconciles their
+    // cached prefix; without a snapshot they remain a truthful live tail.
     state.sessionId = null;
     state.sessionStates[state.workspace.id + ":restored-test2"] = {
       html: "<div class='msg msg-assistant'><div class='msg-body'>正在流式</div></div>",
@@ -2357,13 +2751,13 @@ async function main(){
     };
     openSession("restored-test2");
     await flush(); await flush();
-    chk("restored drops cached in-flight block (no re-append to bottom)",
-        !elsById["messages"].textContent.includes("正在流式")
+    chk("restored preserves cached in-flight assistant tail",
+        elsById["messages"].textContent.includes("正在流式")
         && elsById["messages"].textContent.includes("完成。")
-        && !(state.acc && state.acc.assistantEl),
+        && !!(state.acc && state.acc.assistantEl),
         "has=" + elsById["messages"].textContent.includes("正在流式")
         + " acc=" + !!(state.acc && state.acc.assistantEl));
-    // live 续写靠 SSE：AssistantDelta 在 fresh 尾部之后新建气泡
+    // The following live delta continues the retained unpersisted tail.
     handleSSEBlock("event: AssistantDelta\ndata: {\"type\":\"assistant_delta\",\"session_id\":\"restored-test2\",\"seq\":201,\"delta\":\"续写回复\"}\n\n",
         "restored-test2", state.workspace.id, sessionOpenEpoch);
     chk("restored live delta creates new assistant block",
@@ -2371,9 +2765,8 @@ async function main(){
         && state.acc.assistantEl.isConnected
         && elsById["messages"].textContent.includes("续写回复"),
         "connected=" + (state.acc && state.acc.assistantEl && state.acc.assistantEl.isConnected));
-    // 主 bug 回归：缓存里的「执行中…」tool 卡片绝不重挂到底部——fresh 尾部
-    // 整体替换后，消息区最后一个子节点是尾部最新条目（forked 行），而不是
-    // 切走瞬间还在执行的旧 bash 卡片（否则它出现在最新位置、永不折叠）。
+    // An unpersisted in-flight tool card likewise remains available for its
+    // later ownerless result instead of being silently lost at history render.
     state.sessionId = null;
     state.sessionStates[state.workspace.id + ":restored-test3"] = {
       html: "<div class='msg msg-user'><span class='who'>you&gt;</span>"
@@ -2386,13 +2779,94 @@ async function main(){
     await flush(); await flush();
     const msgs3 = elsById["messages"];
     const last3 = msgs3.children[msgs3.children.length - 1];
-    chk("restored does not re-append cached in-flight tool card to bottom",
-        !msgs3.textContent.includes("执行中…")
-        && !!last3 && last3.className.includes("forked")
-        && !(state.acc && state.acc.toolStack && state.acc.toolStack.length),
+    chk("restored preserves cached in-flight tool card",
+        msgs3.textContent.includes("执行中…")
+        && !!last3 && last3.className.includes("tool-card")
+        && state.acc && state.acc.toolStack && state.acc.toolStack.length === 1,
         "last=" + (last3 ? last3.className : "none")
         + " inflight=" + msgs3.textContent.includes("执行中…")
         + " stack=" + (state.acc && state.acc.toolStack ? state.acc.toolStack.length : "-"));
+
+    // Identical historical text/reasoning is not identity for a current tail.
+    // Both roots remain until the subsequent snapshot produces one projection.
+    const oracleSameText = "历史重复正文", oracleSameReasoning = "历史重复推理";
+    state.sessionId = null;
+    state.sessionStates[state.workspace.id + ":oracle1044"] = {
+      html: "<details class='thinking'><summary><span class='think-dot active'></span></summary>"
+        + "<div class='think-body'>" + oracleSameReasoning + "</div></details>"
+        + "<div class='msg msg-assistant'><div class='msg-body'>" + oracleSameText + "</div></div>"
+        + "<details class='tool-card'><summary>read_file</summary><span class='tool-state'>执行中…</span></details>",
+      scrollTop: 350, nextBeforeSeq: null, olderDone: true, draft: "",
+    };
+    const oracleViewport = elsById["messages"];
+    oracleViewport.scrollHeight = 1000; oracleViewport.clientHeight = 200;
+    oracleViewport.scrollTop = 350; userScrolled = true; elsById["jumpBottomBtn"].hidden = false;
+    oracleHistory = null; oracleSseReadResolve = null;
+    openSession("oracle1044");
+    await flush();
+    chk("oracle1044 delayed history leaves restored tail visible", state.initSource === "restored"
+        && elsById["messages"].textContent.includes(oracleSameText) && oracleHistory !== null);
+    oracleHistory(resp(200, {entries:[
+      {type:"message", message:{User:{content:"H user", images:[]}}},
+      {type:"message", message:{Assistant:{content:oracleSameText, reasoning:oracleSameReasoning}}},
+      {type:"message", message:{Assistant:{content:oracleSameText, reasoning:oracleSameReasoning}}},
+    ], next_before_seq:null}));
+    await flush(); await flush();
+    const oracleAssistantTexts = elsById["messages"].querySelectorAll(".msg-assistant")
+      .map((m) => m.querySelector(".msg-body").textContent.trim());
+    const oracleReasoningTexts = elsById["messages"].querySelectorAll("details.thinking")
+      .map((d) => d.querySelector(".think-body").textContent);
+    chk("oracle1044 same H occurrence retains distinct current roots provisionally",
+        oracleAssistantTexts.length === 3
+        && oracleAssistantTexts.filter((t) => t === oracleSameText).length === 3
+        && oracleReasoningTexts.length === 3
+        && oracleReasoningTexts.filter((t) => t === oracleSameReasoning).length === 3
+        && elsById["messages"].querySelectorAll("details.tool-card").length === 1
+        && state.acc.toolStack.length === 1,
+        "a=" + JSON.stringify(oracleAssistantTexts)
+        + " r=" + JSON.stringify(oracleReasoningTexts));
+    chk("oracle1044 H replacement restores non-following viewport",
+        oracleViewport.scrollHeight - oracleViewport.scrollTop - oracleViewport.clientHeight === 450
+        && userScrolled === true && elsById["jumpBottomBtn"].hidden === false,
+        "top=" + oracleViewport.scrollTop + " offset="
+        + (oracleViewport.scrollHeight - oracleViewport.scrollTop - oracleViewport.clientHeight));
+    oracleSnapshot = 'event: snapshot\ndata: [{"type":"user_prompt","data":{"text":"H user"}},'
+      + '{"type":"reasoning_delta","data":{"delta":"' + oracleSameReasoning + '"}},'
+      + '{"type":"assistant_text","data":{"text":"' + oracleSameText + '"}},'
+      + '{"type":"reasoning_delta","data":{"delta":"' + oracleSameReasoning + '"}},'
+      + '{"type":"assistant_text","data":{"text":"' + oracleSameText + '"}}]\n\n';
+    oracleSseReadResolve({done:false, value:""});
+    await flush(); await flush();
+    const oracleFinalAssistants = elsById["messages"].querySelectorAll(".msg-assistant")
+      .map((m) => m.querySelector(".msg-body").textContent.trim());
+    const oracleFinalReasoning = elsById["messages"].querySelectorAll("details.thinking")
+      .map((d) => d.querySelector(".think-body").textContent);
+    chk("oracle1044 snapshot resolves same-text roots to H/S occurrences once",
+        oracleFinalAssistants.length === 2
+        && oracleFinalAssistants.filter((t) => t === oracleSameText).length === 2
+        && oracleFinalReasoning.length === 2
+        && oracleFinalReasoning.filter((t) => t === oracleSameReasoning).length === 2
+        && !elsById["messages"].textContent.includes("执行中…"),
+        "a=" + JSON.stringify(oracleFinalAssistants)
+        + " r=" + JSON.stringify(oracleFinalReasoning));
+
+    // Bottom-following control exercises the same real open -> delayed H -> delayed S path.
+    state.sessionId = null;
+    state.sessionStates[state.workspace.id + ":oracle1044"] = {
+      html: "<div class='notice'>cached control</div>", scrollTop: 800,
+      nextBeforeSeq: null, olderDone: true, draft: "",
+    };
+    oracleViewport.scrollHeight = 1000; oracleViewport.clientHeight = 200;
+    oracleViewport.scrollTop = 800; userScrolled = false; elsById["jumpBottomBtn"].hidden = true;
+    oracleHistory = null; oracleSseReadResolve = null;
+    openSession("oracle1044"); await flush();
+    oracleHistory(resp(200, {entries:[{type:"message", message:{User:{content:"bottom H", images:[]}}}], next_before_seq:null}));
+    await flush(); await flush();
+    chk("oracle1044 H replacement keeps bottom follower", oracleViewport.scrollTop === oracleViewport.scrollHeight
+        && userScrolled === false && elsById["jumpBottomBtn"].hidden === true,
+        "top=" + oracleViewport.scrollTop + " height=" + oracleViewport.scrollHeight);
+    oracleSnapshot = 'event: snapshot\ndata: [{"type":"message","message":{"User":{"content":"bottom H","images":[]}}}]\n\n';
+    oracleSseReadResolve({done:false, value:""}); await flush(); await flush();
 
     // ---- restored streaming tail reconciliation ----
     // Cache A after ABC, leave it while B is active, then return. The initial
@@ -8454,26 +8928,42 @@ main();
    .replace("MODE === 'markdown'", 'true' if MODE == 'markdown' else 'false') \
    .replace("MODE === 'waiting-input'", 'true' if MODE == 'waiting-input' else 'false') \
    .replace("MODE === 'refresh-deep-link'", 'true' if MODE == 'refresh-deep-link' else 'false') \
-   .replace("MODE === 'fragment'", 'true' if MODE == 'fragment' else 'false')
+   .replace("MODE === 'fragment'", 'true' if MODE in ('fragment', 'splice') else 'false') \
+   .replace("MODE === 'splice'", 'true' if MODE == 'splice' else 'false')
 
 # DEEP_LINK env → location.search 注入（init() 启动时 URL 解析入口）
-HARNESS = HARNESS.replace('globalThis.location={ pathname:', 'globalThis.__fragmentHarness=' + ('true' if MODE == 'fragment' else 'false') + '; globalThis.location={ pathname:')
+HARNESS = HARNESS.replace('globalThis.location={ pathname:', 'globalThis.__fragmentHarness=' + ('true' if MODE in ('fragment', 'splice') else 'false') + '; globalThis.location={ pathname:')
 TAIL = TAIL.replace('__CROSS_PAYLOAD__', json.dumps(CROSS_PAYLOAD)[1:-1])
 HARNESS = HARNESS.replace('__DEEP_LINK_SEARCH__', ('?session=' + DEEP_LINK) if DEEP_LINK else '')
 
 out = os.path.join(HERE, '.test_harness.js')
 with open(out, 'w', encoding='utf-8') as f:
     f.write(HARNESS + vendor_js + "\n" + js + "\n" + usage_dashboard_js + TAIL)
-r = subprocess.run(['gjs', out], capture_output=True, text=True)
-print(r.stdout, end="")
-if r.stderr.strip():
-    print(r.stderr[:12000])
-    # gjs 的 PASS/FAIL/ALL PASS 都走 stderr，且总输出可能超过 12000 字符：
-    # 只打印头部会把结尾的 "ALL PASS"/"N FAILURES" 截掉，导致 exit code
-    # 误报（"ALL PASS" 判据找不到）。补打尾部，保证总判定永远可见。
-    if len(r.stderr) > 12000:
-        print("... [stderr tail] ...")
-        print(r.stderr[-3000:])
+if RAW_GJS:
+    # Stream and retain the same bytes.  A shell timeout therefore leaves the
+    # last GJS callback in its redirected log, while a successful run still
+    # supplies ALL PASS to the ordinary verdict below.
+    proc = subprocess.Popen(['gjs', out], stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True)
+    raw_lines = []
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        raw_lines.append(line)
+        print(line, end="", flush=True)
+    r = subprocess.CompletedProcess(proc.args, proc.wait())
+    r_stdout, r_stderr = "".join(raw_lines), ""
+else:
+    r = subprocess.run(['gjs', out], capture_output=True, text=True)
+    r_stdout, r_stderr = r.stdout, r.stderr
+    print(r_stdout, end="")
+    if r_stderr.strip():
+        print(r_stderr[:12000])
+        # gjs 的 PASS/FAIL/ALL PASS 都走 stderr，且总输出可能超过 12000 字符：
+        # 只打印头部会把结尾的 "ALL PASS"/"N FAILURES" 截掉，导致 exit code
+        # 误报（"ALL PASS" 判据找不到）。补打尾部，保证总判定永远可见。
+        if len(r_stderr) > 12000:
+            print("... [stderr tail] ...")
+            print(r_stderr[-3000:])
 if os.environ.get('KEEP') != '1':
     os.unlink(out)
 
@@ -8754,7 +9244,7 @@ if not (_usage_shell_ok and _usage_contract_ok and _usage_states_ok and _usage_r
 
 
 if MODE == 'connector':
-    sys.exit(0 if ("ALL PASS" in r.stdout + r.stderr) and _task_card_indent_ok and _task_connector_ok else 1)
+    sys.exit(0 if ("ALL PASS" in r_stdout + r_stderr) and _task_card_indent_ok and _task_connector_ok else 1)
 if MODE == 'header':
-    sys.exit(0 if ("ALL PASS" in r.stdout + r.stderr) and _header_busy_ok else 1)
-sys.exit(0 if ("ALL PASS" in r.stdout + r.stderr) and _css_ok and _spin_ok and _status_rules_ok and _status_contrast_ok and _status_scope_ok and _header_busy_ok and _marker_ok and _empty_ok and _diagram_font_ok and _usage_mobile_ok and _chip_ok and _diff_rules_ok and _txt_ok and _contrast_ok and _viewport_ok and _zoom_guard_ok and _icon_ok and _usage_shell_ok and _usage_contract_ok and _usage_states_ok and _usage_responsive_ok else 1)
+    sys.exit(0 if ("ALL PASS" in r_stdout + r_stderr) and _header_busy_ok else 1)
+sys.exit(0 if ("ALL PASS" in r_stdout + r_stderr) and _css_ok and _spin_ok and _status_rules_ok and _status_contrast_ok and _status_scope_ok and _header_busy_ok and _marker_ok and _empty_ok and _diagram_font_ok and _usage_mobile_ok and _chip_ok and _diff_rules_ok and _txt_ok and _contrast_ok and _viewport_ok and _zoom_guard_ok and _icon_ok and _usage_shell_ok and _usage_contract_ok and _usage_states_ok and _usage_responsive_ok else 1)
