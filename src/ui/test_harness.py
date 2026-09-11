@@ -981,6 +981,37 @@ async function main(){
     chk("splice unmatched ownerless result component follows matched c1 not latest c2", r.match
       && r.output.components.map(x=>x.source==="history" ? "H:"+x.part+":"+x.owner : "S:"+x.index).join("|").includes("H:call:0:c1|S:3"));
 
+    r = plan([{type:"message",message:{Assistant:{content:"H-UNMATCHED",tool_calls:[{id:"pending",name:"bash",arguments:"{}"}]}}}],
+      [{type:"tool_result",data:{content:"S-UNRELATED-OWNERLESS",is_error:false}}]);
+    const unrelated = r.output.components.find(x=>x.source === "snapshot");
+    chk("splice unmatched pending H call does not own unrelated S result", !r.match && unrelated && !unrelated.owner);
+    elsById["messages"].innerHTML = ""; state.acc = newAccumulator();
+    renderSpliceComponents(r.output.components);
+    const unrelatedCards = elsById["messages"].querySelectorAll(".tool-card");
+    chk("splice unrelated ownerless result stays independent of unmatched pending H call", unrelatedCards.length === 2
+      && unrelatedCards[0].textContent.includes("等待结果") && unrelatedCards[1].textContent.includes("S-UNRELATED-OWNERLESS"));
+
+    const ownerlessH = [{type:"message", message:{User:{content:"old"}}},
+      {type:"message", message:{Assistant:{content:"first", tool_calls:[{id:"h1",name:"one",arguments:"{}"}]}}},
+      {type:"message", message:{Tool:{call_id:"h1",content:"H-FIRST-RESULT",is_error:false}}},
+      {type:"message", message:{User:{content:"next"}}},
+      {type:"message", message:{Assistant:{content:"second", tool_calls:[{id:"h2",name:"two",arguments:"{}"}]}}},
+      {type:"message", message:{Tool:{call_id:"h2",content:"H-SECOND-RESULT",is_error:false}}}];
+    const ownerlessS = [{type:"user_prompt",data:"old"},{type:"assistant_text",data:"first"},
+      {type:"tool_call",data:{name:"one",arguments:"{}"}},{type:"tool_result",data:{content:"H-FIRST-RESULT",is_error:false}},
+      {type:"user_prompt",data:"next"},{type:"assistant_text",data:"second"},{type:"tool_call",data:{name:"two",arguments:"{}"}},
+      {type:"tool_result",data:{content:"H-SECOND-RESULT",is_error:false}},{type:"tool_result",data:{content:"S-OWNERLESS",is_error:false}},
+      {type:"tool_call",data:{call_id:"live",name:"live",arguments:"{}"}},{type:"tool_result",data:{call_id:"live",content:"S-LIVE",is_error:false}}];
+    r = plan(ownerlessH, ownerlessS);
+    const ownerlessComponent = r.output.components.find(x=>x.source === "snapshot" && x.index === 8);
+    chk("splice unmatched ownerless result has no inferred owner after completed H cards", r.match && ownerlessComponent && !ownerlessComponent.owner);
+    elsById["messages"].innerHTML = ""; state.acc = newAccumulator();
+    renderSpliceComponents(r.output.components);
+    const ownerlessCards = elsById["messages"].querySelectorAll(".tool-card");
+    chk("splice ownerless result is independent and later live call/result still pair", ownerlessCards.length === 4
+      && ownerlessCards[0].textContent.includes("H-FIRST-RESULT") && ownerlessCards[1].textContent.includes("H-SECOND-RESULT")
+      && ownerlessCards[2].textContent.includes("S-OWNERLESS") && ownerlessCards[3].textContent.includes("S-LIVE"));
+
     r = plan([{type:"message", message:{Assistant:{content:"answer", tool_calls:[]}}}],
       [{type:"assistant_text",data:"answer"},{type:"error",data:"partial failed"}]);
     chk("splice persisted answer plus unpersisted error retains error", !r.match && r.output.snapshot.extras.length === 2);
@@ -988,6 +1019,20 @@ async function main(){
     r = plan([{type:"message", message:{Assistant:{content:"hello", tool_calls:[]}}}],
       [{type:"assistant_delta", data:"hello world"}]);
     chk("splice active sparse prefix remains unresolved and retained", !r.match && r.output.snapshot.extras.length === 1);
+
+    // Source-review counterexamples: record the conservative current outcome;
+    // this repair does not broaden matching or hide their snapshot data.
+    r = plan([{type:"message", message:{Assistant:{content:"hello world", tool_calls:[]}}},
+      {type:"message", message:{User:{content:"next"}}},
+      {type:"message", message:{Assistant:{content:"answer", tool_calls:[]}}}],
+      [{type:"assistant_delta",data:"world"},{type:"user_prompt",data:"next"},{type:"assistant_text",data:"answer"}]);
+    chk("source review truncated assistant prefix remains unmatched and visible", !r.match && r.output.snapshot.extras.length === 3);
+    r = plan([{type:"message", message:{Assistant:{content:"answer",reasoning:"complete reasoning",tool_calls:[]}}},
+      {type:"message", message:{User:{content:"next"}}},
+      {type:"message", message:{Assistant:{content:"done",tool_calls:[]}}}],
+      [{type:"reasoning_delta",data:"partial reasoning"},{type:"assistant_text",data:"answer"},
+        {type:"user_prompt",data:"next"},{type:"assistant_text",data:"done"}]);
+    chk("source review partial reasoning remains raw and visible", r.match && r.output.snapshot.extras.join(",") === "0");
     console.log(fail===0 ? "ALL PASS" : fail+" FAILURES");
     imports.system.exit(0);
   }

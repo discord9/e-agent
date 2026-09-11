@@ -945,28 +945,15 @@ function appendToolCall(name, args, acc, callId) {
   pruneMessages();      // 卡片是「执行中…」：进行中，不折叠
 }
 
-function appendToolResult(isError, content, acc, callId) {
+function appendToolResult(isError, content, acc, callId, allowLiveFallback) {
   let card = null;
-  if (callId && acc.pendingByCall.has(callId)) {
-    card = acc.pendingByCall.get(callId);
-    // spliceLastCard is only an ownerless-snapshot fallback. An explicit
-    // call result must consume its own card and cannot arm a later live
-    // ownerless result to overwrite this completed history card.
-    acc.spliceLastCard = null;
-  }
-  if (!card && acc.spliceLastCard) {
-    // A merged snapshot's ownerless result follows the call selected by the
-    // splice plan.  Do not let the normal live fallback steal a later call.
-    card = acc.spliceLastCard;
-    for (const t of acc.toolStack) if (t.el === card) t.filled = true;
-    acc.spliceLastCard = null;
-  }
-  if (!card) {
-    // 从后往前找最近一个未填充的卡片
+  if (callId && acc.pendingByCall.has(callId)) card = acc.pendingByCall.get(callId);
+  if (!card && allowLiveFallback !== false) {
+    // Live ownerless events retain the established newest-pending-card behavior.
     for (let i = acc.toolStack.length - 1; i >= 0; i--) {
       if (!acc.toolStack[i].filled) { card = acc.toolStack[i].el; acc.toolStack[i].filled = true; break; }
     }
-  } else {
+  } else if (card) {
     for (const t of acc.toolStack) if (t.el === card) t.filled = true;
   }
   if (card) {
@@ -1461,7 +1448,6 @@ function renderSpliceComponents(components) {
   const offset = real.scrollHeight - real.scrollTop - real.clientHeight;
   const wasFollowing = offset <= 4;
   const acc = newAccumulator(), pending = acc.pendingByCall;
-  let lastCard = null;
   temp.innerHTML = "";
   els.messages = temp;
   state.acc = acc;
@@ -1490,11 +1476,10 @@ function renderSpliceComponents(components) {
           const tc = calls[Number(component.part.slice(5))] || {};
           freezeAssistant(acc);
           const card = buildToolCard(tc.name, tc.arguments, "等待结果…", "pending", null);
-          temp.appendChild(card); pending.set(tc.id, card); acc.toolStack.push({el:card, filled:false}); lastCard = card;
+          temp.appendChild(card); pending.set(tc.id, card); acc.toolStack.push({el:card, filled:false});
         } else if (component.part === "result") {
-          const t = message.Tool || {}; const card = pending.get(t.call_id);
-          if (card) { acc.spliceLastCard = card; appendToolResult(t.is_error === true, t.content || "", acc, t.call_id); lastCard = card; }
-          else appendToolResult(t.is_error === true, t.content || "", acc, t.call_id);
+          const t = message.Tool || {};
+          appendToolResult(t.is_error === true, t.content || "", acc, t.call_id);
         } else renderEntry(entry, acc, pending);
       } else {
         const event = component.raw || {}, type = String(event.type || "").toLowerCase();
@@ -1506,13 +1491,12 @@ function renderSpliceComponents(components) {
         else if (type === "tool_call" || type === "toolcall") {
           const p = data && typeof data === "object" ? data : {};
           appendToolCall(pickText(p,["name"]), typeof p.arguments === "string" ? p.arguments : JSON.stringify(p.arguments || {}), acc, p.call_id);
-          lastCard = acc.toolStack[acc.toolStack.length - 1].el;
         } else if (type === "tool_result" || type === "toolresult") {
           const p = data && typeof data === "object" ? data : {};
-          // Snapshot results can be ownerless.  The splice order puts one after
-          // its matched H call; use that card, never the generic latest card.
-          acc.spliceLastCard = lastCard;
-          appendToolResult(p.is_error === true || p.error === true, pickText(p,["content","text","result","error"]), acc, p.call_id);
+          // A snapshot result may only fill a card by its explicit owner.  A
+          // missing owner is an independent result, not permission to reuse
+          // whichever completed history card happened to render most recently.
+          appendToolResult(p.is_error === true || p.error === true, pickText(p,["content","text","result","error"]), acc, component.owner || p.call_id, false);
         } else if (type === "notice") appendNotice(pickText(data,["text","message"]));
         else if (type === "error") appendError(pickText(data,["error","message","text"]));
         else if (type === "background_completed" || type === "backgroundcompletionnotice") {

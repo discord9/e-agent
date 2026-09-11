@@ -304,7 +304,7 @@ function normalizeSnapshotForSplice(events) {
     if (type === "assistant_text" || type === "assistanttext") out.push(spliceRecord("snapshot", index, "assistant", event, { part:"text", text:eventText(data,["text","content"]) }));
     else if (type === "user_prompt" || type === "userprompt") out.push(spliceRecord("snapshot", index, "user", event, { part:"user", text:eventText(data,["text","prompt","content"]) }));
     else if (type === "tool_call" || type === "toolcall") { const p=data && typeof data === "object" ? data : {}; out.push(spliceRecord("snapshot",index,"tool_call",event,{part:"call",name:eventText(p,["name"]),arguments:typeof p.arguments === "string" ? p.arguments : JSON.stringify(p.arguments || {})})); }
-    else if (type === "tool_result" || type === "toolresult") { const p=data && typeof data === "object" ? data : {}; out.push(spliceRecord("snapshot",index,"tool_result",event,{part:"result",content:eventText(p,["content","text","result","error"]),isError:p.is_error === true || p.error === true})); }
+    else if (type === "tool_result" || type === "toolresult") { const p=data && typeof data === "object" ? data : {}; out.push(spliceRecord("snapshot",index,"tool_result",event,{part:"result",owner:p.call_id || "",content:eventText(p,["content","text","result","error"]),isError:p.is_error === true || p.error === true})); }
     else if (type === "usage") out.push(spliceRecord("snapshot",index,"usage",event,{part:"usage",neutral:true}));
     else if (type === "notice") out.push(spliceRecord("snapshot",index,"notice",event,{part:"notice",text:eventText(data,["text","message"]),display:true}));
     else if (type === "error") out.push(spliceRecord("snapshot",index,"error",event,{part:"error",text:eventText(data,["error","message","text"])}));
@@ -395,7 +395,16 @@ function splicePlan(historyEntries, snapshotEvents, history, snapshot, match) {
   const emitSnapshot = (record) => {
     for (const index of record.indices) {
       if (!matched.has(index) && !uiOnly.has(index)) {
-        components.push({source:"snapshot",index,raw:snapshotEvents[index]});
+        const previous = components[components.length - 1];
+        // An ownerless snapshot result is eligible for a card only when this
+        // already-ordered plan places it directly after its H call component.
+        // A completed H result, assistant, or any S component proves nothing.
+        const owner = record.kind === "tool_result" && !record.owner
+          // Adjacency alone is not ownership: the preceding H call must itself
+          // be an exact H/S match anchor in this splice plan.
+          && previous && previous.source === "history" && previous.matched
+          && String(previous.part || "").startsWith("call:") ? previous.owner : "";
+        components.push({source:"snapshot",index,raw:snapshotEvents[index],owner});
       }
     }
   };
@@ -413,7 +422,7 @@ function splicePlan(historyEntries, snapshotEvents, history, snapshot, match) {
       while (si < limit) emitSnapshot(snapshot[si++]);
     }
     components.push({source:"history",entry:history[h].index,part:history[h].part,
-      raw:history[h].raw,owner:history[h].owner || ""});
+      raw:history[h].raw,owner:history[h].owner || "",matched:pairsByHistory.has(h)});
   }
   while (si < snapshot.length) emitSnapshot(snapshot[si++]);
   return { history:{entries:historyEntries.slice(), execution:history.filter(r=>r.kind==="tool_call"||r.kind==="tool_result").map(r=>({kind:r.kind,entry:r.index,part:r.part,owner:r.owner||""}))}, snapshot:{events:snapshotEvents.slice(),matched:[...matched],extras,uiOnly:[...uiOnly]}, components };
