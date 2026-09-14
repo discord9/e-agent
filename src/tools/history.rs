@@ -20,6 +20,7 @@ impl Tool for History {
             name: "history".into(),
             description: "Read logical transcripts. Without `scope`, the current session API is unchanged. Explicit `scope` is `global`, `workspace`, or `session`; scoped list/search return provenance and a cursor. `global` searches this configured store only. IDs require an explicit scope.".into(),
             parameters: json!({
+                "type": "object",
                 "oneOf": [
                     {"type":"object","properties":{"action":{"const":"list"},"limit":{"type":"integer","minimum":1,"maximum":100},"scope":{"enum":["global","workspace","session"]},"workspace_id":{"type":"string","minLength":1},"session_id":{"type":"string","minLength":1},"cursor":{"type":"string","minLength":1}},"required":["action"],"additionalProperties":false},
                     {"type":"object","properties":{"action":{"const":"read"},"seq":{"type":"integer"},"scope":{"const":"session"},"workspace_id":{"type":"string","minLength":1},"session_id":{"type":"string","minLength":1}},"required":["action","seq"],"additionalProperties":false},
@@ -548,6 +549,7 @@ mod tests {
     #[test]
     fn schema_preserves_actions_and_adds_explicit_selectors() {
         let parameters = History.spec().parameters;
+        assert_eq!(parameters["type"], json!("object"));
         assert_eq!(parameters["oneOf"].as_array().unwrap().len(), 3);
         assert_eq!(
             parameters["oneOf"][0]["properties"]["action"]["const"],
