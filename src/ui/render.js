@@ -945,15 +945,17 @@ function appendToolCall(name, args, acc, callId) {
   pruneMessages();      // 卡片是「执行中…」：进行中，不折叠
 }
 
-function appendToolResult(isError, content, acc, callId, allowLiveFallback) {
+function appendToolResult(isError, content, acc, callId) {
   let card = null;
-  if (callId && acc.pendingByCall.has(callId)) card = acc.pendingByCall.get(callId);
-  if (!card && allowLiveFallback !== false) {
-    // Live ownerless events retain the established newest-pending-card behavior.
+  if (callId && acc.pendingByCall.has(callId)) {
+    card = acc.pendingByCall.get(callId);
+  }
+  if (!card) {
+    // 从后往前找最近一个未填充的卡片
     for (let i = acc.toolStack.length - 1; i >= 0; i--) {
       if (!acc.toolStack[i].filled) { card = acc.toolStack[i].el; acc.toolStack[i].filled = true; break; }
     }
-  } else if (card) {
+  } else {
     for (const t of acc.toolStack) if (t.el === card) t.filled = true;
   }
   if (card) {
@@ -1049,15 +1051,9 @@ function parseToolArgs(name, argsText) {
    元素重新绑定到新的累积器上：后续 ReasoningDelta / AssistantDelta /
    ToolResult 续写进旧块，而不是另起一块（否则同一个思考/助手/工具卡片会
    重复出现多个）。历史/已完成（dot.done / 已 markdown 化）的元素绝不绑定。 */
-function reattachInFlight(acc, roots) {
-  // When history has just replaced a restored view, only the explicitly moved
-  // in-flight roots are eligible.  A plain-text historical Assistant must not
-  // become a live accumulator merely because it happens to be the last node.
-  const scope = roots || [els.messages];
-  const found = (selector, rootMatches) => scope.flatMap((root) =>
-    (rootMatches(root) ? [root] : []).concat([...root.querySelectorAll(selector)]));
+function reattachInFlight(acc) {
   // 1. thinking：最后一个 details.thinking，且其 .think-dot 没有 .done（进行中）才绑定
-  const thinks = found("details.thinking", (root) => (root.tagName === "DETAILS" || root.tag === "details") && root.classList.contains("thinking"));
+  const thinks = [...els.messages.querySelectorAll("details.thinking")];
   const t = thinks[thinks.length - 1];
   if (t && !t.querySelector(".think-dot.done")) {
     acc.thinkingEl = t;
@@ -1066,7 +1062,7 @@ function reattachInFlight(acc, roots) {
   }
   // 2. assistant：最后一个 .msg-assistant，且其 .msg-body 是纯文本（流式期间
   //    未 markdown 化，无元素子节点）→ 进行中，绑定并把 textContent 取回
-  const as = found(".msg-assistant", (root) => root.classList.contains("msg-assistant"));
+  const as = [...els.messages.querySelectorAll(".msg-assistant")];
   const a = as[as.length - 1];
   if (a) {
     const body = a.querySelector(".msg-body");
@@ -1078,7 +1074,7 @@ function reattachInFlight(acc, roots) {
   }
   // 3. 工具卡片：所有 .tool-state 文本为 "执行中…" 的 details.tool-card →
   //    push 进 acc.toolStack（filled:false），供 appendToolResult 的 fallback 配对
-  for (const c of found("details.tool-card", (root) => (root.tagName === "DETAILS" || root.tag === "details") && root.classList.contains("tool-card"))) {
+  for (const c of [...els.messages.querySelectorAll("details.tool-card")]) {
     const st = c.querySelector(".tool-state");
     if (st && st.textContent === "执行中…") acc.toolStack.push({ el: c, filled: false });
   }
@@ -1220,16 +1216,12 @@ function appendCompaction(summary) {
 /* =====================================================================
  * History 全量渲染（SessionEntry 数组）
  * ===================================================================*/
-function goalNoticeText(goal) {
-  return goal
-    ? "goal [" + (goal.status || "?") + "] " + (goal.objective || "")
-    : "goal cleared";
-}
 function renderEntry(entry, acc, pendingCards) {
   switch (entry.type) {
     case "message": return renderMessage(entry.message, acc, pendingCards);
     case "compaction": return appendCompaction(entry.summary);
-    case "notice": return appendNotice(entry.text);
+    case "notice":
+    case "display": return appendNotice(entry.text);
     case "error": return appendError(entry.text);
     case "background_completion":
       return appendBackgroundCompletion(entry.id ?? "?", entry.label, entry.output || "");
@@ -1239,7 +1231,9 @@ function renderEntry(entry, acc, pendingCards) {
       return scrollBottom(false);
     case "goal_updated":
       // goal 快照/墓碑：一行 notice（不当作用户消息）
-      return appendNotice(goalNoticeText(entry.goal));
+      return entry.goal
+        ? appendNotice("goal [" + entry.goal.status + "] " + (entry.goal.objective || ""))
+        : appendNotice("goal cleared");
     case "prompt_queued":
       // 历史记录里的排队提示（后端演进若引入）：显示为 notice，不落入默认分支
       return appendNotice("⏳ 提示已排队: "
@@ -1440,97 +1434,6 @@ function pruneMessages() {
 function renderHistory(entries) {
   renderEntries(entries, false);
   scrollBottom(true);
-}
-
-/* Render the splice helper's ordered components into a real offscreen DOM, then
-   move those nodes into the visible list.  Moving (rather than innerHTML) keeps
-   accumulator/card references valid for the live event immediately after a
-   snapshot. */
-function renderSpliceComponents(components) {
-  const real = els.messages, temp = real.cloneNode(false), prior = state.acc;
-  const offset = real.scrollHeight - real.scrollTop - real.clientHeight;
-  const wasFollowing = offset <= 4;
-  const acc = newAccumulator(), pending = acc.pendingByCall;
-  temp.innerHTML = "";
-  els.messages = temp;
-  state.acc = acc;
-  suppressScroll = true;
-  try {
-    for (const component of components || []) {
-      if (component.source === "history") {
-        const entry = component.raw || {};
-        const message = entry.message || {};
-        if (component.part === "user") {
-          const u = message.User || {}; appendUserMsg(u.content || ""); appendUserImages(u.images || []);
-        } else if (component.part === "system") {
-          appendSystemMsg((message.System || {}).content || "");
-        } else if (component.part === "reasoning") {
-          const a = message.Assistant || {}, det = el("details", "thinking");
-          det.open = false;
-          const sum = el("summary", "", ""), dot = el("span", "think-dot done"), label = el("span", "think-label", "思考");
-          sum.append(dot, label); det.append(sum, el("div", "think-body", a.reasoning || "")); temp.appendChild(det);
-        } else if (component.part === "text" || component.part === "empty") {
-          const a = message.Assistant || {}; freezeAssistant(acc);
-          const body = assistantBubble(acc, true);
-          if (component.part === "empty") body.innerHTML = "<span class=\"dim\">（空回复）</span>";
-          else { body.innerHTML = renderMarkdown(a.content || ""); acc.assistantText = a.content || ""; }
-        } else if (component.part && component.part.startsWith("call:")) {
-          const calls = (message.Assistant || {}).tool_calls || [];
-          const tc = calls[Number(component.part.slice(5))] || {};
-          freezeAssistant(acc);
-          const card = buildToolCard(tc.name, tc.arguments, "等待结果…", "pending", null);
-          temp.appendChild(card); pending.set(tc.id, card); acc.toolStack.push({el:card, filled:false});
-        } else if (component.part === "result") {
-          const t = message.Tool || {};
-          appendToolResult(t.is_error === true, t.content || "", acc, t.call_id);
-        } else renderEntry(entry, acc, pending);
-      } else {
-        const event = component.raw || {}, type = String(event.type || "").toLowerCase();
-        const data = event.data !== undefined ? event.data : event;
-        if (type === "user_prompt" || type === "userprompt") appendUserMsg(pickText(data, ["text", "prompt", "content"]));
-        else if (type === "assistant_text" || type === "assistanttext") setAssistantText(pickText(data, ["text", "content"]), acc);
-        else if (type === "assistant_delta" || type === "assistantdelta") appendAssistantDelta(pickText(data, ["delta", "text", "content"]), acc);
-        else if (type === "reasoning_delta" || type === "reasoningdelta") appendReasoningDelta(pickText(data, ["delta", "text", "reasoning"]), acc);
-        else if (type === "tool_call" || type === "toolcall") {
-          const p = data && typeof data === "object" ? data : {};
-          appendToolCall(pickText(p,["name"]), typeof p.arguments === "string" ? p.arguments : JSON.stringify(p.arguments || {}), acc, p.call_id);
-        } else if (type === "tool_result" || type === "toolresult") {
-          const p = data && typeof data === "object" ? data : {};
-          // A snapshot result may only fill a card by its explicit owner.  A
-          // missing owner is an independent result, not permission to reuse
-          // whichever completed history card happened to render most recently.
-          appendToolResult(p.is_error === true || p.error === true, pickText(p,["content","text","result","error"]), acc, component.owner || p.call_id, false);
-        } else if (type === "notice" || type === "display") appendNotice(pickText(data,["text","message"]));
-        else if (type === "goal_updated" || type === "goalupdated") {
-          appendNotice(goalNoticeText(data && typeof data === "object" ? (data.goal || null) : null));
-        } else if (type === "error") appendError(pickText(data,["error","message","text"]));
-        else if (type === "background_completed" || type === "backgroundcompletionnotice") {
-          const p = data && typeof data === "object" ? data : {}; appendBackgroundCompletion(p.id ?? "?", p.label, pickText(p,["output","text","content"]));
-        }
-      }
-    }
-  } finally {
-    suppressScroll = false;
-    els.messages = real;
-  }
-  while (real.firstChild) real.firstChild.remove();
-  while (temp.firstChild) real.appendChild(temp.firstChild); // move nodes; do not serialize/recreate
-  state.acc = acc;
-  pruneMessages();
-  if (wasFollowing) {
-    scrollBottom(true);
-  } else {
-    real.scrollTop = Math.max(0, real.scrollHeight - real.clientHeight - offset);
-    userScrolled = true;
-    els.jumpBottomBtn.hidden = false;
-  }
-  return prior;
-}
-
-function renderMergedHistorySnapshot(historyEntries, snapshotEvents) {
-  const plan = spliceHistorySnapshot(historyEntries || [], snapshotEvents || []).output;
-  renderSpliceComponents(plan.components);
-  return plan;
 }
 
 /* =====================================================================
