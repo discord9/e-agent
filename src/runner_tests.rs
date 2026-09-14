@@ -777,7 +777,7 @@ fn persisted_request_user_input_call_is_repaired_on_resume_not_waiting() {
 }
 
 #[test]
-fn entry_event_projects_forked_from_as_notice() {
+fn entry_event_projects_forked_from_as_display() {
     let event = entry_event(&SessionEntry::ForkedFrom {
         source: "src-123".into(),
         at: 4,
@@ -785,8 +785,8 @@ fn entry_event_projects_forked_from_as_notice() {
         seq: Some(3),
     });
     assert!(
-        matches!(event, Some(AgentEvent::Notice(text)) if text == "forked from src-123 at entry 4"),
-        "forked_from must project to a dim Notice line"
+        matches!(event, Some(AgentEvent::Display(text)) if text == "forked from src-123 at entry 4"),
+        "forked_from must project to a dim Display line"
     );
     // Provenance fields never leak into the projection.
     let event = entry_event(&SessionEntry::ForkedFrom {
@@ -796,7 +796,7 @@ fn entry_event_projects_forked_from_as_notice() {
         seq: None,
     });
     assert!(
-        matches!(event, Some(AgentEvent::Notice(text)) if text == "forked from src-123 at entry 4")
+        matches!(event, Some(AgentEvent::Display(text)) if text == "forked from src-123 at entry 4")
     );
 }
 
@@ -1251,14 +1251,14 @@ async fn compaction_deltas_are_live_only_and_success_has_one_projection() {
 
     release.notify_one();
     assert!(
-        matches!(live.recv().await.unwrap(), AgentEvent::Notice(text) if text == "compacted: The user asked an earlier question and the assistant replied; the conversation then moved on to the latest request, which is still being worked on.")
+        matches!(live.recv().await.unwrap(), AgentEvent::Display(text) if text == "compacted: The user asked an earlier question and the assistant replied; the conversation then moved on to the latest request, which is still being worked on.")
     );
     let snapshot = handle.snapshot();
     assert_eq!(
         snapshot
             .iter()
             .filter(
-                |event| matches!(event, AgentEvent::Notice(text) if text == "compacted: The user asked an earlier question and the assistant replied; the conversation then moved on to the latest request, which is still being worked on.")
+                |event| matches!(event, AgentEvent::Display(text) if text == "compacted: The user asked an earlier question and the assistant replied; the conversation then moved on to the latest request, which is still being worked on.")
             )
             .count(),
         1
@@ -1306,7 +1306,7 @@ async fn failed_compaction_persists_error_without_compaction_entry() {
     }
     assert!(
         !handle.snapshot().iter().any(
-            |event| matches!(event, AgentEvent::Notice(text) if text.starts_with("compacted:"))
+            |event| matches!(event, AgentEvent::Display(text) if text.starts_with("compacted:"))
         )
     );
     let loaded = SessionStore::Jsonl
@@ -1495,7 +1495,7 @@ async fn finish_when_idle_drains_prompt_and_compact_queued_at_completion() {
         snapshot
             .iter()
             .filter(
-                |event| matches!(event, AgentEvent::Notice(text) if text == "compacted: The user asked an earlier question and the assistant replied; the conversation then moved on to the latest request, which is still being worked on.")
+                |event| matches!(event, AgentEvent::Display(text) if text == "compacted: The user asked an earlier question and the assistant replied; the conversation then moved on to the latest request, which is still being worked on.")
             )
             .count(),
         1
@@ -2571,7 +2571,7 @@ async fn request_compaction_is_superseded_by_queued_human_prompt_after_siblings(
     handle.prompt("human wins");
     release.notify_one();
     wait_for_log_event(&handle, |event| {
-        matches!(event, AgentEvent::Notice(text) if text == "compaction request superseded by queued human work")
+        matches!(event, AgentEvent::Display(text) if text == "compaction request superseded by queued human work")
     })
     .await;
     wait_for_log_event(
@@ -2657,7 +2657,7 @@ async fn request_compaction_is_superseded_by_queued_goal_after_siblings() {
     assert!(handle.goal_command(GoalCommand::Action(crate::agent::GoalAction::Pause)));
     release.notify_one();
     wait_for_log_event(&handle, |event| {
-        matches!(event, AgentEvent::Notice(text) if text == "compaction request superseded by queued human work")
+        matches!(event, AgentEvent::Display(text) if text == "compaction request superseded by queued human work")
     })
     .await;
     wait_for_goal(
@@ -2938,7 +2938,7 @@ async fn consecutive_compacts_are_not_folded() {
         snapshot
             .iter()
             .filter(
-                |event| matches!(event, AgentEvent::Notice(text) if text == "compacted: The user asked an earlier question and the assistant replied; the conversation then moved on to the latest request, which is still being worked on.")
+                |event| matches!(event, AgentEvent::Display(text) if text == "compacted: The user asked an earlier question and the assistant replied; the conversation then moved on to the latest request, which is still being worked on.")
             )
             .count(),
         1
@@ -2999,7 +2999,7 @@ async fn completed_tool_result_is_committed_before_stale_cancel() {
     loop {
         if matches!(
             live.recv().await.unwrap(),
-            AgentEvent::Notice(text) if text == "turn cancelled"
+            AgentEvent::Display(text) if text == "turn cancelled"
         ) {
             break;
         }
@@ -3431,7 +3431,7 @@ async fn in_flight_compaction_cancel_has_no_entry_or_projection() {
     loop {
         if matches!(
             live.recv().await.unwrap(),
-            AgentEvent::Notice(text) if text == "compaction cancelled"
+            AgentEvent::Display(text) if text == "compaction cancelled"
         ) {
             break;
         }
@@ -3458,7 +3458,7 @@ async fn in_flight_compaction_cancel_has_no_entry_or_projection() {
     );
     assert!(
         !handle.snapshot().iter().any(
-            |event| matches!(event, AgentEvent::Notice(text) if text.starts_with("compacted:"))
+            |event| matches!(event, AgentEvent::Display(text) if text.starts_with("compacted:"))
         )
     );
     drop(handle);
@@ -3496,7 +3496,7 @@ async fn completed_round_is_committed_before_stale_cancel() {
     loop {
         match live.recv().await.unwrap() {
             AgentEvent::AssistantText(text) if text == "completed answer" => break,
-            AgentEvent::Notice(text) if text == "turn cancelled" => {
+            AgentEvent::Display(text) if text == "turn cancelled" => {
                 panic!("a completed round must not be reported as cancelled")
             }
             _ => {}
@@ -3552,7 +3552,7 @@ async fn completed_compaction_is_committed_before_stale_cancel() {
     loop {
         if matches!(
             live.recv().await.unwrap(),
-            AgentEvent::Notice(text) if text == "compacted: The completed summary of the earlier conversation covers the earlier exchange between the user and the assistant; no unfinished work remains."
+            AgentEvent::Display(text) if text == "compacted: The completed summary of the earlier conversation covers the earlier exchange between the user and the assistant; no unfinished work remains."
         ) {
             break;
         }
@@ -3575,7 +3575,7 @@ async fn completed_compaction_is_committed_before_stale_cancel() {
             handle
                 .snapshot()
                 .iter()
-                .filter(|event| matches!(event, AgentEvent::Notice(text) if text == "compacted: The completed summary of the earlier conversation covers the earlier exchange between the user and the assistant; no unfinished work remains."))
+                .filter(|event| matches!(event, AgentEvent::Display(text) if text == "compacted: The completed summary of the earlier conversation covers the earlier exchange between the user and the assistant; no unfinished work remains."))
                 .count(),
             1
         );
@@ -5469,7 +5469,7 @@ async fn steer_release_preempts_in_flight_round_and_runs_queued_prompt_to_natura
 
     loop {
         match live.recv().await.unwrap() {
-            AgentEvent::Notice(text) if text == "turn cancelled" => break,
+            AgentEvent::Display(text) if text == "turn cancelled" => break,
             _ => {}
         }
     }
@@ -5581,7 +5581,7 @@ async fn steer_release_batches_multiple_queued_prompts_into_one_turn() {
 
     loop {
         match live.recv().await.unwrap() {
-            AgentEvent::Notice(text) if text == "turn cancelled" => break,
+            AgentEvent::Display(text) if text == "turn cancelled" => break,
             _ => {}
         }
     }
@@ -5647,7 +5647,7 @@ async fn steer_release_racing_round_completion_commits_answer_then_finalizes() {
     loop {
         match live.recv().await.unwrap() {
             AgentEvent::AssistantText(text) if text == "completed answer" => break,
-            AgentEvent::Notice(text) if text == "turn cancelled" => break,
+            AgentEvent::Display(text) if text == "turn cancelled" => break,
             _ => {}
         }
     }
@@ -5732,7 +5732,7 @@ async fn steer_release_during_tool_keeps_next_provider_context_legal() {
 
     loop {
         match live.recv().await.unwrap() {
-            AgentEvent::Notice(text) if text == "turn cancelled" => break,
+            AgentEvent::Display(text) if text == "turn cancelled" => break,
             _ => {}
         }
     }
@@ -5829,7 +5829,7 @@ async fn steer_release_during_compaction_leaves_no_projection_and_runs_queued_pr
 
     loop {
         match live.recv().await.unwrap() {
-            AgentEvent::Notice(text) if text == "compaction cancelled" => break,
+            AgentEvent::Display(text) if text == "compaction cancelled" => break,
             _ => {}
         }
     }
@@ -5866,7 +5866,7 @@ async fn steer_release_during_compaction_leaves_no_projection_and_runs_queued_pr
     assert!(
         !handle.snapshot().iter().any(|event| matches!(
             event,
-            AgentEvent::Notice(text) if text.starts_with("compacted:")
+            AgentEvent::Display(text) if text.starts_with("compacted:")
         )),
         "a released compaction must leave no projection"
     );
@@ -5909,7 +5909,7 @@ async fn steer_release_without_queued_prompt_finish_when_idle_finalizes_cancelle
 
     loop {
         match live.recv().await.unwrap() {
-            AgentEvent::Notice(text) if text == "turn cancelled" => break,
+            AgentEvent::Display(text) if text == "turn cancelled" => break,
             _ => {}
         }
     }
@@ -5977,7 +5977,7 @@ async fn steer_release_during_tool_without_queued_prompt_finish_when_idle_finali
 
     loop {
         match live.recv().await.unwrap() {
-            AgentEvent::Notice(text) if text == "turn cancelled" => break,
+            AgentEvent::Display(text) if text == "turn cancelled" => break,
             _ => {}
         }
     }
@@ -6023,7 +6023,7 @@ async fn steer_release_with_queued_compact_finish_when_idle_drops_the_compact() 
 
     loop {
         match live.recv().await.unwrap() {
-            AgentEvent::Notice(text) if text == "turn cancelled" => break,
+            AgentEvent::Display(text) if text == "turn cancelled" => break,
             _ => {}
         }
     }
@@ -6052,7 +6052,7 @@ async fn steer_release_with_queued_compact_finish_when_idle_drops_the_compact() 
     assert!(
         !handle.snapshot().iter().any(|event| matches!(
             event,
-            AgentEvent::Notice(text) if text.starts_with("compacted:")
+            AgentEvent::Display(text) if text.starts_with("compacted:")
         )),
         "a release-dropped queued Compact must leave no projection"
     );
@@ -6093,7 +6093,7 @@ async fn steer_release_without_queued_prompt_wait_for_input_returns_to_idle() {
 
     loop {
         match live.recv().await.unwrap() {
-            AgentEvent::Notice(text) if text == "turn cancelled" => break,
+            AgentEvent::Display(text) if text == "turn cancelled" => break,
             _ => {}
         }
     }
@@ -6156,7 +6156,7 @@ async fn steer_btw_wait_for_input_consumes_queued_prompts_then_returns_to_idle()
 
     loop {
         match live.recv().await.unwrap() {
-            AgentEvent::Notice(text) if text == "turn cancelled" => break,
+            AgentEvent::Display(text) if text == "turn cancelled" => break,
             _ => {}
         }
     }
@@ -6555,7 +6555,7 @@ async fn steer_fifo_queued_compact_prompt_cancel_runs_compact_before_prompt() {
     let mut order: Vec<String> = Vec::new();
     loop {
         match live.recv().await.unwrap() {
-            AgentEvent::Notice(text)
+            AgentEvent::Display(text)
                 if text == "turn cancelled" || text.starts_with("compacted:") =>
             {
                 order.push(text);
@@ -7537,7 +7537,7 @@ async fn wait_for_termination_notice(live: &mut tokio::sync::broadcast::Receiver
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
             match live.recv().await.unwrap() {
-                AgentEvent::Notice(text) if text == POLL_GUARD_TERMINATION_NOTICE => break,
+                AgentEvent::Display(text) if text == POLL_GUARD_TERMINATION_NOTICE => break,
                 AgentEvent::Error(text) => panic!("turn failed: {text}"),
                 _ => {}
             }
@@ -7713,7 +7713,7 @@ async fn poll_guard_runner_repeated_empty_polls_never_terminate_the_turn() {
     loop {
         match live.recv().await.unwrap() {
             AgentEvent::AssistantText(text) if text == "finished" => break,
-            AgentEvent::Notice(text) if text == POLL_GUARD_TERMINATION_NOTICE => {
+            AgentEvent::Display(text) if text == POLL_GUARD_TERMINATION_NOTICE => {
                 panic!("empty polls must never terminate the turn")
             }
             AgentEvent::Error(text) => panic!("turn failed: {text}"),
@@ -7818,7 +7818,7 @@ async fn poll_guard_runner_durable_batch_safe_point_and_next_turn_reset() {
         .expect("completion committed at the safe point");
     let notice_idx = snapshot
         .iter()
-        .position(|event| matches!(event, AgentEvent::Notice(text) if text == POLL_GUARD_TERMINATION_NOTICE))
+        .position(|event| matches!(event, AgentEvent::Display(text) if text == POLL_GUARD_TERMINATION_NOTICE))
         .expect("termination notice emitted");
     assert!(completion_idx < notice_idx);
     let loaded = SessionStore::Jsonl
@@ -7889,7 +7889,7 @@ async fn poll_guard_runner_durable_batch_safe_point_and_next_turn_reset() {
     loop {
         match live.recv().await.unwrap() {
             AgentEvent::AssistantText(text) if text == "finished" => break,
-            AgentEvent::Notice(text) if text == POLL_GUARD_TERMINATION_NOTICE => {
+            AgentEvent::Display(text) if text == POLL_GUARD_TERMINATION_NOTICE => {
                 panic!("empty polls must not terminate turn two")
             }
             AgentEvent::Error(text) => panic!("turn two failed: {text}"),
@@ -8521,7 +8521,7 @@ async fn goal_continue_idle_background_followup_then_resume() {
     handle.cancel();
     wait_for_log_event(
         &handle,
-        |event| matches!(event, AgentEvent::Notice(text) if text == "turn cancelled"),
+        |event| matches!(event, AgentEvent::Display(text) if text == "turn cancelled"),
     )
     .await;
     drop(handle);
@@ -8698,7 +8698,7 @@ async fn goal_continue_prompt_before_start_wins_without_goal_call() {
     handle.cancel();
     wait_for_log_event(
         &handle,
-        |event| matches!(event, AgentEvent::Notice(text) if text == "turn cancelled"),
+        |event| matches!(event, AgentEvent::Display(text) if text == "turn cancelled"),
     )
     .await;
     drop(handle);
@@ -9101,7 +9101,7 @@ async fn goal_continue_capped_compaction_missing_usage_stops_before_goal_provide
     handle.compact();
     wait_for_log_event(&handle, |event| {
         matches!(event,
-        AgentEvent::Notice(text) if text == "compacted: compacted summary")
+        AgentEvent::Display(text) if text == "compacted: compacted summary")
     })
     .await;
     wait_for_status(&mut handle.status(), |status| {
@@ -9423,7 +9423,7 @@ async fn capped_goal_skipping_auto_compaction_leaves_latch_for_next_human_turn()
     )
     .await;
     handle.prompt("human after cap");
-    wait_for_log_event(&handle, |event| matches!(event, AgentEvent::Notice(text) if text == "compacted: human compacted summary")).await;
+    wait_for_log_event(&handle, |event| matches!(event, AgentEvent::Display(text) if text == "compacted: human compacted summary")).await;
     assert_eq!(
         calls.lock().unwrap().len(),
         3,
@@ -9508,7 +9508,7 @@ async fn goal_continue_poll_guard_safe_point_remounts_after_committed_completion
         .expect("completion must commit at the poll safe point");
     let termination = snapshot
         .iter()
-        .position(|event| matches!(event, AgentEvent::Notice(text) if text == POLL_GUARD_TERMINATION_NOTICE))
+        .position(|event| matches!(event, AgentEvent::Display(text) if text == POLL_GUARD_TERMINATION_NOTICE))
         .expect("poll guard must end the first Goal turn");
     assert!(completion < termination);
     handle.cancel();
@@ -9856,7 +9856,7 @@ async fn oracle393_goal_manual_compact_resumes_turn_and_charges_budget() {
             if content.contains("[image read: pic.png]")
     )));
     assert!(snapshot.iter().any(|event| matches!(event,
-        AgentEvent::Notice(text) if text == "compacted: charged manual summary"
+        AgentEvent::Display(text) if text == "compacted: charged manual summary"
     )));
     assert_eq!(
         snapshot
@@ -9968,7 +9968,7 @@ async fn oracle393_missing_usage_tool_compact_never_resumes_as_ordinary() {
     release_tool.notify_one();
     wait_for_log_event(
         &handle,
-        |event| matches!(event, AgentEvent::Notice(text) if text == "compacted: manual summary"),
+        |event| matches!(event, AgentEvent::Display(text) if text == "compacted: manual summary"),
     )
     .await;
     wait_for_status(&mut handle.status(), |status| {
@@ -10355,7 +10355,7 @@ async fn oracle_followup_transferred_continue_precedes_blocked_tool_cancel_and_r
 }
 
 #[tokio::test]
-async fn oracle_followup_arm_and_missing_usage_notices_are_live_only_and_late_attachable() {
+async fn oracle_followup_arm_and_missing_usage_displays_are_live_only_and_late_attachable() {
     let temp = tempfile::tempdir().unwrap();
     let agent = Agent::new(
         Box::new(ScriptedAssistantModel {
@@ -10384,11 +10384,11 @@ async fn oracle_followup_arm_and_missing_usage_notices_are_live_only_and_late_at
     .unwrap();
     let task = runner.start(None);
     handle.continue_goal(Some(5));
-    wait_for_log_event(&handle, |event| matches!(event, AgentEvent::Notice(text) if text == "goal continuation armed (token cap: 5)")).await;
-    wait_for_log_event(&handle, |event| matches!(event, AgentEvent::Notice(text) if text == "goal continuation stopped: model usage unavailable")).await;
+    wait_for_log_event(&handle, |event| matches!(event, AgentEvent::Display(text) if text == "goal continuation armed (token cap: 5)")).await;
+    wait_for_log_event(&handle, |event| matches!(event, AgentEvent::Display(text) if text == "goal continuation stopped: model usage unavailable")).await;
     let (snapshot, _, _) = handle.attach();
-    assert!(snapshot.iter().any(|event| matches!(event, AgentEvent::Notice(text) if text == "goal continuation armed (token cap: 5)")));
-    assert!(snapshot.iter().any(|event| matches!(event, AgentEvent::Notice(text) if text == "goal continuation stopped: model usage unavailable")));
+    assert!(snapshot.iter().any(|event| matches!(event, AgentEvent::Display(text) if text == "goal continuation armed (token cap: 5)")));
+    assert!(snapshot.iter().any(|event| matches!(event, AgentEvent::Display(text) if text == "goal continuation stopped: model usage unavailable")));
     let loaded = SessionStore::Jsonl
         .load(temp.path(), "oracle-followup-live-notices")
         .await
@@ -10397,7 +10397,7 @@ async fn oracle_followup_arm_and_missing_usage_notices_are_live_only_and_late_at
         !serde_json::to_string(&loaded.entries)
             .unwrap()
             .contains("goal continuation"),
-        "driver notices must not become durable history"
+        "driver displays must not become durable history"
     );
     handle.cancel();
     wait_for_status(&mut handle.status(), |status| {
@@ -10508,10 +10508,10 @@ async fn exhausted_goal_input_answer_continues(usage: Option<Usage>, session: &s
     assert_eq!(
         snapshot
             .iter()
-            .filter(|event| matches!(event, AgentEvent::Notice(text) if text == stop_notice))
+            .filter(|event| matches!(event, AgentEvent::Display(text) if text == stop_notice))
             .count(),
         1,
-        "continuation stop is one live-only notice"
+        "continuation stop is one live-only display"
     );
     let entries = SessionStore::Jsonl
         .load(temp.path(), session)
@@ -10639,7 +10639,7 @@ async fn exhausted_maintenance_fresh_continue_starts_turn(usage: Option<Usage>, 
     release_tool.notify_one();
     wait_for_log_event(
         &handle,
-        |event| matches!(event, AgentEvent::Notice(text) if text == "compacted: maintenance summary"),
+        |event| matches!(event, AgentEvent::Display(text) if text == "compacted: maintenance summary"),
     )
     .await;
     wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)).await;
@@ -10777,7 +10777,7 @@ async fn oracle677_answer_requested_compaction_is_budget_exempt() {
         4,
         "answer request, answer-owned compaction, and final round"
     );
-    assert_eq!(handle.snapshot().iter().filter(|event| matches!(event, AgentEvent::Notice(text) if text == "goal continuation stopped: token cap exhausted")).count(), 1);
+    assert_eq!(handle.snapshot().iter().filter(|event| matches!(event, AgentEvent::Display(text) if text == "goal continuation stopped: token cap exhausted")).count(), 1);
     let entries = SessionStore::Jsonl
         .load(temp.path(), "oracle677-answer-requested")
         .await
@@ -10988,7 +10988,7 @@ async fn oracle677_answer_manual_compact_missing_usage_preserves_resume() {
     )
     .await
     .unwrap();
-    assert!(handle.snapshot().iter().any(|event| matches!(event, AgentEvent::Notice(text) if text == "goal continuation stopped: model usage unavailable")));
+    assert!(handle.snapshot().iter().any(|event| matches!(event, AgentEvent::Display(text) if text == "goal continuation stopped: model usage unavailable")));
     drop(handle);
     tokio::time::timeout(std::time::Duration::from_secs(2), task.join())
         .await
@@ -11073,9 +11073,9 @@ async fn oracle677_answer_auto_compaction_is_budget_exempt() {
         handle.submit_prompt_with_call_id(Some("input".into()), "yes".into()),
         PromptSubmission::Answered
     );
-    wait_for_log_event(&handle, |event| matches!(event, AgentEvent::Notice(text) if text == "compacted: auto answer summary")).await;
+    wait_for_log_event(&handle, |event| matches!(event, AgentEvent::Display(text) if text == "compacted: auto answer summary")).await;
     wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)).await;
-    assert_eq!(handle.snapshot().iter().filter(|event| matches!(event, AgentEvent::Notice(text) if text == "goal continuation stopped: token cap exhausted")).count(), 1);
+    assert_eq!(handle.snapshot().iter().filter(|event| matches!(event, AgentEvent::Display(text) if text == "goal continuation stopped: token cap exhausted")).count(), 1);
     let entries = SessionStore::Jsonl
         .load(temp.path(), "oracle677-auto")
         .await
@@ -11583,7 +11583,7 @@ async fn oracle677_positive_answer_compaction_keeps_goal_budget(
     tokio::time::timeout(std::time::Duration::from_secs(2), normal_entered.notified())
         .await
         .unwrap();
-    assert!(handle.snapshot().iter().all(|event| !matches!(event, AgentEvent::Notice(text) if text == "goal continuation stopped: token cap exhausted" || text == "goal continuation stopped: model usage unavailable")));
+    assert!(handle.snapshot().iter().all(|event| !matches!(event, AgentEvent::Display(text) if text == "goal continuation stopped: token cap exhausted" || text == "goal continuation stopped: model usage unavailable")));
     handle.cancel();
     tokio::time::timeout(
         std::time::Duration::from_secs(2),
@@ -11770,7 +11770,7 @@ async fn oracle718_ordinary_pause_compact_resume_does_not_rearm_driver() {
     handle.compact();
     assert!(handle.goal_command(GoalCommand::Action(crate::agent::GoalAction::Resume)));
     release.notify_one();
-    tokio::time::timeout(std::time::Duration::from_secs(2), wait_for_log_event(&handle, |event| matches!(event, AgentEvent::Notice(text) if text == "compacted: ordinary summary"))).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), wait_for_log_event(&handle, |event| matches!(event, AgentEvent::Display(text) if text == "compacted: ordinary summary"))).await.unwrap();
     tokio::time::timeout(
         std::time::Duration::from_secs(2),
         wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)),

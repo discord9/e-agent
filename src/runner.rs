@@ -908,7 +908,7 @@ impl SessionRunner {
         self.shared
             .lock()
             .unwrap()
-            .emit(AgentEvent::Notice(match budget {
+            .emit(AgentEvent::Display(match budget {
                 Some(budget) => format!("goal continuation armed (token cap: {budget})"),
                 None => "goal continuation armed".into(),
             }));
@@ -932,7 +932,7 @@ impl SessionRunner {
     /// Cap exhaustion is a runner-local live event: it stays available to
     /// late attaches through Shared's log without becoming a durable entry.
     fn emit_goal_cap_exhausted(&self) {
-        self.shared.lock().unwrap().emit(AgentEvent::Notice(
+        self.shared.lock().unwrap().emit(AgentEvent::Display(
             "goal continuation stopped: token cap exhausted".into(),
         ));
     }
@@ -1261,7 +1261,7 @@ impl SessionRunner {
             self.shared
                 .lock()
                 .unwrap()
-                .emit(AgentEvent::Notice("turn cancelled".into()));
+                .emit(AgentEvent::Display("turn cancelled".into()));
         }
         Ok(steering)
     }
@@ -1475,7 +1475,7 @@ impl SessionRunner {
             self.shared
                 .lock()
                 .unwrap()
-                .emit(AgentEvent::Notice("goal continuation cancelled".into()));
+                .emit(AgentEvent::Display("goal continuation cancelled".into()));
         }
         self.turn_just_ended = false;
         self.maintenance_resume = false;
@@ -1687,7 +1687,7 @@ impl SessionRunner {
                 self.shared
                     .lock()
                     .unwrap()
-                    .emit(AgentEvent::Notice("processing queued prompts".into()));
+                    .emit(AgentEvent::Display("processing queued prompts".into()));
                 false
             }
             Steering::ReleasedIdle => {
@@ -1744,7 +1744,7 @@ impl SessionRunner {
                             // The charged maintenance cannot resume its
                             // interrupted turn after usage is unavailable.
                             self.maintenance_resume = false;
-                            self.shared.lock().unwrap().emit(AgentEvent::Notice(
+                            self.shared.lock().unwrap().emit(AgentEvent::Display(
                                 "goal continuation stopped: model usage unavailable".into(),
                             ));
                         }
@@ -1810,7 +1810,7 @@ impl SessionRunner {
                 // Both manual and auto compaction failures are real harness
                 // errors: persisted as an Error entry and fanned out as an
                 // `AgentEvent::Error` (audit-visible on resume/late attach).
-                // A cancel stays a Notice and never lands as an Error entry.
+                // A cancel stays a Display projection and never lands as an Error entry.
                 self.commit_error(text).await;
                 let steering = self.intake_after_operation(waited.pending);
                 self.status(source.resume_status());
@@ -1824,10 +1824,13 @@ impl SessionRunner {
                 self.intake_after_cancel(waited.pending);
                 let steering = self.release_steering();
                 self.agent.reset_auto_compact_request();
-                self.shared.lock().unwrap().emit(AgentEvent::Notice(format!(
-                    "{}compaction cancelled",
-                    source.prefix()
-                )));
+                self.shared
+                    .lock()
+                    .unwrap()
+                    .emit(AgentEvent::Display(format!(
+                        "{}compaction cancelled",
+                        source.prefix()
+                    )));
                 self.status(source.resume_status());
                 OperationFlow::Released(steering)
             }
@@ -2000,7 +2003,7 @@ impl SessionRunner {
             if self.pending.is_empty() && self.armed_trigger == Some(RunnerTrigger::Goal) {
                 // Goal mutations at the precedence boundary can make the
                 // already-armed continuation ineligible. Drop it before the
-                // provider call, without charging or emitting its Notice.
+                // provider call, without charging or emitting its Display projection.
                 let eligible = self.goal_continuation_armed
                     && matches!(
                         self.agent.goal().as_ref().map(|goal| goal.status),
@@ -2231,7 +2234,7 @@ impl SessionRunner {
                         self.shared
                             .lock()
                             .unwrap()
-                            .emit(AgentEvent::Notice("turn cancelled".into()));
+                            .emit(AgentEvent::Display("turn cancelled".into()));
                         if self.release_after_preempt(steering) {
                             return;
                         }
@@ -2265,7 +2268,7 @@ impl SessionRunner {
                             self.goal_continuation_armed = false;
                             self.goal_continuation_remaining = None;
                             self.armed_trigger = None;
-                            self.shared.lock().unwrap().emit(AgentEvent::Notice(
+                            self.shared.lock().unwrap().emit(AgentEvent::Display(
                                 "goal continuation stopped: model usage unavailable".into(),
                             ));
                         }
@@ -2320,7 +2323,7 @@ impl SessionRunner {
                     self.shared
                         .lock()
                         .unwrap()
-                        .emit(AgentEvent::Notice("turn cancelled".into()));
+                        .emit(AgentEvent::Display("turn cancelled".into()));
                     if self.release_after_preempt(steering) {
                         return;
                     }
@@ -2339,7 +2342,7 @@ impl SessionRunner {
                     self.shared
                         .lock()
                         .unwrap()
-                        .emit(AgentEvent::Notice("──── auto-compacting… ────".into()));
+                        .emit(AgentEvent::Display("──── auto-compacting… ────".into()));
                     match self
                         .compact_operation(
                             CompactionSource::Auto,
@@ -2359,7 +2362,7 @@ impl SessionRunner {
                                 self.shared
                                     .lock()
                                     .unwrap()
-                                    .emit(AgentEvent::Notice("turn cancelled".into()));
+                                    .emit(AgentEvent::Display("turn cancelled".into()));
                                 if self.release_after_preempt(steering) {
                                     return;
                                 }
@@ -2486,7 +2489,7 @@ impl SessionRunner {
                                 self.shared
                                     .lock()
                                     .unwrap()
-                                    .emit(AgentEvent::Notice("turn cancelled".into()));
+                                    .emit(AgentEvent::Display("turn cancelled".into()));
                                 break 'turn;
                             }
                             WaitOutcome::Closed => {
@@ -2649,7 +2652,7 @@ impl SessionRunner {
                             self.shared
                                 .lock()
                                 .unwrap()
-                                .emit(AgentEvent::Notice("turn cancelled".into()));
+                                .emit(AgentEvent::Display("turn cancelled".into()));
                             if self.release_after_preempt(steering) {
                                 return;
                             }
@@ -2715,7 +2718,7 @@ impl SessionRunner {
                         self.shared
                             .lock()
                             .unwrap()
-                            .emit(AgentEvent::Notice("turn cancelled".into()));
+                            .emit(AgentEvent::Display("turn cancelled".into()));
                         if self.release_after_preempt(steering) {
                             return;
                         }
@@ -2750,7 +2753,7 @@ impl SessionRunner {
                     self.shared
                         .lock()
                         .unwrap()
-                        .emit(AgentEvent::Notice("turn cancelled".into()));
+                        .emit(AgentEvent::Display("turn cancelled".into()));
                     if self.release_after_preempt(steering) {
                         return;
                     }
@@ -2787,7 +2790,7 @@ impl SessionRunner {
                             )
                         })
                     {
-                        self.shared.lock().unwrap().emit(AgentEvent::Notice(
+                        self.shared.lock().unwrap().emit(AgentEvent::Display(
                             "compaction request superseded by queued human work".into(),
                         ));
                     }
@@ -2826,7 +2829,7 @@ impl SessionRunner {
                 }
                 // Poll-guard termination: the full sibling batch is durably
                 // committed and the safe point ran — only now emit the
-                // termination Notice and end the current turn. The next
+                // termination Display and end the current turn. The next
                 // turn (fresh/queued prompt, idle background-completion
                 // follow-up) starts with the guard reset and can continue
                 // normally.
@@ -2835,7 +2838,7 @@ impl SessionRunner {
                     self.shared
                         .lock()
                         .unwrap()
-                        .emit(AgentEvent::Notice(POLL_GUARD_TERMINATION_NOTICE.into()));
+                        .emit(AgentEvent::Display(POLL_GUARD_TERMINATION_NOTICE.into()));
                     break 'turn;
                 }
                 // A Goal driver cannot consume fresh ingress. Preserve a
@@ -2921,7 +2924,7 @@ fn entry_event(entry: &SessionEntry) -> Option<AgentEvent> {
             content: content.clone(),
         }),
         SessionEntry::Compaction { summary, .. } => {
-            Some(AgentEvent::Notice(format!("compacted: {summary}")))
+            Some(AgentEvent::Display(format!("compacted: {summary}")))
         }
         SessionEntry::Notice { text } => Some(AgentEvent::Notice(text.clone())),
         SessionEntry::BackgroundCompletion {
@@ -2945,7 +2948,7 @@ fn entry_event(entry: &SessionEntry) -> Option<AgentEvent> {
             status: status.clone(),
             kind: kind.clone(),
         }),
-        SessionEntry::ForkedFrom { source, at, .. } => Some(AgentEvent::Notice(format!(
+        SessionEntry::ForkedFrom { source, at, .. } => Some(AgentEvent::Display(format!(
             "forked from {source} at entry {at}"
         ))),
         // Harness errors are durable and replay as Error events, so a

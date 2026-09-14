@@ -706,9 +706,14 @@ pub enum AgentEvent {
         is_error: bool,
         content: String,
     },
-    /// A system-injected notice (background completion, task-kill report)
-    /// rendered in the TUI as a dim line.
+    /// A durable, model-facing system notice (background completion or task
+    /// report). Fresh background ingress commits it as a `SessionEntry::Notice`,
+    /// puts it in provider context, and requests one regular runner reaction.
+    /// Replayed entries only rebuild the display and never wake a model turn.
     Notice(String),
+    /// Non-persisted UI projection, retained only in the in-memory event log
+    /// for same-process late attach and never added to model context.
+    Display(String),
     /// A turn failed. Recorded even when no frontend is attached.
     Error(String),
     /// Emitted on the turn boundary when a background task's completion is
@@ -2143,14 +2148,14 @@ impl Agent {
                 && (input as u128) * 100 >= (window as u128) * 80
             {
                 self.auto_compacted = true;
-                self.emit(AgentEvent::Notice("──── auto-compacting… ────".into()));
+                self.emit(AgentEvent::Display("──── auto-compacting… ────".into()));
                 if let Err(error) = self.compact().await {
                     self.auto_compacted = false;
-                    self.emit(AgentEvent::Notice(format!(
+                    self.emit(AgentEvent::Display(format!(
                         "auto-compaction error: {error:#}"
                     )));
                 }
-                self.emit(AgentEvent::Notice("──── auto-compaction ────".into()));
+                self.emit(AgentEvent::Display("──── auto-compaction ────".into()));
             }
             if assistant.tool_calls.is_empty() {
                 let answer = assistant.content.clone().unwrap_or_default();
@@ -2217,7 +2222,7 @@ impl Agent {
                 // and end the turn. A follow-up turn (queued prompt or a
                 // background completion folded at turn end) starts with the
                 // guard reset.
-                self.emit(AgentEvent::Notice(POLL_GUARD_TERMINATION_NOTICE.into()));
+                self.emit(AgentEvent::Display(POLL_GUARD_TERMINATION_NOTICE.into()));
                 return Ok(String::new());
             }
         }

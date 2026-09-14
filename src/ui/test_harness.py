@@ -931,6 +931,19 @@ async function main(){
     chk("splice plan emits S notice between retained H turn components", r.match
       && componentSequence(r) === "H0:user|H1:text|S2|H2:user|H3:text");
 
+    const displayToolsH = [
+      {type:"message",message:{User:{content:"run"}}},
+      {type:"message",message:{Assistant:{content:"",tool_calls:[{id:"d1",name:"one",arguments:"{}"},{id:"d2",name:"two",arguments:"{}"}]}}},
+      {type:"message",message:{Tool:{call_id:"d1",content:"r1",is_error:false}}},
+      {type:"message",message:{Tool:{call_id:"d2",content:"r2",is_error:false}}},
+    ];
+    r = plan(displayToolsH, [{type:"user_prompt",data:"run"}, {type:"tool_call",data:{name:"one",arguments:"{}"}},
+      {type:"display",data:"between tools"}, {type:"tool_result",data:{content:"r1",is_error:false}},
+      {type:"tool_call",data:{name:"two",arguments:"{}"}}, {type:"tool_result",data:{content:"r2",is_error:false}}]);
+    chk("splice Display between matched tool anchors is retained in order", r.match
+      && r.output.snapshot.extras.join(",") === "2"
+      && componentSequence(r) === "H0:user|H1:call:0|S2|H2:result|H1:call:1|H3:result");
+
     const suffixPlanH = [{type:"message", message:{User:{content:"old"}}},
       {type:"message", message:{Assistant:{content:"old answer", tool_calls:[]}}},
       {type:"message", message:{User:{content:"x"}}},
@@ -1658,6 +1671,39 @@ async function main(){
         !!_mdStrong && _mdStrong._children.some((c) => c.text === "换个方式"));
     chk("live notice", t.includes("系统提示行"));
     chk("live error", t.includes("错误: 回合失败"));
+    // Display is display-only, but its live projection remains a notice line;
+    // genuine Notice above must remain independently rendered.
+    applyLiveEvent("Display", {text:"LIVE-DISPLAY"});
+    chk("live Display renders display-only line", elsById["messages"].textContent.includes("LIVE-DISPLAY"));
+    const displaySnapshotH = [
+      {type:"message",message:{User:{content:"display tools"}}},
+      {type:"message",message:{Assistant:{content:"",tool_calls:[{id:"sd1",name:"one",arguments:"{}"},{id:"sd2",name:"two",arguments:"{}"}]}}},
+      {type:"message",message:{Tool:{call_id:"sd1",content:"r1",is_error:false}}},
+      {type:"message",message:{Tool:{call_id:"sd2",content:"r2",is_error:false}}},
+    ];
+    renderMergedHistorySnapshot(displaySnapshotH, [
+      {type:"user_prompt",data:"display tools"}, {type:"tool_call",data:{name:"one",arguments:"{}"}},
+      {type:"display",data:{text:"SNAPSHOT-DISPLAY"}}, {type:"tool_result",data:{content:"r1",is_error:false}},
+      {type:"tool_call",data:{name:"two",arguments:"{}"}}, {type:"tool_result",data:{content:"r2",is_error:false}},
+    ]);
+    const displayCards = elsById["messages"].querySelectorAll("details.tool-card");
+    chk("snapshot Display between matched tool anchors has one line and no duplicated cards",
+        elsById["messages"].textContent.includes("SNAPSHOT-DISPLAY")
+        && displayCards.length === 2
+        && displayCards[0].textContent.includes("one") && displayCards[1].textContent.includes("two"),
+        "cards=" + displayCards.length + " text=" + JSON.stringify(elsById["messages"].textContent));
+    // Snapshot-only GoalUpdated must render its transcript line and independently
+    // fold the last set/clear tombstone into GoalBar.
+    state.historyEntries = null; state.initSource = null;
+    handleSSEBlock('event: snapshot\ndata: [{"type":"goal_updated","data":{"goal":{"id":"g-display","status":"active","objective":"snapshot goal","revision":1}}}]\n\n',
+      state.sessionId, state.workspace.id, sessionOpenEpoch, state.sse.ctrl);
+    chk("snapshot-only goal set updates transcript and GoalBar",
+        elsById["messages"].textContent.includes("goal [active] snapshot goal")
+        && elsById["goalBar"].hidden === false && elsById["goalBar"].textContent.includes("snapshot goal"));
+    handleSSEBlock('event: snapshot\ndata: [{"type":"goal_updated","data":{"goal":null}}]\n\n',
+      state.sessionId, state.workspace.id, sessionOpenEpoch, state.sse.ctrl);
+    chk("snapshot-only goal clear updates transcript and GoalBar",
+        elsById["messages"].textContent.includes("goal cleared") && elsById["goalBar"].hidden === true);
     chk("usage shown", elsById["usageInfo"].textContent.includes("1234"), "="+elsById["usageInfo"].textContent);
 
     // ---- 用量行：只显示当前上下文占用（最近一次正常模型请求的 Usage
@@ -1732,7 +1778,7 @@ async function main(){
     //      必须标注，不能把它当普通轮的新值；下一次普通轮 fresh Usage 才清除 ----
     state.usagePreCompaction = false;
     state.compactionUsagePending = false;
-    applyLiveEvent("Notice", { text: "compacted: 早期内容已压缩" });
+    applyLiveEvent("Display", { text: "compacted: 早期内容已压缩" });
     chk("compaction notice sets pre-compaction flag",
         state.usagePreCompaction === true && state.compactionUsagePending === true,
         "flag=" + state.usagePreCompaction + " pending=" + state.compactionUsagePending);
@@ -1768,6 +1814,14 @@ async function main(){
         !formatUsageLine({ context_input: 800, context_window: 1000 }).detail.includes("（压缩前）"));
     // restoreUsageFromSnapshot 按事件顺序推导标注：压缩 Notice + 旧基线 Usage
     //（无后续普通轮）→ 恢复标注；其后有普通轮 Usage → 清除
+    restoreUsageFromSnapshot([
+      { type: "usage", data: { context_input: 5000, context_window: 8000, session: {} } },
+      { type: "display", data: { text: "compacted: 摘要" } },
+      { type: "usage", data: { context_input: 5000, context_window: 8000, session: {} } },
+    ]);
+    chk("snapshot Display derives pre-compaction flag",
+        state.usagePreCompaction === true,
+        "flag=" + state.usagePreCompaction);
     restoreUsageFromSnapshot([
       { type: "usage", data: { context_input: 5000, context_window: 8000, session: {} } },
       { type: "notice", data: { text: "compacted: 摘要" } },

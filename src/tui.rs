@@ -763,8 +763,13 @@ fn parse_help(prompt: &str) -> Option<HelpCommand> {
     }
 }
 
+/// Push a local-only scrollback line without creating a durable/model notice.
+fn push_display(state: &mut TuiState, text: impl Into<String>) {
+    state.push_agent_event(AgentEvent::Display(text.into()));
+}
+
 /// Run a `/help` command: show the command list (bare `/help`) or the
-/// detail of one command, both surfaced as a display-only Notice (same as
+/// detail of one command, both surfaced as a display-only line (same as
 /// `/rename` and `/btw`). Unknown command names get a hint pointing back
 /// at the list.
 fn handle_help(command: HelpCommand, state: &mut TuiState) {
@@ -773,7 +778,7 @@ fn handle_help(command: HelpCommand, state: &mut TuiState) {
         HelpCommand::Detail(detail) => detail.to_string(),
         HelpCommand::Unknown(cmd) => format!("未知命令：{cmd}，可用 /help 查看命令列表"),
     };
-    state.push_agent_event(AgentEvent::Notice(text));
+    push_display(state, text);
 }
 
 fn route_idle_events(
@@ -791,14 +796,14 @@ fn route_idle_events(
 /// (`edit_file` / `write_file`) via the in-process undo stack. The TUI is a
 /// local process, so this calls the tools layer directly — the same
 /// function the server's `POST /api/sessions/{id}/undo` endpoint invokes.
-/// Success and failure are both surfaced as a Notice in the scrollback
+/// Success and failure are both surfaced as a display line in the scrollback
 /// (display-only, same as `/rename` and `/btw`).
 fn handle_undo(state: &mut TuiState) {
     let message = match crate::tools::undo_file_op() {
         Ok(message) => message,
         Err(error) => error,
     };
-    state.push_agent_event(AgentEvent::Notice(message));
+    push_display(state, message);
 }
 
 /// A parsed `/rename` command from the input line.
@@ -831,7 +836,7 @@ fn parse_rename(prompt: &str) -> Option<RenameCommand> {
 /// Run a `/rename` command: persist the title via the store (Greptime
 /// appends a snapshot row with the new title; JSONL is a no-op Ok) and
 /// mirror the result into the terminal title. Success and failure are both
-/// surfaced as a Notice (pushed into the TUI scrollback — the session
+/// surfaced as a display line (pushed into the TUI scrollback — the session
 /// handle exposes no event-injection path, so the notice is display-only)
 /// so the rename never fails silently.
 async fn handle_rename(command: RenameCommand, state: &mut TuiState) {
@@ -841,27 +846,23 @@ async fn handle_rename(command: RenameCommand, state: &mut TuiState) {
     let root = state.root.clone();
     let session_name = state.session_id.clone();
     match command {
-        RenameCommand::Usage => state.push_agent_event(AgentEvent::Notice(
-            "用法：/rename <标题>（留空标题可清除）".to_string(),
-        )),
+        RenameCommand::Usage => {
+            push_display(state, "用法：/rename <标题>（留空标题可清除）".to_string())
+        }
         RenameCommand::Clear => match store.set_title(&root, &session_name, None).await {
             Ok(()) => {
                 set_terminal_title(&sanitize_title(&session_name));
-                state.push_agent_event(AgentEvent::Notice("已清除标题".to_string()));
+                push_display(state, "已清除标题".to_string());
             }
-            Err(error) => {
-                state.push_agent_event(AgentEvent::Notice(format!("重命名失败：{error:#}")))
-            }
+            Err(error) => push_display(state, format!("重命名失败：{error:#}")),
         },
         RenameCommand::Set(title) => {
             match store.set_title(&root, &session_name, Some(&title)).await {
                 Ok(()) => {
                     set_terminal_title(&sanitize_title(&title));
-                    state.push_agent_event(AgentEvent::Notice(format!("已重命名：{title}")));
+                    push_display(state, format!("已重命名：{title}"));
                 }
-                Err(error) => {
-                    state.push_agent_event(AgentEvent::Notice(format!("重命名失败：{error:#}")))
-                }
+                Err(error) => push_display(state, format!("重命名失败：{error:#}")),
             }
         }
     }
@@ -896,21 +897,23 @@ fn parse_model(prompt: &str) -> Option<ModelCommand> {
 /// (the same config + `--base-url`/`--model` overrides the process started
 /// with) and switch the session's model at runtime. The runner installs the
 /// new model on its agent; the display name is mirrored into the input
-/// border immediately. Resolution success queues the switch and a Notice;
-/// resolution failure is surfaced as a Notice.
+/// border immediately. Resolution success queues the switch and a display line;
+/// resolution failure is surfaced as a display line.
 fn handle_model(command: ModelCommand, state: &mut TuiState, handle: &RunnerHandle) {
     match command {
         ModelCommand::Usage => {
             let current = state.model_name.clone();
-            state.push_agent_event(AgentEvent::Notice(format!(
-                "当前模型：{current}。用法：/model <profile>（如 /model deepseek/flash）"
-            )));
+            push_display(
+                state,
+                format!("当前模型：{current}。用法：/model <profile>（如 /model deepseek/flash）"),
+            );
         }
         ModelCommand::Switch(profile) => {
             let Some(factory) = state.factory.clone() else {
-                state.push_agent_event(AgentEvent::Notice(
+                push_display(
+                    state,
                     "无法解析模型：进程没有配置（无 config.toml）".to_string(),
-                ));
+                );
                 return;
             };
             match factory.resolve_profile(&profile) {
@@ -920,12 +923,10 @@ fn handle_model(command: ModelCommand, state: &mut TuiState, handle: &RunnerHand
                     state.model = Some(configured.clone());
                     state.context_window = context_window;
                     handle.switch_model(Box::new(configured), context_window);
-                    state.push_agent_event(AgentEvent::Notice(format!("已切换到 {name}")));
+                    push_display(state, format!("已切换到 {name}"));
                 }
                 Err(error) => {
-                    state.push_agent_event(AgentEvent::Notice(format!(
-                        "未知模型 profile：{error:#}"
-                    )));
+                    push_display(state, format!("未知模型 profile：{error:#}"));
                 }
             }
         }
@@ -993,25 +994,24 @@ fn parse_fork(prompt: &str) -> Option<ForkCommand> {
 /// completed-turn boundary (counted from the newest) into a fresh
 /// `fork-…` session, mirroring the `--fork` CLI / web fork path. The TUI
 /// cannot switch sessions at runtime, so the new id is surfaced as a
-/// Notice with the `--session` flag to open it in a new terminal. Success
-/// and failure are both surfaced as a Notice (display only, same as
+/// display line with the `--session` flag to open it in a new terminal. Success
+/// and failure are both surfaced as a display line (display only, same as
 /// `/rename` and `/btw`).
 async fn handle_fork(command: ForkCommand, state: &mut TuiState) {
     let n = match command {
         ForkCommand::Usage => {
-            state.push_agent_event(AgentEvent::Notice(
+            push_display(
+                state,
                 "用法：/fork [N]（从最新往上数第 N 个完成的回合边界 fork 出新会话，默认 N=1）"
                     .to_string(),
-            ));
+            );
             return;
         }
         ForkCommand::Latest => 1,
         ForkCommand::At(n) => n,
     };
     let Some(store) = state.store.clone() else {
-        state.push_agent_event(AgentEvent::Notice(
-            "无法 fork：TUI 未接线（缺少会话存储）".to_string(),
-        ));
+        push_display(state, "无法 fork：TUI 未接线（缺少会话存储）".to_string());
         return;
     };
     let root = match &state.record_in {
@@ -1019,16 +1019,14 @@ async fn handle_fork(command: ForkCommand, state: &mut TuiState) {
         None => state.root.clone(),
     };
     if root.as_os_str().is_empty() {
-        state.push_agent_event(AgentEvent::Notice(
-            "无法 fork：TUI 未接线（缺少会话根目录）".to_string(),
-        ));
+        push_display(state, "无法 fork：TUI 未接线（缺少会话根目录）".to_string());
         return;
     }
     let session_id = state.session_id.clone();
     let with_seq = match store.load_with_seq(&root, &session_id).await {
         Ok(with_seq) => with_seq,
         Err(error) => {
-            state.push_agent_event(AgentEvent::Notice(format!("无法 fork：{error:#}")));
+            push_display(state, format!("无法 fork：{error:#}"));
             return;
         }
     };
@@ -1041,10 +1039,10 @@ async fn handle_fork(command: ForkCommand, state: &mut TuiState) {
         .map(|(index, (seq, _))| (index, *seq))
         .collect();
     if boundaries.len() < n {
-        state.push_agent_event(AgentEvent::Notice(format!(
-            "无法 fork：只有 {} 个可 fork 的回合边界",
-            boundaries.len()
-        )));
+        push_display(
+            state,
+            format!("无法 fork：只有 {} 个可 fork 的回合边界", boundaries.len()),
+        );
         return;
     }
     let (boundary_index, _boundary_seq) = boundaries[boundaries.len() - n];
@@ -1053,16 +1051,14 @@ async fn handle_fork(command: ForkCommand, state: &mut TuiState) {
     let prefix = match crate::agent::fork_prefix(&entries, Some(at)) {
         Ok(prefix) => prefix,
         Err(error) => {
-            state.push_agent_event(AgentEvent::Notice(format!("无法 fork：{error}")));
+            push_display(state, format!("无法 fork：{error}"));
             return;
         }
     };
     let prefix_len = prefix.len();
     let new_id = crate::session::new_id_prefixed("fork-");
     let Some(factory) = state.factory.clone() else {
-        state.push_agent_event(AgentEvent::Notice(
-            "无法 fork：TUI 未接线（缺少 factory）".into(),
-        ));
+        push_display(state, "无法 fork：TUI 未接线（缺少 factory）");
         return;
     };
     let result = factory
@@ -1078,11 +1074,14 @@ async fn handle_fork(command: ForkCommand, state: &mut TuiState) {
         Ok(built) => {
             let effective = built.session.clone();
             let _task = built.runner.start(None);
-            state.push_agent_event(AgentEvent::Notice(format!(
-                "已 fork 到新会话：{effective}（保留 {prefix_len} 条历史）。新终端用 --session {effective} 打开。"
-            )));
+            push_display(
+                state,
+                format!(
+                    "已 fork 到新会话：{effective}（保留 {prefix_len} 条历史）。新终端用 --session {effective} 打开。"
+                ),
+            );
         }
-        Err(error) => state.push_agent_event(AgentEvent::Notice(format!("无法 fork：{error:#}"))),
+        Err(error) => push_display(state, format!("无法 fork：{error:#}")),
     }
 }
 
@@ -1136,7 +1135,7 @@ fn parse_goal(prompt: &str) -> Option<GoalCommand> {
     }
 }
 
-/// Run a `/goal` command: show the snapshot as a Notice; mutations are
+/// Run a `/goal` command: show the snapshot as a display line; mutations are
 /// queued through the runner, which persists the `GoalUpdated` entry and
 /// fans out the confirmation/error as events (the scrollback reflects the
 /// durable state, never a local guess). Shared by the main view and
@@ -1145,16 +1144,16 @@ fn handle_goal(command: GoalCommand, state: &mut TuiState, handle: &RunnerHandle
     let mut queued = true;
     match command {
         GoalCommand::Show => match handle.goal() {
-            Some(goal) => state.push_agent_event(AgentEvent::Notice(format!(
+            Some(goal) => push_display(state, format!(
                 "goal [{}] {} ({}, rev {})",
                 goal.status.label(),
                 goal.objective,
                 goal.id,
                 goal.revision
-            ))),
-            None => state.push_agent_event(AgentEvent::Notice(
-                "no goal set（创建：/goal set <目标>）".to_owned(),
             )),
+            None => push_display(state,
+                "no goal set（创建：/goal set <目标>）".to_owned(),
+            ),
         },
         GoalCommand::Set(objective) => {
             queued = handle.goal_command(crate::runner::GoalCommand::Create {
@@ -1168,15 +1167,16 @@ fn handle_goal(command: GoalCommand, state: &mut TuiState, handle: &RunnerHandle
         GoalCommand::Continue(budget) => {
             queued = handle.continue_goal(budget);
         }
-        GoalCommand::Usage => state.push_agent_event(AgentEvent::Notice(
+        GoalCommand::Usage => push_display(state,
             "用法：/goal（查看）；/goal set <目标>（创建）；/goal pause|resume|clear（状态操作）；/goal continue [N]（启动实时继续，可选累计 token 上限）"
                 .to_owned(),
-        )),
+        ),
     }
     if !queued {
-        state.push_agent_event(AgentEvent::Notice(
+        push_display(
+            state,
             "goal command not accepted: session is finished or closed".to_owned(),
-        ));
+        );
     }
 }
 
@@ -1205,29 +1205,32 @@ fn btw_context(state: &TuiState) -> Option<crate::delegate::BtwContext> {
 /// question as its first user message. The main session keeps running
 /// untouched — the fork is deliberately NOT auto-attached; it shows up in
 /// the F2 task panel and can be attached to there. Success and failure are
-/// both surfaced as a Notice (pushed into the TUI scrollback — display
+/// both surfaced as a display line (pushed into the TUI scrollback — display
 /// only, same as `/rename`).
 async fn handle_btw(command: BtwCommand, state: &mut TuiState) {
     let question = match command {
         BtwCommand::Usage => {
-            state.push_agent_event(AgentEvent::Notice(
+            push_display(
+                state,
                 "用法：/btw <问题>（fork 出独立子代理继续探讨，F2 任务面板可 attach）".to_string(),
-            ));
+            );
             return;
         }
         BtwCommand::Ask(question) => question,
     };
     let Some(context) = btw_context(state) else {
-        state.push_agent_event(AgentEvent::Notice(
+        push_display(
+            state,
             "btw 创建失败：TUI 未接线（缺少模型/工作区/后端配置）".to_string(),
-        ));
+        );
         return;
     };
     match crate::delegate::spawn_btw_subagent(&state.session_id, &question, context).await {
-        Ok(id) => state.push_agent_event(AgentEvent::Notice(format!(
-            "已创建 btw subagent：{id}（F2 任务面板可 attach）"
-        ))),
-        Err(error) => state.push_agent_event(AgentEvent::Notice(format!("btw 创建失败：{error}"))),
+        Ok(id) => push_display(
+            state,
+            format!("已创建 btw subagent：{id}（F2 任务面板可 attach）"),
+        ),
+        Err(error) => push_display(state, format!("btw 创建失败：{error}")),
     }
 }
 
@@ -1387,7 +1390,7 @@ mod help_tests {
 
     #[test]
     fn help_dispatch_pushes_the_command_detail() {
-        // Every known command's detail Notice mentions the command itself
+        // Every known command's detail line mentions the command itself
         // and carries a usage line.
         for (name, detail) in HELP_DETAILS {
             let mut state = TuiState::default();

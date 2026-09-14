@@ -1220,6 +1220,11 @@ function appendCompaction(summary) {
 /* =====================================================================
  * History 全量渲染（SessionEntry 数组）
  * ===================================================================*/
+function goalNoticeText(goal) {
+  return goal
+    ? "goal [" + (goal.status || "?") + "] " + (goal.objective || "")
+    : "goal cleared";
+}
 function renderEntry(entry, acc, pendingCards) {
   switch (entry.type) {
     case "message": return renderMessage(entry.message, acc, pendingCards);
@@ -1234,9 +1239,7 @@ function renderEntry(entry, acc, pendingCards) {
       return scrollBottom(false);
     case "goal_updated":
       // goal 快照/墓碑：一行 notice（不当作用户消息）
-      return entry.goal
-        ? appendNotice("goal [" + entry.goal.status + "] " + (entry.goal.objective || ""))
-        : appendNotice("goal cleared");
+      return appendNotice(goalNoticeText(entry.goal));
     case "prompt_queued":
       // 历史记录里的排队提示（后端演进若引入）：显示为 notice，不落入默认分支
       return appendNotice("⏳ 提示已排队: "
@@ -1497,8 +1500,10 @@ function renderSpliceComponents(components) {
           // missing owner is an independent result, not permission to reuse
           // whichever completed history card happened to render most recently.
           appendToolResult(p.is_error === true || p.error === true, pickText(p,["content","text","result","error"]), acc, component.owner || p.call_id, false);
-        } else if (type === "notice") appendNotice(pickText(data,["text","message"]));
-        else if (type === "error") appendError(pickText(data,["error","message","text"]));
+        } else if (type === "notice" || type === "display") appendNotice(pickText(data,["text","message"]));
+        else if (type === "goal_updated" || type === "goalupdated") {
+          appendNotice(goalNoticeText(data && typeof data === "object" ? (data.goal || null) : null));
+        } else if (type === "error") appendError(pickText(data,["error","message","text"]));
         else if (type === "background_completed" || type === "backgroundcompletionnotice") {
           const p = data && typeof data === "object" ? data : {}; appendBackgroundCompletion(p.id ?? "?", p.label, pickText(p,["output","text","content"]));
         }

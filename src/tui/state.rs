@@ -1732,7 +1732,7 @@ impl TuiState {
             AgentEvent::PromptConsumed => {
                 self.queued.pop_front();
             }
-            AgentEvent::Notice(text) => {
+            AgentEvent::Notice(text) | AgentEvent::Display(text) => {
                 self.active_lane = None;
                 if text.starts_with("──── auto-compact") {
                     self.push_line(text, LineKind::Compaction);
