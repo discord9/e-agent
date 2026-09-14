@@ -2,9 +2,27 @@
 # Nested subagent restart reproducer. running_tasks is observed with SELECT only.
 set -Eeuo pipefail
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+if [[ "${1:-}" == "--help" ]]; then
+  cat <<'EOF'
+usage: greptime_nested_background_restart.sh
+
+Runs the isolated Greptime nested-background restart E2E. Optional environment:
+  EAGENT_BIN=/path/to/e-agent
+  GREPTIMEDB_BIN=/path/to/greptime
+
+The test creates a temporary data/config/home tree and chooses every service
+port dynamically; it never uses port 15403 or a production configuration.
+EOF
+  exit 0
+fi
+[[ $# -eq 0 ]] || { echo "usage: $0 [--help]" >&2; exit 2; }
 EAGENT_BIN=${EAGENT_BIN:-$ROOT/target/debug/e-agent}
 TARGET=${CARGO_TARGET_DIR:-/mnt/nvme_rust/rust-targets-2/e-agent-nested-restart}
-GREPTIMEDB_BIN=${GREPTIMEDB_BIN:-/home/discord9/.local/share/e-agent/greptimedb/greptime}
+GREPTIMEDB_BIN=${GREPTIMEDB_BIN:-}
+[[ -n "$GREPTIMEDB_BIN" ]] || {
+  echo "SKIPPED: no isolated Greptime binary configured; Main command: GREPTIMEDB_BIN=/path/to/greptime $0" >&2
+  exit 2
+}
 if [[ ! -x "$EAGENT_BIN" ]]; then
   echo "EAGENT_BIN missing; building with CARGO_TARGET_DIR=$TARGET"
   CARGO_TARGET_DIR="$TARGET" cargo build --features greptime --bin e-agent
@@ -23,9 +41,9 @@ export HOME="$TMP/home" XDG_CONFIG_HOME XDG_STATE_HOME NESTED_E2E_KEY=nested-e2e
 RUN_MARKER="eagent-nested-bg-$(date +%s)-$$"
 CHILD_LABEL="exec -a ${RUN_MARKER}-child-own-background sleep 600"
 pick_port() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()'; }
-MOCK_PORT=$(pick_port); SERVER_A_PORT=$(pick_port); SERVER_B_PORT=$(pick_port)
+MOCK_PORT=$(pick_port); SERVER_A_PORT=$(pick_port); SERVER_B_PORT=$(pick_port); SERVER_C_PORT=$(pick_port)
 GT_HTTP=$(pick_port); GT_GRPC=$(pick_port); GT_MYSQL=$(pick_port); GT_PG=$(pick_port)
-for p in "$MOCK_PORT" "$SERVER_A_PORT" "$SERVER_B_PORT" "$GT_HTTP" "$GT_GRPC" "$GT_MYSQL" "$GT_PG"; do
+for p in "$MOCK_PORT" "$SERVER_A_PORT" "$SERVER_B_PORT" "$SERVER_C_PORT" "$GT_HTTP" "$GT_GRPC" "$GT_MYSQL" "$GT_PG"; do
   [[ "$p" != 15403 ]] || { echo "forbidden port 15403" >&2; exit 2; }
 done
 cat >"$XDG_CONFIG_HOME/e-agent/config.toml" <<EOF
@@ -59,19 +77,45 @@ cleanup() {
     echo "cleanup failure: live non-zombie marker process remains" >&2
     cleanup_failed=1
   fi
-  for p in "${SERVER_A_PID:-}" "${SERVER_B_PID:-}" "$GREPTIME_PID" "$MOCK_PID"; do [[ -n "$p" ]] && kill "$p" 2>/dev/null; done
+  for p in "${SERVER_A_PID:-}" "${SERVER_B_PID:-}" "${SERVER_C_PID:-}" "$GREPTIME_PID" "$MOCK_PID"; do [[ -n "$p" ]] && kill "$p" 2>/dev/null; done
   wait 2>/dev/null || true
   if [[ "$cleanup_failed" -ne 0 ]]; then rc=1; fi
   if [[ "$rc" -eq 0 ]]; then rm -rf "$TMP"; else echo "temp root preserved: $TMP" >&2; fi
   exit "$rc"
 }
 trap cleanup EXIT
-python3 "$ROOT/tests/e2e/mock_openai_nested_background.py" "$MOCK_PORT" "$RUN_MARKER" >"$TMP/mock.log" 2>&1 & MOCK_PID=$!
+python3 "$ROOT/tests/e2e/mock_openai_nested_background.py" "$MOCK_PORT" "$RUN_MARKER" "$TMP/mock-requests.jsonl" >"$TMP/mock.log" 2>&1 & MOCK_PID=$!
 "$GREPTIMEDB_BIN" standalone start --data-home "$TMP/greptime-data" --log-dir "$TMP/greptime-log" \
   --http-addr "127.0.0.1:$GT_HTTP" --grpc-bind-addr "127.0.0.1:$GT_GRPC" \
   --mysql-addr "127.0.0.1:$GT_MYSQL" --postgres-addr "127.0.0.1:$GT_PG" >"$TMP/greptime.log" 2>&1 & GREPTIME_PID=$!
 pg() { psql "host=127.0.0.1 port=$GT_PG dbname=public" -v ON_ERROR_STOP=1 -Atqc "$1"; }
 wait_for() { local end=$((SECONDS+90)); while ((SECONDS<end)); do "$@" && return 0; sleep .25; done; return 1; }
+mock_recoveries_match() {
+  local expected_parent=$1 expected_child=$2
+  curl -fsS "http://127.0.0.1:$MOCK_PORT/requests" | \
+    MOCK_EXPECTED_PARENT="$expected_parent" MOCK_EXPECTED_CHILD="$expected_child" python3 -c '
+import json, os, sys
+records = json.load(sys.stdin)["requests"]
+recovery = [r for r in records if r["recovery_notice_count"]]
+parent = [r for r in recovery if r["has_parent_recovery"]]
+child = [r for r in recovery if r["has_child_recovery"]]
+expected_parent = int(os.environ["MOCK_EXPECTED_PARENT"])
+expected_child = int(os.environ["MOCK_EXPECTED_CHILD"])
+ok = (
+    len(parent) == expected_parent
+    and len(child) == expected_child
+    and len(recovery) == expected_parent + expected_child
+    and all(r["recovery_notice_count"] == 1 and not r["emitted_tool_calls"] for r in recovery)
+    and all(not r["has_child_recovery"] for r in parent)
+    and all(not r["has_parent_recovery"] for r in child)
+)
+print(json.dumps({"requests": len(records), "recovery": len(recovery), "parent": len(parent), "child": len(child)}))
+sys.exit(0 if ok else 1)
+'
+}
+mock_request_count() {
+  curl -fsS "http://127.0.0.1:$MOCK_PORT/requests" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["requests"]))'
+}
 wait_for psql "host=127.0.0.1 port=$GT_PG dbname=public" -Atqc 'select 1'
 start_server() {
   local port=$1 log=$2
@@ -82,7 +126,7 @@ start_server "$SERVER_A_PORT" "$TMP/server-a.log"
 SERVER_A_PID=$STARTED_SERVER_PID
 wait_for test -s "$XDG_STATE_HOME/e-agent/server.token"
 TOKEN=$(cat "$XDG_STATE_HOME/e-agent/server.token"); AUTH=(-H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json')
-BASE_A="http://127.0.0.1:$SERVER_A_PORT"; BASE_B="http://127.0.0.1:$SERVER_B_PORT"
+BASE_A="http://127.0.0.1:$SERVER_A_PORT"; BASE_B="http://127.0.0.1:$SERVER_B_PORT"; BASE_C="http://127.0.0.1:$SERVER_C_PORT"
 wait_for curl -fsS "${AUTH[@]}" "$BASE_A/api/sessions"
 curl -fsS "${AUTH[@]}" -X POST "$BASE_A/api/sessions" -d '{"id":"parent-e2e","initial_prompt":"Delegate a child that starts a long-lived background bash task."}' >"$TMP/create.json"
 workspace_id="$WORKSPACE"; child_id=""; tasks_json=""
@@ -91,8 +135,8 @@ while ((SECONDS<end)); do
   tasks_json=$(curl -fsS "${AUTH[@]}" "$BASE_A/api/tasks" 2>/dev/null || true)
   child_id=$(pg "SELECT subagent_session_id FROM running_tasks WHERE workspace_id='$workspace_id' AND session_id='parent-e2e' AND subagent_session_id IS NOT NULL LIMIT 1" || true)
   own=$(pg "SELECT session_id FROM running_tasks WHERE workspace_id='$workspace_id' AND session_id <> 'parent-e2e' AND subagent_session_id IS NULL LIMIT 1" || true)
-  parent_live=$(python3 -c 'import json,sys; a=json.load(sys.stdin); print(any(x.get("kind")=="delegate" and x.get("session_id")=="parent-e2e" for x in a))' <<<"$tasks_json" 2>/dev/null || true)
-  child_live=$(python3 -c 'import json,sys; a=json.load(sys.stdin); print(any(x.get("kind")=="bash" and x.get("owner_session")==sys.argv[1] for x in a))' "$own" <<<"$tasks_json" 2>/dev/null || true)
+  parent_live=$(python3 -c 'import json,sys; a=json.load(sys.stdin); print(str(any(x.get("kind")=="delegate" and x.get("session_id")=="parent-e2e" for x in a)).lower())' <<<"$tasks_json" 2>/dev/null || true)
+  child_live=$(python3 -c 'import json,sys; a=json.load(sys.stdin); print(str(any(x.get("kind")=="bash" and x.get("owner_session")==sys.argv[1] for x in a)).lower())' "$own" <<<"$tasks_json" 2>/dev/null || true)
   [[ -n "$child_id" && "$own" == "$child_id" && "$parent_live" == true && "$child_live" == true ]] && break
   sleep .25
 done
@@ -100,7 +144,7 @@ done
 parent_scope=$(pg "SELECT session_id||' | '||task_id||' | '||subagent_session_id||' | '||label FROM running_tasks WHERE workspace_id='$workspace_id' AND session_id='parent-e2e'")
 child_scope=$(pg "SELECT session_id||' | '||task_id||' | NULL | '||label FROM running_tasks WHERE workspace_id='$workspace_id' AND session_id='$child_id' AND subagent_session_id IS NULL")
 [[ -n "$parent_scope" && -n "$child_scope" ]] || { echo "assertion failed: exact row scopes" >&2; exit 1; }
-echo "ports: mock=$MOCK_PORT serverA=$SERVER_A_PORT serverB=$SERVER_B_PORT greptime_http=$GT_HTTP greptime_grpc=$GT_GRPC greptime_mysql=$GT_MYSQL greptime_pg=$GT_PG"
+echo "ports: mock=$MOCK_PORT serverA=$SERVER_A_PORT serverB=$SERVER_B_PORT serverC=$SERVER_C_PORT greptime_http=$GT_HTTP greptime_grpc=$GT_GRPC greptime_mysql=$GT_MYSQL greptime_pg=$GT_PG"
 echo "assertion reached: /api/tasks parent delegate live=true child background live=true"
 echo "parent row scope before SIGKILL: $parent_scope"
 echo "child row scope before SIGKILL: $child_scope"
@@ -143,6 +187,9 @@ parent_notice_count=$(python3 -c 'import json,sys; h=json.load(sys.stdin); print
 echo "parent notice count=$parent_notice_count text=${parent_notice_text:-<none>}"
 [[ "$parent_notice_count" == 1 ]] || { echo "ASSERTION FAILED: parent must have exactly one parent-owned killed notice, got $parent_notice_count" >&2; exit 1; }
 echo "assertion reached: parent resume consumed/notified only parent delegate row"
+wait_for mock_recoveries_match 1 0
+parent_recovery_requests=$(mock_request_count)
+echo "provider assertion: parent recovery produced exactly one regular Notice reaction; total requests=$parent_recovery_requests"
 
 # The child is resumed explicitly on the same server B; its own session scope must produce exactly
 # one notice and consume its own row. No SQL lifecycle writes are performed.
@@ -162,3 +209,32 @@ if [[ "$child_notice_count" != 1 ]]; then
 fi
 [[ -z "$child_rows" ]] || { echo "ASSERTION FAILED: child-owned rows were not consumed after child resume; rows: $child_rows" >&2; echo "full child history: $child_history" >&2; exit 1; }
 echo "assertion reached: child resume produced exactly one child-owned notice and consumed child-own row"
+wait_for mock_recoveries_match 1 1
+recovery_request_count=$(mock_request_count)
+echo "provider assertion: child Notice woke only child; exactly two total recovery reactions, requests=$recovery_request_count"
+
+# Make the final replay a process restart, not merely a second server attached
+# to the same database. Both stale rows have already been consumed.
+echo "SIGKILL server B pid=$SERVER_B_PID before replay restart"
+kill -KILL "$SERVER_B_PID"; set +e; wait "$SERVER_B_PID"; server_b_exit=$?; set -e; SERVER_B_PID=
+[[ "$server_b_exit" -ne 0 && "$server_b_exit" -ne 127 ]] || { echo "ASSERTION FAILED: server B restart exit was invalid: $server_b_exit" >&2; exit 1; }
+
+# Restart again without a prompt. Every stale row has been consumed. The
+# immediate provider snapshot below must not add a duplicate recovery request;
+# the deterministic runner replay test covers absence of autonomous later wakes.
+start_server "$SERVER_C_PORT" "$TMP/server-c.log"
+SERVER_C_PID=$STARTED_SERVER_PID
+wait_for curl -fsS "${AUTH[@]}" "$BASE_C/api/sessions"
+replay_status=$(curl -sS "${AUTH[@]}" -X POST "$BASE_C/api/sessions" -d '{"id":"parent-e2e"}' -o "$TMP/replay-parent.json" -w '%{http_code}')
+echo "replay parent HTTP=$replay_status body=$(cat "$TMP/replay-parent.json")"
+[[ "$replay_status" == 201 ]] || { echo "ASSERTION FAILED: replay resume must succeed" >&2; exit 1; }
+wait_for mock_recoveries_match 1 1
+replay_request_count=$(mock_request_count)
+[[ "$replay_request_count" == "$recovery_request_count" ]] || {
+  echo "ASSERTION FAILED: immediate post-resume provider snapshot added a request: before=$recovery_request_count after=$replay_request_count" >&2
+  exit 1
+}
+echo "provider assertion: immediate post-resume snapshot added no request; requests remain $replay_request_count"
+
+echo "expected provider recovery events: parent Notice -> 1 regular reaction; child Notice -> 1 child-only regular reaction; immediate replay snapshot -> 0 new requests"
+echo "observed provider request counts: after parent=$parent_recovery_requests after child=$recovery_request_count immediate replay snapshot=$replay_request_count"
