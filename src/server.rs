@@ -4371,6 +4371,13 @@ mod tests {
             value,
             serde_json::json!({"type": "tool_call", "data": {"name": "bash", "arguments": "ls"}})
         );
+        let some_result = serde_json::to_value(AgentEvent::ToolResult {
+            is_error: false,
+            content: "ok".into(),
+            call_id: Some("call-2".into()),
+        })
+        .unwrap();
+        assert_eq!(some_result["data"]["call_id"], "call-2");
         assert_eq!(
             serde_json::to_value(AgentEvent::Notice("hi".into())).unwrap(),
             serde_json::json!({"type": "notice", "data": "hi"})

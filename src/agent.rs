@@ -701,11 +701,13 @@ pub enum AgentEvent {
     ToolCall {
         name: String,
         arguments: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         call_id: Option<String>,
     },
     ToolResult {
         is_error: bool,
         content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         call_id: Option<String>,
     },
     /// A durable, model-facing system notice (background completion or task
@@ -1332,11 +1334,18 @@ impl Agent {
         } else {
             None
         };
-        (
-            self.history[start..].to_vec(),
-            self.entry_locations[start..].to_vec(),
-            cursor,
-        )
+        // An Error applied only after a failed append has no physical entry.
+        // It remains Agent history for control flow, but cannot be owned by
+        // the physical web head; its presentation event is replay-owned.
+        let rows: (Vec<SessionEntry>, Vec<Option<EntryLocation>>) = self.history[start..]
+            .iter()
+            .cloned()
+            .zip(self.entry_locations[start..].iter().cloned())
+            .filter(|(entry, location)| {
+                !matches!(entry, SessionEntry::Error { .. }) || location.is_some()
+            })
+            .unzip();
+        (rows.0, rows.1, cursor)
     }
 
     /// Replace the whole history (session resume). To ADD one entry to an

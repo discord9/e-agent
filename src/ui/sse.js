@@ -129,6 +129,15 @@ function connectSSE(id, wsId, epoch, webAttach) {
       setBanner("⚠ 认证失败：请检查 Token。");
       throw new Error("auth");
     }
+    if (res.status === 409) {
+      // A terminal runner can close between history and attach. Preserve the
+      // readable transcript by resolving history under the same epoch guard,
+      // and stop this transport rather than reconnecting into a 409 loop.
+      if (!stillCurrent(id, wsId, epoch)) { try { ctrl.abort(); } catch (e) { /* ignore */ } return; }
+      state.sse.stopped = true;
+      handleLive404Refresh(id, wsId, epoch);
+      throw new Error("silent-gone");
+    }
     if (res.status === 404) {
       // 404 的两种含义，按会话已知状态区分（判定见 sessionKnownState）：
       // - 已知历史/已结束（active===false）或不在任何列表（任务面板直连
@@ -390,12 +399,12 @@ function handleSSEBlock(block, id, wsId, epoch) {
     state.webHeadEntries = bootstrap.entries;
     state.webHeadLocations = bootstrap.locations || [];
     state.webOlderPages = retained;
-    // Retained physical pages reach farther back than the new bounded head;
-    // continue paging from their existing oldest cursor, not from the head's
-    // truncation cursor (which would reopen their already-loaded interval).
-    state.nextBeforeSeq = retained.length
-      ? oldCursor
-      : (bootstrap.next_before_seq !== undefined ? bootstrap.next_before_seq : null);
+    // Retained pages own the oldest cursor. A newer bounded head can leave a
+    // disjoint interval above them; drain it with its own cursor so `null`
+    // for the true oldest page never hides the gap.
+    const headCursor = bootstrap.next_before_seq !== undefined ? bootstrap.next_before_seq : null;
+    state.webGapCursor = retained.length ? headCursor : null;
+    state.nextBeforeSeq = retained.length ? oldCursor : headCursor;
     state.olderDone = retained.length ? oldOlderDone : state.nextBeforeSeq === null;
     state.initSource = "history";
     if (bootstrap.usage && bootstrap.usage.data !== undefined) {

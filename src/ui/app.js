@@ -59,6 +59,7 @@ const state = {
   webOlderPages: [],         // Web bootstrap head 之前已加载的 {entries,locations} 物理页
   webHeadLocations: [],      // 当前 Web bootstrap head 的 EntryLocation 元数据
   webHeadEntries: [],        // 当前 Web bootstrap head；用于填补重连时的物理 gap
+  webGapCursor: null,        // 新 head 与已加载旧页之间尚未读取的物理区间
   sessionUsage: null,        // 当前会话持久化累计用量 {input_tokens, output_tokens}（含子会话，重启不清零）；
                              // 打开会话时拉 /usage 填充，切换/关闭时置 null；null → 用量行回退 live 进程计数
   lastUsage: null,           // 最近一次 live Usage 事件（applyUsage 记录）：context_input/context_window 来源；
