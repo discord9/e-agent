@@ -24,6 +24,7 @@ ALREADY = "already-parent"
 PARENT = "between-parent"
 CHILD = "child-historical"
 OTHER = "other"
+GAP = "gap-parent"
 FINAL = "FINAL CHILD REPORT"
 DISPLAY = "LIVE DISPLAY RETAINED"
 
@@ -75,6 +76,9 @@ async def main():
         {"id": OTHER, "model": "flash", "role": "main", "status": "Idle", "busy": False,
          "active": True, "parent_session_id": None, "title": "other", "entry_count": 1,
          "created_at": "2026-01-01T00:00:00Z"},
+        {"id": GAP, "model": "flash", "role": "main", "status": "Busy", "busy": True,
+         "active": True, "parent_session_id": None, "title": "gap", "entry_count": 600,
+         "created_at": "2026-01-01T00:00:00Z"},
     ]
     two_calls = {"type": "message", "message": {"Assistant": {
         "content": None, "reasoning": None, "tool_calls": [
@@ -98,6 +102,12 @@ async def main():
     child_tail = {"entries": [assistant("CHILD INTERMEDIATE ONLY")], "next_before_seq": 5}
     child_older = {"entries": [assistant("CHILD OLDER HISTORY")], "next_before_seq": None}
     other_history = {"entries": [assistant("OTHER")], "next_before_seq": None}
+    # 0..199 is fully loaded with its true oldest cursor exhausted. The
+    # reconnect head jumps to 400..599, leaving a physical 200..399 interval.
+    gap_old = {"entries": [assistant("GAP-%03d" % i) for i in range(200)], "next_before_seq": None}
+    gap_middle = {"entries": [assistant("GAP-%03d" % i) for i in range(200, 400)], "next_before_seq": None}
+    gap_new = {"entries": [assistant("GAP-%03d" % i) for i in range(400, 600)], "next_before_seq": 400}
+    gap_event_reads = 0
 
     # Explicit request barriers, not sleeps: second parent history response is
     # the stale durable read; it commits only after fulfilling that response;
@@ -109,7 +119,7 @@ async def main():
     records = []
 
     async def route(route):
-        nonlocal parent_history_reads, parent_event_reads
+        nonlocal parent_history_reads, parent_event_reads, gap_event_reads
         url, method = route.request.url, route.request.method
         base = url.split("?", 1)[0].rstrip("/")
         if base == common.BASE.rstrip("/"):
@@ -139,6 +149,8 @@ async def main():
                 payload = child_older if "before_seq=" in url else child_tail
             elif "/" + OTHER + "/history" in base:
                 payload = other_history
+            elif "/" + GAP + "/history" in base:
+                payload = gap_middle if "before_seq=400" in url else gap_old
             else:
                 payload = {"entries": [], "next_before_seq": None}
             await route.fulfill(status=200, content_type="application/json",
@@ -194,6 +206,9 @@ async def main():
                          "context_window":100, "session":{"input_tokens":1,"output_tokens":2}}},
                          "after_head": False, "transient": True},
                     ]
+                elif "/" + GAP + "/events" in base:
+                    gap_event_reads += 1
+                    head, replay = (gap_old if gap_event_reads == 1 else gap_new), []
                 else:
                     head, replay = other_history, []
                 body = sse_event("bootstrap", {"entries": head["entries"],
@@ -223,7 +238,7 @@ async def main():
         await page.route("**/*", route)
         await page.goto(common.BASE + "/", wait_until="load")
         await page.reload(wait_until="load")
-        await page.wait_for_function("() => Array.isArray(state.lastList) && state.lastList.length === 4")
+        await page.wait_for_function("() => Array.isArray(state.lastList) && state.lastList.length === 5")
 
         async def open_session(sid):
             await page.evaluate("sid => openSession(sid)", sid)
@@ -288,6 +303,30 @@ async def main():
         check("consumed queue remains empty after repeated bootstrap", await page.evaluate("state.queue.length === 0"))
         check("loaded older reader anchor keeps its physical identity", anchor and anchor == anchor_after,
               "before=%r after=%r" % (anchor, anchor_after))
+
+        # Separate gap cursor: old 0..199 is already exhausted, then the
+        # Web head jumps to 400..599. The 200..399 interval must be fetched
+        # without reopening either retained page or losing its reader anchor.
+        await open_session(GAP)
+        old_anchor = await page.locator(".msg-assistant", has_text="GAP-000").evaluate(
+            "node => node.dataset.entryLocation")
+        await page.evaluate("els.messages.scrollTop = 0; restartTransport()")
+        await page.wait_for_function("() => state.webGapCursor === 400 && state.nextBeforeSeq === null")
+        check("disjoint gap retains exhausted oldest cursor",
+              await page.evaluate("state.webGapCursor === 400 && state.nextBeforeSeq === null"))
+        await page.evaluate("loadOlder()")
+        await page.wait_for_function("() => els.messages.textContent.includes('GAP-200') && state.webGapCursor === null")
+        gap = await page.evaluate(r"""() => {
+          const rows = [...document.querySelectorAll('.msg-assistant')]
+            .filter((node) => node.textContent.includes("GAP-"));
+          return { count: rows.length, keys: new Set(rows.map((node) => node.dataset.entryLocation)).size,
+                   old: rows.find((node) => node.textContent.includes('GAP-000'))?.dataset.entryLocation };
+        }""")
+        check("disjoint gap loads all 600 existing physical rows once",
+              gap["count"] == 600 and gap["keys"] == 600,
+              "count=%d keys=%d" % (gap["count"], gap["keys"]))
+        check("disjoint gap keeps retained oldest anchor", old_anchor and gap["old"] == old_anchor,
+              "before=%r after=%r" % (old_anchor, gap["old"]))
 
         await open_session(CHILD)
         text = await page.locator("#messages").text_content()

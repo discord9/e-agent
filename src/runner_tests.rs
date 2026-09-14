@@ -50,6 +50,73 @@ impl Model for ControlledModel {
     }
 }
 
+struct PrefixSuffixModel {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait]
+impl Model for PrefixSuffixModel {
+    async fn complete(
+        &mut self,
+        _: &[Message],
+        _: &[ToolSpec],
+        mut on_delta: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        if let Some(callback) = &mut on_delta {
+            callback(ModelDeltaKind::Reasoning, "reason-prefix");
+            callback(ModelDeltaKind::Content, "content-prefix");
+        }
+        self.entered.notify_one();
+        self.release.notified().await;
+        if let Some(callback) = &mut on_delta {
+            callback(ModelDeltaKind::Reasoning, "reason-suffix");
+            callback(ModelDeltaKind::Content, "content-suffix");
+        }
+        Ok((
+            AssistantMessage {
+                content: Some("content-prefixcontent-suffix".into()),
+                tool_calls: Vec::new(),
+                reasoning: None,
+            },
+            None,
+        ))
+    }
+}
+
+struct UsageSequenceModel {
+    calls: usize,
+}
+
+#[async_trait]
+impl Model for UsageSequenceModel {
+    async fn complete(
+        &mut self,
+        _: &[Message],
+        _: &[ToolSpec],
+        _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        self.calls += 1;
+        let usage = match self.calls {
+            1 | 5 => Some(Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+                ..Usage::default()
+            }),
+            _ => None,
+        };
+        let content = if self.calls == 2 { "summary" } else { "answer" };
+        Ok((
+            AssistantMessage {
+                content: Some(content.into()),
+                tool_calls: Vec::new(),
+                reasoning: None,
+            },
+            usage,
+        ))
+    }
+}
+
 struct DropProbeModel {
     entered: Arc<Notify>,
     release: Arc<Notify>,
@@ -424,6 +491,91 @@ async fn request_user_input_waits_answers_and_resumes_same_turn() {
         entry,
         SessionEntry::Message { message: Message::User { content, .. } } if content == "Ada"
     )));
+    drop(task);
+}
+
+#[tokio::test]
+async fn web_attach_bridges_active_stream_prefix_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let agent = Agent::new(
+        Box::new(PrefixSuffixModel {
+            entered: entered.clone(),
+            release: release.clone(),
+        }),
+        Vec::new(),
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "web-stream-prefix".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let task = runner.start(Some("start".into()));
+    entered.notified().await;
+
+    // The model emitted ordinary reasoning/content deltas and is blocked
+    // before completion. Attach at that exact operation cut.
+    let attach = tokio::time::timeout(std::time::Duration::from_secs(1), handle.web_attach())
+        .await
+        .expect("attach is serviced while the stream is active")
+        .expect("runner attached");
+    assert!(attach.entries.iter().any(|entry| matches!(entry,
+        SessionEntry::Message { message: Message::User { content, .. } } if content == "start")));
+    let replay: Vec<_> = attach
+        .replay
+        .iter()
+        .map(|item| item.event.clone())
+        .collect();
+    assert_eq!(
+        replay
+            .iter()
+            .filter(|event| matches!(event,
+        AgentEvent::ReasoningDelta(text) if text == "reason-prefix"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        replay
+            .iter()
+            .filter(|event| matches!(event,
+        AgentEvent::AssistantDelta(text) if text == "content-prefix"))
+            .count(),
+        1
+    );
+    assert!(
+        !replay
+            .iter()
+            .any(|event| matches!(event, AgentEvent::AssistantText(_)))
+    );
+
+    let mut live = attach.live;
+    release.notify_one();
+    let mut streamed = String::new();
+    let mut reasoning = String::new();
+    let mut assistant_text = 0;
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), live.recv())
+            .await
+            .expect("stream completes")
+            .expect("live event");
+        match event {
+            AgentEvent::AssistantDelta(text) => streamed.push_str(&text),
+            AgentEvent::ReasoningDelta(text) => reasoning.push_str(&text),
+            AgentEvent::AssistantText(_) => assistant_text += 1,
+            _ => {}
+        }
+        if streamed == "content-suffix" && reasoning == "reason-suffix" {
+            break;
+        }
+    }
+    // The bridge owns the prefix; completing a streamed turn never appends a
+    // second full AssistantText projection.
+    assert_eq!(assistant_text, 0);
+    assert_eq!(streamed, "content-suffix");
+    assert_eq!(reasoning, "reason-suffix");
     drop(task);
 }
 
@@ -1927,6 +2079,230 @@ async fn finish_when_idle_failed_turn_persists_exactly_one_error() {
 }
 
 #[tokio::test]
+async fn web_attach_replays_only_transients_in_the_head_history_range() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut runner, _handle) = SessionRunner::new(
+        Agent::new(
+            Box::new(ScriptedAssistantModel {
+                replies: VecDeque::new(),
+            }),
+            Vec::new(),
+        ),
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "head-range".into(),
+        IdlePolicy::WaitForInput,
+    );
+    // An early presentation event is outside a later 200-entry head. Two
+    // later events retain their physical/logical order inside that head.
+    runner.agent.apply_entry(
+        Message::User {
+            content: "old".into(),
+            images: vec![],
+        }
+        .into(),
+    );
+    runner
+        .shared
+        .lock()
+        .unwrap()
+        .set_history_boundary(runner.agent.history().len());
+    runner
+        .shared
+        .lock()
+        .unwrap()
+        .emit_presentation(AgentEvent::Notice("old-notice".into()));
+    for i in 0..205 {
+        runner.agent.apply_entry(
+            Message::User {
+                content: format!("u{i}"),
+                images: vec![],
+            }
+            .into(),
+        );
+        if i == 10 || i == 100 {
+            let mut shared = runner.shared.lock().unwrap();
+            shared.set_history_boundary(runner.agent.history().len());
+            shared.emit_presentation(AgentEvent::Notice(format!("head-notice-{i}")));
+        }
+    }
+    runner.prepare_web_attach();
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    respond_web_attach_shared(&runner.shared, reply);
+    let attach = rx.await.unwrap();
+    let notices: Vec<_> = attach
+        .replay
+        .into_iter()
+        .filter_map(|item| match item.event {
+            AgentEvent::Notice(text) => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(notices, vec!["head-notice-10", "head-notice-100"]);
+}
+
+#[tokio::test]
+async fn compaction_usage_marker_waits_for_a_fresh_regular_usage() {
+    let temp = tempfile::tempdir().unwrap();
+    let (runner, handle) = SessionRunner::new(
+        Agent::new(
+            Box::new(UsageSequenceModel { calls: 0 }),
+            vec![Box::new(KeepAliveTool { sender: None })],
+        ),
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "usage-marker".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let (_, mut live, _) = handle.attach();
+    let task = runner.start(Some("start".into()));
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !matches!(live.recv().await.unwrap(), AgentEvent::AssistantText(_)) {}
+    })
+    .await
+    .expect("first regular turn emitted AssistantText");
+    let mut boundary = handle.status();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        wait_for_status(&mut boundary, |s| matches!(s, SessionStatus::Idle)),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "turn reaches idle: status={:?} events={:?}",
+            *handle.status().borrow(),
+            handle.snapshot()
+        )
+    });
+    assert!(!handle.shared.lock().unwrap().usage_pre_compaction);
+
+    // The second normal answer makes the first turn compactable.
+    handle.prompt("second");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !matches!(live.recv().await.unwrap(), AgentEvent::AssistantText(_)) {}
+    })
+    .await
+    .expect("second regular turn emitted AssistantText");
+    let mut boundary = handle.status();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        wait_for_status(&mut boundary, |s| matches!(s, SessionStatus::Idle)),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "turn reaches idle: status={:?} events={:?}",
+            *handle.status().borrow(),
+            handle.snapshot()
+        )
+    });
+    handle.compact();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !matches!(live.recv().await.unwrap(), AgentEvent::Display(ref text) if text.starts_with("compacted: ")) {}
+    }).await.expect("compact emitted its durable display projection");
+    let mut boundary = handle.status();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        wait_for_status(&mut boundary, |s| matches!(s, SessionStatus::Idle)),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "turn reaches idle: status={:?} events={:?}",
+            *handle.status().borrow(),
+            handle.snapshot()
+        )
+    });
+    assert!(
+        handle.shared.lock().unwrap().usage_pre_compaction,
+        "compact without usage marks pre-compaction"
+    );
+
+    handle.prompt("regular without usage");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !matches!(live.recv().await.unwrap(), AgentEvent::AssistantText(_)) {}
+    })
+    .await
+    .expect("usage-less regular turn emitted AssistantText");
+    let mut boundary = handle.status();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        wait_for_status(&mut boundary, |s| matches!(s, SessionStatus::Idle)),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "turn reaches idle: status={:?} events={:?}",
+            *handle.status().borrow(),
+            handle.snapshot()
+        )
+    });
+    assert!(
+        handle.shared.lock().unwrap().usage_pre_compaction,
+        "regular None must not clear marker"
+    );
+    handle.prompt("regular with usage");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !matches!(live.recv().await.unwrap(), AgentEvent::AssistantText(_)) {}
+    })
+    .await
+    .expect("usage-bearing regular turn emitted AssistantText");
+    let mut boundary = handle.status();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        wait_for_status(&mut boundary, |s| matches!(s, SessionStatus::Idle)),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "turn reaches idle: status={:?} events={:?}",
+            *handle.status().borrow(),
+            handle.snapshot()
+        )
+    });
+    assert!(
+        !handle.shared.lock().unwrap().usage_pre_compaction,
+        "fresh regular usage clears marker"
+    );
+    drop(task);
+}
+
+#[tokio::test]
+async fn cancel_then_web_attach_resolves_before_idle_or_terminal_wait() {
+    for policy in [IdlePolicy::WaitForInput, IdlePolicy::FinishWhenIdle] {
+        let temp = tempfile::tempdir().unwrap();
+        let (agent, entered, _release) = controlled(vec![Ok("late".into())], true);
+        let (runner, handle) = SessionRunner::new(
+            agent,
+            SessionStore::Jsonl,
+            temp.path().into(),
+            format!("cancel-attach-{policy:?}"),
+            policy,
+        );
+        let task = runner.start(Some("start".into()));
+        entered.notified().await;
+        handle.cancel();
+        let attach = tokio::time::timeout(std::time::Duration::from_secs(1), handle.web_attach())
+            .await
+            .expect("Cancel followed by attach resolves at the release safe point")
+            .expect("runner attached");
+        assert!(attach.entries.iter().any(|entry| matches!(entry,
+            SessionEntry::Message { message: Message::User { content, .. } } if content == "start")));
+        if policy == IdlePolicy::FinishWhenIdle {
+            let mut status = handle.status();
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while !matches!(*status.borrow(), SessionStatus::Finished(_)) {
+                    status.changed().await.unwrap();
+                }
+            })
+            .await
+            .expect("terminal runner finishes after serving attach");
+        }
+        drop(task);
+    }
+}
+
+#[tokio::test]
 async fn commit_error_fallback_emits_without_recursion_when_append_fails() {
     // No injectable failing store exists in this codebase (SessionStore is
     // a plain enum with no test seam, and the task forbids inventing one),
@@ -1943,7 +2319,7 @@ async fn commit_error_fallback_emits_without_recursion_when_append_fails() {
     std::fs::create_dir_all(sessions_dir.join("fallback.jsonl")).unwrap();
 
     let (agent, _, _) = controlled(vec![Err(anyhow::anyhow!("store broken"))], false);
-    let (runner, handle) = SessionRunner::new(
+    let (mut runner, handle) = SessionRunner::new(
         agent,
         SessionStore::Jsonl,
         temp.path().into(),
@@ -1951,6 +2327,17 @@ async fn commit_error_fallback_emits_without_recursion_when_append_fails() {
         IdlePolicy::FinishWhenIdle,
     );
     let (_, mut live, status) = handle.attach();
+    let commands = handle.commands.clone();
+    let (attach_tx, attach_rx) = tokio::sync::oneshot::channel();
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    runner.before_finalize = Some(Box::new(move || {
+        // Queue the attach synchronously while the runner is still open;
+        // finalization must service this received terminal-safe command.
+        commands.send(SessionCommand::WebAttach(reply_tx)).unwrap();
+        tokio::spawn(async move {
+            let _ = attach_tx.send(reply_rx.await.map_err(|_| ()));
+        });
+    }));
     let task = runner.start(Some("initial".into()));
     // The prompt append fails -> terminate(Failed) -> commit_error append
     // also fails -> fallback emit. Exactly one Error event, then finish.
@@ -1959,11 +2346,33 @@ async fn commit_error_fallback_emits_without_recursion_when_append_fails() {
         if let AgentEvent::Error(_) = live.recv().await.unwrap() {
             errors += 1;
         }
-        if matches!(*status.borrow(), SessionStatus::Finished(_)) {
+        if errors == 1 {
             break;
         }
     }
     assert_eq!(errors, 1, "fallback emits the error exactly once");
+    // The unlocated Agent-history Error is presentation-owned on bootstrap,
+    // not also part of the physical head.
+    let attach = tokio::time::timeout(std::time::Duration::from_secs(1), attach_rx)
+        .await
+        .expect("finalization hook receives attach")
+        .expect("attach sender lives")
+        .expect("terminal-safe attach");
+    let head_errors = attach
+        .entries
+        .iter()
+        .filter(|entry| matches!(entry, SessionEntry::Error { .. }))
+        .count();
+    let replay_errors = attach
+        .replay
+        .iter()
+        .filter(|item| matches!(item.event, AgentEvent::Error(_)))
+        .count();
+    assert_eq!(
+        head_errors + replay_errors,
+        1,
+        "fallback error appears exactly once in bootstrap"
+    );
     assert!(matches!(
         *status.borrow(),
         SessionStatus::Finished(SessionResult::Failed(_))

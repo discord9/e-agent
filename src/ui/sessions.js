@@ -580,6 +580,7 @@ async function loadHistory(id, wsId, epoch, timeoutMs) {
     const entries = Array.isArray(data) ? data : (data.entries || []);
     state.webOlderPages = [];
     state.webHeadLocations = data.locations || [];
+    state.webGapCursor = null;
     state.nextBeforeSeq = (data.next_before_seq !== undefined ? data.next_before_seq : null);
     state.olderDone = (state.nextBeforeSeq === null);
     if (state.initSource !== "snapshot") {
@@ -620,7 +621,12 @@ async function loadHistory(id, wsId, epoch, timeoutMs) {
 
 /* 滚动到顶部时加载更早历史（分页：一次一个 compaction 段） */
 async function loadOlder() {
-  if (state.loadingOlder || state.olderDone || !state.sessionId || state.nextBeforeSeq === null) return;
+  // A reconnect can advance the bounded head past already-loaded oldest
+  // pages. Drain that disjoint physical interval before following the normal
+  // oldest cursor; the cursors must not overwrite each other.
+  const gap = state.webGapCursor !== null;
+  const cursor = gap ? state.webGapCursor : state.nextBeforeSeq;
+  if (state.loadingOlder || (!gap && state.olderDone) || !state.sessionId || cursor === null) return;
   const wsId = state.workspace.id;   // 发起时的 workspace：响应回来校验用
   const epoch = sessionOpenEpoch;
   const sid = state.sessionId;
@@ -628,25 +634,64 @@ async function loadOlder() {
   const prevHeight = els.messages.scrollHeight;   // 插入前高度
   try {
     const res = await api("/api/sessions/" + encodeURIComponent(sid)
-      + "/history?before_seq=" + state.nextBeforeSeq + "&limit=" + HISTORY_PAGE);
+      + "/history?before_seq=" + cursor + "&limit=" + HISTORY_PAGE);
     if (epoch !== sessionOpenEpoch || state.workspace.id !== wsId || state.sessionId !== sid) return;
     if (res.status === 401 || res.status === 403) { setBanner("⚠ 认证失败：请检查 Token。"); return; }
     if (!res.ok) return;                          // 静默失败，下次滚动重试
     const data = await res.json();
     if (epoch !== sessionOpenEpoch || state.workspace.id !== wsId || state.sessionId !== sid) return;
     const entries = Array.isArray(data) ? data : (data.entries || []);
-    state.nextBeforeSeq = (data.next_before_seq !== undefined ? data.next_before_seq : null);
-    if (state.nextBeforeSeq === null) state.olderDone = true;
-    if (entries.length) {
-      renderEntries(entries, true, data.locations || []);               // 前置插入
-      state.webOlderPages.unshift({ entries, locations: data.locations || [] });
-      // 占位折叠块保持在最顶部：更早条目插到它前面后，把它移回最前，
-      // 保证后续 prune 折叠的仍是「最早」的块（占位内展开顺序不乱）。
-      const ph = [...els.messages.children].find((c) => c.classList && c.classList.contains("older-collapse"));
-      if (ph) els.messages.insertBefore(ph, els.messages.firstChild);
-      // 保持滚动位置：内容在顶部增高，scrollTop 相应下移
-      els.messages.scrollTop += els.messages.scrollHeight - prevHeight;
+    const locations = data.locations || [];
+    // Pagination may touch an already-retained physical page at the gap's
+    // lower boundary. Reconcile only exact EntryLocation keys.
+    const present = new Set([...els.messages.querySelectorAll("[data-entry-location]")]
+      .map((node) => node.dataset.entryLocation));
+    const freshEntries = [], freshLocations = [];
+    for (let i = 0; i < entries.length; i++) {
+      const location = locations[i];
+      const key = location ? JSON.stringify(location) : null;
+      if (!key || !present.has(key)) {
+        freshEntries.push(entries[i]);
+        freshLocations.push(location);
+      }
     }
+    const next = (data.next_before_seq !== undefined ? data.next_before_seq : null);
+    if (gap) {
+      state.webGapCursor = freshEntries.length ? next : null;
+    } else {
+      state.nextBeforeSeq = next;
+      if (state.nextBeforeSeq === null) state.olderDone = true;
+    }
+    if (freshEntries.length) {
+      if (gap) {
+        // Insert between retained old pages and the current head, rather
+        // than prepending it ahead of the true oldest page.
+        const headKeys = new Set((state.webHeadLocations || []).filter(Boolean).map(JSON.stringify));
+        const boundary = [...els.messages.children]
+          .find((node) => headKeys.has(node.dataset.entryLocation));
+        const oldTop = els.messages.scrollTop;
+        const anchor = [...els.messages.children]
+          .find((node) => node.offsetTop >= oldTop && node.dataset.entryLocation);
+        const anchorKey = anchor && anchor.dataset.entryLocation;
+        const anchorOffset = anchor ? anchor.offsetTop - oldTop : 0;
+        renderEntries(freshEntries, true, freshLocations, boundary);
+        state.webOlderPages.push({ entries: freshEntries, locations: freshLocations });
+        const replacement = anchorKey && [...els.messages.children]
+          .find((node) => node.dataset.entryLocation === anchorKey);
+        if (replacement) els.messages.scrollTop = replacement.offsetTop - anchorOffset;
+      } else {
+        renderEntries(freshEntries, true, freshLocations);               // 前置插入
+        state.webOlderPages.unshift({ entries: freshEntries, locations: freshLocations });
+      }
+        if (!gap) {
+          // 占位折叠块保持在最顶部：更早条目插到它前面后，把它移回最前，
+          // 保证后续 prune 折叠的仍是「最早」的块（占位内展开顺序不乱）。
+          const ph = [...els.messages.children].find((c) => c.classList && c.classList.contains("older-collapse"));
+          if (ph) els.messages.insertBefore(ph, els.messages.firstChild);
+          // 保持滚动位置：内容在顶部增高，scrollTop 相应下移
+          els.messages.scrollTop += els.messages.scrollHeight - prevHeight;
+        }
+      }
   } catch (e) {
     // 静默失败，下次滚动重试
   } finally {
@@ -837,6 +882,7 @@ function saveSessionState() {
     webOlderPages: state.webOlderPages,
     webHeadLocations: state.webHeadLocations,
     webHeadEntries: state.webHeadEntries,
+    webGapCursor: state.webGapCursor,
     // The answer draft is call-bound above; the ordinary composer draft stays separate.
     draft: state.waitingInput ? state.waitingInput.priorDraft : els.promptInput.value,
   };
@@ -895,6 +941,7 @@ function openSession(id, onReady, epoch, timeoutMs) {
     state.webOlderPages = cached.webOlderPages || [];
     state.webHeadLocations = cached.webHeadLocations || [];
     state.webHeadEntries = cached.webHeadEntries || [];
+    state.webGapCursor = cached.webGapCursor !== undefined ? cached.webGapCursor : null;
     state.acc = newAccumulator();
     els.messages.innerHTML = cached.html;
     reattachInFlight(state.acc);   // 重新绑定缓存里「进行中」的思考/助手/工具卡片，
@@ -916,6 +963,7 @@ function openSession(id, onReady, epoch, timeoutMs) {
     state.webOlderPages = [];
     state.webHeadLocations = [];
     state.webHeadEntries = [];
+    state.webGapCursor = null;
     state.nextBeforeSeq = null;
     state.loadingOlder = false;
     state.olderDone = false;

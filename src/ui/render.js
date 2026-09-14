@@ -1369,7 +1369,7 @@ function renderMessage(m, acc, pendingCards) {
 
 /* 渲染一批 SessionEntry。prepend=true 时把新条目插入容器开头（保留既有内容），
    用于滚动分页加载更早历史；prepend=false 时整体替换（初始 history 渲染）。 */
-function renderEntries(entries, prepend, locations) {
+function renderEntries(entries, prepend, locations, before) {
   const acc = newAccumulator();
   const pendingCards = new Map();
   const list = Array.isArray(entries) ? entries : [];
@@ -1397,13 +1397,13 @@ function renderEntries(entries, prepend, locations) {
   }
   try {
     for (let i = 0; i < list.length; i++) {
-      const before = new Set(els.messages.children);
+      const priorNodes = new Set(els.messages.children);
       renderEntry(list[i], acc, pendingCards);
       const location = keys[i];
       if (location) {
         const key = JSON.stringify(location);
         for (const node of els.messages.children) {
-          if (!before.has(node) && node.nodeType === 1) node.dataset.entryLocation = key;
+          if (!priorNodes.has(node) && node.nodeType === 1) node.dataset.entryLocation = key;
         }
       }
     }
@@ -1416,7 +1416,9 @@ function renderEntries(entries, prepend, locations) {
     let n = sentinel.nextSibling;
     while (n) {
       const next = n.nextSibling;
-      els.messages.insertBefore(n, firstOld);
+      // Gap pages belong immediately before the refreshed head; ordinary
+      // pagination remains a true prepend.
+      els.messages.insertBefore(n, before || firstOld);
       n = next;
     }
     sentinel.remove();
