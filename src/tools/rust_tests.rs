@@ -4,7 +4,7 @@
 use super::*;
 #[rustfmt::skip]
 use super::rust::{FAULT_CONFIRM, FAULT_KILL, KillGuard, RunRust, SOURCE_MAX_BYTES, COMPILE_TIMEOUT, ScratchGuard, base_dir, create_scratch, create_scratch_once, group_absent, kill_group, reap_confirmed, remove_scratch, resolve_rustc, run_rust_policy, validate_source};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
 #[rustfmt::skip]
@@ -114,13 +114,72 @@ async fn statuses_stdin_compile_and_hash_reporting() {
 }
 #[rustfmt::skip]
 #[tokio::test]
-async fn hostile_fd_forgery_and_wrapper_kill_fail_closed() {
-    let Some((h, _t)) = hdir(run_rust_policy(None)) else { return; };
-    // The payload writes the exact valid packet to every non-stdio fd (the status
-    // socket is CLOEXEC'd and invisible), kills the wrapper, exits.
-    let error = h.run(r#"use std::io::Write;use std::process::Command;fn main(){let p=[b'e',b'a',b'g',b'e',b'n',b't',b'-',b'r',b'u',b'n',b'-',b'r',b'u',b's',b't',0,1,0,0,0,0];for e in std::fs::read_dir("/proc/self/fd").unwrap(){if let Ok(e)=e{let f=e.path();let n=f.file_name().unwrap().to_str().unwrap().parse::<i32>().unwrap();if n>2{let _=std::fs::OpenOptions::new().write(true).open(&f).map(|mut x|x.write_all(&p));}}}for e in std::fs::read_dir("/proc").unwrap(){if let Ok(e)=e{let n=e.file_name();if let Some(p)=n.to_str().and_then(|s|s.parse::<u32>().ok()).filter(|&p|p>1&&p!=std::process::id()){let _=Command::new("/bin/kill").args(["-9",&p.to_string()]).status();}}}std::process::exit(0)}"#).await.unwrap_err();
-    assert!(!error.contains("run: exit 0") && error.contains("run: failed"), "{error}");
+async fn status_forgery_on_stdout_and_known_wrapper_kill_fail_closed() {
+    let Some((h, _t)) = hdir(run_rust_policy(None)) else {
+        eprintln!("STATUS_FORGERY_SKIPPED: bwrap or rustc unavailable");
+        return;
+    };
+    // The packet is deliberately written to stdout, not to the private status
+    // endpoint. The payload kills only its known wrapper parent in the isolated
+    // PID namespace and reports that kill's return value before it exits.
+    let error = h.run(r#"use std::io::Write;extern "C"{fn getppid()->i32;fn kill(pid:i32,sig:i32)->i32;}fn main(){std::io::stdout().write_all(b"eagent-run-rust\0\x01\0\0\0\0\nPAYLOAD_REACHED\n").unwrap();let killed=unsafe{kill(getppid(),9)};println!("KNOWN_WRAPPER_KILL:{killed}");if killed!=0{std::process::exit(73)}}"#).await.unwrap_err();
+    assert!(error.contains("compile: exit code 0"), "compile did not succeed: {error}");
+    assert!(error.contains("PAYLOAD_REACHED") && error.contains("KNOWN_WRAPPER_KILL:0"), "payload did not reach its known wrapper kill: {error}");
+    assert!(error.contains("run: failed: wrapper exit code 137; status not confirmed"), "wrapper status failure was not exact: {error}");
+    assert!(!error.contains("run: exit code 0"), "forged stdout packet was accepted: {error}");
     assert!(h.scratch_empty(), "scratch removed after the failed run");
+    eprintln!("STATUS_FORGERY_EXECUTED");
+}
+
+#[rustfmt::skip]
+#[tokio::test]
+async fn linked_metadata_plan_fds_stay_cloexec_across_bash_and_run_rust() {
+    // The fixture and plan-A CLOEXEC assertion deliberately run before any
+    // bwrap/rustc availability gate. It is synthetic only: no Git repository
+    // or real-worktree metadata is touched.
+    let temp = tempfile::tempdir().unwrap();
+    let main = temp.path().join("main");
+    let nested = main.join("nested");
+    let admin = main.join(".git/worktrees/nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::create_dir_all(&admin).unwrap();
+    let pointer = nested.join(".git");
+    std::fs::write(&pointer, format!("gitdir: {}\n", admin.display())).unwrap();
+    let caller = Workspace::new(&main).unwrap();
+    let workspace = caller.reroot(&nested).unwrap().derive_child_linked_metadata(&caller).unwrap();
+    assert!(workspace.linked_metadata().is_some(), "synthetic pointer was not retained");
+    let sentinel_metadata = std::fs::metadata(&pointer).unwrap();
+    let sentinel = format!("{}:{}", sentinel_metadata.dev(), sentinel_metadata.ino());
+    let policy = run_rust_policy(None);
+    let root = workspace.root().to_string_lossy().into_owned();
+    let plan_a = super::bash::build_bwrap_plan(&workspace, &policy, true, false, &root, None).unwrap();
+    assert!(plan_a.fds.iter().all(|fd| rustix::io::fcntl_getfd(fd).unwrap().contains(rustix::io::FdFlags::CLOEXEC)), "plan A retained an inheritable fd");
+    eprintln!("FD_CLOEXEC_PLAN_ASSERTED");
+
+    if !bwrap_available() {
+        eprintln!("FD_CLOEXEC_BASH_SKIPPED: bwrap unavailable");
+        eprintln!("FD_CLOEXEC_RUN_RUST_SKIPPED: bwrap unavailable");
+        return;
+    }
+    let plan_b = super::bash::build_bwrap_plan(&workspace, &policy, true, false, &root, None).unwrap();
+    let script = format!("set -eu; sentinel=$(stat -Lc '%d:%i' .git); test \"$sentinel\" = '{sentinel}'; seen=0; for fd in /proc/$$/fd/*; do value=$(stat -Lc '%d:%i' \"$fd\") || {{ test ! -e \"$fd\" && continue; echo \"cannot inventory $fd\" >&2; exit 1; }}; seen=$((seen + 1)); test \"$value\" != '{sentinel}' || {{ echo \"sentinel inherited on $fd\" >&2; exit 1; }}; done; test \"$seen\" -gt 0; echo FD_CLOEXEC_BASH_EXECUTED");
+    let output = super::bash::plan_spawn(&plan_b, &["/bin/sh".into(), "-c".into(), script.into()]).unwrap().wait_with_output().unwrap();
+    assert!(output.status.success(), "bash plan B failed: {output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("FD_CLOEXEC_BASH_EXECUTED"), "bash payload did not complete its inventory: {stdout}");
+    eprintln!("FD_CLOEXEC_BASH_EXECUTED");
+
+    if resolve_rustc(std::env::var_os("PATH").as_deref()).is_none() {
+        eprintln!("FD_CLOEXEC_RUN_RUST_SKIPPED: rustc unavailable");
+        return;
+    }
+    let scratch = tempfile::tempdir().unwrap();
+    let h = Harness { tool: RunRust { workspace, policy, compile_timeout: COMPILE_TIMEOUT, run_timeout: Duration::from_secs(30), scratch: Some(scratch.path().to_path_buf()) }, base: scratch };
+    let output = h.run(r#"use std::io::ErrorKind;use std::os::unix::fs::MetadataExt;fn main(){let mut seen=0;for fd in std::fs::read_dir("/proc/self/fd").unwrap().flatten(){match std::fs::metadata(fd.path()){Ok(m)=>{seen+=1;println!("{}:{}",m.dev(),m.ino())},Err(e)if e.kind()==ErrorKind::NotFound=>(),Err(e)=>panic!("cannot inventory {:?}: {e}",fd.path())}}assert!(seen>0);println!("FD_CLOEXEC_RUN_RUST_EXECUTED")}"#).await.unwrap();
+    assert!(!output.lines().any(|line| line == sentinel), "run_rust payload inherited plan A sentinel {sentinel}");
+    assert!(output.contains("FD_CLOEXEC_RUN_RUST_EXECUTED"), "run_rust payload did not complete its inventory: {output}");
+    eprintln!("FD_CLOEXEC_RUN_RUST_EXECUTED");
+    assert!(h.scratch_empty(), "scratch removed after the run");
 }
 #[rustfmt::skip]
 #[tokio::test]

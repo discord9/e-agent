@@ -781,13 +781,13 @@ pub(super) fn build_bwrap_plan_with_tmp_policy(
             .pointer
             .lock()
             .map_err(|_| "cannot retain linked worktree pointer")?;
-        let pointer_fd = rustix::io::dup(pointer.as_fd())
+        let pointer_fd = rustix::io::fcntl_dupfd_cloexec(pointer.as_fd(), 0)
             .map_err(|error| format!("cannot retain linked worktree pointer: {error}"))?;
         push_bind(&mut args, &mut fds, pointer_fd, root.join(".git"), false);
-        let fd = rustix::io::dup(metadata.dir.as_fd())
+        let fd = rustix::io::fcntl_dupfd_cloexec(metadata.dir.as_fd(), 0)
             .map_err(|error| format!("cannot retain linked worktree metadata: {error}"))?;
         push_bind(&mut args, &mut fds, fd, metadata.path.clone(), false);
-        let fd = rustix::io::dup(metadata.admin.as_fd())
+        let fd = rustix::io::fcntl_dupfd_cloexec(metadata.admin.as_fd(), 0)
             .map_err(|error| format!("cannot retain linked worktree admin: {error}"))?;
         push_bind(&mut args, &mut fds, fd, metadata.admin_path.clone(), false);
     }
@@ -1048,7 +1048,7 @@ fn pin_relative(
     relative: &Path,
 ) -> rustix::io::Result<rustix::fd::OwnedFd> {
     use rustix::fs::{Mode, OFlags, ResolveFlags, openat2};
-    let mut fd = rustix::io::dup(parent)?;
+    let mut fd = rustix::io::fcntl_dupfd_cloexec(parent, 0)?;
     for component in relative.components() {
         let std::path::Component::Normal(name) = component else {
             return Err(rustix::io::Errno::INVAL);
@@ -1156,7 +1156,8 @@ fn project_policy_parent(
     {
         let mut buffer = Vec::with_capacity(8192);
         let mut raw = RawDir::new(
-            rustix::io::dup(&parent_fd).map_err(|e| format!("cannot dup policy parent fd: {e}"))?,
+            rustix::io::fcntl_dupfd_cloexec(&parent_fd, 0)
+                .map_err(|e| format!("cannot duplicate policy parent fd: {e}"))?,
             buffer.spare_capacity_mut(),
         );
         while let Some(entry) = raw.next() {
