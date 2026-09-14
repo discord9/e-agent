@@ -2089,6 +2089,55 @@ async fn finish_when_idle_failed_turn_persists_exactly_one_error() {
 }
 
 #[tokio::test]
+async fn web_attach_maps_unlocated_error_boundary_to_returned_entry_offset() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: VecDeque::new(),
+        }),
+        Vec::new(),
+    );
+    agent.apply_entry_located(
+        Message::User {
+            content: "user".into(),
+            images: vec![],
+        }
+        .into(),
+        None,
+    );
+    agent.apply_entry(SessionEntry::Error {
+        text: "fallback".into(),
+    });
+    agent.apply_entry_located(
+        Message::Assistant(AssistantMessage {
+            content: Some("assistant".into()),
+            tool_calls: Vec::new(),
+            reasoning: None,
+        })
+        .into(),
+        None,
+    );
+    let (runner, _) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "mapped-boundary".into(),
+        IdlePolicy::WaitForInput,
+    );
+    {
+        let mut shared = runner.shared.lock().unwrap();
+        shared.set_history_boundary(2);
+        shared.emit_presentation(AgentEvent::Error("fallback".into()));
+    }
+    runner.prepare_web_attach();
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    respond_web_attach_shared(&runner.shared, reply);
+    let attach = rx.await.unwrap();
+    assert_eq!(attach.entries.len(), 2);
+    assert_eq!(attach.replay[0].head_boundary, Some(1));
+}
+
+#[tokio::test]
 async fn web_head_keeps_logical_boundary_when_unlocated_error_is_in_tail() {
     let mut agent = Agent::new(
         Box::new(ScriptedAssistantModel {
@@ -2109,7 +2158,7 @@ async fn web_head_keeps_logical_boundary_when_unlocated_error_is_in_tail() {
     agent.apply_entry(SessionEntry::Error {
         text: "fallback".into(),
     });
-    let (entries, locations, cursor, start, end) = agent.web_head_page(200, true);
+    let (entries, locations, cursor, start, end, _) = agent.web_head_page(200, true);
     assert_eq!((start, end), (2, 202));
     assert_eq!(entries.len(), 199);
     assert_eq!(locations.len(), 199);

@@ -212,6 +212,7 @@ struct WebHead {
     next_before_seq: Option<i64>,
     history_start: usize,
     history_end: usize,
+    returned_boundaries: Vec<usize>,
     log_start: usize,
 }
 
@@ -796,8 +797,13 @@ fn respond_web_attach_locked(shared: &Shared, reply: oneshot::Sender<WebAttach>)
                 event: item.event.clone(),
                 after_head: i >= head.log_start,
                 transient: item.transient,
-                head_boundary: (i < head.log_start)
-                    .then_some(item.history_boundary.saturating_sub(head.history_start)),
+                head_boundary: (i < head.log_start).then(|| {
+                    let logical = item
+                        .history_boundary
+                        .saturating_sub(head.history_start)
+                        .min(head.history_end.saturating_sub(head.history_start));
+                    head.returned_boundaries[logical]
+                }),
             })
             .collect(),
         status: shared.status.borrow().clone(),
@@ -1566,7 +1572,7 @@ impl SessionRunner {
     }
 
     fn prepare_web_attach(&self) {
-        let (entries, locations, next_before_seq, history_start, history_end) =
+        let (entries, locations, next_before_seq, history_start, history_end, returned_boundaries) =
             self.agent.web_head_page(200, self.store.is_jsonl());
         let mut shared = self.shared.lock().unwrap();
         let log_start = shared.log.len();
@@ -1576,6 +1582,7 @@ impl SessionRunner {
             next_before_seq,
             history_start,
             history_end,
+            returned_boundaries,
             log_start,
         });
     }

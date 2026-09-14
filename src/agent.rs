@@ -1107,6 +1107,15 @@ impl ContextItem {
     }
 }
 
+type WebHeadPage = (
+    Vec<SessionEntry>,
+    Vec<Option<EntryLocation>>,
+    Option<i64>,
+    usize,
+    usize,
+    Vec<usize>,
+);
+
 pub struct Agent {
     model: Box<dyn Model>,
     tools: Vec<Box<dyn Tool>>,
@@ -1308,17 +1317,7 @@ impl Agent {
     /// Bounded authoritative head projection for a live Web attach.  The
     /// runner owns this projection; it is derived from the same located
     /// history that it just committed, never from the presentation log.
-    pub(crate) fn web_head_page(
-        &self,
-        limit: usize,
-        jsonl: bool,
-    ) -> (
-        Vec<SessionEntry>,
-        Vec<Option<EntryLocation>>,
-        Option<i64>,
-        usize,
-        usize,
-    ) {
+    pub(crate) fn web_head_page(&self, limit: usize, jsonl: bool) -> WebHeadPage {
         let segment_start = if jsonl {
             0
         } else {
@@ -1340,8 +1339,14 @@ impl Agent {
                 | crate::session_store::LocatedKey::Greptime { seq, .. } => *seq,
             })
             .filter(|_| history_start > 0);
-        let rows: (Vec<SessionEntry>, Vec<Option<EntryLocation>>) = self.history
-            [history_start..history_end]
+        let mut entries = Vec::new();
+        let mut locations = Vec::new();
+        // Map every logical insertion boundary in the frozen interval to the
+        // returned physical-entry offset. Unlocated fallback Errors consume a
+        // logical boundary but do not shift returned entry indices.
+        let mut returned_boundaries = Vec::with_capacity(history_end - history_start + 1);
+        returned_boundaries.push(0);
+        for (entry, location) in self.history[history_start..history_end]
             .iter()
             .cloned()
             .zip(
@@ -1349,11 +1354,21 @@ impl Agent {
                     .iter()
                     .cloned(),
             )
-            .filter(|(entry, location)| {
-                !matches!(entry, SessionEntry::Error { .. }) || location.is_some()
-            })
-            .unzip();
-        (rows.0, rows.1, cursor, history_start, history_end)
+        {
+            if !matches!(entry, SessionEntry::Error { .. }) || location.is_some() {
+                entries.push(entry);
+                locations.push(location);
+            }
+            returned_boundaries.push(entries.len());
+        }
+        (
+            entries,
+            locations,
+            cursor,
+            history_start,
+            history_end,
+            returned_boundaries,
+        )
     }
 
     /// Replace the whole history (session resume). To ADD one entry to an

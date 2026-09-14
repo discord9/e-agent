@@ -198,6 +198,10 @@ async def main():
                             "name":"read_file", "arguments":"{\"path\":\"a.txt\"}",
                             "call_id":"pair-a"}}, "after_head": True, "transient": False})
                     replay += [
+                        {"event": {"type":"notice", "data":"LEADING A"}, "after_head": False,
+                         "head_boundary": 0, "transient": True},
+                        {"event": {"type":"notice", "data":"LEADING B"}, "after_head": False,
+                         "head_boundary": 0, "transient": True},
                         # A fully consumed queue is presentation state, not
                         # transcript history. Every bootstrap folds this pair
                         # from an empty queue and must end empty.
@@ -276,6 +280,10 @@ async def main():
         }""")
         check("pre-head Display is interleaved at its history boundary",
               placement[0] < placement[1] < placement[2], "indices=%r" % placement)
+        leading = await page.evaluate("""() => [...els.messages.children]
+          .filter((node) => node.textContent.includes('LEADING ')).map((node) => node.textContent)""")
+        check("boundary-zero notices retain producer order", leading == ["LEADING A", "LEADING B"],
+              "leading=%r" % leading)
         check("real live Usage retained", "42/100 tok" in await page.locator("#usageInfo").text_content())
         check("consumed queue folds empty on bootstrap", await page.evaluate("state.queue.length === 0"))
         await page.wait_for_function("""() => {
@@ -344,6 +352,15 @@ async def main():
               "count=%d keys=%d ordered=%s" % (gap["count"], gap["keys"], gap["ordered"]))
         check("disjoint gap keeps retained oldest anchor", old_anchor and gap["old"] == old_anchor,
               "before=%r after=%r" % (old_anchor, gap["old"]))
+        await page.evaluate("restartTransport()")
+        await page.wait_for_function("() => state.sessionId === 'gap-parent' && state.initSource === 'history'")
+        gap_reconnect = await page.evaluate(r"""() => {
+          const values = [...document.querySelectorAll('.msg-assistant')]
+            .filter((node) => node.textContent.includes("GAP-"))
+            .map((node) => Number(/GAP-(\d{3})/.exec(node.textContent)[1]));
+          return values.length === 1000 && values.every((value, i) => value === i);
+        }""")
+        check("three-page gap remains chronological after reconnect", gap_reconnect)
 
         await open_session(CHILD)
         text = await page.locator("#messages").text_content()
