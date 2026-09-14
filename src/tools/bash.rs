@@ -6,7 +6,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 #[cfg(unix)]
-use std::os::unix::{ffi::OsStrExt, io::AsRawFd};
+use std::os::unix::{
+    ffi::OsStrExt,
+    io::{AsFd, AsRawFd},
+};
 // `std::process::Command::pre_exec` (CommandExt) is only used by the
 // test-only `plan_spawn`; tokio's `Command` has an inherent `pre_exec`.
 #[cfg(all(unix, test))]
@@ -539,6 +542,14 @@ pub(super) fn build_bwrap_plan_with_tmp_policy(
     // excluded here: that subtree is owned by the fd-pinned projection
     // below, so no pathname bind can project over the policy file.
     let policy_parent = workspace.policy_anchor().parent().map(Path::to_path_buf);
+    let metadata_dest = workspace
+        .linked_metadata()
+        .map(|metadata| metadata.path.clone());
+    let allow_mount = |dest: &str| {
+        metadata_dest
+            .as_ref()
+            .is_none_or(|metadata| !Path::new(dest).starts_with(metadata))
+    };
     let mut mounts = Vec::new();
     // Any configured destination at or under the policy parent is excluded
     // from the generic pathname mount loop: that subtree is owned by the
@@ -550,28 +561,28 @@ pub(super) fn build_bwrap_plan_with_tmp_policy(
     for (source, dest) in &sandbox.readable_mounts {
         if dest_is_policy_subtree(dest, policy_parent.as_deref()) {
             filtered_policy_dests = true;
-        } else {
+        } else if allow_mount(dest) {
             mounts.push((source.as_str(), dest.as_str(), "--ro-bind-try", false));
         }
     }
     for (source, dest) in &sandbox.writable_mounts {
         if dest_is_policy_subtree(dest, policy_parent.as_deref()) {
             filtered_policy_dests = true;
-        } else {
+        } else if allow_mount(dest) {
             mounts.push((source.as_str(), dest.as_str(), "--bind-try", false));
         }
     }
     for path in &sandbox.readable_paths {
         if dest_is_policy_subtree(path, policy_parent.as_deref()) {
             filtered_policy_dests = true;
-        } else {
+        } else if allow_mount(path) {
             mounts.push((path.as_str(), path.as_str(), "--ro-bind-try", false));
         }
     }
     for path in &sandbox.writable_paths {
         if dest_is_policy_subtree(path, policy_parent.as_deref()) {
             filtered_policy_dests = true;
-        } else {
+        } else if allow_mount(path) {
             mounts.push((path.as_str(), path.as_str(), "--bind-try", false));
         }
     }
@@ -678,17 +689,6 @@ pub(super) fn build_bwrap_plan_with_tmp_policy(
             args.push((*dest).into());
         }
     }
-    // 4: lock the guard tmpfs read-only. `--remount-ro` is per-mount
-    // (never recursive), which is exactly right here: the lock seals the
-    // guard tmpfs so no NEW unauthorized mount point can be created under
-    // it, while every submount installed above — the workspace and the
-    // explicit grants — keeps its own configured mode. `--ro-bind`
-    // submounts were already remounted read-only by bwrap itself.
-    for (_, dest) in &ancestor_guards {
-        args.push("--remount-ro".into());
-        args.push(dest.as_os_str().into());
-    }
-
     // Protect the startup policy anchor: a descriptor-pinned projection
     // applied after every other mount so no bind (workspace, alias or
     // explicit descendant) can shadow it. Every destination filtered from
@@ -714,16 +714,75 @@ pub(super) fn build_bwrap_plan_with_tmp_policy(
         ));
     }
 
-    if tmp_read_only {
-        args.extend(["--remount-ro".into(), "/tmp".into()]);
-    }
-
     // .git read-only over itself (subagents; run_rust always). Installed
     // AFTER the policy projection: a workspace whose `.git` lives under the
     // policy parent (e.g. rerooted into `.e-agent/worktrees/<name>`) would
     // otherwise have its ro-bind shadowed by the projection's `--tmpfs
     // parent` plus the top-level writable bind.
-    if protect_git {
+    if let Some(metadata) = workspace.linked_metadata() {
+        let overlaps = |path: &str| {
+            let path = Path::new(path);
+            path.starts_with(&metadata.path)
+                || metadata.path.starts_with(path)
+                || path.starts_with(root.join(".git"))
+                || root.join(".git").starts_with(path)
+        };
+        if sandbox
+            .writable_mounts
+            .iter()
+            .any(|(source, dest)| source != dest && overlaps(source))
+        {
+            return Err("linked worktree metadata overlaps a writable sandbox alias".into());
+        }
+        // Linked-worktree state is descriptor-pinned from authority held
+        // before rerooting. Install after every policy mount, including when
+        // a role opted out of ordinary `.git` protection.
+        // The child workspace bind does not include its parent repository,
+        // so create precisely the metadata mount point beneath the already
+        // projected ancestor before installing the pinned binds.
+        let common = root
+            .ancestors()
+            .find(|ancestor| metadata.path.starts_with(ancestor))
+            .ok_or("linked worktree metadata has no workspace ancestor")?;
+        let mut parents = Vec::new();
+        let mut parent = metadata.path.parent();
+        while let Some(path) = parent {
+            if path == common {
+                break;
+            }
+            parents.push(path);
+            parent = path.parent();
+        }
+        for path in parents.into_iter().rev() {
+            args.push("--dir".into());
+            args.push(path.as_os_str().into());
+        }
+        args.push("--dir".into());
+        args.push(metadata.path.as_os_str().into());
+        let pointer = metadata
+            .pointer
+            .lock()
+            .map_err(|_| "cannot retain linked worktree pointer")?;
+        let pointer_fd = rustix::io::dup(pointer.as_fd())
+            .map_err(|error| format!("cannot retain linked worktree pointer: {error}"))?;
+        push_bind(&mut args, &mut fds, pointer_fd, root.join(".git"), false);
+        let fd = rustix::io::dup(metadata.dir.as_fd())
+            .map_err(|error| format!("cannot retain linked worktree metadata: {error}"))?;
+        push_bind(&mut args, &mut fds, fd, metadata.path.clone(), false);
+        let fd = rustix::io::dup(metadata.admin.as_fd())
+            .map_err(|error| format!("cannot retain linked worktree admin: {error}"))?;
+        push_bind(&mut args, &mut fds, fd, metadata.admin_path.clone(), false);
+    }
+    if tmp_read_only {
+        args.extend(["--remount-ro".into(), "/tmp".into()]);
+    }
+    // Seal guards after all metadata mountpoint directories are present.
+    for (_, dest) in &ancestor_guards {
+        args.push("--remount-ro".into());
+        args.push(dest.as_os_str().into());
+    }
+
+    if protect_git && workspace.linked_metadata().is_none() {
         let git_path = format!("{root_str}/.git");
         if std::path::Path::new(&git_path).exists() {
             args.push("--ro-bind".into());

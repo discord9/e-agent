@@ -2,6 +2,170 @@ use super::*;
 use std::fs;
 
 #[test]
+fn linked_worktree_metadata_requires_authorized_literal_admin_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let main = temp.path().join("main");
+    let child = main.join("child");
+    let admin = main.join(".git/worktrees/child");
+    fs::create_dir_all(&child).unwrap();
+    fs::create_dir_all(&admin).unwrap();
+    fs::write(child.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+    let caller = Workspace::new(&main).unwrap();
+    let child_workspace = caller
+        .reroot(&child)
+        .unwrap()
+        .derive_child_linked_metadata(&caller)
+        .unwrap();
+    assert_eq!(
+        child_workspace.linked_metadata().unwrap().path,
+        main.join(".git")
+    );
+    assert!(child_workspace.write(".git", "no").is_err());
+    assert!(
+        child_workspace
+            .write(admin.join("index").to_str().unwrap(), "no")
+            .is_err()
+    );
+
+    fs::write(child.join(".git"), "not a git pointer\n").unwrap();
+    assert!(
+        caller
+            .reroot(&child)
+            .unwrap()
+            .derive_child_linked_metadata(&caller)
+            .unwrap()
+            .linked_metadata()
+            .is_none()
+    );
+
+    fs::write(
+        child.join(".git"),
+        format!("gitdir: {}/../outside\n", admin.display()),
+    )
+    .unwrap();
+    assert!(
+        caller
+            .reroot(&child)
+            .unwrap()
+            .derive_child_linked_metadata(&caller)
+            .is_err()
+    );
+
+    let outside = temp.path().join("outside/.git/worktrees/child");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(
+        child.join(".git"),
+        format!("gitdir: {}\n", outside.display()),
+    )
+    .unwrap();
+    assert!(
+        caller
+            .reroot(&child)
+            .unwrap()
+            .derive_child_linked_metadata(&caller)
+            .is_err()
+    );
+
+    fs::write(child.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+    fs::write(admin.join("index"), "index").unwrap();
+    // Canonical self grants remain permitted: protected file-tool paths are
+    // denied explicitly and bwrap's final descriptor overlay is read-only.
+    for (case, writable) in [
+        main.clone(),
+        main.join(".git"),
+        child.join(".git"),
+        admin.join("index"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let policy = crate::config::Sandbox {
+            writable_paths: vec![writable.display().to_string()],
+            ..Default::default()
+        };
+        let granted = Workspace::new(&main)
+            .unwrap()
+            .with_external_roots(&policy)
+            .unwrap();
+        let derived = granted
+            .reroot(&child)
+            .unwrap()
+            .derive_child_linked_metadata(&granted)
+            .unwrap_or_else(|error| panic!("canonical grant case {case}: {error}"));
+        assert!(
+            derived
+                .write(main.join(".git/config").to_str().unwrap(), "no")
+                .is_err()
+        );
+    }
+    fs::write(child.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+
+    let alias_policy = crate::config::Sandbox {
+        writable_mounts: vec![(
+            main.join(".git").display().to_string(),
+            temp.path().join("alias").display().to_string(),
+        )],
+        ..Default::default()
+    };
+    let aliased = Workspace::new(&main)
+        .unwrap()
+        .with_external_roots(&alias_policy)
+        .unwrap();
+    assert!(
+        aliased
+            .reroot(&child)
+            .unwrap()
+            .derive_child_linked_metadata(&aliased)
+            .is_err()
+    );
+
+    #[cfg(unix)]
+    {
+        // A forged FIFO must not block pointer discovery; use a bounded
+        // thread receive so a regression cannot stall the suite.
+        let fifo = child.join(".git");
+        fs::remove_file(&fifo).unwrap();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let root = main.clone();
+        let nested = child.clone();
+        let (sent, received) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let caller = Workspace::new(root).unwrap();
+            let _ = caller
+                .reroot(nested)
+                .unwrap()
+                .derive_child_linked_metadata(&caller);
+            sent.send(()).unwrap();
+        });
+        received
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        fs::remove_file(child.join(".git")).unwrap();
+        fs::write(child.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+
+        use std::os::unix::fs::symlink;
+        let other = main.join(".git/worktrees/other");
+        fs::create_dir_all(&other).unwrap();
+        fs::remove_dir_all(&admin).unwrap();
+        symlink(&other, &admin).unwrap();
+        fs::write(child.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+        assert!(
+            caller
+                .reroot(&child)
+                .unwrap()
+                .derive_child_linked_metadata(&caller)
+                .is_err()
+        );
+    }
+}
+
+#[test]
 fn rejects_parent_absolute_and_current_directory_paths() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();

@@ -2325,6 +2325,92 @@ fn policy_bash(workspace: Workspace, sandbox: crate::config::Sandbox) -> Bash {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn sandbox_linked_worktree_retains_read_only_git_metadata() {
+    if !bwrap_available() {
+        eprintln!("bwrap unavailable; skipping sandbox test");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let main = temp.path().join("main");
+    std::fs::create_dir(&main).unwrap();
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&main)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["init"]);
+    git(&["config", "user.email", "test@example.invalid"]);
+    git(&["config", "user.name", "test"]);
+    std::fs::write(main.join("tracked"), "content\n").unwrap();
+    git(&["add", "tracked"]);
+    git(&["commit", "-m", "initial"]);
+    git(&["worktree", "add", "nested", "-b", "nested"]);
+    std::fs::write(main.join("nested/tracked"), "changed\n").unwrap();
+    let caller = Workspace::new(&main).unwrap();
+    let child = caller
+        .reroot(main.join("nested"))
+        .unwrap()
+        .derive_child_linked_metadata(&caller)
+        .unwrap();
+    let index = main.join(".git/worktrees/nested/index");
+    let config = main.join(".git/config");
+    let branch = main.join(".git/refs/heads/master");
+    // This policy-only alias is deliberately absent from Workspace external
+    // roots: bwrap must independently reject an alias source exposing linked
+    // metadata at another destination before it spawns a shell.
+    let alias = temp.path().join("metadata-alias");
+    let mut alias_policy = sandbox().unwrap();
+    alias_policy.writable_mounts.push((
+        main.join(".git").display().to_string(),
+        alias.display().to_string(),
+    ));
+    let config_before_alias = std::fs::read(&config).unwrap();
+    let error = policy_bash(child.clone(), alias_policy)
+        .execute(json!({"command": "true"}))
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("linked worktree metadata overlaps a writable sandbox alias"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read(&config).unwrap(), config_before_alias);
+    assert!(!alias.exists());
+
+    let policy = sandbox().unwrap();
+    let before = [
+        std::fs::read(&index).unwrap(),
+        std::fs::read(&config).unwrap(),
+        std::fs::read(&branch).unwrap(),
+    ];
+    let head = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(main.join("nested"))
+        .output()
+        .unwrap();
+    assert!(head.status.success());
+    let head = String::from_utf8(head.stdout).unwrap();
+    let mut tool = policy_bash(child, policy);
+    tool.protect_git = false;
+    tool.tmp_read_only = true;
+    let script = format!(
+        "set -e; printf shell-write > ordinary; test \"$(cat ordinary)\" = shell-write; git status --porcelain | grep -F 'tracked'; git diff -- tracked | grep -F '+changed'; git log -1 --format=%H | grep -Fx '{}'; for p in \"$(git rev-parse --git-path index)\" \"$(git rev-parse --git-common-dir)/config\" \"$(git rev-parse --git-common-dir)/refs/heads/master\"; do if printf denied > \"$p\"; then exit 70; fi; done",
+        head.trim()
+    );
+    tool.execute(json!({"command": script})).await.unwrap();
+    assert_eq!(std::fs::read(index).unwrap(), before[0]);
+    assert_eq!(std::fs::read(config).unwrap(), before[1]);
+    assert_eq!(std::fs::read(branch).unwrap(), before[2]);
+    assert_eq!(
+        std::fs::read_to_string(main.join("nested/ordinary")).unwrap(),
+        "shell-write"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn sandbox_policy_anchor_keeps_existing_worktrees_writable() {
     // GreptimeDB reproduction: `.e-agent/` exists with `worktrees/`,
     // `config.toml` missing, workspace writable. The old implementation
