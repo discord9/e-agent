@@ -288,10 +288,13 @@ subagents is a planned future option, not implemented today.
 ### Role frontmatter: `protect_git`
 
 Subagent/fixer `bash` protects the workspace `.git` metadata by default
-(`protect_git = true`): on Linux/macOS the sandbox binds `<workspace>/.git`
+(`protect_git = true`): on Linux/Android the sandbox binds Git metadata
 read-only so a delegated agent cannot delete or corrupt the repository (the
-main agent leaves `.git` writable so it can orchestrate git operations). The
-same frontmatter block can opt a role out with `protect_git = false`:
+main agent leaves its own `.git` writable so it can orchestrate git operations).
+For a delegated linked worktree, this includes the `.git` pointer and only the
+caller-authorized main-worktree Git metadata and administrative paths; ordinary
+workspace file writes remain writable. Writable aliases to that metadata are
+rejected. The same frontmatter block can opt a role out with `protect_git = false`:
 
 ```markdown
 ---
@@ -306,8 +309,9 @@ in a delegated subagent/fixer is rejected before execution with guidance in
 the error message. Setting `protect_git = false` in the role's frontmatter
 (and accepting that `.git` stays writable inside the sandbox) restores a
 working shell for that role. The key defaults to `true` when omitted, so
-Linux/macOS behavior is unchanged; only roles that explicitly opt out lose the
-`.git` protection.
+For ordinary repositories, `protect_git = false` disables this protection.
+For delegated linked worktrees, the retained Git metadata stays read-only even
+with that opt-out; it does not authorize writable metadata aliases.
 
 The `bash` tool can be sandboxed with `bubblewrap` when it is installed. The
 sandbox is off unless explicitly enabled:
@@ -430,7 +434,11 @@ persistence to GreptimeDB as well (see the backend sections below). Without `--s
 fresh unique session ID. History is restored for
 model context on startup, while display projections are replayed in the TUI;
 the model only sees the latest compaction summary and everything after it.
-Legacy `.json` sessions are migrated on first load. `--version` (or `-V`) prints the exact
+`Notice` is a durable notification delivered to the model. `Display` is a
+live/session-log presentation event only, never model input or a persisted
+`SessionEntry`; compaction and fork displays are reconstructed from their
+existing durable entries. This adds no `SessionEntry` migration. Legacy `.json`
+sessions are migrated on first load. `--version` (or `-V`) prints the exact
 package build version without loading the workspace or configuration. Optional CLI overrides
 are `--base-url URL`, `--model MODEL`, `--profile PROFILE`, `--workspace PATH`, `--session NAME`,
 `--fork SESSION`, `--at N`, and `--max-rounds N` (tool-call rounds are unlimited by default;
@@ -663,11 +671,14 @@ parent process other than the stripped credential names (`EXA_API_KEY`,
 `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY`,
 `KIMI_API_KEY`) remain visible.
 
-On Linux/macOS, the workspace `.git` entry depends on the role. The main agent
-leaves it writable for repository operations. Delegated subagents/fixers bind
-`<workspace>/.git` read-only over itself after writable mounts. This covers only
-the workspace `.git` entry, not external object stores or other repositories.
-Background commands inherit the parent's role.
+On Linux/Android, the workspace `.git` entry depends on the role. The main
+agent leaves it writable for repository operations. Delegated subagents/fixers
+bind `<workspace>/.git` read-only after writable mounts. For a linked worktree,
+the `.git` pointer and caller-authorized main-worktree metadata and administrative
+paths are read-only, while normal workspace files remain writable; writable
+aliases to protected metadata are rejected. This does not authorize other
+repositories or external object stores. Background commands inherit the
+parent's role.
 
 ### Code mode: `run_rust` (experimental)
 
@@ -944,10 +955,12 @@ configuration, database credentials, arbitrary SQL, or write capability.
 curl 'http://127.0.0.1:8766/api/usage/dashboard?bucket=day&top_n=10'
 ```
 
-SSE connections are kept alive with 15-second heartbeat pings. Ctrl-C shuts
-the server down gracefully: SSE streams self-close on the shutdown signal and
-in-flight requests get a hard 2-second drain deadline before the process
-force-exits; a second Ctrl-C kills it outright.
+SSE connections are kept alive with 15-second heartbeat pings. SSE clients
+must handle live `Display` events; the bundled web UI does. `Display` is not a
+`SessionEntry`, so existing sessions need no migration. Ctrl-C shuts the server
+down gracefully: SSE streams self-close on the shutdown signal and in-flight
+requests get a hard 2-second drain deadline before the process force-exits; a
+second Ctrl-C kills it outright.
 
 A known limitation of `DELETE /api/sessions/{id}` (pre-existing, tracked
 separately): for a WaitForInput web session it can leave an idle runner
