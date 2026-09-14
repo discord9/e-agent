@@ -681,9 +681,12 @@ async function loadOlder() {
         const anchorKey = anchor && anchor.dataset.entryLocation;
         const anchorOffset = anchor ? anchor.offsetTop - oldTop : 0;
         renderEntries(freshEntries, true, freshLocations, boundary);
-        // Each next gap page is older than the previous one, so it becomes
-        // the earliest gap boundary rather than being appended after it.
-        state.webOlderPages.push({ entries: freshEntries, locations: freshLocations });
+        // Store pages in the same chronological order as the DOM. Each next
+        // gap page is older than the page identified by webGapAnchor.
+        const page = { entries: freshEntries, locations: freshLocations };
+        const anchorIndex = gapKey ? state.webOlderPages.findIndex((old) =>
+          JSON.stringify((old.locations || []).find(Boolean)) === gapKey) : -1;
+        state.webOlderPages.splice(anchorIndex < 0 ? state.webOlderPages.length : anchorIndex, 0, page);
         state.webGapAnchor = freshLocations.find(Boolean) || state.webGapAnchor;
         const replacement = anchorKey && [...els.messages.children]
           .find((node) => node.dataset.entryLocation === anchorKey);

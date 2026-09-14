@@ -1425,10 +1425,15 @@ function renderEntries(entries, prepend, locations, before, presentationAt) {
       // There is no prior entry for boundary zero; render it before the
       // completed head by moving newly appended nodes to the front.
       const marker = document.createComment("bootstrap-leading-presentation");
+      const firstHistoryNode = els.messages.firstChild;
       els.messages.appendChild(marker);
       for (const item of leading) applyBootstrapPresentation(item);
       let node = marker.nextSibling;
-      while (node) { const next = node.nextSibling; els.messages.insertBefore(node, els.messages.firstChild); node = next; }
+      while (node) {
+        const next = node.nextSibling;
+        els.messages.insertBefore(node, firstHistoryNode);
+        node = next;
+      }
       marker.remove();
     }
   } finally {
