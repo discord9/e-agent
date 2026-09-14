@@ -1810,7 +1810,7 @@ impl SessionRunner {
                 // Both manual and auto compaction failures are real harness
                 // errors: persisted as an Error entry and fanned out as an
                 // `AgentEvent::Error` (audit-visible on resume/late attach).
-                // A cancel stays a Notice and never lands as an Error entry.
+                // A cancel stays a Display projection and never lands as an Error entry.
                 self.commit_error(text).await;
                 let steering = self.intake_after_operation(waited.pending);
                 self.status(source.resume_status());
@@ -2003,7 +2003,7 @@ impl SessionRunner {
             if self.pending.is_empty() && self.armed_trigger == Some(RunnerTrigger::Goal) {
                 // Goal mutations at the precedence boundary can make the
                 // already-armed continuation ineligible. Drop it before the
-                // provider call, without charging or emitting its Notice.
+                // provider call, without charging or emitting its Display projection.
                 let eligible = self.goal_continuation_armed
                     && matches!(
                         self.agent.goal().as_ref().map(|goal| goal.status),

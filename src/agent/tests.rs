@@ -1079,7 +1079,7 @@ async fn poll_guard_direct_agent_ends_turn_after_full_batch_and_resets_next_turn
             }
         }
     )));
-    // The termination Notice was emitted through the event handler.
+    // The termination Display projection was emitted through the event handler.
     assert!(events.lock().unwrap().iter().any(|event| matches!(
         event,
         AgentEvent::Display(text) if text == POLL_GUARD_TERMINATION_NOTICE

@@ -1172,12 +1172,35 @@ fn attach_after_completion_marks_finished_from_the_snapshot() {
 }
 
 #[test]
-fn display_renders_as_a_dim_line_without_changing_follow_state() {
+fn display_preserves_frozen_scrollback_and_separates_stream_lanes() {
     let mut state = TuiState::default();
+    state.push_line("earlier line".into(), LineKind::Normal);
+    state.window.source_start = 0;
+    state.window.source_end = 1;
+    state.window.local_offset = 0;
+    state.window.follow_bottom = false;
+
+    state.push_agent_event(AgentEvent::AssistantDelta("first".into()));
     state.push_agent_event(AgentEvent::Display("local status".into()));
-    assert_eq!(state.lines.last().unwrap().text, "local status");
-    assert_eq!(state.lines.last().unwrap().kind, LineKind::Dim);
-    assert!(state.window.follow_bottom);
+    state.push_agent_event(AgentEvent::AssistantDelta("second".into()));
+
+    assert!(!state.window.follow_bottom);
+    assert_eq!(state.window.source_start, 0);
+    assert_eq!(state.window.source_end, 1);
+    assert_eq!(state.window.local_offset, 0);
+    assert_eq!(
+        state
+            .lines
+            .iter()
+            .map(|line| (line.text.as_str(), line.kind))
+            .collect::<Vec<_>>(),
+        vec![
+            ("earlier line", LineKind::Normal),
+            ("first", LineKind::Normal),
+            ("local status", LineKind::Dim),
+            ("second", LineKind::Normal),
+        ]
+    );
 }
 
 #[test]

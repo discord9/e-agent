@@ -706,8 +706,10 @@ pub enum AgentEvent {
         is_error: bool,
         content: String,
     },
-    /// A system-injected notice (background completion, task-kill report)
-    /// rendered in the TUI as a dim line.
+    /// A durable, model-facing system notice (background completion or task
+    /// report). Fresh background ingress commits it as a `SessionEntry::Notice`,
+    /// puts it in provider context, and requests one regular runner reaction.
+    /// Replayed entries only rebuild the display and never wake a model turn.
     Notice(String),
     /// Non-persisted UI projection, retained only in the in-memory event log
     /// for same-process late attach and never added to model context.

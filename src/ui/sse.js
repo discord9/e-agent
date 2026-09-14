@@ -696,24 +696,12 @@ function applyLiveEvent(name, payload) {
       break;
     }
     case "Display":
-    case "display": {
-      const text = pickText(payload, ["text", "message"]);
-      appendNotice(text);
-      // Display is the display-only compaction projection. Old servers sent it
-      // as Notice, so both names deliberately drive the same usage marker.
-      if (typeof text === "string" && text.startsWith("compacted: ")) {
-        state.usagePreCompaction = true;
-        state.compactionUsagePending = true;
-      }
-      break;
-    }
+    case "display":
     case "Notice": {
       const text = pickText(payload, ["text", "message"]);
       appendNotice(text);
-      // 旧后端以 Notice 发送的压缩成功投影（"compacted: …"）之后紧跟着一条携带压缩前基线的 Usage
-      // （runner 的 compact_operation 先 emit 投影 Notice，再 apply_usage 旧值）。
-      // 置“（压缩前）”标注并挂起下一次 Usage 的清除动作——那条正是压缩自己
-      // 发出的旧基线，不是普通轮的新值。
+      // Display is the display-only compaction projection; old servers sent it
+      // as Notice, so both names retain the same usage-marker behavior.
       if (typeof text === "string" && text.startsWith("compacted: ")) {
         state.usagePreCompaction = true;
         state.compactionUsagePending = true;
