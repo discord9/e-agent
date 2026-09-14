@@ -15,7 +15,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 use tokio::{
-    sync::{broadcast, mpsc, watch},
+    sync::{broadcast, mpsc, oneshot, watch},
     task::JoinHandle,
 };
 
@@ -60,31 +60,35 @@ async fn await_round(
     agent: &mut Agent,
     specs: &[ToolSpec],
     commands: &mut mpsc::UnboundedReceiver<SessionCommand>,
+    shared: &Arc<Mutex<Shared>>,
 ) -> WaitResult<anyhow::Result<RoundOutput>> {
     let mut operation = Box::pin(agent.complete_round(specs));
-    wait_for_operation(&mut operation, commands).await
+    wait_for_operation(&mut operation, commands, shared).await
 }
 
 async fn await_compaction(
     agent: &mut Agent,
     commands: &mut mpsc::UnboundedReceiver<SessionCommand>,
+    shared: &Arc<Mutex<Shared>>,
 ) -> WaitResult<anyhow::Result<CompactionOutput>> {
     let mut operation = Box::pin(agent.prepare_compaction());
-    wait_for_operation(&mut operation, commands).await
+    wait_for_operation(&mut operation, commands, shared).await
 }
 
 async fn await_tool(
     agent: &mut Agent,
     call: &ToolCall,
     commands: &mut mpsc::UnboundedReceiver<SessionCommand>,
+    shared: &Arc<Mutex<Shared>>,
 ) -> WaitResult<Result<crate::agent::ToolOutput, String>> {
     let mut operation = Box::pin(async move { agent.execute_tool(call).await });
-    wait_for_operation(&mut operation, commands).await
+    wait_for_operation(&mut operation, commands, shared).await
 }
 
 async fn wait_for_operation<F, T>(
     operation: &mut std::pin::Pin<Box<F>>,
     commands: &mut mpsc::UnboundedReceiver<SessionCommand>,
+    shared: &Arc<Mutex<Shared>>,
 ) -> WaitResult<T>
 where
     F: std::future::Future<Output = T>,
@@ -107,6 +111,9 @@ where
                 return WaitResult { outcome: WaitOutcome::Completed(value), pending };
             }
             command = commands.recv() => match command {
+                Some(SessionCommand::WebAttach(reply)) => {
+                    respond_web_attach_shared(shared, reply);
+                }
                 Some(SessionCommand::Cancel) => {
                     return WaitResult { outcome: WaitOutcome::Released, pending };
                 }
@@ -144,6 +151,9 @@ pub enum SessionCommand {
     },
     /// Arm the in-memory continuation driver; `None` means indefinite.
     Continue(Option<u64>),
+    /// Web-only attach barrier. The runner services it from operation waits
+    /// against a head frozen before the model/tool future can mutate Agent.
+    WebAttach(oneshot::Sender<WebAttach>),
 }
 
 /// Human goal operations (creation is human-only; the model's
@@ -181,8 +191,45 @@ pub enum SessionResult {
     Closed,
 }
 
+#[derive(Clone)]
+struct LogEvent {
+    event: AgentEvent,
+    /// Source ownership, not content matching: transient presentation never
+    /// has a SessionEntry projection; durable means the runner published it
+    /// after committing/applying the corresponding entry.
+    transient: bool,
+}
+
+#[derive(Clone)]
+struct WebHead {
+    entries: Vec<SessionEntry>,
+    locations: Vec<Option<crate::session_store::EntryLocation>>,
+    next_before_seq: Option<i64>,
+    log_start: usize,
+}
+
+pub struct WebAttach {
+    pub entries: Vec<SessionEntry>,
+    pub locations: Vec<Option<crate::session_store::WebEntryLocation>>,
+    pub next_before_seq: Option<i64>,
+    pub replay: Vec<WebReplayEvent>,
+    pub status: SessionStatus,
+    pub usage: Option<AgentEvent>,
+    pub usage_pre_compaction: bool,
+    pub live: broadcast::Receiver<AgentEvent>,
+    pub status_live: watch::Receiver<SessionStatus>,
+}
+
+#[derive(Clone, serde::Serialize)]
+pub struct WebReplayEvent {
+    pub event: AgentEvent,
+    pub after_head: bool,
+    pub transient: bool,
+}
+
 struct Shared {
-    log: Vec<AgentEvent>,
+    log: Vec<LogEvent>,
+    web_head: Option<WebHead>,
     events: broadcast::Sender<AgentEvent>,
     status: watch::Sender<SessionStatus>,
     /// Process-local pending root human-input request. It is claimed under
@@ -197,26 +244,36 @@ struct Shared {
     goal: Option<crate::agent::GoalSnapshot>,
 }
 impl Shared {
-    fn emit(&mut self, event: AgentEvent) {
-        self.log.push(event.clone());
+    fn emit_presentation(&mut self, event: AgentEvent) {
+        self.log.push(LogEvent {
+            event: event.clone(),
+            transient: true,
+        });
+        let _ = self.events.send(event);
+    }
+
+    fn emit_durable(&mut self, event: AgentEvent) {
+        self.log.push(LogEvent {
+            event: event.clone(),
+            transient: false,
+        });
         let _ = self.events.send(event);
     }
 
     fn emit_agent(&mut self, event: AgentEvent) {
+        // Agent owns only ephemeral model/provider projections. Runner
+        // commit sites explicitly publish durable projections after their
+        // SessionEntry append; do not infer ownership from an event variant.
         if self.compaction_streaming
             && matches!(
                 event,
                 AgentEvent::AssistantDelta(_) | AgentEvent::ReasoningDelta(_)
             )
         {
-            self.emit_transient(event);
+            let _ = self.events.send(event);
         } else {
-            self.emit(event);
+            self.emit_presentation(event);
         }
-    }
-
-    fn emit_transient(&self, event: AgentEvent) {
-        let _ = self.events.send(event);
     }
 }
 
@@ -279,7 +336,7 @@ impl SessionHandle {
             *shared.status.borrow(),
             SessionStatus::Busy | SessionStatus::Compacting
         ) {
-            shared.emit(AgentEvent::PromptQueued(prompt));
+            shared.emit_presentation(AgentEvent::PromptQueued(prompt));
         }
         PromptSubmission::Queued
     }
@@ -312,7 +369,7 @@ impl SessionHandle {
                 *shared.status.borrow(),
                 SessionStatus::Busy | SessionStatus::Compacting
             ) {
-                shared.emit(AgentEvent::PromptQueued(prompt));
+                shared.emit_presentation(AgentEvent::PromptQueued(prompt));
             }
         } else {
             shared.commands_open = false;
@@ -406,8 +463,35 @@ impl SessionHandle {
     pub fn goal(&self) -> Option<crate::agent::GoalSnapshot> {
         self.shared.lock().unwrap().goal.clone()
     }
+    pub async fn web_attach(&self) -> Result<WebAttach, ()> {
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut shared = self.shared.lock().unwrap();
+            if !shared.commands_open || self.commands.is_closed() {
+                shared.commands_open = false;
+                return Err(());
+            }
+            // An idle runner has already frozen its head and is blocked on
+            // this receive; answer directly under the same Shared lock so a
+            // completed turn cannot race between command send and response.
+            if matches!(*shared.status.borrow(), SessionStatus::Idle) {
+                respond_web_attach_locked(&shared, tx);
+            } else if self.commands.send(SessionCommand::WebAttach(tx)).is_err() {
+                shared.commands_open = false;
+                return Err(());
+            }
+        }
+        rx.await.map_err(|_| ())
+    }
+
     pub fn snapshot(&self) -> Vec<AgentEvent> {
-        self.shared.lock().unwrap().log.clone()
+        self.shared
+            .lock()
+            .unwrap()
+            .log
+            .iter()
+            .map(|item| item.event.clone())
+            .collect()
     }
     /// Atomically obtains replay, live subscription, and status snapshot (no attach gap).
     pub fn attach(
@@ -419,7 +503,7 @@ impl SessionHandle {
     ) {
         let shared = self.shared.lock().unwrap();
         (
-            shared.log.clone(),
+            shared.log.iter().map(|item| item.event.clone()).collect(),
             shared.events.subscribe(),
             shared.status.subscribe(),
         )
@@ -436,7 +520,7 @@ pub(crate) struct TestSessionEmitter {
 #[cfg(test)]
 impl TestSessionEmitter {
     pub(crate) fn emit(&self, event: AgentEvent) {
-        self.shared.lock().unwrap().emit(event);
+        self.shared.lock().unwrap().emit_durable(event);
     }
     /// Test-only: force the runner's status watch to a specific value so
     /// tests can simulate a Busy/Compacting/Finished subagent handle
@@ -461,6 +545,7 @@ pub(crate) fn session_test_channel() -> (
     let (status, _) = watch::channel(SessionStatus::Idle);
     let shared = Arc::new(Mutex::new(Shared {
         log: Vec::new(),
+        web_head: None,
         events,
         status,
         compaction_streaming: false,
@@ -602,6 +687,7 @@ pub struct SessionRunner {
     shared: Arc<Mutex<Shared>>,
     commands: mpsc::UnboundedReceiver<SessionCommand>,
     pending: VecDeque<PendingCommand>,
+    pending_web_attaches: Vec<oneshot::Sender<WebAttach>>,
     policy: IdlePolicy,
     last_answer: Option<String>,
     /// Internal trigger for the next turn; Goal is the in-memory driver mount.
@@ -634,6 +720,71 @@ impl Drop for SessionRunner {
     }
 }
 
+fn respond_web_attach_shared(shared: &Arc<Mutex<Shared>>, reply: oneshot::Sender<WebAttach>) {
+    let shared = shared.lock().unwrap();
+    respond_web_attach_locked(&shared, reply);
+}
+
+fn respond_web_attach_locked(shared: &Shared, reply: oneshot::Sender<WebAttach>) {
+    let Some(head) = shared.web_head.clone() else {
+        return;
+    };
+    let mut usage = None;
+    let mut usage_pre_compaction = false;
+    let mut compaction_pending = false;
+    for item in &shared.log {
+        match &item.event {
+            AgentEvent::Display(text) if text.starts_with("compacted: ") => {
+                compaction_pending = true;
+                usage_pre_compaction = true;
+            }
+            AgentEvent::Usage { .. } => {
+                usage = Some(item.event.clone());
+                if compaction_pending {
+                    compaction_pending = false;
+                } else {
+                    usage_pre_compaction = false;
+                }
+            }
+            _ => {}
+        }
+    }
+    let _ = reply.send(WebAttach {
+        entries: head.entries,
+        locations: head
+            .locations
+            .iter()
+            .map(|location| location.as_ref().map(Into::into))
+            .collect(),
+        next_before_seq: head.next_before_seq,
+        replay: shared
+            .log
+            .iter()
+            .enumerate()
+            .filter(|(i, item)| {
+                // The frozen head owns everything before its log boundary.
+                // Replay only its post-head bridge; presentation state is
+                // reduced below instead of replaying the entire process log.
+                *i >= head.log_start
+                    && !matches!(
+                        item.event,
+                        AgentEvent::AssistantDelta(_) | AgentEvent::ReasoningDelta(_)
+                    )
+            })
+            .map(|(i, item)| WebReplayEvent {
+                event: item.event.clone(),
+                after_head: i >= head.log_start,
+                transient: item.transient,
+            })
+            .collect(),
+        status: shared.status.borrow().clone(),
+        usage,
+        usage_pre_compaction,
+        live: shared.events.subscribe(),
+        status_live: shared.status.subscribe(),
+    });
+}
+
 impl SessionRunner {
     pub fn new(
         mut agent: Agent,
@@ -644,13 +795,22 @@ impl SessionRunner {
     ) -> (Self, SessionHandle) {
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
         let (status, _) = watch::channel(SessionStatus::Idle);
-        let replay = agent.history().iter().filter_map(entry_event).collect();
+        let replay: Vec<LogEvent> = agent
+            .history()
+            .iter()
+            .filter_map(entry_event)
+            .map(|event| LogEvent {
+                event,
+                transient: false,
+            })
+            .collect();
         // Mirror the latest goal snapshot so UIs read it without touching
         // the agent (resume fold: newest GoalUpdated wins — reuse the
         // agent's own fold instead of a second reverse scan).
         let goal = agent.goal();
         let shared = Arc::new(Mutex::new(Shared {
             log: replay,
+            web_head: None,
             events,
             status,
             compaction_streaming: false,
@@ -677,6 +837,7 @@ impl SessionRunner {
                 shared,
                 commands,
                 pending: VecDeque::new(),
+                pending_web_attaches: Vec::new(),
                 policy,
                 last_answer: None,
                 armed_trigger: None,
@@ -818,7 +979,7 @@ impl SessionRunner {
             // Background notices become live only after their durable entry
             // exists; using Agent's normal event path prevents a second UI-only
             // injection and preserves session fanout semantics.
-            self.agent.emit_event(event);
+            self.shared.lock().unwrap().emit_durable(event);
         }
         Ok(committed_seq)
     }
@@ -850,9 +1011,11 @@ impl SessionRunner {
         let mut shared = self.shared.lock().unwrap();
         for (queued, prompt) in consumed {
             if queued {
-                shared.emit(AgentEvent::PromptConsumed);
+                // Queue state is presentation-only: consuming it must not
+                // resurrect a stale queue on a later Web attach.
+                shared.emit_presentation(AgentEvent::PromptConsumed);
             }
-            shared.emit(AgentEvent::UserPrompt(prompt));
+            shared.emit_durable(AgentEvent::UserPrompt(prompt));
         }
         Ok(())
     }
@@ -879,10 +1042,20 @@ impl SessionRunner {
             }
             Err(error) => {
                 tracing::warn!("e-agent: cannot persist session error: {error:#}");
+                // No SessionEntry exists on disk: this fallback is a
+                // presentation event, never a fake durable projection.
                 self.agent.apply_entry(entry);
+                self.shared
+                    .lock()
+                    .unwrap()
+                    .emit_presentation(AgentEvent::Error(text));
+                return;
             }
         }
-        self.shared.lock().unwrap().emit(AgentEvent::Error(text));
+        self.shared
+            .lock()
+            .unwrap()
+            .emit_durable(AgentEvent::Error(text));
     }
 
     /// Arm the runner-local continuation driver. This state is deliberately
@@ -908,7 +1081,7 @@ impl SessionRunner {
         self.shared
             .lock()
             .unwrap()
-            .emit(AgentEvent::Display(match budget {
+            .emit_presentation(AgentEvent::Display(match budget {
                 Some(budget) => format!("goal continuation armed (token cap: {budget})"),
                 None => "goal continuation armed".into(),
             }));
@@ -932,9 +1105,12 @@ impl SessionRunner {
     /// Cap exhaustion is a runner-local live event: it stays available to
     /// late attaches through Shared's log without becoming a durable entry.
     fn emit_goal_cap_exhausted(&self) {
-        self.shared.lock().unwrap().emit(AgentEvent::Display(
-            "goal continuation stopped: token cap exhausted".into(),
-        ));
+        self.shared
+            .lock()
+            .unwrap()
+            .emit_presentation(AgentEvent::Display(
+                "goal continuation stopped: token cap exhausted".into(),
+            ));
     }
 
     /// Apply + persist one human goal command. Errors are plain strings
@@ -1252,16 +1428,20 @@ impl SessionRunner {
         }
         .into();
         self.commit(entry).await?;
-        self.agent.emit_event(AgentEvent::ToolResult {
-            is_error,
-            content: tool_text,
-        });
+        self.shared
+            .lock()
+            .unwrap()
+            .emit_durable(AgentEvent::ToolResult {
+                is_error,
+                content: tool_text,
+                call_id: Some(call.id.clone()),
+            });
         let steering = self.intake_after_operation(Vec::new());
         if steering != Steering::None {
             self.shared
                 .lock()
                 .unwrap()
-                .emit(AgentEvent::Display("turn cancelled".into()));
+                .emit_presentation(AgentEvent::Display("turn cancelled".into()));
         }
         Ok(steering)
     }
@@ -1306,6 +1486,7 @@ impl SessionRunner {
         &mut self,
         call: &ToolCall,
     ) -> WaitResult<Result<Vec<(String, String)>, String>> {
+        self.prepare_web_attach();
         let mut pending = Vec::new();
         loop {
             match self.commands.recv().await {
@@ -1314,6 +1495,12 @@ impl SessionRunner {
                         outcome: WaitOutcome::Completed(Ok(answers)),
                         pending,
                     };
+                }
+                Some(SessionCommand::WebAttach(reply)) => {
+                    // WaitingInput is a stable runner boundary: answer the
+                    // attach immediately from the head frozen before this
+                    // wait, without buffering it behind a human answer.
+                    respond_web_attach_shared(&self.shared, reply);
                 }
                 Some(SessionCommand::Cancel) => {
                     return WaitResult {
@@ -1329,6 +1516,29 @@ impl SessionRunner {
                     };
                 }
             }
+        }
+    }
+
+    fn prepare_web_attach(&self) {
+        let (entries, locations, next_before_seq) =
+            self.agent.web_head_page(200, self.store.is_jsonl());
+        let mut shared = self.shared.lock().unwrap();
+        let log_start = shared.log.len();
+        shared.web_head = Some(WebHead {
+            entries,
+            locations,
+            next_before_seq,
+            log_start,
+        });
+    }
+
+    fn publish_web_attaches(&mut self) {
+        if self.pending_web_attaches.is_empty() {
+            return;
+        }
+        self.prepare_web_attach();
+        for reply in self.pending_web_attaches.drain(..) {
+            respond_web_attach_shared(&self.shared, reply);
         }
     }
 
@@ -1466,6 +1676,10 @@ impl SessionRunner {
                 self.release_steering()
             }
             SessionCommand::Answer { .. } => Steering::None,
+            SessionCommand::WebAttach(reply) => {
+                self.pending_web_attaches.push(reply);
+                Steering::None
+            }
         }
     }
 
@@ -1475,7 +1689,7 @@ impl SessionRunner {
             self.shared
                 .lock()
                 .unwrap()
-                .emit(AgentEvent::Display("goal continuation cancelled".into()));
+                .emit_presentation(AgentEvent::Display("goal continuation cancelled".into()));
         }
         self.turn_just_ended = false;
         self.maintenance_resume = false;
@@ -1540,7 +1754,7 @@ impl SessionRunner {
                 SessionEntry::Notice { .. } | SessionEntry::BackgroundCompletion { .. }
             );
             self.agent.apply_entry_located(entry, location);
-            self.agent.emit_event(event);
+            self.shared.lock().unwrap().emit_durable(event);
             if fresh_ingress {
                 // Arm only after append + owner acknowledgement + apply. A
                 // replayed historical row never passes through this path.
@@ -1687,7 +1901,7 @@ impl SessionRunner {
                 self.shared
                     .lock()
                     .unwrap()
-                    .emit(AgentEvent::Display("processing queued prompts".into()));
+                    .emit_presentation(AgentEvent::Display("processing queued prompts".into()));
                 false
             }
             Steering::ReleasedIdle => {
@@ -1712,8 +1926,9 @@ impl SessionRunner {
         charge_goal_continuation: bool,
     ) -> OperationFlow {
         self.status(SessionStatus::Compacting);
+        self.prepare_web_attach();
         self.shared.lock().unwrap().compaction_streaming = true;
-        let waited = await_compaction(&mut self.agent, &mut self.commands).await;
+        let waited = await_compaction(&mut self.agent, &mut self.commands, &self.shared).await;
         self.shared.lock().unwrap().compaction_streaming = false;
         match waited.outcome {
             WaitOutcome::Completed(Ok(out)) => {
@@ -1744,9 +1959,12 @@ impl SessionRunner {
                             // The charged maintenance cannot resume its
                             // interrupted turn after usage is unavailable.
                             self.maintenance_resume = false;
-                            self.shared.lock().unwrap().emit(AgentEvent::Display(
-                                "goal continuation stopped: model usage unavailable".into(),
-                            ));
+                            self.shared
+                                .lock()
+                                .unwrap()
+                                .emit_presentation(AgentEvent::Display(
+                                    "goal continuation stopped: model usage unavailable".into(),
+                                ));
                         }
                     }
                 }
@@ -1761,7 +1979,7 @@ impl SessionRunner {
                 };
                 // Publish the complete projection only after durable commit. Streaming
                 // deltas were sent live-only while the operation was in flight.
-                self.shared.lock().unwrap().emit(projection);
+                self.shared.lock().unwrap().emit_durable(projection);
                 // 成功压缩后复位 auto-compact 锁存（失败/取消路径走
                 // reset_auto_compact_request，此处不动）。refresh_context=false
                 // 使 last_context_input 保持压缩前基线（UI 借此标注“压缩前”），
@@ -1793,6 +2011,7 @@ impl SessionRunner {
                     }
                 }
                 let steering = self.intake_after_operation(waited.pending);
+                self.publish_web_attaches();
                 self.status(source.resume_status());
                 OperationFlow::Done(steering, true)
             }
@@ -1813,6 +2032,7 @@ impl SessionRunner {
                 // A cancel stays a Display projection and never lands as an Error entry.
                 self.commit_error(text).await;
                 let steering = self.intake_after_operation(waited.pending);
+                self.publish_web_attaches();
                 self.status(source.resume_status());
                 OperationFlow::Done(steering, false)
             }
@@ -1827,7 +2047,7 @@ impl SessionRunner {
                 self.shared
                     .lock()
                     .unwrap()
-                    .emit(AgentEvent::Display(format!(
+                    .emit_presentation(AgentEvent::Display(format!(
                         "{}compaction cancelled",
                         source.prefix()
                     )));
@@ -1955,8 +2175,12 @@ impl SessionRunner {
                     unreachable!()
                 };
                 if let Err(text) = self.apply_goal_command(command).await {
-                    self.shared.lock().unwrap().emit(AgentEvent::Error(text));
+                    self.shared
+                        .lock()
+                        .unwrap()
+                        .emit_presentation(AgentEvent::Error(text));
                 }
+                self.publish_web_attaches();
                 continue;
             }
             if matches!(self.pending.front(), Some(PendingCommand::Continue(_))) {
@@ -2091,6 +2315,7 @@ impl SessionRunner {
                 }
                 // FinishWhenIdle waits indefinitely for blocking background
                 // tasks. Their completion is injected as a follow-up turn.
+                self.prepare_web_attach();
                 tokio::select! { biased;
                     command = self.commands.recv() => match command {
                         Some(command) => {
@@ -2198,7 +2423,9 @@ impl SessionRunner {
                 if reaction_request {
                     self.pending_regular_reaction = false;
                 }
-                let waited = await_round(&mut self.agent, &specs, &mut self.commands).await;
+                self.prepare_web_attach();
+                let waited =
+                    await_round(&mut self.agent, &specs, &mut self.commands, &self.shared).await;
                 let round = match waited.outcome {
                     WaitOutcome::Completed(Ok(round)) => round,
                     WaitOutcome::Completed(Err(error)) => {
@@ -2219,6 +2446,7 @@ impl SessionRunner {
                         self.intake_after_operation(waited.pending); // 保留排队命令
                         self.commit_error(format!("model call failed: {error:#}"))
                             .await;
+                        self.publish_web_attaches();
                         break 'turn; // 外层循环自然回 Idle
                     }
                     WaitOutcome::Released => {
@@ -2234,7 +2462,7 @@ impl SessionRunner {
                         self.shared
                             .lock()
                             .unwrap()
-                            .emit(AgentEvent::Display("turn cancelled".into()));
+                            .emit_presentation(AgentEvent::Display("turn cancelled".into()));
                         if self.release_after_preempt(steering) {
                             return;
                         }
@@ -2268,9 +2496,12 @@ impl SessionRunner {
                             self.goal_continuation_armed = false;
                             self.goal_continuation_remaining = None;
                             self.armed_trigger = None;
-                            self.shared.lock().unwrap().emit(AgentEvent::Display(
-                                "goal continuation stopped: model usage unavailable".into(),
-                            ));
+                            self.shared
+                                .lock()
+                                .unwrap()
+                                .emit_presentation(AgentEvent::Display(
+                                    "goal continuation stopped: model usage unavailable".into(),
+                                ));
                         }
                         None => {}
                     }
@@ -2306,10 +2537,14 @@ impl SessionRunner {
                 {
                     tracing::warn!("e-agent: cannot record usage: {error:#}");
                 }
-                let steering = self.intake_after_operation(waited.pending);
                 if !streamed && let Some(text) = content.clone().filter(|text| !text.is_empty()) {
-                    self.agent.emit_event(AgentEvent::AssistantText(text));
+                    self.shared
+                        .lock()
+                        .unwrap()
+                        .emit_durable(AgentEvent::AssistantText(text));
                 }
+                let steering = self.intake_after_operation(waited.pending);
+                self.publish_web_attaches();
                 if steering != Steering::None && calls.is_empty() {
                     // Stale release: the round completed naturally (final
                     // answer, no tool calls) and its output is committed —
@@ -2323,7 +2558,7 @@ impl SessionRunner {
                     self.shared
                         .lock()
                         .unwrap()
-                        .emit(AgentEvent::Display("turn cancelled".into()));
+                        .emit_presentation(AgentEvent::Display("turn cancelled".into()));
                     if self.release_after_preempt(steering) {
                         return;
                     }
@@ -2342,7 +2577,9 @@ impl SessionRunner {
                     self.shared
                         .lock()
                         .unwrap()
-                        .emit(AgentEvent::Display("──── auto-compacting… ────".into()));
+                        .emit_presentation(AgentEvent::Display(
+                            "──── auto-compacting… ────".into(),
+                        ));
                     match self
                         .compact_operation(
                             CompactionSource::Auto,
@@ -2362,7 +2599,9 @@ impl SessionRunner {
                                 self.shared
                                     .lock()
                                     .unwrap()
-                                    .emit(AgentEvent::Display("turn cancelled".into()));
+                                    .emit_presentation(AgentEvent::Display(
+                                        "turn cancelled".into(),
+                                    ));
                                 if self.release_after_preempt(steering) {
                                     return;
                                 }
@@ -2399,10 +2638,14 @@ impl SessionRunner {
                 let mut poll_terminate = false;
                 let mut requested_compaction = false;
                 for call in calls {
-                    self.agent.emit_event(AgentEvent::ToolCall {
-                        name: call.name.clone(),
-                        arguments: call.arguments.clone(),
-                    });
+                    self.shared
+                        .lock()
+                        .unwrap()
+                        .emit_durable(AgentEvent::ToolCall {
+                            name: call.name.clone(),
+                            arguments: call.arguments.clone(),
+                            call_id: Some(call.id.clone()),
+                        });
                     // Root-only marker: persist the assistant ToolCall first,
                     // then pause this same model/tool turn for the Web answer.
                     if call.name == "request_user_input" {
@@ -2426,10 +2669,14 @@ impl SessionRunner {
                                     .await;
                                     return;
                                 }
-                                self.agent.emit_event(AgentEvent::ToolResult {
-                                    is_error: true,
-                                    content: error,
-                                });
+                                self.shared
+                                    .lock()
+                                    .unwrap()
+                                    .emit_durable(AgentEvent::ToolResult {
+                                        is_error: true,
+                                        content: error,
+                                        call_id: Some(call.id.clone()),
+                                    });
                                 continue;
                             }
                         };
@@ -2472,10 +2719,14 @@ impl SessionRunner {
                                 }
                                 self.clear_waiting_input(SessionStatus::Busy);
                                 human_required_continuation = true;
-                                self.agent.emit_event(AgentEvent::ToolResult {
-                                    is_error: false,
-                                    content,
-                                });
+                                self.shared
+                                    .lock()
+                                    .unwrap()
+                                    .emit_durable(AgentEvent::ToolResult {
+                                        is_error: false,
+                                        content,
+                                        call_id: Some(call.id.clone()),
+                                    });
                                 let steering = self.intake_after_operation(waited.pending);
                                 if steering != Steering::None {
                                     break 'turn;
@@ -2489,7 +2740,9 @@ impl SessionRunner {
                                 self.shared
                                     .lock()
                                     .unwrap()
-                                    .emit(AgentEvent::Display("turn cancelled".into()));
+                                    .emit_presentation(AgentEvent::Display(
+                                        "turn cancelled".into(),
+                                    ));
                                 break 'turn;
                             }
                             WaitOutcome::Closed => {
@@ -2499,7 +2752,10 @@ impl SessionRunner {
                             }
                             WaitOutcome::Completed(Err(error)) => {
                                 self.clear_waiting_input(SessionStatus::Busy);
-                                self.shared.lock().unwrap().emit(AgentEvent::Error(error));
+                                self.shared
+                                    .lock()
+                                    .unwrap()
+                                    .emit_presentation(AgentEvent::Error(error));
                                 break 'turn;
                             }
                         }
@@ -2635,7 +2891,9 @@ impl SessionRunner {
                         }
                         continue;
                     }
-                    let waited = await_tool(&mut self.agent, &call, &mut self.commands).await;
+                    self.prepare_web_attach();
+                    let waited =
+                        await_tool(&mut self.agent, &call, &mut self.commands, &self.shared).await;
                     let result = match waited.outcome {
                         WaitOutcome::Completed(result) => result,
                         WaitOutcome::Released => {
@@ -2652,7 +2910,7 @@ impl SessionRunner {
                             self.shared
                                 .lock()
                                 .unwrap()
-                                .emit(AgentEvent::Display("turn cancelled".into()));
+                                .emit_presentation(AgentEvent::Display("turn cancelled".into()));
                             if self.release_after_preempt(steering) {
                                 return;
                             }
@@ -2705,20 +2963,25 @@ impl SessionRunner {
                         self.terminate(SessionResult::Failed(error), pending).await;
                         return;
                     }
-                    self.agent.emit_event(AgentEvent::ToolResult {
-                        is_error,
-                        content: tool_text,
-                    });
+                    self.shared
+                        .lock()
+                        .unwrap()
+                        .emit_durable(AgentEvent::ToolResult {
+                            is_error,
+                            content: tool_text,
+                            call_id: Some(call.id.clone()),
+                        });
                     // A release that raced the tool's own completion: the
                     // tool result was committed above (contract: completed
                     // output is never lost), but the release stops the turn
                     // here — the committed result stays in history.
                     let steering = self.intake_after_operation(pending);
+                    self.publish_web_attaches();
                     if steering != Steering::None {
                         self.shared
                             .lock()
                             .unwrap()
-                            .emit(AgentEvent::Display("turn cancelled".into()));
+                            .emit_presentation(AgentEvent::Display("turn cancelled".into()));
                         if self.release_after_preempt(steering) {
                             return;
                         }
@@ -2749,11 +3012,12 @@ impl SessionRunner {
                 // Defer queued Prompt/Goal/Compact work to the outer FIFO
                 // loop only after every real sibling result was committed.
                 let steering = self.drain_ready_commands();
+                self.publish_web_attaches();
                 if steering != Steering::None {
                     self.shared
                         .lock()
                         .unwrap()
-                        .emit(AgentEvent::Display("turn cancelled".into()));
+                        .emit_presentation(AgentEvent::Display("turn cancelled".into()));
                     if self.release_after_preempt(steering) {
                         return;
                     }
@@ -2790,9 +3054,12 @@ impl SessionRunner {
                             )
                         })
                     {
-                        self.shared.lock().unwrap().emit(AgentEvent::Display(
-                            "compaction request superseded by queued human work".into(),
-                        ));
+                        self.shared
+                            .lock()
+                            .unwrap()
+                            .emit_presentation(AgentEvent::Display(
+                                "compaction request superseded by queued human work".into(),
+                            ));
                     }
                     // A queued compact is maintenance inside this existing
                     // turn, not its conclusion. Reopen a blank ordinary or
@@ -2838,7 +3105,9 @@ impl SessionRunner {
                     self.shared
                         .lock()
                         .unwrap()
-                        .emit(AgentEvent::Display(POLL_GUARD_TERMINATION_NOTICE.into()));
+                        .emit_presentation(AgentEvent::Display(
+                            POLL_GUARD_TERMINATION_NOTICE.into(),
+                        ));
                     break 'turn;
                 }
                 // A Goal driver cannot consume fresh ingress. Preserve a
@@ -2916,12 +3185,17 @@ fn entry_event(entry: &SessionEntry) -> Option<AgentEvent> {
             message: Message::Assistant(message),
         } => message.content.clone().map(AgentEvent::AssistantText),
         SessionEntry::Message {
-            message: Message::Tool {
-                content, is_error, ..
-            },
+            message:
+                Message::Tool {
+                    call_id,
+                    content,
+                    is_error,
+                    ..
+                },
         } => Some(AgentEvent::ToolResult {
             is_error: *is_error,
             content: content.clone(),
+            call_id: Some(call_id.clone()),
         }),
         SessionEntry::Compaction { summary, .. } => {
             Some(AgentEvent::Display(format!("compacted: {summary}")))

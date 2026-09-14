@@ -574,7 +574,7 @@ const HEAD_OPEN_SENTINEL: i64 = i64::MAX;
 /// issued against this key reads exactly this physical version, so a
 /// same-seq later write can never retarget an old ref (the entry hash check
 /// in `read_field` additionally rejects any payload drift).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum LocatedKey {
     /// JSONL: the 0-based line ordinal in the append-only `.jsonl` file.
     Jsonl { ordinal: i64 },
@@ -603,7 +603,7 @@ impl LocatedKey {
 /// projection (`src/output_receipt.rs`) turns a location into a
 /// direct `eout1.<entry-id>.<field-code>` ref, and `read_output` resolves the ref
 /// back to this location.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct EntryLocation {
     /// Backend kind code: `"jsonl"` | `"sqlite"` | `"greptime"`.
     pub backend: &'static str,
@@ -624,6 +624,24 @@ pub struct EntryLocation {
     pub entry_hash: String,
 }
 
+/// Minimal physical identity exposed to Web history consumers. Backend
+/// fingerprints and payload hashes stay server-side; the UI only needs a
+/// stable row key to reconcile bounded pages without inspecting text.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct WebEntryLocation {
+    pub backend: &'static str,
+    pub key: LocatedKey,
+}
+
+impl From<&EntryLocation> for WebEntryLocation {
+    fn from(location: &EntryLocation) -> Self {
+        Self {
+            backend: location.backend,
+            key: location.key.clone(),
+        }
+    }
+}
+
 /// Loaded history paired with its exact physical locations. `locations[i]`
 /// is `Some` exactly when the persisted entry at that history position has
 /// a located key (all durable backends; legacy/test in-memory entries are
@@ -634,6 +652,16 @@ pub struct LoadedLocated {
     pub entries: Vec<SessionEntry>,
     pub locations: Vec<Option<EntryLocation>>,
     pub legacy: bool,
+}
+
+/// One bounded history page with the exact physical identity of every row.
+/// The entries and locations remain aligned; cursors retain the existing
+/// backend paging contract.
+#[derive(Clone, Debug)]
+pub struct LocatedHistoryPage {
+    pub entries: Vec<SessionEntry>,
+    pub locations: Vec<Option<EntryLocation>>,
+    pub next_before_seq: Option<i64>,
 }
 
 /// One session's metadata snapshot from the `sessions` audit table
@@ -876,7 +904,17 @@ pub(crate) fn decode_history_rows(
     Ok(out)
 }
 
+fn location_cursor(location: &EntryLocation) -> Option<i64> {
+    match location.key {
+        LocatedKey::Jsonl { ordinal } => Some(ordinal),
+        LocatedKey::Sqlite { seq, .. } | LocatedKey::Greptime { seq, .. } => Some(seq),
+    }
+}
+
 impl SessionStore {
+    pub fn is_jsonl(&self) -> bool {
+        matches!(self, SessionStore::Jsonl)
+    }
     pub fn supports_history_query(&self) -> bool {
         !matches!(self, SessionStore::Jsonl)
     }
@@ -1133,6 +1171,101 @@ impl SessionStore {
     /// `[0, before)` and later appends (which only extend the head) never
     /// shift it. `limit = None` keeps the whole session + `None`, exactly
     /// like [`Self::load_head`].
+    /// The same bounded head contract as [`Self::load_head_page`], retaining
+    /// each selected row's physical identity for Web reconciliation.
+    pub async fn load_head_page_located(
+        &self,
+        root: &Path,
+        name: &str,
+        limit: Option<usize>,
+    ) -> Result<LocatedHistoryPage> {
+        let loaded = self.load_located(root, name).await?;
+        let backend = loaded.locations.iter().flatten().next().map(|l| l.backend);
+        let segment_start = if backend == Some("jsonl") {
+            0
+        } else {
+            loaded
+                .entries
+                .iter()
+                .rposition(|entry| matches!(entry, SessionEntry::Compaction { .. }))
+                .unwrap_or(0)
+        };
+        let start = limit.map_or(segment_start, |n| {
+            loaded.entries.len().saturating_sub(n).max(segment_start)
+        });
+        let next_before_seq = if start > 0 {
+            loaded
+                .locations
+                .get(start)
+                .and_then(|l| l.as_ref())
+                .and_then(location_cursor)
+        } else {
+            None
+        };
+        Ok(LocatedHistoryPage {
+            entries: loaded.entries[start..].to_vec(),
+            locations: loaded.locations[start..].to_vec(),
+            next_before_seq,
+        })
+    }
+
+    /// The same older-page contract as [`Self::load_older`], retaining each
+    /// selected row's physical identity. Selection is made from the located
+    /// backend rows themselves, never by entry text.
+    pub async fn load_older_located(
+        &self,
+        root: &Path,
+        name: &str,
+        before_seq: i64,
+        limit: Option<usize>,
+    ) -> Result<LocatedHistoryPage> {
+        let loaded = self.load_located(root, name).await?;
+        let backend = loaded.locations.iter().flatten().next().map(|l| l.backend);
+        let end = if backend == Some("jsonl") {
+            (before_seq.max(0) as usize).min(loaded.entries.len())
+        } else {
+            loaded
+                .locations
+                .iter()
+                .position(|location| {
+                    location
+                        .as_ref()
+                        .and_then(location_cursor)
+                        .is_some_and(|seq| seq >= before_seq)
+                })
+                .unwrap_or(loaded.entries.len())
+        };
+        let segment_start = if backend == Some("jsonl") {
+            0
+        } else {
+            loaded.entries[..end]
+                .iter()
+                .rposition(|entry| matches!(entry, SessionEntry::Compaction { .. }))
+                .unwrap_or(0)
+        };
+        let start = limit.map_or(segment_start, |n| end.saturating_sub(n).max(segment_start));
+        let next_before_seq = if start > segment_start {
+            loaded
+                .locations
+                .get(start)
+                .and_then(|l| l.as_ref())
+                .and_then(location_cursor)
+        } else if segment_start > 0 {
+            loaded
+                .locations
+                .get(segment_start)
+                .and_then(|l| l.as_ref())
+                .and_then(location_cursor)
+        } else {
+            None
+        };
+        Ok(LocatedHistoryPage {
+            entries: loaded.entries[start..end].to_vec(),
+            locations: loaded.locations[start..end].to_vec(),
+            next_before_seq,
+        })
+    }
+
     pub async fn load_head_page(
         &self,
         root: &Path,

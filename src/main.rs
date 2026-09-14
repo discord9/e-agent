@@ -530,7 +530,9 @@ async fn consume_stderr_events(mut events: tokio::sync::broadcast::Receiver<Agen
                 eprint!("\x1b[2m{text}\x1b[0m");
                 reasoning = true;
             }
-            AgentEvent::ToolCall { name, arguments } => {
+            AgentEvent::ToolCall {
+                name, arguments, ..
+            } => {
                 if streaming || reasoning {
                     eprintln!();
                     streaming = false;
@@ -538,7 +540,9 @@ async fn consume_stderr_events(mut events: tokio::sync::broadcast::Receiver<Agen
                 }
                 eprintln!("tool: {name} {}", preview(&arguments, 200))
             }
-            AgentEvent::ToolResult { is_error, content } => eprintln!(
+            AgentEvent::ToolResult {
+                is_error, content, ..
+            } => eprintln!(
                 "  {}: {}",
                 if is_error { "error" } else { "ok" },
                 preview(&content, 500)

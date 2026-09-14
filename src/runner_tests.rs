@@ -428,6 +428,44 @@ async fn request_user_input_waits_answers_and_resumes_same_turn() {
 }
 
 #[tokio::test]
+async fn web_attach_while_waiting_input_returns_before_answer() {
+    let temp = tempfile::tempdir().unwrap();
+    let agent = Agent::new(
+        Box::new(InputRecordingModel {
+            calls: 0,
+            saw_result: Arc::new(Mutex::new(false)),
+        }),
+        vec![Box::new(crate::tools::user_input::RequestUserInput)],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "web-input".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let task = runner.start(Some("start".into()));
+    let mut status = handle.status();
+    loop {
+        status.changed().await.unwrap();
+        if matches!(&*status.borrow(), SessionStatus::WaitingInput(_)) {
+            break;
+        }
+    }
+    let attach = tokio::time::timeout(std::time::Duration::from_secs(1), handle.web_attach())
+        .await
+        .expect("WebAttach must not wait for an answer")
+        .expect("runner attached");
+    assert!(matches!(attach.status, SessionStatus::WaitingInput(_)));
+    assert!(attach.entries.iter().any(|entry| matches!(entry, SessionEntry::Message { message: Message::User { content, .. } } if content == "start")));
+    assert!(matches!(
+        handle.submit_prompt_with_call_id(Some("call-input".into()), "Ada".into()),
+        PromptSubmission::Answered
+    ));
+    drop(task);
+}
+
+#[tokio::test]
 async fn request_user_input_twice_rejects_stale_first_call_id() {
     let temp = tempfile::tempdir().unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
@@ -2101,6 +2139,36 @@ async fn queued_handle_prompt_is_transient_until_consumed() {
             if content == "queued while busy"
     )));
     task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn consumed_queue_is_not_replayed_by_repeated_web_attach() {
+    let temp = tempfile::tempdir().unwrap();
+    let (agent, entered, release) = controlled(vec![Ok("first".into()), Ok("second".into())], true);
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "queue-web".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let task = runner.start(Some("initial".into()));
+    entered.notified().await;
+    handle.prompt("queued while busy");
+    release.notify_one();
+    let mut status = handle.status();
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+    let first = handle.web_attach().await.expect("first attach");
+    let second = handle.web_attach().await.expect("second attach");
+    for attach in [&first, &second] {
+        // The frozen post-turn head owns the consumed prompt. No stale queue
+        // projection crosses the boundary, so repeated attaches start empty.
+        assert!(!attach.replay.iter().any(|item| matches!(
+            item.event,
+            AgentEvent::PromptQueued(_) | AgentEvent::PromptConsumed
+        )));
+    }
+    drop(task);
 }
 
 #[tokio::test]
@@ -8949,7 +9017,7 @@ async fn goal_continue_capped_missing_usage_commits_tools_without_another_provid
     handle.continue_goal(Some(10));
     wait_for_log_event(&handle, |event| {
         matches!(event,
-        AgentEvent::ToolResult { content, is_error: false } if content.is_empty())
+        AgentEvent::ToolResult { content, is_error: false, .. } if content.is_empty())
     })
     .await;
     wait_for_status(&mut handle.status(), |status| {
@@ -9019,7 +9087,7 @@ async fn goal_request_compaction_suppresses_after_exhausted_or_missing_usage() {
         let task = runner.start(None);
         handle.continue_goal(Some(10));
         wait_for_log_event(&handle, |event| {
-            matches!(event, AgentEvent::ToolResult { content, is_error: false }
+            matches!(event, AgentEvent::ToolResult { content, is_error: false, .. }
                 if content.contains("suppressed"))
         })
         .await;
@@ -9852,7 +9920,7 @@ async fn oracle393_goal_manual_compact_resumes_turn_and_charges_budget() {
         AgentEvent::ToolCall { name, .. } if name == "read_image"
     )));
     assert!(snapshot.iter().any(|event| matches!(event,
-        AgentEvent::ToolResult { is_error: false, content }
+        AgentEvent::ToolResult { is_error: false, content, .. }
             if content.contains("[image read: pic.png]")
     )));
     assert!(snapshot.iter().any(|event| matches!(event,

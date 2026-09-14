@@ -2325,7 +2325,26 @@ pub struct HistoryParams {
 #[derive(Serialize)]
 pub struct HistoryResponse {
     pub entries: Vec<SessionEntry>,
+    pub locations: Vec<Option<crate::session_store::WebEntryLocation>>,
     pub next_before_seq: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct EventsParams {
+    view: Option<String>,
+}
+
+/// One atomic runner-owned web bootstrap, delivered as the first event on
+/// `/events?view=web`. `entries` are durable SessionEntry history; replay is
+/// only the presentation bridge after the frozen head.
+#[derive(Serialize)]
+struct WebBootstrap {
+    entries: Vec<SessionEntry>,
+    locations: Vec<Option<crate::session_store::WebEntryLocation>>,
+    next_before_seq: Option<i64>,
+    replay: Vec<crate::runner::WebReplayEvent>,
+    usage: Option<crate::agent::AgentEvent>,
+    usage_pre_compaction: bool,
 }
 
 /// `GET /api/sessions/{id}/history` — the frontend's initial-render path.
@@ -2371,22 +2390,13 @@ async fn session_history(
     // store empty → 404, and ids that can never exist (invalid session
     // name) also 404, keeping the previous registry-miss semantics.
     let (store, historical) = resolve_session_store(&state, &id, false).await?;
-    let (entries, next_before_seq) = match params.before_seq {
+    let page = match params.before_seq {
         None => {
-            // Head segment, paged: with a `limit` the newest `limit`
-            // entries are returned and the cursor is the seq of the
-            // oldest entry of that page — the truncation point, fed back
-            // as `before_seq` to page into the cut-off part of the head
-            // segment (the frontend's 200-entry initial render never
-            // loses the gap to the older segments). Without a `limit` the
-            // whole head segment is returned and the cursor is the seq of
-            // the compaction that opens it (None = the whole session is
-            // one head segment).
             let page = store
-                .load_head_page(root, &id, params.limit)
+                .load_head_page_located(root, &id, params.limit)
                 .await
                 .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
-            if historical && page.0.is_empty() {
+            if historical && page.entries.is_empty() {
                 return Err(error(
                     StatusCode::NOT_FOUND,
                     format!("session {id} not found"),
@@ -2395,14 +2405,11 @@ async fn session_history(
             page
         }
         Some(before_seq) => {
-            // Older entries: [prev_comp, before_seq), paged intra-segment
-            // by `limit` when present (cursor = oldest seq of the page,
-            // crossing into the older segment at a compaction boundary).
-            let (entries, cursor) = store
-                .load_older(root, &id, before_seq, params.limit)
+            let page = store
+                .load_older_located(root, &id, before_seq, params.limit)
                 .await
                 .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
-            if historical && entries.is_empty() {
+            if historical && page.entries.is_empty() {
                 let count = store
                     .count_entries(root, &id)
                     .await
@@ -2414,12 +2421,17 @@ async fn session_history(
                     ));
                 }
             }
-            (entries, cursor)
+            page
         }
     };
     Ok(Json(HistoryResponse {
-        entries,
-        next_before_seq,
+        entries: page.entries,
+        locations: page
+            .locations
+            .iter()
+            .map(|location| location.as_ref().map(Into::into))
+            .collect(),
+        next_before_seq: page.next_before_seq,
     }))
 }
 
@@ -2674,10 +2686,12 @@ fn digest_recent(events: &[AgentEvent], max: usize) -> String {
         let line = match event {
             AgentEvent::UserPrompt(text) => Some(format!("用户: {}", preview(text, 80))),
             AgentEvent::AssistantText(text) => Some(format!("助手: {}", preview(text, 80))),
-            AgentEvent::ToolCall { name, arguments } => {
-                Some(format!("调用工具 {name}: {}", preview(arguments, 60)))
-            }
-            AgentEvent::ToolResult { is_error, content } => {
+            AgentEvent::ToolCall {
+                name, arguments, ..
+            } => Some(format!("调用工具 {name}: {}", preview(arguments, 60))),
+            AgentEvent::ToolResult {
+                is_error, content, ..
+            } => {
                 let prefix = if *is_error {
                     "工具出错"
                 } else {
@@ -3324,19 +3338,37 @@ async fn session_usage(
 async fn session_events(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    Query(params): Query<EventsParams>,
 ) -> Result<Response, (StatusCode, String)> {
     let session = live(&state, &id)?;
-    let (snapshot, live, status) = session.handle().attach();
+    let web = params.view.as_deref() == Some("web");
+    let (initial, live, status) = if web {
+        let attach = session
+            .handle()
+            .web_attach()
+            .await
+            .map_err(|_| error(StatusCode::CONFLICT, "session attach unavailable"))?;
+        (
+            Event::default().event("bootstrap").json_data(WebBootstrap {
+                entries: attach.entries,
+                locations: attach.locations,
+                next_before_seq: attach.next_before_seq,
+                replay: attach.replay,
+                usage: attach.usage,
+                usage_pre_compaction: attach.usage_pre_compaction,
+            }),
+            attach.live,
+            attach.status_live,
+        )
+    } else {
+        let (snapshot, live, status) = session.handle().attach();
+        (snapshot_event(&tail_snapshot(snapshot)), live, status)
+    };
+    let initial = initial.map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let (tx, rx) = mpsc::channel::<Result<Event, Error>>(SSE_CHANNEL_CAPACITY);
     let shutdown = state.shutdown.subscribe();
     tokio::spawn(forward_events(
-        state,
-        id,
-        tail_snapshot(snapshot),
-        live,
-        status,
-        shutdown,
-        tx,
+        state, id, initial, live, status, shutdown, tx, web,
     ));
     let mut response = Sse::new(SseReceiver(rx)).into_response();
     response.headers_mut().insert(
@@ -3357,20 +3389,22 @@ impl Stream for SseReceiver {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Existing SSE forwarding owns these independent streams.
 async fn forward_events(
     state: Arc<AppState>,
     id: String,
-    snapshot: Vec<AgentEvent>,
+    initial: Event,
     mut events: broadcast::Receiver<AgentEvent>,
     mut status: watch::Receiver<SessionStatus>,
     mut shutdown: watch::Receiver<()>,
     tx: mpsc::Sender<Result<Event, Error>>,
+    web: bool,
 ) {
     // Bounded queue: a full queue means the client is too slow to keep up —
     // drop the connection instead of buffering without bound (the frontend
     // reconnects after 3s).
     let send = |event: Result<Event, Error>| tx.try_send(event).is_ok();
-    if !send(snapshot_event(&snapshot)) {
+    if !send(Ok(initial)) {
         return;
     }
     if !send(status_event(&status.borrow().clone())) {
@@ -3411,6 +3445,10 @@ async fn forward_events(
                     // like a registry stream; a deleted session (registry
                     // entry or subagent `Sessions` entry gone) ends the
                     // stream.
+                    if web {
+                        let _ = send(Ok(Event::default().event("bootstrap-required")));
+                        return;
+                    }
                     let Ok(session) = live(&state, &id) else { return };
                     let (snapshot, new_events, new_status) = session.handle().attach();
                     if !send(resync_event(&tail_snapshot(snapshot))) {
@@ -3501,11 +3539,19 @@ fn event_payload(event: &AgentEvent) -> serde_json::Value {
         }
         AgentEvent::PromptConsumed => json!({}),
         AgentEvent::Error(text) => json!({ "error": text }),
-        AgentEvent::ToolCall { name, arguments } => {
-            json!({ "name": name, "arguments": arguments })
+        AgentEvent::ToolCall {
+            name,
+            arguments,
+            call_id,
+        } => {
+            json!({ "name": name, "arguments": arguments, "call_id": call_id })
         }
-        AgentEvent::ToolResult { is_error, content } => {
-            json!({ "is_error": is_error, "content": content })
+        AgentEvent::ToolResult {
+            is_error,
+            content,
+            call_id,
+        } => {
+            json!({ "is_error": is_error, "content": content, "call_id": call_id })
         }
         AgentEvent::BackgroundCompleted {
             id,
@@ -4318,6 +4364,7 @@ mod tests {
         let value = serde_json::to_value(AgentEvent::ToolCall {
             name: "bash".into(),
             arguments: "ls".into(),
+            call_id: None,
         })
         .unwrap();
         assert_eq!(
@@ -4357,14 +4404,16 @@ mod tests {
         assert_eq!(
             name(&AgentEvent::ToolCall {
                 name: "bash".into(),
-                arguments: "ls".into()
+                arguments: "ls".into(),
+                call_id: None,
             }),
             "ToolCall"
         );
         assert_eq!(
             name(&AgentEvent::ToolResult {
                 is_error: false,
-                content: "o".into()
+                content: "o".into(),
+                call_id: None,
             }),
             "ToolResult"
         );
@@ -4439,16 +4488,18 @@ mod tests {
         assert_eq!(
             event_payload(&AgentEvent::ToolCall {
                 name: "bash".into(),
-                arguments: "ls".into()
+                arguments: "ls".into(),
+                call_id: None,
             }),
-            json!({"name": "bash", "arguments": "ls"})
+            json!({"name": "bash", "arguments": "ls", "call_id": null})
         );
         assert_eq!(
             event_payload(&AgentEvent::ToolResult {
                 is_error: true,
-                content: "boom".into()
+                content: "boom".into(),
+                call_id: None,
             }),
-            json!({"is_error": true, "content": "boom"})
+            json!({"is_error": true, "content": "boom", "call_id": null})
         );
         assert_eq!(
             event_payload(&AgentEvent::Notice("hi".into())),
@@ -4521,10 +4572,12 @@ mod tests {
             AgentEvent::ToolCall {
                 name: "bash".into(),
                 arguments: "cargo build".into(),
+                call_id: None,
             },
             AgentEvent::ToolResult {
                 is_error: false,
                 content: "ok".into(),
+                call_id: None,
             },
             AgentEvent::ReasoningDelta("思考".into()),
             AgentEvent::Notice("后台任务完成".into()),
@@ -6705,7 +6758,8 @@ model = "deepseek-chat"
         assert!(
             live_event(&AgentEvent::ToolCall {
                 name: "bash".into(),
-                arguments: "ls".into()
+                arguments: "ls".into(),
+                call_id: None,
             })
             .is_ok()
         );
@@ -7901,6 +7955,7 @@ model = "deepseek-chat"
         assert_eq!(
             serde_json::to_value(HistoryResponse {
                 entries,
+                locations: vec![],
                 next_before_seq: Some(42),
             })
             .unwrap(),
@@ -7909,6 +7964,7 @@ model = "deepseek-chat"
                     {"type": "message", "message": {"User": {"content": "hello"}}},
                     {"type": "compaction", "summary": "rolled up", "retained": []},
                 ],
+                "locations": [],
                 "next_before_seq": 42,
             })
         );
@@ -7917,10 +7973,11 @@ model = "deepseek-chat"
         assert_eq!(
             serde_json::to_value(HistoryResponse {
                 entries: vec![],
+                locations: vec![],
                 next_before_seq: None,
             })
             .unwrap(),
-            serde_json::json!({"entries": [], "next_before_seq": null})
+            serde_json::json!({"entries": [], "locations": [], "next_before_seq": null})
         );
     }
 
@@ -8578,11 +8635,12 @@ model = "deepseek-chat"
         let task = tokio::spawn(forward_events(
             state.clone(),
             id.clone(),
-            tail_snapshot(snapshot),
+            snapshot_event(&tail_snapshot(snapshot)).unwrap(),
             live,
             status,
             state.shutdown.subscribe(),
             tx,
+            false,
         ));
 
         // Frame order: snapshot + status first, then the lag resync + a
@@ -8636,11 +8694,12 @@ model = "deepseek-chat"
         let task = tokio::spawn(forward_events(
             state,
             id,
-            tail_snapshot(snapshot),
+            snapshot_event(&tail_snapshot(snapshot)).unwrap(),
             live,
             status,
             shutdown,
             tx,
+            false,
         ));
         tokio::time::timeout(std::time::Duration::from_secs(2), task)
             .await
@@ -8665,11 +8724,12 @@ model = "deepseek-chat"
         let task = tokio::spawn(forward_events(
             state.clone(),
             id,
-            tail_snapshot(snapshot),
+            snapshot_event(&tail_snapshot(snapshot)).unwrap(),
             live,
             status,
             shutdown_rx,
             tx,
+            false,
         ));
 
         // 流活着：初始 snapshot + status 两帧先到（session_events 的既定
@@ -8749,17 +8809,19 @@ model = "deepseek-chat"
                 AgentEvent::ToolCall {
                     name: "bash".into(),
                     arguments: "ls".into(),
+                    call_id: None,
                 },
                 "ToolCall",
-                json!({"name": "bash", "arguments": "ls"}),
+                json!({"name": "bash", "arguments": "ls", "call_id": null}),
             ),
             (
                 AgentEvent::ToolResult {
                     is_error: true,
                     content: "no".into(),
+                    call_id: None,
                 },
                 "ToolResult",
-                json!({"is_error": true, "content": "no"}),
+                json!({"is_error": true, "content": "no", "call_id": null}),
             ),
             (
                 AgentEvent::GoalUpdated {

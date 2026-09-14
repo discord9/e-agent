@@ -701,10 +701,12 @@ pub enum AgentEvent {
     ToolCall {
         name: String,
         arguments: String,
+        call_id: Option<String>,
     },
     ToolResult {
         is_error: bool,
         content: String,
+        call_id: Option<String>,
     },
     /// A durable, model-facing system notice (background completion or task
     /// report). Fresh background ingress commits it as a `SessionEntry::Notice`,
@@ -1299,6 +1301,42 @@ impl Agent {
     /// Full append-only history (what is persisted and shown in the TUI).
     pub fn history(&self) -> &[SessionEntry] {
         &self.history
+    }
+
+    /// Bounded authoritative head projection for a live Web attach.  The
+    /// runner owns this projection; it is derived from the same located
+    /// history that it just committed, never from the presentation log.
+    pub(crate) fn web_head_page(
+        &self,
+        limit: usize,
+        jsonl: bool,
+    ) -> (Vec<SessionEntry>, Vec<Option<EntryLocation>>, Option<i64>) {
+        let segment_start = if jsonl {
+            0
+        } else {
+            self.history
+                .iter()
+                .rposition(|entry| matches!(entry, SessionEntry::Compaction { .. }))
+                .unwrap_or(0)
+        };
+        let start = self.history.len().saturating_sub(limit).max(segment_start);
+        let cursor = if start > 0 {
+            self.entry_locations
+                .get(start)
+                .and_then(|location| location.as_ref())
+                .map(|location| match &location.key {
+                    crate::session_store::LocatedKey::Jsonl { ordinal } => *ordinal,
+                    crate::session_store::LocatedKey::Sqlite { seq, .. }
+                    | crate::session_store::LocatedKey::Greptime { seq, .. } => *seq,
+                })
+        } else {
+            None
+        };
+        (
+            self.history[start..].to_vec(),
+            self.entry_locations[start..].to_vec(),
+            cursor,
+        )
     }
 
     /// Replace the whole history (session resume). To ADD one entry to an
@@ -1997,10 +2035,6 @@ impl Agent {
         self.record_usage(usage, refresh_context);
     }
 
-    pub(crate) fn emit_event(&mut self, event: AgentEvent) {
-        self.emit(event);
-    }
-
     pub(crate) async fn after_tool_entry(
         &mut self,
         call: &ToolCall,
@@ -2185,6 +2219,7 @@ impl Agent {
                 self.emit(AgentEvent::ToolCall {
                     name: call.name.clone(),
                     arguments: call.arguments.clone(),
+                    call_id: Some(call.id.clone()),
                 });
                 let result = Self::execute_on(&self.tools, call).await;
                 if call.name == "get_background_tasks" && is_poll_guard_terminate(&result) {
@@ -2207,6 +2242,7 @@ impl Agent {
                 self.emit(AgentEvent::ToolResult {
                     is_error,
                     content: content.clone(),
+                    call_id: Some(call.id.clone()),
                 });
                 self.push_message(Message::Tool {
                     call_id: call.id.clone(),

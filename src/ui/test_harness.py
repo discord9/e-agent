@@ -689,6 +689,11 @@ globalThis.fetch=(url,opts={})=>{
     entries: [{type:"message", message:{User:{content:"persisted A history", images:[]}}}],
     next_before_seq: null,
   }, signal);
+  // Live Web attach is a single bootstrap SSE. Keep the broad existing
+  // harness on its former transcript fixture while exercising the new wire.
+  if(url==="/api/sessions/s1/events?view=web") return resp(200, { getReader(){ let n=0; return { read:async()=> n++ ? ({done:true}) : ({done:false, value:"event: bootstrap\ndata: {\"entries\":" + JSON.stringify(historyData.entries) + ",\"next_before_seq\":100,\"replay\":[]}\n\nevent: status\ndata: {\"status\":\"Busy\"}\n\n" + sseChunks.slice(2).join("")}) }; } }, signal);
+  if(url==="/api/sessions/s2/events?view=web") return resp(200, { getReader(){ let n=0; return { read:async()=> n++ ? ({done:true}) : ({done:false, value:"event: bootstrap\ndata: {\"entries\":" + JSON.stringify(historyData.entries) + ",\"next_before_seq\":100,\"replay\":[]}\n\n" + sseChunks.slice(1).join("")}) }; } }, signal);
+  if(url==="/api/sessions/s3/events?view=web") return resp(200, streamSnapshotUsage(), signal);
   if(url==="/api/sessions/s1/events") return resp(200, stream(), signal);
   if(url==="/api/sessions/s2/events") return resp(200, stream(), signal);
   if(url==="/api/sessions/s3/events") return resp(200, streamSnapshotUsage(), signal);
@@ -1726,6 +1731,8 @@ async function main(){
     historyOverrides.set("s1", { delay: true });
     historyResolve = null;
     const restartEpochBefore = sessionOpenEpoch;
+    state.lastList = (state.lastList || []).map((x) => x.id === "s1" ? Object.assign({}, x, {active:false}) : x);
+    state.workspaceLists[state.workspace.id] = state.lastList;
     restartTransport();
     await flush();
     const staleRestartResolve = historyResolve;
@@ -1742,6 +1749,8 @@ async function main(){
         state.sessionId === "s1" && !allText().includes("STALE-TOKEN-RESTART")
         && allText() === textAfterFreshRestart,
         "sid=" + state.sessionId + " stale=" + allText().includes("STALE-TOKEN-RESTART"));
+    state.lastList = (state.lastList || []).map((x) => x.id === "s1" ? Object.assign({}, x, {active:true}) : x);
+    state.workspaceLists[state.workspace.id] = state.lastList;
 
     // ---- /model：运行时切换当前会话模型 ----
     pin.value = "/model";
