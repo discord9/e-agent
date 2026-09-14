@@ -638,6 +638,7 @@ impl BackgroundTasks {
             self.sender.lock().unwrap().clone(),
             self.sandbox.clone(),
             None,
+            None,
         )
     }
 
@@ -653,6 +654,7 @@ impl BackgroundTasks {
     /// subagent's bash, `None` for the main session / unknown): the registry
     /// is shared, so the task panel needs it to show the true initiator
     /// instead of the registry owner.
+    #[allow(clippy::too_many_arguments)]
     pub fn start_with_sender(
         &self,
         workspace: Workspace,
@@ -661,11 +663,12 @@ impl BackgroundTasks {
         sender: Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
         sandbox: Option<crate::config::Sandbox>,
         owner_session: Option<String>,
+        title: Option<String>,
     ) -> Result<String, String> {
         let sender = sender
             .filter(|sender| !sender.is_closed())
             .ok_or("background task delivery is unavailable")?;
-        let label = preview(&command, 100);
+        let label = title.clone().unwrap_or_else(|| preview(&command, 100));
         let completion_label = label.clone();
         self.spawn_bash_command(
             label,
@@ -706,11 +709,12 @@ impl BackgroundTasks {
         &self,
         workspace: Workspace,
         command: String,
+        title: Option<String>,
         protect_git: bool,
         sandbox: Option<crate::config::Sandbox>,
         owner_session: Option<String>,
     ) -> Result<String, String> {
-        let label = preview(&command, 100);
+        let label = title.unwrap_or_else(|| preview(&command, 100));
         self.spawn_bash_command(
             label,
             workspace,
@@ -1404,6 +1408,7 @@ mod tests {
                 Some(sender),
                 None,
                 Some("closed".into()),
+                None,
             )
             .unwrap();
         drop(receiver);

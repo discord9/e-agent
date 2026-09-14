@@ -645,6 +645,8 @@ async fn concurrent_first_installs_serialize_and_leave_exact_v4_layout() {
                 false,
                 Some(tx.clone()),
                 Some(policy.clone()),
+                None,
+                None,
             )
             .unwrap();
         assert!(started.contains("started background task"), "{started}");

@@ -56,6 +56,20 @@ pub fn bash_tool(
     }))
 }
 
+/// Optional bash task title is trimmed and whitespace-normalized to one line.
+/// A blank title falls back to the command-derived task label.
+fn optional_background_title(arguments: &Value) -> Result<Option<String>, String> {
+    let Some(value) = arguments
+        .as_object()
+        .ok_or("tool arguments must be a JSON object")?
+        .get("title")
+    else {
+        return Ok(None);
+    };
+    let title = value.as_str().ok_or("`title` must be a string")?.trim();
+    Ok((!title.is_empty()).then(|| title.split_whitespace().collect::<Vec<_>>().join(" ")))
+}
+
 pub(super) struct Bash {
     pub(super) workspace: Workspace,
     /// Foreground command timeout; `None` = no timeout (runs until done).
@@ -163,6 +177,7 @@ impl Tool for Bash {
                 "properties": {
                     "background": {"type": "boolean", "description": "default for async builds, tests, downloads, translations, scripts, and long computations expected to finish; runs without blocking, completion is delivered, and the session waits/reacts"},
                     "detached": {"type": "boolean", "description": "RARE: ONLY for intentionally persistent daemon, service, or watcher processes. Requires background:true; completion is never delivered and this does not keep the session alive. NEVER use for builds/tests/downloads/translations/scripts or any command whose result/output the agent needs"},
+                    "title": {"type": "string", "description": "optional background task title; whitespace is normalized to one line, and blank titles fall back to the command label"},
                     "command": {"type": "string", "description": "shell command"}
                 },
                 "required": ["command"]
@@ -174,6 +189,7 @@ impl Tool for Bash {
         let command = required_string(&arguments, "command")?;
         let background = optional_bool(&arguments, "background")?;
         let detached = optional_bool(&arguments, "detached")?;
+        let title = optional_background_title(&arguments)?;
         if detached && !background {
             return Err(
                 "`detached` requires `background: true`: a detached command runs without \
@@ -193,6 +209,7 @@ impl Tool for Bash {
                     .start_detached(
                         self.workspace.clone(),
                         command.to_owned(),
+                        title,
                         self.protect_git,
                         self.sandbox.clone(),
                         self.owner_session.clone(),
@@ -211,6 +228,7 @@ impl Tool for Bash {
                     self.sender.clone(),
                     self.sandbox.clone(),
                     self.owner_session.clone(),
+                    title,
                 )
                 .map(ToolOutput::text);
         }

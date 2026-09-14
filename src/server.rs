@@ -9626,6 +9626,7 @@ model = "deepseek-chat"
                 Some(spare_tx),
                 None,
                 Some("sub-a1".into()),
+                None,
             )
             .expect("subagent bash background task starts");
         let subagent_bash = app

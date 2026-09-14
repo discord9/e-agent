@@ -1633,12 +1633,19 @@ fn bash_spec_explains_async_command_choice_and_preserves_schema() {
     assert_eq!(properties["command"]["type"], json!("string"));
     assert_eq!(properties["background"]["type"], json!("boolean"));
     assert_eq!(properties["detached"]["type"], json!("boolean"));
+    assert_eq!(properties["title"]["type"], json!("string"));
+    assert!(
+        properties["title"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("blank titles fall back")
+    );
     assert!(properties["background"].get("default").is_none());
     assert!(properties["detached"].get("default").is_none());
 }
 
 #[tokio::test]
-async fn bash_detached_requires_background() {
+async fn bash_detached_requires_background_and_keeps_title() {
     let temp = tempfile::tempdir().unwrap();
     let (tool, _) = background_bash(&temp, Duration::from_secs(30));
     let error = tool
@@ -1646,6 +1653,21 @@ async fn bash_detached_requires_background() {
         .await
         .unwrap_err();
     assert!(error.contains("detached` requires `background: true"));
+
+    tool.execute(json!({
+        "command": "sleep 30",
+        "background": true,
+        "detached": true,
+        "title": "daemon title"
+    }))
+    .await
+    .unwrap();
+    assert_eq!(tool.background.running()[0].label, "daemon title");
+    assert_eq!(
+        tool.background.running()[0].full_command.as_deref(),
+        Some("sleep 30")
+    );
+    tool.background.cancel(1);
 }
 
 #[test]
@@ -3909,6 +3931,85 @@ async fn background_snapshot_keeps_full_command_beyond_truncated_label() {
     assert_eq!(running[0].full_command.as_deref(), Some(command.as_str()));
     bash.background.cancel(running[0].id);
     let _ = tokio::time::timeout(Duration::from_millis(100), receiver.recv()).await;
+}
+
+#[tokio::test]
+async fn background_title_labels_task_but_keeps_full_command() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut bash, mut receiver) = background_bash(&temp, Duration::from_secs(10));
+    bash.owner_session = Some("title-owner".into());
+    let background = bash.background.clone();
+    let tasks = GetBackgroundTasks::new(background.clone(), None, None);
+    let command = format!("printf done; sleep 0.05 # {}", "long-command-".repeat(20));
+    let title = format!("  compile\n\t{}  ", "long-title-".repeat(10));
+    let normalized_title = format!("compile {}", "long-title-".repeat(10));
+
+    let started = bash
+        .execute(json!({
+            "command": command,
+            "background": true,
+            "title": title
+        }))
+        .await
+        .unwrap()
+        .content;
+    assert_eq!(
+        started,
+        format!("started background task 1: {normalized_title}")
+    );
+
+    let running = background.running();
+    assert_eq!(running.len(), 1);
+    assert_eq!(running[0].label, normalized_title);
+    assert_eq!(running[0].owner_session.as_deref(), Some("title-owner"));
+    assert_eq!(running[0].full_command.as_deref(), Some(command.as_str()));
+    assert_eq!(
+        tasks.execute(json!({})).await.unwrap().content,
+        format!(
+            "1 background task(s) running:\n#1: {normalized_title} (bash)\n    command: {command}"
+        )
+    );
+
+    let event = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+        .await
+        .expect("timeout waiting for completion")
+        .unwrap();
+    assert!(matches!(
+        event,
+        AgentEvent::BackgroundCompleted { label: Some(label), output, .. }
+            if label == normalized_title && output.contains("done")
+    ));
+}
+
+#[tokio::test]
+async fn background_title_blank_falls_back_and_foreground_is_ignored() {
+    let temp = tempfile::tempdir().unwrap();
+    let (bash, mut receiver) = background_bash(&temp, Duration::from_secs(10));
+
+    assert!(
+        bash.execute(json!({"command": "true", "background": true, "title": 1}))
+            .await
+            .unwrap_err()
+            .contains("`title` must be a string")
+    );
+    assert!(
+        bash.execute(json!({"command": "printf foreground", "title": "ignored"}))
+            .await
+            .unwrap()
+            .content
+            .contains("foreground")
+    );
+
+    // An omitted or blank title keeps the legacy command-preview label.
+    let started = bash
+        .execute(json!({"command": "sleep 30", "background": true, "title": "  \n\t "}))
+        .await
+        .unwrap()
+        .content;
+    assert_eq!(started, "started background task 1: sleep 30");
+    assert_eq!(bash.background.running()[0].label, "sleep 30");
+    assert_eq!(bash.background.cancel(1).as_deref(), Some("sleep 30"));
+    let _ = tokio::time::timeout(Duration::from_secs(5), receiver.recv()).await;
 }
 
 #[tokio::test]
