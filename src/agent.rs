@@ -1033,6 +1033,9 @@ pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
     async fn execute(&self, arguments: Value) -> Result<ToolOutput, String>;
     fn set_event_sender(&mut self, _sender: mpsc::UnboundedSender<AgentEvent>) {}
+    /// Bind this tool to the live session that owns the agent. Tools that
+    /// route live work may retain this endpoint; normal tools ignore it.
+    fn set_session_handle(&mut self, _session_id: &str, _handle: crate::runner::SessionHandle) {}
     /// True when the tool already delivers background completions through a
     /// channel of its own (e.g. bound to a shared registry); Agent::new
     /// leaves such tools alone.
@@ -1278,6 +1281,13 @@ impl Agent {
     /// models.
     pub(crate) fn supports_vision(&self) -> bool {
         self.model.supports_vision()
+    }
+
+    /// Bind tools to the runner endpoint after that endpoint exists.
+    pub fn set_session_handle(&mut self, session_id: &str, handle: crate::runner::SessionHandle) {
+        for tool in &mut self.tools {
+            tool.set_session_handle(session_id, handle.clone());
+        }
     }
 
     pub fn set_event_handler(&mut self, handler: Box<dyn FnMut(AgentEvent) + Send>) {
