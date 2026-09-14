@@ -262,10 +262,18 @@ def make_intercept(c):
             except Exception:
                 pass
             return await route.fulfill(status=202, content_type="application/json", body="{}")
-        if url.endswith("/events"):
+        if base.endswith("/events"):
+            # Live sessions now use the runner-owned Web bootstrap: the
+            # persisted head arrives before the ordinary live frames.
+            bootstrap = "event: bootstrap\ndata: " + json.dumps({
+                "entries": (c.history() if callable(c.history) else c.history).get("entries", []),
+                "locations": [],
+                "next_before_seq": (c.history() if callable(c.history) else c.history).get("next_before_seq"),
+                "replay": [],
+            }, ensure_ascii=False) + "\n\n"
             return await route.fulfill(status=200,
                                        headers={"content-type": "text/event-stream"},
-                                       body=c.sse_body)
+                                       body=bootstrap + c.sse_body)
         if "/history" in url:
             c.records["history"].append((url, method))
             if "before_seq=" in url:

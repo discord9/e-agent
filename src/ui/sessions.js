@@ -578,6 +578,8 @@ async function loadHistory(id, wsId, epoch, timeoutMs) {
     const data = await res.json();
     if (epoch !== sessionOpenEpoch || state.workspace.id !== wsId || state.sessionId !== id) return "stale";
     const entries = Array.isArray(data) ? data : (data.entries || []);
+    state.webOlderPages = [];
+    state.webHeadLocations = data.locations || [];
     state.nextBeforeSeq = (data.next_before_seq !== undefined ? data.next_before_seq : null);
     state.olderDone = (state.nextBeforeSeq === null);
     if (state.initSource !== "snapshot") {
@@ -592,7 +594,7 @@ async function loadHistory(id, wsId, epoch, timeoutMs) {
         // 跳过 in-flight）而永久残留。保留滚动位置（距底部偏移）。
         const offset = els.messages.scrollHeight - els.messages.scrollTop - els.messages.clientHeight;
         state.acc.toolStack = [];   // 防重：替换后 reattachInFlight 重新收集
-        renderHistory(entries);     // 清空 + 渲染最新尾部
+        renderHistory(entries, data.locations || []);     // 清空 + 渲染最新尾部
         reattachInFlight(state.acc);   // 按渲染后的 DOM 现状重绑进行中块（若
                                        // 尾部自身含未完成条目），增量续写不中断
         if (offset > 4) {
@@ -601,7 +603,7 @@ async function loadHistory(id, wsId, epoch, timeoutMs) {
           els.jumpBottomBtn.hidden = false;
         }
       } else {
-        renderHistory(entries);
+        renderHistory(entries, data.locations || []);
       }
       state.initSource = "history";
     }
@@ -636,7 +638,8 @@ async function loadOlder() {
     state.nextBeforeSeq = (data.next_before_seq !== undefined ? data.next_before_seq : null);
     if (state.nextBeforeSeq === null) state.olderDone = true;
     if (entries.length) {
-      renderEntries(entries, true);               // 前置插入
+      renderEntries(entries, true, data.locations || []);               // 前置插入
+      state.webOlderPages.unshift({ entries, locations: data.locations || [] });
       // 占位折叠块保持在最顶部：更早条目插到它前面后，把它移回最前，
       // 保证后续 prune 折叠的仍是「最早」的块（占位内展开顺序不乱）。
       const ph = [...els.messages.children].find((c) => c.classList && c.classList.contains("older-collapse"));
@@ -700,7 +703,13 @@ function openWith(id, withHistory, onReady, wsId, epoch, timeoutMs) {
     state.queue.push(...snap);
   }
   renderQueueBar();
-  const step = withHistory ? loadHistory(id, wsId, epoch, timeoutMs) : Promise.resolve("ok");
+  // Live sessions receive one atomic runner-owned bootstrap over the SSE
+  // transport. Historical sessions retain the existing store history + 404
+  // events path; connectSSE classifies their 404 without losing transcript.
+  const known = sessionKnownState(id, wsId);
+  const step = withHistory
+    ? (known === "historical" ? loadHistory(id, wsId, epoch, timeoutMs) : Promise.resolve("web"))
+    : Promise.resolve("ok");
   step.then((r) => {
     if (epoch !== sessionOpenEpoch) return;       // 更新的打开/切换 workspace 已发生
     if (state.workspace.id !== wsId) return;      // 已被切到其它服务器
@@ -718,7 +727,7 @@ function openWith(id, withHistory, onReady, wsId, epoch, timeoutMs) {
       state.deepLink.attemptEpoch = -1;
       return;
     }
-    connectSSE(id, wsId, epoch);
+    connectSSE(id, wsId, epoch, r === "web");
     if (onReady) onReady();
   });
 }
@@ -825,6 +834,9 @@ function saveSessionState() {
     scrollTop: els.messages.scrollTop,
     nextBeforeSeq: state.nextBeforeSeq,
     olderDone: state.olderDone,
+    webOlderPages: state.webOlderPages,
+    webHeadLocations: state.webHeadLocations,
+    webHeadEntries: state.webHeadEntries,
     // The answer draft is call-bound above; the ordinary composer draft stays separate.
     draft: state.waitingInput ? state.waitingInput.priorDraft : els.promptInput.value,
   };
@@ -880,6 +892,9 @@ function openSession(id, onReady, epoch, timeoutMs) {
     state.nextBeforeSeq = cached.nextBeforeSeq;
     state.loadingOlder = false;
     state.olderDone = cached.olderDone;
+    state.webOlderPages = cached.webOlderPages || [];
+    state.webHeadLocations = cached.webHeadLocations || [];
+    state.webHeadEntries = cached.webHeadEntries || [];
     state.acc = newAccumulator();
     els.messages.innerHTML = cached.html;
     reattachInFlight(state.acc);   // 重新绑定缓存里「进行中」的思考/助手/工具卡片，
@@ -898,6 +913,9 @@ function openSession(id, onReady, epoch, timeoutMs) {
   } else {
     // 首次打开：走既有流程（加载历史 + SSE）
     state.initSource = null;
+    state.webOlderPages = [];
+    state.webHeadLocations = [];
+    state.webHeadEntries = [];
     state.nextBeforeSeq = null;
     state.loadingOlder = false;
     state.olderDone = false;

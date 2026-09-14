@@ -1775,10 +1775,12 @@ impl TuiState {
                 }
             }
             AgentEvent::AssistantDelta(_) | AgentEvent::ReasoningDelta(_) => {}
-            AgentEvent::ToolCall { name, arguments } => self.push_tool_call(&name, &arguments),
-            AgentEvent::ToolResult { is_error, content } => {
-                self.push_tool_result(&content, is_error)
-            }
+            AgentEvent::ToolCall {
+                name, arguments, ..
+            } => self.push_tool_call(&name, &arguments),
+            AgentEvent::ToolResult {
+                is_error, content, ..
+            } => self.push_tool_result(&content, is_error),
             // Transient live signal (per-turn subscriber only): the
             // persistent display line comes from the UserPrompt emitted at
             // the turn boundary (handled above), so rendering this too

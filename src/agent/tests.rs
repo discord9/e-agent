@@ -1300,10 +1300,12 @@ async fn emits_assistant_tool_and_result_events_in_order() {
             AgentEvent::ToolCall {
                 name: "echo".into(),
                 arguments: r#"{"value":"ok"}"#.into(),
+                call_id: Some("call-1".into()),
             },
             AgentEvent::ToolResult {
                 is_error: false,
                 content: "\"ok\"".into(),
+                call_id: Some("call-1".into()),
             },
         ]
     );
@@ -1324,10 +1326,12 @@ async fn emits_deltas_without_duplicate_assistant_text() {
             AgentEvent::ToolCall {
                 name: "echo".into(),
                 arguments: r#"{"value":"ok"}"#.into(),
+                call_id: Some("call-1".into()),
             },
             AgentEvent::ToolResult {
                 is_error: false,
                 content: "\"ok\"".into(),
+                call_id: Some("call-1".into()),
             },
         ]
     );
