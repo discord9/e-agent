@@ -220,23 +220,24 @@ async function readSSEStream(reader, id, wsId, epoch, ctrl) {
 /* 从初始 snapshot 事件数组恢复 current usage：取最后一个 Usage 事件（最近
    一次正常模型请求；compaction 不刷新它）交给 applyUsage——与 live 路径共用
    state.lastUsage + renderUsageLine，不引入第二套状态。同时按事件顺序推导
-   “（压缩前）”标注：压缩成功 Notice（"compacted: …"）之后的 Usage 是压缩
-   自身发出的旧基线（runner 的 compact_operation 先 emit 投影再 apply_usage），
+   “（压缩前）”标注：压缩成功 Display（旧 Notice 兼容，"compacted: …"）之后的 Usage 是压缩
+   自身发出的旧基线（runner 的 compact_operation 先 emit Display 投影再 apply_usage），
    标注保留；其后的普通轮 Usage 才清除标注。 */
 function restoreUsageFromSnapshot(events) {
   if (!Array.isArray(events)) return;
-  let pending = false;        // 压缩成功 Notice 之后、压缩自身旧基线 Usage 未消费
+  let pending = false;        // 压缩成功 Display（旧 Notice 兼容）之后、压缩自身旧基线 Usage 未消费
   let preCompaction = false;  // 最近一次 Usage 是否为压缩前基线（默认：普通轮的）
   let lastUsage;
   for (const ev of events) {
     if (!ev) continue;
-    if (ev.type === "notice") {
-      const text = ev.data && (ev.data.text || ev.data.message);
+    const type = String(ev.type || "").toLowerCase();
+    if (type === "display" || type === "notice") {
+      const text = eventText(ev.data !== undefined ? ev.data : ev, ["text", "message"]);
       if (typeof text === "string" && text.startsWith("compacted: ")) {
         preCompaction = true;   // 若其后无 Usage，显示的旧值同样属于压缩前
         pending = true;
       }
-    } else if (ev.type === "usage" && ev.data !== undefined) {
+    } else if (type === "usage" && ev.data !== undefined) {
       if (pending) {
         pending = false;        // 压缩自身的旧基线 Usage：标注保留
       } else {
@@ -307,6 +308,8 @@ function normalizeSnapshotForSplice(events) {
     else if (type === "tool_result" || type === "toolresult") { const p=data && typeof data === "object" ? data : {}; out.push(spliceRecord("snapshot",index,"tool_result",event,{part:"result",owner:p.call_id || "",content:eventText(p,["content","text","result","error"]),isError:p.is_error === true || p.error === true})); }
     else if (type === "usage") out.push(spliceRecord("snapshot",index,"usage",event,{part:"usage",neutral:true}));
     else if (type === "notice") out.push(spliceRecord("snapshot",index,"notice",event,{part:"notice",text:eventText(data,["text","message"]),display:true}));
+    else if (type === "display") out.push(spliceRecord("snapshot",index,"display",event,{part:"display",text:eventText(data,["text","message"]),display:true}));
+    else if (type === "goal_updated" || type === "goalupdated") out.push(spliceRecord("snapshot",index,"goal_updated",event,{part:"goal_updated",goal:data && typeof data === "object" ? (data.goal || null) : null,display:true}));
     else if (type === "error") out.push(spliceRecord("snapshot",index,"error",event,{part:"error",text:eventText(data,["error","message","text"])}));
     else out.push(spliceRecord("snapshot",index,type || "unknown",event,{part:type || "unknown",text:JSON.stringify(data)}));
   }
@@ -327,8 +330,8 @@ function sparseCallCanOmit(history, h, snapshot, s) {
   return false;
 }
 /* One walker: exact substantive pairs; Usage is neutral; missing H reasoning and
-   calls are sparse only under the documented conditions; only notice may gap two
-   established anchors.  Error/U/tool/content mismatches stop the candidate. */
+   calls are sparse only under the documented conditions; display-only events may gap
+   two established anchors.  Error/U/tool/content mismatches stop the candidate. */
 function walkSplice(history, startH, snapshot, startS) {
   let h = startH, s = startS, pairs = [];
   while (h < history.length) {
@@ -361,7 +364,7 @@ function walkSplice(history, startH, snapshot, startS) {
       pairs.push({h:h++, s:s++});
       continue;
     }
-    // Notices, and an ownerless result between two matched calls, are retained
+    // Display-only events, and an ownerless result between two matched calls, are retained
     // as S extras rather than ending an otherwise anchored comparison. A call
     // is still not omitted: the later S call must itself match this H call.
     const canGap = (record) => record.display
@@ -580,7 +583,9 @@ async function handleSSEBlock(block, id, wsId, epoch, ctrl) {
       //（handleSSEBlock 顶部已校验三元组）。
       let snapshotGoal = undefined;   // undefined = snapshot 无 goal_updated
       for (const ev of entries) {
-        if (ev && ev.type === "goal_updated" && ev.data && "goal" in ev.data) {
+        if (ev && (String(ev.type || "").toLowerCase() === "goal_updated"
+            || String(ev.type || "").toLowerCase() === "goalupdated")
+            && ev.data && "goal" in ev.data) {
           snapshotGoal = ev.data.goal;   // null = cleared
         }
       }
@@ -690,10 +695,22 @@ function applyLiveEvent(name, payload) {
       appendToolResult(isErr, content, acc, p.call_id);
       break;
     }
+    case "Display":
+    case "display": {
+      const text = pickText(payload, ["text", "message"]);
+      appendNotice(text);
+      // Display is the display-only compaction projection. Old servers sent it
+      // as Notice, so both names deliberately drive the same usage marker.
+      if (typeof text === "string" && text.startsWith("compacted: ")) {
+        state.usagePreCompaction = true;
+        state.compactionUsagePending = true;
+      }
+      break;
+    }
     case "Notice": {
       const text = pickText(payload, ["text", "message"]);
       appendNotice(text);
-      // 压缩成功投影（"compacted: …"）之后紧跟着一条携带压缩前基线的 Usage
+      // 旧后端以 Notice 发送的压缩成功投影（"compacted: …"）之后紧跟着一条携带压缩前基线的 Usage
       // （runner 的 compact_operation 先 emit 投影 Notice，再 apply_usage 旧值）。
       // 置“（压缩前）”标注并挂起下一次 Usage 的清除动作——那条正是压缩自己
       // 发出的旧基线，不是普通轮的新值。
@@ -739,9 +756,7 @@ function applyLiveEvent(name, payload) {
       const p = (payload && typeof payload === "object") ? payload : {};
       const goal = p.goal || null;
       renderGoalBar(goal);
-      appendNotice(goal
-        ? "goal [" + (goal.status || "?") + "] " + (goal.objective || "")
-        : "goal cleared");
+      appendNotice(goalNoticeText(goal));
       break;
     }
     default:

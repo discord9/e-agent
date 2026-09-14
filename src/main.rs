@@ -513,7 +513,7 @@ async fn consume_stderr_events(mut events: tokio::sync::broadcast::Receiver<Agen
         match event {
             AgentEvent::PromptQueued(_) | AgentEvent::PromptConsumed => {}
             AgentEvent::UserPrompt(_) => {}
-            AgentEvent::Notice(text) => {
+            AgentEvent::Notice(text) | AgentEvent::Display(text) => {
                 eprintln!("{}", text);
             }
             AgentEvent::Error(text) => eprintln!("error: {text}"),

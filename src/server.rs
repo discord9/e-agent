@@ -3377,6 +3377,7 @@ fn event_name(event: &AgentEvent) -> &'static str {
         AgentEvent::ToolCall { .. } => "ToolCall",
         AgentEvent::ToolResult { .. } => "ToolResult",
         AgentEvent::Notice(_) => "Notice",
+        AgentEvent::Display(_) => "Display",
         AgentEvent::Error(_) => "Error",
         AgentEvent::BackgroundCompleted { .. } => "BackgroundCompleted",
         AgentEvent::BackgroundCompletionNotice { .. } => "BackgroundCompletionNotice",
@@ -3397,7 +3398,8 @@ fn event_payload(event: &AgentEvent) -> serde_json::Value {
         AgentEvent::PromptQueued(text)
         | AgentEvent::UserPrompt(text)
         | AgentEvent::AssistantText(text)
-        | AgentEvent::Notice(text) => json!({ "text": text }),
+        | AgentEvent::Notice(text)
+        | AgentEvent::Display(text) => json!({ "text": text }),
         AgentEvent::AssistantDelta(text) | AgentEvent::ReasoningDelta(text) => {
             json!({ "delta": text })
         }
@@ -4222,6 +4224,10 @@ mod tests {
             serde_json::to_value(AgentEvent::Notice("hi".into())).unwrap(),
             serde_json::json!({"type": "notice", "data": "hi"})
         );
+        assert_eq!(
+            serde_json::to_value(AgentEvent::Display("hi".into())).unwrap(),
+            serde_json::json!({"type": "display", "data": "hi"})
+        );
     }
 
     /// Frontend contract: live SSE frames are named after the Rust variant
@@ -4259,6 +4265,7 @@ mod tests {
             "ToolResult"
         );
         assert_eq!(name(&AgentEvent::Notice("x".into())), "Notice");
+        assert_eq!(name(&AgentEvent::Display("x".into())), "Display");
         assert_eq!(name(&AgentEvent::Error("x".into())), "Error");
         assert_eq!(
             name(&AgentEvent::BackgroundCompleted {
@@ -4341,6 +4348,10 @@ mod tests {
         );
         assert_eq!(
             event_payload(&AgentEvent::Notice("hi".into())),
+            json!({"text": "hi"})
+        );
+        assert_eq!(
+            event_payload(&AgentEvent::Display("hi".into())),
             json!({"text": "hi"})
         );
         assert_eq!(
@@ -6567,8 +6578,8 @@ model = "deepseek-chat"
         // `event_payload_is_flat_for_frontend` (axum 0.8's `Event` exposes
         // no getters to assert the buffer on).
         assert!(snapshot_event(&[AgentEvent::Notice("hi".into())]).is_ok());
-        assert!(resync_event(&[AgentEvent::Notice("hi".into())]).is_ok());
-        assert!(live_event(&AgentEvent::AssistantText("x".into())).is_ok());
+        assert!(resync_event(&[AgentEvent::Display("hi".into())]).is_ok());
+        assert!(live_event(&AgentEvent::Display("x".into())).is_ok());
         assert!(
             live_event(&AgentEvent::ToolCall {
                 name: "bash".into(),
@@ -7552,12 +7563,12 @@ model = "deepseek-chat"
         assert_eq!(result, SessionStatus::Finished(SessionResult::Cancelled));
 
         // The cancel never took the ReleasedWithPrompts path: no "processing
-        // queued prompts" Notice and no committed prompt beyond the initial
+        // queued prompts" Display and no committed prompt beyond the initial
         // one.
         assert!(
             !handle.snapshot().iter().any(|event| matches!(
                 event,
-                AgentEvent::Notice(text) if text == "processing queued prompts"
+                AgentEvent::Display(text) if text == "processing queued prompts"
             )),
             "no queued prompt: the release must not take the prompts branch"
         );

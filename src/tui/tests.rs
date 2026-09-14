@@ -1172,6 +1172,15 @@ fn attach_after_completion_marks_finished_from_the_snapshot() {
 }
 
 #[test]
+fn display_renders_as_a_dim_line_without_changing_follow_state() {
+    let mut state = TuiState::default();
+    state.push_agent_event(AgentEvent::Display("local status".into()));
+    assert_eq!(state.lines.last().unwrap().text, "local status");
+    assert_eq!(state.lines.last().unwrap().kind, LineKind::Dim);
+    assert!(state.window.follow_bottom);
+}
+
+#[test]
 fn background_completion_notice_renders_as_dim_line() {
     // The turn-boundary completion is a structured Notice event (not a
     // UserPrompt with a magic prefix); the main view renders it dim.

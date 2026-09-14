@@ -1082,7 +1082,7 @@ async fn poll_guard_direct_agent_ends_turn_after_full_batch_and_resets_next_turn
     // The termination Notice was emitted through the event handler.
     assert!(events.lock().unwrap().iter().any(|event| matches!(
         event,
-        AgentEvent::Notice(text) if text == POLL_GUARD_TERMINATION_NOTICE
+        AgentEvent::Display(text) if text == POLL_GUARD_TERMINATION_NOTICE
     )));
 
     assert_eq!(agent.run("turn two".into()).await.unwrap(), "all done");
@@ -1211,7 +1211,7 @@ async fn poll_guard_main_builtins_carry_the_guard() {
     )));
     assert!(events.lock().unwrap().iter().any(|event| matches!(
         event,
-        AgentEvent::Notice(text) if text == POLL_GUARD_TERMINATION_NOTICE
+        AgentEvent::Display(text) if text == POLL_GUARD_TERMINATION_NOTICE
     )));
 
     // The active task is cancelled first; c8 is then an empty poll, proving
