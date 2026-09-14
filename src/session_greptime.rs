@@ -998,11 +998,11 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#);
     /// group, later rows for that seq may be skipped by the seq cursor. This
     /// is acceptable because they represent the same logical entry. The
     /// paged path makes no cross-page exhaustive divergent-tie guarantee.
-    pub async fn load_older(
+    pub async fn load_older_located(
         &self,
         before_seq: i64,
         limit: Option<usize>,
-    ) -> Result<(Vec<SessionEntry>, Option<i64>)> {
+    ) -> Result<(Vec<(EntryLocation, SessionEntry)>, Option<i64>)> {
         let row = self
             .client
             .query_opt(
@@ -1111,12 +1111,37 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#);
             prev_comp
         };
 
-        let entries = dedup_raw_entries(&raw, &self.session_id, &self.workspace_id, "event_time")
+        let fingerprint = workspace_id_fingerprint(&self.workspace_id);
+        let rows = dedup_raw_located(&raw, &self.session_id, &self.workspace_id, "event_time")
             .map_err(anyhow::Error::msg)?
             .into_iter()
-            .map(|(_, e)| e)
+            .map(|(seq, event_time, entry, raw_payload)| {
+                let location = EntryLocation {
+                    backend: "greptime",
+                    fingerprint: fingerprint.clone(),
+                    backend_fp: self.backend_fp.clone(),
+                    session: self.session_id.clone(),
+                    key: LocatedKey::Greptime {
+                        seq,
+                        event_time_us: datetime_to_us(event_time),
+                    },
+                    entry_hash: entry_payload_hash(&raw_payload),
+                };
+                (location, entry)
+            })
             .collect();
-        Ok((entries, cursor))
+        Ok((rows, cursor))
+    }
+
+    /// Load the selected bounded segment without physical locations.
+    pub async fn load_older(
+        &self,
+        before_seq: i64,
+        limit: Option<usize>,
+    ) -> Result<(Vec<SessionEntry>, Option<i64>)> {
+        self.load_older_located(before_seq, limit)
+            .await
+            .map(|(rows, cursor)| (rows.into_iter().map(|(_, entry)| entry).collect(), cursor))
     }
 
     /// Load the oldest compaction segment: everything before the first
@@ -2884,6 +2909,14 @@ mod tests {
     fn greptime_session_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<GreptimeSession>();
+    }
+
+    #[test]
+    fn located_paged_queries_are_bounded_by_sql_limit() {
+        let source = include_str!("session_greptime.rs");
+        assert!(source.contains("ORDER BY seq DESC, event_time DESC LIMIT $5"));
+        assert!(source.contains("ORDER BY seq DESC, event_time DESC LIMIT $4"));
+        assert!(source.contains("pub async fn load_older_located"));
     }
 
     #[test]
