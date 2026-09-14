@@ -647,7 +647,7 @@ where
             } else if let Some(command) = parse_rename(&prompt) {
                 handle_rename(command, state).await;
             } else if let Some(command) = parse_btw(&prompt) {
-                handle_btw(command, state).await;
+                handle_btw(command, state, handle).await;
             } else if let Some(command) = parse_fork(&prompt) {
                 handle_fork(command, state).await;
             } else if let Some(command) = parse_goal(&prompt) {
@@ -1184,7 +1184,10 @@ fn handle_goal(command: GoalCommand, state: &mut TuiState, handle: &RunnerHandle
 /// wired by `run_inner`. Returns `None` when a required component is
 /// missing — only possible in unit-test state without a run loop, since
 /// `run_inner` sets every field together.
-fn btw_context(state: &TuiState) -> Option<crate::delegate::BtwContext> {
+fn btw_context(
+    state: &TuiState,
+    parent_handle: RunnerHandle,
+) -> Option<crate::delegate::BtwContext> {
     Some(crate::delegate::BtwContext {
         model: state.model.clone()?,
         context_window: state.context_window,
@@ -1197,6 +1200,7 @@ fn btw_context(state: &TuiState) -> Option<crate::delegate::BtwContext> {
         backend: state.backend.clone()?,
         record_in: state.record_in.clone(),
         local_sessions: state.factory.as_ref()?.local_sessions(),
+        parent_handle: parent_handle.downgrade(),
     })
 }
 
@@ -1207,7 +1211,7 @@ fn btw_context(state: &TuiState) -> Option<crate::delegate::BtwContext> {
 /// the F2 task panel and can be attached to there. Success and failure are
 /// both surfaced as a display line (pushed into the TUI scrollback — display
 /// only, same as `/rename`).
-async fn handle_btw(command: BtwCommand, state: &mut TuiState) {
+async fn handle_btw(command: BtwCommand, state: &mut TuiState, handle: &RunnerHandle) {
     let question = match command {
         BtwCommand::Usage => {
             push_display(
@@ -1218,7 +1222,7 @@ async fn handle_btw(command: BtwCommand, state: &mut TuiState) {
         }
         BtwCommand::Ask(question) => question,
     };
-    let Some(context) = btw_context(state) else {
+    let Some(context) = btw_context(state, handle.clone()) else {
         push_display(
             state,
             "btw 创建失败：TUI 未接线（缺少模型/工作区/后端配置）".to_string(),

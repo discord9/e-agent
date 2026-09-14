@@ -25,7 +25,9 @@ use crate::agent::{
 };
 use crate::config::SessionBackend;
 use crate::model::ConfiguredModel;
-use crate::runner::{IdlePolicy, SessionBootstrap, SessionHandle, SessionResult, SessionRunner};
+use crate::runner::{
+    IdlePolicy, SessionBootstrap, SessionHandle, SessionResult, SessionRunner, WeakSessionHandle,
+};
 use crate::session_store::SessionStore;
 use crate::tools::{BackgroundTasks, TaskExit, new_exit_slot};
 use crate::workspace::Workspace;
@@ -169,6 +171,118 @@ async fn finish_child_cleanup(
 pub type RoleModelSource =
     Arc<dyn Fn(&str) -> Option<(ConfiguredModel, Option<u64>)> + Send + Sync>;
 
+/// Direct, live-only parent/child agent messaging. Endpoints are bound by a
+/// runner at construction time and are deliberately never reconstructed.
+pub struct SendMessage {
+    mode: MessageMode,
+}
+
+enum MessageMode {
+    Parent {
+        sessions: Sessions,
+        identity: Option<String>,
+    },
+    Child {
+        parent: WeakSessionHandle,
+        identity: Option<String>,
+    },
+}
+
+impl SendMessage {
+    pub fn parent(sessions: Sessions) -> Self {
+        Self {
+            mode: MessageMode::Parent {
+                sessions,
+                identity: None,
+            },
+        }
+    }
+
+    fn child(parent: WeakSessionHandle) -> Self {
+        Self {
+            mode: MessageMode::Child {
+                parent,
+                identity: None,
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for SendMessage {
+    fn spec(&self) -> ToolSpec {
+        let child = matches!(self.mode, MessageMode::Child { .. });
+        ToolSpec {
+            name: "send_message".into(),
+            description: if child {
+                "Send a direct message to the live parent agent. The target must be `parent`. Delivery is queued; it is not a human instruction.".into()
+            } else {
+                "Send a direct message to one live child agent. The target must be that child's exact registered subagent session id. Delivery is queued; it is not a human instruction.".into()
+            },
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string", "description": if child { "REQUIRED — `parent`" } else { "REQUIRED — exact live child subagent session id" }},
+                    "message": {"type": "string", "description": "REQUIRED — message body"}
+                },
+                "required": ["target", "message"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    async fn execute(&self, arguments: Value) -> Result<ToolOutput, String> {
+        let object = arguments.as_object().ok_or("arguments must be an object")?;
+        let target = object
+            .get("target")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or("send_message requires target")?;
+        let message = object
+            .get("message")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or("send_message requires message")?;
+        match &self.mode {
+            MessageMode::Parent { sessions, identity } => {
+                let source = identity
+                    .as_ref()
+                    .ok_or("sender session is not live")?
+                    .clone();
+                let entry = sessions
+                    .list()
+                    .into_iter()
+                    .find_map(|(_, entry)| (entry.session_id == target).then_some(entry))
+                    .ok_or("target is not a live child session")?;
+                entry
+                    .handle
+                    .send_agent_message(source, message.to_owned())?;
+            }
+            MessageMode::Child { parent, identity } => {
+                if target != "parent" {
+                    return Err("child send_message target must be `parent`".into());
+                }
+                parent.send_agent_message(
+                    identity
+                        .as_ref()
+                        .ok_or("sender session is not live")?
+                        .clone(),
+                    message.to_owned(),
+                )?;
+            }
+        }
+        Ok(ToolOutput::text("message queued"))
+    }
+
+    fn set_session_handle(&mut self, session_id: &str, _handle: SessionHandle) {
+        match &mut self.mode {
+            MessageMode::Parent { identity, .. } | MessageMode::Child { identity, .. } => {
+                *identity = Some(session_id.to_owned());
+            }
+        }
+    }
+}
+
 pub struct Delegate {
     /// Subagents run on the role-routed model when configured, otherwise
     /// on the main model.
@@ -213,6 +327,8 @@ pub struct Delegate {
     /// Session backend configuration for subagent persistence (not a
     /// connected store — each subagent connects its own).
     persist_backend: SessionBackend,
+    /// Current live parent runner endpoint, installed after runner creation.
+    parent_endpoint: Option<WeakSessionHandle>,
 }
 
 /// Where a subagent writes its own session file.
@@ -279,6 +395,7 @@ impl Delegate {
             record_in: None,
             local_sessions: crate::session_factory::LocalSessionRegistry::default(),
             persist_backend: SessionBackend::default(),
+            parent_endpoint: None,
         }
     }
 
@@ -404,6 +521,7 @@ impl Delegate {
         bootstrap: Option<SessionBootstrap>,
         policy: IdlePolicy,
         compaction_mode: CompactionMode,
+        parent_endpoint: Option<WeakSessionHandle>,
     ) -> Result<(SessionHandle, crate::runner::SessionTask), String> {
         let model_name = model.display_name().to_owned();
         let resumed = resume.is_some();
@@ -411,7 +529,7 @@ impl Delegate {
             .read_to_string("AGENTS.md")
             .ok()
             .filter(|content| !content.trim().is_empty());
-        let tools = crate::tools::builtins_with_background(
+        let mut tools = crate::tools::builtins_with_background(
             workspace,
             background,
             task.sandbox,
@@ -422,6 +540,9 @@ impl Delegate {
             // annotate which entry is "itself".
             Some(persist.session_id.clone()),
         );
+        if let Some(parent) = parent_endpoint {
+            tools.push(Box::new(SendMessage::child(parent)));
+        }
         let mut agent = Agent::new(Box::new(model), tools);
         // Delegated one-shot subagents compact as single tasks (tool-loop
         // tail retained, no actual user required for repeated compaction);
@@ -612,6 +733,8 @@ pub struct BtwContext {
     /// and supplies the `parent_session_id` metadata link.
     pub record_in: Option<crate::session_store::BackgroundRecord>,
     pub local_sessions: crate::session_factory::LocalSessionRegistry,
+    /// The source session's live endpoint; the fork may message only here.
+    pub parent_handle: WeakSessionHandle,
 }
 
 /// The initial history of a btw fork: the source session's prefix up to its
@@ -683,6 +806,7 @@ pub async fn spawn_btw_subagent(
         backend,
         record_in,
         local_sessions,
+        parent_handle,
     } = context;
     let model_name = model.profile_key();
     let cwd = workspace.root().display().to_string();
@@ -740,6 +864,7 @@ pub async fn spawn_btw_subagent(
         // A btw fork is an interactive main-style conversation (real user
         // turns, current turn kept verbatim).
         CompactionMode::Main,
+        Some(parent_handle),
     )
     .await?;
     // Sessions metadata: the subagent's row links back to the parent
@@ -1202,6 +1327,7 @@ impl Tool for Delegate {
         } else {
             self.sandbox.clone()
         };
+        let parent_endpoint = self.parent_endpoint.clone();
         let (handle, runner_task) = Self::start_runner(
             model,
             context_window,
@@ -1221,6 +1347,7 @@ impl Tool for Delegate {
             None,
             IdlePolicy::FinishWhenIdle,
             CompactionMode::SingleTask,
+            parent_endpoint,
         )
         .await?;
         let sessions = self.sessions.clone();
@@ -1346,6 +1473,10 @@ impl Tool for Delegate {
 
     fn set_event_sender(&mut self, sender: tokio::sync::mpsc::UnboundedSender<AgentEvent>) {
         self.background.set_event_sender(sender);
+    }
+
+    fn set_session_handle(&mut self, _session_id: &str, handle: SessionHandle) {
+        self.parent_endpoint = Some(handle.downgrade());
     }
 }
 

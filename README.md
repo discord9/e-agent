@@ -758,6 +758,16 @@ task number and subagent session ID, and its completion includes that same
 session ID when delivered as a background task completion (waking an idle
 agent). Legacy calls passing a `background` parameter are rejected.
 
+A live parent and one of its currently registered child sessions may use
+`send_message` for direct progress messages: the parent targets the child's
+exact session ID and a child targets only `parent`. The receipt means queued,
+not delivered. Endpoints and unconsumed queues are process-local and are not
+durable or recoverable after restart; only a successfully committed Notice
+survives replay, and replay never wakes a model turn. Messages cannot target
+siblings, other main sessions, or finished sessions. Hard abort/restart, or a
+persistence/consumption failure, can discard an accepted queued body; there is
+no retry.
+
 A running background subagent can be watched live in the TUI: open the tasks
 panel with F2, select it with Up/Down, and press Enter to attach. The
 attached view replays everything the subagent has done so far and then
@@ -1368,7 +1378,7 @@ It deliberately does not fetch provider/model catalogs (including
 models.dev), generate configuration, cache provider metadata, or infer
 context windows; TOML profiles are local static settings only. `AGENTS.md`
 loading is workspace-root-only: there is no parent/nested discovery or merging.
-Subagents exist but are deliberately minimal: no agent-to-agent messaging,
+Subagents exist but are deliberately minimal: no arbitrary agent-to-agent messaging (only direct live parent/child `send_message`),
 no delegation deeper than 1 level, and no process-level isolation yet
 (subagents are runtime tasks, not subprocesses).
 Cancellation is a *release*, not a termination: `cancel` preempts the

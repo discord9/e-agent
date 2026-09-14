@@ -12,10 +12,14 @@ use crate::{
 use std::{
     collections::VecDeque,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
 };
 use tokio::{
-    sync::{broadcast, mpsc, oneshot, watch},
+    sync::{
+        broadcast,
+        mpsc::{self, WeakUnboundedSender},
+        oneshot, watch,
+    },
     task::JoinHandle,
 };
 
@@ -157,6 +161,11 @@ pub enum SessionCommand {
     /// Web-only attach barrier. The runner services it from operation waits
     /// against a head frozen before the model/tool future can mutate Agent.
     WebAttach(oneshot::Sender<WebAttach>),
+    /// A direct live agent-to-agent message. It is not a human prompt.
+    AgentMessage {
+        source: String,
+        body: String,
+    },
 }
 
 /// Human goal operations (creation is human-only; the model's
@@ -313,7 +322,61 @@ pub struct SessionHandle {
     shared: Arc<Mutex<Shared>>,
     commands: mpsc::UnboundedSender<SessionCommand>,
 }
+
+/// Non-owning live command endpoint. It cannot keep a runner alive.
+#[derive(Clone)]
+pub struct WeakSessionHandle {
+    shared: Weak<Mutex<Shared>>,
+    commands: WeakUnboundedSender<SessionCommand>,
+}
+
+impl WeakSessionHandle {
+    /// Queue an agent message only while both the runner state and command
+    /// channel still exist. Losing either is a normal live-endpoint failure.
+    pub fn send_agent_message(&self, source: String, body: String) -> Result<(), String> {
+        let Some(shared) = self.shared.upgrade() else {
+            return Err("target session is no longer live".into());
+        };
+        let Some(commands) = self.commands.upgrade() else {
+            return Err("target session is no longer live".into());
+        };
+        let mut shared = shared.lock().unwrap();
+        if !shared.commands_open || commands.is_closed() {
+            return Err("target session is no longer live".into());
+        }
+        commands
+            .send(SessionCommand::AgentMessage { source, body })
+            .map_err(|_| {
+                shared.commands_open = false;
+                "target session is no longer live".to_owned()
+            })
+    }
+}
+
 impl SessionHandle {
+    /// Produce a non-owning endpoint for a child tool. Unlike a handle clone,
+    /// this does not keep command intake open or retain the runner state.
+    pub fn downgrade(&self) -> WeakSessionHandle {
+        WeakSessionHandle {
+            shared: Arc::downgrade(&self.shared),
+            commands: self.commands.downgrade(),
+        }
+    }
+    /// Admit an agent message without turning it into a human prompt. The
+    /// shared admission lock also serializes against finalization.
+    pub fn send_agent_message(&self, source: String, body: String) -> Result<(), String> {
+        let mut shared = self.shared.lock().unwrap();
+        if !shared.commands_open || self.commands.is_closed() {
+            return Err("target session is no longer live".into());
+        }
+        self.commands
+            .send(SessionCommand::AgentMessage { source, body })
+            .map_err(|_| {
+                shared.commands_open = false;
+                "target session is no longer live".to_owned()
+            })
+    }
+
     pub fn prompt(&self, prompt: impl Into<String>) {
         self.prompt_inner(prompt.into(), None);
     }
@@ -683,6 +746,10 @@ enum OperationFlow {
 }
 
 enum PendingCommand {
+    AgentMessage {
+        source: String,
+        body: String,
+    },
     Prompt {
         text: String,
         queued: bool,
@@ -867,6 +934,7 @@ impl SessionRunner {
             shared: shared.clone(),
             commands: tx,
         };
+        agent.set_session_handle(&session, handle.clone());
         (
             Self {
                 agent,
@@ -1063,6 +1131,17 @@ impl SessionRunner {
             }
             shared.emit_durable(AgentEvent::UserPrompt(prompt));
         }
+        Ok(())
+    }
+
+    /// Commit an accepted live agent message. It becomes visible and model
+    /// context only after the notice append succeeds.
+    async fn commit_agent_message(&mut self, source: String, body: String) -> anyhow::Result<()> {
+        let text = format!("[agent message from {source}]\n{body}");
+        self.commit(SessionEntry::Notice { text }).await?;
+        // Only a fresh successful append owns a follow-up request. Replayed
+        // notices never pass through here.
+        self.pending_regular_reaction = true;
         Ok(())
     }
 
@@ -1663,6 +1742,19 @@ impl SessionRunner {
         loop {
             while self.has_work() {
                 match self.pending.front() {
+                    Some(PendingCommand::AgentMessage { .. }) => {
+                        let Some(PendingCommand::AgentMessage { source, body }) =
+                            self.pending.pop_front()
+                        else {
+                            unreachable!()
+                        };
+                        if let Err(error) = self.commit_agent_message(source, body).await {
+                            self.commit_error(format!(
+                                "persisting accepted agent message while terminating: {error:#}"
+                            ))
+                            .await;
+                        }
+                    }
                     Some(PendingCommand::Prompt { .. }) => {
                         let (prompt, image, consumed) = self.take_prompt_batch();
                         if !consumed.is_empty()
@@ -1698,6 +1790,11 @@ impl SessionRunner {
     /// reflects whether prompts are already pending.
     fn queue(&mut self, command: SessionCommand) -> Steering {
         match command {
+            SessionCommand::AgentMessage { source, body } => {
+                self.pending
+                    .push_back(PendingCommand::AgentMessage { source, body });
+                Steering::None
+            }
             SessionCommand::Prompt(prompt) => {
                 self.armed_trigger = None;
                 self.pending.push_back(PendingCommand::Prompt {
@@ -1837,9 +1934,12 @@ impl SessionRunner {
     }
 
     fn has_prompt_work(&self) -> bool {
-        self.pending
-            .iter()
-            .any(|command| matches!(command, PendingCommand::Prompt { .. }))
+        self.pending.iter().any(|command| {
+            matches!(
+                command,
+                PendingCommand::Prompt { .. } | PendingCommand::AgentMessage { .. }
+            )
+        })
     }
 
     fn release_steering(&self) -> Steering {
@@ -2202,6 +2302,21 @@ impl SessionRunner {
             // below and the turn(s) started from it decide the end naturally.
             if steering == Steering::ReleasedIdle && self.release_after_preempt(steering) {
                 return;
+            }
+            if matches!(
+                self.pending.front(),
+                Some(PendingCommand::AgentMessage { .. })
+            ) {
+                let Some(PendingCommand::AgentMessage { source, body }) = self.pending.pop_front()
+                else {
+                    unreachable!()
+                };
+                if let Err(error) = self.commit_agent_message(source, body).await {
+                    self.terminate(SessionResult::Failed(format!("{error:#}")), Vec::new())
+                        .await;
+                    return;
+                }
+                continue;
             }
             if matches!(self.pending.front(), Some(PendingCommand::Compact)) {
                 self.pending.pop_front();
@@ -3121,12 +3236,32 @@ impl SessionRunner {
                     }
                 }
                 if self.has_work() {
+                    // A request_compaction accepted in this sibling batch is
+                    // preserved only for direct agent-message handoff. Human
+                    // prompts and goal maintenance retain their established
+                    // superseding behavior.
+                    let message_handoff = self
+                        .pending
+                        .iter()
+                        .any(|command| matches!(command, PendingCommand::AgentMessage { .. }));
+                    let human_or_goal_handoff = self.pending.iter().any(|command| {
+                        matches!(
+                            command,
+                            PendingCommand::Prompt { .. } | PendingCommand::Goal(_)
+                        )
+                    });
                     if requested_compaction
                         && !auto_compacted
+                        && message_handoff
+                        && !human_or_goal_handoff
                         && !self
                             .pending
                             .iter()
                             .any(|command| matches!(command, PendingCommand::Compact))
+                    {
+                        self.pending.push_front(PendingCommand::Compact);
+                    } else if requested_compaction
+                        && !auto_compacted
                         && self.pending.iter().any(|command| {
                             matches!(
                                 command,
@@ -3160,9 +3295,18 @@ impl SessionRunner {
                         self.armed_trigger = Some(RunnerTrigger::Goal);
                         self.maintenance_resume = true;
                     } else if !goal_turn
-                        && matches!(self.pending.front(), Some(PendingCommand::Compact))
+                        && self.pending.iter().any(|command| {
+                            matches!(
+                                command,
+                                PendingCommand::Compact | PendingCommand::AgentMessage { .. }
+                            )
+                        })
                     {
+                        // A message or compaction that arrived during this
+                        // tool turn is FIFO maintenance. Commit it before the
+                        // next round, then resume without resetting tools.
                         self.armed_trigger = Some(RunnerTrigger::Resume);
+                        self.maintenance_resume = true;
                     }
                     break 'turn;
                 }

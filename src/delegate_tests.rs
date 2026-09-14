@@ -2111,6 +2111,16 @@ async fn btw_durable_start_record_failure_aborts_live_child_as_system() {
             .unwrap(),
     );
     let record_root = failing_record_root(&root);
+    // main's durable-start test predates #5's required `parent_handle`: a live
+    // source endpoint needs a real runner to downgrade into the context.
+    let (parent_runner, parent_handle) = SessionRunner::new(
+        Agent::new(Box::new(model.clone()), vec![]),
+        SessionStore::Jsonl,
+        root.clone(),
+        "web-main".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let _parent_runner = parent_runner;
     let id = spawn_btw_subagent(
         "web-main",
         "side question",
@@ -2130,6 +2140,7 @@ async fn btw_durable_start_record_failure_aborts_live_child_as_system() {
                 store: crate::session_store::SessionStore::Jsonl,
             }),
             local_sessions: crate::session_factory::LocalSessionRegistry::default(),
+            parent_handle: parent_handle.downgrade(),
         },
     )
     .await
@@ -2372,6 +2383,14 @@ async fn spawn_btw_subagent_forks_history_and_registers_persistent_subagent() {
         )
         .unwrap(),
     );
+    let (parent_runner, parent_handle) = SessionRunner::new(
+        Agent::new(Box::new(model.clone()), vec![]),
+        SessionStore::Jsonl,
+        root.clone(),
+        "web-main".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let _parent_runner = parent_runner;
     let id = spawn_btw_subagent(
         "web-main",
         "side question",
@@ -2391,6 +2410,7 @@ async fn spawn_btw_subagent_forks_history_and_registers_persistent_subagent() {
                 store: crate::session_store::SessionStore::Jsonl,
             }),
             local_sessions: crate::session_factory::LocalSessionRegistry::default(),
+            parent_handle: parent_handle.downgrade(),
         },
     )
     .await
@@ -3167,4 +3187,96 @@ async fn delegate_failed_resume_load_releases_local_permit() {
             ))
             .is_ok()
     );
+}
+
+#[tokio::test]
+async fn send_message_routes_only_to_live_registered_child_or_parent() {
+    let sessions = Sessions::default();
+    let (parent, _parent_events, _parent_commands) = crate::runner::session_test_channel();
+    let (child, _child_events, _child_commands) = crate::runner::session_test_channel();
+    sessions.insert(
+        1,
+        Arc::new(SessionEntry {
+            handle: child.clone(),
+            model: "model".into(),
+            role: None,
+            cwd: "".into(),
+            session_id: "sub-live".into(),
+            context_window: None,
+            store: SessionStore::Jsonl,
+            local_permit: None,
+        }),
+    );
+    let mut parent_tool = SendMessage::parent(sessions.clone());
+    parent_tool.set_session_handle("main", parent.clone());
+    assert!(
+        parent_tool
+            .execute(json!({"target":"sub-live","message":"down"}))
+            .await
+            .is_ok()
+    );
+    assert!(
+        child.snapshot().is_empty(),
+        "receipt is queued, not delivered"
+    );
+    assert!(
+        parent_tool
+            .execute(json!({"target":"missing","message":"no"}))
+            .await
+            .unwrap_err()
+            .contains("not a live child")
+    );
+    let mut child_tool = SendMessage::child(parent.downgrade());
+    child_tool.set_session_handle("sub-live", child);
+    assert!(
+        child_tool
+            .execute(json!({"target":"parent","message":"up"}))
+            .await
+            .is_ok()
+    );
+    assert!(
+        child_tool
+            .execute(json!({"target":"sub-live","message":"no"}))
+            .await
+            .unwrap_err()
+            .contains("must be `parent`")
+    );
+    drop(parent);
+    assert!(
+        child_tool
+            .execute(json!({"target":"parent","message":"after-close"}))
+            .await
+            .unwrap_err()
+            .contains("target session is no longer live")
+    );
+}
+
+#[tokio::test]
+async fn delegate_weak_parent_endpoint_does_not_keep_runner_command_intake_open() {
+    let temp = tempfile::tempdir().unwrap();
+    let delegate = delegate(temp.path());
+    let agent = Agent::new(
+        Box::new(ProbeModel {
+            entered: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+            future_dropped: Arc::new(Notify::new()),
+            model_dropped: Arc::new(Notify::new()),
+            side_effects: Arc::new(AtomicUsize::new(0)),
+            panic: false,
+        }),
+        vec![Box::new(delegate)],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "main-live-endpoint".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let task = runner.start(None);
+    drop(handle);
+    tokio::time::timeout(std::time::Duration::from_secs(1), task.join())
+        .await
+        .expect("Delegate's weak parent endpoint must not retain command intake")
+        .unwrap();
 }

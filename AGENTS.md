@@ -119,7 +119,7 @@ result or user correction challenges an assumption.
   `background` argument is rejected), with isolated Agent state: fresh history and builtin
   tools only (no MCP, no nested `delegate`). They share the parent's unbounded
   running-task registry so nested background bash stays visible. No
-  agent-to-agent messaging or worker/concurrency pool. Process-level isolation
+  arbitrary agent-to-agent messaging (only direct live parent/child `send_message`) or worker/concurrency pool. Process-level isolation
   (subagents as subprocesses) is the planned evolution but not implemented.
 
 ## Commands
