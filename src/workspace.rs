@@ -2,6 +2,9 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use std::os::fd::AsFd;
+
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, File, OpenOptions};
 
@@ -38,6 +41,21 @@ pub struct Workspace {
     /// The workspace entry's writable flag. Meaningful when the sandbox is
     /// enabled; with it disabled the workspace stays historically writable.
     workspace_writable: bool,
+    /// A linked-worktree admin directory retained from the caller's existing
+    /// directory capability. It is deliberately not discovered ambiently.
+    linked_metadata: Option<LinkedWorktreeMetadata>,
+}
+
+/// Descriptor-backed linked-worktree admin metadata for the bash sandbox.
+/// Its directory is also installed as a most-specific read-only file-tool
+/// root on the child workspace.
+#[derive(Clone, Debug)]
+pub(crate) struct LinkedWorktreeMetadata {
+    pub(crate) path: PathBuf,
+    pub(crate) dir: Arc<Dir>,
+    pub(crate) admin: Arc<Dir>,
+    pub(crate) admin_path: PathBuf,
+    pub(crate) pointer: Arc<Mutex<File>>,
 }
 
 /// One logical external entry: the capability is opened from the canonical
@@ -45,7 +63,7 @@ pub struct Workspace {
 /// lookup. The same canonical source can appear in several entries with
 /// different destinations and writability (e.g. canonical RW + alias RO of
 /// the same source coexist independently).
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct ExternalRoot {
     /// Canonical path the capability was opened from — the security
     /// boundary used by reroot and policy-anchor visibility. Aliases never
@@ -61,7 +79,7 @@ struct ExternalRoot {
     capability: ExternalCapability,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum ExternalCapability {
     Dir(Arc<Dir>),
     File(Arc<Mutex<File>>),
@@ -98,6 +116,7 @@ impl Workspace {
             external: Arc::new(Vec::new()),
             sandbox_enabled: false,
             workspace_writable: true,
+            linked_metadata: None,
         })
     }
 
@@ -280,7 +299,159 @@ impl Workspace {
             external: self.external.clone(),
             sandbox_enabled: self.sandbox_enabled,
             workspace_writable,
+            linked_metadata: None,
         })
+    }
+
+    /// Retain linked-worktree Git metadata only when it is already reachable
+    /// through the caller's directory capability. This deliberately rejects
+    /// overlapping writable configured roots: a later read-only logical root
+    /// cannot revoke an existing writable alias to the same host objects.
+    pub(crate) fn derive_child_linked_metadata(
+        mut self,
+        caller: &Workspace,
+    ) -> Result<Self, String> {
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            let _ = caller;
+            return Ok(self);
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            let Some(pointer) = open_regular_file_nofollow(&self.dir, Path::new(".git"))? else {
+                return Ok(self);
+            };
+            let mut pointer = File::from(pointer);
+            let mut text = Vec::new();
+            pointer
+                .read_to_end(&mut text)
+                .map_err(|error| format!("cannot read linked worktree .git: {error}"))?;
+            let text = std::str::from_utf8(&text)
+                .map_err(|_| "linked worktree .git pointer is malformed")?;
+            let Some(target) = text
+                .strip_prefix("gitdir: ")
+                .or_else(|| text.strip_prefix("gitdir:"))
+            else {
+                return Ok(self);
+            };
+            let target = Path::new(target.trim());
+            if !target.is_absolute()
+                || target.components().any(|part| {
+                    !matches!(
+                        part,
+                        Component::RootDir | Component::Prefix(_) | Component::Normal(_)
+                    )
+                })
+            {
+                return Err("linked worktree .git pointer is malformed".into());
+            }
+            let worktrees = target
+                .parent()
+                .ok_or("linked worktree .git pointer is unauthorized")?;
+            let main_git = worktrees
+                .parent()
+                .ok_or("linked worktree .git pointer is unauthorized")?;
+            let name = target
+                .file_name()
+                .ok_or("linked worktree .git pointer is unauthorized")?;
+            if worktrees.file_name() != Some(std::ffi::OsStr::new("worktrees"))
+                || main_git.file_name() != Some(std::ffi::OsStr::new(".git"))
+            {
+                return Err("linked worktree .git pointer is unauthorized".into());
+            }
+            let main = caller.open_authorized_dir_nofollow(main_git)?;
+            let admin = Arc::new(
+                open_dir_nofollow(&main, &Path::new("worktrees").join(name)).map_err(|error| {
+                    format!("linked worktree .git pointer is unauthorized: {error}")
+                })?,
+            );
+            self.reject_writable_metadata_overlap(main_git)?;
+            let pointer = Arc::new(Mutex::new(pointer));
+            let metadata = Arc::new(main);
+            let mut external = (*self.external).clone();
+            external.push(ExternalRoot {
+                source: self.root.join(".git"),
+                dest: self.root.join(".git"),
+                writable: false,
+                capability: ExternalCapability::File(pointer.clone()),
+            });
+            external.push(ExternalRoot {
+                source: main_git.to_path_buf(),
+                dest: main_git.to_path_buf(),
+                writable: false,
+                capability: ExternalCapability::Dir(metadata.clone()),
+            });
+            self.external = Arc::new(external);
+            self.linked_metadata = Some(LinkedWorktreeMetadata {
+                path: main_git.to_path_buf(),
+                dir: metadata,
+                admin,
+                admin_path: main_git.join("worktrees").join(name),
+                pointer,
+            });
+            Ok(self)
+        }
+    }
+
+    pub(crate) fn linked_metadata(&self) -> Option<&LinkedWorktreeMetadata> {
+        self.linked_metadata.as_ref()
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn open_authorized_dir_nofollow(&self, absolute: &Path) -> Result<Dir, String> {
+        // Unlike rerooting, retained metadata needs only read authority.
+        let mut winner = absolute.strip_prefix(&self.root).ok().map(|remainder| {
+            (
+                self.root.components().count(),
+                self.dir.clone(),
+                remainder.to_path_buf(),
+            )
+        });
+        for root in self.external.iter() {
+            let (ExternalCapability::Dir(dir), Ok(remainder)) =
+                (&root.capability, absolute.strip_prefix(&root.source))
+            else {
+                continue;
+            };
+            if winner
+                .as_ref()
+                .is_none_or(|(depth, _, _)| root.source.components().count() > *depth)
+            {
+                winner = Some((
+                    root.source.components().count(),
+                    dir.clone(),
+                    remainder.to_path_buf(),
+                ));
+            }
+        }
+        let Some((_, dir, remainder)) = winner else {
+            return Err("linked worktree .git pointer is unauthorized".into());
+        };
+        if remainder.as_os_str().is_empty() {
+            return dir
+                .try_clone()
+                .map_err(|_| "linked worktree .git pointer is unauthorized".into());
+        }
+        open_dir_nofollow(&dir, &remainder)
+            .map_err(|error| format!("linked worktree .git pointer is unauthorized: {error}"))
+    }
+
+    fn reject_writable_metadata_overlap(&self, metadata: &Path) -> Result<(), String> {
+        let pointer = self.root.join(".git");
+        let overlaps =
+            |left: &Path, right: &Path| left.starts_with(right) || right.starts_with(left);
+        // A canonical self-grant remains safe: file tools reject protected
+        // writes below and the final descriptor bind wins in bwrap. An alias
+        // source is different authority at another destination and could
+        // expose the same host metadata outside that final overlay.
+        if self.external.iter().any(|root| {
+            root.writable
+                && root.source != root.dest
+                && (overlaps(&root.source, metadata) || overlaps(&root.source, &pointer))
+        }) {
+            return Err("linked worktree metadata overlaps a writable external alias".into());
+        }
+        Ok(())
     }
 
     /// Open an authorized directory. A missing path returns `None`; an
@@ -485,6 +656,13 @@ impl Workspace {
         absolute: &Path,
         writable: bool,
     ) -> Result<Resolved<'a>, String> {
+        if writable
+            && self.linked_metadata.as_ref().is_some_and(|metadata| {
+                absolute == self.root.join(".git") || absolute.starts_with(&metadata.path)
+            })
+        {
+            return Err("linked worktree Git metadata is read-only".into());
+        }
         if absolute.components().any(|part| {
             !matches!(
                 part,
@@ -612,6 +790,53 @@ fn push_external_root(
         capability,
     });
     Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn open_dir_nofollow(base: &Dir, path: &Path) -> rustix::io::Result<Dir> {
+    use rustix::fs::{Mode, OFlags, ResolveFlags, openat2};
+    let fd = openat2(
+        base.as_fd(),
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+    )?;
+    Ok(Dir::from(fd))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn open_regular_file_nofollow(
+    base: &Dir,
+    path: &Path,
+) -> Result<Option<rustix::fd::OwnedFd>, String> {
+    use rustix::fs::{FileType, Mode, OFlags, ResolveFlags, fstat, openat2};
+    let fd = match openat2(
+        base.as_fd(),
+        path,
+        // O_NONBLOCK is required before fstat: a forged `.git` FIFO must
+        // never block delegate construction waiting for a writer.
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+    ) {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        Err(rustix::io::Errno::LOOP) => {
+            return Err("linked worktree .git pointer is unauthorized".into());
+        }
+        Err(error) => return Err(format!("cannot read linked worktree .git: {error}")),
+    };
+    if !FileType::from_raw_mode(
+        fstat(&fd)
+            .map_err(|error| format!("cannot read linked worktree .git: {error}"))?
+            .st_mode,
+    )
+    .is_file()
+    {
+        return Ok(None);
+    }
+    Ok(Some(fd))
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]

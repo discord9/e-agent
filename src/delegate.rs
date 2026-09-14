@@ -1089,6 +1089,8 @@ impl Tool for Delegate {
         let workspace = self
             .workspace
             .reroot(&workspace_path)
+            .map_err(|error| format!("invalid `workspace` path `{workspace_arg}`: {error}"))?
+            .derive_child_linked_metadata(&self.workspace)
             .map_err(|error| format!("invalid `workspace` path `{workspace_arg}`: {error}"))?;
 
         let admitted_id = resume_id_arg
