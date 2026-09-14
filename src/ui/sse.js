@@ -394,7 +394,22 @@ function handleSSEBlock(block, id, wsId, epoch) {
       }
       if (entries.length) retained.push({ entries, locations });
     }
-    renderHistory(bootstrap.entries, bootstrap.locations || []);
+    // Insert pre-head presentation controls at their explicit logical
+    // boundary while rendering the durable head. The active-stream bridge is
+    // applied afterward and never gets folded into completed history.
+    const preHead = new Map();
+    const postHead = [];
+    for (const item of bootstrap.replay || []) {
+      if (!item || !item.event) continue;
+      if (item.after_head) postHead.push(item);
+      else {
+        const at = Number.isInteger(item.head_boundary) ? item.head_boundary : 0;
+        const items = preHead.get(at) || [];
+        items.push(item);
+        preHead.set(at, items);
+      }
+    }
+    renderHistory(bootstrap.entries, bootstrap.locations || [], preHead);
     if (older.length) renderEntries(older, true, retained.flatMap((page) => page.locations));
     state.webHeadEntries = bootstrap.entries;
     state.webHeadLocations = bootstrap.locations || [];
@@ -404,6 +419,7 @@ function handleSSEBlock(block, id, wsId, epoch) {
     // for the true oldest page never hides the gap.
     const headCursor = bootstrap.next_before_seq !== undefined ? bootstrap.next_before_seq : null;
     state.webGapCursor = retained.length ? headCursor : null;
+    state.webGapAnchor = null;
     state.nextBeforeSeq = retained.length ? oldCursor : headCursor;
     state.olderDone = retained.length ? oldOlderDone : state.nextBeforeSeq === null;
     state.initSource = "history";
@@ -432,8 +448,7 @@ function handleSSEBlock(block, id, wsId, epoch) {
     state.queueExpanded = false;
     delete state.queues[wsId + ":" + id];
     renderQueueBar();
-    for (const item of bootstrap.replay || []) {
-      if (!item || !item.event) continue;
+    for (const item of postHead) {
       const ev = item.event;
       const TYPE = { prompt_queued:"PromptQueued", prompt_consumed:"PromptConsumed",
         user_prompt:"UserPrompt", assistant_text:"AssistantText", assistant_delta:"AssistantDelta",

@@ -581,6 +581,7 @@ async function loadHistory(id, wsId, epoch, timeoutMs) {
     state.webOlderPages = [];
     state.webHeadLocations = data.locations || [];
     state.webGapCursor = null;
+    state.webGapAnchor = null;
     state.nextBeforeSeq = (data.next_before_seq !== undefined ? data.next_before_seq : null);
     state.olderDone = (state.nextBeforeSeq === null);
     if (state.initSource !== "snapshot") {
@@ -666,16 +667,24 @@ async function loadOlder() {
       if (gap) {
         // Insert between retained old pages and the current head, rather
         // than prepending it ahead of the true oldest page.
+        // First gap page goes after retained oldest pages and before the
+        // refreshed head. Each later page goes before the earliest prior gap
+        // page, tracked explicitly rather than inferred from all old pages.
+        const gapKey = state.webGapAnchor && JSON.stringify(state.webGapAnchor);
         const headKeys = new Set((state.webHeadLocations || []).filter(Boolean).map(JSON.stringify));
         const boundary = [...els.messages.children]
-          .find((node) => headKeys.has(node.dataset.entryLocation));
+          .find((node) => (gapKey && node.dataset.entryLocation === gapKey)
+            || (!gapKey && headKeys.has(node.dataset.entryLocation)));
         const oldTop = els.messages.scrollTop;
         const anchor = [...els.messages.children]
           .find((node) => node.offsetTop >= oldTop && node.dataset.entryLocation);
         const anchorKey = anchor && anchor.dataset.entryLocation;
         const anchorOffset = anchor ? anchor.offsetTop - oldTop : 0;
         renderEntries(freshEntries, true, freshLocations, boundary);
+        // Each next gap page is older than the previous one, so it becomes
+        // the earliest gap boundary rather than being appended after it.
         state.webOlderPages.push({ entries: freshEntries, locations: freshLocations });
+        state.webGapAnchor = freshLocations.find(Boolean) || state.webGapAnchor;
         const replacement = anchorKey && [...els.messages.children]
           .find((node) => node.dataset.entryLocation === anchorKey);
         if (replacement) els.messages.scrollTop = replacement.offsetTop - anchorOffset;
@@ -883,6 +892,7 @@ function saveSessionState() {
     webHeadLocations: state.webHeadLocations,
     webHeadEntries: state.webHeadEntries,
     webGapCursor: state.webGapCursor,
+    webGapAnchor: state.webGapAnchor,
     // The answer draft is call-bound above; the ordinary composer draft stays separate.
     draft: state.waitingInput ? state.waitingInput.priorDraft : els.promptInput.value,
   };
@@ -942,6 +952,7 @@ function openSession(id, onReady, epoch, timeoutMs) {
     state.webHeadLocations = cached.webHeadLocations || [];
     state.webHeadEntries = cached.webHeadEntries || [];
     state.webGapCursor = cached.webGapCursor !== undefined ? cached.webGapCursor : null;
+    state.webGapAnchor = cached.webGapAnchor || null;
     state.acc = newAccumulator();
     els.messages.innerHTML = cached.html;
     reattachInFlight(state.acc);   // 重新绑定缓存里「进行中」的思考/助手/工具卡片，
@@ -964,6 +975,7 @@ function openSession(id, onReady, epoch, timeoutMs) {
     state.webHeadLocations = [];
     state.webHeadEntries = [];
     state.webGapCursor = null;
+    state.webGapAnchor = null;
     state.nextBeforeSeq = null;
     state.loadingOlder = false;
     state.olderDone = false;

@@ -232,6 +232,9 @@ pub struct WebReplayEvent {
     pub event: AgentEvent,
     pub after_head: bool,
     pub transient: bool,
+    /// Logical insertion point within the returned head entries. `None` is
+    /// reserved for the post-head active-stream bridge.
+    pub head_boundary: Option<usize>,
 }
 
 struct Shared {
@@ -780,7 +783,11 @@ fn respond_web_attach_locked(shared: &Shared, reply: oneshot::Sender<WebAttach>)
                     || (item.transient
                         && !matches!(
                             item.event,
-                            AgentEvent::PromptQueued(_) | AgentEvent::PromptConsumed
+                            AgentEvent::PromptQueued(_)
+                                | AgentEvent::PromptConsumed
+                                | AgentEvent::AssistantDelta(_)
+                                | AgentEvent::ReasoningDelta(_)
+                                | AgentEvent::Usage { .. }
                         )
                         && item.history_boundary >= head.history_start
                         && item.history_boundary <= head.history_end)
@@ -789,6 +796,8 @@ fn respond_web_attach_locked(shared: &Shared, reply: oneshot::Sender<WebAttach>)
                 event: item.event.clone(),
                 after_head: i >= head.log_start,
                 transient: item.transient,
+                head_boundary: (i < head.log_start)
+                    .then_some(item.history_boundary.saturating_sub(head.history_start)),
             })
             .collect(),
         status: shared.status.borrow().clone(),
@@ -1068,6 +1077,10 @@ impl SessionRunner {
             Ok(mut locations) => {
                 self.agent
                     .apply_entry_located(entry, locations.drain(..).next());
+                self.shared
+                    .lock()
+                    .unwrap()
+                    .set_history_boundary(self.agent.history().len());
             }
             Err(error) => {
                 tracing::warn!("e-agent: cannot persist session error: {error:#}");
@@ -1553,10 +1566,8 @@ impl SessionRunner {
     }
 
     fn prepare_web_attach(&self) {
-        let (entries, locations, next_before_seq) =
+        let (entries, locations, next_before_seq, history_start, history_end) =
             self.agent.web_head_page(200, self.store.is_jsonl());
-        let history_end = self.agent.history().len();
-        let history_start = history_end.saturating_sub(entries.len());
         let mut shared = self.shared.lock().unwrap();
         let log_start = shared.log.len();
         shared.web_head = Some(WebHead {
@@ -1802,7 +1813,9 @@ impl SessionRunner {
                 SessionEntry::Notice { .. } | SessionEntry::BackgroundCompletion { .. }
             );
             self.agent.apply_entry_located(entry, location);
-            self.shared.lock().unwrap().emit_durable(event);
+            let mut shared = self.shared.lock().unwrap();
+            shared.set_history_boundary(self.agent.history().len());
+            shared.emit_durable(event);
             if fresh_ingress {
                 // Arm only after append + owner acknowledgement + apply. A
                 // replayed historical row never passes through this path.
