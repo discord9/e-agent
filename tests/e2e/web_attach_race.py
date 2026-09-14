@@ -102,11 +102,15 @@ async def main():
     child_tail = {"entries": [assistant("CHILD INTERMEDIATE ONLY")], "next_before_seq": 5}
     child_older = {"entries": [assistant("CHILD OLDER HISTORY")], "next_before_seq": None}
     other_history = {"entries": [assistant("OTHER")], "next_before_seq": None}
-    # 0..199 is fully loaded with its true oldest cursor exhausted. The
-    # reconnect head jumps to 400..599, leaving a physical 200..399 interval.
+    # 0..199 is exhausted. Reconnect jumps to 800..999, requiring three
+    # descending gap pages; each later fetch must insert before its successor.
     gap_old = {"entries": [assistant("GAP-%03d" % i) for i in range(200)], "next_before_seq": None}
-    gap_middle = {"entries": [assistant("GAP-%03d" % i) for i in range(200, 400)], "next_before_seq": None}
-    gap_new = {"entries": [assistant("GAP-%03d" % i) for i in range(400, 600)], "next_before_seq": 400}
+    gap_new = {"entries": [assistant("GAP-%03d" % i) for i in range(800, 1000)], "next_before_seq": 800}
+    gap_pages = {
+        800: {"entries": [assistant("GAP-%03d" % i) for i in range(600, 800)], "next_before_seq": 600},
+        600: {"entries": [assistant("GAP-%03d" % i) for i in range(400, 600)], "next_before_seq": 400},
+        400: {"entries": [assistant("GAP-%03d" % i) for i in range(200, 400)], "next_before_seq": None},
+    }
     gap_event_reads = 0
 
     # Explicit request barriers, not sleeps: second parent history response is
@@ -150,7 +154,8 @@ async def main():
             elif "/" + OTHER + "/history" in base:
                 payload = other_history
             elif "/" + GAP + "/history" in base:
-                payload = gap_middle if "before_seq=400" in url else gap_old
+                payload = next((page for cursor, page in gap_pages.items()
+                                if "before_seq=%d" % cursor in url), gap_old)
             else:
                 payload = {"entries": [], "next_before_seq": None}
             await route.fulfill(status=200, content_type="application/json",
@@ -201,10 +206,10 @@ async def main():
                         {"event": {"type":"prompt_consumed", "data":None},
                          "after_head": False, "transient": True},
                         {"event": {"type":"display", "data": DISPLAY}, "after_head": False,
-                         "transient": True},
+                         "head_boundary": 2, "transient": True},
                         {"event": {"type":"usage", "data": {"context_input":42,
                          "context_window":100, "session":{"input_tokens":1,"output_tokens":2}}},
-                         "after_head": False, "transient": True},
+                         "after_head": True, "transient": True},
                     ]
                 elif "/" + GAP + "/events" in base:
                     gap_event_reads += 1
@@ -263,6 +268,14 @@ async def main():
               "count=%d" % text.count("IDENTICAL COMPLETE OUTPUT"))
         check("valid compaction history retained", "retained compaction" in text)
         check("real live Display retained", DISPLAY in text)
+        placement = await page.evaluate("""() => {
+          const nodes = [...els.messages.children];
+          return [nodes.findIndex((n) => n.textContent.includes('PERSISTED COMPLETE SEGMENT')),
+                  nodes.findIndex((n) => n.textContent.includes('LIVE DISPLAY RETAINED')),
+                  nodes.findIndex((n) => n.textContent.includes('IDENTICAL COMPLETE OUTPUT'))];
+        }""")
+        check("pre-head Display is interleaved at its history boundary",
+              placement[0] < placement[1] < placement[2], "indices=%r" % placement)
         check("real live Usage retained", "42/100 tok" in await page.locator("#usageInfo").text_content())
         check("consumed queue folds empty on bootstrap", await page.evaluate("state.queue.length === 0"))
         await page.wait_for_function("""() => {
@@ -304,27 +317,31 @@ async def main():
         check("loaded older reader anchor keeps its physical identity", anchor and anchor == anchor_after,
               "before=%r after=%r" % (anchor, anchor_after))
 
-        # Separate gap cursor: old 0..199 is already exhausted, then the
-        # Web head jumps to 400..599. The 200..399 interval must be fetched
-        # without reopening either retained page or losing its reader anchor.
+        # Separate gap cursor: old 0..199 is exhausted, then the Web head
+        # jumps to 800..999. Fetch 600, 400, and 200 pages in descending
+        # backend order; DOM remains chronological 0..999 after each insert.
         await open_session(GAP)
         old_anchor = await page.locator(".msg-assistant", has_text="GAP-000").evaluate(
             "node => node.dataset.entryLocation")
         await page.evaluate("els.messages.scrollTop = 0; restartTransport()")
-        await page.wait_for_function("() => state.webGapCursor === 400 && state.nextBeforeSeq === null")
+        await page.wait_for_function("() => state.webGapCursor === 800 && state.nextBeforeSeq === null")
         check("disjoint gap retains exhausted oldest cursor",
-              await page.evaluate("state.webGapCursor === 400 && state.nextBeforeSeq === null"))
-        await page.evaluate("loadOlder()")
-        await page.wait_for_function("() => els.messages.textContent.includes('GAP-200') && state.webGapCursor === null")
+              await page.evaluate("state.webGapCursor === 800 && state.nextBeforeSeq === null"))
+        for cursor, text in [(800, "GAP-600"), (600, "GAP-400"), (400, "GAP-200")]:
+            await page.evaluate("loadOlder()")
+            await page.wait_for_function("text => els.messages.textContent.includes(text)", arg=text)
+        await page.wait_for_function("() => state.webGapCursor === null")
         gap = await page.evaluate(r"""() => {
           const rows = [...document.querySelectorAll('.msg-assistant')]
             .filter((node) => node.textContent.includes("GAP-"));
+          const values = rows.map((node) => Number(/GAP-(\d{3})/.exec(node.textContent)[1]));
           return { count: rows.length, keys: new Set(rows.map((node) => node.dataset.entryLocation)).size,
+                   ordered: values.every((value, i) => value === i),
                    old: rows.find((node) => node.textContent.includes('GAP-000'))?.dataset.entryLocation };
         }""")
-        check("disjoint gap loads all 600 existing physical rows once",
-              gap["count"] == 600 and gap["keys"] == 600,
-              "count=%d keys=%d" % (gap["count"], gap["keys"]))
+        check("three-page disjoint gap keeps all 1000 physical rows chronological and unique",
+              gap["count"] == 1000 and gap["keys"] == 1000 and gap["ordered"],
+              "count=%d keys=%d ordered=%s" % (gap["count"], gap["keys"], gap["ordered"]))
         check("disjoint gap keeps retained oldest anchor", old_anchor and gap["old"] == old_anchor,
               "before=%r after=%r" % (old_anchor, gap["old"]))
 

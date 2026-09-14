@@ -1369,7 +1369,16 @@ function renderMessage(m, acc, pendingCards) {
 
 /* 渲染一批 SessionEntry。prepend=true 时把新条目插入容器开头（保留既有内容），
    用于滚动分页加载更早历史；prepend=false 时整体替换（初始 history 渲染）。 */
-function renderEntries(entries, prepend, locations, before) {
+
+function applyBootstrapPresentation(item) {
+  const ev = item.event;
+  const TYPE = { notice:"Notice", display:"Display", error:"Error", background_completed:"BackgroundCompleted",
+    background_completion_notice:"BackgroundCompletionNotice", goal_updated:"GoalUpdated" };
+  const name = TYPE[ev.type];
+  if (name) applyLiveEvent(name, ev.data !== undefined ? ev.data : ev);
+}
+
+function renderEntries(entries, prepend, locations, before, presentationAt) {
   const acc = newAccumulator();
   const pendingCards = new Map();
   const list = Array.isArray(entries) ? entries : [];
@@ -1406,6 +1415,21 @@ function renderEntries(entries, prepend, locations, before) {
           if (!priorNodes.has(node) && node.nodeType === 1) node.dataset.entryLocation = key;
         }
       }
+      const presentation = presentationAt && presentationAt.get(i + 1);
+      if (presentation) {
+        for (const item of presentation) applyBootstrapPresentation(item);
+      }
+    }
+    const leading = presentationAt && presentationAt.get(0);
+    if (leading) {
+      // There is no prior entry for boundary zero; render it before the
+      // completed head by moving newly appended nodes to the front.
+      const marker = document.createComment("bootstrap-leading-presentation");
+      els.messages.appendChild(marker);
+      for (const item of leading) applyBootstrapPresentation(item);
+      let node = marker.nextSibling;
+      while (node) { const next = node.nextSibling; els.messages.insertBefore(node, els.messages.firstChild); node = next; }
+      marker.remove();
     }
   } finally {
     suppressScroll = false;
@@ -1497,8 +1521,8 @@ function pruneMessages() {
   }
 }
 
-function renderHistory(entries, locations) {
-  renderEntries(entries, false, locations);
+function renderHistory(entries, locations, presentationAt) {
+  renderEntries(entries, false, locations, undefined, presentationAt);
   scrollBottom(true);
 }
 

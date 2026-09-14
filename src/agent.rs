@@ -1312,7 +1312,13 @@ impl Agent {
         &self,
         limit: usize,
         jsonl: bool,
-    ) -> (Vec<SessionEntry>, Vec<Option<EntryLocation>>, Option<i64>) {
+    ) -> (
+        Vec<SessionEntry>,
+        Vec<Option<EntryLocation>>,
+        Option<i64>,
+        usize,
+        usize,
+    ) {
         let segment_start = if jsonl {
             0
         } else {
@@ -1321,31 +1327,33 @@ impl Agent {
                 .rposition(|entry| matches!(entry, SessionEntry::Compaction { .. }))
                 .unwrap_or(0)
         };
-        let start = self.history.len().saturating_sub(limit).max(segment_start);
-        let cursor = if start > 0 {
-            self.entry_locations
-                .get(start)
-                .and_then(|location| location.as_ref())
-                .map(|location| match &location.key {
-                    crate::session_store::LocatedKey::Jsonl { ordinal } => *ordinal,
-                    crate::session_store::LocatedKey::Sqlite { seq, .. }
-                    | crate::session_store::LocatedKey::Greptime { seq, .. } => *seq,
-                })
-        } else {
-            None
-        };
-        // An Error applied only after a failed append has no physical entry.
-        // It remains Agent history for control flow, but cannot be owned by
-        // the physical web head; its presentation event is replay-owned.
-        let rows: (Vec<SessionEntry>, Vec<Option<EntryLocation>>) = self.history[start..]
+        let history_start = self.history.len().saturating_sub(limit).max(segment_start);
+        let history_end = self.history.len();
+        // The pagination boundary is the first physical row in the logical
+        // head interval. An unlocated fallback Error must not move it.
+        let cursor = self.entry_locations[history_start..history_end]
+            .iter()
+            .find_map(|location| location.as_ref())
+            .map(|location| match &location.key {
+                crate::session_store::LocatedKey::Jsonl { ordinal } => *ordinal,
+                crate::session_store::LocatedKey::Sqlite { seq, .. }
+                | crate::session_store::LocatedKey::Greptime { seq, .. } => *seq,
+            })
+            .filter(|_| history_start > 0);
+        let rows: (Vec<SessionEntry>, Vec<Option<EntryLocation>>) = self.history
+            [history_start..history_end]
             .iter()
             .cloned()
-            .zip(self.entry_locations[start..].iter().cloned())
+            .zip(
+                self.entry_locations[history_start..history_end]
+                    .iter()
+                    .cloned(),
+            )
             .filter(|(entry, location)| {
                 !matches!(entry, SessionEntry::Error { .. }) || location.is_some()
             })
             .unzip();
-        (rows.0, rows.1, cursor)
+        (rows.0, rows.1, cursor, history_start, history_end)
     }
 
     /// Replace the whole history (session resume). To ADD one entry to an

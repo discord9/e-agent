@@ -504,7 +504,7 @@ async fn web_attach_bridges_active_stream_prefix_once() {
             entered: entered.clone(),
             release: release.clone(),
         }),
-        Vec::new(),
+        vec![Box::new(KeepAliveTool { sender: None })],
     );
     let (runner, handle) = SessionRunner::new(
         agent,
@@ -576,6 +576,16 @@ async fn web_attach_bridges_active_stream_prefix_once() {
     assert_eq!(assistant_text, 0);
     assert_eq!(streamed, "content-suffix");
     assert_eq!(reasoning, "reason-suffix");
+    // A later attach owns the completed assistant entry, not the old stream
+    // deltas or a stale transient usage projection.
+    let completed = handle.web_attach().await.expect("completed attach");
+    assert!(completed.entries.iter().any(|entry| matches!(entry,
+        SessionEntry::Message { message: Message::Assistant(AssistantMessage { content: Some(text), .. }) }
+            if text == "content-prefixcontent-suffix")));
+    assert!(!completed.replay.iter().any(|item| matches!(
+        item.event,
+        AgentEvent::AssistantDelta(_) | AgentEvent::ReasoningDelta(_) | AgentEvent::Usage { .. }
+    )));
     drop(task);
 }
 
@@ -2076,6 +2086,42 @@ async fn finish_when_idle_failed_turn_persists_exactly_one_error() {
         .collect();
     assert_eq!(errors.len(), 1, "exactly one Error entry: {loaded:?}");
     assert!(matches!(errors[0], SessionEntry::Error { text } if text.contains("terminal boom")));
+}
+
+#[tokio::test]
+async fn web_head_keeps_logical_boundary_when_unlocated_error_is_in_tail() {
+    let mut agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: VecDeque::new(),
+        }),
+        Vec::new(),
+    );
+    for i in 0..201 {
+        agent.apply_entry(
+            Message::User {
+                content: format!("u{i}"),
+                images: vec![],
+            }
+            .into(),
+        );
+    }
+    // This Error has no physical location but remains a logical tail entry.
+    agent.apply_entry(SessionEntry::Error {
+        text: "fallback".into(),
+    });
+    let (entries, locations, cursor, start, end) = agent.web_head_page(200, true);
+    assert_eq!((start, end), (2, 202));
+    assert_eq!(entries.len(), 199);
+    assert_eq!(locations.len(), 199);
+    assert!(
+        cursor.is_none(),
+        "unlocated logical boundary cannot invent a cursor"
+    );
+    assert!(
+        entries
+            .iter()
+            .all(|entry| !matches!(entry, SessionEntry::Error { .. }))
+    );
 }
 
 #[tokio::test]
