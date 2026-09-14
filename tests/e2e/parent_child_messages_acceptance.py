@@ -22,8 +22,10 @@ OLD = (HERE / ".e-agent/message-acceptance/e-agent-old-bca5941").resolve()
 ARTIFACTS = HERE / ".e-agent/message-acceptance/runs"
 ARTIFACTS.mkdir(parents=True, exist_ok=True)
 PARENT = "acceptance-parent"
+RESUME_PARENT = "resume-parent"
 P2C = "P2C-BEGIN\nFull parent message: café 中文 \"quoted\".\nP2C-END"
 C2P = "C2P-BEGIN\nFull child message: café 中文 \"quoted\".\nC2P-END"
+C2NEW = "C2NEW-BEGIN\nResumed child reply: café 中文 \"new parent\".\nC2NEW-END"
 
 
 def port():
@@ -96,6 +98,19 @@ class Mock(BaseHTTPRequestHandler):
                 response = {"content": "OLD_APPEND_RECORDED"}
             elif latest == "NEW_APPEND_ACCEPTANCE":
                 response = {"content": "NEW_APPEND_RECORDED"}
+            elif latest == "PROMPTLESS_ACTIVATION":
+                response = {"content": "PROMPTLESS_ACTIVATED"}
+            elif role == "parent" and latest == "START_RESUME_PARENT":
+                response = delta_tool("delegate", {"workspace": str(WORK), "label": "resume-child",
+                    "resume": child_id, "task": "RESUME_CHILD_TASK: send the requested reply to your current parent."}, "resume-delegate-1")
+            elif role == "parent" and notice(request, child_id, C2NEW):
+                response = {"content": "NEW_PARENT_REACTED_TO_RESUMED_CHILD"}
+            elif role == "parent" and any(m.get("tool_call_id") == "resume-delegate-1" for m in request.get("messages", [])):
+                response = {"content": "RESUME_PARENT_READY"}
+            elif role == "child" and latest == "RESUME_CHILD_TASK: send the requested reply to your current parent.":
+                response = delta_tool("send_message", {"target": "parent", "message": C2NEW}, "child-send-new-parent")
+            elif role == "child" and any(m.get("tool_call_id") == "child-send-new-parent" and m.get("content") == "message queued" for m in request.get("messages", [])):
+                response = {"content": "RESUMED_CHILD_REPLY"}
             elif role == "parent" and call == 1:
                 send = next(x["function"] for x in tools if x["function"]["name"] == "send_message")
                 assert set(send["parameters"]["required"]) == {"target", "message"}
@@ -307,8 +322,60 @@ try:
     final_parent = until(new_appended, "new append")
     assert final_parent[:len(old_parent_after)] == old_parent_after, "new append did not preserve new-old records/order"
     dump("parent-history-final.json", final_parent)
-    result.update({"verdict": "pass", "established": ["real --serve API/factory/delegate", "busy child queued bidirectional full multiline Unicode messages", "exact message queued receipts", "attributed Notice provider context and API/JSONL persistence", "new→old→new passive replay and append preserve API record order"], "uncovered": ["unknown/finished/sibling target rejection", "resumed child current-parent endpoint", "/btw", "SSE event classification", "SQLite/Greptime/browser"]})
-    print("PASS: parent/child messaging and new-old-new JSONL acceptance", flush=True)
+    stop(log)
+
+    # Fourth product launch: history-only reads must exactly retain both original
+    # transcripts.  A promptless POST /sessions is the actual runner lifecycle
+    # boundary (it installs a live WaitForInput runner); its historical Notice
+    # must not create a provider request before an explicit activation prompt.
+    log = start(NEW, "new-fourth-history-resume")
+    until(lambda: api("GET", f"/api/sessions/{PARENT}/history") is not None, "fourth API history")
+    fourth_parent = history(PARENT)
+    fourth_child = history(child_id)
+    assert fourth_parent == final_parent, "fourth launch changed final parent records/order"
+    assert fourth_child == child_history, "fourth launch changed original child records/order"
+    dump("parent-history-fourth-before-resume.json", fourth_parent)
+    dump("child-history-fourth-before-resume.json", fourth_child)
+    requests_before_resume = len(requests)
+    resumed = api("POST", "/api/sessions", {"id": PARENT}, 201)
+    assert resumed["status"] == "Idle" and resumed["active"] is True, "promptless resume did not establish live Idle runner"
+    time.sleep(.5)
+    assert len(requests) == requests_before_resume, "historical Notice reacted during promptless live resume"
+    assert history(PARENT) == final_parent, "promptless resume appended records"
+    api("POST", f"/api/sessions/{PARENT}/prompt", {"prompt": "PROMPTLESS_ACTIVATION"}, 202)
+    def promptless_activated():
+        h = history(PARENT)
+        return h if "PROMPTLESS_ACTIVATED" in json.dumps(h) else None
+    promptless_parent = until(promptless_activated, "promptless resume activation")
+    assert promptless_parent[:len(final_parent)] == final_parent, "activation failed to preserve final parent order"
+    dump("parent-history-promptless-activated.json", promptless_parent)
+
+    # Resume the finished child through a fresh real parent delegate.  The
+    # child's `parent` endpoint must point at this new parent, not the old one.
+    api("POST", "/api/sessions", {"id": RESUME_PARENT, "initial_prompt": "START_RESUME_PARENT"}, 201)
+    def resumed_delivery():
+        h = history(RESUME_PARENT)
+        return h if "NEW_PARENT_REACTED_TO_RESUMED_CHILD" in json.dumps(h) else None
+    resume_parent_history = until(resumed_delivery, "resumed child delivery to new parent")
+    resumed_child_history = history(child_id)
+    assert sum(e.get("type") == "notice" and e.get("text") == f"[agent message from {child_id}]\n{C2NEW}" for e in resume_parent_history) == 1, "resumed child did not reach new parent as one complete Notice"
+    old_parent_after_delivery = history(PARENT)
+    dump("old-parent-history-after-resumed-delivery.json", old_parent_after_delivery)
+    assert not any(e.get("type") == "notice" and C2NEW in e.get("text", "") for e in old_parent_after_delivery), "resumed child incorrectly reached old parent"
+    resumed_calls = [c for e in resumed_child_history for c in e.get("message", {}).get("Assistant", {}).get("tool_calls", []) if c.get("id") == "child-send-new-parent"]
+    assert len(resumed_calls) == 1 and json.loads(resumed_calls[0]["arguments"]) == {"target": "parent", "message": C2NEW}, "resumed child did not use current parent endpoint"
+    dump("resume-parent-history.json", resume_parent_history)
+    dump("child-history-resumed.json", resumed_child_history)
+    stop(log)
+
+    # A final restart proves the child append is durable and API-readable.
+    log = start(NEW, "new-fifth-child-durability")
+    until(lambda: api("GET", f"/api/sessions/{child_id}/history") is not None, "resumed child final API history")
+    durable_child = history(child_id)
+    assert durable_child == resumed_child_history, "restart changed resumed child records/order"
+    dump("child-history-final-durable.json", durable_child)
+    result.update({"verdict": "pass", "established": ["real --serve API/factory/delegate", "busy child queued bidirectional full multiline Unicode messages", "exact message queued receipts", "attributed Notice provider context and API/JSONL persistence", "new→old→new passive replay and append preserve API record order", "fourth-launch exact parent/child API replay and promptless live resume has no Notice-only reaction before activation", "resumed finished child uses current new-parent endpoint and its appended history survives restart"], "uncovered": ["unknown/finished/sibling target rejection", "/btw", "SSE event classification", "SQLite/Greptime/browser"]})
+    print("PASS: parent/child messaging, compatibility, promptless resume, and resumed-child routing", flush=True)
 except Exception as exc:
     result["error"] = repr(exc)
     result["traceback"] = traceback.format_exc()
