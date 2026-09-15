@@ -91,7 +91,6 @@ const state = {
     draggingPin: false,      // 置顶拖拽进行中：轮询期间跳过树重绘，防被 capture 的行节点被重建打断（同 renameActive）
   },
   tasks: {                   // 运行中任务（composer 折叠条/面板 + 消息列表输出块）
-    seq: 0,                  // 统一轮询竞态序号：只应用最新一次响应
     timer: null,             // 统一轮询定时器（2s 常驻；替代原徽标/面板双轮询）
     list: [],                // 多 workspace 聚合的最近一次 /api/tasks 全量结果
                              //（每任务带 _ws 标记；面板按激活 workspace 过滤，
@@ -557,6 +556,10 @@ function removeWorkspace(ws) {
   state.workspaces.splice(idx, 1);
   delete state.workspaceLists[ws.id];    // 清理聚合缓存：被删服务器不再显示
   delete state.workspaceErrors[ws.id];
+  delete state.tasks.byWorkspace[ws.id];
+  delete state.tasks.finishedByWorkspace[ws.id];
+  state.tasks.list = (state.tasks.list || []).filter((t) => t._ws !== ws.id);
+  state.tasks.finished = (state.tasks.finished || []).filter((t) => t._ws !== ws.id);
   removePinOrder(ws.id);                 // 清理该服务器所有置顶显示顺序
   saveWorkspaces();
   if (wasActive) {

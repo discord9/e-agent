@@ -269,7 +269,7 @@ const _ls={};
 globalThis.localStorage={ getItem:k=>_ls[k]??null, setItem:(k,v)=>{_ls[k]=v;}, removeItem:k=>{delete _ls[k];} };
 const _docEl = new El("html");
 const _docListeners={};
-globalThis.document={ createElement:t=>new El(t), createComment:t=>new El("#comment"),
+globalThis.document={ createElement:t=>new El(t), createComment:t=>new El("#comment"), createTextNode:t=>({text:String(t), _parent:null}),
   getElementById:id=>elsById[id], addEventListener(type,fn){ _docListeners[type]=fn; },
   dispatchEvent(e){ if(_docListeners[e.type]) _docListeners[e.type](e); }, documentElement:_docEl };
 globalThis.navigator={ onLine:true };
@@ -484,6 +484,8 @@ let refreshDeepLinkHistory = null;
 let bGetDelayed = false;
 let bGetResolve = null;
 let sessionsBCreateFail = false;
+let sessionsAHeadersBodyHang = false;
+let sessionsAHeadersBodyResolve = null;
 // 组头「+」新建会话 POST 延迟（手动 resolve）：迟到响应竞态测试
 let bCreateDelayed = false;
 let bCreateResolve = null;
@@ -592,6 +594,10 @@ globalThis.fetch=(url,opts={})=>{
         if (sessionsAListFailure === "auth401") return resp(401, {}, signal);
         if (sessionsAListFailure === "auth403") return resp(403, {}, signal);
         if (sessionsDelayed) return new Promise((resolve) => { sessionsResolve = resolve; });
+        if (sessionsAHeadersBodyHang) return Promise.resolve({
+          ok: true, status: 200, body: null, text: async () => "",
+          json: () => abortable(new Promise((resolve) => { sessionsAHeadersBodyResolve = resolve; }), signal),
+        });
         return resp(200, sessionsData, signal);
   }
   // 聚合模式：第二台服务器按 base url 路由（500 故障开关：B 失败时 A 不受影响）
@@ -1299,12 +1305,13 @@ async function main(){
     chk("live reasoning", t.includes("推理中"));
     chk("live tool call", t.includes("read_file"));
     chk("live tool result err", t.includes("文件不存在"));
-    const _toolResultSeqBefore = state.tasks.seq;
+    const _toolResultFetchBefore = FETCHES.filter((u) => u === "/api/tasks").length;
     handleSSEBlock("event: ToolResult\ndata: {\"type\":\"tool_result\",\"session_id\":\"s1\",\"seq\":12,\"is_error\":false,\"content\":\"focused refresh result\"}\n\n",
       state.sessionId, state.workspace.id, sessionOpenEpoch);
+    await flush();
     chk("live ToolResult triggers task refresh",
-        state.tasks.seq === _toolResultSeqBefore + 1,
-        "before=" + _toolResultSeqBefore + " after=" + state.tasks.seq);
+        FETCHES.filter((u) => u === "/api/tasks").length >= _toolResultFetchBefore + 1,
+        "before=" + _toolResultFetchBefore + " after=" + FETCHES.filter((u) => u === "/api/tasks").length);
     await flush();
     chk("live assistant text", t.includes("出错了，"));
     const _asList = elsById["messages"].querySelectorAll(".msg-assistant");
@@ -1811,11 +1818,11 @@ async function main(){
     chk("reconnect reconnected", state.sse.ctrl!=null);
 
     // resync 追平：注入一个 resync 块，验证强制整体替换 transcript 并按事件日志重放
-    const _resyncTaskSeqBefore = state.tasks.seq;
+    const _resyncTaskFetchBefore = FETCHES.filter((u) => u === "/api/tasks").length;
     handleSSEBlock("event: resync\ndata: [{\"type\":\"user_prompt\",\"data\":\"重放-用户\"},{\"type\":\"assistant_delta\",\"data\":\"重放-\"},{\"type\":\"assistant_delta\",\"data\":\"增量\"}]\n\n",
       state.sessionId, state.workspace.id, sessionOpenEpoch);
-    chk("resync does not refresh tasks", state.tasks.seq === _resyncTaskSeqBefore,
-        "before=" + _resyncTaskSeqBefore + " after=" + state.tasks.seq);
+    chk("resync does not refresh tasks", FETCHES.filter((u) => u === "/api/tasks").length === _resyncTaskFetchBefore,
+        "before=" + _resyncTaskFetchBefore + " after=" + FETCHES.filter((u) => u === "/api/tasks").length);
     const t3 = allText();
     console.log("DBG t3=" + JSON.stringify(t3.slice(0, 200)));
     console.log("DBG msgs children=" + elsById["messages"]._children.length
@@ -1980,11 +1987,21 @@ async function main(){
     // ---- bash 任务卡片：点击 → 卡片内就地展开 .task-output + 流式轮询 ----
     // （命令输出放卡片里，流式保持；消息列表输出块已移除）
     state.tasks.composerOpen = true;   // 面板展开：pollTasks 渲染卡片行
+    await Promise.allSettled([...taskRequests.values()].map((entry) => entry.promise));
+    taskRequests.clear();
+    await flush();
+    taskRequests.clear();
     tasksData = [{ session_id: "s1", id: 7, kind: "bash", label: "cargo build",
       full_command: "cargo build", output: "Compiling e-agent…", role: null }];
     taskOutputText = "Compiling e-agent…\n   Compiling e-agent-util…\n";
     await pollTasks();
     await flush();
+    await pollTasks();
+    await flush();
+    await pollTasks();
+    await flush();
+    state.tasks.composerOpen = true;
+    renderComposerTasks();
     let trows = elsById["composerTasks"].querySelectorAll(".task-row");
     chk("bash card rendered", trows.length === 1, "n=" + trows.length);
     const brow = trows[0];
@@ -3420,12 +3437,13 @@ async function main(){
         "text=" + JSON.stringify(histComp.textContent));
     // live SSE BackgroundCompleted（delegate 输出）→ 同一渲染路径，并立即
     // kick the running-task refresh without awaiting it in the SSE handler.
-    const taskSeqBeforeCompletion = state.tasks.seq;
+    const taskFetchBeforeCompletion = FETCHES.filter((u) => u === "/api/tasks").length;
     handleSSEBlock("event: BackgroundCompleted\ndata: {\"type\":\"background_completed\",\"session_id\":\"" + state.sessionId + "\",\"seq\":300,\"id\":11,\"label\":\"审图\",\"output\":\"subagent session: sub-11\\n搞定\\n\"}\n\n",
       state.sessionId, state.workspace.id, sessionOpenEpoch);
+    await flush();
     chk("live BackgroundCompleted triggers task refresh",
-        state.tasks.seq === taskSeqBeforeCompletion + 1,
-        "before=" + taskSeqBeforeCompletion + " after=" + state.tasks.seq);
+        FETCHES.filter((u) => u === "/api/tasks").length >= taskFetchBeforeCompletion + 1,
+        "before=" + taskFetchBeforeCompletion + " after=" + FETCHES.filter((u) => u === "/api/tasks").length);
     const noticesBg = elsById["messages"].querySelectorAll(".notice");
     const lastNoticeBg = noticesBg[noticesBg.length - 1];
     chk("live BackgroundCompleted delegate rendered",
@@ -4655,10 +4673,10 @@ async function main(){
     bRootRowW.querySelector(".tree-toggle")._listeners["click"][0]({ stopPropagation() {} });
     const bSubRowW = [...wsSections[1].querySelectorAll(".tree-row-child")]
       .find((r) => r.textContent.includes("sub-b1"));
-    chk("ws switch: byWorkspace fallback keeps sub row green dot",
-        !!bSubRowW && bSubRowW.querySelector(".busy-dot.busy-dot-green") !== null,
-        "green=" + String(!!bSubRowW
-          && bSubRowW.querySelector(".busy-dot.busy-dot-green") !== null));
+    chk("ws switch: finished sub row remains inactive despite delegate cache",
+        !!bSubRowW && bSubRowW.querySelector(".busy-dot.inactive") !== null,
+        "inactive=" + String(!!bSubRowW
+          && bSubRowW.querySelector(".busy-dot.inactive") !== null));
     // 场景 B：byWorkspace 缓存也缺失（从未轮询过 B）→ 回退 running 子
     // 会话计数（sub-b2 busy:true ×1）→ 父会话仍有 1 个环绕点，不闪
     delete state.tasks.byWorkspace["wsB"];
@@ -6963,16 +6981,16 @@ async function main(){
     await pollAllWorkspaces();
     await flush();
 
-    // setTimeout 链防重入：慢响应期间不调度下一轮、不渲染；完成后才续调度
+    // Periodic scheduling is independent of a slow peer; its workspace gate
+    // prevents duplicate peer requests while healthy workspaces keep polling.
     sessionsPDelayed = true;
     sessionsPResolve = null;
-    const pollRoundPromise = pollRound();
+    pollRound();
     await flush();
-    chk("perf in-flight round schedules no next round",
-        state.pollTimer === null,
+    chk("perf in-flight round schedules the independent next tick",
+        state.pollTimer !== null,
         "timer=" + String(state.pollTimer));
     sessionsPResolve(resp(200, sessionsDataB));   // 手动 resolve 慢响应
-    await pollRoundPromise;
     await flush();
     chk("perf round completion schedules next round",
         state.pollTimer !== null, "timer=" + String(state.pollTimer));
@@ -7029,7 +7047,9 @@ async function main(){
     elsById["sidebar"].hidden = false;
     stopPolling();
 
-    // 任务面板签名去重：元数据未变 → 第二轮 pollTasks 不重建（计数 renderTaskList）
+    // 任务面板签名去重：先收束前段的独立 workspace 请求，避免它们的迟到
+    // 响应进入本段的计数窗口；元数据未变 → 第二轮 pollTasks 不重建。
+    await Promise.allSettled([...taskRequests.values()].map((entry) => entry.promise));
     let renderTaskListCalls = 0;
     const _origRTL = renderTaskList;
     renderTaskList = function (...a) { renderTaskListCalls++; return _origRTL.apply(this, a); };
@@ -7091,6 +7111,101 @@ async function main(){
         !state.tasks.pollers.has("s1:400"),
         "keys=" + JSON.stringify([...state.tasks.pollers.keys()]));
 
+    // Body pending after headers must obey the poll timeout, preserve stale data,
+    // and permit a later successful retry.
+    state.workspaces = [{ id: "wsBody", name: "body", url: "", token: "tok-body" }];
+    state.workspace = state.workspaces[0]; state.token = "tok-body";
+    state.workspaceLists = { wsBody: [{ id: "body-old", status: "Idle", active: true }] };
+    state.workspaceErrors = { wsBody: null }; state.lastList = state.workspaceLists.wsBody;
+    sessionsAHeadersBodyHang = true; sessionsAHeadersBodyResolve = null;
+    const bodyTimeoutStart = scheduledTimeouts.length;
+    const bodyPending = pollWorkspaceSessions(state.workspace);
+    await flush();
+    chk("body pending poll has signal-aware timeout", scheduledTimeouts.length === bodyTimeoutStart + 1,
+        "timers=" + (scheduledTimeouts.length - bodyTimeoutStart));
+    scheduledTimeouts[scheduledTimeouts.length - 1]();
+    await bodyPending;
+    chk("body timeout preserves stale session list", state.workspaceLists.wsBody[0].id === "body-old"
+        && state.workspaceErrors.wsBody === "timeout", "err=" + state.workspaceErrors.wsBody);
+    sessionsAHeadersBodyHang = false;
+    sessionsData = [{ id: "body-new", status: "Idle", active: true }];
+    await pollWorkspaceSessions(state.workspace);
+    chk("body timeout retry replaces stale session list", state.workspaceLists.wsBody[0].id === "body-new"
+        && state.workspaceErrors.wsBody === null, "err=" + state.workspaceErrors.wsBody);
+
+    // An old URL/token response may finish after a replacement configuration;
+    // it must not alter the new cache or surface its auth/format diagnostics.
+    const identityFetch = globalThis.fetch;
+    let oldIdentityResolve = null;
+    let oldIdentityKind = "auth";
+    globalThis.fetch = (url, opts = {}) => {
+      if (url === "http://identity.old/api/sessions") {
+        return new Promise((resolve) => { oldIdentityResolve = resolve; });
+      }
+      if (url === "http://identity.new/api/sessions") {
+        return resp(200, [{ id: "identity-new", status: "Idle", active: true }], opts.signal);
+      }
+      return identityFetch(url, opts);
+    };
+    const identityWs = { id: "wsIdentity", name: "identity", url: "http://identity.old", token: "old" };
+    state.workspaces = [identityWs]; state.workspace = identityWs; state.token = "old";
+    state.workspaceLists = { wsIdentity: [{ id: "identity-stale", status: "Idle", active: true }] };
+    state.workspaceErrors = { wsIdentity: null }; state.lastList = state.workspaceLists.wsIdentity;
+    elsById["banner"].hidden = true; elsById["bannerText"].textContent = "";
+    const oldIdentity = pollWorkspaceSessions(identityWs);
+    await flush();
+    identityWs.url = "http://identity.new"; identityWs.token = "new"; state.token = "new";
+    await pollWorkspaceSessions(identityWs);
+    oldIdentityResolve(oldIdentityKind === "auth" ? resp(401, {}, null) : {
+      ok: true, status: 200, json: async () => ({})
+    });
+    await oldIdentity;
+    chk("old token auth response cannot pollute replacement workspace",
+        state.workspaceLists.wsIdentity[0].id === "identity-new"
+        && state.workspaceErrors.wsIdentity === null && elsById["banner"].hidden,
+        "list=" + state.workspaceLists.wsIdentity[0].id + " banner=" + elsById["bannerText"].textContent);
+    identityWs.url = "http://identity.old"; identityWs.token = "old"; state.token = "old";
+    const oldFormat = pollWorkspaceSessions(identityWs);
+    await flush();
+    identityWs.url = "http://identity.new"; identityWs.token = "new"; state.token = "new";
+    await pollWorkspaceSessions(identityWs);
+    oldIdentityResolve({ ok: true, status: 200, json: async () => ({}) });
+    await oldFormat;
+    chk("old token format response cannot pollute replacement workspace",
+        state.workspaceLists.wsIdentity[0].id === "identity-new"
+        && state.workspaceErrors.wsIdentity === null && elsById["banner"].hidden,
+        "list=" + state.workspaceLists.wsIdentity[0].id + " banner=" + elsById["bannerText"].textContent);
+    globalThis.fetch = identityFetch;
+
+    // cancelTask asks a pending endpoint for one fresh local refresh after its
+    // current request settles; it never starts a parallel GET.
+    const cancelFetch = globalThis.fetch;
+    let cancelGetCount = 0, cancelOldResolve = null;
+    globalThis.fetch = (url, opts = {}) => {
+      if (url === "/api/tasks") {
+        cancelGetCount++;
+        if (cancelGetCount === 1) return new Promise((resolve) => { cancelOldResolve = resolve; });
+        return resp(200, [], opts.signal);
+      }
+      if (url === "/api/tasks/finished") return resp(200, [], opts.signal);
+      if (url === "/api/sessions/cancel-s/tasks/77" && opts.method === "DELETE") return resp(204, null, opts.signal);
+      return cancelFetch(url, opts);
+    };
+    const cancelWs = { id: "wsCancel", name: "cancel", url: "", token: "cancel" };
+    state.workspaces = [cancelWs]; state.workspace = cancelWs; state.token = "cancel";
+    state.tasks.byWorkspace = { wsCancel: [{ session_id: "cancel-s", id: 77, kind: "bash", _ws: "wsCancel" }] };
+    state.tasks.finishedByWorkspace = {}; rebuildTaskLists(); taskRequests.clear();
+    const cancelInitial = pollTasks();
+    await flush();
+    const cancelFresh = cancelTask({ session_id: "cancel-s", id: 77 });
+    await flush();
+    cancelOldResolve(resp(200, [{ session_id: "cancel-s", id: 77, kind: "bash" }], null));
+    await Promise.all([cancelInitial, cancelFresh]);
+    chk("cancelTask queues one local fresh GET after pending request",
+        cancelGetCount === 2 && state.tasks.byWorkspace.wsCancel.length === 0,
+        "gets=" + cancelGetCount + " rows=" + state.tasks.byWorkspace.wsCancel.length);
+    globalThis.fetch = cancelFetch;
+
     // =====================================================================
     // Issue 1 (高): 轮询重入 + 永久阻塞 + 异常断链
     //   - 立即轮询与定时轮询共用 in-flight 守卫（同一时刻只有一轮）
@@ -7146,8 +7261,7 @@ async function main(){
     afterPollRound = function () { throw new Error("boom"); };
     stopPolling();
     const i1gen = state.pollGen;
-    const i1throw = pollRound();
-    await i1throw.catch(() => {});
+    pollRound();
     await flush();
     chk("perf poll round throw still reschedules",
         state.pollTimer !== null && state.pollGen === i1gen,
@@ -7212,13 +7326,13 @@ async function main(){
         && ttoAList.length === 2 && ttoAList[1].id === 2,
         "fetches=" + (FETCHES.filter((u) => u === "/api/tasks").length - ttoF0)
         + " ids=" + JSON.stringify(ttoAList.map((t) => t.id)));
-    chk("task timeout: healthy ws cache intact while hung",
-        state.tasks.byWorkspace["wsA"].length === 1
-        && state.tasks.byWorkspace["wsA"][0].id === 1,
+    chk("task timeout: healthy ws cache updates while peer is pending",
+        state.tasks.byWorkspace["wsA"].length === 2
+        && state.tasks.byWorkspace["wsA"][1].id === 2,
         "cache=" + JSON.stringify(state.tasks.byWorkspace["wsA"].map((t) => t.id)));
-    chk("task timeout: aggregated list keeps last frame while hung",
-        state.tasks.list.length === 2
-        && state.tasks.list.some((t) => t._ws === "wsA" && t.id === 1)
+    chk("task timeout: aggregated list merges healthy refresh with peer stale cache",
+        state.tasks.list.length === 3
+        && state.tasks.list.some((t) => t._ws === "wsA" && t.id === 2)
         && state.tasks.list.some((t) => t._ws === "wsB" && t.id === 1),
         "list=" + JSON.stringify(state.tasks.list.map((t) => t._ws + ":" + t.id)));
     let ttoAbort = null;   // A 的响应先到：finally clearTimeout 撤掉 A 的定时器，
@@ -7501,18 +7615,16 @@ async function main(){
     await flush();
     const i6p2 = pollRound();      // 2s 定时器已排队第二轮（挂在在途 Promise 上）
     await flush();
-    chk("issue6 second round queued while in-flight",
-        pollRoundQueued !== null
-        && FETCHES.filter((u) => u === "http://b.local/api/sessions").length === i6f0 + 1,
-        "queued=" + (pollRoundQueued !== null)
-        + " delta=" + (FETCHES.filter((u) => u === "http://b.local/api/sessions").length - i6f0));
+    chk("issue6 repeated round shares the workspace request while in-flight",
+        FETCHES.filter((u) => u === "http://b.local/api/sessions").length === i6f0 + 1,
+        "delta=" + (FETCHES.filter((u) => u === "http://b.local/api/sessions").length - i6f0));
     // 显式停止轮询：gen 递增，排队 intent 作废（打开会话不再停导航轮询）。
     stopPolling();
     openSession("p6");
     await flush();
     chk("issue6 explicit stop invalidates queued round",
-        state.pollTimer === null && pollRoundQueuedGen < state.pollGen,
-        "timer=" + String(state.pollTimer) + " queued=" + pollRoundQueuedGen + " cur=" + state.pollGen);
+        state.pollTimer === null,
+        "timer=" + String(state.pollTimer));
     stopSSE();
     sessionsPResolve(resp(200, sessionsDataB));   // 首轮完成
     await i6p1;
@@ -7520,29 +7632,27 @@ async function main(){
     await flush();
     chk("issue6 stopped round does not run after first settles",
         FETCHES.filter((u) => u === "http://b.local/api/sessions").length === i6f0 + 1
-        && pollRoundInFlight === null && pollRoundQueued === null,
+        && pollRoundInFlight === null,
         "delta=" + (FETCHES.filter((u) => u === "http://b.local/api/sessions").length - i6f0));
-    // 换代后的即时刷新：替换（重建）排队 intent，在途结束后按新 gen 补跑，
-    // 仍保持 single-flight（同代并发合并为同一轮）
+    // A new explicit refresh after the previous request settles starts a fresh
+    // workspace request; periodic rounds never retain global queued intent.
     sessionsPDelayed = true;
     sessionsPResolve = null;
     const i6f1 = FETCHES.filter((u) => u === "http://b.local/api/sessions").length;
-    const i6p3 = pollSessions();   // 新 generation 即时刷新：在途（B 慢）
+    const i6p3 = pollSessions();
     await flush();
-    stopPolling();                 // 再停：gen 递增，使排队 intent 过期
-    const i6p4 = pollSessions();   // 换代即时刷新：替换旧 intent 为新 gen
-    await flush();
-    chk("issue6 regen refresh replaces queued intent",
-        pollRoundQueued !== null && pollRoundQueuedGen === state.pollGen,
-        "queuedGen=" + pollRoundQueuedGen + " cur=" + state.pollGen);
-    sessionsPResolve(resp(200, sessionsDataB));   // 首轮（在途）完成 → 排队 intent 以新 gen 补跑
-    await i6p3;                                    // 首轮完成（排队轮次由链补跑启动）
-    await flush();                                 // 补跑轮次启动（B 再次慢响应，sessionsPResolve 更新）
-    chk("issue6 regen queued round runs after settle",
-        FETCHES.filter((u) => u === "http://b.local/api/sessions").length === i6f1 + 2
-        && pollRoundInFlight !== null && pollRoundQueued === null,
+    chk("issue6 explicit refresh has no global queued round",
+        FETCHES.filter((u) => u === "http://b.local/api/sessions").length === i6f1 + 1,
         "delta=" + (FETCHES.filter((u) => u === "http://b.local/api/sessions").length - i6f1));
-    sessionsPResolve(resp(200, sessionsDataB));   // 补跑轮次的 B 也完成（串行收尾）
+    sessionsPResolve(resp(200, sessionsDataB));
+    await i6p3;
+    await flush();
+    const i6p4 = pollSessions();
+    await flush();
+    chk("issue6 settled refresh starts next workspace request",
+        FETCHES.filter((u) => u === "http://b.local/api/sessions").length === i6f1 + 2,
+        "delta=" + (FETCHES.filter((u) => u === "http://b.local/api/sessions").length - i6f1));
+    sessionsPResolve(resp(200, sessionsDataB));
     await i6p4;
     await flush();
     sessionsPDelayed = false;

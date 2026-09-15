@@ -81,27 +81,56 @@ async function fetchWithTimeout(ws, path, opts = {}) {
   }
 }
 
+/* Poll endpoints must time out while consuming their body too: fetch() resolving
+   headers does not mean res.json() will resolve. Deep-link/history deliberately
+   keeps fetchWithTimeout's established response-only behavior. */
+async function fetchPollJson(ws, path, opts = {}) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), POLL_TIMEOUT_MS);
+  try {
+    const res = await apiFor(ws, path, Object.assign({}, opts, { signal: ctrl.signal }));
+    try {
+      return { res, json: res.ok ? await res.json() : null };
+    } catch (e) {
+      if (e && e.name === "AbortError") throw e;
+      return { res, json: null, formatError: true };
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function pollAllWorkspaces() {
   const wss = (state.workspaces || []).slice();
   await Promise.allSettled(wss.map((ws) => pollWorkspaceSessions(ws)));
-  // 整轮完成后统一渲染一次：各 workspace 响应只更新缓存（workspaceLists），
-  // 不再各自触发渲染——多 workspace 聚合下避免每响应全量重建树。
-  afterPollRound();
 }
+
+function workspaceRequestCurrent(ws, identity) {
+  return state.workspaces.includes(ws)
+    && ws.url === identity.url && workspaceToken(ws) === identity.token;
+}
+
+const workspaceSessionRequests = new Map();
 
 /* 聚合轮询整轮收尾：深链、字段校验、当前会话元信息与侧边栏同步。
    侧边栏是唯一导航，因此即使抽屉关闭也持续刷新数据缓存；打开时强制
    重绘即可得到最新树。 */
+let pollRenderQueued = false;
 function afterPollRound() {
-  maybeHandleDeepLink();
-  applyValidation(validateSessions(state.lastList || []));
-  if (state.sessionId) {
-    updateComposerMeta();               // model/role 可能随轮询更新（幂等）
-    updateCurrentSessionBusy();         // 当前会话 busy 可能随轮询变化
-    const cur = (state.lastList || []).find((s) => s.id === state.sessionId);
-    if (cur) els.backParentBtn.hidden = !cur.parent_session_id;
-  }
-  if (!els.sidebar.hidden) renderSidebarTree();
+  if (pollRenderQueued) return;
+  pollRenderQueued = true;
+  Promise.resolve().then(() => {
+    pollRenderQueued = false;
+    maybeHandleDeepLink();
+    applyValidation(validateSessions(state.lastList || []));
+    if (state.sessionId) {
+      updateComposerMeta();
+      updateCurrentSessionBusy();
+      const cur = (state.lastList || []).find((s) => s.id === state.sessionId);
+      if (cur) els.backParentBtn.hidden = !cur.parent_session_id;
+    }
+    if (!els.sidebar.hidden) renderSidebarTree();
+  });
 }
 
 /* 兼容别名：既有调用点（switchWorkspace/restartTransport/init）
@@ -120,49 +149,43 @@ function pollSessions() {
    激活 workspace 额外同步 state.lastList（既有单服务器路径的唯一数据源）；
    渲染/深链/校验 banner 由 pollAllWorkspaces 整轮完成后统一执行一次
    （afterPollRound）——各 workspace 响应不再各自全量重建树。 */
-async function pollWorkspaceSessions(ws) {
-  if (!workspaceToken(ws)) return;   // 全局 token 也未配置：跳过（不显示错误）
+function pollWorkspaceSessions(ws) {
+  if (!workspaceToken(ws)) return Promise.resolve();
+  const identity = { url: ws.url, token: workspaceToken(ws) };
+  const key = ws.id + "\u0000" + identity.url + "\u0000" + identity.token;
+  const active = workspaceSessionRequests.get(key);
+  if (active) return active;
+  let request;
+  request = pollWorkspaceSessionsNow(ws, identity).then(
+    (value) => {
+      if (workspaceSessionRequests.get(key) === request) workspaceSessionRequests.delete(key);
+      return value;
+    },
+    (err) => {
+      if (workspaceSessionRequests.get(key) === request) workspaceSessionRequests.delete(key);
+      throw err;
+    }
+  );
+  workspaceSessionRequests.set(key, request);
+  return request;
+}
+
+async function pollWorkspaceSessionsNow(ws, identity) {
   if (!state.workspaceListPending) state.workspaceListPending = {};
   state.workspaceListPending[ws.id] = true;
   let list = null;
   let err = null;
   try {
-    const res = await fetchWithTimeout(ws, "/api/sessions");
+    const response = await fetchPollJson(ws, "/api/sessions");
+    const res = response.res;
     if (res.status === 401 || res.status === 403) {
       err = "auth";
-      if (ws === state.workspace) setBanner("⚠ 认证失败：请检查 Token。");
     } else if (!res.ok) {
       err = "http" + res.status;
+    } else if (response.formatError || !Array.isArray(response.json)) {
+      err = "format";
     } else {
-      let parsed = null;
-      try {
-        parsed = await res.json();
-      } catch (e) {
-        // 旧 server 返回 HTML 错误页等非 JSON：不崩，提示后跳过本轮；
-        // 占住校验 banner 位（恢复后由 applyValidation 自动清除），
-        // 并重置签名，恢复后的问题批次会重新上报
-        err = "format";
-        if (ws === state.workspace) {
-          state.validateBannerUp = true;
-          state.lastValidateSig = null;
-          setBanner("⚠ 服务器返回异常格式（非 JSON，可能为旧版服务器）。", true);
-        }
-      }
-      if (!err) {
-        if (Array.isArray(parsed)) {
-          list = parsed;
-        } else {
-          // 合法 JSON 但不是数组（如 {}）：按格式错误处理——保留旧缓存
-          // （stale）+ 错误标记；只有激活 workspace 提示 banner（背景
-          // workspace 的格式错误只标记自己的分组，不弹全局 banner）。
-          err = "format";
-          if (ws === state.workspace) {
-            state.validateBannerUp = true;
-            state.lastValidateSig = null;
-            setBanner("⚠ 服务器返回异常格式（非数组 JSON）。", true);
-          }
-        }
-      }
+      list = response.json;
     }
   } catch (e) {
     // 超时（AbortError）和网络失败只在 workspace 侧边栏标记：保留旧列表
@@ -172,7 +195,13 @@ async function pollWorkspaceSessions(ws) {
   // 在途请求守卫：请求发出后 workspace 被删除（removeWorkspace）→ 直接丢弃，
   // 绝不写回已删 workspace 的缓存/错误标记，也不重绘（聚合视图已随删除重绘，
   // 写回会让被删服务器"复活"在侧边栏里；review 发现 2）。
-  if (!state.workspaces.includes(ws)) return;
+  if (!workspaceRequestCurrent(ws, identity)) return;
+  if (err === "auth" && ws === state.workspace) setBanner("⚠ 认证失败：请检查 Token。");
+  if (err === "format" && ws === state.workspace) {
+    state.validateBannerUp = true;
+    state.lastValidateSig = null;
+    setBanner("⚠ 服务器返回异常格式（非数组 JSON）。", true);
+  }
   if (list) {
     state.workspaceLists[ws.id] = list;
     state.workspaceErrors[ws.id] = null;
@@ -181,11 +210,8 @@ async function pollWorkspaceSessions(ws) {
     state.workspaceErrors[ws.id] = err;   // 保留旧列表（stale），标记错误
   }
   state.workspaceListPending[ws.id] = false;
-  if (ws === state.workspace) {
-    // 激活 workspace 的列表缓存 → lastList（既有单服务器路径的唯一数据源）；
-    // 渲染/深链/校验统一由 pollAllWorkspaces 整轮完成后执行（afterPollRound）
-    state.lastList = state.workspaceLists[ws.id];
-  }
+  if (ws === state.workspace) state.lastList = state.workspaceLists[ws.id];
+  afterPollRound();
 }
 /* URL 深链：?session=<id>。token 就绪后立即尝试（init / restartTransport /
    afterPollRound 三个入口共用，状态机防重复）：
@@ -439,7 +465,7 @@ async function loadHistory(id, wsId, epoch, timeoutMs) {
         return "pending";
       }
       if (state.deepLink.probing && state.deepLink.attemptEpoch === epoch
-          && state.workspaceErrors[wsId] !== null) {
+          && state.workspaceListPending && state.workspaceListPending[wsId]) {
         state.deepLink.probing = false;
         state.deepLink.attemptEpoch = -1;
         state.deepLink.pending = id;
@@ -1599,47 +1625,18 @@ function shouldPollSessions() {
   return state.sidebar.open && !els.sidebar.hidden && !document.hidden;
 }
 
-/* 单一 in-flight 守卫（promise 串行链）：同一时刻只有一轮轮询在途。
-   无在途轮询 → 立即启动一轮；有在途轮询 → 把「新鲜一轮」排队到其后
-   （调用方要的是当下数据，不能共享一个可能已过时的在途轮询），多个并发
-   请求合并为同一轮（同代排队复用）。排队 intent 携带 generation：在途
-   结束后启动前校验 gen 仍有效——stopPolling（gen 递增）后旧 intent 作废
-   被丢弃（不启动）；换代后的即时刷新（pollSessions）用新 gen 替换旧
-   intent（仍保持全局 single-flight，不并发叠加）。 */
-let pollRoundInFlight = null;   // 当前在途轮询的 Promise
-let pollRoundQueued = null;     // 已排队的「新鲜一轮」Promise（在途结束后立即跑）
-let pollRoundQueuedGen = -1;    // 排队 intent 的 generation（换代后替换而非复用）
-
+/* Requests are single-flight per workspace in pollWorkspaceSessions, not per
+   aggregate round: one closed/slow server must never starve healthy servers. */
+let pollRoundInFlight = null;
 function runPollRound() {
-  if (pollRoundInFlight) {
-    const gen = state.pollGen;
-    if (!pollRoundQueued || pollRoundQueuedGen !== gen) {
-      pollRoundQueuedGen = gen;
-      pollRoundQueued = pollRoundInFlight.then(
-        () => startPollRound(gen),
-        () => startPollRound(gen)
-      );
-    }
-    return pollRoundQueued;
-  }
-  return startPollRound(state.pollGen);
-}
-
-function startPollRound(gen) {
-  pollRoundQueued = null;
-  pollRoundQueuedGen = -1;
-  if (gen !== state.pollGen) return;   // 过期 intent（stopPolling/换代后）→ 丢弃
-  pollRoundInFlight = (async () => {
-    try {
-      await pollAllWorkspaces();
-    } catch (e) {
-      // 一轮内的渲染/校验异常（afterPollRound 抛错等）不外泄：轮询链继续，
-      // 不产生未处理 rejection（断链防护在 pollRound 的 finally 兜底）
-    } finally {
-      pollRoundInFlight = null;
-    }
-  })();
-  return pollRoundInFlight;
+  const round = pollAllWorkspaces();
+  pollRoundInFlight = round;
+  round.then(() => {
+    if (pollRoundInFlight === round) pollRoundInFlight = null;
+  }, () => {
+    if (pollRoundInFlight === round) pollRoundInFlight = null;
+  });
+  return round;
 }
 
 function startPolling() {
@@ -1652,17 +1649,15 @@ function stopPolling() {
   state.pollGen++;   // 使在途轮询的 finally 续调度失效（stop 后不再续）
   if (state.pollTimer) { clearTimeout(state.pollTimer); state.pollTimer = null; }
 }
-async function pollRound() {
+function pollRound() {
   const gen = state.pollGen;
   state.pollTimer = null;
-  try {
-    await runPollRound();
-  } finally {
-    // 无论成功/异常都续调度下一轮——防断链；期间 stopPolling（gen 变化）
-    // 或条件不满足（聊天视图关侧边栏）→ 不续调度
-    if (gen === state.pollGen && state.pollTimer === null && shouldPollSessions()) {
-      state.pollTimer = setTimeout(pollRound, POLL_INTERVAL_MS);
-    }
+  // The aggregate promise may include a hung peer. Schedule the next periodic
+  // tick independently: per-workspace gates share that peer's request while
+  // healthy workspaces make their next refresh on time.
+  void runPollRound();
+  if (gen === state.pollGen && state.pollTimer === null && shouldPollSessions()) {
+    state.pollTimer = setTimeout(pollRound, POLL_INTERVAL_MS);
   }
 }
 /* delegate 任务 → 对应 subagent 会话 id。

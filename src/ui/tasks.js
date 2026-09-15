@@ -26,23 +26,20 @@
    _ws 过滤），侧边栏环绕点消费全量列表。 */
 async function fetchTasks(ws) {
   if (!workspaceToken(ws)) return null;
+  const identity = { url: ws.url, token: workspaceToken(ws) };
   try {
-    // fetchWithTimeout（sessions.js）：10s 上限 + AbortController。裸 apiFor
-    // 无超时，任一 workspace 的 /api/tasks 永久 pending 会拖住 pollTasks 整轮
-    // Promise.all——其它健康 workspace 的响应也进不了缓存，面板「加载不出来」。
-    // 超时 → AbortError → 下方 catch 返回 null → 该 ws 保留旧缓存（stale），
-    // 下轮 2s 轮询自动恢复。
-    const res = await fetchWithTimeout(ws, "/api/tasks");
+    const response = await fetchPollJson(ws, "/api/tasks");
+    const res = response.res;
     if (res.status === 401 || res.status === 403) {
-      // 认证失败只对激活 workspace 弹 banner（背景 workspace 静默，不刷屏）
-      if (ws === state.workspace) setBanner("⚠ 认证失败：请检查 Token。");
+      if (taskRequestCurrent(ws, identity.url, identity.token) && ws === state.workspace) {
+        setBanner("⚠ 认证失败：请检查 Token。");
+      }
       return null;
     }
     if (!res.ok) throw new Error("HTTP " + res.status);
-    const list = await res.json();
-    return Array.isArray(list) ? list : [];
+    return Array.isArray(response.json) ? response.json : [];
   } catch (e) {
-    return null;   // 网络/404：静默，保持现状，不刷屏
+    return null;
   }
 }
 
@@ -53,11 +50,11 @@ async function fetchTasks(ws) {
 async function fetchFinishedTasks(ws) {
   if (!workspaceToken(ws)) return null;
   try {
-    const res = await fetchWithTimeout(ws, "/api/tasks/finished");
+    const response = await fetchPollJson(ws, "/api/tasks/finished");
+    const res = response.res;
     if (res.status === 401 || res.status === 403) return null;
     if (!res.ok) throw new Error("HTTP " + res.status);
-    const list = await res.json();
-    return Array.isArray(list) ? list : [];
+    return Array.isArray(response.json) ? response.json : [];
   } catch (e) {
     return null;
   }
@@ -74,77 +71,87 @@ async function fetchFinishedTasks(ws) {
    已完成列表同轮并行拉取（state.tasks.finished + finishedByWorkspace），
    渲染在面板底部的 finished 小节。live 与 finished 分别应用：慢的持久化
    查询不会阻塞运行中任务面板。 */
-async function pollTasks() {
-  const seq = ++state.tasks.seq;
-  const wss = (state.workspaces || []).slice();
-  if (!wss.length && state.workspace) wss.push(state.workspace);   // 兜底
+const taskRequests = new Map();
 
-  // 启动两组请求而不互相等待；每组内部仍等待所有 workspace，保持聚合
-  // 快照和 stale-on-error 语义。
-  const liveResults = Promise.all(wss.map((ws) => fetchTasks(ws)));
-  const finishedResults = Promise.all(wss.map((ws) => fetchFinishedTasks(ws)));
-
-  const applyFinished = (results) => {
-    if (seq !== state.tasks.seq) return;   // 过期响应丢弃
-    const wsId = state.workspace ? state.workspace.id : null;
-    const oldVisibleFinishedSig = finishedListSig(
-      (state.tasks.finished || []).filter((t) => !t._ws || t._ws === wsId));
-    const allFinished = [];
-    for (let i = 0; i < wss.length; i++) {
-      const ws = wss[i];
-      const finished = results[i];
-      if (finished === null) {
-        // 拉取失败：保留该 workspace 的旧缓存（stale），避免完成记录闪烁消失
-        const old = state.tasks.finishedByWorkspace[ws.id];
-        if (old) allFinished.push(...old);
-      } else {
-        const tagged = finished.map((t) => Object.assign({}, t, { _ws: ws.id }));
-        state.tasks.finishedByWorkspace[ws.id] = tagged;
-        allFinished.push(...tagged);
-      }
+function taskRequestKey(ws, kind) {
+  return kind + "\u0000" + ws.id + "\u0000" + ws.url + "\u0000" + workspaceToken(ws);
+}
+function taskRequestCurrent(ws, url, token) {
+  return state.workspaces.includes(ws) && ws.url === url && workspaceToken(ws) === token;
+}
+function rebuildTaskLists() {
+  const live = [], finished = [];
+  for (const ws of state.workspaces || []) {
+    if (state.tasks.byWorkspace[ws.id]) live.push(...state.tasks.byWorkspace[ws.id]);
+    if (state.tasks.finishedByWorkspace[ws.id]) finished.push(...state.tasks.finishedByWorkspace[ws.id]);
+  }
+  state.tasks.list = live;
+  state.tasks.finished = finished;
+}
+function applyTaskWorkspace(ws, kind, items, url, token) {
+  if (!taskRequestCurrent(ws, url, token) || items === null) return;
+  const cache = kind === "live" ? state.tasks.byWorkspace : state.tasks.finishedByWorkspace;
+  cache[ws.id] = items.map((t) => Object.assign({}, t, { _ws: ws.id }));
+  rebuildTaskLists();
+  if (kind === "live") {
+    renderComposerTasks();
+    renderSidebarTree();
+    return;
+  }
+  const wsId = state.workspace ? state.workspace.id : null;
+  const panel = els.composerTasks;
+  const live = state.tasks.list.filter((t) => !t._ws || t._ws === wsId);
+  if (panel && state.tasks.composerOpen && live.length) {
+    const visible = state.tasks.finished.filter((t) => !t._ws || t._ws === wsId);
+    const old = panel.querySelector(".tasks-finished");
+    const finishedSig = finishedListSig(visible);
+    if (!old || old.getAttribute("data-finished-sig") !== finishedSig) {
+      renderFinishedSection(panel, visible);
     }
-    state.tasks.finished = allFinished;
-    // Finished data is a secondary section: update it in place so a late
-    // completion query cannot rebuild live task rows or stop their output
-    // pollers. If the panel is not currently showing live rows, the next
-    // live render will include this cached section.
-    const visibleFinished = allFinished.filter((t) => !t._ws || t._ws === wsId);
-    if (finishedListSig(visibleFinished) === oldVisibleFinishedSig) return;
-    const live = (state.tasks.list || []).filter((t) => !t._ws || t._ws === wsId);
-    const panel = els.composerTasks;
-    if (panel && state.tasks.composerOpen && live.length) {
-      renderFinishedSection(panel, visibleFinished);
-      const sig = tasksRenderSig(live) + "|f" + finishedListSig(visibleFinished);
-      lastTasksSig = sig;
-      lastTasksRenderedSig = sig;
-    }
-  };
-  // Do not make the caller wait for the finished query. Its continuation is
-  // separately guarded so a newer poll cannot be overwritten by old data.
-  finishedResults.then(applyFinished).catch((err) => {
-    console.warn("[tasks] finished refresh failed:", err);
-  });
-
-  const results = await liveResults;
-  if (seq !== state.tasks.seq) return;   // 过期响应丢弃
-  const all = [];
-  for (let i = 0; i < wss.length; i++) {
-    const ws = wss[i];
-    const tasks = results[i];
-    if (tasks === null) {
-      // 拉取失败：保留该 workspace 的旧缓存（stale），避免任务闪烁消失
-      const old = state.tasks.byWorkspace[ws.id];
-      if (old) all.push(...old);
-    } else {
-      const tagged = tasks.map((t) => Object.assign({}, t, { _ws: ws.id }));
-      state.tasks.byWorkspace[ws.id] = tagged;
-      all.push(...tagged);
+    const liveSig = tasksRenderSig(live);
+    if (lastTasksRenderedSig.startsWith(liveSig + "|f")) {
+      lastTasksSig = liveSig + "|f" + finishedSig;
+      lastTasksRenderedSig = lastTasksSig;
     }
   }
-  state.tasks.list = all;
-  renderComposerTasks();
-  renderSidebarTree();   // 任务数据恢复后主动触发侧边栏重绘（dot 数据源变化，
-                         // 不再依赖 sessionId 变化碰巧打破 sidebarTreeSig 去重）
+}
+function pollTaskWorkspace(ws, kind, fetcher, refresh) {
+  if (!workspaceToken(ws)) return Promise.resolve();
+  const url = ws.url, token = workspaceToken(ws), key = taskRequestKey(ws, kind);
+  const active = taskRequests.get(key);
+  if (active) {
+    if (refresh) active.refresh = true;
+    return active.promise;
+  }
+  const entry = { promise: null, refresh: false };
+  // Register before fetcher reaches its first await: an immediate second caller
+  // must observe this request rather than starting a parallel one.
+  taskRequests.set(key, entry);
+  entry.promise = fetcher(ws).then(
+    (items) => {
+      if (taskRequests.get(key) !== entry) return;
+      taskRequests.delete(key);
+      applyTaskWorkspace(ws, kind, items, url, token);
+      if (entry.refresh) return pollTaskWorkspace(ws, kind, fetcher);
+    },
+    (err) => {
+      if (taskRequests.get(key) === entry) taskRequests.delete(key);
+      throw err;
+    }
+  );
+  return entry.promise;
+}
+
+/* Each workspace/endpoint is independently single-flight. A slow workspace
+   never holds healthy results or their next polling cycle, and its eventual
+   success is still applied unless that workspace changed or was removed. */
+async function pollTasks() {
+  const wss = (state.workspaces || []).slice();
+  if (!wss.length && state.workspace) wss.push(state.workspace);
+  const live = wss.map((ws) => pollTaskWorkspace(ws, "live", fetchTasks));
+  const finished = wss.map((ws) => pollTaskWorkspace(ws, "finished", fetchFinishedTasks));
+  void Promise.allSettled(finished);
+  await Promise.allSettled(live);
 }
 
 /* Pointer activation after selecting text must leave that exact card alone. Keyboard
@@ -373,11 +380,14 @@ function renderComposerTasks() {
       // 签名 → 重建（不显示旧行/旧闭包）；数据未变 → 跳过（DOM 仍最新）。
       // !rendered 兜底 DOM 被外部清空（switchWorkspace 等）但签名未变的场景。
       const rendered = panel.querySelectorAll(".task-row").length > 0;
-      if (sig !== lastTasksRenderedSig || sig !== lastTasksSig || !rendered) {
+      if (sig !== lastTasksRenderedSig || !rendered) {
         lastTasksSig = sig;
         lastTasksRenderedSig = sig;
         renderTaskList(list, panel);
-        renderFinishedSection(panel, finished);
+        const oldFinished = panel.querySelector(".tasks-finished");
+        if (!oldFinished || oldFinished.getAttribute("data-finished-sig") !== finishedListSig(finished)) {
+          renderFinishedSection(panel, finished);
+        }
       }
     } else {
       lastTasksSig = sig;   // 收起：只记录 data 签名，不更新已渲染签名
@@ -396,6 +406,7 @@ function renderFinishedSection(panel, finished) {
     return;
   }
   const box = old || el("div", "tasks-finished");
+  box.setAttribute("data-finished-sig", finishedListSig(finished));
   box.innerHTML = "";
   const header = el("button", "tasks-finished-header", "已完成");
   header.type = "button";                    // 非表单提交
@@ -1054,8 +1065,12 @@ async function cancelTask(t) {
     if (res.status === 401 || res.status === 403) { setBanner("⚠ 认证失败：请检查 Token。"); return; }
     if (res.status === 404) { setBanner("⚠ 任务不存在（可能已完成）。"); return; }
     if (res.status !== 204) throw new Error("HTTP " + res.status);
-    // 成功：立即刷新面板（统一轮询）
-    await pollTasks();
+    // 成功：若本 workspace 的请求在途，合并一轮其完成后的局部刷新。
+    const ws = state.workspace;
+    await Promise.all([
+      pollTaskWorkspace(ws, "live", fetchTasks, true),
+      pollTaskWorkspace(ws, "finished", fetchFinishedTasks, true),
+    ]);
   } catch (e) {
     setBanner("⚠ 取消失败：" + e.message);
   } finally {
