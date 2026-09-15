@@ -293,8 +293,10 @@ check(request("GET", f"/api/sessions/{unknown}/history?limit=2", 404) is None,
 check(request("GET", f"/api/sessions/{unknown}/history?before_seq=0&limit=2", 404) is None,
       "unknown valid id before_seq=0 history must be 404")
 known_empty = request("GET", f"/api/sessions/{historical}/history?before_seq=0&limit=2", 200)
-check(known_empty == {"entries": [], "next_before_seq": None},
-      "known historical session before_seq=0 must be an empty terminal page")
+check(known_empty.get("entries") == []
+      and known_empty.get("locations") == []
+      and known_empty.get("next_before_seq") is None,
+      "known historical session before_seq=0 must have empty entries/locations and a terminal cursor")
 # The route returns entries in ascending order inside each physical page.
 def page(before=None):
     query = "?limit=2"
