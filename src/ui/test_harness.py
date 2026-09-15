@@ -7199,12 +7199,38 @@ async function main(){
     await flush();
     const cancelFresh = cancelTask({ session_id: "cancel-s", id: 77 });
     await flush();
+    chk("cancelTask does not start a parallel GET before old response settles",
+        cancelGetCount === 1, "gets=" + cancelGetCount);
     cancelOldResolve(resp(200, [{ session_id: "cancel-s", id: 77, kind: "bash" }], null));
     await Promise.all([cancelInitial, cancelFresh]);
     chk("cancelTask queues one local fresh GET after pending request",
         cancelGetCount === 2 && state.tasks.byWorkspace.wsCancel.length === 0,
         "gets=" + cancelGetCount + " rows=" + state.tasks.byWorkspace.wsCancel.length);
     globalThis.fetch = cancelFetch;
+
+    // JSON parse failure is transient for both task caches: neither endpoint
+    // may turn its existing cache into a successful empty snapshot.
+    const taskFormatFetch = globalThis.fetch;
+    globalThis.fetch = (url, opts = {}) => {
+      if (url === "/api/tasks" || url === "/api/tasks/finished") {
+        return Promise.resolve({
+          ok: true, status: 200, body: null, text: async () => "",
+          json: async () => { throw new SyntaxError("bad json"); },
+        });
+      }
+      return taskFormatFetch(url, opts);
+    };
+    state.tasks.byWorkspace = { wsCancel: [{ session_id: "cancel-s", id: 88, kind: "bash", _ws: "wsCancel" }] };
+    state.tasks.finishedByWorkspace = { wsCancel: [{ session_id: "cancel-s", id: 89, kind: "bash", _ws: "wsCancel" }] };
+    rebuildTaskLists(); taskRequests.clear();
+    await pollTasks();
+    chk("task live JSON SyntaxError preserves stale cache",
+        state.tasks.byWorkspace.wsCancel[0].id === 88,
+        "id=" + state.tasks.byWorkspace.wsCancel[0].id);
+    chk("task finished JSON SyntaxError preserves stale cache",
+        state.tasks.finishedByWorkspace.wsCancel[0].id === 89,
+        "id=" + state.tasks.finishedByWorkspace.wsCancel[0].id);
+    globalThis.fetch = taskFormatFetch;
 
     // =====================================================================
     // Issue 1 (高): 轮询重入 + 永久阻塞 + 异常断链
@@ -7233,14 +7259,13 @@ async function main(){
     stopPolling();
     chk("perf poll timeout constant is 10s", POLL_TIMEOUT_MS === 10000,
         "=" + POLL_TIMEOUT_MS);
-    // 慢响应在途时连续两次立即轮询 → 不并发叠加：第一次启动在途轮询，
-    // 第二次排队一轮新鲜的（合并为同一轮）；在途轮询完成后才补跑
+    // 慢响应在途时连续两次立即轮询按 workspace 复用同一请求，不并发。
     sessionsPDelayed = true;
     sessionsPResolve = null;
     const i1f = FETCHES.filter((u) => u === "/api/sessions").length;
     const i1t = scheduledTimeouts.length;
     const i1p1 = pollSessions();
-    const i1p2 = pollSessions();   // 立即轮询：必须排队（不并发），合并为同一轮
+    const i1p2 = pollSessions();   // 立即轮询复用每个 workspace 的在途请求
     await flush();
     chk("perf immediate polls no concurrent round",
         FETCHES.filter((u) => u === "/api/sessions").length === i1f + 1,
@@ -7252,7 +7277,7 @@ async function main(){
     await flush();
     chk("perf workspace poll uses abort signal", pollSignalSeen === true,
         "seen=" + pollSignalSeen);
-    sessionsPResolve(resp(200, sessionsDataB));   // 排队补跑的新鲜一轮（串行）
+    sessionsPResolve(resp(200, sessionsDataB));   // 共享在途请求已完成
     await Promise.all([i1p1, i1p2]);
     await flush();
     sessionsPDelayed = false;
@@ -7583,9 +7608,8 @@ async function main(){
         "title=" + JSON.stringify(trow5.title));
 
     // =====================================================================
-    // Issue 6 (中): stopPolling 取消已排队的下一轮——queued round 携带
-    //   generation，在途结束后启动前校验失效 → 丢弃；换代后的即时刷新
-    //   （pollSessions）替换旧 intent，仍保持全局 single-flight
+    // Issue 6: repeated aggregate rounds share each workspace request while
+    // it is pending; a settled explicit refresh starts a new request.
     // =====================================================================
     sessionsData = [{ id: "p6", status: "Idle", title: "P6", created_at: "2024-01-01T00:00:00Z", entry_count: 1, busy: false, active: true }];
     sessionsDataB = [{ id: "p6b", status: "Busy", title: "P6B", created_at: "2024-02-02T00:00:00Z", entry_count: 1, busy: true, active: true }];
@@ -7613,16 +7637,16 @@ async function main(){
     const i6f0 = FETCHES.filter((u) => u === "http://b.local/api/sessions").length;
     const i6p1 = pollSessions();   // 初始立即轮询：在途（B 慢）
     await flush();
-    const i6p2 = pollRound();      // 2s 定时器已排队第二轮（挂在在途 Promise 上）
+    const i6p2 = pollRound();      // 周期轮次复用在途的 workspace 请求
     await flush();
     chk("issue6 repeated round shares the workspace request while in-flight",
         FETCHES.filter((u) => u === "http://b.local/api/sessions").length === i6f0 + 1,
         "delta=" + (FETCHES.filter((u) => u === "http://b.local/api/sessions").length - i6f0));
-    // 显式停止轮询：gen 递增，排队 intent 作废（打开会话不再停导航轮询）。
+    // 显式停止轮询后，不再调度下一周期。
     stopPolling();
     openSession("p6");
     await flush();
-    chk("issue6 explicit stop invalidates queued round",
+    chk("issue6 explicit stop clears periodic timer",
         state.pollTimer === null,
         "timer=" + String(state.pollTimer));
     stopSSE();
@@ -7631,8 +7655,7 @@ async function main(){
     await i6p2;
     await flush();
     chk("issue6 stopped round does not run after first settles",
-        FETCHES.filter((u) => u === "http://b.local/api/sessions").length === i6f0 + 1
-        && pollRoundInFlight === null,
+        FETCHES.filter((u) => u === "http://b.local/api/sessions").length === i6f0 + 1,
         "delta=" + (FETCHES.filter((u) => u === "http://b.local/api/sessions").length - i6f0));
     // A new explicit refresh after the previous request settles starts a fresh
     // workspace request; periodic rounds never retain global queued intent.

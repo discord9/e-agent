@@ -134,8 +134,8 @@ function afterPollRound() {
 }
 
 /* 兼容别名：既有调用点（switchWorkspace/restartTransport/init）
-   语义不变——现在等于聚合轮询全部 workspace；经 runPollRound 与定时轮询
-   （setTimeout 链）共用同一个 in-flight 守卫，同一时刻只有一轮在途。 */
+   语义不变——现在等于聚合轮询全部 workspace；每个 workspace 自己复用
+   in-flight 请求，慢 peer 不阻塞健康 peer 的下一轮。 */
 function pollSessions() {
   // 初始加载、workspace 切换和打开抽屉都需要立即刷新；周期调用只由
   // pollRound 的 shouldPollSessions 守卫续调度。
@@ -1615,8 +1615,7 @@ function restartTransport() {
    轰炸。stopPolling 或条件不满足（聊天视图 + 侧边栏关闭）时不再续调度。
    立即轮询（pollSessions：restartTransport/switchWorkspace/
    refreshSessionsForSidebar/init 的即时刷新）与定时轮询共用同一个 in-flight
-   守卫（runPollRound 串行链）：在途轮询未完成时，新请求不并发叠加——把
-   「新鲜一轮」排队到在途轮询之后，多个并发请求合并为同一轮。 */
+   调度；每个 workspace 复用自己的在途请求，健康 workspace 不等待慢 peer。 */
 const POLL_INTERVAL_MS = 2000;
 
 /* 会话列表只为可见的侧边栏服务；document.hidden 也纳入条件，作为
@@ -1627,16 +1626,8 @@ function shouldPollSessions() {
 
 /* Requests are single-flight per workspace in pollWorkspaceSessions, not per
    aggregate round: one closed/slow server must never starve healthy servers. */
-let pollRoundInFlight = null;
 function runPollRound() {
-  const round = pollAllWorkspaces();
-  pollRoundInFlight = round;
-  round.then(() => {
-    if (pollRoundInFlight === round) pollRoundInFlight = null;
-  }, () => {
-    if (pollRoundInFlight === round) pollRoundInFlight = null;
-  });
-  return round;
+  return pollAllWorkspaces();
 }
 
 function startPolling() {

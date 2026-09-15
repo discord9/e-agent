@@ -36,7 +36,7 @@ async function fetchTasks(ws) {
       }
       return null;
     }
-    if (!res.ok) throw new Error("HTTP " + res.status);
+    if (!res.ok || response.formatError) return null;
     return Array.isArray(response.json) ? response.json : [];
   } catch (e) {
     return null;
@@ -53,7 +53,7 @@ async function fetchFinishedTasks(ws) {
     const response = await fetchPollJson(ws, "/api/tasks/finished");
     const res = response.res;
     if (res.status === 401 || res.status === 403) return null;
-    if (!res.ok) throw new Error("HTTP " + res.status);
+    if (!res.ok || response.formatError) return null;
     return Array.isArray(response.json) ? response.json : [];
   } catch (e) {
     return null;
