@@ -2357,7 +2357,7 @@ function renderSessionBusyDot(target, s, kids, wsId) {
     const title = parentTasks
       ? taskDotTitle(t, i + 1, runningKidCount)
       : "子任务 " + (i + 1) + "/" + runningKidCount;
-    circles += `<circle class="orbit-dot${taskWaiting ? " waiting" : taskError ? " error" : taskInactive ? " inactive" : green ? " green" : ""}" cx="12" cy="12" r="2"` +
+    circles += `<circle class="orbit-dot${taskWaiting ? " waiting" : taskError ? " error" : taskInactive ? " inactive" : green ? " green" : t !== null && t.kind === "bash" ? " bash" : ""}" cx="12" cy="12" r="2"` +
       ` transform="rotate(${slotDeg} 12 12) translate(0 ${-R})"` +
       ` aria-hidden="true"><title>${escapeHtml(title)}</title></circle>`;
   }

@@ -305,7 +305,7 @@
   .busy-dot-wrap .main-dot.waiting { fill: var(--cyan); }
   .busy-dot-wrap .main-dot.error { fill: var(--yellow); }
   .busy-dot-wrap .main-dot.inactive { fill: var(--base1); }
-  /* 环绕点：red（bash / busy delegate），cyan（waiting delegate），
+  /* 环绕点：#1453AD（bash），red（busy delegate），cyan（waiting delegate），
      yellow（failed delegate），green（idle delegate）。
      SVG circle 无盒模型，无法用 box-shadow 描边；用 stroke 给 0.5px 光环。 */
   .busy-dot-wrap .orbit-dot {
@@ -315,6 +315,7 @@
     animation: subagent-pulse 1.45s ease-in-out infinite;
   }
   .busy-dot-wrap .orbit-dot.green { fill: var(--green); }
+  .busy-dot-wrap .orbit-dot.bash { fill: #1453AD; }
   .busy-dot-wrap .orbit-dot.waiting { fill: var(--cyan); }
   .busy-dot-wrap .orbit-dot.error { fill: var(--yellow); }
   .busy-dot-wrap .orbit-dot.inactive { fill: var(--base1); }

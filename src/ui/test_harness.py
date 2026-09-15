@@ -3923,7 +3923,8 @@ async function main(){
         elsById["chatBusy"].hidden === false
         && !!elsById["chatBusy"].querySelector(".main-dot")
         && elsById["chatBusy"].querySelector(".main-dot.busy") === null
-        && elsById["chatBusy"].querySelectorAll(".orbit-dot").length === 1,
+        && elsById["chatBusy"].querySelectorAll(".orbit-dot").length === 1
+        && elsById["chatBusy"].querySelectorAll(".orbit-dot.bash").length === 0,
         "hidden=" + elsById["chatBusy"].hidden + " html=" + elsById["chatBusy"].innerHTML);
 
     // 权威 task 快照：7 个当前父任务 => 5 个点 + +2；其它父和其它 workspace
@@ -3968,6 +3969,51 @@ async function main(){
         && !!elsById["chatBusy"].querySelector(".main-dot")
         && elsById["chatBusy"].querySelectorAll(".orbit-dot").length === 5,
         "header=" + elsById["chatBusy"].innerHTML + " sidebar=" + _sidebarDot.innerHTML);
+
+    // 任务快照中仅普通运行 bash 带蓝色 class；delegate 保持红色，且其明确
+    // waiting/error/inactive/green 状态优先于 kind。中心点、轨道几何和 +N
+    // 徽章仍由同一 renderer 生成（前述共享 SVG/overflow 断言覆盖）。
+    state.lastList = [
+      { id: "current-busy", busy: false, status: "Idle", active: true },
+      { id: "delegate-running", parent_session_id: "current-busy", busy: true, status: "Busy", active: true },
+      { id: "delegate-waiting", parent_session_id: "current-busy", busy: false, status: "WaitingInput", active: true },
+      { id: "delegate-error", parent_session_id: "current-busy", busy: false, status: "Failed: child", active: true },
+      { id: "delegate-inactive", parent_session_id: "current-busy", busy: false, status: "Finished", active: false },
+      { id: "delegate-green", parent_session_id: "current-busy", busy: false, status: "Idle", active: true },
+    ];
+    state.tasks.byWorkspace[_activeWsId] = [
+      { session_id: "current-busy", id: 1, kind: "bash" },
+      { session_id: "current-busy", id: 2, kind: "delegate", subagent_session_id: "delegate-running" },
+      { session_id: "current-busy", id: 3, kind: "delegate", subagent_session_id: "delegate-waiting" },
+      { session_id: "current-busy", id: 4, kind: "delegate", subagent_session_id: "delegate-error" },
+      { session_id: "current-busy", id: 5, kind: "delegate", subagent_session_id: "delegate-inactive" },
+      { session_id: "current-busy", id: 6, kind: "delegate", subagent_session_id: "delegate-green" },
+    ];
+    state.tasks.list = state.tasks.byWorkspace[_activeWsId];
+    updateCurrentSessionBusy();
+    chk("orbit colors distinguish normal bash from delegate and preserve status priority",
+        elsById["chatBusy"].querySelectorAll(".orbit-dot").length === 6
+        && elsById["chatBusy"].querySelectorAll(".orbit-dot.bash").length === 1
+        && elsById["chatBusy"].querySelectorAll(".orbit-dot.waiting").length === 1
+        && elsById["chatBusy"].querySelectorAll(".orbit-dot.error").length === 1
+        && elsById["chatBusy"].querySelectorAll(".orbit-dot.inactive").length === 1
+        && elsById["chatBusy"].querySelectorAll(".orbit-dot.green").length === 1
+        && elsById["chatBusy"].querySelector(".main-dot.busy") === null,
+        "html=" + elsById["chatBusy"].innerHTML);
+
+    // Without a task snapshot, busy child fallback is untyped and must not be
+    // mislabeled as bash.
+    state.tasks.byWorkspace = {};
+    state.tasks.list = [];
+    state.lastList = [
+      { id: "current-busy", busy: false },
+      { id: "fallback-child", parent_session_id: "current-busy", busy: true, status: "Busy" },
+    ];
+    updateCurrentSessionBusy();
+    chk("orbit fallback does not misclassify child as bash",
+        elsById["chatBusy"].querySelectorAll(".orbit-dot").length === 1
+        && elsById["chatBusy"].querySelectorAll(".orbit-dot.bash").length === 0,
+        "html=" + elsById["chatBusy"].innerHTML);
 
     // A delegate becomes cyan only when its actual subagent session reports
     // WaitingInput; busy:false Idle remains green and absent status is not guessed.
