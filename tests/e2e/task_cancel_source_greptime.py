@@ -543,7 +543,8 @@ class Server:
         wait_for("session task drain", lambda: not self.session_tasks(), ENTRY_SECONDS)
         self.await_idle()
         # A cancelled wrapper's durable completion is appended by the runner;
-        # two identical consecutive reads prove no append is still in flight.
+        # consecutive identical reads are a settling heuristic, not proof that
+        # no append remains in flight. Later restart comparisons check durability.
         previous = json.dumps(self.history(), sort_keys=True)
         for _ in range(3):
             time.sleep(0.4)
@@ -791,6 +792,8 @@ def binary_identity(path, expect_src, expect_commit, label):
     assert match, "%s --version does not embed a git commit: %r" % (label, version)
     commit, dirty = match.group(1), bool(match.group(2))
     src = git_info(expect_src)
+    assert not dirty, "%s binary carries a dirty build marker" % label
+    assert not src["status_porcelain"], "%s source checkout is dirty" % label
     assert src["head"].startswith(commit), \
         "%s --version commit %s is not the HEAD of %s (%s)" % (label, commit, expect_src, src["head"])
     if expect_commit:
@@ -1013,7 +1016,7 @@ def run_stages(args, fixture, evidence, run_dir):
     session_rows = [r for r in rows if r.get("session_id") == SESSION_ID]
     session_rows.sort(key=lambda r: r.get("seq"))
     seqs = [r.get("seq") for r in session_rows]
-    assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs), "finished rows are not one row per seq: %s" % seqs
+    assert len(set(seqs)) == len(seqs), "finished rows are not one row per seq: %s" % seqs
     completions = [e for e in entries if e.get("type") == "background_completion"]
     assert len(session_rows) == len(completions), (
         "finished-task API has %d rows for %s, history has %d completions"
@@ -1022,7 +1025,7 @@ def run_stages(args, fixture, evidence, run_dir):
     pairs = []
     for entry, row in zip(completions, session_rows):
         key = "seq=%s id=%s" % (row.get("seq"), row.get("id"))
-        for field in ("output", "label", "started_at_ms", "duration_ms", "exit_code", "signal", "status", "kind"):
+        for field in ("id", "output", "label", "started_at_ms", "duration_ms", "exit_code", "signal", "status", "kind"):
             assert row.get(field) == entry.get(field), \
                 "finished row %s field %s: api=%r entry=%r" % (key, field, row.get(field), entry.get(field))
         assert row.get("cancellation_source") == entry.get("cancellation_source"), \
