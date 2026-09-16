@@ -9089,6 +9089,7 @@ async fn goal_continue_idle_background_followup_then_resume() {
             signal: None,
             status: None,
             kind: None,
+            cancellation_source: None,
         })
         .unwrap();
     wait_for_log_event(
@@ -12493,6 +12494,7 @@ async fn oracle718_background_during_answer_compact_keeps_resume(
             signal: None,
             status: None,
             kind: None,
+            cancellation_source: None,
         })
         .unwrap();
     compact_release.notify_one();

@@ -1972,9 +1972,11 @@ async fn delete_session(
             SessionRef::Subagent {
                 parent, task_id, ..
             } => {
+                // An authenticated DELETE is a user request, exactly like the
+                // task-panel cancel above — never a system teardown.
                 parent
                     .background
-                    .cancel_with_source(task_id, CancellationSource::System);
+                    .cancel_with_source(task_id, CancellationSource::User);
             }
         }
     }
@@ -7553,8 +7555,28 @@ model = "deepseek-chat"
             StatusCode::NO_CONTENT,
             "deleting an unknown session hides it idempotently"
         );
-        // A live registry session also deletes cleanly.
-        let (id, session) = live_session("web-del");
+        // A live registry session also deletes cleanly — and the
+        // main-session teardown must not fabricate a background completion
+        // (only a *subagent* DELETE routes through `cancel_with_source`).
+        // A pending background task makes the no-completion assertion
+        // non-vacuous: DELETE drops the registry entry, it does not complete
+        // the task.
+        let (id, session, mut completions) = live_session_with_background_sender("web-del");
+        session
+            .background
+            .spawn_with_id(
+                "main teardown probe".into(),
+                None,
+                None,
+                None,
+                crate::tools::new_exit_slot(),
+                |_| {},
+                || async {
+                    std::future::pending::<()>().await;
+                    String::new()
+                },
+            )
+            .expect("probe background task starts");
         state.registry.insert(id.clone(), session);
         let response = app
             .oneshot(
@@ -7569,6 +7591,11 @@ model = "deepseek-chat"
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         assert!(state.registry.get(&id).is_none(), "registry entry removed");
+        tokio::task::yield_now().await;
+        assert!(
+            completions.try_recv().is_err(),
+            "main-session teardown must not deliver a completion"
+        );
     }
 
     /// Regression (interrupt-no-longer-kills-delegate): `DELETE
@@ -7581,7 +7608,9 @@ model = "deepseek-chat"
     /// parent's `BackgroundTasks::cancel_with_source(task_id, …)` instead: the delegate
     /// wrapper is aborted, its captured cleanup removes the `Sessions`
     /// entry, and dropping the wrapper's runner handle aborts the subagent
-    /// runner.
+    /// runner. The delivered completion carries the User cancellation
+    /// source (the authenticated request), and the main-session teardown
+    /// path stays completion-free.
     #[tokio::test]
     async fn delete_subagent_session_aborts_delegate_runner_and_cleans_up() {
         use async_trait::async_trait;
@@ -7764,12 +7793,20 @@ model = "deepseek-chat"
         assert!(parent.background.running().is_empty());
         assert!(parent.sessions.list().is_empty());
         // The parent saw the same "background task cancelled" completion a
-        // task-panel cancel produces.
+        // task-panel cancel produces — attributed to the authenticated
+        // DELETE (User), not to a system teardown.
         assert!(matches!(
             completions.try_recv(),
-            Ok(AgentEvent::BackgroundCompleted { output, .. })
-                if output == "background task cancelled"
+            Ok(AgentEvent::BackgroundCompleted {
+                output,
+                cancellation_source: Some(CancellationSource::User),
+                ..
+            }) if output == "background task cancelled"
         ));
+        assert!(
+            completions.try_recv().is_err(),
+            "the DELETE delivers exactly one completion"
+        );
     }
 
     /// `POST /api/sessions/{id}/cancel` on a REAL runner — the endpoint was
