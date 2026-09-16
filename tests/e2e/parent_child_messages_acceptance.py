@@ -17,12 +17,15 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = Path(__file__).resolve().parents[2]
-NEW = (HERE / ".e-agent/message-acceptance/e-agent-new-dd1cc4d").resolve()
-OLD = (HERE / ".e-agent/message-acceptance/e-agent-old-bca5941").resolve()
-GREPTIME = (HERE / ".e-agent/message-acceptance/bin/greptime").resolve()
+# Env overrides keep the reviewed default binaries/artifacts and let a run
+# point at a provenance-clean build of the exact commits, a different
+# GreptimeDB build, or an isolated evidence directory.
+NEW = Path(os.environ.get("PARENT_CHILD_NEW_BINARY", HERE / ".e-agent/message-acceptance/e-agent-new-dd1cc4d")).resolve()
+OLD = Path(os.environ.get("PARENT_CHILD_OLD_BINARY", HERE / ".e-agent/message-acceptance/e-agent-old-bca5941")).resolve()
+GREPTIME = Path(os.environ.get("PARENT_CHILD_GREPTIME", HERE / ".e-agent/message-acceptance/bin/greptime")).resolve()
 BACKEND = os.environ.get("PARENT_CHILD_BACKEND", "jsonl")
 assert BACKEND in {"jsonl", "greptime"}, "PARENT_CHILD_BACKEND must be jsonl or greptime"
-ARTIFACTS = HERE / ".e-agent/message-acceptance/runs"
+ARTIFACTS = Path(os.environ.get("PARENT_CHILD_ARTIFACTS", HERE / ".e-agent/message-acceptance/runs")).resolve()
 ARTIFACTS.mkdir(parents=True, exist_ok=True)
 PARENT = "acceptance-parent"
 RESUME_PARENT = "resume-parent"
