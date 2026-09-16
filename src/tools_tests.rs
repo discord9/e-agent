@@ -3825,6 +3825,80 @@ async fn background_timeout_is_delivered_as_completion() {
     );
 }
 
+/// The registry's explicit cancellation latch is the first accepted source
+/// and wins over any exit-slot mark the work wrote — the merge order
+/// `completion_trace` documents (`registry.or(exit slot)`). Delegate
+/// durable-start-record failures rely on this: their system mark must never
+/// override a user/agent cancel that already latched.
+async fn marked_task_cancelled_as(source: crate::agent::CancellationSource) {
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let mut background = BackgroundTasks::new(None, None);
+    background.set_event_sender(sender);
+
+    // Cancel-target wrapper (like a delegate task): it stays in the
+    // registry until its work exits, so the cancel latches after the mark.
+    let marked = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let exit_slot = new_exit_slot();
+    let work_exit = exit_slot.clone();
+    let work_marked = marked.clone();
+    let work_release = release.clone();
+    let id_slot: Arc<std::sync::Mutex<Option<u64>>> = Arc::new(std::sync::Mutex::new(None));
+    let hook_slot = id_slot.clone();
+    let target = tokio::spawn(std::future::pending::<()>());
+    background
+        .spawn_with_id_target(
+            background.sender.lock().unwrap().clone(),
+            "mark-then-cancel".into(),
+            None,
+            None,
+            None,
+            exit_slot,
+            Some(target.abort_handle()),
+            move |id| *hook_slot.lock().unwrap() = Some(id),
+            move || {
+                let (work_exit, work_marked, work_release) = (work_exit, work_marked, work_release);
+                async move {
+                    work_exit.lock().unwrap().cancellation_source =
+                        Some(crate::agent::CancellationSource::System);
+                    work_marked.notify_one();
+                    work_release.notified().await;
+                    "aborted work".into()
+                }
+            },
+        )
+        .expect("cancel-target task starts");
+    let id = id_slot.lock().unwrap().expect("task id assigned");
+    marked.notified().await;
+    assert!(
+        background.cancel_with_source(id, source).is_some(),
+        "the explicit cancel is accepted while the work is parked"
+    );
+    release.notify_one();
+    let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+        .await
+        .expect("completion after the work exits")
+        .unwrap();
+    match event {
+        AgentEvent::BackgroundCompleted {
+            cancellation_source,
+            ..
+        } => assert_eq!(
+            cancellation_source,
+            Some(source),
+            "the registry latch must win over the exit-slot System mark"
+        ),
+        other => panic!("expected BackgroundCompleted, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn explicit_registry_cancel_source_wins_over_exit_slot_mark() {
+    // User (the web DELETE) and Agent (the cancel tool) both latch.
+    marked_task_cancelled_as(crate::agent::CancellationSource::User).await;
+    marked_task_cancelled_as(crate::agent::CancellationSource::Agent).await;
+}
+
 #[tokio::test]
 async fn background_without_timeout_runs_to_completion() {
     let temp = tempfile::tempdir().unwrap();
