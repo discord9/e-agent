@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Focused JSONL-route acceptance for live parent/child messaging and /btw.
+"""Focused route/SSE acceptance for live parent/child messaging and /btw.
 
 Uses the exact candidate binary with an isolated --serve process and an actual
-OpenAI-compatible streaming provider.  This deliberately covers the bounded
-route/SSE gaps only; it is not a Greptime acceptance run.
+OpenAI-compatible streaming provider.  This covers the bounded route/SSE gaps
+only; it runs on the JSONL backend by default and on GreptimeDB when
+PARENT_CHILD_BACKEND=greptime (candidate binary overridable via
+PARENT_CHILD_NEW_BINARY, GreptimeDB path via PARENT_CHILD_GREPTIME,
+artifacts via PARENT_CHILD_ARTIFACTS).
 """
 import hashlib
 import json
@@ -21,11 +24,14 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = Path(__file__).resolve().parents[2]
-BINARY = (HERE / ".e-agent/message-acceptance/e-agent-new-dd1cc4d").resolve()
-GREPTIME = (HERE / ".e-agent/message-acceptance/bin/greptime").resolve()
+# Env overrides keep the reviewed default binaries/artifacts and let a run
+# point at a provenance-clean build of the exact commit, a different
+# GreptimeDB build, or an isolated evidence directory.
+BINARY = Path(os.environ.get("PARENT_CHILD_NEW_BINARY", HERE / ".e-agent/message-acceptance/e-agent-new-dd1cc4d")).resolve()
+GREPTIME = Path(os.environ.get("PARENT_CHILD_GREPTIME", HERE / ".e-agent/message-acceptance/bin/greptime")).resolve()
 BACKEND = os.environ.get("PARENT_CHILD_BACKEND", "jsonl")
 assert BACKEND in {"jsonl", "greptime"}, "PARENT_CHILD_BACKEND must be jsonl or greptime"
-ARTIFACTS = HERE / ".e-agent/message-acceptance/runs"
+ARTIFACTS = Path(os.environ.get("PARENT_CHILD_ARTIFACTS", HERE / ".e-agent/message-acceptance/runs")).resolve()
 ARTIFACTS.mkdir(parents=True, exist_ok=True)
 ROOT = Path(tempfile.mkdtemp(prefix="parent-child-routes-", dir=ARTIFACTS))
 WORK = ROOT / "workspace"
