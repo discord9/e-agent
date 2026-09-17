@@ -112,7 +112,7 @@ fn request_user_input_schema_and_validation_are_strict() {
 fn request_user_input_is_not_in_common_builtins() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();
-    let (tools, _) = builtins_with_exa_key(workspace.clone(), None, None, false, None, None);
+    let (tools, _) = builtins_with_web_search(workspace.clone(), None, None, false, None, None);
     assert!(
         !tools
             .iter()
@@ -163,7 +163,7 @@ fn request_compaction_registered_for_main_read_only_and_subagent_builds() {
     };
 
     // Main build (no key, no sandbox).
-    let (tools, _) = builtins_with_exa_key(workspace.clone(), None, None, false, None, None);
+    let (tools, _) = builtins_with_web_search(workspace.clone(), None, None, false, None, None);
     let main_names = names(tools);
     assert!(main_names.contains(&"request_compaction".to_string()));
     assert!(main_names.contains(&"get_context_usage".to_string()));
@@ -171,7 +171,7 @@ fn request_compaction_registered_for_main_read_only_and_subagent_builds() {
     assert!(main_names.contains(&"history".to_string()));
 
     // Read-only main build without a sandbox (fail-closed bash).
-    let (tools, _) = builtins_with_exa_key(workspace.clone(), None, None, true, None, None);
+    let (tools, _) = builtins_with_web_search(workspace.clone(), None, None, true, None, None);
     let n = names(tools);
     assert!(n.contains(&"request_compaction".to_string()), "{n:?}");
     assert!(n.contains(&"get_context_usage".to_string()), "{n:?}");
@@ -212,7 +212,7 @@ fn request_compaction_registered_for_main_read_only_and_subagent_builds() {
     // The schema is CLOSED and the tool is read-only by construction: its
     // spec declares exactly ref/offset/limit with additionalProperties
     // false and a required ref.
-    let (tools, _) = builtins_with_exa_key(
+    let (tools, _) = builtins_with_web_search(
         Workspace::new(temp.path()).unwrap(),
         None,
         None,
@@ -253,13 +253,19 @@ fn web_search_registration_requires_a_nonempty_key() {
         "read_output".to_string(),
         "history".to_string(),
     ];
-    for key in [None, Some("   ".into())] {
-        let (tools, _) = builtins_with_exa_key(workspace.clone(), key, None, false, None, None);
+    for key in [None, Some(WebSearchSource::Exa("   ".into()))] {
+        let (tools, _) = builtins_with_web_search(workspace.clone(), key, None, false, None, None);
         let names: Vec<String> = tools.iter().map(|tool| tool.spec().name).collect();
         assert_eq!(names, local_tools);
     }
-    let (tools, _) =
-        builtins_with_exa_key(workspace, Some(" key ".into()), None, false, None, None);
+    let (tools, _) = builtins_with_web_search(
+        workspace,
+        Some(WebSearchSource::Exa(" key ".into())),
+        None,
+        false,
+        None,
+        None,
+    );
     let names: Vec<String> = tools.iter().map(|tool| tool.spec().name).collect();
     assert_eq!(
         names,
@@ -282,6 +288,87 @@ fn web_search_registration_requires_a_nonempty_key() {
         ]
         .map(String::from)
     );
+}
+
+#[test]
+fn searxng_registration_needs_no_key() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(temp.path()).unwrap();
+    let (tools, _) = builtins_with_web_search(
+        workspace.clone(),
+        Some(WebSearchSource::Searxng("http://127.0.0.1:8088".into())),
+        None,
+        false,
+        None,
+        None,
+    );
+    assert!(
+        tools.iter().any(|tool| tool.spec().name == "web_search"),
+        "a SearXNG base URL registers web_search with no credential"
+    );
+    // A blank base URL is ignored exactly like a blank Exa key.
+    let (tools, _) = builtins_with_web_search(
+        workspace,
+        Some(WebSearchSource::Searxng("  ".into())),
+        None,
+        false,
+        None,
+        None,
+    );
+    assert!(!tools.iter().any(|tool| tool.spec().name == "web_search"));
+}
+
+/// A minimal GET-only HTTP server: unlike `web_server`, it must not expect
+/// a request body (`searxng` searches are GETs).
+async fn searxng_server(
+    status: &str,
+    body: impl AsRef<[u8]>,
+) -> (String, tokio::task::JoinHandle<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let response = http_response(status, body);
+    let task = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let count = socket.read(&mut buffer).await.unwrap();
+            assert!(count > 0, "client closed before sending its request head");
+            request.extend_from_slice(&buffer[..count]);
+        }
+        let _ = socket.write_all(&response).await;
+        request
+    });
+    (base_url, task)
+}
+
+#[tokio::test]
+async fn searxng_searches_without_a_key_and_formats_results() {
+    let (base_url, server) = searxng_server(
+        "200 OK",
+        br#"{"results":[
+            {"title":"Rust ownership","url":"https://doc.rust-lang.org/book/ch04-00.html","content":"Ownership rules."},
+            {"title":" Borrowing ","url":"https://example.test/borrow","content":"References."}
+        ],"unresponsive_engines":[["google","timeout"]]}"#,
+    )
+    .await;
+    let result = WebSearch::for_test_searxng(base_url, Duration::from_secs(1))
+        .execute(json!({"query": "rust ownership"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        result.content,
+        "Rust ownership\nhttps://doc.rust-lang.org/book/ch04-00.html\nOwnership rules.\n\nBorrowing\nhttps://example.test/borrow\nReferences."
+    );
+
+    let request = String::from_utf8(server.await.unwrap()).unwrap();
+    let request_line = request.lines().next().unwrap();
+    assert!(
+        request_line.starts_with("GET /search?") && request_line.contains("format=json"),
+        "unexpected SearXNG request line: {request_line}"
+    );
+    assert!(request_line.contains("q=rust+ownership"), "{request_line}");
+    assert!(!request.to_lowercase().contains("x-api-key"), "{request}");
 }
 
 #[tokio::test]
@@ -1565,7 +1652,7 @@ async fn bash_detached_requires_background() {
 fn read_only_builtins_exclude_write_edit_and_bash_without_sandbox() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();
-    let (tools, _) = builtins_with_exa_key(workspace, None, None, true, None, None);
+    let (tools, _) = builtins_with_web_search(workspace, None, None, true, None, None);
     let names: Vec<String> = tools.iter().map(|tool| tool.spec().name).collect();
     assert_eq!(
         names,
@@ -1589,9 +1676,9 @@ fn read_only_builtins_exclude_write_edit_and_bash_without_sandbox() {
 fn read_only_builtins_keep_bash_with_a_narrowed_sandbox() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();
-    let (tools, _) = builtins_with_exa_key(
+    let (tools, _) = builtins_with_web_search(
         workspace,
-        Some("key".into()),
+        Some(WebSearchSource::Exa("key".into())),
         Some(crate::config::Sandbox {
             enabled: true,
             network: true,
@@ -5234,7 +5321,7 @@ fn goal_specs_are_closed_and_generic_specs_stay_open() {
     ];
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();
-    let (tools, _) = builtins_with_exa_key(workspace, None, None, false, None, None);
+    let (tools, _) = builtins_with_web_search(workspace, None, None, false, None, None);
     for tool in &tools {
         let name = tool.spec().name;
         if name == "get_goal" || name == "update_goal" {
@@ -6160,7 +6247,7 @@ async fn common_construction_owner_attribution_does_not_select_tmp_policy() {
     };
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();
-    let tools = super::tools_with_background_and_exa_key(
+    let tools = super::tools_with_background_and_web_search(
         workspace,
         BackgroundTasks::new(None, Some(policy.clone())),
         None,

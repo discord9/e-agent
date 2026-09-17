@@ -345,6 +345,129 @@ api_key_env = "SOME_VAR"
 }
 
 #[test]
+fn web_search_provider_resolves_searxng_and_validates() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("exa-key"), "exa-secret").unwrap();
+
+    // SearXNG: base_url, no credential.
+    let searxng = write_config(
+        temp.path(),
+        r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://x"
+api_key_file = "exa-key"
+[models."kimi/k3"]
+model = "k3"
+[web_search]
+provider = "searxng"
+base_url = "http://127.0.0.1:8088"
+"#,
+    );
+    let config = Config::from_path(&searxng).unwrap();
+    assert_eq!(
+        config.web_search_provider().unwrap(),
+        Some(WebSearchProvider::Searxng {
+            base_url: "http://127.0.0.1:8088".into()
+        })
+    );
+    // A SearXNG section carries no Exa key.
+    assert_eq!(config.web_search_key().unwrap(), None);
+
+    // Exa stays the default and keeps the exactly-one-key rule.
+    let exa = write_config(
+        temp.path(),
+        r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://x"
+api_key_file = "exa-key"
+[models."kimi/k3"]
+model = "k3"
+[web_search]
+api_key_file = "exa-key"
+"#,
+    );
+    let config = Config::from_path(&exa).unwrap();
+    assert_eq!(
+        config.web_search_provider().unwrap(),
+        Some(WebSearchProvider::Exa)
+    );
+    assert_eq!(config.web_search_key().unwrap(), Some("exa-secret".into()));
+
+    // SearXNG forbids a key (file or env).
+    for provider_line in [
+        "api_key_file = \"exa-key\"\n",
+        "api_key_env = \"SOME_VAR\"\n",
+    ] {
+        let both = write_config(
+            temp.path(),
+            &format!(
+                r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://x"
+api_key_file = "exa-key"
+[models."kimi/k3"]
+model = "k3"
+[web_search]
+provider = "searxng"
+base_url = "http://127.0.0.1:8088"
+{provider_line}"#
+            ),
+        );
+        let error = Config::from_path(&both)
+            .unwrap()
+            .web_search_provider()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("must not set"), "{error}");
+    }
+
+    // SearXNG requires base_url.
+    let missing = write_config(
+        temp.path(),
+        r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://x"
+api_key_file = "exa-key"
+[models."kimi/k3"]
+model = "k3"
+[web_search]
+provider = "searxng"
+"#,
+    );
+    let error = Config::from_path(&missing)
+        .unwrap()
+        .web_search_provider()
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("requires `base_url`"), "{error}");
+
+    // Unknown provider values are rejected.
+    let unknown = write_config(
+        temp.path(),
+        r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://x"
+api_key_file = "exa-key"
+[models."kimi/k3"]
+model = "k3"
+[web_search]
+provider = "google"
+"#,
+    );
+    let error = Config::from_path(&unknown)
+        .unwrap()
+        .web_search_provider()
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("not supported"), "{error}");
+}
+
+#[test]
 fn resolves_role_routing_and_falls_back_when_unrouted() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("key"), "key").unwrap();

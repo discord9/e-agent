@@ -21,14 +21,17 @@ use crate::agent::{Agent, SessionEntry};
 use crate::codex::CodexModel;
 use crate::codex_auth::CodexAuth;
 use crate::config::{
-    AuthMode, Config, ProjectSourceObservation, ResolvedModel, Sandbox, resolve_sandbox,
+    AuthMode, Config, ProjectSourceObservation, ResolvedModel, Sandbox, WebSearchProvider,
+    resolve_sandbox,
 };
 use crate::delegate::{Delegate, Sessions};
 use crate::mcp;
 use crate::model::{ConfiguredModel, OpenAiModel};
 use crate::runner::{IdlePolicy, SessionBootstrap, SessionHandle, SessionRunner};
 use crate::session_store::SessionStore;
-use crate::tools::{BackgroundTasks, add_root_user_input_tool, builtins_with_bash_timeout};
+use crate::tools::{
+    BackgroundTasks, SEARXNG_BASE_URL_ENV, add_root_user_input_tool, builtins_with_bash_timeout,
+};
 use crate::workspace::Workspace;
 
 /// What to do with background-task records left behind by a previous run
@@ -271,17 +274,25 @@ impl SessionFactory {
             .as_ref()
             .map(|c| c.session_backend())
             .unwrap_or_default();
-        // Web search reads EXA_API_KEY from the process env (tools.rs and
-        // subagents pick it up there). When unset, fall back to the
-        // `[web_search]` config section by injecting it into the env once at
-        // startup — this keeps the key's single transport mechanism and
-        // avoids threading it through every tools constructor. Startup is
+        // Web search reads its backend from the process env (tools.rs and
+        // subagents pick it up there): EXA_API_KEY for the default Exa
+        // provider, and the internal `E_AGENT_SEARXNG_BASE_URL` for
+        // `[web_search] provider = "searxng"`. The section is validated once
+        // here, which keeps the single transport mechanism and avoids
+        // threading the setting through every tools constructor. Startup is
         // single-threaded, so set_var is safe.
-        if std::env::var_os("EXA_API_KEY").is_none()
-            && let Some(config) = &config
-            && let Some(key) = config.web_search_key()?
-        {
-            unsafe { std::env::set_var("EXA_API_KEY", key) };
+        if let Some(config) = &config {
+            if let Some(WebSearchProvider::Searxng { base_url }) = config.web_search_provider()?
+                && std::env::var_os(SEARXNG_BASE_URL_ENV).is_none()
+            {
+                unsafe { std::env::set_var(SEARXNG_BASE_URL_ENV, base_url) };
+            }
+            // Process env EXA_API_KEY still wins over a configured Exa key.
+            if std::env::var_os("EXA_API_KEY").is_none()
+                && let Some(key) = config.web_search_key()?
+            {
+                unsafe { std::env::set_var("EXA_API_KEY", key) };
+            }
         }
         let (runtime, auth) = match &config {
             Some(config) => {
@@ -1412,11 +1423,15 @@ fn apply_reloaded_config(
         state.models = None;
         return ReloadResult::Reloaded;
     };
-    // Mirror the startup web-search gate: when EXA_API_KEY is not set, a
-    // malformed `[web_search]` section is a config error. The key value
-    // itself is NOT re-injected at runtime — `std::env::set_var` is only
-    // safe at startup (single-threaded), so web-search key changes still
-    // need a restart.
+    // Mirror the startup web-search gate: provider/base_url validation
+    // always applies, and a malformed Exa key section is a config error when
+    // process env EXA_API_KEY does not shadow it. The resolved values are
+    // NOT re-injected at runtime — `std::env::set_var` is only safe at
+    // startup (single-threaded), so web-search backend changes still need a
+    // restart.
+    if let Err(error) = config.web_search_provider() {
+        return ReloadResult::Rejected(format!("{error:#}"));
+    }
     if std::env::var_os("EXA_API_KEY").is_none()
         && let Err(error) = config.web_search_key()
     {
