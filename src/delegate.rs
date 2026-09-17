@@ -459,7 +459,7 @@ impl Delegate {
         // 不要给出最终答案收尾（FinishWhenIdle 会等待它完成并注入结果触发新 turn）；
         // 收到注入后必须把结果整合进完整最终答案，不要只简短确认「完成了」。
         instructions.push_str(
-            "\n\n后台任务（background bash）完成时会自动以 `[background task N completed]` 消息注入，无需轮询：dispatch 后台任务后继续其它工作或直接等待即可，不要反复调用 get_background_tasks / sleep 重查。若你 dispatch 了后台任务且其结果属于最终答案的一部分：在后台任务完成之前不要给出最终答案收尾（FinishWhenIdle 会等待它完成并自动注入结果触发新 turn）；收到 `[background task N completed]` 注入后，把结果整合进你的完整最终答案，不要只简短确认「完成了」——你的任务是给出含后台任务结果的完整答案。\n\n后台命令的输出本身已做截断与持久化处理，完成回执里就能看到完整结论；不要再给命令加 `| tail`、`| head` 之类的输出裁剪后缀，那样只会丢掉上下文、妨碍判断。需要长输出时直接原样运行，让系统去截断。",
+            "\n\n后台任务（background bash）完成时会自动以 `[background task N completed]` 消息注入，无需轮询：dispatch 后台任务后继续其它工作或直接等待即可，不要反复调用 get_background_tasks / sleep 重查。若你 dispatch 了后台任务且其结果属于最终答案的一部分：在后台任务完成之前不要给出最终答案收尾（FinishWhenIdle 会等待它完成并自动注入结果触发新 turn）；收到 `[background task N completed]` 注入后，把结果整合进你的完整最终答案，不要只简短确认「完成了」——你的任务是给出含后台任务结果的完整答案。",
         );
         if let Some(content) = agents_instructions {
             instructions.push_str("\n\n## AGENTS.md\n\n");
