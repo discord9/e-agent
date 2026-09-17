@@ -918,7 +918,7 @@ fn handle_model(command: ModelCommand, state: &mut TuiState, handle: &RunnerHand
             };
             match factory.resolve_profile(&profile) {
                 Ok((configured, context_window)) => {
-                    let name = configured.display_name().to_owned();
+                    let name = configured.profile_key();
                     state.model_name = name.clone();
                     state.model = Some(configured.clone());
                     state.context_window = context_window;

@@ -1261,11 +1261,9 @@ async fn create_session(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateSessionBody>,
 ) -> Result<(StatusCode, Json<SessionMeta>), (StatusCode, String)> {
-    // Only an explicit id is a resume. A generated `web-…` id is fresh by
-    // construction; both paths are reserved in the process-local registry
-    // before the async build begins. Captured before the match moves
-    // `body.id` out.
-    let explicit_id = body.id.is_some();
+    // An explicit id resumes (or reconnects to) that session; a generated
+    // `web-…` id is fresh by construction. Both paths are reserved in the
+    // process-local registry before the async build begins.
     let id = match body.id {
         Some(id) => {
             crate::session::validate_session_name(&id)
@@ -1275,25 +1273,10 @@ async fn create_session(
         None => crate::session::new_id_prefixed("web-"),
     };
     // `build_session` reserves the factory-owned permit before its store
-    // connect/history load. Metadata is read only after admission so the
-    // complete resume/build path is covered by the same permit.
+    // connect/history load, so the complete resume/build path is covered by
+    // the same permit.
     let root = state.factory.root();
     let built = build_session(&state.factory, &id).await?;
-    // Preserve the original model in the web-facing live registry. For a
-    // resumed row, build's idempotent metadata write leaves this unchanged.
-    let persisted_model = if explicit_id {
-        meta_store(&state)
-            .await
-            .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
-            .list_meta(root)
-            .await
-            .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
-            .into_iter()
-            .find(|meta| meta.session_id == id)
-            .and_then(|meta| meta.model)
-    } else {
-        None
-    };
     let initial_prompt = body.initial_prompt.filter(|p| !p.trim().is_empty());
     let session = Arc::new(LiveSession {
         handle: built.handle,
@@ -1301,7 +1284,10 @@ async fn create_session(
         store: built.store,
         background: built.background,
         sessions: built.sessions,
-        model_name: Mutex::new(persisted_model.unwrap_or(built.model_name)),
+        // The live display is the model actually in use: `build` always
+        // installs the factory's current config model, even when resuming a
+        // row whose persisted (append-only) metadata carries a stale name.
+        model_name: Mutex::new(built.model_name),
         role_name: built.role_name,
         created_at: chrono::Utc::now(),
         local_permit: Some(built.local_permit),
@@ -4679,11 +4665,12 @@ mod tests {
         assert_eq!(with_id.initial_prompt.as_deref(), Some("go"));
     }
 
-    /// Resuming uses the persisted model for web display while the runner
-    /// retains the factory's current model; newly created sessions display
-    /// that current factory model.
+    /// Both resume and fresh creation display the factory's current config
+    /// model — the one the runner actually installs. A resumed row's stale
+    /// persisted (append-only) name is not the live display, and the stored
+    /// row itself is left untouched.
     #[tokio::test]
-    async fn resumed_session_lists_persisted_model_and_fresh_session_lists_current_model() {
+    async fn resume_and_fresh_sessions_list_current_model() {
         use axum::http::Request;
         use tower::util::ServiceExt;
 
@@ -4694,7 +4681,7 @@ mod tests {
             .await
             .unwrap();
         let state = Arc::new(AppState {
-            factory: crate::session_factory::SessionFactory::test_factory(root),
+            factory: crate::session_factory::SessionFactory::test_factory(root.clone()),
             registry: Arc::new(SessionRegistry::default()),
             token: "sekrit".to_owned(),
             meta_store: SessionStore::Jsonl,
@@ -4722,6 +4709,13 @@ mod tests {
 
         let resumed = post(r#"{"id":"historical"}"#).await;
         assert_eq!(resumed.status(), StatusCode::CREATED);
+        let resumed: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resumed.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(resumed["model"], "test-model");
         let fresh = post("{}").await;
         assert_eq!(fresh.status(), StatusCode::CREATED);
         let fresh: serde_json::Value = serde_json::from_slice(
@@ -4756,7 +4750,17 @@ mod tests {
                 .iter()
                 .find(|meta| meta["id"] == "historical")
                 .expect("resumed session is listed")["model"],
-            "X"
+            "test-model"
+        );
+        // Append-only persistence: the live display follows the config, the
+        // historical row keeps its old name.
+        let stored = SessionStore::Jsonl.list_meta(&root).await.unwrap();
+        assert_eq!(
+            stored
+                .iter()
+                .find(|meta| meta.session_id == "historical")
+                .and_then(|meta| meta.model.as_deref()),
+            Some("X")
         );
     }
 
