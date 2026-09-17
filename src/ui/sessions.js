@@ -63,7 +63,7 @@ function applyValidation(problems) {
 /* 轮询请求超时：任一 workspace 请求永久 pending 会卡住整轮（渲染/深链/
    校验/后续调度全部停摆）。每个请求挂 AbortController + 10s 超时，超时
    按失败处理（保留旧列表 stale，标记 workspaceErrors）。 */
-const POLL_TIMEOUT_MS = 10000;
+const POLL_TIMEOUT_MS = 30000;
 
 /* 深链 history 有界超时：恶劣网络下深链直接按 id probe history，同样挂
    10s 上限（复用 fetchWithTimeout）——只作用于深链路径（maybeHandleDeepLink
