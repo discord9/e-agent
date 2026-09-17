@@ -411,11 +411,12 @@ function streamManualNotice(){
 }
 /* 带 abort 感知的响应 Promise：signal 已 abort → 立即 reject AbortError；
    pending 期间 abort → reject AbortError（resolve 后迟到 abort 是 no-op，
-   与真实 fetch 一致）。 */
-function resp(status, body, signal){
+   与真实 fetch 一致）。可选 headers 映射（小写键）挂成 Headers 风格的 get。 */
+function resp(status, body, signal, headers){
   return new Promise((resolve, reject) => {
     const ok = status>=200 && status<300;
     const done = () => resolve({ ok, status, body,
+      headers: { get: (n) => (headers||{})[String(n).toLowerCase()] },
       json:async()=>typeof body==="string"?JSON.parse(body):body,
       text:async()=>String(body) });
     if (signal && signal.aborted) { const e=new Error("The operation was aborted."); e.name="AbortError"; reject(e); return; }
@@ -457,6 +458,8 @@ let taskOutputResolve = null;
 let taskOutput404 = false;
 // 网络失败测试：output 端点 fetch reject（模拟断网）→ 轮询停止、不降级
 let taskOutputNetFail = false;
+// 16 MiB 保头上限测试：output 端点带 x-spool-truncated:true → 轮询停止（不降级）
+let taskOutputTruncated = false;
 // 轮询超时测试：workspace 轮询请求是否带了 AbortSignal
 let pollSignalSeen = false;
 // 会话列表响应（测试中可变）：默认 s1；Bug C 测试会替换成含 subagent 的列表
@@ -570,11 +573,21 @@ globalThis.fetch=(url,opts={})=>{
         if (finishedDelayed) return abortable(new Promise((resolve) => { finishedResolve = resolve; }), signal);
         return resp(200, finishedData, signal);
       }
-      if(url.startsWith("/api/sessions/")&&url.includes("/tasks/")&&url.endsWith("/output")) {
+      if(url.startsWith("/api/sessions/")&&url.includes("/tasks/")&&url.includes("/output")) {
         if (taskOutput404) return resp(404, {}, signal);
         if (taskOutputDelayed) return abortable(new Promise((resolve) => { taskOutputResolve = resolve; }), signal);
         if (taskOutputNetFail) return Promise.reject(new TypeError("network error"));
-        return resp(200, taskOutputText, signal);
+        // 增量协议桩：?offset=N → 从 N 起的切片 + x-spool-* 响应头。mock 的
+        // total 用字符串长度（内容全在本文件内自洽，前端只透传偏移）。
+        const mOff = /[?&]offset=(\d+)/.exec(url);
+        const asked = mOff ? parseInt(mOff[1], 10) : 0;
+        const total = taskOutputText.length;
+        const offset = Math.min(asked, total);
+        return resp(200, taskOutputText.slice(offset), signal, {
+          "x-spool-offset": String(offset),
+          "x-spool-total": String(total),
+          "x-spool-truncated": taskOutputTruncated ? "true" : "false",
+        });
       }
       // SSE 404 语义测试：命中这些 id 的 /events 返回 404（优先于下方具体会话路由）
       const _m404 = /^\/api\/sessions\/([^/]+)\/events$/.exec(url);
@@ -7133,13 +7146,13 @@ async function main(){
     const rrow = elsById["composerTasks"].querySelectorAll(".task-row")[0];
     taskOutputDelayed = true;
     taskOutputResolve = null;
-    const outFetchBefore = FETCHES.filter((u) => u.endsWith("/output")).length;
+    const outFetchBefore = FETCHES.filter((u) => u.includes("/output")).length;
     rrow._listeners["click"][0]();   // 展开 → 启动轮询，首个 tick 挂起
     await flush();
     chk("perf output poller single in-flight fetch",
         state.tasks.pollers.has("s1:400")
-        && FETCHES.filter((u) => u.endsWith("/output")).length === outFetchBefore + 1,
-        "fetches=" + (FETCHES.filter((u) => u.endsWith("/output")).length - outFetchBefore));
+        && FETCHES.filter((u) => u.includes("/output")).length === outFetchBefore + 1,
+        "fetches=" + (FETCHES.filter((u) => u.includes("/output")).length - outFetchBefore));
     taskOutputResolve(resp(200, "reentry-done"));
     await flush();
     chk("perf output poller updates after settle",
@@ -7150,6 +7163,79 @@ async function main(){
     chk("perf output poller cleaned on collapse",
         !state.tasks.pollers.has("s1:400"),
         "keys=" + JSON.stringify([...state.tasks.pollers.keys()]));
+
+    // 增量 offset 协议：首轮 offset=0 全量（静态尾部不被重复拼接），随后只
+    // append 响应头给出的差值；spool 缩回（失步）→ 本轮不渲染，下一轮
+    // offset=0 全量重取，不拼接错位文本。
+    elsById["composerTasks"].innerHTML = "";
+    state.tasks.composerOpen = true;
+    state.tasks.list = [];
+    state.tasks.degraded = new Set();
+    state.tasks.pollers = new Map();
+    lastTasksSig = "";
+    lastTasksRenderedSig = "";
+    taskOutputText = "abc";
+    tasksData = [{ session_id: "s1", id: 500, kind: "bash", label: "offset",
+      full_command: "offset", output: "abc", role: null }];
+    await pollTasks();
+    await flush();
+    const ofrow = elsById["composerTasks"].querySelectorAll(".task-row")[0];
+    const ofpre = ofrow.querySelector(".task-output");
+    taskOutputText = "abcdef";   // 首轮：静态尾部 "abc" 之后新数据已到
+    ofrow._listeners["click"][0]();   // 展开 → 首 tick（offset=0）
+    await flush();
+    chk("offset poll first fetch starts at 0",
+        FETCHES[FETCHES.length - 1].includes("/tasks/500/output?offset=0"),
+        "url=" + FETCHES[FETCHES.length - 1]);
+    chk("offset poll full text without duplication",
+        ofpre.textContent === "abcdef" && ofpre._offset === 6,
+        "text=" + ofpre.textContent + " offset=" + ofpre._offset);
+    taskOutputText = "abcdefgh";   // 增量到达
+    const ofInterval = state.tasks.pollers.get("s1:500");
+    scheduledIntervals[ofInterval - 1]();   // 下一 tick：offset=6 → 服务端只回增量
+    await flush();
+    chk("offset poll next fetch resumes at total",
+        FETCHES[FETCHES.length - 1].includes("/tasks/500/output?offset=6"),
+        "url=" + FETCHES[FETCHES.length - 1]);
+    chk("offset poll appends delta only",
+        ofpre.textContent === "abcdefgh" && ofpre._offset === 8,
+        "text=" + ofpre.textContent + " offset=" + ofpre._offset);
+    taskOutputText = "xy";   // spool 缩回 → 响应起点 2 ≠ 请求 8（失步）
+    scheduledIntervals[ofInterval - 1]();
+    await flush();
+    chk("offset poll desync keeps current text and resets cursor",
+        ofpre.textContent === "abcdefgh" && ofpre._offset === 0,
+        "text=" + ofpre.textContent + " offset=" + ofpre._offset);
+    scheduledIntervals[ofInterval - 1]();   // 下一轮：offset=0 全量重取
+    await flush();
+    chk("offset poll desync refetches full from 0",
+        ofpre.textContent === "xy" && ofpre._offset === 2
+        && FETCHES[FETCHES.length - 1].includes("/tasks/500/output?offset=0"),
+        "text=" + ofpre.textContent + " offset=" + ofpre._offset
+        + " url=" + FETCHES[FETCHES.length - 1]);
+    ofrow._listeners["click"][0]();   // 收起，清理轮询
+    chk("offset poll cleaned up on collapse",
+        !state.tasks.pollers.has("s1:500"),
+        "keys=" + JSON.stringify([...state.tasks.pollers.keys()]));
+    // x-spool-truncated:true（16 MiB 保头上限已到）→ 内容照常渲染，轮询停止
+    // （不是降级：端点可用，只是不再有新数据）
+    taskOutputTruncated = true;
+    taskOutputText = "capped-output";
+    tasksData = [{ session_id: "s1", id: 501, kind: "bash", label: "capped",
+      full_command: "capped", output: "", role: null }];
+    await pollTasks();
+    await flush();
+    const trow = elsById["composerTasks"].querySelectorAll(".task-row")[0];
+    const tpre = trow.querySelector(".task-output");
+    trow._listeners["click"][0]();
+    await flush();
+    chk("offset poll truncated header stops polling without degrading",
+        !state.tasks.pollers.has("s1:501") && !state.tasks.degraded.has("s1:501")
+        && tpre.textContent === "capped-output",
+        "pollers=" + JSON.stringify([...state.tasks.pollers.keys()])
+        + " degraded=" + state.tasks.degraded.has("s1:501")
+        + " text=" + tpre.textContent);
+    taskOutputTruncated = false;
 
     // Body pending after headers must obey the poll timeout, preserve stale data,
     // and permit a later successful retry.

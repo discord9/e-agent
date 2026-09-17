@@ -2103,18 +2103,29 @@ async fn cancel_task(
     }
 }
 
-/// `GET /api/sessions/{id}/tasks/{task_id}/output` — the full captured
-/// output of one running background bash task as `text/plain` (lossy
-/// UTF-8). Unlike `/api/tasks`' 2000-char output tail this is the
-/// untruncated full spool (keep-first capped at 16 MiB), so the frontend
-/// can poll it while a task streams. `Cache-Control: no-cache` keeps
-/// polling honest (the global API middleware upgrades it to `no-store` on
-/// the wire). 404 for an unknown session, a subagent session (its
-/// tasks live in the parent's registry), or a task with no output spool
-/// (delegate tasks).
+/// Optional `?offset=` for the background-task output endpoint: a byte
+/// offset into the spool (default 0 = the full output).
+#[derive(serde::Deserialize)]
+struct TaskOutputQuery {
+    offset: Option<usize>,
+}
+
+/// `GET /api/sessions/{id}/tasks/{task_id}/output` — the captured output of
+/// one running background bash task as `text/plain` (lossy UTF-8). Unlike
+/// `/api/tasks`' 2000-char output tail this is the untruncated full spool
+/// (keep-first capped at 16 MiB), so the frontend can poll it while a task
+/// streams. `?offset=` resumes at a byte offset instead of re-sending the
+/// whole spool, and the `x-spool-offset` / `x-spool-total` /
+/// `x-spool-truncated` response headers report the served start, the spool
+/// size, and whether the keep-first cap was hit. `Cache-Control: no-cache`
+/// keeps polling honest (the global API middleware upgrades it to
+/// `no-store` on the wire). 404 for an unknown session, a subagent session
+/// (its tasks live in the parent's registry), or a task with no output
+/// spool (delegate tasks).
 async fn task_output(
     State(state): State<Arc<AppState>>,
     Path((id, task_id)): Path<(String, u64)>,
+    Query(query): Query<TaskOutputQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let session = live(&state, &id)?;
     let SessionRef::Live(session) = session else {
@@ -2126,19 +2137,56 @@ async fn task_output(
             format!("session {id} has no background task registry"),
         ));
     };
-    match session.background.output(task_id) {
-        Some(output) => Ok((
-            [
-                (header::CACHE_CONTROL, "no-cache"),
-                (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
-            ],
-            String::from_utf8_lossy(&output).into_owned(),
-        )),
-        None => Err(error(
+    let spool = session.background.spool(task_id).ok_or_else(|| {
+        error(
             StatusCode::NOT_FOUND,
             format!("task {task_id} not found in session {id}"),
-        )),
-    }
+        )
+    })?;
+    // One snapshot drives both the delta and `x-spool-total`, so the next
+    // requested offset always matches the bytes this response carried (a
+    // separate `len()` could report fewer bytes than the clone contains,
+    // making the client re-fetch an already rendered tail).
+    let bytes = spool.bytes();
+    let total = bytes.len();
+    let truncated = spool.truncated();
+    let offset = query.offset.unwrap_or(0).min(total);
+    let body = if offset >= total {
+        String::new() // no new data: every byte was already served
+    } else {
+        String::from_utf8_lossy(&bytes[offset..]).into_owned()
+    };
+    let count_header = |value: usize| {
+        value
+            .to_string()
+            .parse::<header::HeaderValue>()
+            .expect("usize digits are a valid header value")
+    };
+    Ok((
+        [
+            (
+                header::CACHE_CONTROL,
+                header::HeaderValue::from_static("no-cache"),
+            ),
+            (
+                header::CONTENT_TYPE,
+                header::HeaderValue::from_static("text/plain; charset=utf-8"),
+            ),
+            (
+                header::HeaderName::from_static("x-spool-offset"),
+                count_header(offset),
+            ),
+            (
+                header::HeaderName::from_static("x-spool-total"),
+                count_header(total),
+            ),
+            (
+                header::HeaderName::from_static("x-spool-truncated"),
+                header::HeaderValue::from_static(if truncated { "true" } else { "false" }),
+            ),
+        ],
+        body,
+    ))
 }
 
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -9131,6 +9179,109 @@ model = "deepseek-chat"
         // Clean up the running tasks so the test leaks no processes.
         session.background.cancel(1);
         session.background.cancel(2);
+    }
+
+    /// `?offset=` slices the same spool: `x-spool-offset` reports the
+    /// clamped start, `x-spool-total` the spool size (the frontend's next
+    /// byte cursor), and `x-spool-truncated` stays `"false"` while the
+    /// keep-first cap is not hit. `offset == total` and beyond serve an
+    /// empty body with the total unchanged.
+    #[tokio::test]
+    async fn task_output_offset_serves_delta_with_spool_headers() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use std::time::Duration;
+        use tower::util::ServiceExt;
+
+        async fn fetch(app: &Router, uri: &str) -> (StatusCode, header::HeaderMap, String) {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header(header::AUTHORIZATION, "Bearer sekrit")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let headers = response.headers().clone();
+            let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            (
+                status,
+                headers,
+                String::from_utf8_lossy(&bytes).into_owned(),
+            )
+        }
+
+        let state = test_app_state("sekrit");
+        let (id, session, _rx) = live_session_with_background_sender("web-offset");
+        state.registry.insert(id.clone(), session.clone());
+        let app = router(state);
+
+        // A live bash task writing 10 known bytes and staying alive: a
+        // finished task leaves the registry, so its spool would 404.
+        let workspace = crate::workspace::Workspace::new(std::env::temp_dir()).unwrap();
+        session
+            .background
+            .start(
+                workspace,
+                "printf 'abcdefghij'; sleep 30".to_string(),
+                false,
+            )
+            .expect("bash background task starts");
+        let uri = format!("/api/sessions/{id}/tasks/1/output");
+
+        // Full fetch (no offset) until the 10 bytes have landed.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let (status, headers, body) = fetch(&app, &uri).await;
+            if status == StatusCode::OK && body == "abcdefghij" {
+                assert_eq!(headers.get("x-spool-offset").unwrap(), "0");
+                assert_eq!(headers.get("x-spool-total").unwrap(), "10");
+                assert_eq!(headers.get("x-spool-truncated").unwrap(), "false");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "task output never became complete (status {status}, body {body:?})"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        // `?offset=0` is the full output again, with an explicit start.
+        let (status, headers, body) = fetch(&app, &format!("{uri}?offset=0")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "abcdefghij", "offset 0 must serve the full spool");
+        assert_eq!(headers.get("x-spool-offset").unwrap(), "0");
+        assert_eq!(headers.get("x-spool-total").unwrap(), "10");
+
+        // A middle offset serves exactly the delta.
+        let (status, headers, body) = fetch(&app, &format!("{uri}?offset=4")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "efghij");
+        assert_eq!(headers.get("x-spool-offset").unwrap(), "4");
+        assert_eq!(headers.get("x-spool-total").unwrap(), "10");
+
+        // offset == total: nothing new, total unchanged.
+        let (status, headers, body) = fetch(&app, &format!("{uri}?offset=10")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "", "offset == total must serve nothing new");
+        assert_eq!(headers.get("x-spool-offset").unwrap(), "10");
+        assert_eq!(headers.get("x-spool-total").unwrap(), "10");
+
+        // offset past total: clamped to total, still empty.
+        let (status, headers, body) = fetch(&app, &format!("{uri}?offset=999")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "");
+        assert_eq!(headers.get("x-spool-offset").unwrap(), "10");
+        assert_eq!(headers.get("x-spool-total").unwrap(), "10");
+
+        // Clean up the running task so the test leaks no process.
+        session.background.cancel(1);
     }
 
     #[tokio::test]

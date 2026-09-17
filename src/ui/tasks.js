@@ -476,12 +476,17 @@ function attachScrollGuard(el) {
 }
 
 /* bash 输出轮询（通用）：给定任务 key + 目标 pre 元素 + 状态回调，500ms
-   GET /api/sessions/{sid}/tasks/{tid}/output 全量刷新输出区（textContent）。
-   旧后端（端点 404）→ 静默停轮询并记为降级（重绘不再重启），保持静态尾部；
-   网络失败 / 元素脱离 DOM 同样停轮询。句柄存 state.tasks.pollers
-   （key=session_id:id），同一 key 同时只有一处活跃，后启动的会先停掉旧
-   句柄再接管。onPhase 回调可选：onPhase("start"|"stop"|"degraded")，
-   卡片用它驱动状态小字显隐。 */
+   GET /api/sessions/{sid}/tasks/{tid}/output?offset=N 增量刷新输出区。
+   偏移协议（pre._offset = 下一轮起始字节；行重建/静态快照更新时复位 0）：
+   响应头 x-spool-offset 与请求 offset 一致 → 纯 append 新文本节点；
+   起点为 0（首轮/服务端截到 0/输出重置）→ 全量替换；两者都不符（失步）
+   → 本轮丢弃，下一轮 offset=0 全量重取。x-spool-total = 渲染后的新 offset；
+   x-spool-truncated=true（16 MiB 保头上限已到）→ 停止轮询（再轮询没有新
+   数据）。旧后端（端点 404）→ 静默停轮询并记为降级（重绘不再重启），
+   保持静态尾部；网络失败 / 元素脱离 DOM 同样停轮询。句柄存
+   state.tasks.pollers（key=session_id:id），同一 key 同时只有一处活跃，
+   后启动的会先停掉旧句柄再接管。onPhase 回调可选：
+   onPhase("start"|"stop"|"degraded")，卡片用它驱动状态小字显隐。 */
 function startOutputPoller(key, t, pre, onPhase) {
   stopTaskPoller(key);
   if (onPhase) onPhase("start");
@@ -505,7 +510,7 @@ function startOutputPoller(key, t, pre, onPhase) {
     tickInFlight = true;
     try {
       const res = await api("/api/sessions/" + encodeURIComponent(t.session_id || "")
-        + "/tasks/" + encodeURIComponent(t.id) + "/output");
+        + "/tasks/" + encodeURIComponent(t.id) + "/output?offset=" + (pre._offset || 0));
       if (state.tasks.pollers.get(key) !== intervalId) return;
       if (res.status === 401 || res.status === 403) {
         setBanner("⚠ 认证失败：请检查 Token。");
@@ -518,27 +523,55 @@ function startOutputPoller(key, t, pre, onPhase) {
       const text = await res.text();
       if (state.tasks.pollers.get(key) !== intervalId) return;
       if (!pre.isConnected) { stop(false); return; }
-      const txt = String(text).trim() !== "" ? String(text) : "";
-      pre.classList.toggle("empty", txt === "");
-      // 增量追加（保住选区）：_lastText 缓存上次已渲染的完整文本；txt 以它为
-      // 前缀 → 只 append 差值文本节点，不整段 textContent 重写（整段重写会
-      // 塌缩用户选区，无法复制）。输出被清空/重置/改写（非前缀）→ 整体替换
-      // 并复位缓存。
-      if (txt === "") {
-        if (pre._lastText !== "" || pre.textContent !== "(无输出)") {
-          pre.textContent = "(无输出)";   // 任务重置/清空：回到空占位
+      // 增量协议（与服务端 task_output 的响应头约定一致；响应头缺失 →
+      // 按旧后端处理：起点 0 + 下一轮仍从 0 全量取）。
+      const headerValue = (name) => {
+        if (!res.headers || typeof res.headers.get !== "function") return null;
+        const value = res.headers.get(name);
+        return value == null ? null : String(value);
+      };
+      const headerCount = (name) => {
+        const value = headerValue(name);
+        if (value == null) return null;
+        const parsed = parseInt(value, 10);
+        return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+      };
+      const started = headerCount("x-spool-offset");
+      const total = headerCount("x-spool-total");
+      const servedFrom = started == null ? 0 : started;
+      const prev = pre._offset || 0;
+      const raw = String(text);
+      const txt = raw.trim() !== "" ? raw : "";   // 全空白视作无输出（显示占位）
+      if (servedFrom === 0) {
+        // 全量替换：首轮 / 服务端把 offset 截到 0 / 输出被重置。
+        if (txt === "") {
+          if (pre._lastText !== "" || pre.textContent !== "(无输出)") {
+            pre.textContent = "(无输出)";   // 任务重置/清空：回到空占位
+          }
+          pre._lastText = "";
+        } else {
+          pre.textContent = txt;
+          pre._lastText = txt;
         }
-        pre._lastText = "";
-      } else if (txt.startsWith(pre._lastText || "")) {
-        if (!pre._lastText && pre.textContent !== "") pre.textContent = "";   // 清掉占位/旧内容
-        const chunk = txt.slice((pre._lastText || "").length);
-        if (chunk) pre.appendChild(document.createTextNode(chunk));
-        pre._lastText = txt;
+        pre.classList.toggle("empty", txt === "");
+        pre._offset = total == null ? 0 : total;
+      } else if (servedFrom === prev) {
+        // 纯追加：只 append 新文本节点，不整段 textContent 重写
+        // （整段重写会塌缩用户选区，无法复制）。
+        if (raw) {
+          if (pre.textContent === "(无输出)") pre.textContent = "";   // 清掉空占位
+          pre.appendChild(document.createTextNode(raw));
+          pre._lastText = (pre._lastText || "") + raw;
+        }
+        pre.classList.toggle("empty", pre.textContent.trim() === "");
+        pre._offset = total == null ? 0 : total;
       } else {
-        pre.textContent = txt;   // 输出被改写（非前缀）：整体替换
-        pre._lastText = txt;
+        // 失步（响应起点 ≠ 请求 offset）：本轮内容不可用，下一轮 offset=0
+        // 全量重取，避免拼接错位或重复。
+        pre._offset = 0;
       }
       if (!pre._userScrolled) pre.scrollTop = pre.scrollHeight;
+      if (headerValue("x-spool-truncated") === "true") stop(false);
     } catch (e) {
       stop(false);   // 网络失败：停轮询，保留已有内容
     } finally {
@@ -850,6 +883,7 @@ function updateRetainedTaskRow(row, t, key) {
   pre.classList.toggle("empty", out === "");
   pre.textContent = out || "(无输出)";
   pre._lastText = out;   // 同步增量缓存：重新展开时 tick 以此为前缀基准，避免重复追加
+  pre._offset = 0;   // 静态快照是全新文本：下一轮从 0 全量取，不接着旧偏移追加
 }
 
 /* 单个任务卡片行（keyed 更新用）：data-task = key、data-key-sig = 元数据
@@ -998,6 +1032,7 @@ function buildTaskRow(t, key, restoreExpanded, depth, connector) {
       const out = (t.output != null && String(t.output).trim() !== "") ? String(t.output) : "";
       pre = el("pre", "task-output" + (out ? "" : " empty"), out || "(无输出)");
       pre._lastText = out;   // 初始静态快照即增量基准（首轮 tick 以它为前缀判断）
+      pre._offset = 0;   // 静态快照是全新文本：首轮 tick 从 0 全量取
       pre.hidden = true;
       attachScrollGuard(pre);
       row.appendChild(pre);
