@@ -2535,6 +2535,11 @@ function renderSubagentRows(container, kids, hist, wsId) {
   }
 }
 
+/* 折叠分组懒渲染阈值：组内行数 ≤ 该值时折叠态仍直接建 DOM（小组建行开销
+   可忽略，且保持「折叠组内行可被查询」的既有行为）；超过该值才等首次
+   展开——5000 条归档/孤儿会话每次整树重建会创建 ~73K DOM 元素，卡住数秒。 */
+const EAGER_GROUP_MAX = 50;
+
 /* 「历史子会话 (N)」折叠分组：只收 active === false 的 inactive subagent
    （live 直显组之外），默认收起，点击展开；展开状态与主会话 expanded 同
    Set 持久（内存态，不落盘）——键按宿主区分：主树内 = wsId:hist:parentSid，
@@ -2554,7 +2559,8 @@ function buildHistGroup(kids, wsId, parentSid) {
   const expanded = state.sidebar.expanded.has(key);
   children.hidden = !expanded;
   if (expanded) toggle.classList.add("open");
-  renderSubagentRows(children, kids, true, wsId);
+  children._lazyRender = () => renderSubagentRows(children, kids, true, wsId);
+  if (expanded || kids.length <= EAGER_GROUP_MAX) children._lazyRender();
   node.appendChild(children);
   return node;
 }
@@ -2576,7 +2582,8 @@ function buildTreeGroup(label, kids, wsId) {
   const expanded = state.sidebar.expanded.has(key);
   children.hidden = !expanded;   // 「未关联」分组默认折叠，点击展开
   if (expanded) toggle.classList.add("open");
-  renderTreeChildren(children, kids, wsId, null);   // 组内历史组键 = wsId:hist:__orphans__
+  children._lazyRender = () => renderTreeChildren(children, kids, wsId, null);   // 组内历史组键 = wsId:hist:__orphans__
+  if (expanded || kids.length <= EAGER_GROUP_MAX) children._lazyRender();
   node.appendChild(children);
   return node;
 }
@@ -2613,11 +2620,14 @@ function buildArchiveGroup(archivedSessions, wsId, childrenByParent) {
   const expanded = state.sidebar.expanded.has(key);
   children.hidden = !expanded;
   if (expanded) toggle.classList.add("open");
-  for (const s of roots) {
-    if (!isMain(s)) { renderSubagentRows(children, [s], true, wsId); continue; }
-    children.appendChild(buildTreeRoot(s, childrenByParent.get(s.id) || [], wsId));
-  }
-  if (subRows.length) renderSubagentRows(children, subRows, true, wsId);
+  children._lazyRender = () => {
+    for (const s of roots) {
+      if (!isMain(s)) { renderSubagentRows(children, [s], true, wsId); continue; }
+      children.appendChild(buildTreeRoot(s, childrenByParent.get(s.id) || [], wsId));
+    }
+    if (subRows.length) renderSubagentRows(children, subRows, true, wsId);
+  };
+  if (expanded || archivedSessions.length <= EAGER_GROUP_MAX) children._lazyRender();
   node.appendChild(children);
   return node;
 }
@@ -2631,6 +2641,9 @@ function toggleTreeGroup(ev, toggle, key) {
   if (children.hidden) {
     children.hidden = false;
     toggle.classList.add("open");
+    // 懒渲染：折叠期间不建子行 DOM，首次展开时才渲染（小分组已在构建时
+    // 渲染过，firstChild 非空即跳过）；收起保留 DOM，再展开不重建。
+    if (children._lazyRender && !children.firstChild) children._lazyRender();
     state.sidebar.expanded.add(key);
   } else {
     children.hidden = true;
