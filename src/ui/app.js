@@ -91,14 +91,14 @@ const state = {
     draggingPin: false,      // 置顶拖拽进行中：轮询期间跳过树重绘，防被 capture 的行节点被重建打断（同 renameActive）
   },
   tasks: {                   // 运行中任务（composer 折叠条/面板 + 消息列表输出块）
-    timer: null,             // 统一轮询定时器（2s 常驻；替代原徽标/面板双轮询）
     list: [],                // 多 workspace 聚合的最近一次 /api/tasks 全量结果
                              //（每任务带 _ws 标记；面板按激活 workspace 过滤，
                              //  侧边栏环绕点消费全量）
     byWorkspace: {},         // workspaceId -> task[]：各 workspace 独立的 /api/tasks
                              // 缓存（聚合轮询的 stale 保留 + 面板过滤数据源）
     finished: [],            // 已完成任务（GET /api/tasks/finished，来自持久化
-                             // session_entries，newest first；每项带 _ws 标记）
+                             // session_entries，newest first；每项带 _ws 标记；
+                             // 「已完成」小节展开时才按需拉取，不随任务拉取刷新）
     finishedByWorkspace: {}, // workspaceId -> finished[]：已完成列表的 per-workspace
                              // 缓存（stale 保留 + 面板过滤数据源）
     cancelling: new Set(),   // 正在取消的任务 id（防重复点击）
@@ -436,7 +436,6 @@ async function switchWorkspace(id, epoch) {
   // not be allowed to paint into the newly active workspace.
   if (usageDashboardState.open) closeUsageDashboard(false);
   stopPolling();
-  stopTasksPolling();
   stopTaskRows();
   closeForkMenu();
   stopSSE();
@@ -511,7 +510,6 @@ async function switchWorkspace(id, epoch) {
   // ---- 重跑启动加载序列（与 init() 的加载部分一致） ----
   startPolling();
   pollSessions();   // 立即轮询经 runPollRound 与定时轮询共用 in-flight 守卫
-  startTasksPolling();
   pollTasks();
 }
 

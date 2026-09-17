@@ -1,5 +1,5 @@
 /* =============================================================================
- * tasks.js — 运行中任务：/api/tasks 统一轮询（fetchTasks/pollTasks）、
+ * tasks.js — 运行中任务：/api/tasks 按需拉取（fetchTasks/pollTasks）、
  * composer 任务面板（renderComposerTasks/renderTaskList，卡片内就地展开：
  * bash 流式轮询 .task-output / delegate 内嵌 SSE 流式 .task-stream）、
  * 任务取消（cancelTask）。
@@ -13,7 +13,9 @@
  *      面板内每行一张任务卡片：bash 点击就地展开/收起 .task-output 并
  *      500ms 流式轮询 output 端点；delegate 点击切到 subagent 会话
  *      （解析不到时回退就地展开 .task-stream 内嵌 SSE）。
- * 统一轮询 pollTasks()（2s 常驻）：一次 GET /api/tasks 更新面板。
+ * 按需拉取：pollTasks()（初始化 / SSE 工具事件 / 页面重新可见时调用，无
+ * 定时器）一次 GET /api/tasks 更新面板；「已完成」小节只在展开时
+ * GET /api/tasks/finished（loadFinishedTasks），不预加载。
  * ===================================================================*/
 /* GET /api/tasks → 任务数组；失败/无 token 返回 null（调用方决定如何处理）。
    ws 指定目标 workspace（apiFor 按 ws 的 base/token 发请求）：多 workspace
@@ -60,7 +62,7 @@ async function fetchFinishedTasks(ws) {
   }
 }
 
-/* 统一任务轮询（防重入：seq 竞态序号只应用最新一次响应）。
+/* 运行中任务拉取（防重入：seq 竞态序号只应用最新一次响应）。
    多 workspace 聚合：遍历 state.workspaces，每个 workspace 经 apiFor 各自
    拉 /api/tasks（与 pollAllWorkspaces 同款语义），合并成一份全量列表存
    state.tasks.list——侧边栏环绕点按 session_id 匹配父会话，需要全量。
@@ -68,9 +70,8 @@ async function fetchFinishedTasks(ws) {
    单 workspace / 未配置时行为与旧版一致（只拉激活 workspace 一份）。
    某 workspace 拉取失败 → 保留其旧缓存（stale，与单服务器语义一致），
    不参与本轮合并。
-   已完成列表同轮并行拉取（state.tasks.finished + finishedByWorkspace），
-   渲染在面板底部的 finished 小节。live 与 finished 分别应用：慢的持久化
-   查询不会阻塞运行中任务面板。 */
+   已完成列表不在这里拉取：/api/tasks/finished 按需拉取（loadFinishedTasks，仅
+   用户展开「已完成」小节时触发），默认折叠/空闲时零流量。 */
 const taskRequests = new Map();
 
 function taskRequestKey(ws, kind) {
@@ -149,9 +150,29 @@ async function pollTasks() {
   const wss = (state.workspaces || []).slice();
   if (!wss.length && state.workspace) wss.push(state.workspace);
   const live = wss.map((ws) => pollTaskWorkspace(ws, "live", fetchTasks));
-  const finished = wss.map((ws) => pollTaskWorkspace(ws, "finished", fetchFinishedTasks));
-  void Promise.allSettled(finished);
+  // 「已完成」小节只在用户展开着时才顺带刷新：折叠（默认）时一次都不拉，因此
+  // 默认状态零 finished 流量；首次数据由展开动作触发（loadFinishedTasks）。
+  // live 与 finished 分别应用：慢的持久化查询不会阻塞运行中任务面板。
+  if (finishedSectionExpanded()) {
+    void Promise.allSettled(wss.map((ws) => pollTaskWorkspace(ws, "finished", fetchFinishedTasks)));
+  }
   await Promise.allSettled(live);
+}
+
+/* 「已完成」小节是否处于展开态（默认折叠）：它是 pollTasks 顺带刷新 finished
+   的唯一前提——未展开时任何路径都不拉取（首次加载见 loadFinishedTasks）。 */
+function finishedSectionExpanded() {
+  return state.tasks.finishedCollapsed === false;
+}
+
+/* 「已完成」小节按需拉取：用户点击展开小节时调用（首次加载入口；折叠/隐藏/
+   空闲/SSE 事件都不会经由这里拉取）。与 pollTasks 同款多 workspace 聚合 +
+   单飞 / 缓存应用路径；慢的持久化查询完成后经 applyTaskWorkspace 按签名重绘
+   小节。 */
+function loadFinishedTasks() {
+  const wss = (state.workspaces || []).slice();
+  if (!wss.length && state.workspace) wss.push(state.workspace);
+  return Promise.allSettled(wss.map((ws) => pollTaskWorkspace(ws, "finished", fetchFinishedTasks)));
 }
 
 /* Pointer activation after selecting text must leave that exact card alone. Keyboard
@@ -337,7 +358,8 @@ let lastTasksRenderedSig = "";
    过滤——其他 workspace 的任务只供侧边栏环绕点消费，不混入本 workspace 的
    面板/徽标。面板内容仅在展开时渲染（收起时只更新计数/箭头/高亮，不触碰
    DOM）。签名去重：数据未变且面板已渲染 → 跳过 renderTaskList，保留已展开
-   的卡片 DOM 与进行中的 output 轮询/SSE 流（2s 轮询不再每轮销毁重建）。 */
+   的卡片 DOM 与进行中的 output 轮询/SSE 流（事件触发的拉取重绘不再每轮
+   销毁重建）。 */
 function renderComposerTasks() {
   const bar = els.tasksToggleBar;
   if (!bar) return;
@@ -398,13 +420,11 @@ function renderComposerTasks() {
 /* 已完成小节（只读）：默认折叠，header 为真 <button>（aria-expanded/controls，
    键盘可达），点击切换 state.tasks.finishedCollapsed（页面内保持，刷新重置）；
    标题只写「已完成」，不显示精确数量（折叠/展开都保持简洁）；行与「更多」
-   包在 .tasks-finished-body 整体显隐，每次最多 20 条。 */
+   包在 .tasks-finished-body 整体显隐，每次最多 20 条。
+   数据不预加载：header 始终渲染（首次展开的入口），只有展开动作才拉取
+   （loadFinishedTasks），折叠不拉取；拉回后由 applyTaskWorkspace 按签名重绘。 */
 function renderFinishedSection(panel, finished) {
   const old = panel.querySelector(".tasks-finished");
-  if (!finished.length) {
-    if (old) old.remove();
-    return;
-  }
   const box = old || el("div", "tasks-finished");
   box.setAttribute("data-finished-sig", finishedListSig(finished));
   box.innerHTML = "";
@@ -424,6 +444,7 @@ function renderFinishedSection(panel, finished) {
     state.tasks.finishedCollapsed = !state.tasks.finishedCollapsed;
     body.hidden = state.tasks.finishedCollapsed;
     header.setAttribute("aria-expanded", String(!state.tasks.finishedCollapsed));
+    if (!state.tasks.finishedCollapsed) void loadFinishedTasks();   // 只有展开才拉取
   });
   box.appendChild(header);
   box.appendChild(body);
@@ -466,7 +487,7 @@ function startOutputPoller(key, t, pre, onPhase) {
   if (onPhase) onPhase("start");
   pre._userScrolled = false;   // 新一轮轮询从底部跟随开始；用户上滚后才锁定
   let intervalId = null;
-  // 只停自己的轮询：2s 重绘会先停旧轮询再启新轮询，旧 tick 的异步收尾
+  // 只停自己的轮询：任务拉取重绘会先停旧轮询再启新轮询，旧 tick 的异步收尾
   // 不能误清新轮询（竞态：key 相同）。
   const stop = (degraded) => {
     if (state.tasks.pollers.get(key) !== intervalId) return;
@@ -540,7 +561,7 @@ function stopTaskPoller(key) {
    live AssistantText → 替换；AssistantDelta → 追加。
    404（历史 subagent 会话已结束/不存在）→ 提示「任务已结束」。
    收起/任务消失/重绘 → abort 流。累积文本存 state.tasks.streamText，
-   2s 轮询重绘重启流时恢复，不闪断。 */
+   拉取重绘重启流时恢复，不闪断。 */
 function startTaskStream(t, key, streamEl, status) {
   stopTaskStream(key);
   const ctrl = new AbortController();
@@ -597,7 +618,7 @@ function startTaskStream(t, key, streamEl, status) {
       if (e && e.name === "AbortError") return;   // 主动收起/任务消失/重绘
       // 网络失败：保留已显示内容
     } finally {
-      // 只清自己的条目：2s 重绘会先 abort 旧流再启新流（key 相同），
+      // 只清自己的条目：拉取重绘会先 abort 旧流再启新流（key 相同），
       // 旧流的 finally 不能误删新流的 AbortController
       if (state.tasks.streams.get(key) === ctrl) state.tasks.streams.delete(key);
     }
@@ -609,8 +630,8 @@ function stopTaskStream(key) {
   if (ctrl) { ctrl.abort(); state.tasks.streams.delete(key); }
 }
 
-/* workspace / 会话导航的统一行级资源清理。除了主任务 2s 轮询，展开行还
-   各自持有 output interval 或 delegate SSE；导航时全部停止并清掉旧 DOM，
+/* workspace / 会话导航的统一行级资源清理。除了任务列表拉取（pollTasks），
+   展开行还各自持有 output interval 或 delegate SSE；导航时全部停止并清掉旧 DOM，
    防止旧 workspace/session 在后台继续请求。下次展开由最新 tasks.list 重建。 */
 function stopTaskRows() {
   for (const key of [...state.tasks.pollers.keys()]) stopTaskPoller(key);
@@ -1077,17 +1098,5 @@ async function cancelTask(t) {
     state.tasks.cancelling.delete(t.id);
   }
 }
-/* 统一任务轮询定时器（2s 常驻）：composer 折叠条/面板共用一次 /api/tasks。
-   与 pollSessions 的 2s 链错峰：首轮延迟 1000ms 再进入 2s 周期，避免两条
-   轮询同帧各自 Promise.all(5) 打出 10 个并发请求（相位偏移 1000ms）。 */
-const TASKS_POLL_OFFSET_MS = 1000;
-
-function startTasksPolling() {
-  stopTasksPolling();
-  state.tasks.timer = setTimeout(() => {
-    state.tasks.timer = setInterval(pollTasks, 2000);
-  }, TASKS_POLL_OFFSET_MS);
-}
-function stopTasksPolling() {
-  if (state.tasks.timer) { clearInterval(state.tasks.timer); state.tasks.timer = null; }
-}
+/* 任务列表现由事件/按需触发（init、SSE ToolResult/BackgroundCompleted、
+   页面重新可见、取消任务后），不再有常驻轮询定时器。 */

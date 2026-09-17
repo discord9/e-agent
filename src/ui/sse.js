@@ -740,18 +740,17 @@ function init() {
   try {
     if (localStorage.getItem("e-agent.sidebar.open") === "1") openSidebar();
   } catch (e) { /* 静默 */ }
-  // 运行中任务：统一轮询（2s 常驻）同时更新侧边栏树分组 + composer
-  // 折叠条/面板（无 token 时 fetchTasks 静默跳过；填 token 后下一轮生效）
-  startTasksPolling();
+  // 运行中任务：初始化拉一次更新侧边栏树分组 + composer 折叠条/面板
+  //（无 token 时 fetchTasks 静默跳过；之后由 SSE 工具事件与页面重新可见
+  // 触发，无常驻定时器——空闲时不打 /api/tasks）
   pollTasks();
-  // 页面隐藏（切标签页/最小化）时暂停两条 2s 轮询（会话 + 任务）：后台
-  // 标签页无需拉取，避免 5 workspace × 2 条轮询持续打服务器；重新可见时
-  // 立即补一轮再重启定时器（序列与 init/switchWorkspace 的启动一致）。
+  // 页面隐藏（切标签页/最小化）时暂停会话 2s 轮询：后台标签页无需拉取，
+  // 避免 5 workspace × 多条轮询持续打服务器；重新可见时立即补一轮会话 +
+  // 任务（pollTasks 单次；任务侧已无定时器，隐藏时无需额外处理）。
   // 只挂一次：init 是唯一启动入口。
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) {
       stopPolling();
-      stopTasksPolling();
     } else {
       if (shouldPollSessions()) {
         startPolling();
@@ -759,7 +758,6 @@ function init() {
       } else {
         stopPolling();
       }
-      startTasksPolling();
       pollTasks();
     }
   });
