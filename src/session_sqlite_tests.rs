@@ -4051,6 +4051,119 @@ async fn sessions_meta_set_archived_persists_and_survives_touch() {
     assert_eq!(latest.archived, Some(false), "restore stores Some(false)");
 }
 
+/// The sidebar-filter SQL fragment: `None` is empty (backward compatible),
+/// and a live set emits bound `?` placeholders — one per id, never
+/// interpolated.
+#[test]
+fn sidebar_filter_clause_binds_live_ids_after_the_snapshot_filter() {
+    assert_eq!(
+        sqlite_sidebar_filter_clause(None),
+        (String::new(), Vec::new())
+    );
+
+    let empty = HashSet::new();
+    let (clause, live) = sqlite_sidebar_filter_clause(Some(&empty));
+    assert!(clause.starts_with(" AND (s.pinned = 1"));
+    assert!(clause.contains("s.archived IS NOT 1"));
+    assert!(clause.contains("s.parent_session_id IS NULL"));
+    assert!(!clause.contains(" IN ("), "empty live set emits no IN list");
+    assert!(clause.ends_with(')'));
+    assert!(live.is_empty());
+
+    let live_set: HashSet<String> = ["a", "b", "c"].into_iter().map(str::to_owned).collect();
+    let (clause, live) = sqlite_sidebar_filter_clause(Some(&live_set));
+    assert!(
+        clause.contains("s.session_id IN (?, ?, ?)"),
+        "live ids are bound placeholders: {clause}"
+    );
+    assert_eq!(live.len(), 3);
+    assert!(live.iter().all(|id| live_set.contains(id)));
+}
+
+/// `list_meta_diagnostic(Some(live))` returns only the sidebar's default
+/// set — pinned sessions, unarchived roots, and live sessions — evaluated
+/// on each session's LATEST snapshot. The metadata table is an append-only
+/// audit log, so an archive or a late parent-link backfill must not be
+/// undone by an older row filtering back in.
+#[tokio::test]
+async fn list_meta_sidebar_filter_keeps_current_snapshot_state() {
+    let (_dir, path) = temp_db();
+    let wid = workspace_id();
+    let bound = format!("test-sql-sidebar-{}", crate::session::new_id());
+    let session = SqliteSession::connect(path.to_str().unwrap(), &wid, &bound)
+        .await
+        .unwrap();
+
+    for (id, parent) in [
+        ("keep-main", None),
+        ("arch-main", None),
+        ("pin-arch", None),
+        ("idle-child", Some("keep-main")),
+        ("live-child", Some("keep-main")),
+        ("late-child", None),
+    ] {
+        session
+            .create_meta(id, None, None, parent, None, None)
+            .await
+            .unwrap();
+    }
+    // Archive appends a newer snapshot; a later rename appends yet another
+    // carrying the flag. The older unarchived rows must never resurrect the
+    // session into the sidebar set.
+    session.set_archived("arch-main", true).await.unwrap();
+    session
+        .set_title("arch-main", Some("archived rename"))
+        .await
+        .unwrap();
+    session.set_archived("pin-arch", true).await.unwrap();
+    session.set_pinned("pin-arch", true).await.unwrap();
+    // Late parent-link backfill: the newest snapshot says child, an older
+    // row has no parent — the filter must read the newest.
+    session
+        .create_meta(
+            "late-child",
+            Some("model-late"),
+            None,
+            Some("keep-main"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Unfiltered list is unchanged (backward compatible `None`).
+    let all = session.list_meta().await.unwrap();
+    assert_eq!(all.len(), 6);
+    let archived = all
+        .iter()
+        .find(|m| m.session_id == "arch-main")
+        .expect("arch-main listed");
+    assert_eq!(archived.archived, Some(true));
+    assert_eq!(archived.title.as_deref(), Some("archived rename"));
+    let late = all
+        .iter()
+        .find(|m| m.session_id == "late-child")
+        .expect("late-child listed");
+    assert_eq!(late.parent_session_id.as_deref(), Some("keep-main"));
+
+    // Live child (its `active` flag is only merged in server-side, after
+    // this SQL filter) survives; the inactive child, the archived unpinned
+    // session, and the late-adopted child are filtered out.
+    let live: HashSet<String> = ["live-child".to_owned()].into_iter().collect();
+    let (rows, diagnostic) = session.list_meta_diagnostic(Some(&live)).await.unwrap();
+    let mut ids: Vec<&str> = rows.iter().map(|m| m.session_id.as_str()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["keep-main", "live-child", "pin-arch"]);
+    assert_eq!(diagnostic.logical_rows, 3);
+
+    // No live sessions at all: only pinned / unarchived roots survive.
+    let empty = HashSet::new();
+    let (rows, _) = session.list_meta_diagnostic(Some(&empty)).await.unwrap();
+    let mut ids: Vec<&str> = rows.iter().map(|m| m.session_id.as_str()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["keep-main", "pin-arch"]);
+}
+
 #[tokio::test]
 async fn sessions_meta_list_is_latest_wins() {
     // Multiple snapshots per session → exactly one list row with the

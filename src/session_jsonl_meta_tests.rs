@@ -642,6 +642,81 @@ async fn flag_setters_without_sidecar_are_noops() {
 }
 
 // ----------------------------------------------------------------------
+// sidebar filter (`?exclude=archived_children` pushdown)
+// ----------------------------------------------------------------------
+
+/// `list_meta_with_diagnostics` with the sidebar filter active returns only
+/// pinned sessions, unarchived roots, and live sessions — the same rule the
+/// SQL backends push into their current-snapshot query. `None` stays the
+/// unfiltered list.
+#[tokio::test]
+async fn sidebar_filter_keeps_pinned_roots_and_live_children() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = SessionStore::Jsonl;
+    for (id, parent) in [
+        ("keep-main", None),
+        ("arch-main", None),
+        ("pin-arch", None),
+        ("idle-child", Some("keep-main")),
+        ("live-child", Some("keep-main")),
+    ] {
+        store
+            .create_meta(temp.path(), id, None, None, parent, None, None)
+            .await
+            .unwrap();
+    }
+    store
+        .set_archived(temp.path(), "arch-main", true)
+        .await
+        .unwrap();
+    store
+        .set_archived(temp.path(), "pin-arch", true)
+        .await
+        .unwrap();
+    store
+        .set_pinned(temp.path(), "pin-arch", true)
+        .await
+        .unwrap();
+
+    // Unfiltered: every sidecar is listed.
+    let (all, _) = store
+        .list_meta_with_diagnostics(temp.path(), None)
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 5);
+    assert_eq!(
+        all.iter()
+            .find(|m| m.session_id == "arch-main")
+            .and_then(|m| m.archived),
+        Some(true),
+        "the latest snapshot carries the archive flag"
+    );
+
+    // Live child survives even though its `active` flag is only merged in
+    // after this backend filter runs; the inactive child and the archived
+    // unpinned session are gone.
+    let live: HashSet<String> = ["live-child".to_owned()].into_iter().collect();
+    let (rows, diagnostic) = store
+        .list_meta_with_diagnostics(temp.path(), Some(&live))
+        .await
+        .unwrap();
+    let mut ids: Vec<&str> = rows.iter().map(|m| m.session_id.as_str()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["keep-main", "live-child", "pin-arch"]);
+    assert_eq!(diagnostic.logical_rows, 3);
+
+    // Empty live set: only pinned / unarchived roots survive.
+    let empty = HashSet::new();
+    let (rows, _) = store
+        .list_meta_with_diagnostics(temp.path(), Some(&empty))
+        .await
+        .unwrap();
+    let mut ids: Vec<&str> = rows.iter().map(|m| m.session_id.as_str()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["keep-main", "pin-arch"]);
+}
+
+// ----------------------------------------------------------------------
 // delete
 // ----------------------------------------------------------------------
 

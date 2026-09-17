@@ -14,7 +14,7 @@
 //!
 //! Non-goals: no Storage trait, no migration of existing JSONL sessions.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -2454,31 +2454,48 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM {selected_from} WH
     /// `last_active_at` per session (explicit GROUP BY + JOIN — correct
     /// whether or not the engine auto-dedups same-PK rows at read time).
     pub async fn list_meta(&self) -> Result<Vec<SessionMeta>, String> {
-        Ok(self.list_meta_diagnostic().await?.0)
+        Ok(self.list_meta_diagnostic(None).await?.0)
     }
 
+    /// Latest metadata snapshot per session, newest activity first, with the
+    /// optional sidebar filter (`?exclude=archived_children`).
+    ///
+    /// `sidebar_filter` is the server's live-session id set: `Some` keeps
+    /// only the sidebar's default set — pinned sessions, unarchived roots,
+    /// and live sessions (main or child) — so the database returns only the
+    /// rows the sidebar needs. The predicate is applied to the CURRENT
+    /// (deduplicated) snapshot row, never to raw audit rows: the table is
+    /// an append-only log, so filtering before dedup would resurrect the
+    /// older unarchived/parent state of a session archived or adopted
+    /// after it was first written.
     pub async fn list_meta_diagnostic(
         &self,
+        sidebar_filter: Option<&HashSet<String>>,
     ) -> Result<(Vec<SessionMeta>, crate::session_store::ListMetaDiagnostics), String> {
         let lock_started = std::time::Instant::now();
         let conn = self.conn.lock().await;
         let connection_lock_wait_ms = lock_started.elapsed().as_millis();
         let query_started = std::time::Instant::now();
+        let (filter_clause, live_ids) = sqlite_sidebar_filter_clause(sidebar_filter);
+        let sql = format!(
+            "SELECT s.session_id, s.created_at, s.last_active_at, s.model, s.\"role\", \
+                    s.entry_count, s.parent_session_id, s.parent_task_id, s.title, s.pinned, \
+                    s.archived, s.writer \
+             FROM sessions s \
+             INNER JOIN ( \
+                 SELECT session_id, MAX(last_active_at) AS max_ts \
+                 FROM sessions WHERE workspace_id = ?1 GROUP BY session_id \
+             ) latest \
+               ON latest.session_id = s.session_id AND latest.max_ts = s.last_active_at \
+             WHERE s.workspace_id = ?1{filter_clause} \
+             ORDER BY s.last_active_at DESC"
+        );
+        let mut params: Vec<turso::Value> = vec![turso::Value::Text(self.workspace_id.clone())];
+        for id in &live_ids {
+            params.push(turso::Value::Text(id.clone()));
+        }
         let mut rows = conn
-            .query(
-                "SELECT s.session_id, s.created_at, s.last_active_at, s.model, s.\"role\", \
-                        s.entry_count, s.parent_session_id, s.parent_task_id, s.title, s.pinned, \
-                        s.archived, s.writer \
-                 FROM sessions s \
-                 INNER JOIN ( \
-                     SELECT session_id, MAX(last_active_at) AS max_ts \
-                     FROM sessions WHERE workspace_id = ?1 GROUP BY session_id \
-                 ) latest \
-                   ON latest.session_id = s.session_id AND latest.max_ts = s.last_active_at \
-                 WHERE s.workspace_id = ?1 \
-                 ORDER BY s.last_active_at DESC",
-                (self.workspace_id.as_str(),),
-            )
+            .query(&sql, turso::params_from_iter(params))
             .await
             .map_err(|e| format!("cannot list session metadata: {e}"))?;
         let query_ms = query_started.elapsed().as_millis();
@@ -2980,6 +2997,31 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM {selected_from} WH
     pub async fn rewrite(&self, _entries: &[SessionEntry]) -> Result<(), String> {
         Ok(())
     }
+}
+
+/// The sidebar-filter `AND (...)` fragment for
+/// [`SqliteSession::list_meta_diagnostic`], appended after
+/// `WHERE s.workspace_id = ?1`. `Some` keeps pinned sessions, unarchived
+/// roots, and live sessions (main or child) — evaluated on the CURRENT
+/// deduplicated snapshot row, because the table is an append-only audit
+/// log and a raw-row filter would resurrect older archived/parent state.
+/// Returns the fragment plus the ids to bind in placeholder order (empty
+/// when the filter is off); an empty live set emits the non-live disjuncts
+/// only. `pinned`/`archived` are 0/1 INTEGERs and may be NULL (`= 1` and
+/// `IS NOT 1` both treat NULL as "not set").
+fn sqlite_sidebar_filter_clause(sidebar_filter: Option<&HashSet<String>>) -> (String, Vec<String>) {
+    let Some(ids) = sidebar_filter else {
+        return (String::new(), Vec::new());
+    };
+    let mut clause =
+        " AND (s.pinned = 1 OR (s.archived IS NOT 1 AND s.parent_session_id IS NULL)".to_owned();
+    let live_ids: Vec<String> = ids.iter().cloned().collect();
+    if !live_ids.is_empty() {
+        let placeholders = vec!["?"; live_ids.len()].join(", ");
+        clause.push_str(&format!(" OR s.session_id IN ({placeholders})"));
+    }
+    clause.push(')');
+    (clause, live_ids)
 }
 
 // ----------------------------------------------------------------------

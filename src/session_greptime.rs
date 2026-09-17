@@ -6,7 +6,7 @@
 //! Non-goals: no Storage trait, no migration of existing JSONL sessions.
 
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
 use tokio_postgres::NoTls;
 
@@ -2342,39 +2342,57 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#);
     /// The table is append-only, so one session has many rows; ordered selectors
     /// avoid the aggregate self-join and its two full scans.
     pub async fn list_meta(&self) -> Result<Vec<SessionMeta>> {
-        Ok(self.list_meta_diagnostic().await?.0)
+        Ok(self.list_meta_diagnostic(None).await?.0)
     }
 
+    /// Latest metadata snapshot per session, newest activity first, with the
+    /// optional sidebar filter (`?exclude=archived_children`).
+    ///
+    /// `sidebar_filter` is the server's live-session id set plus the
+    /// workspace-scoped "live" signal for the sidebar: `Some` restricts the
+    /// result to the sidebar's default set — pinned sessions, unarchived
+    /// roots, and live sessions (main or child) — so the database returns
+    /// only the rows the sidebar needs. The predicate runs on the CURRENT
+    /// (deduplicated) snapshot values, never on raw audit rows: the table
+    /// is an append-only log, so filtering rows before dedup would
+    /// resurrect the older unarchived/parent state of a session archived or
+    /// adopted after it was first written.
     pub async fn list_meta_diagnostic(
         &self,
+        sidebar_filter: Option<&HashSet<String>>,
     ) -> Result<(Vec<SessionMeta>, crate::session_store::ListMetaDiagnostics)> {
         let query_started = std::time::Instant::now();
+        let (filter_clause, live_ids) = sidebar_filter_clause(sidebar_filter);
+        let sql = format!(
+            "SELECT session_id, created_at, last_active_at, model, \"role\", entry_count, \
+                    parent_session_id, parent_task_id, title, pinned, archived, writer \
+             FROM ( \
+                 SELECT \
+                     session_id, \
+                     last_value(ARRAY[created_at] ORDER BY last_active_at)[1] AS created_at, \
+                     last_value(ARRAY[last_active_at] ORDER BY last_active_at)[1] AS last_active_at, \
+                     last_value(ARRAY[model] ORDER BY last_active_at)[1] AS model, \
+                     last_value(ARRAY[\"role\"] ORDER BY last_active_at)[1] AS \"role\", \
+                     last_value(ARRAY[entry_count] ORDER BY last_active_at)[1] AS entry_count, \
+                     last_value(ARRAY[parent_session_id] ORDER BY last_active_at)[1] AS parent_session_id, \
+                     last_value(ARRAY[parent_task_id] ORDER BY last_active_at)[1] AS parent_task_id, \
+                     last_value(ARRAY[title] ORDER BY last_active_at)[1] AS title, \
+                     last_value(ARRAY[pinned] ORDER BY last_active_at)[1] AS pinned, \
+                     last_value(ARRAY[archived] ORDER BY last_active_at)[1] AS archived, \
+                     last_value(ARRAY[writer] ORDER BY last_active_at)[1] AS writer \
+                 FROM sessions \
+                 WHERE workspace_id = $1 \
+                 GROUP BY session_id \
+             ) current{filter_clause} \
+             ORDER BY current.last_active_at DESC"
+        );
+        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&self.workspace_id];
+        for id in &live_ids {
+            params.push(id);
+        }
         let rows = self
             .client
-            .query(
-                "SELECT session_id, created_at, last_active_at, model, \"role\", entry_count, \
-                        parent_session_id, parent_task_id, title, pinned, archived, writer \
-                 FROM ( \
-                     SELECT \
-                         session_id, \
-                         last_value(ARRAY[created_at] ORDER BY last_active_at)[1] AS created_at, \
-                         last_value(ARRAY[last_active_at] ORDER BY last_active_at)[1] AS last_active_at, \
-                         last_value(ARRAY[model] ORDER BY last_active_at)[1] AS model, \
-                         last_value(ARRAY[\"role\"] ORDER BY last_active_at)[1] AS \"role\", \
-                         last_value(ARRAY[entry_count] ORDER BY last_active_at)[1] AS entry_count, \
-                         last_value(ARRAY[parent_session_id] ORDER BY last_active_at)[1] AS parent_session_id, \
-                         last_value(ARRAY[parent_task_id] ORDER BY last_active_at)[1] AS parent_task_id, \
-                         last_value(ARRAY[title] ORDER BY last_active_at)[1] AS title, \
-                         last_value(ARRAY[pinned] ORDER BY last_active_at)[1] AS pinned, \
-                         last_value(ARRAY[archived] ORDER BY last_active_at)[1] AS archived, \
-                         last_value(ARRAY[writer] ORDER BY last_active_at)[1] AS writer \
-                     FROM sessions \
-                     WHERE workspace_id = $1 \
-                     GROUP BY session_id \
-                 ) current \
-                 ORDER BY current.last_active_at DESC",
-                &[&self.workspace_id],
-            )
+            .query(&sql, &params)
             .await
             .context("cannot list session metadata")?;
         let query_ms = query_started.elapsed().as_millis();
@@ -2772,6 +2790,33 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#);
     }
 }
 
+/// The `WHERE` fragment for the sidebar's `?exclude=archived_children` set,
+/// appended after the latest-snapshot subquery in
+/// [`GreptimeSession::list_meta_diagnostic`]. Keeps pinned sessions,
+/// unarchived roots, and the live session ids (main or child) — evaluated
+/// on the CURRENT deduplicated values, because the metadata table is an
+/// append-only audit log and a raw-row filter would resurrect older
+/// archived/parent state. Returns the fragment plus the ids to bind in
+/// placeholder order (empty when the filter is off); placeholders start at
+/// `$2`, after the workspace id.
+fn sidebar_filter_clause(sidebar_filter: Option<&HashSet<String>>) -> (String, Vec<String>) {
+    let Some(ids) = sidebar_filter else {
+        return (String::new(), Vec::new());
+    };
+    let mut clause = " WHERE current.pinned = true \
+                      OR (current.archived IS NOT true AND current.parent_session_id IS NULL)"
+        .to_owned();
+    let live_ids: Vec<String> = ids.iter().cloned().collect();
+    if !live_ids.is_empty() {
+        let placeholders = (0..live_ids.len())
+            .map(|i| format!("${}", i + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        clause.push_str(&format!(" OR current.session_id IN ({placeholders})"));
+    }
+    (clause, live_ids)
+}
+
 /// Build a multi-row INSERT with 7 bound parameters per row (workspace_id,
 /// session_id, seq, event_time, entry_kind, payload, is_error);
 /// schema_version is hardcoded as 1.
@@ -2852,6 +2897,32 @@ mod tests {
             }
         });
         assert_eq!(cursor.load(Ordering::Acquire), 29);
+    }
+
+    /// The SQL WHERE clause pushed into `list_meta_diagnostic` when the
+    /// sidebar filter is active: pinned OR unarchived root OR a live id
+    /// (bound placeholders, never interpolated). `None` and an empty live
+    /// set degrade to the non-live disjuncts only.
+    #[test]
+    fn sidebar_filter_clause_keeps_pinned_roots_and_live_ids() {
+        assert_eq!(sidebar_filter_clause(None), (String::new(), Vec::new()));
+
+        let empty = HashSet::new();
+        let (clause, live) = sidebar_filter_clause(Some(&empty));
+        assert!(clause.starts_with(" WHERE current.pinned = true"));
+        assert!(clause.contains("current.archived IS NOT true"));
+        assert!(clause.contains("current.parent_session_id IS NULL"));
+        assert!(!clause.contains(" IN ("), "empty live set emits no IN list");
+        assert!(live.is_empty());
+
+        let live_set: HashSet<String> = ["s1", "s2"].into_iter().map(str::to_owned).collect();
+        let (clause, live) = sidebar_filter_clause(Some(&live_set));
+        assert!(
+            clause.contains("current.session_id IN ($2, $3)"),
+            "live ids are bound placeholders: {clause}"
+        );
+        assert_eq!(live.len(), 2);
+        assert!(live.iter().all(|id| live_set.contains(id)));
     }
 
     fn conn_str() -> String {
@@ -5762,6 +5833,74 @@ mod tests {
     // ------------------------------------------------------------------
     // sessions — metadata audit table (integration)
     // ------------------------------------------------------------------
+
+    /// `list_meta_diagnostic(Some(live))` (the `?exclude=archived_children`
+    /// pushdown) keeps only pinned sessions, unarchived roots, and live ids,
+    /// evaluated on each session's LATEST snapshot: an archive or a late
+    /// parent-link backfill must not be undone by older rows. Runs only
+    /// with GREPTIME_PG set, against a fresh workspace id.
+    #[tokio::test]
+    async fn sessions_meta_sidebar_filter_keeps_current_snapshot_state() {
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = derive_workspace_id(Path::new(&format!(
+            "/tmp/e-agent-test-sidebar-{}",
+            crate::session::new_id()
+        )));
+        let sid = format!("gt-sidebar-{}", crate::session::new_id());
+        let session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+
+        for (id, parent) in [
+            ("keep-main", None),
+            ("arch-main", None),
+            ("pin-arch", None),
+            ("idle-child", Some("keep-main")),
+            ("live-child", Some("keep-main")),
+            ("late-child", None),
+        ] {
+            session
+                .create_meta(id, None, None, parent, None, None)
+                .await
+                .unwrap();
+        }
+        session.set_archived("arch-main", true).await.unwrap();
+        session
+            .set_title("arch-main", Some("archived rename"))
+            .await
+            .unwrap();
+        session.set_archived("pin-arch", true).await.unwrap();
+        session.set_pinned("pin-arch", true).await.unwrap();
+        session
+            .create_meta(
+                "late-child",
+                Some("model-late"),
+                None,
+                Some("keep-main"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let (all, _) = session.list_meta_diagnostic(None).await.unwrap();
+        assert_eq!(all.len(), 6, "unfiltered list unchanged");
+
+        let live: HashSet<String> = ["live-child".to_owned()].into_iter().collect();
+        let (rows, diagnostic) = session.list_meta_diagnostic(Some(&live)).await.unwrap();
+        let mut ids: Vec<&str> = rows.iter().map(|m| m.session_id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["keep-main", "live-child", "pin-arch"]);
+        assert_eq!(diagnostic.logical_rows, 3);
+
+        let empty = HashSet::new();
+        let (rows, _) = session.list_meta_diagnostic(Some(&empty)).await.unwrap();
+        let mut ids: Vec<&str> = rows.iter().map(|m| m.session_id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["keep-main", "pin-arch"]);
+    }
 
     #[tokio::test]
     async fn sessions_meta_create_list_touch_audit_delete() {

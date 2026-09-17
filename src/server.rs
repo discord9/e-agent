@@ -951,7 +951,10 @@ fn sidebar_excluded(meta: &SessionMeta) -> bool {
 }
 
 /// Apply the optional `?exclude=` filter to a merged session list. `None`
-/// and unknown values are a no-op (the pre-filter full list).
+/// and unknown values are a no-op (the pre-filter full list). For
+/// `?exclude=archived_children` the backend already applied the same rule
+/// (with the live-id set) before the merge; this stays as a
+/// defense-in-depth safety net over the merged list.
 fn apply_list_sessions_exclude(merged: &mut Vec<SessionMeta>, exclude: Option<&str>) {
     if exclude == Some(EXCLUDE_ARCHIVED_CHILDREN) {
         merged.retain(|meta| !sidebar_excluded(meta));
@@ -996,19 +999,35 @@ async fn list_sessions(
     // the child-handle backfill below must skip it — a stale same-id child
     // handle must never overwrite the authoritative registry state.
     let mut main_registry_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Live session ids (main registry + every live subagent handle) for the
+    // sidebar filter: `?exclude=archived_children` pushes this set into the
+    // backend so the database returns only pinned sessions, unarchived
+    // roots, and live sessions. The set is collected here, in the same
+    // registry snapshot the active metas come from.
+    let mut live_session_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (id, session) in state.registry.list() {
         main_registry_ids.insert(id.clone());
+        live_session_ids.insert(id.clone());
+        for (_, entry) in session.sessions.list() {
+            live_session_ids.insert(entry.session_id.clone());
+        }
         active.push(session_meta(&id, &session, root).await);
     }
     timing.live_ms = phase_start.elapsed().as_millis();
     let live_count = active.len();
+    // The sidebar's default poll knows its live set already; hand it to the
+    // backend so only the rows the sidebar needs leave the database (the
+    // in-memory filter below stays as a safety net). Unknown/absent
+    // `exclude` values keep the full list.
+    let sidebar_filter =
+        (query.exclude.as_deref() == Some(EXCLUDE_ARCHIVED_CHILDREN)).then_some(&live_session_ids);
     let phase_start = std::time::Instant::now();
     // Historical sessions from the metadata table (Greptime/SQLite audit
     // table; JSONL `.meta.jsonl` sidecars).
     let historical_result = {
         #[cfg(feature = "greptime")]
         if let Some(store) = request_read_store.as_ref() {
-            store.list_meta_with_diagnostics(root).await
+            store.list_meta_with_diagnostics(root, sidebar_filter).await
         } else if request_read_failed {
             Err(anyhow!(
                 "ephemeral Greptime sessions read connection unavailable"
@@ -1016,7 +1035,7 @@ async fn list_sessions(
         } else {
             async {
                 let store = meta_store(&state).await?;
-                store.list_meta_with_diagnostics(root).await
+                store.list_meta_with_diagnostics(root, sidebar_filter).await
             }
             .await
         }
@@ -1024,7 +1043,7 @@ async fn list_sessions(
         {
             async {
                 let store = meta_store(&state).await?;
-                store.list_meta_with_diagnostics(root).await
+                store.list_meta_with_diagnostics(root, sidebar_filter).await
             }
             .await
         }
@@ -1163,7 +1182,10 @@ async fn list_sessions(
     }
     // `?exclude=archived_children` (the 2s sidebar poll) runs AFTER the
     // handle backfill above: a live child looks inactive until its real
-    // status is merged in, and must survive the filter.
+    // status is merged in, and must survive the filter. The backend already
+    // dropped the rows this request must hide (the live-id filter is pushed
+    // into SQL / the sidecar scan), so this is a defense-in-depth safety
+    // net over the merged list.
     apply_list_sessions_exclude(&mut merged, query.exclude.as_deref());
     timing.merge_ms = phase_start.elapsed().as_millis();
     timing.total_ms = request_start.elapsed().as_millis();
@@ -1175,6 +1197,7 @@ async fn list_sessions(
             historical_count,
             merged.len(),
             subagent_label_count,
+            query.exclude.as_deref(),
         );
     }
     Json(merged)
@@ -1191,10 +1214,12 @@ fn list_sessions_slow_event(
     historical_count: usize,
     merged_count: usize,
     subagent_label_count: usize,
+    exclude: Option<&str>,
 ) {
     let diagnostics = timing.list_meta_diagnostics;
     tracing::warn!(
         kind = if degraded { "degraded" } else { "slow" },
+        exclude,
         total_ms = timing.total_ms,
         connect_ms = timing.connect_ms,
         live_ms = timing.live_ms,
@@ -3738,6 +3763,7 @@ mod tests {
         #[derive(Default)]
         struct Captured {
             kind: Option<String>,
+            exclude: Option<String>,
             total_ms: Option<u128>,
             connect_ms: Option<u128>,
             live_count: Option<usize>,
@@ -3752,6 +3778,7 @@ mod tests {
             fn record_str(&mut self, field: &Field, value: &str) {
                 match field.name() {
                     "kind" => self.kind = Some(value.to_owned()),
+                    "exclude" => self.exclude = Some(value.to_owned()),
                     "backend" => self.backend = Some(value.to_owned()),
                     _ => {}
                 }
@@ -3809,11 +3836,17 @@ mod tests {
                 34,
                 36,
                 0,
+                Some(EXCLUDE_ARCHIVED_CHILDREN),
             );
         });
 
         let captured = capture.inner.lock().unwrap().take().unwrap();
         assert_eq!(captured.kind.as_deref(), Some("slow"));
+        assert_eq!(
+            captured.exclude.as_deref(),
+            Some(EXCLUDE_ARCHIVED_CHILDREN),
+            "the slow-request warning logs the ?exclude= value"
+        );
         assert_eq!(captured.total_ms, Some(1000));
         assert_eq!(captured.connect_ms, Some(7));
         assert_eq!(captured.live_count, Some(2));

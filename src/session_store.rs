@@ -17,7 +17,7 @@
 //! [`SessionStore::clear_background_task`] /
 //! [`SessionStore::peek+consume].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 #[cfg(any(feature = "greptime", feature = "sqlite"))]
 use std::sync::Arc;
@@ -1973,7 +1973,10 @@ impl SessionStore {
 
     /// List the latest metadata snapshot per session (Greptime/SQLite:
     /// newest activity first from the audit table; JSONL: one tail-read of
-    /// each transcript's sidecar), newest activity first.
+    /// each transcript's sidecar), newest activity first. This is the
+    /// unfiltered data API; the server's sidebar read path is
+    /// [`Self::list_meta_with_diagnostics`] with the optional live-session
+    /// filter.
     pub async fn list_meta(&self, root: &Path) -> Result<Vec<SessionMeta>> {
         match self {
             SessionStore::Jsonl => jsonl_list_meta(root),
@@ -2010,21 +2013,28 @@ impl SessionStore {
 
     /// List metadata and collect backend timings for the server's slow-path
     /// diagnostic. The ordinary `list_meta` API above remains data-only.
+    ///
+    /// `sidebar_filter` is the sidebar's live-session id set
+    /// (`?exclude=archived_children`): `Some` pushes the filter down to the
+    /// backend (Greptime/SQLite: SQL on the current snapshot; JSONL: the
+    /// sidecar scan), `None` keeps the full list. The filter runs on meta
+    /// snapshots only — live handles are merged in by the server afterwards.
     pub async fn list_meta_with_diagnostics(
         &self,
         root: &Path,
+        sidebar_filter: Option<&HashSet<String>>,
     ) -> Result<(Vec<SessionMeta>, ListMetaDiagnostics)> {
         match self {
             SessionStore::Jsonl => {
                 let started = std::time::Instant::now();
-                let (rows, mut diagnostic) = jsonl_list_meta_diagnostic(root)?;
+                let (rows, mut diagnostic) = jsonl_list_meta_diagnostic(root, sidebar_filter)?;
                 diagnostic.backend_operation_ms = started.elapsed().as_millis();
                 Ok((rows, diagnostic))
             }
             #[cfg(feature = "greptime")]
             SessionStore::Greptime { session, .. } => {
                 let operation_started = std::time::Instant::now();
-                let (rows, mut diagnostic) = session.list_meta_diagnostic().await?;
+                let (rows, mut diagnostic) = session.list_meta_diagnostic(sidebar_filter).await?;
                 diagnostic.backend_operation_ms = operation_started.elapsed().as_millis();
                 Ok((rows, diagnostic))
             }
@@ -2035,7 +2045,7 @@ impl SessionStore {
                 let wait_ms = started.elapsed().as_millis();
                 let operation_started = std::time::Instant::now();
                 let (rows, mut diagnostic) = guard
-                    .list_meta_diagnostic()
+                    .list_meta_diagnostic(sidebar_filter)
                     .await
                     .map_err(anyhow::Error::msg)?;
                 diagnostic.facade_lock_wait_ms = wait_ms;
@@ -2825,11 +2835,27 @@ fn jsonl_touch_meta(root: &Path, session: &str) -> anyhow::Result<()> {
 /// they can never be mistaken for sessions. Sorted
 /// newest-activity-first, matching the SQLite query's ORDER BY.
 fn jsonl_list_meta(root: &Path) -> anyhow::Result<Vec<SessionMeta>> {
-    Ok(jsonl_list_meta_diagnostic(root)?.0)
+    Ok(jsonl_list_meta_diagnostic(root, None)?.0)
+}
+
+/// Whether the sidebar's `?exclude=archived_children` set keeps `meta`.
+/// Evaluated on the sidecar's LATEST snapshot, before the server merges
+/// live handles in: pinned rows and unarchived roots stay, and so does any
+/// session in `live` — the server's snapshot of the live registries (main
+/// or child), which is what keeps a live child listed even though its
+/// `active` flag is only filled in after this filter runs. Mirrors the
+/// Greptime/SQLite WHERE predicate (`pinned = true OR (archived IS NOT
+/// true AND parent_session_id IS NULL) OR session_id IN (live)`). Pure so
+/// the rule is unit-testable without a sidecar.
+fn sidebar_filter_keeps(meta: &SessionMeta, live: &HashSet<String>) -> bool {
+    meta.pinned == Some(true)
+        || (meta.archived != Some(true) && meta.parent_session_id.is_none())
+        || live.contains(&meta.session_id)
 }
 
 fn jsonl_list_meta_diagnostic(
     root: &Path,
+    sidebar_filter: Option<&HashSet<String>>,
 ) -> anyhow::Result<(Vec<SessionMeta>, ListMetaDiagnostics)> {
     let started = std::time::Instant::now();
     let directory = root.join(".e-agent/sessions");
@@ -2850,7 +2876,9 @@ fn jsonl_list_meta_diagnostic(
         diagnostic.sidecars_seen += 1;
         if let Some(meta) = jsonl_read_meta_snapshot(root, session_id)? {
             diagnostic.sidecars_opened += 1;
-            out.push(meta);
+            if sidebar_filter.is_none_or(|live| sidebar_filter_keeps(&meta, live)) {
+                out.push(meta);
+            }
         }
     }
     out.sort_by(|a, b| b.last_active_at.cmp(&a.last_active_at));
