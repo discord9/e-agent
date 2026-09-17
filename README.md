@@ -522,12 +522,25 @@ The built-in local tool set always includes the capability-relative file tools
 `read_file`, `write_file`, and `edit_file`, plus `bash`,
 `get_background_tasks`, and `cancel_background_task`. Main-agent sessions also
 register `delegate`; delegated subagents do not, which caps delegation depth at
-1. `web_search` is registered for either kind of session only when
-`EXA_API_KEY` is set to a non-whitespace value, or when `[web_search]` sets
-`api_key_file` / `api_key_env` in the config (process env wins). It searches
-public documentation and code examples through the Exa Context API. OpenCode's
-own Exa configuration is not inherited. Configured local MCP servers may add
-their tools to the main agent separately.
+1. `web_search` is registered for either kind of session when a backend is
+configured:
+
+```toml
+[web_search]
+provider = "searxng"                 # default: "exa"
+base_url = "http://127.0.0.1:8088"   # SearXNG only; no API key needed
+```
+
+With the default `provider = "exa"`, the tool is registered when `EXA_API_KEY`
+is set to a non-whitespace value or when `[web_search]` sets `api_key_file` /
+`api_key_env` (process env wins); queries go through the Exa Context API.
+With `provider = "searxng"`, it is registered from `base_url` alone — SearXNG
+needs no key, and setting `api_key_file` / `api_key_env` alongside it is a
+config error. SearXNG queries are `GET {base_url}/search?q=...&format=json`,
+and the `results` array (title/url/content) is returned as plain text. An
+unknown `provider` value is a config error. OpenCode's own Exa configuration
+is not inherited. Configured local MCP servers may add their tools to the
+main agent separately.
 The three file tools use a capability-relative directory rooted at the
 canonical workspace (the current directory by default). At startup, e-agent
 loads a non-empty `AGENTS.md` from that workspace root into the system context
@@ -688,9 +701,11 @@ parent's role.
 - The compile stage mounts the host rustc/rustup toolchain and runs with its PATH/RUSTUP_HOME; the run stage gets PATH `/bin:/usr/bin` and no toolchain mounts added by run_rust, so Cargo/toolchain is not supplied on the run-stage PATH/mounts (the prebuilt `/tmp/runner` and `/tmp/main` still run on system runtime libraries; no claim against a user-supplied cargo binary invoked by explicit path). No Cargo/crates, stdin, background/daemon execution, or custom env/mount/cwd/timeout; 60-second compile / 30-second run timeouts kill the group, reap, bound the drain, and confirm the group is gone before removing the scratch (uncertain teardown retains/quarantines it); output capped at 24 KiB head + 8 KiB tail. The run status is an in-sandbox wrapper over a private inherited socketpair (dumpable-off + CLOEXEC before exec, so no descendant can forge; exactly one packet then EOF, gated on outer bwrap exit 0), so an explicit `process::exit(134)` is never misreported as a signal; the result reports the source SHA-256, the stable commands, both stage statuses and captured output — the source text is not repeated.
 - Enabling `[code_mode]` fails closed at startup without Linux+bwrap+rustc; experimental, Linux-only, main-agent-only, no sandbox-escape model claimed beyond the exact bwrap policy above.
 
-Every `web_search` query is disclosed to Exa, a third party. Never include
-credentials, tokens, private repository contents, customer data, personal data,
-private issue text, or internal URLs. Returned text is untrusted web content:
+Every `web_search` query is disclosed to the configured backend — Exa, or the
+SearXNG instance from `[web_search] base_url` (which forwards it to its
+upstream search engines). Never include credentials, tokens, private repository
+contents, customer data, personal data, private issue text, or internal URLs.
+Returned text is untrusted web content:
 it may contain prompt injection, insecure code, or false claims. The tool does
 not open links, execute returned code, or fetch arbitrary URLs. This guidance
 is not a sandbox and cannot guarantee that a model will not disclose sensitive
@@ -1006,8 +1021,11 @@ Deliberately NOT hot-reloaded (restart required):
 - `[sandbox]` scalar policy and workspace/file capabilities are wired at
   startup (sandbox path edits are retained as unresolved source diagnostics).
 - `[session]` backend — stores are connected at startup.
-- `[web_search]` key changes — the key is injected into the process env once
-  at startup (`std::env::set_var` is only safe single-threaded).
+- `[web_search]` backend changes — the resolved key / SearXNG `base_url` is
+  injected into the process env once at startup (`std::env::set_var` is only
+  safe single-threaded). The SearXNG base URL travels through the internal
+  `E_AGENT_SEARXNG_BASE_URL` variable (plumbing shared with subagent sessions,
+  not a user-facing knob); both backends therefore need a restart to change.
 - `AGENTS.md` / skills instructions and existing sessions' models (existing
   sessions keep their model until a `/model` switch).
 
@@ -1053,7 +1071,8 @@ supported — no resources, prompts, or server-initiated notifications.
 - `OPENAI_BASE_URL` — API base URL, default: `https://api.openai.com/v1`.
 - `OPENAI_MODEL` — model name, default: `gpt-4o-mini`.
 - `EXA_API_KEY` — optional; a non-whitespace value enables `web_search` through
-  Exa Context.
+  Exa Context. `[web_search] provider = "searxng"` needs no environment
+  variable: its `base_url` comes from the config file only.
 - `RUST_BACKTRACE=1` — optional; appends a backtrace to ordinary `anyhow` error
   chains (and enables their full Rust verbosity). Rust panics always print a
   forced stack regardless of this setting.
@@ -1377,8 +1396,8 @@ unless `--max-rounds` sets an explicit cap; subagent tool rounds are unlimited.
 Config hot reload is deliberately scoped: `[models]`/`[providers]`/`[roles]`
 (and anything else read at session-build time) hot-reload in the server and
 TUI via mtime polling with validate-before-swap, but `[sandbox]`, the
-`[session]` backend, and web-search key env injection stay startup-fixed and
-require a restart. Reload emits sanitized per-source TOML leaf diagnostics;
+`[session]` backend, and the web-search backend env injection stay
+startup-fixed and require a restart. Reload emits sanitized per-source TOML leaf diagnostics;
 uncertain changes are `unknown`, and credential values are never compared.
 There is no reload HTTP endpoint, no watch(1)/inotify, and no per-section partial reload (a bad edit is rejected
 wholesale and the last good config is kept).
@@ -1386,8 +1405,11 @@ Reasoning-model `reasoning_content` is persisted in the session for
 display/audit; it is never sent back to the API, except by an explicit
 `deepseek_compat = true` thinking-mode tool-call profile (see Run).
 Web search deliberately has no browser, crawler, URL fetch, citations, domain
-filters, multiple providers or provider trait, retries, cache, background
-search, or remote MCP support.
+filters, provider registry or provider trait, fallback chain between backends,
+third provider, retries, cache, background search, or remote MCP support: it
+has exactly the two config-selected backends documented above (`exa`, the
+default, and `searxng`) and no per-engine behavior differences are
+special-cased.
 The web UI is a single self-contained HTML page, assembled from disk on
 every request in dev builds and compiled into the binary via `include_str!`
 in release builds: deliberately no frontend bundler/build pipeline, no

@@ -22,7 +22,8 @@ pub struct Config {
     /// exists; new roles are added where they are spawned.
     #[serde(default)]
     roles: HashMap<String, String>,
-    /// Optional `[web_search]` credentials for the Exa `web_search` tool.
+    /// Optional `[web_search]` backend for the `web_search` tool: Exa
+    /// credentials (default) or a SearXNG base URL.
     #[serde(default)]
     web_search: Option<WebSearch>,
     /// Optional `[sandbox]` policy shared by bash mounts and file tools.
@@ -285,8 +286,21 @@ fn default_true() -> bool {
 
 #[derive(Clone, Debug, Deserialize)]
 struct WebSearch {
+    /// Backend: `"exa"` (default when absent) or `"searxng"`.
+    provider: Option<String>,
+    /// SearXNG only: the base URL, e.g. `http://127.0.0.1:8088`.
+    base_url: Option<String>,
     api_key_file: Option<PathBuf>,
     api_key_env: Option<String>,
+}
+
+/// The provider selected by `[web_search]` (`exa` when `provider` is unset).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WebSearchProvider {
+    /// Exa (the default): the credential comes from `web_search_key`.
+    Exa,
+    /// SearXNG: searches go to `{base_url}/search` with no credential.
+    Searxng { base_url: String },
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -576,11 +590,54 @@ impl Config {
         profiles
     }
 
+    /// The provider selected by `[web_search]`, or None when the section is
+    /// absent; `exa` is the default when `provider` is unset. Validated
+    /// without resolving credentials: `provider = "searxng"` requires
+    /// `base_url` and forbids `api_key_file` / `api_key_env`, and any other
+    /// provider value is a config error. The Exa key itself comes from
+    /// [`Self::web_search_key`].
+    pub fn web_search_provider(&self) -> anyhow::Result<Option<WebSearchProvider>> {
+        let Some(web_search) = &self.web_search else {
+            return Ok(None);
+        };
+        match web_search.provider.as_deref() {
+            None | Some("exa") => Ok(Some(WebSearchProvider::Exa)),
+            Some("searxng") => {
+                if web_search.api_key_file.is_some() || web_search.api_key_env.is_some() {
+                    bail!(
+                        "[web_search] provider `searxng` must not set `api_key_file` or `api_key_env`"
+                    );
+                }
+                let base_url = web_search
+                    .base_url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|base_url| !base_url.is_empty())
+                    .ok_or_else(|| {
+                        anyhow!("[web_search] provider `searxng` requires `base_url`")
+                    })?;
+                Ok(Some(WebSearchProvider::Searxng {
+                    base_url: base_url.to_owned(),
+                }))
+            }
+            Some(provider) => bail!(
+                "[web_search] provider `{provider}` is not supported (expected `exa` or `searxng`)"
+            ),
+        }
+    }
+
     /// The Exa web-search API key from `[web_search]`, or None when the
-    /// section is absent. Process env `EXA_API_KEY` always wins over this
-    /// (callers check it first). Exactly one of `api_key_file` / `api_key_env`
-    /// must be set when the section is present.
+    /// section is absent or selects the SearXNG provider. Process env
+    /// `EXA_API_KEY` always wins over this (callers check it first). Exactly
+    /// one of `api_key_file` / `api_key_env` must be set for the Exa
+    /// provider.
     pub fn web_search_key(&self) -> anyhow::Result<Option<String>> {
+        if matches!(
+            self.web_search_provider()?,
+            Some(WebSearchProvider::Searxng { .. }) | None
+        ) {
+            return Ok(None);
+        }
         let Some(web_search) = &self.web_search else {
             return Ok(None);
         };

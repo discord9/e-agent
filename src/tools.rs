@@ -68,6 +68,58 @@ const READ_LIMIT: usize = 64 * 1024;
 const DEFAULT_READ_LINES: usize = 2000;
 const OUTPUT_LIMIT: usize = 64 * 1024;
 
+/// Resolved `web_search` backend: the Exa API key or a SearXNG base URL.
+/// The session factory resolves `[web_search]` once at startup and hands
+/// the setting over via the process environment (see
+/// [`SEARXNG_BASE_URL_ENV`]); the registration helpers below take it
+/// explicitly, so both backends are testable without touching the env.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum WebSearchSource {
+    /// Exa (the default provider): the API key.
+    Exa(String),
+    /// SearXNG: the base URL; requests go to `{base_url}/search` and carry
+    /// no credential.
+    Searxng(String),
+}
+
+impl WebSearchSource {
+    /// The registered tool, or None when the configured value is blank
+    /// (the tool stays unregistered, exactly like an absent Exa key).
+    fn into_tool(self) -> Option<WebSearch> {
+        match self {
+            Self::Exa(key) => {
+                let key = key.trim().to_owned();
+                (!key.is_empty()).then(|| WebSearch::new(key))
+            }
+            Self::Searxng(base_url) => {
+                let base_url = base_url.trim().to_owned();
+                (!base_url.is_empty()).then(|| WebSearch::searxng(base_url))
+            }
+        }
+    }
+}
+
+/// Internal transport for a config-selected SearXNG backend: the session
+/// factory sets this variable once at startup (single-threaded, like
+/// `EXA_API_KEY`) so subagent sessions, which load no global config, see the
+/// same backend. It is internal plumbing, never a user-facing knob.
+pub(crate) const SEARXNG_BASE_URL_ENV: &str = "E_AGENT_SEARXNG_BASE_URL";
+
+/// The resolved web-search backend from the process environment: the
+/// internal SearXNG base URL (an explicit `[web_search] provider` choice)
+/// wins over `EXA_API_KEY`; blank values are ignored.
+fn web_search_source_from_env() -> Option<WebSearchSource> {
+    let env_value = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+    };
+    env_value(SEARXNG_BASE_URL_ENV)
+        .map(WebSearchSource::Searxng)
+        .or_else(|| env_value("EXA_API_KEY").map(WebSearchSource::Exa))
+}
+
 /// Check whether bwrap is installed and user namespaces work.
 /// Used at startup and by sandbox tests to skip when unavailable.
 pub fn bwrap_available() -> bool {
@@ -119,9 +171,9 @@ pub fn builtins_with_bash_timeout(
     background_timeout: Option<Duration>,
     bash_timeout: Option<Duration>,
 ) -> (Vec<Box<dyn Tool>>, BackgroundTasks) {
-    builtins_with_exa_key(
+    builtins_with_web_search(
         workspace,
-        std::env::var("EXA_API_KEY").ok(),
+        web_search_source_from_env(),
         sandbox,
         read_only,
         background_timeout,
@@ -157,10 +209,10 @@ pub fn builtins_with_background(
     // Subagent / fixer: protect_git defaults to true so .git is read-only;
     // a role frontmatter `protect_git = false` opts out (needed under the
     // Windows sandbox, whose MVP cannot enforce the protection).
-    tools_with_background_and_exa_key(
+    tools_with_background_and_web_search(
         workspace,
         background,
-        std::env::var("EXA_API_KEY").ok(),
+        web_search_source_from_env(),
         sandbox,
         protect_git,
         read_only,
@@ -176,9 +228,9 @@ pub fn builtins_with_background(
     )
 }
 
-fn builtins_with_exa_key(
+fn builtins_with_web_search(
     workspace: Workspace,
-    exa_api_key: Option<String>,
+    web_search: Option<WebSearchSource>,
     sandbox: Option<crate::config::Sandbox>,
     read_only: bool,
     background_timeout: Option<Duration>,
@@ -186,10 +238,10 @@ fn builtins_with_exa_key(
 ) -> (Vec<Box<dyn Tool>>, BackgroundTasks) {
     let background = BackgroundTasks::new(background_timeout, sandbox.clone());
     // Main agent: protect_git = false so git worktree/add/commit work.
-    let tools = tools_with_background_and_exa_key(
+    let tools = tools_with_background_and_web_search(
         workspace,
         background.clone(),
-        exa_api_key,
+        web_search,
         sandbox,
         false,
         read_only,
@@ -226,10 +278,10 @@ pub(crate) fn read_only_sandbox(sandbox: &crate::config::Sandbox) -> crate::conf
 }
 
 #[allow(clippy::too_many_arguments)]
-fn tools_with_background_and_exa_key(
+fn tools_with_background_and_web_search(
     workspace: Workspace,
     background: BackgroundTasks,
-    exa_api_key: Option<String>,
+    web_search: Option<WebSearchSource>,
     sandbox: Option<crate::config::Sandbox>,
     protect_git: bool,
     read_only: bool,
@@ -280,11 +332,8 @@ fn tools_with_background_and_exa_key(
     {
         tools.push(tool);
     }
-    if let Some(key) = exa_api_key
-        .map(|key| key.trim().to_owned())
-        .filter(|key| !key.is_empty())
-    {
-        tools.push(Box::new(WebSearch::new(key)));
+    if let Some(tool) = web_search.and_then(WebSearchSource::into_tool) {
+        tools.push(Box::new(tool));
     }
     // Goal tools ride on every session (main + subagents): each session's
     // runner executes them against ITS OWN goal state, so a subagent can
