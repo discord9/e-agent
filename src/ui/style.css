@@ -705,6 +705,8 @@
   .tool-card .tool-result.tool-diff.expandable .diff-full { display: none; }
   .tool-card .tool-result.tool-diff.expandable.expanded .diff-full { display: block; }
   .tool-card .tool-result.tool-diff.expandable.expanded .diff-more { display: none; }
+  /* 同上：diff 视图展开后放开高度帽，全文完整铺开 */
+  .tool-card .tool-result.tool-diff.expandable.expanded { max-height: none; }
   /* 「复制结果」图标按钮（attachResultCopy）：read/edit/write 三路径统一——
      容器标 .diff-copy（position:relative + padding-top 让出按钮行），按钮
      绝对定位到结果区右上角（与 maybeTruncateEl .expand-copy 按钮组同款
@@ -968,6 +970,14 @@
   .expandable .expand-preview { display: inline; }
   .expandable .expand-full { display: none; }
   .expandable.expanded .expand-preview { display: none; }
+  /* 展开即真展开：放开折叠态的高度帽（.tool-result 14em / .task-snapshot-body
+     14em / .notice .notice-output），全部展开路径统一行为——展开后全文完整
+     铺开、页面滚动接管，不再挤在原高度的内滚框里。文件工具 diff 视图
+     （.tool-diff）的规则见 705 行附近，此处覆盖其余全部。 */
+  .expandable.expanded, .tool-card .expandable.expanded,
+  .tool-card .expandable.expanded pre, .notice .expandable.expanded pre {
+    max-height: none;
+  }
   .expandable.expanded .expand-full { display: inline; }
   /* 展开按钮：控件样式（底色+边框+圆角），紧跟正文 pre 后面，与正文明显区分 */
   .expand-toggle {
@@ -983,6 +993,19 @@
     color: var(--blue);
     user-select: none;
     transition: background 0.15s, border-color 0.15s;
+  }
+  /* 工具结果卡片内的展开按钮吸底：折叠态正文被 14em 高度帽截断，按钮
+     若随文档流排在长文末尾会被滚出可视区（要滚很久才看到）。sticky
+     bottom 让它始终浮在结果框底部可见，无需先滚动。展开后高度帽已放开
+     （max-height:none），按钮回到文末正常位置，吸底无副作用。
+     覆盖所有展开容器：tool-result、notice-output pre。 */
+  .tool-result .expand-toggle,
+  .notice pre.notice-output .expand-toggle {
+    position: sticky;
+    bottom: 0;
+    z-index: 2;
+    background: var(--base3);
+    box-shadow: 0 -2px 6px rgba(0,0,0,0.08);
   }
   .expand-toggle:hover { background: var(--base1); border-color: var(--blue); }
   /* 箭头由 CSS 绘制：收起=下指（▾ 语义），展开旋转 180° 上指（▴ 语义） */
@@ -1014,6 +1037,9 @@
     max-height: 14em;
     overflow-y: auto;
   }
+  /* notice 输出同样纳入「展开即真展开」：notice-output pre 自身是
+     expandable 容器（maybeTruncateEl 直接加 class），展开后放开高度帽。 */
+  .notice pre.notice-output.expandable.expanded { max-height: none; }
 
   /* 「复制全文」图标按钮（render.js maybeTruncateEl 长文本分支）：容器标
      .expand-copy；复制按钮（图标）绝对定位到正文区域右上角，正文第一行

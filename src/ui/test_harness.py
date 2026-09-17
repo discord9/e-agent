@@ -2844,13 +2844,15 @@ async function main(){
     const bigCard = lastCard();
     appendToolResult(false, "file edited (line 100)", state.acc, null);
     const bigRes = bigCard.querySelector(".tool-result");
-    // 预览区 = 卡片直属 diff-row（不含 .diff-full 全文区）；每侧 30 行 + 截断标记
+    // 预览区 = 卡片直属 diff-row（不含 .diff-full 全文区）；两侧合计
+    // DIFF_VIEW_LINES(9) 行（old 优先），new 全部进截断标记
     const bigPrevDel = diffRowsOf(bigCard, "diff-del").filter((r) => !r.closest(".diff-full"));
     const bigPrevAdd = diffRowsOf(bigCard, "diff-add").filter((r) => !r.closest(".diff-full"));
-    chk("edit_file truncates each side to 30",
-        bigPrevDel.length === 30 && bigPrevAdd.length === 30
-        && bigRes.querySelector(".diff-more").textContent === "−… (10 more lines)",
-        "more=" + JSON.stringify(bigRes.querySelector(".diff-more") && bigRes.querySelector(".diff-more").textContent));
+    const bigMores = [...bigRes.querySelectorAll(".diff-more")].map((d) => d.textContent);
+    chk("edit_file truncates preview to view lines",
+        bigPrevDel.length === 9 && bigPrevAdd.length === 0
+        && bigMores.includes("−… (31 more lines)") && bigMores.includes("+… (40 more lines)"),
+        "more=" + JSON.stringify(bigMores));
     // 【高】edit_file 截断 → 展开全文：expand-toggle + .diff-full（两侧剩余行），
     // 点击展开后 old/new 全文同时可见；容器标 expandable，含复制结果按钮
     const bigFull = bigRes.querySelector(".diff-full");
@@ -2869,9 +2871,9 @@ async function main(){
         bigRes.classList.contains("expandable") && !bigRes.classList.contains("expanded")
         && bigExpandBtn !== null && bigExpandBtn.textContent === "展开全文（内容）"
         && bigFull !== null
-        && bigFull.querySelectorAll(".diff-row").filter((r) => r.classList.contains("diff-del")).length === 10
-        && bigFull.querySelectorAll(".diff-row").filter((r) => r.classList.contains("diff-add")).length === 10
-        && bigFull.textContent.includes("old line 30") && bigFull.textContent.includes("new line 39"),
+        && bigFull.querySelectorAll(".diff-row").filter((r) => r.classList.contains("diff-del")).length === 31
+        && bigFull.querySelectorAll(".diff-row").filter((r) => r.classList.contains("diff-add")).length === 40
+        && bigFull.textContent.includes("old line 9") && bigFull.textContent.includes("new line 39"),
         "btn=" + (bigExpandBtn && bigExpandBtn.textContent)
         + " full=" + (bigFull ? bigFull.querySelectorAll(".diff-row").length : "null"));
     const clicksBig = (elsById["messages"]._listeners["click"] || []);
@@ -2959,11 +2961,11 @@ async function main(){
     appendToolResult(false, Array.from({ length: 40 }, (_, i) => "row " + i).join("\n"),
       state.acc, null);
     const longRes = longCard.querySelector(".tool-result");
-    chk("read_file truncated to 30 preview rows",
+    chk("read_file truncated to view-line preview rows",
         longRes.classList.contains("expandable") && !longRes.classList.contains("expanded")
         && longCard.querySelectorAll(".diff-row").length === 40
-        && longRes.querySelector(".diff-full").querySelectorAll(".diff-row").length === 10
-        && longRes.querySelector(".diff-more").textContent === "… (10 more lines)",
+        && longRes.querySelector(".diff-full").querySelectorAll(".diff-row").length === 31
+        && longRes.querySelector(".diff-more").textContent === "… (31 more lines)",
         "total=" + longCard.querySelectorAll(".diff-row").length);
     // 展开按钮可发现性：统一模板后 DOM 顺序 diff-more → diff-full → expand-toggle → copy
     const _kids = longRes._children.filter((c) => c instanceof El);
@@ -3057,10 +3059,10 @@ async function main(){
         + " copy=" + wBigKidIdx("copy-toggle"));
     chk("write_file truncated diff has expand + full rows",
         wBigRes.classList.contains("expandable")
-        && diffRowsOf(wBigCard, "diff-add").filter((r) => !r.closest(".diff-full")).length === 30
-        && wBigRes.querySelector(".diff-more").textContent === "+… (10 more lines)"
+        && diffRowsOf(wBigCard, "diff-add").filter((r) => !r.closest(".diff-full")).length === 9
+        && wBigRes.querySelector(".diff-more").textContent === "+… (31 more lines)"
         && wBigExpandBtn !== null && wBigExpandBtn.textContent === "展开全文（内容）"
-        && wBigRes.querySelector(".diff-full").querySelectorAll(".diff-row").length === 10
+        && wBigRes.querySelector(".diff-full").querySelectorAll(".diff-row").length === 31
         && wBigRes.querySelector(".diff-full").textContent.includes("w line 39"),
         "btn=" + (wBigExpandBtn && wBigExpandBtn.textContent)
         + " full=" + wBigRes.querySelector(".diff-full").querySelectorAll(".diff-row").length);

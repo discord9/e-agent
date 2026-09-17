@@ -287,27 +287,43 @@ function attachDiffExpand(resEl, label, fullRows) {
    单侧超 DIFF_LINE_LIMIT 行时：两侧预览 + 截断标记 + 一个「展开全文（内容）」
    按钮（展开后两侧全文同时显示）；末尾加「复制结果」（复制两侧原文拼接）。
    短 diff（两侧均 ≤30 行）：无展开按钮，仅「复制结果」。 */
+/* 视口内行数上限：折叠态高度帽 14em ÷ 约 1.4em/行 ≈ 9 行可视。
+   超过此行数的 diff 走预览+展开，让「展开」真正改变可视高度；
+   ≤9 行的短 diff 直出（14em 帽内完整可见，无交互成本）。 */
+const DIFF_VIEW_LINES = 9;
+
 function renderEditDiff(resEl, args, content) {
   const line = parseEditedLine(content);
   resEl.classList.add("tool-diff");
   resEl.appendChild(el("div", "diff-head",
     "file edited" + (line != null ? " (line " + line + ")" : "")));
-  const oldLines = diffLines(args.old), newLines = diffLines(args.new);
-  const oldTrunc = oldLines.length > DIFF_LINE_LIMIT, newTrunc = newLines.length > DIFF_LINE_LIMIT;
-  if (!oldTrunc && !newTrunc) {   // 短 diff：直接全量渲染，无展开机制
+  // 空 old/new 与 diffSideRows 同语义：视为 0 行（diffLines("") 会返回 [""]，
+  // 不特判则空侧渲染出幻影行，并抢占/污染预览截断行数与标记数字）
+  const oldLines = args.old === "" ? [] : diffLines(args.old);
+  const newLines = args.new === "" ? [] : diffLines(args.new);
+  const totalRows = oldLines.length + newLines.length;
+  if (totalRows <= DIFF_VIEW_LINES) {   // 短 diff：帽内完整可见，直出
     for (const r of diffSideRows(args.old, "−", line)) resEl.appendChild(r);
     for (const r of diffSideRows(args.new, "+", line)) resEl.appendChild(r);
     attachResultCopy(resEl, args.old + "\n" + args.new);   // 复制 = 旧+新原文
     return;
   }
-  // 截断：预览（每侧前 30 行 + 截断标记）+ 展开按钮 + 全文区（剩余行）。
-  // diffSideRows 自带截断标记行（"… (N more lines)"）；全文区只放剩余行。
-  for (const r of diffSideRows(args.old, "−", line)) resEl.appendChild(r);
-  for (const r of diffSideRows(args.new, "+", line)) resEl.appendChild(r);
+  // 超过可视行数：预览（两侧合计前 DIFF_VIEW_LINES 行）+ 展开全文。
+  // 预览按旧内容优先截断，剩余额度给新内容（镜像 TUI 旧上/新下顺序）。
+  const oldShown = Math.min(oldLines.length, DIFF_VIEW_LINES);
+  const newShown = Math.min(newLines.length, Math.max(0, DIFF_VIEW_LINES - oldShown));
+  for (let i = 0; i < oldShown; i++)
+    resEl.appendChild(diffRow("−", line != null ? line + i : null, oldLines[i]));
+  if (oldLines.length > oldShown)
+    resEl.appendChild(el("div", "diff-more", "−… (" + (oldLines.length - oldShown) + " more lines)"));
+  for (let i = 0; i < newShown; i++)
+    resEl.appendChild(diffRow("+", line != null ? line + i : null, newLines[i]));
+  if (newLines.length > newShown)
+    resEl.appendChild(el("div", "diff-more", "+… (" + (newLines.length - newShown) + " more lines)"));
   const full = [];
-  for (let i = DIFF_LINE_LIMIT; i < oldLines.length; i++)
+  for (let i = oldShown; i < oldLines.length; i++)
     full.push(diffRow("−", line != null ? line + i : null, oldLines[i]));
-  for (let i = DIFF_LINE_LIMIT; i < newLines.length; i++)
+  for (let i = newShown; i < newLines.length; i++)
     full.push(diffRow("+", line != null ? line + i : null, newLines[i]));
   attachDiffExpand(resEl, "内容", full);
   attachResultCopy(resEl, args.old + "\n" + args.new);
@@ -321,11 +337,16 @@ function renderEditDiff(resEl, args, content) {
 function renderWriteDiff(resEl, args, content) {
   resEl.classList.add("tool-diff");
   resEl.appendChild(el("div", "diff-head", content || "file written"));
-  for (const r of diffSideRows(args.content, "+", 1)) resEl.appendChild(r);
-  const lines = diffLines(args.content);
-  if (lines.length > DIFF_LINE_LIMIT) {
+  // 空 content：与 diffSideRows 同语义，不生成任何行（diffLines("") 会返回 [""]，
+  // 不特判会渲染出 1 个空 add row，并因 1 > 0 误走截断分支生成 diff-more/expand）
+  const lines = args.content === "" ? [] : diffLines(args.content);
+  const shown = Math.min(lines.length, DIFF_VIEW_LINES);
+  for (let i = 0; i < shown; i++)
+    resEl.appendChild(diffRow("+", 1 + i, lines[i]));
+  if (lines.length > shown) {
+    resEl.appendChild(el("div", "diff-more", "+… (" + (lines.length - shown) + " more lines)"));
     const full = [];
-    for (let i = DIFF_LINE_LIMIT; i < lines.length; i++)
+    for (let i = shown; i < lines.length; i++)
       full.push(diffRow("+", 1 + i, lines[i]));
     attachDiffExpand(resEl, "内容", full);
   }
@@ -358,14 +379,14 @@ function renderFileView(resEl, args, content) {
     rows.push(diffRow("", isFooter ? null : offset + i, lines[i], isFooter ? "diff-footer" : null));
   }
   resEl.classList.add("tool-diff");
-  if (rows.length <= DIFF_LINE_LIMIT) {
+  if (rows.length <= DIFF_VIEW_LINES) {
     for (const r of rows) resEl.appendChild(r);
     attachResultCopy(resEl, s);
     return;
   }
-  for (const r of rows.slice(0, DIFF_LINE_LIMIT)) resEl.appendChild(r);
-  resEl.appendChild(el("div", "diff-more", "… (" + (rows.length - DIFF_LINE_LIMIT) + " more lines)"));
-  attachDiffExpand(resEl, "内容", rows.slice(DIFF_LINE_LIMIT));
+  for (const r of rows.slice(0, DIFF_VIEW_LINES)) resEl.appendChild(r);
+  resEl.appendChild(el("div", "diff-more", "… (" + (rows.length - DIFF_VIEW_LINES) + " more lines)"));
+  attachDiffExpand(resEl, "内容", rows.slice(DIFF_VIEW_LINES));
   attachResultCopy(resEl, s);
 }
 
