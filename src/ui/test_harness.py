@@ -334,6 +334,14 @@ const FETCHES=[];
 const FETCH_HEADERS=[];   // 每个请求的 {url, method, headers}（全局 token 回退测试断言 Authorization）
 const FETCH_BODIES=[];    // 每个请求的 body（深链 resume 断言 POST {"id":...}）
 const FETCH_OPTS=[];      // 每个请求的 {url, method, cache}（apiFor cache:no-store 断言）
+// 侧边栏轮询 URL（带 exclude）：每个 workspace 身份的第一次列表请求是无过滤
+// 的完整列表（分组表头需要），此后都是带 exclude 的小轮询。计数断言把两者
+// 都算作「一次列表请求」，展开分组的按需补拉只在缓存缺隐藏条目时发生。
+const POLL_LIST_URL = "/api/sessions?exclude=archived_children";
+const POLL_LIST_URL_B = "http://b.local" + POLL_LIST_URL;
+const isListPollFetchA = (u) => u === POLL_LIST_URL || u === "/api/sessions";
+const isListPollFetchB = (u) => u === POLL_LIST_URL_B || u === "http://b.local/api/sessions";
+const isListPollFetch = (u) => isListPollFetchA(u) || isListPollFetchB(u);   // 两侧
 const sseChunks = [
   "event: snapshot\ndata: [{\"type\":\"notice\",\"text\":\"SNAPSHOT-SHOULD-BE-SKIPPED\"}]\n\n",
   "event: status\ndata: {\"status\":\"Busy\"}\n\n",
@@ -452,6 +460,7 @@ let taskOutputNetFail = false;
 // 轮询超时测试：workspace 轮询请求是否带了 AbortSignal
 let pollSignalSeen = false;
 // 会话列表响应（测试中可变）：默认 s1；Bug C 测试会替换成含 subagent 的列表
+// （同一个桩同时喂给完整列表首拉与带 ?exclude=archived_children 的小轮询）
 let sessionsData = [{id:"s1",status:"Idle",model:"kimi",created_at:"2024-01-01T00:00:00Z",entry_count:8,busy:false}];
 // 聚合模式：第二台服务器（url "http://b.local"）的独立列表 + 故障开关
 let sessionsDataB = [
@@ -586,7 +595,9 @@ globalThis.fetch=(url,opts={})=>{
         if (o.delay) return abortable(new Promise((resolve) => { historyResolve = resolve; }), signal);
         return resp(o.status, o.body, signal);
       }
-      if(url==="/api/sessions"&&m==="GET") {
+      // 列表端点：每个身份第一次请求完整列表（无参数），此后轮询带
+      // ?exclude=archived_children；展开分组的按需补拉也不带参数。
+      if((url==="/api/sessions"||url.startsWith("/api/sessions?"))&&m==="GET") {
         if (opts && opts.signal) pollSignalSeen = true;
         if (sessionsAFail) return resp(500, {}, signal);
         if (sessionsAListFailure === "network") return Promise.reject(new TypeError("network error"));
@@ -605,7 +616,7 @@ globalThis.fetch=(url,opts={})=>{
     if (tasksBHang) return abortable(new Promise(() => {}), signal);   // 永久 pending，仅 abort 可打断
     return resp(200, tasksDataB, signal);
   }
-  if(url==="http://b.local/api/sessions"&&m==="GET") {
+  if((url==="http://b.local/api/sessions"||url.startsWith("http://b.local/api/sessions?"))&&m==="GET") {
     if (bGetDelayed) return abortable(new Promise((resolve) => { bGetResolve = resolve; }), signal);
     if (sessionsPDelayed) return abortable(new Promise((resolve) => { sessionsPResolve = resolve; }), signal);
     if (sessionsBFail) return resp(500, {}, signal);
@@ -4768,7 +4779,10 @@ async function main(){
         && !wsSections[0].textContent.includes("b-orphan2"),
         "A-has=" + wsSections[0].textContent.includes("b-orphan2")
         + " B-has=" + wsSections[1].textContent.includes("b-orphan2"));
-    const bOrphanGroup = wsSections[1].querySelector(".tree-group");
+    // 组选择按文本定位：B 列表里可能另有（保留的）历史子会话组，DOM 顺序
+    // 不保证「未关联」是第一个 .tree-group。
+    const bOrphanGroup = wsSections[1].querySelectorAll(".tree-group")
+      .find((g) => (g.textContent || "").includes("未关联"));
     chk("agg orphan collision: under B 未关联 group",
         bOrphanGroup !== null
         && bOrphanGroup.textContent.includes("未关联")
@@ -6205,9 +6219,9 @@ async function main(){
     await pollAllWorkspaces();
     await flush();
     chk("global token empty: B not polled with A token",
-        !FETCH_HEADERS.slice(hMark).some((f) => f.url === "http://b.local/api/sessions"),
+        !FETCH_HEADERS.slice(hMark).some((f) => f.url === POLL_LIST_URL_B),
         "b=" + JSON.stringify(FETCH_HEADERS.slice(hMark)
-          .filter((f) => f.url === "http://b.local/api/sessions").map((f) => f.headers["Authorization"])));
+          .filter((f) => f.url === POLL_LIST_URL_B).map((f) => f.headers["Authorization"])));
     // 通过顶部 tokenInput 设置全局 token（模拟用户输入；展开/收起交互已由
     // 前序 token 折叠测试覆盖，这里直接驱动 input 事件）
     elsById["tokenInput"].value = "tok-g";
@@ -6231,15 +6245,15 @@ async function main(){
     await pollAllWorkspaces();
     await flush();
     chk("background B poll uses global token",
-        FETCH_HEADERS.slice(hMark).some((f) => f.url === "http://b.local/api/sessions"
+        FETCH_HEADERS.slice(hMark).some((f) => f.url === "http://b.local" + POLL_LIST_URL
           && f.headers["Authorization"] === "Bearer tok-g"),
         "b=" + JSON.stringify(FETCH_HEADERS.slice(hMark)
-          .filter((f) => f.url === "http://b.local/api/sessions").map((f) => f.headers["Authorization"])));
+          .filter((f) => f.url === "http://b.local" + POLL_LIST_URL).map((f) => f.headers["Authorization"])));
     chk("background A poll uses own token",
-        FETCH_HEADERS.slice(hMark).some((f) => f.url === "/api/sessions"
+        FETCH_HEADERS.slice(hMark).some((f) => f.url === POLL_LIST_URL
           && f.headers["Authorization"] === "Bearer tok-a"),
         "a=" + JSON.stringify(FETCH_HEADERS.slice(hMark)
-          .filter((f) => f.url === "/api/sessions").map((f) => f.headers["Authorization"])));
+          .filter((f) => f.url === POLL_LIST_URL).map((f) => f.headers["Authorization"])));
     // 切到 B：全局 token 保留、state.token 派生为全局、legacy 键不被覆盖
     const legacyBeforeSwitch = localStorage.getItem("eagent_token");
     switchWorkspace("wsB");
@@ -6716,6 +6730,32 @@ async function main(){
     const kidsBox = groupNode && groupNode.querySelector(".tree-children");
     chk("archive: 分组默认折叠",
         !!kidsBox && kidsBox.hidden === true, "hidden=" + (kidsBox && kidsBox.hidden));
+    // 侧边栏轮询带 exclude=archived_children（只拉默认可见子集）
+    chk("poll list URL carries exclude filter",
+        FETCHES.includes("/api/sessions?exclude=archived_children"),
+        "n=" + FETCHES.filter((u) => u === "/api/sessions?exclude=archived_children").length);
+    // 小轮询结果里没有归档 / inactive 子会话：合并必须把它们留在缓存里
+    // （否则展开过的「归档 (N)」分组会随下一次 2s 轮询闪没）。
+    const _polledSubset = [
+      { id: "s1", parent_session_id: null, model: "kimi", role: "main",
+        status: "Idle", entry_count: 8, active: true },
+    ];
+    const _prevCache = [
+      { id: "s1", parent_session_id: null, status: "Idle", entry_count: 7, active: true },
+      { id: "arch-1", parent_session_id: null, status: "Idle", active: true, archived: true },
+      { id: "sub-arch", parent_session_id: "s1", status: "Idle", active: true, archived: true },
+      { id: "x-hist", parent_session_id: "s1", status: "Idle", active: false },
+      { id: "gone", parent_session_id: null, status: "Idle", active: true },
+    ];
+    const _mergedCache = mergePolledSessions(_prevCache, _polledSubset);
+    chk("archive: filtered poll merge retains archived and inactive children",
+        _mergedCache.some((x) => x.id === "arch-1")
+        && _mergedCache.some((x) => x.id === "sub-arch")
+        && _mergedCache.some((x) => x.id === "x-hist")
+        && _mergedCache.some((x) => x.id === "s1" && x.entry_count === 8)
+        && !_mergedCache.some((x) => x.id === "gone")
+        && _mergedCache.filter((x) => x.id === "s1").length === 1,
+        "ids=" + _mergedCache.map((x) => x.id).join(","));
     // 展开分组 → 归档行可见（buildTreeRoot 保留，点击可打开）
     const gToggle = groupNode && groupNode.querySelector(".tree-toggle");
     for (const fn of (gToggle && gToggle._listeners["click"]) || []) fn(_noopEv);
@@ -7010,15 +7050,15 @@ async function main(){
     // 打开侧边栏仍立即刷新一次。
     stopPolling();
     state.sidebar.open = false;
-    const closedSessionFetches = FETCHES.filter((u) => u.endsWith("/api/sessions")).length;
+    const closedSessionFetches = FETCHES.filter(isListPollFetch).length;
     startPolling();
     chk("perf closed sidebar does not schedule polling",
         state.pollTimer === null && !shouldPollSessions(),
         "timer=" + String(state.pollTimer));
     await flush();
     chk("perf closed sidebar skips repeated fetch",
-        FETCHES.filter((u) => u.endsWith("/api/sessions")).length === closedSessionFetches,
-        "fetches=" + (FETCHES.filter((u) => u.endsWith("/api/sessions")).length - closedSessionFetches));
+        FETCHES.filter(isListPollFetch).length === closedSessionFetches,
+        "fetches=" + (FETCHES.filter(isListPollFetch).length - closedSessionFetches));
     state.sessionId = null;
     openSession("p1");
     chk("perf openSession leaves closed-sidebar polling stopped",
@@ -7139,10 +7179,12 @@ async function main(){
     let oldIdentityResolve = null;
     let oldIdentityKind = "auth";
     globalThis.fetch = (url, opts = {}) => {
-      if (url === "http://identity.old/api/sessions") {
+      // 每个身份的第一次列表请求是完整列表（无 exclude），之后是小轮询：
+      // 两者都要挂起（挂起的 401/格式响应才是被测的「迟到响应」）。
+      if (url.startsWith("http://identity.old/api/sessions")) {
         return new Promise((resolve) => { oldIdentityResolve = resolve; });
       }
-      if (url === "http://identity.new/api/sessions") {
+      if (url.startsWith("http://identity.new/api/sessions")) {
         return resp(200, [{ id: "identity-new", status: "Idle", active: true }], opts.signal);
       }
       return identityFetch(url, opts);
@@ -7257,19 +7299,19 @@ async function main(){
     renderWorkspaceSelect();
     renderSidebarTreeCalls = 0;
     stopPolling();
-    chk("perf poll timeout constant is 10s", POLL_TIMEOUT_MS === 10000,
+    chk("perf poll timeout constant is 30s", POLL_TIMEOUT_MS === 30000,
         "=" + POLL_TIMEOUT_MS);
     // 慢响应在途时连续两次立即轮询按 workspace 复用同一请求，不并发。
     sessionsPDelayed = true;
     sessionsPResolve = null;
-    const i1f = FETCHES.filter((u) => u === "/api/sessions").length;
+    const i1f = FETCHES.filter(isListPollFetchA).length;
     const i1t = scheduledTimeouts.length;
     const i1p1 = pollSessions();
     const i1p2 = pollSessions();   // 立即轮询复用每个 workspace 的在途请求
     await flush();
     chk("perf immediate polls no concurrent round",
-        FETCHES.filter((u) => u === "/api/sessions").length === i1f + 1,
-        "delta=" + (FETCHES.filter((u) => u === "/api/sessions").length - i1f));
+        FETCHES.filter(isListPollFetchA).length === i1f + 1,
+        "delta=" + (FETCHES.filter(isListPollFetchA).length - i1f));
     chk("perf workspace poll arms abort timeout",
         scheduledTimeouts.length === i1t + 2,   // 两个 workspace 各一个 abort 定时器
         "delta=" + (scheduledTimeouts.length - i1t));
@@ -7634,14 +7676,14 @@ async function main(){
     elsById["sidebar"].hidden = false;
     renderWorkspaceSelect();
     stopPolling();
-    const i6f0 = FETCHES.filter((u) => u === "http://b.local/api/sessions").length;
+    const i6f0 = FETCHES.filter(isListPollFetchB).length;
     const i6p1 = pollSessions();   // 初始立即轮询：在途（B 慢）
     await flush();
     const i6p2 = pollRound();      // 周期轮次复用在途的 workspace 请求
     await flush();
     chk("issue6 repeated round shares the workspace request while in-flight",
-        FETCHES.filter((u) => u === "http://b.local/api/sessions").length === i6f0 + 1,
-        "delta=" + (FETCHES.filter((u) => u === "http://b.local/api/sessions").length - i6f0));
+        FETCHES.filter(isListPollFetchB).length === i6f0 + 1,
+        "delta=" + (FETCHES.filter(isListPollFetchB).length - i6f0));
     // 显式停止轮询后，不再调度下一周期。
     stopPolling();
     openSession("p6");
@@ -7655,26 +7697,26 @@ async function main(){
     await i6p2;
     await flush();
     chk("issue6 stopped round does not run after first settles",
-        FETCHES.filter((u) => u === "http://b.local/api/sessions").length === i6f0 + 1,
-        "delta=" + (FETCHES.filter((u) => u === "http://b.local/api/sessions").length - i6f0));
+        FETCHES.filter(isListPollFetchB).length === i6f0 + 1,
+        "delta=" + (FETCHES.filter(isListPollFetchB).length - i6f0));
     // A new explicit refresh after the previous request settles starts a fresh
     // workspace request; periodic rounds never retain global queued intent.
     sessionsPDelayed = true;
     sessionsPResolve = null;
-    const i6f1 = FETCHES.filter((u) => u === "http://b.local/api/sessions").length;
+    const i6f1 = FETCHES.filter(isListPollFetchB).length;
     const i6p3 = pollSessions();
     await flush();
     chk("issue6 explicit refresh has no global queued round",
-        FETCHES.filter((u) => u === "http://b.local/api/sessions").length === i6f1 + 1,
-        "delta=" + (FETCHES.filter((u) => u === "http://b.local/api/sessions").length - i6f1));
+        FETCHES.filter(isListPollFetchB).length === i6f1 + 1,
+        "delta=" + (FETCHES.filter(isListPollFetchB).length - i6f1));
     sessionsPResolve(resp(200, sessionsDataB));
     await i6p3;
     await flush();
     const i6p4 = pollSessions();
     await flush();
     chk("issue6 settled refresh starts next workspace request",
-        FETCHES.filter((u) => u === "http://b.local/api/sessions").length === i6f1 + 2,
-        "delta=" + (FETCHES.filter((u) => u === "http://b.local/api/sessions").length - i6f1));
+        FETCHES.filter(isListPollFetchB).length === i6f1 + 2,
+        "delta=" + (FETCHES.filter(isListPollFetchB).length - i6f1));
     sessionsPResolve(resp(200, sessionsDataB));
     await i6p4;
     await flush();
@@ -7785,7 +7827,7 @@ async function main(){
     }
     chk("issue8 timeout abort timer armed", i8abort !== null,
         "none");
-    const i8fB = FETCHES.filter((u) => u === "http://b.local/api/sessions").length;
+    const i8fB = FETCHES.filter(isListPollFetchB).length;
     i8abort();   // 触发 10s 超时 → ctrl.abort() → B 的 pending fetch reject AbortError
     await i8p;
     await flush();
@@ -7793,8 +7835,8 @@ async function main(){
         state.workspaceErrors["wsT2"] === "timeout" && state.workspaceErrors["wsT1"] === null,
         JSON.stringify(state.workspaceErrors));
     chk("issue8 no new fetch on aborted round",
-        FETCHES.filter((u) => u === "http://b.local/api/sessions").length === i8fB,
-        "delta=" + (FETCHES.filter((u) => u === "http://b.local/api/sessions").length - i8fB));
+        FETCHES.filter(isListPollFetchB).length === i8fB,
+        "delta=" + (FETCHES.filter(isListPollFetchB).length - i8fB));
     // 下一轮恢复成功：B 正常 → 错误标记清除
     sessionsPDelayed = false;
     await pollSessions();
@@ -7897,7 +7939,7 @@ async function main(){
     _open404("sub-race", [{ id: "sub-race", status: "Idle", entry_count: 1, busy: false, active: true }]);
     sse404Ids.add("sub-race");
     const _to404d = scheduledTimeouts.length;
-    const _listFetchesD = FETCHES.filter((u) => u === "/api/sessions").length;
+    const _listFetchesD = FETCHES.filter(isListPollFetchA).length;
     connectSSE("sub-race", state.workspace.id, sessionOpenEpoch);
     await flush();
     chk("sse404 race: refresh pending, no banner yet",
@@ -7908,8 +7950,8 @@ async function main(){
         state.sse.stopped === true && state.sse.retryTimer === null,
         "stopped=" + state.sse.stopped);
     chk("sse404 race: list refresh issued for workspace",
-        FETCHES.filter((u) => u === "/api/sessions").length === _listFetchesD + 1,
-        "n=" + (FETCHES.filter((u) => u === "/api/sessions").length - _listFetchesD));
+        FETCHES.filter(isListPollFetchA).length === _listFetchesD + 1,
+        "n=" + (FETCHES.filter(isListPollFetchA).length - _listFetchesD));
     // 模拟刷新完成：服务端列表已把该 subagent 标记为结束（active:false）
     sessionsData = [{ id: "sub-race", status: "Idle", entry_count: 1, busy: false, active: false }];
     sessionsResolve(resp(200, sessionsData));

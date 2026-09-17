@@ -6,7 +6,7 @@
 //!
 //! | Method | Path                              | Semantics                          |
 //! |--------|-----------------------------------|------------------------------------|
-//! | GET    | `/api/sessions`                   | list active sessions               |
+//! | GET    | `/api/sessions`                   | list sessions (`?exclude=archived_children` = sidebar default set) |
 //! | POST   | `/api/sessions`                   | create a session                   |
 //! | GET    | `/api/sessions/{id}/events`       | SSE: snapshot, then live events    |
 //! | GET    | `/api/sessions/{id}/history`      | segmented history (head or older)  |
@@ -928,7 +928,40 @@ fn list_sessions_is_slow(timing: ListSessionsTiming, degraded: bool) -> bool {
     degraded || timing.total_ms >= LIST_SESSIONS_SLOW_THRESHOLD.as_millis()
 }
 
-async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionMeta>> {
+/// The one `?exclude=` value `GET /api/sessions` understands: the sidebar
+/// tree's default set (pinned sessions, unarchived roots, live children).
+const EXCLUDE_ARCHIVED_CHILDREN: &str = "archived_children";
+
+/// Query parameters of `GET /api/sessions`. Absent / unknown `exclude`
+/// values keep the full list (backward compatible).
+#[derive(Deserialize, Default)]
+struct ListSessionsQuery {
+    exclude: Option<String>,
+}
+
+/// Whether `?exclude=archived_children` drops this entry: archived sessions
+/// unless they are pinned, and inactive subagent children. Pinned rows stay
+/// (the sidebar shows them in its 归档 group), and live children must not be
+/// dropped — their `active` flag is only true after `list_sessions` merges
+/// the real handles in, so this predicate runs after that merge. Pure so the
+/// rule is unit-testable without a backend.
+fn sidebar_excluded(meta: &SessionMeta) -> bool {
+    (meta.archived == Some(true) && meta.pinned != Some(true))
+        || (meta.parent_session_id.is_some() && !meta.active)
+}
+
+/// Apply the optional `?exclude=` filter to a merged session list. `None`
+/// and unknown values are a no-op (the pre-filter full list).
+fn apply_list_sessions_exclude(merged: &mut Vec<SessionMeta>, exclude: Option<&str>) {
+    if exclude == Some(EXCLUDE_ARCHIVED_CHILDREN) {
+        merged.retain(|meta| !sidebar_excluded(meta));
+    }
+}
+
+async fn list_sessions(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ListSessionsQuery>,
+) -> Json<Vec<SessionMeta>> {
     let request_start = std::time::Instant::now();
     let mut timing = ListSessionsTiming::default();
     let mut degraded = false;
@@ -1128,6 +1161,10 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionMe
             apply_subagent_label(meta, label.clone());
         }
     }
+    // `?exclude=archived_children` (the 2s sidebar poll) runs AFTER the
+    // handle backfill above: a live child looks inactive until its real
+    // status is merged in, and must survive the filter.
+    apply_list_sessions_exclude(&mut merged, query.exclude.as_deref());
     timing.merge_ms = phase_start.elapsed().as_millis();
     timing.total_ms = request_start.elapsed().as_millis();
     if list_sessions_is_slow(timing, degraded) {
@@ -7052,7 +7089,12 @@ model = "deepseek-chat"
             .registry
             .insert("web-parent-nohandle".to_owned(), nohandle);
 
-        let listed = list_sessions(State(state)).await.0;
+        let listed = list_sessions(
+            State(state.clone()),
+            Query(ListSessionsQuery { exclude: None }),
+        )
+        .await
+        .0;
         let by_id: HashMap<&str, &SessionMeta> =
             listed.iter().map(|m| (m.id.as_str(), m)).collect();
 
@@ -7103,7 +7145,167 @@ model = "deepseek-chat"
         let m = by_id["sub-multi"];
         assert_eq!((m.active, m.status.as_str(), m.busy), (true, "Busy", true));
 
+        // 9) `?exclude=archived_children` ran AFTER the handle backfill: every
+        //    live child survives, only the stale/no-handle child is dropped.
+        let filtered = list_sessions(
+            State(state.clone()),
+            Query(ListSessionsQuery {
+                exclude: Some(EXCLUDE_ARCHIVED_CHILDREN.to_owned()),
+            }),
+        )
+        .await
+        .0;
+        let kept: HashSet<&str> = filtered.iter().map(|m| m.id.as_str()).collect();
+        assert!(
+            !kept.contains("sub-stale"),
+            "inactive child without a live handle is excluded"
+        );
+        for id in [
+            "sub-busy",
+            "sub-compact",
+            "sub-idle",
+            "sub-finished",
+            "sub-nolabel",
+            "sub-multi",
+        ] {
+            assert!(kept.contains(id), "live child {id} survives the filter");
+        }
+
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The `?exclude=archived_children` predicate (sidebar default set):
+    /// archived unpinned sessions and inactive subagent children leave the
+    /// list; pinned archived rows and live children stay, and historical
+    /// main sessions (resumable, but `active: false`) stay too.
+    #[test]
+    fn sidebar_excluded_keeps_pinned_archived_and_live_entries() {
+        let meta = |archived: Option<bool>,
+                    pinned: Option<bool>,
+                    parent: Option<&str>,
+                    active: bool| SessionMeta {
+            id: "test-session".to_owned(),
+            model: "test-model".to_owned(),
+            role: None,
+            created_at: chrono::Utc::now(),
+            last_active_at: chrono::Utc::now(),
+            status: "Idle".to_owned(),
+            entry_count: 0,
+            busy: false,
+            active,
+            parent_session_id: parent.map(str::to_owned),
+            title: None,
+            pinned,
+            archived,
+            label: None,
+        };
+        // Archived unpinned (main or child) → excluded.
+        assert!(sidebar_excluded(&meta(Some(true), None, None, true)));
+        assert!(sidebar_excluded(&meta(
+            Some(true),
+            Some(false),
+            Some("parent"),
+            true
+        )));
+        // Pinned archived → kept (the sidebar renders it in its 归档 group).
+        assert!(!sidebar_excluded(&meta(Some(true), Some(true), None, true)));
+        // Inactive child → excluded; live child → kept.
+        assert!(sidebar_excluded(&meta(None, None, Some("parent"), false)));
+        assert!(!sidebar_excluded(&meta(None, None, Some("parent"), true)));
+        // Historical main sessions are resumable roots: never excluded.
+        assert!(!sidebar_excluded(&meta(Some(false), None, None, false)));
+        assert!(!sidebar_excluded(&meta(None, Some(false), None, false)));
+    }
+
+    /// `GET /api/sessions?exclude=archived_children` end to end over the
+    /// router (JSONL backend): the parameter is read from the query string,
+    /// drops archived unpinned sessions + inactive children, and no
+    /// parameter / an unknown value keep the full pre-filter list.
+    #[tokio::test]
+    async fn list_sessions_route_excludes_archived_children() {
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        async fn get(app: &axum::Router, uri: &str) -> (StatusCode, Vec<u8>) {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header(header::AUTHORIZATION, "Bearer sekrit")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec();
+            (status, body)
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let store = SessionStore::Jsonl;
+        for (id, parent) in [
+            ("keep-main", None),
+            ("arch-main", None),
+            ("pin-arch", None),
+            ("idle-child", Some("keep-main")),
+        ] {
+            store
+                .create_meta(&root, id, Some("test-model"), None, parent, None, None)
+                .await
+                .unwrap();
+        }
+        store.set_archived(&root, "arch-main", true).await.unwrap();
+        store.set_archived(&root, "pin-arch", true).await.unwrap();
+        store.set_pinned(&root, "pin-arch", true).await.unwrap();
+        let state = Arc::new(AppState {
+            factory: crate::session_factory::SessionFactory::test_factory(root),
+            registry: Arc::new(SessionRegistry::default()),
+            token: "sekrit".to_owned(),
+            meta_store: SessionStore::Jsonl,
+            summaries: Arc::new(Mutex::new(HashMap::new())),
+            summary_pending: Arc::new(SummaryPending(Mutex::new(HashSet::new()))),
+            shutdown: watch::channel(()).0,
+        });
+        let app = router(state);
+        let listed_ids = |body: &[u8]| -> Vec<String> {
+            let rows: Vec<serde_json::Value> = serde_json::from_slice(body).unwrap();
+            let mut ids: Vec<String> = rows
+                .iter()
+                .map(|row| row["id"].as_str().unwrap().to_owned())
+                .collect();
+            ids.sort();
+            ids
+        };
+
+        let (status, body) = get(&app, "/api/sessions").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            listed_ids(&body),
+            ["arch-main", "idle-child", "keep-main", "pin-arch"],
+            "no parameter keeps the full list"
+        );
+
+        let (status, body) = get(&app, "/api/sessions?exclude=archived_children").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            listed_ids(&body),
+            ["keep-main", "pin-arch"],
+            "archived unpinned and inactive child are excluded"
+        );
+
+        let (status, body) = get(&app, "/api/sessions?exclude=unknown").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            listed_ids(&body).len(),
+            4,
+            "unknown exclude values keep the full list"
+        );
     }
 
     /// The web addresses a subagent by session id exactly like the TUI:

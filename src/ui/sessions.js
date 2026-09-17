@@ -65,6 +65,13 @@ function applyValidation(problems) {
    按失败处理（保留旧列表 stale，标记 workspaceErrors）。 */
 const POLL_TIMEOUT_MS = 30000;
 
+/* 会话列表端点：每个 workspace 身份的第一次请求拉完整列表（分组表头 +
+   展开数据），此后每 2s 的轮询只取侧边栏默认可见子集（服务端过滤归档 +
+   inactive 子会话）；展开「归档」/「历史子会话」/「更早的会话」且缓存缺
+   数据时由 ensureFullSessions 按需补拉完整列表。 */
+const SESSIONS_PATH = "/api/sessions";
+const SESSIONS_POLL_PATH = SESSIONS_PATH + "?exclude=archived_children";
+
 /* 深链 history 有界超时：恶劣网络下深链直接按 id probe history，同样挂
    10s 上限（复用 fetchWithTimeout）——只作用于深链路径（maybeHandleDeepLink
    命中分支 / attemptDeepLinkProbe），普通会话打开的网络语义不变。超时按
@@ -170,13 +177,39 @@ function pollWorkspaceSessions(ws) {
   return request;
 }
 
+/* 服务端 `?exclude=archived_children` 的同款判定：归档（非置顶）会话与
+   inactive 子会话。轮询结果里没有这些条目，本地归档/子会话结束后用同一
+   规则把它们留在缓存里（展开分组仍可见），其余消失的条目按已删除丢弃。 */
+function sidebarHiddenSession(s) {
+  return (s.archived === true && s.pinned !== true)
+    || (!!s.parent_session_id && s.active === false);
+}
+
+/* 小轮询结果合并进缓存：同 id 用新数据替换；轮询结果里没有的条目仅当
+   属于轮询过滤掉的类别时保留（展开过的归档/历史分组不闪没）。 */
+function mergePolledSessions(prev, polled) {
+  if (!Array.isArray(prev) || !prev.length) return polled;
+  const seen = new Set(polled.map((s) => s.id));
+  const kept = prev.filter((s) => !seen.has(s.id) && sidebarHiddenSession(s));
+  return kept.length ? polled.concat(kept) : polled;
+}
+
 async function pollWorkspaceSessionsNow(ws, identity) {
   if (!state.workspaceListPending) state.workspaceListPending = {};
   state.workspaceListPending[ws.id] = true;
   let list = null;
   let err = null;
+  // 每个 workspace 身份的第一次请求拉完整列表（无过滤）：侧边栏的
+  // 「归档 (N)」「历史子会话 (N)」分组表头也来自这份数据，刷新页面后必须
+  // 仍可发现（分组收起 ≠ 分组可以不存在）。此后每 2s 的轮询一律带
+  // exclude 只拉默认可见子集；成功一次后即切换（失败则下轮重试完整列表，
+  // 不影响正确性）。展开分组 /「更早的会话」时另有 ensureFullSessions 兜底。
+  const fullKey = workspaceIdentityKey(ws, identity.token);
+  const firstFetch = !workspaceFullAttempted.has(fullKey);
   try {
-    const response = await fetchPollJson(ws, "/api/sessions");
+    // 侧边栏默认只画 pinned / 未归档主会话 / live 子会话：轮询带 exclude
+    // 只拉默认可见子集（5000 会话不再每 2s 传整份归档）。
+    const response = await fetchPollJson(ws, firstFetch ? SESSIONS_PATH : SESSIONS_POLL_PATH);
     const res = response.res;
     if (res.status === 401 || res.status === 403) {
       err = "auth";
@@ -184,8 +217,13 @@ async function pollWorkspaceSessionsNow(ws, identity) {
       err = "http" + res.status;
     } else if (response.formatError || !Array.isArray(response.json)) {
       err = "format";
-    } else {
+    } else if (firstFetch) {
+      workspaceFullAttempted.add(fullKey);   // 首份完整列表就是全量，无需合并
       list = response.json;
+    } else {
+      // 小轮询结果里没有归档 / inactive 子会话：把它们从缓存里保留下来
+      // （分组内容与计数不闪没），其余缺失条目按已删除丢弃。
+      list = mergePolledSessions(state.workspaceLists[ws.id], response.json);
     }
   } catch (e) {
     // 超时（AbortError）和网络失败只在 workspace 侧边栏标记：保留旧列表
@@ -203,7 +241,7 @@ async function pollWorkspaceSessionsNow(ws, identity) {
     setBanner("⚠ 服务器返回异常格式（非数组 JSON）。", true);
   }
   if (list) {
-    state.workspaceLists[ws.id] = list;
+    state.workspaceLists[ws.id] = list;   // 上面已按 id 合并（本轮结果 + 保留的隐藏条目）
     state.workspaceErrors[ws.id] = null;
   } else {
     if (state.workspaceLists[ws.id] === undefined) state.workspaceLists[ws.id] = [];
@@ -213,6 +251,67 @@ async function pollWorkspaceSessionsNow(ws, identity) {
   if (ws === state.workspace) state.lastList = state.workspaceLists[ws.id];
   afterPollRound();
 }
+
+const workspaceFullRequests = new Map();
+/* 已成功拉到过「完整列表」的 workspace 身份键集合（wsId + url + token）：
+   每个身份只在第一次请求时拉全量，之后每 2s 的轮询只拉默认可见子集。
+   展开分组 /「更早的会话」且缓存缺数据时按需再补（ensureFullSessions）。 */
+const workspaceFullAttempted = new Set();
+
+function workspaceIdentityKey(ws, token) {
+  return ws.id + "\u0000" + (ws.url || "") + "\u0000" + token;
+}
+
+/* 完整列表按需补拉（展开「归档」/「历史子会话」/「更早的会话」时）：
+   侧边栏小轮询只拉默认可见子集，缓存里缺少被过滤条目时取一次全量并进
+   缓存。在途请求去重，失败静默（保留旧缓存，下次用户展开再试）。 */
+function ensureFullSessions(wsId) {
+  const ws = (state.workspaces || []).find((w) => w.id === wsId);
+  if (!ws || !workspaceToken(ws)) return Promise.resolve(null);
+  // 缓存里已有归档 / inactive 子会话（首次完整列表或此前展开补拉过）：
+  // 无需再请求，分组数据已在本地。
+  if (workspaceListFor(ws).some(sidebarHiddenSession)) return Promise.resolve(null);
+  return fetchAllSessions(ws);
+}
+
+function fetchAllSessions(ws) {
+  const token = workspaceToken(ws);
+  const identity = { url: ws.url, token };
+  const key = workspaceIdentityKey(ws, token);
+  const active = workspaceFullRequests.get(key);
+  if (active) return active;
+  let request;
+  request = fetchAllSessionsNow(ws, identity).then(
+    (value) => {
+      if (workspaceFullRequests.get(key) === request) workspaceFullRequests.delete(key);
+      return value;
+    },
+    () => {
+      if (workspaceFullRequests.get(key) === request) workspaceFullRequests.delete(key);
+      return null;   // 展开路径失败静默：保留旧缓存
+    }
+  );
+  workspaceFullRequests.set(key, request);
+  return request;
+}
+
+async function fetchAllSessionsNow(ws, identity) {
+  const response = await fetchPollJson(ws, SESSIONS_PATH);
+  const res = response.res;
+  if (!res || !res.ok || response.formatError || !Array.isArray(response.json)) return null;
+  if (!workspaceRequestCurrent(ws, identity)) return null;
+  // 完整列表（含归档 / inactive 子会话）替换缓存：被小轮询过滤掉的条目
+  // 重新可渲染；缓存里不在完整列表、但属于轮询过滤类别的条目保留（与
+  // 轮询合并同一规则，防删除竞态导致刚归档的行闪没）。
+  const full = response.json;
+  const ids = new Set(full.map((s) => s.id));
+  const kept = workspaceListFor(ws).filter((s) => !ids.has(s.id) && sidebarHiddenSession(s));
+  state.workspaceLists[ws.id] = kept.length ? full.concat(kept) : full;
+  if (ws === state.workspace) state.lastList = state.workspaceLists[ws.id];
+  renderSidebarTree(true);
+  return full;
+}
+
 /* URL 深链：?session=<id>。token 就绪后立即尝试（init / restartTransport /
    afterPollRound 三个入口共用，状态机防重复）：
    - fresh 列表命中（成功轮询过的列表里有该 id）→ 既有分支：active 直接
@@ -2263,6 +2362,9 @@ function renderTreeForList(container, list, wsId) {
       moreBtn.title = "显示全部主会话";
       moreBtn.addEventListener("click", () => {
         state.sidebar.showAllWs.add(wsId);   // 只展开本 workspace 分组
+        // 「更早的会话」展开是用户首次要完整视图的信号：按需补拉全量列表
+        // （归档槽位与分组数据补回缓存；已有隐藏条目则复用不请求）。
+        ensureFullSessions(wsId);
         renderSidebarTree(true);
       });
     }
@@ -2551,7 +2653,7 @@ function buildHistGroup(kids, wsId, parentSid) {
   const toggle = el("button", "tree-toggle");
   toggle.type = "button";
   toggle.title = "展开 / 收起";
-  toggle.addEventListener("click", (ev) => toggleTreeGroup(ev, toggle, key));
+  toggle.addEventListener("click", (ev) => toggleTreeGroup(ev, toggle, key, wsId));
   const idEl = el("span", "tree-id tree-group tree-hist-label", "历史子会话 (" + kids.length + ")");
   row.append(toggle, idEl);
   node.appendChild(row);
@@ -2574,7 +2676,7 @@ function buildTreeGroup(label, kids, wsId) {
   const toggle = el("button", "tree-toggle");
   toggle.type = "button";
   toggle.title = "展开 / 收起";
-  toggle.addEventListener("click", (ev) => toggleTreeGroup(ev, toggle, key));
+  toggle.addEventListener("click", (ev) => toggleTreeGroup(ev, toggle, key, wsId));
   const idEl = el("span", "tree-id tree-group", label);
   row.append(toggle, idEl);
   node.appendChild(row);
@@ -2611,7 +2713,7 @@ function buildArchiveGroup(archivedSessions, wsId, childrenByParent) {
   const toggle = el("button", "tree-toggle");
   toggle.type = "button";
   toggle.title = "展开 / 收起";
-  toggle.addEventListener("click", (ev) => toggleTreeGroup(ev, toggle, key));
+  toggle.addEventListener("click", (ev) => toggleTreeGroup(ev, toggle, key, wsId));
   const idEl = el("span", "tree-id tree-group tree-archive-label",
     "归档 (" + archivedSessions.length + ")");
   row.append(toggle, idEl);
@@ -2634,8 +2736,9 @@ function buildArchiveGroup(archivedSessions, wsId, childrenByParent) {
 
 /* 分组折叠切换（未关联 / 历史子会话 / 归档）：默认收起，点击展开；展开
    状态写入 state.sidebar.expanded（key 由各构建函数按 wsId 前缀生成，
-   与 toggleSidebarNode 同 Set，重绘后保留——内存态，不落盘）。 */
-function toggleTreeGroup(ev, toggle, key) {
+   与 toggleSidebarNode 同 Set，重绘后保留——内存态，不落盘）。
+   展开时按需补拉完整列表（归档 / inactive 子会话被小轮询过滤掉）。 */
+function toggleTreeGroup(ev, toggle, key, wsId) {
   ev.stopPropagation();
   const children = toggle.closest(".tree-node").querySelector(".tree-children");
   if (children.hidden) {
@@ -2645,6 +2748,7 @@ function toggleTreeGroup(ev, toggle, key) {
     // 渲染过，firstChild 非空即跳过）；收起保留 DOM，再展开不重建。
     if (children._lazyRender && !children.firstChild) children._lazyRender();
     state.sidebar.expanded.add(key);
+    ensureFullSessions(wsId);   // 展开 = 用户要完整视图：按需补拉全量
   } else {
     children.hidden = true;
     toggle.classList.remove("open");
