@@ -701,10 +701,14 @@ pub enum AgentEvent {
     ToolCall {
         name: String,
         arguments: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
     },
     ToolResult {
         is_error: bool,
         content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
     },
     /// A durable, model-facing system notice (background completion or task
     /// report). Fresh background ingress commits it as a `SessionEntry::Notice`,
@@ -1103,6 +1107,15 @@ impl ContextItem {
     }
 }
 
+type WebHeadPage = (
+    Vec<SessionEntry>,
+    Vec<Option<EntryLocation>>,
+    Option<i64>,
+    usize,
+    usize,
+    Vec<usize>,
+);
+
 pub struct Agent {
     model: Box<dyn Model>,
     tools: Vec<Box<dyn Tool>>,
@@ -1299,6 +1312,63 @@ impl Agent {
     /// Full append-only history (what is persisted and shown in the TUI).
     pub fn history(&self) -> &[SessionEntry] {
         &self.history
+    }
+
+    /// Bounded authoritative head projection for a live Web attach.  The
+    /// runner owns this projection; it is derived from the same located
+    /// history that it just committed, never from the presentation log.
+    pub(crate) fn web_head_page(&self, limit: usize, jsonl: bool) -> WebHeadPage {
+        let segment_start = if jsonl {
+            0
+        } else {
+            self.history
+                .iter()
+                .rposition(|entry| matches!(entry, SessionEntry::Compaction { .. }))
+                .unwrap_or(0)
+        };
+        let history_start = self.history.len().saturating_sub(limit).max(segment_start);
+        let history_end = self.history.len();
+        // The pagination boundary is the first physical row in the logical
+        // head interval. An unlocated fallback Error must not move it.
+        let cursor = self.entry_locations[history_start..history_end]
+            .iter()
+            .find_map(|location| location.as_ref())
+            .map(|location| match &location.key {
+                crate::session_store::LocatedKey::Jsonl { ordinal } => *ordinal,
+                crate::session_store::LocatedKey::Sqlite { seq, .. }
+                | crate::session_store::LocatedKey::Greptime { seq, .. } => *seq,
+            })
+            .filter(|_| history_start > 0);
+        let mut entries = Vec::new();
+        let mut locations = Vec::new();
+        // Map every logical insertion boundary in the frozen interval to the
+        // returned physical-entry offset. Unlocated fallback Errors consume a
+        // logical boundary but do not shift returned entry indices.
+        let mut returned_boundaries = Vec::with_capacity(history_end - history_start + 1);
+        returned_boundaries.push(0);
+        for (entry, location) in self.history[history_start..history_end]
+            .iter()
+            .cloned()
+            .zip(
+                self.entry_locations[history_start..history_end]
+                    .iter()
+                    .cloned(),
+            )
+        {
+            if !matches!(entry, SessionEntry::Error { .. }) || location.is_some() {
+                entries.push(entry);
+                locations.push(location);
+            }
+            returned_boundaries.push(entries.len());
+        }
+        (
+            entries,
+            locations,
+            cursor,
+            history_start,
+            history_end,
+            returned_boundaries,
+        )
     }
 
     /// Replace the whole history (session resume). To ADD one entry to an
@@ -1997,10 +2067,6 @@ impl Agent {
         self.record_usage(usage, refresh_context);
     }
 
-    pub(crate) fn emit_event(&mut self, event: AgentEvent) {
-        self.emit(event);
-    }
-
     pub(crate) async fn after_tool_entry(
         &mut self,
         call: &ToolCall,
@@ -2185,6 +2251,7 @@ impl Agent {
                 self.emit(AgentEvent::ToolCall {
                     name: call.name.clone(),
                     arguments: call.arguments.clone(),
+                    call_id: Some(call.id.clone()),
                 });
                 let result = Self::execute_on(&self.tools, call).await;
                 if call.name == "get_background_tasks" && is_poll_guard_terminate(&result) {
@@ -2207,6 +2274,7 @@ impl Agent {
                 self.emit(AgentEvent::ToolResult {
                     is_error,
                     content: content.clone(),
+                    call_id: Some(call.id.clone()),
                 });
                 self.push_message(Message::Tool {
                     call_id: call.id.clone(),

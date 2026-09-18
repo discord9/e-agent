@@ -80,10 +80,29 @@ function handleSse404Classified(known, id, wsId, epoch) {
 async function handleLive404Refresh(id, wsId, epoch) {
   const ws = (state.workspaces || []).find((w) => w.id === wsId);
   if (ws) await pollWorkspaceSessions(ws);
+  if (!stillCurrent(id, wsId, epoch)) return;
+  // A stale/unlisted live row can have finished between polling and SSE.
+  // Confirm its transcript before declaring terminal or retrying.
+  try {
+    const res = await apiFor(ws || state.workspace,
+      "/api/sessions/" + encodeURIComponent(id) + "/history?limit=" + HISTORY_PAGE);
+    if (!stillCurrent(id, wsId, epoch)) return;
+    if (res.ok) {
+      const data = await res.json();
+      if (!stillCurrent(id, wsId, epoch)) return;
+      const entries = Array.isArray(data) ? data : (data.entries || []);
+      renderHistory(entries, data.locations || []);
+      state.nextBeforeSeq = data.next_before_seq !== undefined ? data.next_before_seq : null;
+      state.olderDone = state.nextBeforeSeq === null;
+      state.initSource = "history";
+      setConn("ended", "会话已结束");
+      return;
+    }
+  } catch (e) { /* existing classification below keeps retry semantics */ }
   handleSse404Classified(sessionKnownState(id, wsId), id, wsId, epoch);
 }
 
-function connectSSE(id, wsId, epoch) {
+function connectSSE(id, wsId, epoch, webAttach) {
   // 起流前三重校验：陈旧 history 响应绝不能对刚激活的服务器/会话起 SSE。
   if (!stillCurrent(id, wsId, epoch)) return;
   // New/reconnected streams replace this cached projection with their initial
@@ -98,7 +117,8 @@ function connectSSE(id, wsId, epoch) {
   state.sse.ctrl = new AbortController();
   const ctrl = state.sse.ctrl;
 
-  fetch(fullUrl("/api/sessions/" + encodeURIComponent(id) + "/events"), {
+  fetch(fullUrl("/api/sessions/" + encodeURIComponent(id) + "/events"
+    + (webAttach ? "?view=web" : "")), {
     headers: {
       "Authorization": "Bearer " + state.token,
       "Accept": "text/event-stream",
@@ -108,6 +128,15 @@ function connectSSE(id, wsId, epoch) {
     if (res.status === 401 || res.status === 403) {
       setBanner("⚠ 认证失败：请检查 Token。");
       throw new Error("auth");
+    }
+    if (res.status === 409) {
+      // A terminal runner can close between history and attach. Preserve the
+      // readable transcript by resolving history under the same epoch guard,
+      // and stop this transport rather than reconnecting into a 409 loop.
+      if (!stillCurrent(id, wsId, epoch)) { try { ctrl.abort(); } catch (e) { /* ignore */ } return; }
+      state.sse.stopped = true;
+      handleLive404Refresh(id, wsId, epoch);
+      throw new Error("silent-gone");
     }
     if (res.status === 404) {
       // 404 的两种含义，按会话已知状态区分（判定见 sessionKnownState）：
@@ -322,6 +351,122 @@ function handleSSEBlock(block, id, wsId, epoch) {
   if (!dataLines.length) return;
   const data = dataLines.join("\n");
 
+  if (eventName === "bootstrap") {
+    let bootstrap = null;
+    try { bootstrap = JSON.parse(data); } catch (e) { /* bad bootstrap reconnects */ }
+    if (!bootstrap || !Array.isArray(bootstrap.entries)) return;
+    // Replace only the authoritative head. Older pages stay in front: their
+    // physical keys are disjoint from the frozen head, so no text or task-id
+    // matching is involved. The head carries the locations that own it.
+    const oldTop = els.messages.scrollTop;
+    const oldHeight = els.messages.scrollHeight;
+    const oldCursor = state.nextBeforeSeq;
+    const oldOlderDone = state.olderDone;
+    const wasAtBottom = oldHeight - oldTop - els.messages.clientHeight <= 4;
+    const anchor = [...els.messages.children].find((node) => node.offsetTop >= oldTop && node.dataset.entryLocation);
+    const anchorKey = anchor && anchor.dataset.entryLocation;
+    const anchorOffset = anchor ? anchor.offsetTop - oldTop : 0;
+    const expanded = new Set([...els.messages.querySelectorAll("details[open]")]
+      .map((node) => node.closest("[data-entry-location]")?.dataset.entryLocation).filter(Boolean));
+    const locationKey = (location) => location ? JSON.stringify(location) : null;
+    const headKeys = new Set((bootstrap.locations || []).map(locationKey).filter(Boolean));
+    // Older pages retain their own physical keys. A new head may overlap a
+    // previously retained page only at a backend boundary; remove exactly
+    // those rows by physical identity, never by content or task id.
+    const olderPages = state.webOlderPages || [];
+    // The previous bounded head is also a physical page. If the new head
+    // advanced past its oldest rows, retain that disjoint interval so there
+    // is no pagination hole between already-loaded pages and the new head.
+    const oldHeadHasKeys = (state.webHeadLocations || []).some(locationKey);
+    const retainedPages = olderPages.concat(oldHeadHasKeys && state.webHeadEntries && state.webHeadEntries.length
+      ? [{ entries: state.webHeadEntries, locations: state.webHeadLocations || [] }] : []);
+    const older = [];
+    const retained = [];
+    for (const page of retainedPages) {
+      const entries = [], locations = [];
+      for (let i = 0; i < page.entries.length; i++) {
+        const location = (page.locations || [])[i];
+        if (!headKeys.has(locationKey(location))) {
+          entries.push(page.entries[i]);
+          locations.push(location);
+          older.push(page.entries[i]);
+        }
+      }
+      if (entries.length) retained.push({ entries, locations });
+    }
+    // Insert pre-head presentation controls at their explicit logical
+    // boundary while rendering the durable head. The active-stream bridge is
+    // applied afterward and never gets folded into completed history.
+    const preHead = new Map();
+    const postHead = [];
+    for (const item of bootstrap.replay || []) {
+      if (!item || !item.event) continue;
+      if (item.after_head) postHead.push(item);
+      else {
+        const at = Number.isInteger(item.head_boundary) ? item.head_boundary : 0;
+        const items = preHead.get(at) || [];
+        items.push(item);
+        preHead.set(at, items);
+      }
+    }
+    renderHistory(bootstrap.entries, bootstrap.locations || [], preHead);
+    if (older.length) renderEntries(older, true, retained.flatMap((page) => page.locations));
+    state.webHeadEntries = bootstrap.entries;
+    state.webHeadLocations = bootstrap.locations || [];
+    state.webOlderPages = retained;
+    // Retained pages own the oldest cursor. A newer bounded head can leave a
+    // disjoint interval above them; drain it with its own cursor so `null`
+    // for the true oldest page never hides the gap.
+    const headCursor = bootstrap.next_before_seq !== undefined ? bootstrap.next_before_seq : null;
+    state.webGapCursor = retained.length ? headCursor : null;
+    state.webGapAnchor = null;
+    state.nextBeforeSeq = retained.length ? oldCursor : headCursor;
+    state.olderDone = retained.length ? oldOlderDone : state.nextBeforeSeq === null;
+    state.initSource = "history";
+    if (bootstrap.usage && bootstrap.usage.data !== undefined) {
+      state.usagePreCompaction = bootstrap.usage_pre_compaction === true;
+      state.compactionUsagePending = false;
+      applyUsage(bootstrap.usage.data);
+    }
+    for (const node of els.messages.querySelectorAll("details")) {
+      if (expanded.has(node.closest("[data-entry-location]")?.dataset.entryLocation)) node.open = true;
+    }
+    if (!wasAtBottom) {
+      // Same physical older pages were reinserted above the refreshed head;
+      // preserve the reader's visual anchor rather than jumping to its end.
+      const replacement = anchorKey && [...els.messages.children]
+        .find((node) => node.dataset.entryLocation === anchorKey);
+      els.messages.scrollTop = replacement
+        ? replacement.offsetTop - anchorOffset
+        : oldTop + (els.messages.scrollHeight - oldHeight);
+      userScrolled = true;
+      els.jumpBottomBtn.hidden = false;
+    }
+    // A consumed prompt is not transcript content. Start every bootstrap
+    // queue projection empty before folding its presentation bridge.
+    state.queue.length = 0;
+    state.queueExpanded = false;
+    delete state.queues[wsId + ":" + id];
+    renderQueueBar();
+    for (const item of postHead) {
+      const ev = item.event;
+      const TYPE = { prompt_queued:"PromptQueued", prompt_consumed:"PromptConsumed",
+        user_prompt:"UserPrompt", assistant_text:"AssistantText", assistant_delta:"AssistantDelta",
+        reasoning_delta:"ReasoningDelta", tool_call:"ToolCall", tool_result:"ToolResult",
+        notice:"Notice", display:"Display", error:"Error", background_completed:"BackgroundCompleted",
+        background_completion_notice:"BackgroundCompletionNotice", goal_updated:"GoalUpdated", usage:"Usage" };
+      const name = TYPE[ev.type];
+      if (!name || (!item.transient && !item.after_head)) continue;
+      const payload = ev.data !== undefined ? ev.data : ev;
+      applyLiveEvent(name, payload);
+    }
+    return;
+  }
+  if (eventName === "bootstrap-required") {
+    scheduleReconnect(id, wsId, epoch);
+    return;
+  }
+
   if (eventName === "snapshot") {
     let entries = null;
     try {
@@ -343,7 +488,7 @@ function handleSSEBlock(block, id, wsId, epoch) {
       // 视图来自缓存）也跳过——缓存内容与 snapshot 等价，重放会造成重复；
       // history 加载失败时仍作为兜底
       if (state.initSource !== "history" && state.initSource !== "restored") {
-        renderHistory(entries);
+        renderHistory(entries, []);
         state.initSource = "snapshot";
       }
       // GoalBar：snapshot 里最新的 goal_updated（set 或 clear 墓碑）折叠

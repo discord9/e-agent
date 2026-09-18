@@ -1064,10 +1064,12 @@ fn attached_view_replays_snapshot_and_marks_finished_on_completion() {
     sink.emit(AgentEvent::ToolCall {
         name: "bash".into(),
         arguments: r#"{"command":"ls"}"#.into(),
+        call_id: None,
     });
     sink.emit(AgentEvent::ToolResult {
         is_error: false,
         content: "files".into(),
+        call_id: None,
     });
     attach_test(&mut state, 7, "demo task", handle);
     let lines: Vec<_> = state
@@ -3720,6 +3722,7 @@ fn scrolling_is_bounded_and_events_append_echo_lines() {
     state.push_agent_event(AgentEvent::ToolResult {
         is_error: false,
         content: "done".into(),
+        call_id: None,
     });
     assert_eq!(state.lines.last().unwrap().text, "  ok: done");
     assert_eq!(state.lines.last().unwrap().kind, LineKind::ToolResult);
@@ -3730,6 +3733,7 @@ fn scrolling_is_bounded_and_events_append_echo_lines() {
     state.push_agent_event(AgentEvent::ToolResult {
         is_error: true,
         content: "failed".into(),
+        call_id: None,
     });
     assert_eq!(state.lines.last().unwrap().text, "  error: failed");
     assert_eq!(state.lines.last().unwrap().kind, LineKind::ToolError);
@@ -3772,6 +3776,7 @@ fn edit_file_tool_calls_render_as_a_numbered_diff_on_result() {
         name: "edit_file".into(),
         arguments: r#"{"path":"src/a.rs","old":"fn a() {}\nfn b() {}","new":"fn a() { 1 }"}"#
             .into(),
+        call_id: None,
     });
     assert_eq!(state.lines.len(), 1);
     assert_eq!(state.lines[0].text, "tool: edit_file src/a.rs");
@@ -3779,6 +3784,7 @@ fn edit_file_tool_calls_render_as_a_numbered_diff_on_result() {
     state.push_agent_event(AgentEvent::ToolResult {
         is_error: false,
         content: "file edited (line 7)".into(),
+        call_id: None,
     });
     let lines: Vec<_> = state
         .lines
@@ -3799,6 +3805,7 @@ fn edit_file_tool_calls_render_as_a_numbered_diff_on_result() {
     state.push_agent_event(AgentEvent::ToolCall {
         name: "edit_file".into(),
         arguments: "not json".into(),
+        call_id: None,
     });
     assert_eq!(state.lines.len(), 1);
     assert!(state.lines[0].text.starts_with("tool: edit_file not json"));

@@ -574,7 +574,7 @@ const HEAD_OPEN_SENTINEL: i64 = i64::MAX;
 /// issued against this key reads exactly this physical version, so a
 /// same-seq later write can never retarget an old ref (the entry hash check
 /// in `read_field` additionally rejects any payload drift).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum LocatedKey {
     /// JSONL: the 0-based line ordinal in the append-only `.jsonl` file.
     Jsonl { ordinal: i64 },
@@ -603,7 +603,7 @@ impl LocatedKey {
 /// projection (`src/output_receipt.rs`) turns a location into a
 /// direct `eout1.<entry-id>.<field-code>` ref, and `read_output` resolves the ref
 /// back to this location.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct EntryLocation {
     /// Backend kind code: `"jsonl"` | `"sqlite"` | `"greptime"`.
     pub backend: &'static str,
@@ -624,6 +624,24 @@ pub struct EntryLocation {
     pub entry_hash: String,
 }
 
+/// Minimal physical identity exposed to Web history consumers. Backend
+/// fingerprints and payload hashes stay server-side; the UI only needs a
+/// stable row key to reconcile bounded pages without inspecting text.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct WebEntryLocation {
+    pub backend: &'static str,
+    pub key: LocatedKey,
+}
+
+impl From<&EntryLocation> for WebEntryLocation {
+    fn from(location: &EntryLocation) -> Self {
+        Self {
+            backend: location.backend,
+            key: location.key.clone(),
+        }
+    }
+}
+
 /// Loaded history paired with its exact physical locations. `locations[i]`
 /// is `Some` exactly when the persisted entry at that history position has
 /// a located key (all durable backends; legacy/test in-memory entries are
@@ -634,6 +652,16 @@ pub struct LoadedLocated {
     pub entries: Vec<SessionEntry>,
     pub locations: Vec<Option<EntryLocation>>,
     pub legacy: bool,
+}
+
+/// One bounded history page with the exact physical identity of every row.
+/// The entries and locations remain aligned; cursors retain the existing
+/// backend paging contract.
+#[derive(Clone, Debug)]
+pub struct LocatedHistoryPage {
+    pub entries: Vec<SessionEntry>,
+    pub locations: Vec<Option<EntryLocation>>,
+    pub next_before_seq: Option<i64>,
 }
 
 /// One session's metadata snapshot from the `sessions` audit table
@@ -877,6 +905,9 @@ pub(crate) fn decode_history_rows(
 }
 
 impl SessionStore {
+    pub fn is_jsonl(&self) -> bool {
+        matches!(self, SessionStore::Jsonl)
+    }
     pub fn supports_history_query(&self) -> bool {
         !matches!(self, SessionStore::Jsonl)
     }
@@ -1133,6 +1164,127 @@ impl SessionStore {
     /// `[0, before)` and later appends (which only extend the head) never
     /// shift it. `limit = None` keeps the whole session + `None`, exactly
     /// like [`Self::load_head`].
+    /// The same bounded head contract as [`Self::load_head_page`], retaining
+    /// each selected row's physical identity for Web reconciliation.
+    pub async fn load_head_page_located(
+        &self,
+        root: &Path,
+        name: &str,
+        limit: Option<usize>,
+    ) -> Result<LocatedHistoryPage> {
+        match self {
+            // JSONL has no seq.  Its cursor is an absolute entry position,
+            // including for legacy whole-document sessions whose locations
+            // are deliberately absent.
+            SessionStore::Jsonl => {
+                let loaded = Session::load_located(root, name)?;
+                let start = match limit.filter(|&n| n > 0) {
+                    Some(n) if loaded.entries.len() > n => loaded.entries.len() - n,
+                    _ => 0,
+                };
+                Ok(LocatedHistoryPage {
+                    entries: loaded.entries[start..].to_vec(),
+                    locations: loaded.locations[start..].to_vec(),
+                    next_before_seq: (start > 0).then_some(start as i64),
+                })
+            }
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session, .. } => {
+                let (rows, next_before_seq) = session
+                    .load_older_located(HEAD_OPEN_SENTINEL, limit)
+                    .await?;
+                Ok(LocatedHistoryPage {
+                    entries: rows.iter().map(|(_, entry)| entry.clone()).collect(),
+                    locations: rows
+                        .into_iter()
+                        .map(|(location, _)| Some(location))
+                        .collect(),
+                    next_before_seq,
+                })
+            }
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite { session, .. } => {
+                let (rows, next_before_seq) = session
+                    .lock()
+                    .await
+                    .load_older_located(HEAD_OPEN_SENTINEL, limit)
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+                Ok(LocatedHistoryPage {
+                    entries: rows.iter().map(|(_, entry)| entry.clone()).collect(),
+                    locations: rows
+                        .into_iter()
+                        .map(|(location, _)| Some(location))
+                        .collect(),
+                    next_before_seq,
+                })
+            }
+        }
+    }
+
+    /// The same older-page contract as [`Self::load_older`], retaining each
+    /// selected row's physical identity.  Database backends use their
+    /// bounded segment query directly; JSONL retains its positional cursor.
+    pub async fn load_older_located(
+        &self,
+        root: &Path,
+        name: &str,
+        before_seq: i64,
+        limit: Option<usize>,
+    ) -> Result<LocatedHistoryPage> {
+        match self {
+            SessionStore::Jsonl => {
+                if before_seq <= 0 {
+                    return Ok(LocatedHistoryPage {
+                        entries: Vec::new(),
+                        locations: Vec::new(),
+                        next_before_seq: None,
+                    });
+                }
+                let loaded = Session::load_located(root, name)?;
+                let before = (before_seq as usize).min(loaded.entries.len());
+                let start = match limit.filter(|&n| n > 0) {
+                    Some(n) => before.saturating_sub(n),
+                    None => 0,
+                };
+                Ok(LocatedHistoryPage {
+                    entries: loaded.entries[start..before].to_vec(),
+                    locations: loaded.locations[start..before].to_vec(),
+                    next_before_seq: (start > 0).then_some(start as i64),
+                })
+            }
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session, .. } => {
+                let (rows, next_before_seq) = session.load_older_located(before_seq, limit).await?;
+                Ok(LocatedHistoryPage {
+                    entries: rows.iter().map(|(_, entry)| entry.clone()).collect(),
+                    locations: rows
+                        .into_iter()
+                        .map(|(location, _)| Some(location))
+                        .collect(),
+                    next_before_seq,
+                })
+            }
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite { session, .. } => {
+                let (rows, next_before_seq) = session
+                    .lock()
+                    .await
+                    .load_older_located(before_seq, limit)
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+                Ok(LocatedHistoryPage {
+                    entries: rows.iter().map(|(_, entry)| entry.clone()).collect(),
+                    locations: rows
+                        .into_iter()
+                        .map(|(location, _)| Some(location))
+                        .collect(),
+                    next_before_seq,
+                })
+            }
+        }
+    }
+
     pub async fn load_head_page(
         &self,
         root: &Path,
@@ -4469,6 +4621,95 @@ mod tests {
                 "cleared task must not reappear after restart: {labels:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn jsonl_located_pages_keep_absolute_ordinals_beyond_200() {
+        use crate::agent::Message;
+        use crate::session::Session;
+
+        let root = std::env::temp_dir();
+        let name = format!("test-jsonl-located-pages-{}", crate::session::new_id());
+        let entries: Vec<SessionEntry> = (0..205)
+            .map(|i| SessionEntry::Message {
+                message: Message::User {
+                    content: format!("m{i}"),
+                    images: vec![],
+                },
+            })
+            .collect();
+        Session::append(&root, &name, &entries).unwrap();
+        let store = SessionStore::Jsonl;
+
+        let mut page = store
+            .load_head_page_located(&root, &name, Some(200))
+            .await
+            .unwrap();
+        assert_eq!(page.entries, entries[5..]);
+        assert_eq!(page.next_before_seq, Some(5));
+        for (i, location) in page.locations.iter().enumerate() {
+            assert!(matches!(
+                location.as_ref().map(|location| &location.key),
+                Some(LocatedKey::Jsonl { ordinal }) if *ordinal == (i + 5) as i64
+            ));
+        }
+
+        let older = store
+            .load_older_located(&root, &name, page.next_before_seq.unwrap(), Some(200))
+            .await
+            .unwrap();
+        assert_eq!(older.entries, entries[..5]);
+        assert_eq!(older.next_before_seq, None);
+        page.entries.splice(0..0, older.entries);
+        assert_eq!(
+            page.entries, entries,
+            "located pages cover the file exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_jsonl_located_pages_use_positional_cursor_without_locations() {
+        use crate::agent::Message;
+
+        let root = tempfile::tempdir().unwrap();
+        let name = "legacy-located";
+        let messages = vec![
+            Message::User {
+                content: "one".into(),
+                images: vec![],
+            },
+            Message::User {
+                content: "two".into(),
+                images: vec![],
+            },
+            Message::User {
+                content: "three".into(),
+                images: vec![],
+            },
+        ];
+        let dir = root.path().join(".e-agent/sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{name}.json")),
+            serde_json::json!({ "version": 1, "messages": messages }).to_string(),
+        )
+        .unwrap();
+        let store = SessionStore::Jsonl;
+
+        let head = store
+            .load_head_page_located(root.path(), name, Some(2))
+            .await
+            .unwrap();
+        assert_eq!(head.entries.len(), 2);
+        assert_eq!(head.next_before_seq, Some(1));
+        assert!(head.locations.iter().all(Option::is_none));
+        let older = store
+            .load_older_located(root.path(), name, 1, Some(2))
+            .await
+            .unwrap();
+        assert_eq!(older.entries.len(), 1);
+        assert_eq!(older.next_before_seq, None);
+        assert!(older.locations.iter().all(Option::is_none));
     }
 }
 

@@ -158,9 +158,13 @@ async def run_chat_state_preserved(c):
     import asyncio as _asyncio
 
     async def hold_events(route, url, method):
-        await _asyncio.sleep(120)
-        await route.fulfill(status=200, headers={"content-type": "text/event-stream"}, body="")
-    c.extra_handlers.append((lambda url, method: url.endswith("/events"), hold_events))
+        # Query-aware Web attach matcher: establish the authoritative head
+        # first, then leave no live events for this cached-view case.
+        bootstrap = {"entries": c.history["entries"], "locations": [],
+                     "next_before_seq": c.history["next_before_seq"], "replay": []}
+        await route.fulfill(status=200, headers={"content-type": "text/event-stream"},
+                            body="event: bootstrap\ndata: " + json.dumps(bootstrap) + "\n\n")
+    c.extra_handlers.append((lambda url, method: url.split("?", 1)[0].endswith("/events"), hold_events))
 
     await c.start()
     await c.open_sidebar()
@@ -193,7 +197,7 @@ async def run_chat_state_preserved(c):
     c.check("切回 sess-a：消息缓存恢复（不重新渲染）",
             await c.page.locator("#messages .msg-user").count() == 30, "")
     hist_a = [u for u, _ in c.records["history"] if "/sess-a/history" in u]
-    c.check("切回 sess-a：缓存先恢复并补拉最新历史", len(hist_a) == 2, f"fetches={len(hist_a)}")
+    c.check("切回 sess-a：缓存先恢复并通过 Web bootstrap 追平", len(hist_a) == 0, f"history_fetches={len(hist_a)}")
 
 async def run_chat_error_render(c):
     c.sessions = [

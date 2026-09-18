@@ -4437,3 +4437,141 @@ async fn rewrite_is_a_noop() {
     assert_eq!(loaded.len(), 2);
     assert_eq!(loaded[0], entries[0]);
 }
+
+#[tokio::test]
+async fn located_pages_match_segment_pages_and_keep_winning_physical_keys() {
+    let (_dir, session, _sid) = fresh_session().await;
+    let compaction = |summary: &str| SessionEntry::Compaction {
+        summary: summary.into(),
+        retained: vec![],
+        current_prompt_at: None,
+        no_current_prompt: false,
+    };
+    let user = |text: &str| {
+        Message::User {
+            content: text.into(),
+            images: vec![],
+        }
+        .into()
+    };
+    let original = vec![
+        user("zero"),
+        compaction("one"),
+        user("two"),
+        user("three"),
+        compaction("four"),
+        user("five"),
+        user("six"),
+    ];
+    session.append(&original).await.unwrap();
+
+    // The replacement's later event time makes it the logical seq-2 winner,
+    // while its event time is deliberately unrelated to seq ordering.
+    let replacement = user("two replacement");
+    let replacement_time = next_event_time_us();
+    let conn = session.conn.lock().await;
+    conn.execute(
+        "INSERT INTO session_entries \
+         (workspace_id, session_id, seq, event_time_us, entry_kind, payload, schema_version, is_error) \
+         VALUES (?1, ?2, 2, ?3, ?4, ?5, 1, 0)",
+        (
+            session.workspace_id.as_str(),
+            session.session_id.as_str(),
+            replacement_time,
+            entry_kind(&replacement),
+            serde_json::to_string(&replacement).unwrap(),
+        ),
+    )
+    .await
+    .unwrap();
+    drop(conn);
+
+    // Head [4, ∞), bounded to its newest two rows.
+    let (located_head, located_head_cursor) =
+        session.load_older_located(i64::MAX, Some(2)).await.unwrap();
+    assert_eq!(
+        located_head
+            .iter()
+            .map(|(_, entry)| entry)
+            .collect::<Vec<_>>(),
+        vec![&user("five"), &user("six")]
+    );
+    assert_eq!(located_head_cursor, Some(5));
+
+    // The next page first returns the opening compaction, then the middle
+    // segment. The winner's location must pin the newer physical record.
+    let (opening, opening_cursor) = session
+        .load_older_located(located_head_cursor.unwrap(), Some(2))
+        .await
+        .unwrap();
+    assert_eq!(opening.len(), 1);
+    assert_eq!(opening[0].1, compaction("four"));
+    assert_eq!(opening_cursor, Some(4));
+    let (middle, middle_cursor) = session
+        .load_older_located(opening_cursor.unwrap(), Some(2))
+        .await
+        .unwrap();
+    assert_eq!(
+        middle.iter().map(|(_, entry)| entry).collect::<Vec<_>>(),
+        vec![&user("three"), &replacement],
+        "winning event-time order is preserved within the bounded middle page"
+    );
+    assert_eq!(middle_cursor, Some(2));
+    assert!(matches!(
+        middle[1].0.key,
+        LocatedKey::Sqlite { seq: 2, event_time_us } if event_time_us == replacement_time
+    ));
+}
+
+#[tokio::test]
+async fn located_pages_keep_sparse_seq_contents_and_cursors() {
+    let (_dir, session, _sid) = fresh_session().await;
+    let user = |text: &str| {
+        Message::User {
+            content: text.into(),
+            images: vec![],
+        }
+        .into()
+    };
+    let entries = vec![user("zero"), user("one"), user("two"), user("three")];
+    session.append(&entries).await.unwrap();
+
+    // Make the physical sequence sparse without changing the logical entry
+    // order: 0, 10, 40, 90. Paging must use the actual oldest seq cursor,
+    // not an assumed contiguous offset.
+    let conn = session.conn.lock().await;
+    for (old, new) in [(1_i64, 10_i64), (2, 40), (3, 90)] {
+        conn.execute(
+            "UPDATE session_entries SET seq = ?1 WHERE workspace_id = ?2 AND session_id = ?3 AND seq = ?4",
+            (new, session.workspace_id.as_str(), session.session_id.as_str(), old),
+        )
+        .await
+        .unwrap();
+    }
+    drop(conn);
+
+    let (page1, cursor1) = session.load_older_located(i64::MAX, Some(2)).await.unwrap();
+    assert_eq!(
+        page1.iter().map(|(_, entry)| entry).collect::<Vec<_>>(),
+        vec![&entries[2], &entries[3]]
+    );
+    assert_eq!(cursor1, Some(40));
+
+    let (page2, cursor2) = session
+        .load_older_located(cursor1.unwrap(), Some(2))
+        .await
+        .unwrap();
+    assert_eq!(
+        page2.iter().map(|(_, entry)| entry).collect::<Vec<_>>(),
+        vec![&entries[0], &entries[1]]
+    );
+    assert_eq!(cursor2, None);
+}
+
+#[test]
+fn located_sqlite_paged_query_is_deduplicated_and_limited_in_sql() {
+    let source = include_str!("session_sqlite.rs");
+    assert!(source.contains("SELECT seq, MAX(event_time_us) AS me FROM session_entries"));
+    assert!(source.contains("ORDER BY t.seq DESC LIMIT ?5"));
+    assert!(source.contains("ORDER BY t.seq DESC LIMIT ?4"));
+}

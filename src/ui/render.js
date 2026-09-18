@@ -967,8 +967,17 @@ function appendReasoningDelta(text, acc) {
   scheduleScrollBottom();   // rAF 批处理：帧内多个 delta 合并为一次滚动
 }
 
-/* 工具调用卡片（live 事件，无 call_id，按顺序配对结果） */
+/* 工具调用卡片（live 事件优先按 call_id 配对结果，旧事件按顺序回退） */
 function appendToolCall(name, args, acc, callId) {
+  // An authoritative history head may already contain the whole assistant
+  // tool-call batch when live delivery resumes at its first call. Reuse that
+  // exact call-id card instead of creating a second logical call.
+  if (callId && acc.pendingByCall.has(callId)) {
+    const card = acc.pendingByCall.get(callId);
+    const state = card.querySelector(".tool-state");
+    if (state && state.textContent === "等待结果…") state.textContent = "执行中…";
+    return;
+  }
   freezeAssistant(acc);
   const card = buildToolCard(name, args, "执行中…", "pending", null);
   acc.toolStack.push({ el: card, filled: false });
@@ -992,6 +1001,7 @@ function appendToolResult(isError, content, acc, callId) {
     for (const t of acc.toolStack) if (t.el === card) t.filled = true;
   }
   if (card) {
+    if (callId) acc.pendingByCall.delete(callId);
     card.querySelector(".tool-state").textContent = isError ? "失败" : "完成";
     const resEl = card.querySelector(".tool-result");
     resEl.classList.remove("pending");
@@ -1319,6 +1329,10 @@ function renderMessage(m, acc, pendingCards) {
       const card = buildToolCard(tc.name, tc.arguments, "等待结果…", "pending", null);
       els.messages.appendChild(card);
       pendingCards.set(tc.id, card);
+      // Keep bootstrap history calls in the live accumulator too. A result
+      // or repeated live ToolCall can then pair by the model call id.
+      acc.pendingByCall.set(tc.id, card);
+      acc.toolStack.push({ el: card, filled: false });
     }
     scrollBottom(false);
     return;
@@ -1328,6 +1342,8 @@ function renderMessage(m, acc, pendingCards) {
     let card = pendingCards.get(t.call_id);
     if (card) {
       pendingCards.delete(t.call_id);
+      acc.pendingByCall.delete(t.call_id);
+      for (const item of acc.toolStack) if (item.el === card) item.filled = true;
       card.querySelector(".tool-state").textContent = t.is_error ? "失败" : "完成";
       const resEl = card.querySelector(".tool-result");
       resEl.classList.remove("pending");
@@ -1353,10 +1369,20 @@ function renderMessage(m, acc, pendingCards) {
 
 /* 渲染一批 SessionEntry。prepend=true 时把新条目插入容器开头（保留既有内容），
    用于滚动分页加载更早历史；prepend=false 时整体替换（初始 history 渲染）。 */
-function renderEntries(entries, prepend) {
+
+function applyBootstrapPresentation(item) {
+  const ev = item.event;
+  const TYPE = { notice:"Notice", display:"Display", error:"Error", background_completed:"BackgroundCompleted",
+    background_completion_notice:"BackgroundCompletionNotice", goal_updated:"GoalUpdated" };
+  const name = TYPE[ev.type];
+  if (name) applyLiveEvent(name, ev.data !== undefined ? ev.data : ev);
+}
+
+function renderEntries(entries, prepend, locations, before, presentationAt) {
   const acc = newAccumulator();
   const pendingCards = new Map();
   const list = Array.isArray(entries) ? entries : [];
+  const keys = Array.isArray(locations) ? locations : [];
   const prevAcc = state.acc;
   let sentinel = null;
   // 无论 prepend 与否，渲染期间都禁止自动滚动：每条消息的 scrollBottom
@@ -1379,7 +1405,37 @@ function renderEntries(entries, prepend) {
     els.jumpBottomBtn.hidden = true;
   }
   try {
-    for (const e of list) renderEntry(e, acc, pendingCards);
+    for (let i = 0; i < list.length; i++) {
+      const priorNodes = new Set(els.messages.children);
+      renderEntry(list[i], acc, pendingCards);
+      const location = keys[i];
+      if (location) {
+        const key = JSON.stringify(location);
+        for (const node of els.messages.children) {
+          if (!priorNodes.has(node) && node.nodeType === 1) node.dataset.entryLocation = key;
+        }
+      }
+      const presentation = presentationAt && presentationAt.get(i + 1);
+      if (presentation) {
+        for (const item of presentation) applyBootstrapPresentation(item);
+      }
+    }
+    const leading = presentationAt && presentationAt.get(0);
+    if (leading) {
+      // There is no prior entry for boundary zero; render it before the
+      // completed head by moving newly appended nodes to the front.
+      const marker = document.createComment("bootstrap-leading-presentation");
+      const firstHistoryNode = els.messages.firstChild;
+      els.messages.appendChild(marker);
+      for (const item of leading) applyBootstrapPresentation(item);
+      let node = marker.nextSibling;
+      while (node) {
+        const next = node.nextSibling;
+        els.messages.insertBefore(node, firstHistoryNode);
+        node = next;
+      }
+      marker.remove();
+    }
   } finally {
     suppressScroll = false;
     if (prepend) state.acc = prevAcc;
@@ -1389,7 +1445,9 @@ function renderEntries(entries, prepend) {
     let n = sentinel.nextSibling;
     while (n) {
       const next = n.nextSibling;
-      els.messages.insertBefore(n, firstOld);
+      // Gap pages belong immediately before the refreshed head; ordinary
+      // pagination remains a true prepend.
+      els.messages.insertBefore(n, before || firstOld);
       n = next;
     }
     sentinel.remove();
@@ -1468,8 +1526,8 @@ function pruneMessages() {
   }
 }
 
-function renderHistory(entries) {
-  renderEntries(entries, false);
+function renderHistory(entries, locations, presentationAt) {
+  renderEntries(entries, false, locations, undefined, presentationAt);
   scrollBottom(true);
 }
 
