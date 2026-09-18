@@ -381,15 +381,27 @@ fn ordered_entries(entries: &[(i64, SessionEntry)]) -> Vec<(i64, &SessionEntry)>
     out.sort_by(|a, b| b.0.cmp(&a.0));
     out
 }
-fn searchable_content(entry: &SessionEntry) -> Option<&str> {
+/// Searchable text projection: User content, Assistant content plus every
+/// tool call's name and raw argument string, and Notice text. Tool result
+/// content and reasoning stay out.
+fn searchable_content(entry: &SessionEntry) -> Option<String> {
     match entry {
         SessionEntry::Message {
             message: Message::User { content, .. },
-        } => Some(content),
+        } => Some(content.clone()),
         SessionEntry::Message {
             message: Message::Assistant(a),
-        } => a.content.as_deref(),
-        SessionEntry::Notice { text } => Some(text),
+        } => {
+            let mut text = a.content.clone().unwrap_or_default();
+            for call in &a.tool_calls {
+                text.push('\n');
+                text.push_str(&call.name);
+                text.push('\n');
+                text.push_str(&call.arguments);
+            }
+            (!text.is_empty()).then_some(text)
+        }
+        SessionEntry::Notice { text } => Some(text.clone()),
         _ => None,
     }
 }
@@ -521,7 +533,7 @@ fn parse_arguments(arguments: &Value) -> Result<Args, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::{AssistantMessage, SessionEntry};
+    use crate::agent::{AssistantMessage, SessionEntry, ToolCall};
 
     fn notice(text: &str) -> SessionEntry {
         SessionEntry::Notice { text: text.into() }
@@ -541,6 +553,24 @@ mod tests {
             message: Message::Assistant(AssistantMessage {
                 content: Some(content.into()),
                 tool_calls: vec![],
+                reasoning: None,
+            }),
+        }
+    }
+
+    fn assistant_with_tool_calls(content: Option<&str>, calls: &[(&str, &str)]) -> SessionEntry {
+        SessionEntry::Message {
+            message: Message::Assistant(AssistantMessage {
+                content: content.map(str::to_owned),
+                tool_calls: calls
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (name, arguments))| ToolCall {
+                        id: format!("call_{index}"),
+                        name: (*name).into(),
+                        arguments: (*arguments).into(),
+                    })
+                    .collect(),
                 reasoning: None,
             }),
         }
@@ -669,6 +699,31 @@ mod tests {
         entries.push(SessionEntry::Error {
             text: "needle excluded".into(),
         });
+        entries.push(SessionEntry::Message {
+            message: Message::Assistant(AssistantMessage {
+                content: None,
+                tool_calls: vec![],
+                reasoning: Some("needle excluded".into()),
+            }),
+        });
+        // Assistant tool calls are searchable: the arguments string is matched
+        // literally, without parsing it.
+        entries.push(assistant_with_tool_calls(
+            None,
+            &[(
+                "write_file",
+                r#"{"path":"/tmp/a.txt","content":"needle in tool arguments"}"#,
+            )],
+        ));
+        // A turn with both text and tool calls matches on either segment: a
+        // first-non-empty-wins projection would hide the arguments here.
+        entries.push(assistant_with_tool_calls(
+            Some("needle in assistant content"),
+            &[(
+                "edit_file",
+                r#"{"path":"/tmp/b.txt","content":"argonlymarker"}"#,
+            )],
+        ));
         SessionStore::Jsonl
             .append(temp.path(), "current", &entries)
             .await
@@ -687,10 +742,10 @@ mod tests {
         .unwrap();
         let found = result["entries"].as_array().unwrap();
         assert_eq!(found.len(), 2);
-        assert_eq!(found[0]["seq"], json!(101)); // assistant, newest matching
-        assert_eq!(found[1]["seq"], json!(99)); // newest-100 scan bound excludes seq 0
+        assert_eq!(found[0]["seq"], json!(108)); // assistant text + tool calls
+        assert_eq!(found[1]["seq"], json!(107)); // tool-call arguments only
         assert_eq!(found[0]["entry"]["type"], json!("message"));
-        assert_eq!(found[1]["entry"]["type"], json!("notice"));
+        assert_eq!(found[1]["entry"]["type"], json!("message"));
 
         let all_matches: Value = serde_json::from_str(
             &execute(
@@ -704,7 +759,7 @@ mod tests {
         )
         .unwrap();
         let all_matches = all_matches["entries"].as_array().unwrap();
-        let excluded_seqs = (excluded_start..excluded_start + 4).collect::<Vec<_>>();
+        let excluded_seqs = (excluded_start..excluded_start + 5).collect::<Vec<_>>();
         assert!(
             all_matches
                 .iter()
@@ -718,7 +773,37 @@ mod tests {
                     entry["entry"]["type"].as_str().unwrap(),
                 ))
                 .collect::<Vec<_>>(),
-            vec![(101, "message"), (99, "notice"), (98, "notice")]
+            vec![
+                // newest-100 window starts at seq 9; seq 0 ("old needle") stays out
+                (108, "message"),
+                (107, "message"),
+                (101, "message"),
+                (99, "notice"),
+                (98, "notice"),
+            ]
+        );
+
+        // The tool-call argument fragment matches on its own, even though the
+        // turn's text does not contain it.
+        let arguments_only: Value = serde_json::from_str(
+            &execute(
+                &SessionStore::Jsonl,
+                temp.path(),
+                "current",
+                &json!({"action": "search", "query": "argonlymarker"}),
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            arguments_only["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["seq"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![108]
         );
 
         let empty: Value = serde_json::from_str(

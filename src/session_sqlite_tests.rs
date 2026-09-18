@@ -632,6 +632,110 @@ async fn history_query_search_is_literal_and_ignores_unselected_bad_json() {
         .await
         .unwrap_err();
     assert!(selected_bad.contains("cannot decode"));
+
+    // Assistant tool calls are searchable: `json_extract` of the tool_calls
+    // array returns the array's JSON text, so tool names and raw argument
+    // strings match literally. The turn also carries text, so an argument-only
+    // match proves the projection does not stop at the first non-empty
+    // segment. A Tool result carrying the same word and an assistant
+    // `reasoning` field stay out of the projection.
+    let tool_call = serde_json::to_string(&SessionEntry::Message {
+        message: Message::Assistant(AssistantMessage {
+            content: Some("contentonlymarker".into()),
+            tool_calls: vec![crate::agent::ToolCall {
+                id: "call_1".into(),
+                name: "write_file".into(),
+                arguments: r#"{"path":"/tmp/x","content":"toolneedle"}"#.into(),
+            }],
+            reasoning: Some("reasononly".into()),
+        }),
+    })
+    .unwrap();
+    let tool_result = serde_json::to_string(&SessionEntry::Message {
+        message: Message::Tool {
+            call_id: "call_1".into(),
+            name: "write_file".into(),
+            content: "toolneedle".into(),
+            images: vec![],
+            is_error: false,
+            synthetic: false,
+        },
+    })
+    .unwrap();
+    let conn = session.conn.lock().await;
+    conn.execute(
+        "INSERT INTO session_entries (workspace_id,session_id,seq,event_time_us,entry_kind,payload,schema_version,is_error) VALUES (?1,?2,12,?3,'message',?4,1,0),(?1,?2,13,?5,'message',?6,1,0)",
+        (
+            session.workspace_id.as_str(),
+            session.session_id.as_str(),
+            next_event_time_us(),
+            tool_call.as_str(),
+            next_event_time_us(),
+            tool_result.as_str(),
+        ),
+    )
+    .await
+    .unwrap();
+    drop(conn);
+    let tool_calls = session
+        .query_history(&HistoryQuery {
+            workspace_id: Some(session.workspace_id.clone()),
+            session_id: Some(session.session_id.clone()),
+            query: Some("toolneedle".into()),
+            after: None,
+            after_event_time: None,
+            offset: None,
+            exact_seq: None,
+            limit: 4,
+            default_search_window: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        tool_calls.iter().map(|entry| entry.seq).collect::<Vec<_>>(),
+        vec![12],
+        "argument-only fragment matches the turn that also has text; the Tool result with the same word does not"
+    );
+    let content_only = session
+        .query_history(&HistoryQuery {
+            workspace_id: Some(session.workspace_id.clone()),
+            session_id: Some(session.session_id.clone()),
+            query: Some("contentonlymarker".into()),
+            after: None,
+            after_event_time: None,
+            offset: None,
+            exact_seq: None,
+            limit: 4,
+            default_search_window: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        content_only
+            .iter()
+            .map(|entry| entry.seq)
+            .collect::<Vec<_>>(),
+        vec![12],
+        "the same turn's assistant text stays searchable"
+    );
+    let reasoning = session
+        .query_history(&HistoryQuery {
+            workspace_id: Some(session.workspace_id.clone()),
+            session_id: Some(session.session_id.clone()),
+            query: Some("reasononly".into()),
+            after: None,
+            after_event_time: None,
+            offset: None,
+            exact_seq: None,
+            limit: 4,
+            default_search_window: false,
+        })
+        .await
+        .unwrap();
+    assert!(
+        reasoning.is_empty(),
+        "assistant reasoning stays out of the search projection"
+    );
 }
 
 #[tokio::test]

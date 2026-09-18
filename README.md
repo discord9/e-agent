@@ -868,8 +868,11 @@ The always-available `history` tool has `list`, `read`, and `search` actions.
 Without selectors it preserves the current runner-bound session API: `list`
 returns newest logical entries by `seq` (default limit 20, maximum 100), `read`
 returns one complete entry by `seq`, and literal, case-sensitive `search`
-examines User/Assistant/Notice text in the newest 100 entries. Default calls
-have no pagination fields.
+examines User content, Assistant text and tool calls (tool name plus the
+unparsed argument JSON), and Notice text in the newest 100 entries.
+Default calls have no pagination fields. Recovering a lost edit means searching
+a distinctive fragment of what was written — a function name or another unique
+string — not `"write_file"`, which lists every write.
 
 Explicit scopes query the same configured store read-only:
 
@@ -909,10 +912,11 @@ internally but sanitized in model-facing errors. No History-specific content
 truncation is introduced.
 
 Non-goals: physical-row inspection, arbitrary SQL or backend selection,
-federating database instances or JSONL roots, searching Tool/reasoning or other
-non-User/Assistant/Notice fields, persistent search indexes, and a separate
-history storage or truncation layer. Cross-session/workspace access, formerly
-excluded, is now explicitly available through scopes within the configured store.
+federating database instances or JSONL roots, searching Tool result content,
+reasoning, or other non-User/Assistant/Notice fields, persistent search
+indexes, and a separate history storage or truncation layer. Cross-session/
+workspace access, formerly excluded, is now explicitly available through
+scopes within the configured store.
 
 ## Web UI / headless server
 
