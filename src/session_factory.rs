@@ -871,6 +871,9 @@ impl SessionFactory {
             }
         }
         let subagent_sessions = delegate.sessions();
+        tools.push(Box::new(crate::delegate::SendMessage::parent(
+            subagent_sessions.clone(),
+        )));
         tools.push(Box::new(delegate));
         let mut agent = Agent::new(Box::new(main_model.clone()), tools);
         let mut context = Vec::new();

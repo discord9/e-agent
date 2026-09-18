@@ -1453,6 +1453,7 @@ async fn session_btw(
                 store: session.store.clone(),
             }),
             local_sessions: state.factory.local_sessions(),
+            parent_handle: session.handle.downgrade(),
         },
     )
     .await

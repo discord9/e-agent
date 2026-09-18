@@ -12699,3 +12699,646 @@ async fn oracle481_auto_nothing_to_compact_preserves_queued_manual_and_human_wor
     drop(handle);
     task.join().await.unwrap();
 }
+
+#[tokio::test]
+async fn agent_message_is_a_durable_notice_not_a_human_prompt() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: VecDeque::from([(
+                AssistantMessage {
+                    content: Some("seen".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                None,
+            )]),
+            calls: calls.clone(),
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "message".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let task = runner.start(None);
+    handle
+        .send_agent_message("sub-child".into(), "progress".into())
+        .unwrap();
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "seen"),
+    )
+    .await;
+    let events = handle.snapshot();
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::UserPrompt(_) | AgentEvent::PromptQueued(_) | AgentEvent::PromptConsumed
+    )));
+    assert!(calls.lock().unwrap()[0].iter().any(|message| matches!(message, Message::User { content, .. } if content == "[agent message from sub-child]\nprogress")));
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "message")
+        .await
+        .unwrap()
+        .entries;
+    assert!(entries.iter().any(|entry| matches!(entry, SessionEntry::Notice { text } if text == "[agent message from sub-child]\nprogress")));
+    assert!(!entries.iter().any(|entry| matches!(entry, SessionEntry::Message { message: Message::User { content, .. } } if content == "progress")));
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[test]
+fn agent_message_admission_rejects_closed_runner() {
+    let (handle, _emitter, receiver) = session_test_channel();
+    drop(receiver);
+    assert_eq!(
+        handle.send_agent_message("child".into(), "hello".into()),
+        Err("target session is no longer live".into())
+    );
+}
+
+#[tokio::test]
+async fn agent_message_and_compaction_while_waiting_input_preserve_answer_turn() {
+    let temp = tempfile::tempdir().unwrap();
+    let starts = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![
+                (
+                    AssistantMessage {
+                        content: None,
+                        tool_calls: vec![ToolCall {
+                            id: "input".into(),
+                            name: "request_user_input".into(),
+                            arguments: r#"{"questions":[{"id":"answer","prompt":"answer?"}]}"#
+                                .into(),
+                        }],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("summary".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("answered".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+            ]
+            .into(),
+            calls: calls.clone(),
+        }),
+        vec![
+            Box::new(crate::tools::user_input::RequestUserInput),
+            Box::new(TurnStartMarkerTool(starts.clone())),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    history_for_compaction(&mut agent);
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "message-wait".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let task = runner.start(Some("start".into()));
+    let mut status = handle.status();
+    wait_for_status(&mut status, |status| {
+        matches!(status, SessionStatus::WaitingInput(_))
+    })
+    .await;
+    handle
+        .send_agent_message("child".into(), "progress".into())
+        .unwrap();
+    handle.compact();
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("input".into()), "yes".into()),
+        PromptSubmission::Answered
+    );
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "answered"),
+    )
+    .await;
+    assert_eq!(
+        starts.load(Ordering::SeqCst),
+        1,
+        "maintenance must resume the existing tool turn"
+    );
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        3,
+        "message does not create an extra request"
+    );
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "message-wait")
+        .await
+        .unwrap()
+        .entries;
+    assert!(entries.iter().any(|entry| matches!(entry, SessionEntry::Notice { text } if text.contains("[agent message from child]"))));
+    assert!(
+        entries
+            .iter()
+            .any(|entry| matches!(entry, SessionEntry::Compaction { .. }))
+    );
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+struct BlockingTurnStartTool {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+    starts: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for BlockingTurnStartTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "read_image".into(),
+            description: "test".into(),
+            parameters: serde_json::json!({}),
+        }
+    }
+    async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok(ToolOutput::text("done"))
+    }
+    fn on_turn_start(&mut self) {
+        self.starts.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn agent_message_during_active_tool_resumes_without_new_turn() {
+    let temp = tempfile::tempdir().unwrap();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let starts = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![
+                (
+                    AssistantMessage {
+                        content: None,
+                        tool_calls: vec![ToolCall {
+                            id: "block".into(),
+                            name: "read_image".into(),
+                            arguments: "{}".into(),
+                        }],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("resumed".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+            ]
+            .into(),
+            calls: calls.clone(),
+        }),
+        vec![
+            Box::new(BlockingTurnStartTool {
+                entered: entered.clone(),
+                release: release.clone(),
+                starts: starts.clone(),
+            }),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "active-message".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let task = runner.start(Some("start".into()));
+    entered.notified().await;
+    handle
+        .send_agent_message("child".into(), "progress".into())
+        .unwrap();
+    release.notify_one();
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "resumed"),
+    )
+    .await;
+    assert_eq!(
+        starts.load(Ordering::SeqCst),
+        1,
+        "message maintenance resumes the same turn"
+    );
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        2,
+        "message contributes context without an extra request"
+    );
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn agent_message_racing_finalization_is_committed_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let (agent, _, _) = controlled(vec![Ok("first".into()), Ok("reaction".into())], false);
+    let (mut runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "message-finalize".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let racing = handle.clone();
+    runner.before_finalize = Some(Box::new(move || {
+        racing
+            .send_agent_message("child".into(), "last".into())
+            .unwrap();
+    }));
+    let task = runner.start(Some("start".into()));
+    let finished = wait_for_status(&mut handle.status(), |status| {
+        matches!(status, SessionStatus::Finished(_))
+    })
+    .await;
+    assert!(
+        matches!(finished, SessionStatus::Finished(SessionResult::Completed(Some(ref text))) if text == "reaction")
+    );
+    assert_eq!(
+        handle.send_agent_message("child".into(), "after-finish".into()),
+        Err("target session is no longer live".into())
+    );
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "message-finalize")
+        .await
+        .unwrap()
+        .entries;
+    assert_eq!(entries.iter().filter(|entry| matches!(entry, SessionEntry::Notice { text } if text == "[agent message from child]\nlast")).count(), 1);
+    assert!(!handle.snapshot().iter().any(|event| matches!(
+        event,
+        AgentEvent::UserPrompt(text) if text == "last"
+    )));
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn replayed_agent_message_notice_does_not_wake_a_turn() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: VecDeque::new(),
+            calls: calls.clone(),
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    agent.apply_entry(SessionEntry::Notice {
+        text: "[agent message from child]\nold".into(),
+    });
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "message-replay".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let task = runner.start(None);
+    wait_for_status(&mut handle.status(), |status| {
+        matches!(status, SessionStatus::Idle)
+    })
+    .await;
+    drop(handle);
+    task.join().await.unwrap();
+    assert!(calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn agent_message_handoff_preserves_accepted_compaction_after_siblings() {
+    let temp = tempfile::tempdir().unwrap();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![
+                (
+                    AssistantMessage {
+                        content: None,
+                        tool_calls: vec![
+                            ToolCall {
+                                id: "request".into(),
+                                name: "request_compaction".into(),
+                                arguments: "{}".into(),
+                            },
+                            ToolCall {
+                                id: "sibling".into(),
+                                name: "read_image".into(),
+                                arguments: "{}".into(),
+                            },
+                        ],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("summary".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("message handled".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+            ]
+            .into(),
+            calls: calls.clone(),
+        }),
+        vec![
+            Box::new(crate::tools::RequestCompaction),
+            Box::new(BlockingMarkerTool {
+                entered: entered.clone(),
+                release: release.clone(),
+            }),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    history_for_compaction(&mut agent);
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "message-request-compaction".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let task = runner.start(Some("start".into()));
+    entered.notified().await;
+    handle
+        .send_agent_message("child".into(), "progress".into())
+        .unwrap();
+    release.notify_one();
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "message handled"),
+    )
+    .await;
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "message-request-compaction")
+        .await
+        .unwrap()
+        .entries;
+    assert!(
+        entries
+            .iter()
+            .any(|entry| matches!(entry, SessionEntry::Compaction { .. }))
+    );
+    assert!(entries.iter().any(|entry| matches!(entry, SessionEntry::Notice { text } if text == "[agent message from child]\nprogress")));
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        3,
+        "one sibling batch, compaction, then one message reaction"
+    );
+    assert!(calls.lock().unwrap()[2].iter().any(|message| matches!(message, Message::User { content, .. } if content == "[agent message from child]\nprogress")));
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+async fn agent_message_continue_handoff_preserves_compaction(message_first: bool) {
+    let temp = tempfile::tempdir().unwrap();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![
+                (
+                    AssistantMessage {
+                        content: None,
+                        tool_calls: vec![
+                            ToolCall {
+                                id: "request".into(),
+                                name: "request_compaction".into(),
+                                arguments: "{}".into(),
+                            },
+                            ToolCall {
+                                id: "sibling".into(),
+                                name: "read_image".into(),
+                                arguments: "{}".into(),
+                            },
+                        ],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("summary".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("message handled".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+            ]
+            .into(),
+            calls: calls.clone(),
+        }),
+        vec![
+            Box::new(crate::tools::RequestCompaction),
+            Box::new(BlockingMarkerTool {
+                entered: entered.clone(),
+                release: release.clone(),
+            }),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    history_for_compaction(&mut agent);
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "message-continue-compaction".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let task = runner.start(Some("start".into()));
+    entered.notified().await;
+    if message_first {
+        handle
+            .send_agent_message("child".into(), "progress".into())
+            .unwrap();
+        handle.continue_goal(Some(0));
+    } else {
+        handle.continue_goal(Some(0));
+        handle
+            .send_agent_message("child".into(), "progress".into())
+            .unwrap();
+    }
+    release.notify_one();
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "message handled"),
+    )
+    .await;
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "message-continue-compaction")
+        .await
+        .unwrap()
+        .entries;
+    assert!(
+        entries
+            .iter()
+            .any(|entry| matches!(entry, SessionEntry::Compaction { .. }))
+    );
+    assert!(entries.iter().any(|entry| matches!(entry, SessionEntry::Notice { text } if text == "[agent message from child]\nprogress")));
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        3,
+        "Continue must not add a second message reaction"
+    );
+    assert!(calls.lock().unwrap()[2].iter().any(|message| matches!(message, Message::User { content, .. } if content == "[agent message from child]\nprogress")));
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn agent_message_then_continue_handoff_preserves_compaction() {
+    agent_message_continue_handoff_preserves_compaction(true).await;
+}
+
+#[tokio::test]
+async fn continue_then_agent_message_handoff_preserves_compaction() {
+    agent_message_continue_handoff_preserves_compaction(false).await;
+}
+
+#[tokio::test]
+async fn cancelled_blocked_round_keeps_accepted_agent_message_for_normal_reaction() {
+    let temp = tempfile::tempdir().unwrap();
+    let (agent, entered, _) = recovering_agent(
+        vec![
+            Ok(AssistantMessage {
+                content: Some("interrupted".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            }),
+            Ok(AssistantMessage {
+                content: Some("message reaction".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            }),
+        ],
+        true,
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "cancel-message".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let task = runner.start(Some("start".into()));
+    entered.notified().await;
+    handle
+        .send_agent_message("child".into(), "progress".into())
+        .unwrap();
+    handle.cancel();
+    let mut status = handle.status();
+    let finished = wait_for_status(&mut status, |status| {
+        matches!(status, SessionStatus::Finished(_))
+    })
+    .await;
+    assert!(
+        matches!(finished, SessionStatus::Finished(SessionResult::Completed(Some(ref text))) if text == "message reaction")
+    );
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "cancel-message")
+        .await
+        .unwrap()
+        .entries;
+    assert!(entries.iter().any(|entry| matches!(entry, SessionEntry::Notice { text } if text == "[agent message from child]\nprogress")));
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn terminal_provider_failure_flushes_pending_message_and_prompt_without_request() {
+    let temp = tempfile::tempdir().unwrap();
+    let (agent, entered, release) =
+        recovering_agent(vec![Err(anyhow::anyhow!("provider failed"))], true);
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "failure-message-flush".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let task = runner.start(Some("start".into()));
+    entered.notified().await;
+    handle
+        .send_agent_message("child".into(), "progress".into())
+        .unwrap();
+    handle.prompt("queued prompt");
+    release.notify_one();
+    let mut status = handle.status();
+    let finished = wait_for_status(&mut status, |status| {
+        matches!(status, SessionStatus::Finished(_))
+    })
+    .await;
+    assert!(
+        matches!(finished, SessionStatus::Finished(SessionResult::Failed(ref text)) if text.contains("provider failed"))
+    );
+    assert_eq!(
+        handle.send_agent_message("child".into(), "after-finish".into()),
+        Err("target session is no longer live".into())
+    );
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "failure-message-flush")
+        .await
+        .unwrap()
+        .entries;
+    let notice = entries
+        .iter()
+        .position(|entry| matches!(entry, SessionEntry::Notice { text } if text == "[agent message from child]\nprogress"))
+        .expect("accepted agent message is flushed as a Notice");
+    let prompt = entries
+        .iter()
+        .position(|entry| matches!(entry, SessionEntry::Message { message: Message::User { content, .. } } if content == "queued prompt"))
+        .expect("accepted prompt is flushed");
+    assert!(
+        notice < prompt,
+        "terminal flush preserves accepted FIFO order"
+    );
+    task.join().await.unwrap();
+}
