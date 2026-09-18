@@ -2585,32 +2585,52 @@ async function main(){
         argsTextOf(dgCard).includes("后台运行")
         && argsTextOf(dgLegacy).includes("前台同步") && !argsTextOf(dgLegacy).includes("后台运行"),
         "text=" + JSON.stringify(argsTextOf(dgLegacy)));
-    // delegate 长任务参数框展开：CSS 里外层 .tool-args 有 10em 高度帽，内层
-    // .task-snapshot-body 另有 14em 帽。点「展开全文」只放开内层时，外层 10em
-    // 仍截断 → 视觉零变化（用户报告的真实 bug）。修复：展开/收起同步给最近的
-    // .tool-args 祖先加/去 .expanded（CSS .tool-card .tool-args.expanded 放开帽）。
+    // delegate 长任务参数框：宿主 .tool-args 必须摘帽（.delegate-host，CSS
+    // max-height:none + overflow-y:visible）——内层 pre.task-snapshot-body 自带
+    // 10em 滚动帽，成为唯一滚动口。否则双层滚动条，且「展开全文」按钮若留在
+    // 内层 pre 里会被滚动区底部裁掉，用户要滚动才点得到（用户报告的真实 bug）。
+    // 按钮现在落在 pre 的兄弟 footer .delegate-footer（折叠态即可见、可点）。
     const dgExpandTask = "L".repeat(600);
     const dgExpandCard = buildToolCard("delegate", JSON.stringify({
       task: dgExpandTask, role: "explore", workspace: "/w", label: "长任务",
     }), "完成", "", "ok");
     const dgExpandWrap = dgExpandCard.querySelector(".tool-args");
     const dgExpandPre = dgExpandWrap.querySelector(".task-snapshot-body");
-    chk("delegate long task folded by default (inner expandable, outer cap intact)",
+    chk("delegate host .tool-args exempted from height cap (.delegate-host)",
+        dgExpandWrap.classList.contains("delegate-host"),
+        "cls=" + dgExpandWrap.className);
+    chk("delegate long task folded by default (inner expandable is the only scroll cap)",
         dgExpandPre !== null && dgExpandPre.classList.contains("expandable")
-        && !dgExpandPre.classList.contains("expanded") && !dgExpandWrap.classList.contains("expanded")
+        && !dgExpandPre.classList.contains("expanded")
         && dgExpandPre.querySelector(".expand-full").textContent.length === 600,
-        "pre=" + (dgExpandPre && dgExpandPre.className) + " wrap=" + dgExpandWrap.className);
-    const dgExpandBtn = dgExpandPre.querySelector(".expand-toggle");
-    chk("delegate expand button targets task body", !!dgExpandBtn && dgExpandBtn._target === dgExpandPre);
+        "pre=" + (dgExpandPre && dgExpandPre.className));
+    const dgFooter = dgExpandWrap.querySelector(".delegate-footer");
+    const dgExpandBtn = dgFooter && dgFooter.querySelector(".expand-toggle");
+    chk("delegate expand button in .delegate-footer, not inside the scrollable pre",
+        !!dgExpandBtn && dgExpandBtn._target === dgExpandPre
+        && dgExpandPre.querySelector(".expand-toggle") === null
+        && dgFooter.querySelector(".copy-toggle") !== null,
+        "btn=" + (dgExpandBtn && dgExpandBtn._target === dgExpandPre)
+        + " pre-btn=" + (dgExpandPre.querySelector(".expand-toggle") !== null)
+        + " copy=" + (!!dgFooter && dgFooter.querySelector(".copy-toggle") !== null));
     const dgExpandClicks = (elsById["messages"]._listeners["click"] || []);
     for (const fn of dgExpandClicks) fn({ target: dgExpandBtn });
-    chk("delegate expand lifts outer .tool-args height cap",
-        dgExpandPre.classList.contains("expanded") && dgExpandWrap.classList.contains("expanded"),
-        "pre=" + dgExpandPre.className + " wrap=" + dgExpandWrap.className);
+    chk("delegate expand toggles task body",
+        dgExpandPre.classList.contains("expanded")
+        && dgExpandPre.querySelector(".expand-full").textContent.length === 600,
+        "pre=" + dgExpandPre.className);
     for (const fn of dgExpandClicks) fn({ target: dgExpandBtn });
-    chk("delegate collapse restores outer .tool-args height cap",
-        !dgExpandPre.classList.contains("expanded") && !dgExpandWrap.classList.contains("expanded"),
-        "pre=" + dgExpandPre.className + " wrap=" + dgExpandWrap.className);
+    chk("delegate collapse restores folded task body",
+        !dgExpandPre.classList.contains("expanded"),
+        "pre=" + dgExpandPre.className);
+    // 短任务：无 footer 占位行（footer 仅在有按钮时才插入 DOM）
+    chk("delegate short task inserts no .delegate-footer placeholder",
+        dgCard.querySelector(".tool-args").querySelector(".delegate-footer") === null,
+        "footer=" + (dgCard.querySelector(".tool-args").querySelector(".delegate-footer") !== null));
+    // 边界：豁免只给 delegate——MCP/未知工具的长 JSON 参数仍吃 .tool-args 10em 帽
+    chk("non-delegate long args keep the .tool-args 10em cap (no .delegate-host)",
+        argsPreA.classList.contains("expandable") && !argsPreA.classList.contains("delegate-host"),
+        "cls=" + argsPreA.className);
     // get_background_tasks：空对象 / 空串 → 参数区隐藏
     const bgtCard = buildToolCard("get_background_tasks", "{}", "完成", "", "ok");
     const bgtCard2 = buildToolCard("get_background_tasks", "", "完成", "", "ok");
@@ -8996,13 +9016,19 @@ _diff_rules_ok = bool(
     and re.search(r'\.tool-card\s+\.tool-result\.tool-diff\s+\.diff-row\.diff-del\s*\{[^}]*background:\s*#fbe3e4', _css)
     and re.search(r'\.tool-card\s+\.tool-result\.tool-diff\s+\.diff-ln\s*\{[^}]*text-align:\s*right', _css))
 print(("PASS" if _diff_rules_ok else "FAIL") + " file-tool diff styles (add/del/ln) in style.css")
-# delegate 参数框展开（bug 修复的 CSS 半边；JS 侧的 .expanded 同步由 DOM 断言
-# 守护）：外层 .tool-args（10em 帽）必须在展开态放开，否则内层 .task-snapshot-body
-# 展开后视觉零变化；delegate 结果卡同步去帽（内容短 / 长答案折进 details）。
+# delegate 参数框（bug 修复的 CSS 半边；DOM 侧的 footer/豁免类由 2588 附近的
+# 断言守护）：宿主 .tool-args 必须摘帽（.delegate-host → max-height:none +
+# overflow-y:visible），内层 .task-snapshot-body（唯一滚动口）帽固定 10em；
+# delegate 结果卡同步去帽（内容短 / 长答案折进 details）。另：.tool-args.expanded
+# 仍是活规则（字符串参数回退路径 c 自身即 .tool-args），一并守护。
 _args_expand_css_ok = bool(
-    re.search(r'\.tool-card\s+\.tool-args\.expanded\s*\{[^}]*max-height:\s*none', _css)
+    re.search(r'\.tool-card\s+\.tool-args\.delegate-host\s*\{[^}]*max-height:\s*none', _css)
+    and re.search(r'\.tool-card\s+\.tool-args\.delegate-host\s*\{[^}]*overflow-y:\s*visible', _css)
+    and re.search(r'\.task-snapshot-body\s*\{[^}]*max-height:\s*10em', _css)
+    and re.search(r'\.delegate-footer\s*\{[^}]*display:\s*flex', _css)
+    and re.search(r'\.tool-card\s+\.tool-args\.expanded\s*\{[^}]*max-height:\s*none', _css)
     and re.search(r'\.tool-card\s+\.tool-result\.delegate-result\s*\{[^}]*max-height:\s*none', _css))
-print(("PASS" if _args_expand_css_ok else "FAIL") + " delegate expand lifts outer .tool-args/result caps in style.css")
+print(("PASS" if _args_expand_css_ok else "FAIL") + " delegate host .tool-args exempt + task body 10em cap in style.css")
 # 窄屏防溢出：.diff-text 必须可收缩（min-width:0）且允许任意位置断行
 # （overflow-wrap: anywhere，长 URL/长行不撑破卡片）
 _txt_rule = re.search(r'\.tool-card\s+\.tool-result\.tool-diff\s+\.diff-text\s*\{([^}]*)\}', _css)

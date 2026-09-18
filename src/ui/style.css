@@ -623,6 +623,14 @@
     border-radius: 3px;
     padding: 4px 6px;
   }
+  /* delegate 宿主摘帽（render.js buildToolCard 给 delegate 的 .tool-args 加
+     .delegate-host）：内层 pre.task-snapshot-body 已自带 10em 滚动帽，外层再套
+     一层帽会造成双层滚动条、且把 footer 里的「展开全文」按钮裁进滚动区
+     （用户报告的 bug）。其余工具（bash/MCP 长 JSON）继续吃上面的 10em 帽。 */
+  .tool-card .tool-args.delegate-host {
+    max-height: none;
+    overflow-y: visible;
+  }
   .tool-card .tool-result {
     margin: 0;
     font-size: 12px;
@@ -793,8 +801,16 @@
     border: 1px solid var(--base1);
     border-radius: 3px;
     padding: 4px 6px;
-    max-height: 14em;
+    max-height: 10em;   /* delegate 参数区唯一滚动口（外层 .tool-args 已豁免） */
     overflow-y: auto;
+  }
+  /* delegate 参数区 footer（展开/复制按钮专用行）：仅当 task 超长、生成了
+     按钮时才插入（render.js），短任务零占位。 */
+  .delegate-footer {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    padding: 2px 0;
   }
   .delegate-loc {
     display: flex;
@@ -977,17 +993,16 @@
   .expandable .expand-full { display: none; }
   .expandable.expanded .expand-preview { display: none; }
   /* 展开即真展开：放开折叠态的高度帽（.tool-result 14em / .task-snapshot-body
-     14em / .notice .notice-output），全部展开路径统一行为——展开后全文完整
+     10em / .notice .notice-output），全部展开路径统一行为——展开后全文完整
      铺开、页面滚动接管，不再挤在原高度的内滚框里。文件工具 diff 视图
      （.tool-diff）的规则见 705 行附近，此处覆盖其余全部。 */
   .expandable.expanded, .tool-card .expandable.expanded,
   .tool-card .expandable.expanded pre, .notice .expandable.expanded pre {
     max-height: none;
   }
-  /* delegate 参数框：外层 .tool-args（10em 帽）包住内层 .task-snapshot-body
-     （.expandable，14em 帽）。展开只放开内层时外层帽仍截断 → 视觉零变化
-     （用户报告的真实 bug）。sse.js 展开/收起时把 .expanded 同步给最近的
-     .tool-args 祖先，这里放开外层帽（类选择器特异性高于 614 行基础规则）。 */
+  /* delegate 参数框：宿主 .tool-args 已由 .delegate-host 摘帽（见 626 行附近），
+     内层 pre.task-snapshot-body（.expandable，10em 帽）是唯一滚动口；此处保留
+     兼容字符串参数回退路径（c 自身即 .tool-args 时展开仍要放开帽）。 */
   .tool-card .tool-args.expanded { max-height: none; }
   .expandable.expanded .expand-full { display: inline; }
   /* 展开按钮：控件样式（底色+边框+圆角），紧跟正文 pre 后面，与正文明显区分 */

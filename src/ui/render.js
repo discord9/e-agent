@@ -624,8 +624,13 @@ function renderDelegateArgs(parsed, rawText) {
     loc.appendChild(el("div", "delegate-resume", "续接会话: " + parsed.resume));
   }
   wrap.appendChild(loc);
-  wrap.appendChild(maybeTruncateEl(el("pre", "task-snapshot-body"), parsed.task,
-    LONG_TEXT_THRESHOLD, null));
+  // task 正文：超长时 maybeTruncateEl 把「展开全文/复制全文」按钮放进
+  // .delegate-footer（而非 pre 末尾）——footer 是 pre 的兄弟节点，不被
+  // pre 的滚动帽裁掉；仅当确有条目（超长分支）才插入，短任务零占位。
+  const pre = el("pre", "task-snapshot-body");
+  const foot = el("div", "delegate-footer");
+  wrap.appendChild(maybeTruncateEl(pre, parsed.task, LONG_TEXT_THRESHOLD, foot));
+  if (foot.firstChild) wrap.appendChild(foot);   // 无条目（短任务）不插入占位行
   return wrap;
 }
 
@@ -1038,6 +1043,10 @@ function buildToolCard(name, args, stateText, stateCls, resultText) {
   } else if (typeof argsNode === "string") {
     maybeTruncateEl(argsEl, argsNode, LONG_TEXT_THRESHOLD, null, "参数");
   } else {
+    // delegate 内层已自带滚动帽（pre.task-snapshot-body 自身 10em + 滚动），
+    // 外层 .tool-args 豁免 10em 帽/滚动：避免双层滚动条，也避免把内层
+    // 生成的 footer（展开/复制按钮）裁进外层滚动区（用户报告的 bug）。
+    if (name === "delegate") argsEl.classList.add("delegate-host");
     argsEl.appendChild(argsNode);
   }
   maybeTruncateEl(resEl,
