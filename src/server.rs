@@ -9345,7 +9345,9 @@ model = "deepseek-chat"
         assert_eq!(headers.get("x-spool-total").unwrap(), "10");
 
         // Clean up the running task so the test leaks no process.
-        session.background.cancel(1);
+        session
+            .background
+            .cancel_with_source(1, crate::agent::CancellationSource::System);
     }
 
     #[tokio::test]
