@@ -1664,7 +1664,8 @@ async fn bash_detached_requires_background_and_keeps_title() {
         tool.background.running()[0].full_command.as_deref(),
         Some("sleep 30")
     );
-    tool.background.cancel(1);
+    tool.background
+        .cancel_with_source(1, crate::agent::CancellationSource::System);
 }
 
 #[test]
@@ -4067,7 +4068,12 @@ async fn background_title_blank_falls_back_and_foreground_is_ignored() {
         .content;
     assert_eq!(started, "started background task 1: sleep 30");
     assert_eq!(bash.background.running()[0].label, "sleep 30");
-    assert_eq!(bash.background.cancel(1).as_deref(), Some("sleep 30"));
+    assert_eq!(
+        bash.background
+            .cancel_with_source(1, crate::agent::CancellationSource::System)
+            .as_deref(),
+        Some("sleep 30")
+    );
     let _ = tokio::time::timeout(Duration::from_secs(5), receiver.recv()).await;
 }
 
