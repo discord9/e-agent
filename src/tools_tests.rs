@@ -1442,7 +1442,6 @@ async fn bash_timeout_kills_its_background_process_group() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
-        tmp_read_only: false,
     };
     assert!(
         tool.execute(json!({"command": "sleep 30 & echo $! > child.pid; wait"}))
@@ -1476,7 +1475,6 @@ fn bash_description_explains_the_sandbox_only_when_enabled() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
-        tmp_read_only: false,
     };
     let plain_desc = plain.spec().description;
     #[cfg(windows)]
@@ -1505,7 +1503,6 @@ fn bash_description_explains_the_sandbox_only_when_enabled() {
         protect_git: true,
         shell: Shell::detect().unwrap(),
         owner_session: None,
-        tmp_read_only: false,
     };
     let desc = sandboxed.spec().description;
     #[cfg(windows)]
@@ -1557,7 +1554,6 @@ fn bash_description_explains_the_sandbox_only_when_enabled() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
-        tmp_read_only: false,
     };
     let desc_ro = sandboxed_ro.spec().description;
     #[cfg(windows)]
@@ -1592,7 +1588,6 @@ fn bash_description_explains_the_sandbox_only_when_enabled() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
-        tmp_read_only: false,
     };
     let desc_main = sandboxed_main.spec().description;
     assert!(
@@ -1877,7 +1872,6 @@ async fn background_bash_uses_the_facade_sandbox_not_the_registry_one() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
-        tmp_read_only: false,
     };
     bash.set_event_sender(sender.clone());
     bash.background.set_event_sender(sender);
@@ -1916,7 +1910,6 @@ fn background_bash(
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
-        tmp_read_only: false,
     };
     bash.set_event_sender(sender.clone());
     // This helper also exercises BackgroundTasks directly in a few tests.
@@ -1954,7 +1947,6 @@ async fn sandbox_allows_workspace_writes_but_not_outside() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
-        tmp_read_only: false,
     };
     // Writing inside the workspace succeeds.
     tool.execute(json!({"command": "echo hi > inside.txt"}))
@@ -1964,8 +1956,9 @@ async fn sandbox_allows_workspace_writes_but_not_outside() {
         std::fs::read_to_string(temp.path().join("inside.txt")).unwrap(),
         "hi\n"
     );
-    // Writing outside the workspace (/tmp is a fresh tmpfs, /usr is ro)
-    // must not touch the host: /usr is read-only inside the sandbox.
+    // Writing outside the workspace must not touch the host: /usr is
+    // read-only inside the sandbox (/tmp is the host's real /tmp by
+    // design; /usr is the escape check here).
     let result = tool
         .execute(json!({"command": "touch /usr/e_agent_sandbox_escape 2>&1"}))
         .await;
@@ -2023,7 +2016,6 @@ async fn sandbox_mounts_configured_dests_at_their_configured_paths() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
-        tmp_read_only: false,
     };
     // The configured readable dest is visible inside the sandbox with the
     // canonical source's content, and it is read-only.
@@ -2070,7 +2062,6 @@ async fn sandbox_can_disable_network() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
-        tmp_read_only: false,
     };
     // No loopback either in a fresh net namespace: connecting anywhere fails.
     let result = tool
@@ -2135,7 +2126,6 @@ async fn sandbox_read_only_workspace_rejects_bash_and_file_tool_writes() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
-        tmp_read_only: false,
     };
     assert!(
         tool.execute(json!({"command": "touch bash-file"}))
@@ -2283,7 +2273,6 @@ async fn sandbox_workspace_mount_wins_over_external_ancestor() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
-        tmp_read_only: false,
     };
     assert!(
         read_only
@@ -2305,7 +2294,6 @@ async fn sandbox_workspace_mount_wins_over_external_ancestor() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
-        tmp_read_only: false,
     };
     writable
         .execute(json!({"command": "touch workspace-wins"}))
@@ -2334,7 +2322,6 @@ async fn sandbox_read_only_workspace_allows_explicit_writable_child() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
-        tmp_read_only: false,
     };
     tool.execute(json!({"command": "touch child/allowed"}))
         .await
@@ -2377,7 +2364,6 @@ async fn sandbox_reroot_keeps_startup_policy_anchor_read_only() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
-        tmp_read_only: false,
     };
     assert!(
         tool.execute(json!({"command": "echo no > ../.e-agent/config.toml"}))
@@ -2407,7 +2393,6 @@ async fn sandbox_missing_policy_cannot_be_created_through_writable_e_agent_child
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
-        tmp_read_only: false,
     };
     assert!(
         tool.execute(json!({"command": "touch .e-agent/config.toml"}))
@@ -2430,7 +2415,6 @@ fn policy_bash(workspace: Workspace, sandbox: crate::config::Sandbox) -> Bash {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
-        tmp_read_only: false,
     }
 }
 
@@ -2505,7 +2489,6 @@ async fn sandbox_linked_worktree_retains_read_only_git_metadata() {
     let head = String::from_utf8(head.stdout).unwrap();
     let mut tool = policy_bash(child, policy);
     tool.protect_git = false;
-    tool.tmp_read_only = true;
     let script = format!(
         "set -e; printf shell-write > ordinary; test \"$(cat ordinary)\" = shell-write; git status --porcelain | grep -F 'tracked'; git diff -- tracked | grep -F '+changed'; git log -1 --format=%H | grep -Fx '{}'; for p in \"$(git rev-parse --git-path index)\" \"$(git rev-parse --git-common-dir)/config\" \"$(git rev-parse --git-common-dir)/refs/heads/master\"; do if printf denied > \"$p\"; then exit 70; fi; done",
         head.trim()
@@ -3025,7 +3008,6 @@ async fn sandbox_policy_anchor_rerooted_worktree_git_stays_read_only() {
         protect_git: true,
         shell: Shell::detect().unwrap(),
         owner_session: None,
-        tmp_read_only: false,
     };
     // Reading git metadata works (git commands read it).
     let out = tool
@@ -3086,7 +3068,6 @@ async fn sandbox_policy_anchor_rerooted_worktree_git_pointer_stays_read_only() {
         protect_git: true,
         shell: Shell::detect().unwrap(),
         owner_session: None,
-        tmp_read_only: false,
     };
     let out = tool
         .execute(json!({"command": "cat .git"}))
@@ -3145,7 +3126,6 @@ async fn sandbox_policy_anchor_rerooted_worktree_git_read_only_background_bash()
         protect_git: true,
         shell: Shell::detect().unwrap(),
         owner_session: None,
-        tmp_read_only: false,
     };
     bash.set_event_sender(sender);
     let start = bash
@@ -3385,7 +3365,6 @@ async fn sandbox_ro_parent_allows_rw_child_override() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
-        tmp_read_only: false,
     };
     tool.execute(json!({"command": format!("touch '{}/yes'", child.display())}))
         .await
@@ -3423,7 +3402,6 @@ async fn sandbox_extra_writable_and_readable_paths() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
-        tmp_read_only: false,
     };
     let cache_path = cache.path().to_string_lossy().into_owned();
     let data_path = data.path().to_string_lossy().into_owned();
@@ -3468,7 +3446,6 @@ async fn sandbox_protects_workspace_git_directory() {
         protect_git: true,
         shell: Shell::detect().unwrap(),
         owner_session: None,
-        tmp_read_only: false,
     };
     // Reading .git/HEAD must succeed (git commands read metadata).
     let out = tool
@@ -3512,7 +3489,6 @@ async fn sandbox_protects_workspace_git_file_linked_worktree() {
         protect_git: true,
         shell: Shell::detect().unwrap(),
         owner_session: None,
-        tmp_read_only: false,
     };
     // Reading the .git pointer must succeed.
     let out = tool
@@ -3554,7 +3530,6 @@ async fn sandbox_mounts_systemd_resolve_when_present() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
-        tmp_read_only: false,
     };
     // Check whether /run/systemd/resolve exists on this host.
     let host_has_resolve = std::path::Path::new("/run/systemd/resolve").exists();
@@ -3605,7 +3580,6 @@ async fn sandbox_cat_etc_resolv_conf_works() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
-        tmp_read_only: false,
     };
     // /etc/resolv.conf is always mounted (--ro-bind-try). Its contents
     // depend on the host config; we just check it is readable.
@@ -3644,7 +3618,6 @@ async fn sandbox_dns_resolution_live_smoke() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
-        tmp_read_only: false,
     };
     // Live DNS resolution: this is a network-dependent smoke test.
     // Skip if /run/systemd/resolve does not exist on the host (no
@@ -3857,7 +3830,6 @@ async fn background_without_timeout_runs_to_completion() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
-        tmp_read_only: false,
     };
     bash.set_event_sender(sender.clone());
     bash.background.set_event_sender(sender);
@@ -4840,7 +4812,6 @@ async fn sandbox_does_not_protect_git_when_protect_git_is_false() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
-        tmp_read_only: false,
     };
     // Writing to .git/HEAD must succeed (main agent orchestrates git).
     let write = tool
@@ -4885,7 +4856,6 @@ async fn sandbox_does_not_protect_git_file_when_protect_git_is_false() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
-        tmp_read_only: false,
     };
     // Overwriting the .git pointer must succeed.
     let write = tool
@@ -4925,7 +4895,6 @@ async fn background_bash_inherits_protect_git_from_parent_bash() {
         protect_git: true,
         shell: Shell::detect().unwrap(),
         owner_session: None,
-        tmp_read_only: false,
     };
     bash.set_event_sender(sender);
 
@@ -4964,7 +4933,6 @@ async fn shared_registry_clone_drop_does_not_kill_another_bash_origin() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
-        tmp_read_only: false,
     };
     bash.set_event_sender(origin_tx);
     // Dropping an unrelated facade must not tear down the shared registry.
@@ -4994,7 +4962,6 @@ async fn shared_bash_facades_keep_completions_at_their_origins() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
-        tmp_read_only: false,
     };
     let mut second = Bash {
         workspace,
@@ -5005,7 +4972,6 @@ async fn shared_bash_facades_keep_completions_at_their_origins() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
-        tmp_read_only: false,
     };
     first.set_event_sender(first_tx);
     second.set_event_sender(second_tx);
@@ -5585,7 +5551,6 @@ fn ancestor_bash(workspace_dir: &std::path::Path, sandbox: crate::config::Sandbo
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
-        tmp_read_only: false,
     }
 }
 
@@ -6305,8 +6270,10 @@ fn ancestor_guard_symlinked_ancestor_resolves_to_canonical_target() {
 #[cfg(unix)]
 #[test]
 fn ancestor_guard_skips_tmp_scratch_and_policy_paths_untouched() {
-    // /tmp scratch workspaces need no guard (private tmpfs / host scratch
-    // bind); the policy-parent projection must be unaffected by guards.
+    // /tmp scratch workspaces need no ancestor guard: the sandbox /tmp is
+    // the host's real /tmp, granted wholesale by design, so there is no
+    // smaller host object a guard could shadow. The policy-parent
+    // projection must be unaffected by guards.
     // Pure plan construction needs no bwrap installation: build the
     // policy struct directly so these tests also run where bwrap is
     // missing.
@@ -6330,109 +6297,51 @@ fn ancestor_guard_skips_tmp_scratch_and_policy_paths_untouched() {
         .iter()
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
+    // Exactly the intentional host bind, and no guard mount/lock on /tmp.
     assert!(
-        !args.windows(3).any(|w| {
-            (w[0] == "--ro-bind" || w[0] == "--bind") && (w[1] == "/tmp" || w[2] == "/tmp")
-        }) && !args
-            .windows(2)
-            .any(|w| w[0] == "--remount-ro" && w[1] == "/tmp"),
-        "/tmp scratch workspaces must gain no guard bind and no guard lock: {args:?}"
+        args.windows(3)
+            .any(|w| w[0] == "--bind" && w[1] == "/tmp" && w[2] == "/tmp"),
+        "the sandbox /tmp must be the host /tmp bind: {args:?}"
+    );
+    assert!(
+        !args.windows(2).any(|w| w[0] == "--tmpfs" && w[1] == "/tmp")
+            && !args
+                .windows(2)
+                .any(|w| w[0] == "--remount-ro" && w[1] == "/tmp"),
+        "/tmp scratch workspaces must gain no guard mount and no guard lock: {args:?}"
     );
     std::fs::remove_dir_all(&scratch).unwrap();
 }
 
-#[cfg(unix)]
-#[tokio::test]
-async fn common_construction_owner_attribution_does_not_select_tmp_policy() {
-    let Some(policy) = sandbox() else {
-        eprintln!("bwrap unavailable; skipping sandbox test");
-        return;
-    };
-    let temp = tempfile::tempdir().unwrap();
-    let workspace = Workspace::new(temp.path()).unwrap();
-    let tools = super::tools_with_background_and_web_search(
-        workspace,
-        BackgroundTasks::new(None, Some(policy.clone())),
-        None,
-        Some(policy),
-        false,
-        false,
-        None,
-        Some("owner-only".into()),
-        false,
-        None,
-    );
-    let bash = tools
-        .into_iter()
-        .find(|tool| tool.spec().name == "bash")
-        .unwrap();
-    let output = bash
-        .execute(json!({"command": "touch /tmp/e-agent-owner-attribution-tmp-test"}))
-        .await
-        .unwrap();
-    assert!(output.content.contains("exit code: 0"), "{output:?}");
-    assert!(!std::path::Path::new("/tmp/e-agent-owner-attribution-tmp-test").exists());
-}
-
-#[cfg(unix)]
-#[test]
-fn sandbox_tmp_policy_plan_differs_only_for_subagents() {
-    let temp = tempfile::tempdir().unwrap();
-    let workspace = Workspace::new(temp.path()).unwrap();
-    let policy = sandbox().unwrap_or(crate::config::Sandbox {
-        enabled: true,
-        network: true,
-        workspace_writable: true,
-        writable_paths: Vec::new(),
-        readable_paths: Vec::new(),
-        readable_mounts: Vec::new(),
-        writable_mounts: Vec::new(),
-    });
-    let root = workspace.root().to_string_lossy().into_owned();
-    let main =
-        super::bash::build_bwrap_plan(&workspace, &policy, false, true, &root, None).unwrap();
-    let sub = super::bash::build_bwrap_plan_with_tmp_policy(
-        &workspace, &policy, true, true, &root, None, true,
-    )
-    .unwrap();
-    let main_args: Vec<String> = main
-        .args
-        .iter()
-        .map(|arg| arg.to_string_lossy().into())
-        .collect();
-    let sub_args: Vec<String> = sub
-        .args
-        .iter()
-        .map(|arg| arg.to_string_lossy().into())
-        .collect();
-    assert!(sub_args.windows(2).any(|pair| pair == ["--tmpfs", "/tmp"]));
-    assert!(
-        sub_args
-            .windows(2)
-            .any(|pair| pair == ["--remount-ro", "/tmp"])
-    );
-    assert!(
-        !main_args
-            .windows(2)
-            .any(|pair| pair == ["--remount-ro", "/tmp"])
-    );
-}
-
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn sandbox_facade_tmp_is_writable_for_main_and_read_only_for_subagent() {
+async fn sandbox_facade_tmp_is_host_tmp_for_main_and_subagent() {
+    // The sandbox /tmp is the host's real /tmp: same device+inode, and
+    // writable under the main and the subagent facade alike (the private
+    // tmpfs and the subagent read-only remount were removed), so a tool that
+    // needs a shared writable scratch space (cargo, TMPDIR users) works
+    // directly. The caller's own /tmp writability decides the write
+    // expectation: a nested read-only sandbox around the test process must
+    // reproduce that same failure inside.
     if !bwrap_available() {
         eprintln!("bwrap unavailable; skipping sandbox test");
         return;
     }
+    use std::os::unix::fs::MetadataExt;
+
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();
     let policy = sandbox().unwrap();
-    let main_path = "/tmp/e-agent-main-tmp-test";
-    let sub_path = "/tmp/e-agent-subagent-tmp-test";
-    let _ = std::fs::remove_file(main_path);
-    let _ = std::fs::remove_file(sub_path);
-    let make = |tmp_read_only| Bash {
+    let host_tmp = std::fs::metadata("/tmp").unwrap();
+    let host_identity = format!("{}:{}", host_tmp.dev(), host_tmp.ino());
+    let unique = format!("e-agent-facade-tmp-test-{}", std::process::id());
+    let host_writable = {
+        let probe = std::path::PathBuf::from("/tmp").join(format!("{unique}-probe"));
+        let ok = std::fs::write(&probe, b"x").is_ok();
+        let _ = std::fs::remove_file(&probe);
+        ok
+    };
+    let make = || Bash {
         workspace: workspace.clone(),
         timeout: Some(Duration::from_secs(10)),
         sender: None,
@@ -6441,24 +6350,48 @@ async fn sandbox_facade_tmp_is_writable_for_main_and_read_only_for_subagent() {
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
-        tmp_read_only,
     };
-    let main = make(false);
-    let output = main
-        .execute(json!({"command": format!("touch {main_path}")}))
-        .await
-        .unwrap();
-    assert!(output.content.contains("exit code: 0"), "{output:?}");
-    assert!(!std::path::Path::new(main_path).exists());
-    let sub = make(true);
-    let output = sub
-        .execute(json!({"command": format!("mkdir {sub_path} 2>&1")}))
-        .await
-        .unwrap_err();
-    let output = ToolOutput::text(output);
-    assert!(
-        output.content.contains("exit code:") || output.content.contains("Read-only file system"),
-        "{output:?}"
-    );
-    assert!(!std::path::Path::new(sub_path).exists());
+    for (facade, name) in [
+        ("main", unique.clone()),
+        ("subagent", format!("{unique}-sub")),
+    ] {
+        let tool = make();
+        // The sandbox /tmp must BE the host /tmp: identical device+inode.
+        let output = tool
+            .execute(json!({"command": format!(
+                "test \"$(stat -c '%d:%i' /tmp)\" = {host_identity}"
+            )}))
+            .await
+            .unwrap();
+        assert!(
+            output.content.contains("exit code: 0"),
+            "the {facade} facade's /tmp is not the host /tmp: {output:?}"
+        );
+        let path = std::path::PathBuf::from("/tmp").join(&name);
+        let _ = std::fs::remove_file(&path);
+        let output = tool
+            .execute(json!({"command": format!("touch {}", path.display())}))
+            .await;
+        if host_writable {
+            let output = output.unwrap();
+            assert!(
+                output.content.contains("exit code: 0"),
+                "the {facade} facade's /tmp write must succeed with a writable host /tmp: {output:?}"
+            );
+            assert!(
+                path.exists(),
+                "the {facade} facade's /tmp write must reach the host /tmp"
+            );
+        } else {
+            assert!(
+                output.is_err(),
+                "the host /tmp is read-only, so the {facade} facade's write must fail too: {output:?}"
+            );
+            assert!(
+                !path.exists(),
+                "the {facade} facade must not create {path:?}"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
 }

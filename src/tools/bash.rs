@@ -37,7 +37,6 @@ pub fn bash_tool(
     protect_git: bool,
     timeout: Option<Duration>,
     self_session_id: Option<String>,
-    tmp_read_only: bool,
 ) -> Result<Box<dyn Tool>, String> {
     let shell = Shell::detect()?;
     Ok(Box::new(Bash {
@@ -52,7 +51,6 @@ pub fn bash_tool(
         // 后台 bash 任务记到共享 registry 时带它，任务面板才能显示真正的
         // 发起者而非 registry 所属会话。
         owner_session: self_session_id,
-        tmp_read_only,
     }))
 }
 
@@ -88,9 +86,6 @@ pub(super) struct Bash {
     /// 发起者会话 id（subagent 为它自己的 session id，主会话为 None）：
     /// 后台 bash 任务在共享 registry 里用它标注发起者。
     pub(super) owner_session: Option<String>,
-    /// Delegated subagents get an empty read-only private `/tmp`; main Bash
-    /// keeps its writable private tmpfs.
-    pub(super) tmp_read_only: bool,
 }
 
 #[async_trait]
@@ -232,7 +227,7 @@ impl Tool for Bash {
                 )
                 .map(ToolOutput::text);
         }
-        run_bash_with_tmp_policy(
+        run_bash(
             &self.shell,
             &self.workspace,
             command,
@@ -243,7 +238,6 @@ impl Tool for Bash {
             None,
             self.sandbox.as_ref(),
             None,
-            self.tmp_read_only,
         )
         .await
         .map(ToolOutput::text)
@@ -488,27 +482,6 @@ pub(super) fn build_bwrap_plan(
     chdir: &str,
     scratch_bind: Option<&str>,
 ) -> Result<BwrapPlan, String> {
-    build_bwrap_plan_with_tmp_policy(
-        workspace,
-        sandbox,
-        protect_git,
-        network,
-        chdir,
-        scratch_bind,
-        false,
-    )
-}
-
-#[cfg(unix)]
-pub(super) fn build_bwrap_plan_with_tmp_policy(
-    workspace: &Workspace,
-    sandbox: &crate::config::Sandbox,
-    protect_git: bool,
-    network: bool,
-    chdir: &str,
-    scratch_bind: Option<&str>,
-    tmp_read_only: bool,
-) -> Result<BwrapPlan, String> {
     let root = workspace.root();
     let workspace_bind = if sandbox.workspace_writable {
         "--bind"
@@ -550,9 +523,11 @@ pub(super) fn build_bwrap_plan_with_tmp_policy(
         // run_rust: the private scratch is the sandbox /tmp, deleted afterwards.
         args.extend(["--bind".into(), scratch.into(), "/tmp".into()]);
     } else {
-        // Mount the private tmpfs first. A delegated subagent's read-only
-        // remount is appended after all other mounts are created below.
-        args.extend(["--tmpfs".into(), "/tmp".into()]);
+        // The sandbox /tmp is the HOST's real /tmp, bound writable by design
+        // for main and delegated subagents alike (no private tmpfs, no
+        // read-only remount): tools that need a shared writable scratch space
+        // (cargo, TMPDIR users) run directly against it.
+        args.extend(["--bind".into(), "/tmp".into(), "/tmp".into()]);
     }
     args.extend(["--tmpfs".into(), "/home".into()]);
     // Ancestors before descendants (workspace last among equals stays
@@ -791,9 +766,6 @@ pub(super) fn build_bwrap_plan_with_tmp_policy(
             .map_err(|error| format!("cannot retain linked worktree admin: {error}"))?;
         push_bind(&mut args, &mut fds, fd, metadata.admin_path.clone(), false);
     }
-    if tmp_read_only {
-        args.extend(["--remount-ro".into(), "/tmp".into()]);
-    }
     // Seal guards after all metadata mountpoint directories are present.
     for (_, dest) in &ancestor_guards {
         args.push("--remount-ro".into());
@@ -899,9 +871,12 @@ pub(super) fn ancestor_guards(
                 root.display()
             ));
         }
-        // /tmp is a private tmpfs (or the run_rust private scratch bind)
-        // that never maps to host paths: nothing under it can escape to the
-        // host, so no guard is needed for scratch workspaces.
+        // /tmp is deliberately granted wholesale: the sandbox /tmp is the
+        // host's real /tmp (a run_rust scratch run binds its private host
+        // scratch there instead). A guard would have to shadow that very
+        // directory — the intentional authorization itself — so there is no
+        // smaller host object to protect, and a scratch workspace under
+        // /tmp needs no guard.
         if dir == Path::new("/tmp") {
             break;
         }
@@ -1302,7 +1277,6 @@ pub(super) fn plan_spawn(
 /// command and the descriptor-pinned plan. The caller must keep the plan
 /// alive until the spawn.
 #[cfg(unix)]
-#[allow(dead_code)]
 pub(super) fn wrap_bash_command(
     shell: &Shell,
     workspace: &Workspace,
@@ -1310,28 +1284,15 @@ pub(super) fn wrap_bash_command(
     protect_git: bool,
     sandbox: &crate::config::Sandbox,
 ) -> Result<(Command, Option<BwrapPlan>), String> {
-    wrap_bash_command_with_tmp_policy(shell, workspace, command, protect_git, sandbox, false)
-}
-
-#[cfg(unix)]
-fn wrap_bash_command_with_tmp_policy(
-    shell: &Shell,
-    workspace: &Workspace,
-    command: &str,
-    protect_git: bool,
-    sandbox: &crate::config::Sandbox,
-    tmp_read_only: bool,
-) -> Result<(Command, Option<BwrapPlan>), String> {
     let root = workspace.root();
     let root_str = root.to_string_lossy().into_owned();
-    let plan = build_bwrap_plan_with_tmp_policy(
+    let plan = build_bwrap_plan(
         workspace,
         sandbox,
         protect_git,
         sandbox.network,
         &root_str,
         None,
-        tmp_read_only,
     )?;
     let mut cmd = Command::new("bwrap");
     cmd.args(&plan.args);
@@ -1360,7 +1321,6 @@ fn wrap_bash_command_with_tmp_policy(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
 pub(super) async fn run_bash(
     shell: &Shell,
     workspace: &Workspace,
@@ -1373,7 +1333,7 @@ pub(super) async fn run_bash(
     sandbox: Option<&crate::config::Sandbox>,
     exit_slot: Option<ExitSlot>,
 ) -> Result<String, String> {
-    run_bash_with_tmp_policy_and_stall_state(
+    run_bash_with_stall_state(
         shell,
         workspace,
         command,
@@ -1384,7 +1344,6 @@ pub(super) async fn run_bash(
         spool,
         sandbox,
         exit_slot,
-        false,
         None,
     )
     .await
@@ -1394,7 +1353,7 @@ pub(super) async fn run_bash(
 /// eligibility at the exact child-process exit boundary. Output capture is
 /// intentionally still joined afterward so inherited pipes continue draining.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn run_bash_with_tmp_policy(
+pub(super) async fn run_bash_with_stall_state(
     shell: &Shell,
     workspace: &Workspace,
     command: &str,
@@ -1405,38 +1364,6 @@ pub(super) async fn run_bash_with_tmp_policy(
     spool: Option<Arc<TaskSpool>>,
     sandbox: Option<&crate::config::Sandbox>,
     exit_slot: Option<ExitSlot>,
-    tmp_read_only: bool,
-) -> Result<String, String> {
-    run_bash_with_tmp_policy_and_stall_state(
-        shell,
-        workspace,
-        command,
-        timeout,
-        protect_git,
-        process_group_slot,
-        output_slot,
-        spool,
-        sandbox,
-        exit_slot,
-        tmp_read_only,
-        None,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn run_bash_with_tmp_policy_and_stall_state(
-    shell: &Shell,
-    workspace: &Workspace,
-    command: &str,
-    timeout: Option<Duration>,
-    protect_git: bool,
-    process_group_slot: Option<Arc<AtomicI32>>,
-    output_slot: Option<OutputSlot>,
-    spool: Option<Arc<TaskSpool>>,
-    sandbox: Option<&crate::config::Sandbox>,
-    exit_slot: Option<ExitSlot>,
-    tmp_read_only: bool,
     stall_state: Option<Arc<std::sync::Mutex<super::background::MonitoredTaskState>>>,
 ) -> Result<String, String> {
     #[cfg(windows)]
@@ -1464,14 +1391,7 @@ pub(super) async fn run_bash_with_tmp_policy_and_stall_state(
     // arm) — for foreground and background calls alike.
     #[cfg(unix)]
     let (mut process, _plan) = match sandbox {
-        Some(sandbox) => wrap_bash_command_with_tmp_policy(
-            shell,
-            workspace,
-            command,
-            protect_git,
-            sandbox,
-            tmp_read_only,
-        )?,
+        Some(sandbox) => wrap_bash_command(shell, workspace, command, protect_git, sandbox)?,
         None => {
             let mut cmd = Command::new(&shell.executable);
             cmd.args(shell.command_args(command));

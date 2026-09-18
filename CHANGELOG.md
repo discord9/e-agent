@@ -38,6 +38,15 @@ does not yet follow semantic versioning strictly.
   milliseconds, and the process force-exits at the deadline instead of
   waiting on a hung connection; a second Ctrl-C still kills it outright.
 
+### Changed
+
+- **Sandbox `/tmp` is the host's real `/tmp` again** — bubblewrap bash no
+  longer mounts a private `/tmp` tmpfs, and the delegated-subagent
+  read-only `/tmp` remount is gone: inside the sandbox `/tmp` is the host
+  `/tmp`, writable for the main agent and subagents alike, so tools that
+  expect a shared writable scratch space (cargo, TMPDIR users) run
+  directly. `run_rust`'s private scratch `/tmp` binding is unchanged.
+
 ## [0.1.1] — 2026-08-04
 
 ### Fixed

@@ -266,8 +266,9 @@ fail closed rather than an unsandboxed shell.
 
 Read-only is a tool boundary, not a host security framework: it constrains
 which tools the model may call, and the bash sandbox remains a best-effort
-bwrap policy (see "Safety boundaries"). Inside that sandbox `/tmp` and the
-`$HOME` tmpfs remain writable scratch space; the file tools are the
+bwrap policy (see "Safety boundaries"). Inside that sandbox `/tmp` is the
+host's real `/tmp` (writable for main and subagents alike) and the `$HOME`
+tmpfs remains writable scratch space; the file tools are the
 authoritative write path, and they are absent.
 
 The main session can request the same policy with `--read-only`: no
@@ -670,11 +671,10 @@ lifecycle enhancement.
 
 On Linux/macOS every `bash` call—main agent and subagents alike—is wrapped in
 `bwrap`: system directories are mounted read-only, the workspace is mounted
-read-write (`workspace_writable = false` makes it read-only), `/tmp` and `/home`
-are fresh tmpfs, PID/IPC/UTS namespaces are unshared, and TIOCSTI is blocked via
-`--new-session`. Main-agent Bash gets a fresh writable private `/tmp`; delegated
-subagent Bash gets an empty private read-only `/tmp`, so cross-command artifacts
-belong in the workspace. Network stays available by default; `network = false` unshares
+read-write (`workspace_writable = false` makes it read-only), `/tmp` is the
+host's real `/tmp` (bound writable for main-agent and subagent Bash alike),
+`/home` is a fresh tmpfs, PID/IPC/UTS namespaces are unshared, and TIOCSTI is
+blocked via `--new-session`. Network stays available by default; `network = false` unshares
 it. When the host uses systemd-resolved, the stub resolver at
 `/run/systemd/resolve` is mounted read-only so DNS resolution via the symlinked
 `/etc/resolv.conf` works inside the sandbox. The restriction constrains the

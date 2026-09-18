@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use crate::agent::{AgentEvent, BackgroundTrace, preview};
 
-use super::bash::{Shell, run_bash_with_tmp_policy_and_stall_state};
+use super::bash::{Shell, run_bash_with_stall_state};
 
 #[derive(Clone)]
 pub struct BackgroundTasks {
@@ -791,7 +791,7 @@ impl BackgroundTasks {
                 }
             },
             move || async move {
-                let run = run_bash_with_tmp_policy_and_stall_state(
+                let run = run_bash_with_stall_state(
                     &shell,
                     &workspace,
                     &command,
@@ -802,7 +802,6 @@ impl BackgroundTasks {
                     Some(full),
                     sandbox.as_ref(),
                     Some(exit_slot.clone()),
-                    false,
                     output_state.clone(),
                 );
                 let result = if let Some(sender) = stall_sender {
@@ -1310,7 +1309,7 @@ mod tests {
             let run_shell = shell.clone();
             let run_workspace = workspace.clone();
             let run = tokio::spawn(async move {
-                super::bash::run_bash_with_tmp_policy_and_stall_state(
+                super::bash::run_bash_with_stall_state(
                     &run_shell,
                     &run_workspace,
                     "sleep 1",
@@ -1321,7 +1320,6 @@ mod tests {
                     None,
                     None,
                     None,
-                    false,
                     Some(state),
                 )
                 .await
@@ -1367,7 +1365,7 @@ mod tests {
         let spool = Arc::new(TaskSpool::with_monitor(Some(state.clone())));
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let shell = Shell::detect().unwrap();
-        let run = super::bash::run_bash_with_tmp_policy_and_stall_state(
+        let run = super::bash::run_bash_with_stall_state(
             &shell,
             &workspace,
             "(sleep 0.05; printf retained) & exit 0",
@@ -1378,7 +1376,6 @@ mod tests {
             Some(spool),
             None,
             None,
-            false,
             Some(state.clone()),
         );
         let monitor = monitor_stalls(
