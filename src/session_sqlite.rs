@@ -680,10 +680,16 @@ impl SqliteSession {
     /// `(workspace_id, session_id, seq, event_time_us)` primary key makes each
     /// selected winner physical row unique; decoding remains selected-only.
     pub async fn query_history(&self, query: &HistoryQuery) -> Result<Vec<HistoryEntry>, String> {
+        // `concat` keeps every non-empty segment instead of short-circuiting
+        // on the first one: an assistant message that carries both text and
+        // tool calls must match on either. `json_extract` of the tool_calls
+        // array yields the array's JSON text (tool names and raw argument
+        // strings), the same surface the JSONL backend searches.
         let text = r#"CASE WHEN json_valid(payload) THEN CASE json_extract(payload,'$.type')
- WHEN 'message' THEN CASE
-  WHEN json_type(payload,'$.message.User.content')='text' THEN json_extract(payload,'$.message.User.content')
-  WHEN json_type(payload,'$.message.Assistant.content')='text' THEN json_extract(payload,'$.message.Assistant.content') END
+ WHEN 'message' THEN concat(
+  CASE WHEN json_type(payload,'$.message.User.content')='text' THEN json_extract(payload,'$.message.User.content') END,
+  CASE WHEN json_type(payload,'$.message.Assistant.content')='text' THEN json_extract(payload,'$.message.Assistant.content') END,
+  CASE WHEN json_type(payload,'$.message.Assistant.tool_calls')='array' THEN json_extract(payload,'$.message.Assistant.tool_calls') END)
  WHEN 'notice' THEN CASE WHEN json_type(payload,'$.text')='text' THEN json_extract(payload,'$.text') END END END"#;
         let predicate = query
             .query

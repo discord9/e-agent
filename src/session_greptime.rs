@@ -604,10 +604,19 @@ impl GreptimeSession {
     /// Direct physical-record history search. Greptime search intentionally
     /// does not reconstruct latest seq winners: older matching versions remain
     /// searchable. `TRY_CAST(... AS BYTEA)` keeps malformed payloads NULL.
+    ///
+    /// Unlike SQLite's `json_extract`, `json_get_string` cannot render JSON
+    /// containers here: `message.Assistant.tool_calls` is an array and comes
+    /// back NULL (verified against GreptimeDB 1.2.0), and no array-to-text
+    /// function exists, so assistant tool calls are searched through the
+    /// rendered `message.Assistant` object — the one container
+    /// `json_get_object` + `json_to_string` can produce. `reasoning` is
+    /// stripped from that rendering so reasoning stays out of the search
+    /// surface, exactly like the JSONL/SQLite backends.
     pub async fn query_history(&self, query: &HistoryQuery) -> Result<Vec<HistoryEntry>> {
         let text = r#"CASE json_get_string(TRY_CAST(payload AS BYTEA),'type')
  WHEN 'notice' THEN json_get_string(TRY_CAST(payload AS BYTEA),'text')
- WHEN 'message' THEN coalesce(json_get_string(TRY_CAST(payload AS BYTEA),'message.User.content'),json_get_string(TRY_CAST(payload AS BYTEA),'message.Assistant.content')) END"#;
+ WHEN 'message' THEN concat_ws(chr(10),json_get_string(TRY_CAST(payload AS BYTEA),'message.User.content'),json_get_string(TRY_CAST(payload AS BYTEA),'message.Assistant.content'),regexp_replace(json_to_string(json_get_object(TRY_CAST(payload AS BYTEA),'message.Assistant')),'"reasoning":"(\\.|[^"\\])*"','""')) END"#;
         let workspace = query.workspace_id.as_deref();
         let session = query.session_id.as_deref();
         let limit = query.limit as i64;
@@ -4391,6 +4400,139 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(cross_first[0].event_time, cross_second[0].event_time);
+
+        // Verified against GreptimeDB 1.2.0: `json_get_string` renders JSON
+        // *containers* as NULL for a STRING payload, so the tool_calls array
+        // is not searchable directly and has no array-to-text equivalent. The
+        // projection therefore renders the Assistant object (the one
+        // container `json_get_object`+`json_to_string` can produce) with the
+        // `reasoning` field stripped. The turn also carries text, so an
+        // argument-only match proves the projection does not stop at the
+        // first non-empty segment.
+        let tool_call = serde_json::to_string(&SessionEntry::Message {
+            message: Message::Assistant(AssistantMessage {
+                content: Some("contentonlymarker".into()),
+                tool_calls: vec![crate::agent::ToolCall {
+                    id: "call_1".into(),
+                    name: "write_file".into(),
+                    arguments: r#"{"path":"/tmp/x","content":"toolneedle"}"#.into(),
+                }],
+                reasoning: Some("reasononly".into()),
+            }),
+        })
+        .unwrap();
+        let tool_result = serde_json::to_string(&SessionEntry::Message {
+            message: Message::Tool {
+                call_id: "call_1".into(),
+                name: "write_file".into(),
+                content: "toolneedle".into(),
+                images: vec![],
+                is_error: false,
+                synthetic: false,
+            },
+        })
+        .unwrap();
+        session
+            .client
+            .execute(
+                "INSERT INTO session_entries (workspace_id, session_id, seq, event_time, entry_kind, payload, schema_version, is_error) VALUES ($1,$2,12,$3,'message',$4,1,false),($1,$2,13,$5,'message',$6,1,false)",
+                &[
+                    &wid,
+                    &sid,
+                    &us_to_datetime(next_event_time_us()),
+                    &tool_call,
+                    &us_to_datetime(next_event_time_us()),
+                    &tool_result,
+                ],
+            )
+            .await
+            .unwrap();
+        let rendered = session
+            .client
+            .query(
+                "SELECT json_get_string(TRY_CAST(payload AS BYTEA),'message.Assistant.tool_calls') AS array_text, json_get_string(TRY_CAST(payload AS BYTEA),'message.Assistant.tool_calls[0].arguments') AS first_argument, json_to_string(json_get_object(TRY_CAST(payload AS BYTEA),'message.Assistant')) AS object_text FROM session_entries WHERE workspace_id=$1 AND session_id=$2 AND seq=12",
+                &[&wid, &sid],
+            )
+            .await
+            .unwrap();
+        let array_text: Option<String> = rendered[0].get("array_text");
+        assert!(
+            array_text.is_none(),
+            "json_get_string must still render the tool_calls array as NULL: {array_text:?}"
+        );
+        let first_argument: Option<String> = rendered[0].get("first_argument");
+        assert_eq!(
+            first_argument.as_deref(),
+            Some(r#"{"path":"/tmp/x","content":"toolneedle"}"#)
+        );
+        let object_text: Option<String> = rendered[0].get("object_text");
+        assert!(
+            object_text
+                .as_deref()
+                .is_some_and(|text| text.contains("toolneedle")),
+            "rendered Assistant object carries the tool-call arguments: {object_text:?}"
+        );
+
+        let tool_calls = session
+            .query_history(&HistoryQuery {
+                workspace_id: Some(wid.clone()),
+                session_id: Some(sid.clone()),
+                query: Some("toolneedle".into()),
+                after: None,
+                after_event_time: None,
+                offset: None,
+                exact_seq: None,
+                limit: 4,
+                default_search_window: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            tool_calls.iter().map(|entry| entry.seq).collect::<Vec<_>>(),
+            vec![12],
+            "argument-only fragment matches the turn that also has text; the Tool result with the same word does not"
+        );
+        let content_only = session
+            .query_history(&HistoryQuery {
+                workspace_id: Some(wid.clone()),
+                session_id: Some(sid.clone()),
+                query: Some("contentonlymarker".into()),
+                after: None,
+                after_event_time: None,
+                offset: None,
+                exact_seq: None,
+                limit: 4,
+                default_search_window: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            content_only
+                .iter()
+                .map(|entry| entry.seq)
+                .collect::<Vec<_>>(),
+            vec![12],
+            "the same turn's assistant text stays searchable"
+        );
+        let reasoning = session
+            .query_history(&HistoryQuery {
+                workspace_id: Some(wid.clone()),
+                session_id: Some(sid.clone()),
+                query: Some("reasononly".into()),
+                after: None,
+                after_event_time: None,
+                offset: None,
+                exact_seq: None,
+                limit: 4,
+                default_search_window: false,
+            })
+            .await
+            .unwrap();
+        assert!(
+            reasoning.is_empty(),
+            "stripped reasoning stays out of the search projection"
+        );
+
         let selected_bad = session
             .query_history(&HistoryQuery {
                 workspace_id: Some(wid),
