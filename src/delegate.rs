@@ -161,6 +161,13 @@ async fn finish_child_cleanup(
     }
 }
 
+/// Live default-subagent-model resolver installed by the session factory:
+/// resolves the fallback model (no routed role) from the reloadable config
+/// at spawn time (returns the model plus its context window, or `None` when
+/// the live config routes no subagent model).
+pub type SubagentModelSource =
+    Arc<dyn Fn() -> Option<(ConfiguredModel, Option<u64>)> + Send + Sync>;
+
 /// Live role-model resolver installed by the session factory: resolves a
 /// role's model from the reloadable config at spawn time (returns the model
 /// plus its context window, or `None` when the role is not routed).
@@ -197,6 +204,13 @@ pub struct Delegate {
     /// `None` (a Delegate constructed directly, e.g. in tests) falls back to
     /// the construction-time `role_models` snapshot.
     role_model_source: Option<RoleModelSource>,
+    /// Live default-subagent-model resolver installed by the session
+    /// factory: resolves the fallback model for tasks with no routed role
+    /// from the reloadable config at spawn time, so `[roles] subagent`
+    /// edits hot-reload into newly spawned subagents without a restart.
+    /// `None` (a Delegate constructed directly, e.g. in tests) falls back
+    /// to the construction-time `subagent_model` snapshot.
+    subagent_model_source: Option<SubagentModelSource>,
     /// Workspace root used to resolve role templates across global, legacy
     /// project (`agents/`), and canonical project (`.e-agent/agents/`) layers.
     roles_root: Option<std::path::PathBuf>,
@@ -261,6 +275,19 @@ struct DelegatedTask {
 }
 
 impl Delegate {
+    /// The effective default subagent model at spawn time: the live source
+    /// (session factory, hot-reloadable) when installed, else the
+    /// construction-time snapshot. Shared by both fallback paths in
+    /// `execute` — the no-`role` branch and the routed-role branch when the
+    /// live `[roles]` config does not route the role.
+    fn effective_subagent_model(&self) -> (ConfiguredModel, Option<u64>) {
+        match &self.subagent_model_source {
+            Some(source) => source()
+                .unwrap_or_else(|| (self.subagent_model.clone(), self.subagent_context_window)),
+            None => (self.subagent_model.clone(), self.subagent_context_window),
+        }
+    }
+
     pub fn new(model: ConfiguredModel, workspace: Workspace, background: BackgroundTasks) -> Self {
         Self {
             subagent_model: model,
@@ -272,6 +299,7 @@ impl Delegate {
             role_models: std::collections::HashMap::new(),
             role_context_windows: std::collections::HashMap::new(),
             role_model_source: None,
+            subagent_model_source: None,
             roles_root: None,
             sandbox: None,
             record_in: None,
@@ -318,6 +346,16 @@ impl Delegate {
     /// the role is not routed — the `role_models` snapshot then applies.
     pub fn with_role_model_source(mut self, source: RoleModelSource) -> Self {
         self.role_model_source = Some(source);
+        self
+    }
+
+    /// Resolve the default subagent model live at spawn time (from the
+    /// session factory's reloadable config) instead of the construction-time
+    /// snapshot, for tasks with no routed role. The source returns
+    /// `(model, context window)`, or `None` when the live config routes no
+    /// subagent model — the `subagent_model` snapshot then applies.
+    pub fn with_subagent_model_source(mut self, source: SubagentModelSource) -> Self {
+        self.subagent_model_source = Some(source);
         self
     }
 
@@ -992,23 +1030,23 @@ impl Tool for Delegate {
                     let (model, cw) = match &self.role_model_source {
                         // Live source (session factory): pick up hot-reloaded
                         // `[roles]` routing; when the role is not routed, fall
-                        // back to the default subagent model like the snapshot
-                        // path below.
+                        // back to the (equally live) default subagent model.
                         Some(source) => source(role).unwrap_or_else(|| {
-                            (self.subagent_model.clone(), self.subagent_context_window)
+                            let (model, window) = self.effective_subagent_model();
+                            (model, window)
                         }),
                         // Construction-time snapshot (direct Delegate use/tests).
-                        None => (
-                            self.role_models
-                                .get(role)
-                                .cloned()
-                                .unwrap_or_else(|| self.subagent_model.clone()),
-                            self.role_context_windows
-                                .get(role)
-                                .copied()
-                                .flatten()
-                                .or(self.subagent_context_window),
-                        ),
+                        None => {
+                            let (model, window) = self.effective_subagent_model();
+                            (
+                                self.role_models.get(role).cloned().unwrap_or(model),
+                                self.role_context_windows
+                                    .get(role)
+                                    .copied()
+                                    .flatten()
+                                    .or(window),
+                            )
+                        }
                     };
                     let compaction_reminder = crate::roles::core_directive(&template.prompt);
                     (
@@ -1020,16 +1058,21 @@ impl Tool for Delegate {
                         template.protect_git,
                     )
                 }
-                None => (
-                    self.subagent_model.clone(),
-                    self.subagent_context_window,
-                    None,
-                    None,
-                    false,
-                    // No role: keep the historical subagent default (protect
-                    // .git, exactly like the fixer path).
-                    true,
-                ),
+                None => {
+                    // No role: the live (hot-reloadable) default subagent
+                    // model, falling back to the construction-time snapshot.
+                    let (model, context_window) = self.effective_subagent_model();
+                    (
+                        model,
+                        context_window,
+                        None,
+                        None,
+                        false,
+                        // Keep the historical subagent default (protect
+                        // .git, exactly like the fixer path).
+                        true,
+                    )
+                }
             };
         let resume = arguments
             .as_object()
