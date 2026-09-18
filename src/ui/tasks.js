@@ -191,7 +191,7 @@ function finishedKeySig(t) {
     t.label || "", t.kind || "", t.status || "",
     t.output != null ? t.output : "",
     t.exit_code != null ? t.exit_code : "", t.signal || "",
-    t.duration_ms != null ? t.duration_ms : "",
+    t.cancellation_source || "", t.duration_ms != null ? t.duration_ms : "",
   ]);
 }
 
@@ -214,6 +214,7 @@ function buildFinishedRow(t) {
   if (t.status) meta.push(t.status);
   if (t.exit_code != null) meta.push("exit " + t.exit_code);
   else if (t.signal) meta.push("signal");
+  if (t.cancellation_source) meta.push("cancelled by " + t.cancellation_source);
   if (t.duration_ms != null) meta.push(formatDurationMs(t.duration_ms));
   if (meta.length) {
     line.appendChild(el("span", "task-meta tfin", meta.join(" · ")));

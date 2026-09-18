@@ -1664,7 +1664,8 @@ async fn bash_detached_requires_background_and_keeps_title() {
         tool.background.running()[0].full_command.as_deref(),
         Some("sleep 30")
     );
-    tool.background.cancel(1);
+    tool.background
+        .cancel_with_source(1, crate::agent::CancellationSource::System);
 }
 
 #[test]
@@ -3723,6 +3724,7 @@ async fn background_bash_completion_carries_exit_trace() {
             signal,
             status,
             kind,
+            cancellation_source,
             started_at_ms,
             duration_ms,
             ..
@@ -3732,6 +3734,7 @@ async fn background_bash_completion_carries_exit_trace() {
             assert_eq!(signal, None);
             assert_eq!(status.as_deref(), Some("completed"));
             assert_eq!(kind.as_deref(), Some("bash"));
+            assert_eq!(cancellation_source, None);
             assert!(started_at_ms.is_some(), "started_at_ms must be present");
             assert!(
                 duration_ms.is_some_and(|ms| ms > 0),
@@ -3753,6 +3756,7 @@ async fn background_bash_completion_carries_exit_trace() {
             status,
             kind,
             duration_ms,
+            cancellation_source,
             ..
         } => {
             assert!(output.starts_with("exit code: 3\n"), "{output}");
@@ -3760,6 +3764,7 @@ async fn background_bash_completion_carries_exit_trace() {
             assert_eq!(signal, None);
             assert_eq!(status.as_deref(), Some("failed"));
             assert_eq!(kind.as_deref(), Some("bash"));
+            assert_eq!(cancellation_source, None);
             assert!(duration_ms.is_some_and(|ms| ms > 0));
         }
         other => panic!("expected BackgroundCompleted, got {other:?}"),
@@ -3776,6 +3781,7 @@ async fn background_bash_completion_carries_exit_trace() {
             signal,
             status,
             kind,
+            cancellation_source,
             ..
         } => {
             assert!(output.starts_with("exit code: signal\n"), "{output}");
@@ -3783,6 +3789,7 @@ async fn background_bash_completion_carries_exit_trace() {
             assert_eq!(signal.as_deref(), Some("SIGTERM"));
             assert_eq!(status.as_deref(), Some("killed"));
             assert_eq!(kind.as_deref(), Some("bash"));
+            assert_eq!(cancellation_source, None);
         }
         other => panic!("expected BackgroundCompleted, got {other:?}"),
     }
@@ -3801,7 +3808,11 @@ async fn background_timeout_is_delivered_as_completion() {
         .unwrap();
     assert!(matches!(
         event,
-        AgentEvent::BackgroundCompleted { output, .. } if output.contains("timed out")
+        AgentEvent::BackgroundCompleted {
+            output,
+            cancellation_source: Some(crate::agent::CancellationSource::System),
+            ..
+        } if output.contains("timed out")
     ));
     let pid = std::fs::read_to_string(temp.path().join("child.pid")).unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -3813,6 +3824,80 @@ async fn background_timeout_is_delivered_as_completion() {
             .unwrap()
             .success()
     );
+}
+
+/// The registry's explicit cancellation latch is the first accepted source
+/// and wins over any exit-slot mark the work wrote — the merge order
+/// `completion_trace` documents (`registry.or(exit slot)`). Delegate
+/// durable-start-record failures rely on this: their system mark must never
+/// override a user/agent cancel that already latched.
+async fn marked_task_cancelled_as(source: crate::agent::CancellationSource) {
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let mut background = BackgroundTasks::new(None, None);
+    background.set_event_sender(sender);
+
+    // Cancel-target wrapper (like a delegate task): it stays in the
+    // registry until its work exits, so the cancel latches after the mark.
+    let marked = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let exit_slot = new_exit_slot();
+    let work_exit = exit_slot.clone();
+    let work_marked = marked.clone();
+    let work_release = release.clone();
+    let id_slot: Arc<std::sync::Mutex<Option<u64>>> = Arc::new(std::sync::Mutex::new(None));
+    let hook_slot = id_slot.clone();
+    let target = tokio::spawn(std::future::pending::<()>());
+    background
+        .spawn_with_id_target(
+            background.sender.lock().unwrap().clone(),
+            "mark-then-cancel".into(),
+            None,
+            None,
+            None,
+            exit_slot,
+            Some(target.abort_handle()),
+            move |id| *hook_slot.lock().unwrap() = Some(id),
+            move || {
+                let (work_exit, work_marked, work_release) = (work_exit, work_marked, work_release);
+                async move {
+                    work_exit.lock().unwrap().cancellation_source =
+                        Some(crate::agent::CancellationSource::System);
+                    work_marked.notify_one();
+                    work_release.notified().await;
+                    "aborted work".into()
+                }
+            },
+        )
+        .expect("cancel-target task starts");
+    let id = id_slot.lock().unwrap().expect("task id assigned");
+    marked.notified().await;
+    assert!(
+        background.cancel_with_source(id, source).is_some(),
+        "the explicit cancel is accepted while the work is parked"
+    );
+    release.notify_one();
+    let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+        .await
+        .expect("completion after the work exits")
+        .unwrap();
+    match event {
+        AgentEvent::BackgroundCompleted {
+            cancellation_source,
+            ..
+        } => assert_eq!(
+            cancellation_source,
+            Some(source),
+            "the registry latch must win over the exit-slot System mark"
+        ),
+        other => panic!("expected BackgroundCompleted, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn explicit_registry_cancel_source_wins_over_exit_slot_mark() {
+    // User (the web DELETE) and Agent (the cancel tool) both latch.
+    marked_task_cancelled_as(crate::agent::CancellationSource::User).await;
+    marked_task_cancelled_as(crate::agent::CancellationSource::Agent).await;
 }
 
 #[tokio::test]
@@ -3903,7 +3988,8 @@ async fn background_snapshot_keeps_full_command_beyond_truncated_label() {
         "label shows ellipsis"
     );
     assert_eq!(running[0].full_command.as_deref(), Some(command.as_str()));
-    bash.background.cancel(running[0].id);
+    bash.background
+        .cancel_with_source(running[0].id, crate::agent::CancellationSource::System);
     let _ = tokio::time::timeout(Duration::from_millis(100), receiver.recv()).await;
 }
 
@@ -3982,7 +4068,12 @@ async fn background_title_blank_falls_back_and_foreground_is_ignored() {
         .content;
     assert_eq!(started, "started background task 1: sleep 30");
     assert_eq!(bash.background.running()[0].label, "sleep 30");
-    assert_eq!(bash.background.cancel(1).as_deref(), Some("sleep 30"));
+    assert_eq!(
+        bash.background
+            .cancel_with_source(1, crate::agent::CancellationSource::System)
+            .as_deref(),
+        Some("sleep 30")
+    );
     let _ = tokio::time::timeout(Duration::from_secs(5), receiver.recv()).await;
 }
 
@@ -4004,7 +4095,10 @@ async fn cancel_kills_the_process_group() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let pid = std::fs::read_to_string(temp.path().join("child.pid")).unwrap();
-    let label = bash.background.cancel(id).unwrap();
+    let label = bash
+        .background
+        .cancel_with_source(id, crate::agent::CancellationSource::System)
+        .unwrap();
     assert!(label.contains("sleep 30"));
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(bash.background.running().is_empty());
@@ -4066,7 +4160,7 @@ async fn get_background_tasks_lists_running_tasks() {
     );
 
     // Cancel the first task (id=1).
-    background.cancel(1);
+    background.cancel_with_source(1, crate::agent::CancellationSource::System);
     let _ = tokio::time::timeout(Duration::from_millis(100), receiver.recv()).await;
 
     // The remaining task (id=2) still shows as #2, NOT renumbered to #1.
@@ -4077,7 +4171,7 @@ async fn get_background_tasks_lists_running_tasks() {
     );
 
     // Cleanup.
-    background.cancel(2);
+    background.cancel_with_source(2, crate::agent::CancellationSource::System);
     let _ = tokio::time::timeout(Duration::from_millis(100), receiver.recv()).await;
     assert_eq!(
         tool.execute(json!({})).await.unwrap().content,
@@ -4129,7 +4223,7 @@ async fn get_background_tasks_shows_full_command_beyond_truncated_label() {
         "command line carries the untruncated original"
     );
 
-    background.cancel(1);
+    background.cancel_with_source(1, crate::agent::CancellationSource::System);
     let _ = tokio::time::timeout(Duration::from_millis(100), receiver.recv()).await;
 }
 
@@ -4193,7 +4287,7 @@ async fn get_background_tasks_shows_roled_delegate_with_role_name() {
 #[tokio::test]
 async fn subagent_background_tasks_are_scoped_for_listing_and_cancel() {
     let temp = tempfile::tempdir().unwrap();
-    let (mut bash, _receiver) = background_bash(&temp, Duration::from_secs(30));
+    let (mut bash, mut receiver) = background_bash(&temp, Duration::from_secs(30));
     let background = bash.background.clone();
     let self_session_id = "sub-own";
 
@@ -4267,6 +4361,14 @@ async fn subagent_background_tasks_are_scoped_for_listing_and_cancel() {
         cancel.execute(json!({"id": own_id})).await.unwrap().content,
         format!("cancelled background task {own_id}")
     );
+    assert!(matches!(
+        receiver.recv().await,
+        Some(AgentEvent::BackgroundCompleted {
+            id,
+            cancellation_source: Some(crate::agent::CancellationSource::Agent),
+            ..
+        }) if id == own_id
+    ));
 
     // Main callers retain unrestricted visibility and cancellation.
     let main_list = GetBackgroundTasks::new(background.clone(), None, None);
@@ -4314,7 +4416,7 @@ async fn subagent_hidden_tasks_do_not_trigger_poll_guard() {
         );
     }
     for task in background.running() {
-        background.cancel(task.id);
+        background.cancel_with_source(task.id, crate::agent::CancellationSource::System);
     }
 }
 
@@ -4389,7 +4491,7 @@ async fn subagent_poll_guard_escalates_on_unchanged_snapshot_and_resets_on_chang
 
     // An empty poll (task cancelled) clears the guard: repeated empty
     // polls never escalate…
-    background.cancel(1);
+    background.cancel_with_source(1, crate::agent::CancellationSource::System);
     let _ = tokio::time::timeout(Duration::from_millis(100), receiver.recv()).await;
     for _ in 0..10 {
         assert_eq!(
@@ -4419,7 +4521,7 @@ async fn subagent_poll_guard_escalates_on_unchanged_snapshot_and_resets_on_chang
     assert!(output.starts_with("1 background task(s) running:"));
 
     // Different subagent instances own their tools: independent counts.
-    background.cancel(2);
+    background.cancel_with_source(2, crate::agent::CancellationSource::System);
     let _ = tokio::time::timeout(Duration::from_millis(100), receiver.recv()).await;
     bash.execute(json!({"command": "sleep 30", "background": true}))
         .await
@@ -4487,7 +4589,7 @@ async fn subagent_poll_guard_completion_resets_and_output_growth_does_not() {
     // A task COMPLETING changes the ID set → reset (normal poll again).
     // A fresh SHORT task gives a fresh snapshot {2}; after it completes the
     // observed set is empty — different from {2}, so the next poll resets.
-    background.cancel(1);
+    background.cancel_with_source(1, crate::agent::CancellationSource::System);
     let _ = tokio::time::timeout(Duration::from_millis(100), receiver.recv()).await;
     bash.execute(json!({"command": "sleep 0.1", "background": true}))
         .await
@@ -4566,7 +4668,7 @@ async fn main_poll_guard_escalates_1_2_normal_3_4_reminder_5_sentinel() {
 
     // Cancelling empties the snapshot: empty polls are normal again and
     // clear the guard, so a later real snapshot starts counting fresh.
-    background.cancel(1);
+    background.cancel_with_source(1, crate::agent::CancellationSource::System);
     let _ = tokio::time::timeout(Duration::from_millis(100), receiver.recv()).await;
     assert_eq!(
         tool.execute(json!({})).await.unwrap().content,
@@ -4580,7 +4682,7 @@ async fn main_poll_guard_escalates_1_2_normal_3_4_reminder_5_sentinel() {
         output.starts_with("1 background task(s) running:"),
         "empty poll must reset the guard: {output}"
     );
-    background.cancel(2);
+    background.cancel_with_source(2, crate::agent::CancellationSource::System);
     let _ = tokio::time::timeout(Duration::from_millis(100), receiver.recv()).await;
 }
 
@@ -4718,7 +4820,9 @@ async fn cancel_during_on_id_suppresses_work_and_completion() {
 
     entered.wait();
     assert_eq!(
-        background.cancel(1).as_deref(),
+        background
+            .cancel_with_source(1, crate::agent::CancellationSource::System)
+            .as_deref(),
         Some("blocked registration")
     );
     release.wait();
@@ -5409,6 +5513,77 @@ fn goal_specs_are_closed_and_generic_specs_stay_open() {
 }
 
 #[tokio::test]
+async fn first_cancel_source_latches_for_live_wrapper() {
+    // A delegate wrapper remains registered after its cancel target is
+    // aborted. Every request below is accepted; the first must own the
+    // eventual completion provenance even if work later writes its exit slot.
+    let background = BackgroundTasks::new(None, None);
+    let exit_slot = new_exit_slot();
+    let slot_for_assertion = exit_slot.clone();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let (trace_tx, trace_rx) = tokio::sync::oneshot::channel::<crate::agent::BackgroundTrace>();
+    let target = tokio::spawn(std::future::pending::<()>());
+    background
+        .spawn_inner(
+            "held wrapper".into(),
+            None,
+            None,
+            None,
+            None,
+            exit_slot,
+            Some(target.abort_handle()),
+            |_| {},
+            move || async move {
+                let _ = release_rx.await;
+                "wrapper exited".into()
+            },
+            move |_, _, trace| {
+                let _ = trace_tx.send(trace);
+            },
+        )
+        .expect("spawn wrapper");
+    let id = background.running()[0].id;
+
+    assert!(
+        background
+            .cancel_with_source(id, crate::agent::CancellationSource::User)
+            .is_some()
+    );
+    assert!(
+        background
+            .cancel_with_source(id, crate::agent::CancellationSource::Agent)
+            .is_some()
+    );
+    assert!(
+        background
+            .cancel_with_source(id, crate::agent::CancellationSource::System)
+            .is_some()
+    );
+
+    // Simulate a later work-owned exit-slot write. The registry latch must
+    // still win when the wrapper finally leaves the registry.
+    *slot_for_assertion.lock().unwrap() = TaskExit {
+        exit_code: None,
+        signal: Some("SIGKILL".into()),
+        status: Some("killed".into()),
+        cancellation_source: Some(crate::agent::CancellationSource::System),
+    };
+    let _ = release_tx.send(());
+    let trace = tokio::time::timeout(Duration::from_secs(5), trace_rx)
+        .await
+        .expect("wrapper completion")
+        .expect("trace delivered");
+    assert_eq!(
+        trace.cancellation_source,
+        Some(crate::agent::CancellationSource::User)
+    );
+    assert!(
+        target.await.unwrap_err().is_cancelled(),
+        "first cancellation aborted target"
+    );
+}
+
+#[tokio::test]
 async fn cancel_overrides_stale_completed_trace_with_killed() {
     // Race contract (oracle finding 3): run_bash may already have written
     // completed/failed into the exit slot before its wrapper removes the
@@ -5440,6 +5615,7 @@ async fn cancel_overrides_stale_completed_trace_with_killed() {
                     exit_code: Some(0),
                     signal: None,
                     status: Some("completed".into()),
+                    cancellation_source: None,
                 };
                 let _ = wrote_tx.send(());
                 let _ = release_rx.await;
@@ -5456,6 +5632,7 @@ async fn cancel_overrides_stale_completed_trace_with_killed() {
                     signal: trace.signal,
                     status: trace.status,
                     kind: trace.kind,
+                    cancellation_source: trace.cancellation_source,
                 });
             },
         )
@@ -5468,7 +5645,9 @@ async fn cancel_overrides_stale_completed_trace_with_killed() {
     let _ = tokio::time::timeout(Duration::from_secs(5), wrote_rx)
         .await
         .expect("work must write the stale slot");
-    let label = background.cancel(id).expect("cancel must remove the task");
+    let label = background
+        .cancel_with_source(id, crate::agent::CancellationSource::System)
+        .expect("cancel must remove the task");
     assert!(label.contains("race probe"));
     let _ = release_tx.send(());
 
@@ -5482,12 +5661,17 @@ async fn cancel_overrides_stale_completed_trace_with_killed() {
             signal,
             status,
             kind,
+            cancellation_source,
             ..
         } => {
             assert_eq!(exit_code, None, "canceled trace has no exit code");
             assert_eq!(signal.as_deref(), Some("SIGKILL"));
             assert_eq!(status.as_deref(), Some("killed"));
             assert_eq!(kind.as_deref(), Some("delegate"));
+            assert_eq!(
+                cancellation_source,
+                Some(crate::agent::CancellationSource::System)
+            );
         }
         other => panic!("expected BackgroundCompleted, got {other:?}"),
     }
@@ -5503,11 +5687,13 @@ fn mark_failed_if_empty_fills_only_empty_slots() {
     assert_eq!(empty.exit_code, None);
     assert_eq!(empty.signal, None);
     assert_eq!(empty.status.as_deref(), Some("failed"));
+    assert_eq!(empty.cancellation_source, None);
 
     let mut killed = TaskExit {
         exit_code: None,
         signal: Some("SIGKILL".into()),
         status: Some("killed".into()),
+        cancellation_source: None,
     };
     mark_failed_if_empty(&mut killed);
     assert_eq!(
@@ -5521,6 +5707,7 @@ fn mark_failed_if_empty_fills_only_empty_slots() {
         exit_code: Some(0),
         signal: None,
         status: Some("completed".into()),
+        cancellation_source: None,
     };
     mark_failed_if_empty(&mut completed);
     assert_eq!(completed.exit_code, Some(0), "completed preserved");

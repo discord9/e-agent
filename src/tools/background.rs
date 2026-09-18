@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::time::Duration;
 
-use crate::agent::{AgentEvent, BackgroundTrace, preview};
+use crate::agent::{AgentEvent, BackgroundTrace, CancellationSource, preview};
 
 use super::bash::{Shell, run_bash_with_stall_state};
 
@@ -43,6 +43,9 @@ pub struct TaskExit {
     pub signal: Option<String>,
     /// "completed" | "failed" | "killed".
     pub status: Option<String>,
+    /// Explicit cancellation source recorded by work-owned termination paths
+    /// such as a configured background timeout.
+    pub cancellation_source: Option<CancellationSource>,
 }
 
 /// Shared out-slot for a task's exit metadata, following the
@@ -86,6 +89,7 @@ impl RunningTask {
                 .clone()
                 .map(|name| name.to_ascii_lowercase())
                 .or_else(|| Some("delegate".to_owned())),
+            cancellation_source: self.cancellation_source.or(exit.cancellation_source),
         }
     }
 }
@@ -430,6 +434,8 @@ struct RunningTask {
     /// Exit metadata out-slot written by the work closure (bash:
     /// `run_bash`'s out-slot; delegate: the subagent result success flag).
     exit: ExitSlot,
+    /// Set only by an explicit background-task cancellation path.
+    cancellation_source: Option<CancellationSource>,
 }
 
 /// Structured metadata for delegate-task display in the F2 task panel.
@@ -559,23 +565,31 @@ impl BackgroundTasks {
             .and_then(|task| task.spool.as_ref().map(|spool| spool.bytes()))
     }
 
-    /// Cancel a running background task. Aborting its future drops any
-    /// in-flight `run_bash`, which kills the process group via its guard.
-    /// Returns the cancelled task's label, or `None` if no such task.
-    pub fn cancel(&self, id: u64) -> Option<String> {
-        self.cancel_matching(id, |_| true)
+    /// Cancel a task with the source of the explicit cancellation request.
+    pub fn cancel_with_source(&self, id: u64, source: CancellationSource) -> Option<String> {
+        self.cancel_matching(id, source, |_| true)
     }
 
     /// Cancel a task only when its owner matches the calling subagent. The
     /// ownership check and removal share the registry mutex, so a task cannot
     /// change from visible to cancelled between separate operations.
-    pub fn cancel_owned(&self, id: u64, owner_session: &str) -> Option<String> {
-        self.cancel_matching(id, |task| {
+    pub fn cancel_owned_with_source(
+        &self,
+        id: u64,
+        owner_session: &str,
+        source: CancellationSource,
+    ) -> Option<String> {
+        self.cancel_matching(id, source, |task| {
             task.owner_session.as_deref() == Some(owner_session)
         })
     }
 
-    fn cancel_matching(&self, id: u64, matches: impl Fn(&RunningTask) -> bool) -> Option<String> {
+    fn cancel_matching(
+        &self,
+        id: u64,
+        source: CancellationSource,
+        matches: impl Fn(&RunningTask) -> bool,
+    ) -> Option<String> {
         let (label, target, task) = {
             let mut running = self.registry.running.lock().unwrap();
             let index = running
@@ -587,6 +601,10 @@ impl BackgroundTasks {
             if let Some(state) = &running[index].monitored {
                 state.lock().unwrap().eligible = false;
             }
+            // A cancel-target wrapper stays in the registry until its work
+            // exits, so later accepted requests can observe it too. Preserve
+            // the first accepted source; it is the cancellation that won.
+            running[index].cancellation_source.get_or_insert(source);
             if let Some(target) = running[index].cancel_target.clone() {
                 (running[index].label.clone(), Some(target), None)
             } else {
@@ -689,6 +707,7 @@ impl BackgroundTasks {
                     signal: trace.signal,
                     status: trace.status,
                     kind: trace.kind,
+                    cancellation_source: trace.cancellation_source,
                 });
             },
         )
@@ -965,6 +984,7 @@ impl BackgroundTasks {
                     signal: trace.signal,
                     status: trace.status,
                     kind: trace.kind,
+                    cancellation_source: trace.cancellation_source,
                 });
             },
         )
@@ -1081,6 +1101,7 @@ impl BackgroundTasks {
             started_at_ms,
             started_at,
             exit: exit_slot,
+            cancellation_source: None,
         });
         on_id(id);
         if let Err(work) = work_tx.send(work) {

@@ -954,6 +954,8 @@ The `/api` surface (JSON except for the SSE endpoint):
 | DELETE | `/api/sessions/{id}/tasks/{task_id}` | cancel one background task |
 | GET | `/api/sessions/{id}/tasks/{task_id}/output` | full output of a running bash task |
 
+Background completion records may include cancellation provenance: `user` for an authenticated API or TUI task cancellation, `agent` for the model cancellation tool, and `system` for a configured timeout or a live wrapper cleanup that produces an existing completion. Provenance annotates existing completion records only; owned-task teardown and registry drop create no completion event or provenance audit record.
+
 Usage dashboard accepts `from`/`to` (default: the last 7 days, maximum 366
 days, half-open `[from,to)`), `bucket=hour|day` (UTC), optional
 `root_session_id` (the root and its direct children only; no recursion),

@@ -304,7 +304,12 @@ async fn background_cancel_during_on_id_cleans_registration_without_completion()
 
     entered.wait();
     assert!(sessions.get(1).is_some());
-    assert_eq!(background.cancel(1).as_deref(), Some("probe"));
+    assert_eq!(
+        background
+            .cancel_with_source(1, crate::agent::CancellationSource::System)
+            .as_deref(),
+        Some("probe")
+    );
     release.wait();
     assert!(spawn.await.unwrap().is_ok(), "spawn must not panic or fail");
     signals.model_dropped.notified().await;
@@ -371,7 +376,12 @@ async fn background_cancel_before_first_yield_cleans_everything() {
         )
         .unwrap();
 
-    assert_eq!(background.cancel(1).as_deref(), Some("probe"));
+    assert_eq!(
+        background
+            .cancel_with_source(1, crate::agent::CancellationSource::System)
+            .as_deref(),
+        Some("probe")
+    );
     signals.model_dropped.notified().await;
     signals.release.notify_one();
     tokio::task::yield_now().await;
@@ -435,7 +445,12 @@ async fn background_cancel_while_joining_aborts_inner_without_completion() {
         .unwrap();
 
     signals.entered.notified().await;
-    assert_eq!(background.cancel(1).as_deref(), Some("probe"));
+    assert_eq!(
+        background
+            .cancel_with_source(1, crate::agent::CancellationSource::System)
+            .as_deref(),
+        Some("probe")
+    );
     signals.future_dropped.notified().await;
     signals.model_dropped.notified().await;
     signals.release.notify_one();
@@ -591,6 +606,31 @@ async fn capturing_model() -> (String, Arc<Mutex<Vec<u8>>>) {
         stream.write_all(response.as_bytes()).await.unwrap();
     });
     (format!("http://{address}"), captured)
+}
+
+/// A provider that accepts connections but never answers: the subagent's
+/// first model call blocks forever, so an abort deterministically lands on
+/// a live child runner (used by the durable-start-record failure tests).
+async fn hanging_model() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    format!("http://{address}")
+}
+
+/// Make a durable background-start record fail deterministically: a regular
+/// file where the record root expects a directory makes
+/// `record_background_start_durable` return Err (the same path as any I/O
+/// failure) and no record file can be written.
+fn failing_record_root(parent: &std::path::Path) -> std::path::PathBuf {
+    let root = parent.join("not-a-directory");
+    std::fs::write(&root, b"file, not a directory").unwrap();
+    root
 }
 
 #[tokio::test]
@@ -1864,12 +1904,22 @@ async fn background_failure_completion_retains_session_id() {
         .expect("timed out waiting for background failure")
         .unwrap();
     match event {
-        AgentEvent::BackgroundCompleted { output, .. } => assert!(
-            output.starts_with(&format!(
-                "subagent session: {immediate_session}\n{DELEGATE_COMPLETION_REMINDER}\nsubagent failed:"
-            )),
-            "failed completion must retain the main-branch session format, got: {output}"
-        ),
+        AgentEvent::BackgroundCompleted {
+            output,
+            cancellation_source,
+            ..
+        } => {
+            assert!(
+                output.starts_with(&format!(
+                    "subagent session: {immediate_session}\n{DELEGATE_COMPLETION_REMINDER}\nsubagent failed:"
+                )),
+                "failed completion must retain the main-branch session format, got: {output}"
+            );
+            assert_eq!(
+                cancellation_source, None,
+                "an ordinary subagent failure is not a cancellation"
+            );
+        }
         other => panic!("expected BackgroundCompleted, got {other:?}"),
     }
 }
@@ -1906,6 +1956,7 @@ async fn background_delegate_completion_carries_status_and_kind() {
             kind,
             started_at_ms,
             duration_ms,
+            cancellation_source,
             ..
         } => {
             assert!(
@@ -1916,6 +1967,10 @@ async fn background_delegate_completion_carries_status_and_kind() {
             assert_eq!(signal, None);
             assert_eq!(status.as_deref(), Some("completed"));
             assert_eq!(kind.as_deref(), Some("delegate"));
+            assert_eq!(
+                cancellation_source, None,
+                "a normal completion is not a cancellation"
+            );
             assert!(started_at_ms.is_some(), "started_at_ms must be present");
             assert!(
                 duration_ms.is_some_and(|ms| ms > 0),
@@ -1946,13 +2001,184 @@ async fn background_delegate_completion_carries_status_and_kind() {
             status,
             kind,
             exit_code,
+            cancellation_source,
             ..
         } => {
             assert_eq!(status.as_deref(), Some("failed"));
             assert_eq!(kind.as_deref(), Some("delegate"));
             assert_eq!(exit_code, None);
+            assert_eq!(
+                cancellation_source, None,
+                "an ordinary subagent failure is not a cancellation"
+            );
         }
         other => panic!("expected BackgroundCompleted, got {other:?}"),
+    }
+}
+
+/// Durable background-start recording failure (regular delegate): the
+/// wrapper aborts the live child — its spawn can no longer be recorded —
+/// and the delivered completion must attribute that abort to the SYSTEM
+/// instead of leaving it unsourced. The provider hangs, so the abort
+/// provably lands on a live child.
+#[tokio::test]
+async fn delegate_durable_start_record_failure_aborts_live_child_as_system() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    let base_url = hanging_model().await;
+    let record_root = failing_record_root(&root);
+    let mut tool = delegate_with_url(&root, base_url)
+        .persist_sessions(root.join("subagent-sessions"))
+        .record_background_tasks_in(record_root, "parent", SessionStore::Jsonl);
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    tool.set_event_sender(sender);
+
+    tool.execute(json!({
+        "task": "hello",
+        "workspace": root.to_str().unwrap()
+    }))
+    .await
+    .unwrap();
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
+        .await
+        .expect("timed out waiting for the aborted delegate completion")
+        .unwrap();
+    match event {
+        AgentEvent::BackgroundCompleted {
+            output,
+            status,
+            kind,
+            cancellation_source,
+            ..
+        } => {
+            assert!(
+                output.contains("subagent cancelled"),
+                "the aborted child reports its cancellation, got: {output}"
+            );
+            assert_eq!(status.as_deref(), Some("failed"));
+            assert_eq!(kind.as_deref(), Some("delegate"));
+            assert_eq!(
+                cancellation_source,
+                Some(crate::agent::CancellationSource::System),
+                "the record-failure abort is a system kill"
+            );
+        }
+        other => panic!("expected BackgroundCompleted, got {other:?}"),
+    }
+    // The wrapper cleaned up behind the abort: no leaked registration.
+    assert!(tool.background.running().is_empty());
+    assert!(tool.sessions.sessions.lock().unwrap().is_empty());
+    assert!(
+        receiver.try_recv().is_err(),
+        "exactly one completion is sent"
+    );
+}
+
+/// Durable background-start recording failure (btw fork): same abort as the
+/// regular delegate and the same SYSTEM attribution in the completion. The
+/// provider hangs, so the abort provably lands on a live child.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn btw_durable_start_record_failure_aborts_live_child_as_system() {
+    use crate::agent::SessionEntry as AgentEntry;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    let source_entries = vec![
+        AgentEntry::Message {
+            message: Message::User {
+                content: "main question".into(),
+                images: vec![],
+            },
+        },
+        AgentEntry::Message {
+            message: Message::Assistant(AssistantMessage {
+                content: Some("main answer".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            }),
+        },
+    ];
+    crate::session::Session::append(&root, "web-main", &source_entries).unwrap();
+
+    let workspace = Workspace::new(&root).unwrap();
+    let (_, mut background) = builtins(workspace.clone(), None, false, None);
+    let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
+    background.set_event_sender(sender);
+    let sessions = Sessions::default();
+    let base_url = hanging_model().await;
+    let model = ConfiguredModel::chat(
+        crate::model::OpenAiModel::new(base_url, "test-key".into(), "test-model".into(), None)
+            .unwrap(),
+    );
+    let record_root = failing_record_root(&root);
+    let id = spawn_btw_subagent(
+        "web-main",
+        "side question",
+        BtwContext {
+            model,
+            context_window: None,
+            workspace,
+            sandbox: None,
+            read_only: false,
+            background: background.clone(),
+            sessions: sessions.clone(),
+            persist_root: root.clone(),
+            backend: SessionBackend::Jsonl,
+            record_in: Some(crate::session_store::BackgroundRecord {
+                root: record_root,
+                session: "web-main".into(),
+                store: crate::session_store::SessionStore::Jsonl,
+            }),
+            local_sessions: crate::session_factory::LocalSessionRegistry::default(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(id.starts_with("btw-"), "btw session id, got {id}");
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), completions.recv())
+        .await
+        .expect("timed out waiting for the aborted btw completion")
+        .unwrap();
+    match event {
+        AgentEvent::BackgroundCompleted {
+            output,
+            status,
+            kind,
+            cancellation_source,
+            ..
+        } => {
+            assert!(
+                output.starts_with(&format!("btw session: {id}")),
+                "btw completion format, got: {output}"
+            );
+            assert!(
+                output.contains("subagent cancelled"),
+                "the aborted child reports its cancellation, got: {output}"
+            );
+            assert_eq!(status, None, "btw tasks carry no completion status");
+            assert_eq!(kind.as_deref(), Some("delegate"));
+            assert_eq!(
+                cancellation_source,
+                Some(crate::agent::CancellationSource::System),
+                "the record-failure abort is a system kill"
+            );
+        }
+        other => panic!("expected BackgroundCompleted, got {other:?}"),
+    }
+    // The wrapper cleaned up behind the abort: no leaked registration.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let sessions_empty = sessions.sessions.lock().unwrap().is_empty();
+        let tasks_empty = background.running().is_empty();
+        if sessions_empty && tasks_empty {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "cleanup did not complete: sessions_empty={sessions_empty} tasks_empty={tasks_empty}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
 }
 
@@ -2239,7 +2465,11 @@ async fn spawn_btw_subagent_forks_history_and_registers_persistent_subagent() {
     // Cancelling the task (the current close path for a btw subagent)
     // aborts the runner and cleans up the registration + the parent's
     // background record.
-    assert!(background.cancel(task_id).is_some());
+    assert!(
+        background
+            .cancel_with_source(task_id, crate::agent::CancellationSource::System)
+            .is_some()
+    );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
         let sessions_empty = sessions.sessions.lock().unwrap().is_empty();
@@ -2393,8 +2623,16 @@ async fn background_delegate_cancel_aborts_child_before_wrapper_completion() {
 
     // Repeated cancellation still targets the live wrapper while its child
     // cleanup is in progress; it must not remove or publish the wrapper early.
-    assert!(background.cancel(delegate_id).is_some());
-    assert!(background.cancel(delegate_id).is_some());
+    assert!(
+        background
+            .cancel_with_source(delegate_id, crate::agent::CancellationSource::System)
+            .is_some()
+    );
+    assert!(
+        background
+            .cancel_with_source(delegate_id, crate::agent::CancellationSource::System)
+            .is_some()
+    );
     assert!(
         background
             .running()
@@ -2595,7 +2833,7 @@ async fn subagent_background_bash_recorded_under_its_own_session() {
 
     // 取消阻塞的 bash → completion 注入 subagent → FinishWhenIdle finalize →
     // wrapper 完成并发送一次 BackgroundCompleted。
-    background.cancel(bash_task.id);
+    background.cancel_with_source(bash_task.id, crate::agent::CancellationSource::System);
     let event = tokio::time::timeout(std::time::Duration::from_secs(10), completions.recv())
         .await
         .expect("timed out waiting for the background completion")

@@ -8708,6 +8708,11 @@ async function main(){
         && finishedRow.getAttribute("data-task-depth") === null,
         "hidden=" + finishedOutput.hidden
         + " depth=" + String(finishedRow.getAttribute("data-task-depth")));
+    const sourcedFinished = buildFinishedRow({ session_id: "s1", seq: 899, id: 99,
+      kind: "bash", label: "cancelled", status: "killed", cancellation_source: "user" });
+    chk("finished task shows known cancellation source",
+        sourcedFinished.textContent.includes("cancelled by user"),
+        "text=" + sourcedFinished.textContent);
     // 持久化 finished 查询可以慢，但 live 任务面板必须先显示。
     finishedDelayed = true;
     finishedResolve = null;

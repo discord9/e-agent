@@ -335,6 +335,7 @@ fn delegate_replay_background_completion() {
         signal: None,
         status: None,
         kind: None,
+        cancellation_source: None,
     }];
     // Create a session channel to capture emitted events.
     let (handle, sink, _source) = crate::runner::session_test_channel();

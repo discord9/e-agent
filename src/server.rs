@@ -57,7 +57,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, mpsc, watch};
 
-use crate::agent::{AgentEvent, Message, Model, SessionEntry, preview};
+use crate::agent::{AgentEvent, CancellationSource, Message, Model, SessionEntry, preview};
 use crate::delegate::Sessions;
 use crate::runner::{
     IdlePolicy, PromptSubmission, SessionHandle, SessionStatus, SessionTask, UserInputRequest,
@@ -567,7 +567,7 @@ pub enum SessionRef {
     /// (key = background-task id, `entry.session_id` is the address).
     /// The parent and task id are kept so `DELETE /api/sessions/{id}` can
     /// truly terminate the subagent through the parent's
-    /// `BackgroundTasks::cancel(task_id)` — a plain `handle().cancel()`
+    /// `BackgroundTasks::cancel_with_source(task_id, …)` — a plain `handle().cancel()`
     /// only interrupts the current turn and must not be relied on to end a
     /// delegate.
     Subagent {
@@ -1952,7 +1952,7 @@ async fn delete_session(
     // end themselves.
     //
     // A live subagent is truly terminated through its parent's
-    // `BackgroundTasks::cancel(task_id)` instead of a plain
+    // `BackgroundTasks::cancel_with_source(task_id, …)` instead of a plain
     // `handle().cancel()`: the latter is a *release* — it preempts the
     // in-flight operation and (for a FinishWhenIdle subagent with nothing
     // queued) finalizes the runner as Cancelled, but it does not remove the
@@ -1972,7 +1972,11 @@ async fn delete_session(
             SessionRef::Subagent {
                 parent, task_id, ..
             } => {
-                parent.background.cancel(task_id);
+                // An authenticated DELETE is a user request, exactly like the
+                // task-panel cancel above — never a system teardown.
+                parent
+                    .background
+                    .cancel_with_source(task_id, CancellationSource::User);
             }
         }
     }
@@ -2080,7 +2084,10 @@ async fn cancel_task(
             format!("session {id} has no background task registry"),
         ));
     };
-    match session.background.cancel(task_id) {
+    match session
+        .background
+        .cancel_with_source(task_id, CancellationSource::User)
+    {
         Some(_) => Ok(StatusCode::NO_CONTENT),
         None => Err(error(
             StatusCode::NOT_FOUND,
@@ -3517,6 +3524,7 @@ fn event_payload(event: &AgentEvent) -> serde_json::Value {
             signal,
             status,
             kind,
+            cancellation_source,
         }
         | AgentEvent::BackgroundCompletionNotice {
             id,
@@ -3528,17 +3536,24 @@ fn event_payload(event: &AgentEvent) -> serde_json::Value {
             signal,
             status,
             kind,
-        } => json!({
-            "id": id,
-            "output": output,
-            "label": label,
-            "started_at_ms": started_at_ms,
-            "duration_ms": duration_ms,
-            "exit_code": exit_code,
-            "signal": signal,
-            "status": status,
-            "kind": kind,
-        }),
+            cancellation_source,
+        } => {
+            let mut payload = json!({
+                "id": id,
+                "output": output,
+                "label": label,
+                "started_at_ms": started_at_ms,
+                "duration_ms": duration_ms,
+                "exit_code": exit_code,
+                "signal": signal,
+                "status": status,
+                "kind": kind,
+            });
+            if let Some(source) = cancellation_source {
+                payload["cancellation_source"] = json!(source);
+            }
+            payload
+        }
         AgentEvent::GoalUpdated { goal } => json!({ "goal": goal }),
         AgentEvent::Usage {
             context_input,
@@ -4382,6 +4397,7 @@ mod tests {
                 signal: None,
                 status: None,
                 kind: None,
+                cancellation_source: None,
             }),
             "BackgroundCompleted"
         );
@@ -4396,6 +4412,7 @@ mod tests {
                 signal: None,
                 status: None,
                 kind: None,
+                cancellation_source: None,
             }),
             "BackgroundCompletionNotice"
         );
@@ -4473,10 +4490,12 @@ mod tests {
                 signal: None,
                 status: None,
                 kind: None,
+                cancellation_source: Some(CancellationSource::User),
             }),
             json!({"id": 7, "output": "ok", "label": "cargo",
                    "started_at_ms": null, "duration_ms": null, "exit_code": null,
-                   "signal": null, "status": null, "kind": null})
+                   "signal": null, "status": null, "kind": null,
+                   "cancellation_source": "user"})
         );
         assert_eq!(
             event_payload(&AgentEvent::BackgroundCompletionNotice {
@@ -4489,6 +4508,7 @@ mod tests {
                 signal: None,
                 status: Some("completed".into()),
                 kind: Some("bash".into()),
+                cancellation_source: None,
             }),
             json!({"id": 7, "output": "ok", "label": null,
                    "started_at_ms": 1_700_000_000_000u64, "duration_ms": 42, "exit_code": 0,
@@ -4538,6 +4558,7 @@ mod tests {
                 signal: None,
                 status: None,
                 kind: None,
+                cancellation_source: None,
             },
             AgentEvent::Usage {
                 context_input: 1,
@@ -7473,8 +7494,28 @@ model = "deepseek-chat"
             StatusCode::NO_CONTENT,
             "deleting an unknown session hides it idempotently"
         );
-        // A live registry session also deletes cleanly.
-        let (id, session) = live_session("web-del");
+        // A live registry session also deletes cleanly — and the
+        // main-session teardown must not fabricate a background completion
+        // (only a *subagent* DELETE routes through `cancel_with_source`).
+        // A pending background task makes the no-completion assertion
+        // non-vacuous: DELETE drops the registry entry, it does not complete
+        // the task.
+        let (id, session, mut completions) = live_session_with_background_sender("web-del");
+        session
+            .background
+            .spawn_with_id(
+                "main teardown probe".into(),
+                None,
+                None,
+                None,
+                crate::tools::new_exit_slot(),
+                |_| {},
+                || async {
+                    std::future::pending::<()>().await;
+                    String::new()
+                },
+            )
+            .expect("probe background task starts");
         state.registry.insert(id.clone(), session);
         let response = app
             .oneshot(
@@ -7489,6 +7530,11 @@ model = "deepseek-chat"
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         assert!(state.registry.get(&id).is_none(), "registry entry removed");
+        tokio::task::yield_now().await;
+        assert!(
+            completions.try_recv().is_err(),
+            "main-session teardown must not deliver a completion"
+        );
     }
 
     /// Regression (interrupt-no-longer-kills-delegate): `DELETE
@@ -7498,10 +7544,12 @@ model = "deepseek-chat"
     /// queued) finalizes the runner as Cancelled, but it does not remove
     /// the `Sessions` registry entry / running_tasks row or abort a runner
     /// parked at an idle select — so the endpoint routes through the
-    /// parent's `BackgroundTasks::cancel(task_id)` instead: the delegate
+    /// parent's `BackgroundTasks::cancel_with_source(task_id, …)` instead: the delegate
     /// wrapper is aborted, its captured cleanup removes the `Sessions`
     /// entry, and dropping the wrapper's runner handle aborts the subagent
-    /// runner.
+    /// runner. The delivered completion carries the User cancellation
+    /// source (the authenticated request), and the main-session teardown
+    /// path stays completion-free.
     #[tokio::test]
     async fn delete_subagent_session_aborts_delegate_runner_and_cleans_up() {
         use async_trait::async_trait;
@@ -7684,12 +7732,20 @@ model = "deepseek-chat"
         assert!(parent.background.running().is_empty());
         assert!(parent.sessions.list().is_empty());
         // The parent saw the same "background task cancelled" completion a
-        // task-panel cancel produces.
+        // task-panel cancel produces — attributed to the authenticated
+        // DELETE (User), not to a system teardown.
         assert!(matches!(
             completions.try_recv(),
-            Ok(AgentEvent::BackgroundCompleted { output, .. })
-                if output == "background task cancelled"
+            Ok(AgentEvent::BackgroundCompleted {
+                output,
+                cancellation_source: Some(CancellationSource::User),
+                ..
+            }) if output == "background task cancelled"
         ));
+        assert!(
+            completions.try_recv().is_err(),
+            "the DELETE delivers exactly one completion"
+        );
     }
 
     /// `POST /api/sessions/{id}/cancel` on a REAL runner — the endpoint was
@@ -9181,8 +9237,12 @@ model = "deepseek-chat"
         assert_eq!(subagent.status(), StatusCode::NOT_FOUND);
 
         // Clean up the running tasks so the test leaks no processes.
-        session.background.cancel(1);
-        session.background.cancel(2);
+        session
+            .background
+            .cancel_with_source(1, crate::agent::CancellationSource::System);
+        session
+            .background
+            .cancel_with_source(2, crate::agent::CancellationSource::System);
     }
 
     /// `?offset=` slices the same spool: `x-spool-offset` reports the
@@ -9285,7 +9345,9 @@ model = "deepseek-chat"
         assert_eq!(headers.get("x-spool-total").unwrap(), "10");
 
         // Clean up the running task so the test leaks no process.
-        session.background.cancel(1);
+        session
+            .background
+            .cancel_with_source(1, crate::agent::CancellationSource::System);
     }
 
     #[tokio::test]
@@ -9679,7 +9741,7 @@ model = "deepseek-chat"
         use tower::util::ServiceExt;
 
         let state = test_app_state("sekrit");
-        let (id_a, session_a, _rx_a) = live_session_with_background_sender("web-a");
+        let (id_a, session_a, mut rx_a) = live_session_with_background_sender("web-a");
         let (id_b, session_b, _rx_b) = live_session_with_background_sender("web-b");
         state.registry.insert(id_a.clone(), session_a.clone());
         state.registry.insert(id_b.clone(), session_b.clone());
@@ -9811,7 +9873,9 @@ model = "deepseek-chat"
         );
         // Cancel the subagent-owned task so the later `running().is_empty()`
         // assertion (after cancelling task 1) stays exact.
-        session_a.background.cancel(2);
+        session_a
+            .background
+            .cancel_with_source(2, crate::agent::CancellationSource::System);
 
         // Cancel the bash task via the endpoint: 204, task gone, and a
         // second cancel 404s.
@@ -9828,6 +9892,14 @@ model = "deepseek-chat"
             .await
             .unwrap();
         assert_eq!(cancel.status(), StatusCode::NO_CONTENT);
+        assert!(matches!(
+            rx_a.recv().await,
+            Some(AgentEvent::BackgroundCompleted {
+                id: 1,
+                cancellation_source: Some(CancellationSource::User),
+                ..
+            })
+        ));
         assert!(
             session_a.background.running().is_empty(),
             "bash task must be cancelled"
@@ -9847,7 +9919,10 @@ model = "deepseek-chat"
 
         // Clean up the delegate task too (it is still registered).
         assert!(
-            session_b.background.cancel(1).is_some(),
+            session_b
+                .background
+                .cancel_with_source(1, crate::agent::CancellationSource::System)
+                .is_some(),
             "delegate task is cancelled"
         );
     }

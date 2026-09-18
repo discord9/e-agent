@@ -4711,6 +4711,7 @@ async fn unfinished_background_bash_blocks_finish_when_idle_until_completion() {
             signal: None,
             status: None,
             kind: None,
+            cancellation_source: None,
         })
         .unwrap();
     loop {
@@ -4801,7 +4802,7 @@ async fn detached_daemon_does_not_block_finish_when_idle() {
     assert_eq!(daemons.len(), 1, "daemon must stay registered: {daemons:?}");
     assert_eq!(daemons[0].kind, "bash");
     // Explicitly cancel to avoid leaking the sleep process past the test.
-    background.cancel(daemons[0].id);
+    background.cancel_with_source(daemons[0].id, crate::agent::CancellationSource::System);
     assert!(background.running().is_empty());
 }
 
@@ -4878,6 +4879,7 @@ async fn content_and_tool_calls_in_same_round_still_block_and_complete() {
             signal: None,
             status: None,
             kind: None,
+            cancellation_source: None,
         })
         .unwrap();
     loop {
@@ -4986,6 +4988,7 @@ async fn completion_arriving_during_last_model_round_is_committed_before_finaliz
             signal: None,
             status: None,
             kind: None,
+            cancellation_source: None,
         })
         .unwrap();
     release.notify_one();
@@ -5068,6 +5071,7 @@ impl Tool for SelfCompletingBash {
                 signal: None,
                 status: None,
                 kind: None,
+                cancellation_source: None,
             })
             .unwrap();
         Ok(ToolOutput::text(format!(
@@ -5280,6 +5284,7 @@ async fn finish_when_idle_waits_indefinitely_for_blocking_completion() {
             signal: None,
             status: None,
             kind: None,
+            cancellation_source: None,
         })
         .unwrap();
     loop {
@@ -6303,7 +6308,7 @@ async fn steer_cancel_while_idle_waiting_on_blocking_background_finalizes_cancel
     assert_eq!(tasks.len(), 1, "task must stay registered: {tasks:?}");
     assert_eq!(tasks[0].kind, "bash");
     // Explicitly cancel to avoid leaking the sleep process past the test.
-    background.cancel(tasks[0].id);
+    background.cancel_with_source(tasks[0].id, crate::agent::CancellationSource::System);
     assert!(background.running().is_empty());
 }
 
@@ -6412,6 +6417,7 @@ async fn steer_cancel_then_prompt_at_idle_with_blocking_background_runs_queued_t
             signal: None,
             status: None,
             kind: None,
+            cancellation_source: None,
         })
         .unwrap();
     loop {
@@ -8058,6 +8064,7 @@ async fn oracle449_runner_persists_notice_before_completion_and_keeps_owner_unti
         signal: None,
         status: None,
         kind: None,
+        cancellation_source: None,
     })
     .unwrap();
     loop {
@@ -8175,6 +8182,7 @@ async fn oracle449_runner_notice_is_visible_once_to_attached_and_late_views() {
             signal: None,
             status: None,
             kind: None,
+            cancellation_source: None,
         })
         .unwrap();
     let mut notices = 0;
@@ -8509,6 +8517,7 @@ async fn goal_continue_idle_background_followup_then_resume() {
             signal: None,
             status: None,
             kind: None,
+            cancellation_source: None,
         })
         .unwrap();
     wait_for_log_event(
@@ -11913,6 +11922,7 @@ async fn oracle718_background_during_answer_compact_keeps_resume(
             signal: None,
             status: None,
             kind: None,
+            cancellation_source: None,
         })
         .unwrap();
     compact_release.notify_one();
