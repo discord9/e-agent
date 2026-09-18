@@ -651,6 +651,13 @@ els.messages.addEventListener("click", (ev) => {
       || (t.closest(".tool-card") || t.closest(".notice") || {}).querySelector?.(".expandable");
     if (!c) return;
     const expanded = c.classList.toggle("expanded");
+    // 外层容器也可能有高度帽（.tool-args 10em；delegate 参数框：
+    // .tool-args > .delegate-args > pre.task-snapshot-body.expandable）——
+    // 只放开内层 .expandable 在外层帽下视觉零变化（用户报告的真实 bug）。
+    // 同步 .expanded 给最近的 .tool-args 祖先（c 自身即 .tool-args 的
+    // 字符串参数场景也覆盖；notice 等无此祖先时跳过）。
+    const w = c.closest(".tool-args");
+    if (w) w.classList.toggle("expanded", expanded);
     const label = t.textContent.includes("（") ? t.textContent.slice(t.textContent.indexOf("（")) : "";
     t.textContent = expanded ? "收起" + label : "展开全文" + label;
     return;

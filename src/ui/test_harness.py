@@ -2585,6 +2585,32 @@ async function main(){
         argsTextOf(dgCard).includes("后台运行")
         && argsTextOf(dgLegacy).includes("前台同步") && !argsTextOf(dgLegacy).includes("后台运行"),
         "text=" + JSON.stringify(argsTextOf(dgLegacy)));
+    // delegate 长任务参数框展开：CSS 里外层 .tool-args 有 10em 高度帽，内层
+    // .task-snapshot-body 另有 14em 帽。点「展开全文」只放开内层时，外层 10em
+    // 仍截断 → 视觉零变化（用户报告的真实 bug）。修复：展开/收起同步给最近的
+    // .tool-args 祖先加/去 .expanded（CSS .tool-card .tool-args.expanded 放开帽）。
+    const dgExpandTask = "L".repeat(600);
+    const dgExpandCard = buildToolCard("delegate", JSON.stringify({
+      task: dgExpandTask, role: "explore", workspace: "/w", label: "长任务",
+    }), "完成", "", "ok");
+    const dgExpandWrap = dgExpandCard.querySelector(".tool-args");
+    const dgExpandPre = dgExpandWrap.querySelector(".task-snapshot-body");
+    chk("delegate long task folded by default (inner expandable, outer cap intact)",
+        dgExpandPre !== null && dgExpandPre.classList.contains("expandable")
+        && !dgExpandPre.classList.contains("expanded") && !dgExpandWrap.classList.contains("expanded")
+        && dgExpandPre.querySelector(".expand-full").textContent.length === 600,
+        "pre=" + (dgExpandPre && dgExpandPre.className) + " wrap=" + dgExpandWrap.className);
+    const dgExpandBtn = dgExpandPre.querySelector(".expand-toggle");
+    chk("delegate expand button targets task body", !!dgExpandBtn && dgExpandBtn._target === dgExpandPre);
+    const dgExpandClicks = (elsById["messages"]._listeners["click"] || []);
+    for (const fn of dgExpandClicks) fn({ target: dgExpandBtn });
+    chk("delegate expand lifts outer .tool-args height cap",
+        dgExpandPre.classList.contains("expanded") && dgExpandWrap.classList.contains("expanded"),
+        "pre=" + dgExpandPre.className + " wrap=" + dgExpandWrap.className);
+    for (const fn of dgExpandClicks) fn({ target: dgExpandBtn });
+    chk("delegate collapse restores outer .tool-args height cap",
+        !dgExpandPre.classList.contains("expanded") && !dgExpandWrap.classList.contains("expanded"),
+        "pre=" + dgExpandPre.className + " wrap=" + dgExpandWrap.className);
     // get_background_tasks：空对象 / 空串 → 参数区隐藏
     const bgtCard = buildToolCard("get_background_tasks", "{}", "完成", "", "ok");
     const bgtCard2 = buildToolCard("get_background_tasks", "", "完成", "", "ok");
@@ -8962,6 +8988,13 @@ _diff_rules_ok = bool(
     and re.search(r'\.tool-card\s+\.tool-result\.tool-diff\s+\.diff-row\.diff-del\s*\{[^}]*background:\s*#fbe3e4', _css)
     and re.search(r'\.tool-card\s+\.tool-result\.tool-diff\s+\.diff-ln\s*\{[^}]*text-align:\s*right', _css))
 print(("PASS" if _diff_rules_ok else "FAIL") + " file-tool diff styles (add/del/ln) in style.css")
+# delegate 参数框展开（bug 修复的 CSS 半边；JS 侧的 .expanded 同步由 DOM 断言
+# 守护）：外层 .tool-args（10em 帽）必须在展开态放开，否则内层 .task-snapshot-body
+# 展开后视觉零变化；delegate 结果卡同步去帽（内容短 / 长答案折进 details）。
+_args_expand_css_ok = bool(
+    re.search(r'\.tool-card\s+\.tool-args\.expanded\s*\{[^}]*max-height:\s*none', _css)
+    and re.search(r'\.tool-card\s+\.tool-result\.delegate-result\s*\{[^}]*max-height:\s*none', _css))
+print(("PASS" if _args_expand_css_ok else "FAIL") + " delegate expand lifts outer .tool-args/result caps in style.css")
 # 窄屏防溢出：.diff-text 必须可收缩（min-width:0）且允许任意位置断行
 # （overflow-wrap: anywhere，长 URL/长行不撑破卡片）
 _txt_rule = re.search(r'\.tool-card\s+\.tool-result\.tool-diff\s+\.diff-text\s*\{([^}]*)\}', _css)
@@ -9066,4 +9099,4 @@ if MODE == 'connector':
     sys.exit(0 if ("ALL PASS" in r.stdout + r.stderr) and _task_card_indent_ok and _task_connector_ok else 1)
 if MODE == 'header':
     sys.exit(0 if ("ALL PASS" in r.stdout + r.stderr) and _header_busy_ok else 1)
-sys.exit(0 if ("ALL PASS" in r.stdout + r.stderr) and _css_ok and _spin_ok and _status_rules_ok and _status_contrast_ok and _status_scope_ok and _header_busy_ok and _marker_ok and _empty_ok and _diagram_font_ok and _usage_mobile_ok and _chip_ok and _diff_rules_ok and _txt_ok and _contrast_ok and _viewport_ok and _zoom_guard_ok and _icon_ok and _usage_shell_ok and _usage_contract_ok and _usage_states_ok and _usage_responsive_ok else 1)
+sys.exit(0 if ("ALL PASS" in r.stdout + r.stderr) and _css_ok and _spin_ok and _status_rules_ok and _status_contrast_ok and _status_scope_ok and _header_busy_ok and _marker_ok and _empty_ok and _diagram_font_ok and _usage_mobile_ok and _chip_ok and _diff_rules_ok and _args_expand_css_ok and _txt_ok and _contrast_ok and _viewport_ok and _zoom_guard_ok and _icon_ok and _usage_shell_ok and _usage_contract_ok and _usage_states_ok and _usage_responsive_ok else 1)

@@ -809,8 +809,14 @@
     color: var(--base02);
   }
 
-  /* delegate 结果（后台回执 / 同步完成）：子代理会话行 + markdown 答案 */
-  .tool-card .tool-result.delegate-result { background: var(--base3); }
+  /* delegate 结果（后台回执 / 同步完成）：子代理会话行 + markdown 答案。
+     防御性去帽：回执内容短（或长答案折进 details.delegate-collapse 后不
+     高），不需要 14em 内滚框——与参数框同一教训：套着高度帽的容器会让内部
+     的展开/开合看起来「无效」。 */
+  .tool-card .tool-result.delegate-result {
+    background: var(--base3);
+    max-height: none;
+  }
   .delegate-result-wrap { display: flex; flex-direction: column; gap: 4px; }
   .delegate-bg-line {
     display: flex;
@@ -978,6 +984,11 @@
   .tool-card .expandable.expanded pre, .notice .expandable.expanded pre {
     max-height: none;
   }
+  /* delegate 参数框：外层 .tool-args（10em 帽）包住内层 .task-snapshot-body
+     （.expandable，14em 帽）。展开只放开内层时外层帽仍截断 → 视觉零变化
+     （用户报告的真实 bug）。sse.js 展开/收起时把 .expanded 同步给最近的
+     .tool-args 祖先，这里放开外层帽（类选择器特异性高于 614 行基础规则）。 */
+  .tool-card .tool-args.expanded { max-height: none; }
   .expandable.expanded .expand-full { display: inline; }
   /* 展开按钮：控件样式（底色+边框+圆角），紧跟正文 pre 后面，与正文明显区分 */
   .expand-toggle {
