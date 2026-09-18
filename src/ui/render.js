@@ -658,11 +658,18 @@ function renderReadImageArgs(parsed, rawText) {
 }
 
 /* bash / pwsh（Windows 工具名）：$ command + background:true 时追加
-   [background] 徽标；缺 command 字段回退原文 */
+   [background] 徽标；缺 command 字段回退原文。
+   命令超长（> LONG_TEXT_THRESHOLD）时命令本体走 maybeTruncateEl：紧凑行内
+   「$ 预览 … 」+「展开全文（命令）」+「复制全文」，与其它工具长参数同一机制
+   （sse.js 事件委托把 .expanded 同步给最近的 .tool-args → 展开时放开 10em
+   帽，折叠态仍受帽约束）；短命令直出，零交互成本、DOM 与旧实现逐字一致。
+   「$ 」是终端提示符装饰，随文本一起截断/复制（与视图逐字一致）。 */
 function renderBashArgs(parsed, rawText) {
   if (!parsed || typeof parsed !== "object" || typeof parsed.command !== "string") return rawText;
   const row = el("div", "tool-args-compact");
-  row.appendChild(el("span", "tool-primary", "$ " + parsed.command));
+  const cmd = el("span", "tool-primary");   // 命令本体（含 "$ " 前缀）作可展开容器
+  maybeTruncateEl(cmd, "$ " + parsed.command, LONG_TEXT_THRESHOLD, null, "命令");
+  row.appendChild(cmd);
   if (parsed.background === true) {
     row.appendChild(el("span", "tool-chip tool-bg", "[background]"));
   }

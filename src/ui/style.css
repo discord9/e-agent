@@ -1033,6 +1033,19 @@
     background: var(--base3);
     box-shadow: 0 -2px 6px rgba(0,0,0,0.08);
   }
+  /* bash / pwsh 长命令（renderBashArgs 紧凑行内的展开按钮）同理：折叠态
+     .tool-args 有 10em 帽，按钮随 300 字符预览排在末尾，窄屏/长预览下会被
+     滚出可视区 —— sticky bottom 让它始终浮在参数框底部可见。展开后
+     .tool-args.expanded 放开帽（见上方 991 行规则），按钮回到文末正常位置。
+     作用域限定 .tool-args-compact：目前只有 bash/pwsh 长命令会在此产生展开
+     按钮，delegate 等其它参数区（.delegate-args）不受影响。 */
+  .tool-card .tool-args-compact .expand-toggle {
+    position: sticky;
+    bottom: 0;
+    z-index: 2;
+    background: var(--base3);
+    box-shadow: 0 -2px 6px rgba(0,0,0,0.08);
+  }
   .expand-toggle:hover { background: var(--base1); border-color: var(--blue); }
   /* 箭头由 CSS 绘制：收起=下指（▾ 语义），展开旋转 180° 上指（▴ 语义） */
   .expand-toggle::after {

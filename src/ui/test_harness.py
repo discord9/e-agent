@@ -2522,6 +2522,92 @@ async function main(){
     chk("bash command rendered as terminal line",
         bashArgs.textContent === "$ cd /tmp && ls",
         "text=" + JSON.stringify(bashArgs.textContent));
+    // 短命令直出：紧凑行内不加展开/复制控件（零交互成本，DOM 与旧实现一致）
+    chk("bash short command has no expand/copy control",
+        bashArgs.querySelector(".expand-toggle") === null
+        && bashArgs.querySelector(".copy-toggle") === null,
+        "btn=" + (bashArgs.querySelector(".expand-toggle") !== null)
+        + " copy=" + (bashArgs.querySelector(".copy-toggle") !== null));
+    // 长命令（> LONG_TEXT_THRESHOLD）：紧凑「$ 预览 … 」+「展开全文（命令）」+
+    // 「复制全文」，仍走 renderBashArgs 的 $ 前缀 + .tool-args-compact 形态
+    // （不改成 read/write 那样的 raw 参数框）。折叠态 .tool-args 不带 .expanded
+    // → 仍受 CSS 10em 帽约束；点展开由 sse.js 委托把 .expanded 同步给最近的
+    // .tool-args（与 delegate 参数框同一机制）→ 全文铺开。
+    const bashLongCmd = "echo " + "x".repeat(400);
+    const bashLongCard = buildToolCard("bash", JSON.stringify({ command: bashLongCmd }), "完成", "", "ok");
+    const bashLongArgs = bashLongCard.querySelector(".tool-args");
+    const bashLongCmdEl = bashLongArgs.querySelector(".expandable");
+    chk("bash long command folded by default (compact $ view, outer 10em cap intact)",
+        bashLongCmdEl !== null && bashLongCmdEl.classList.contains("tool-primary")
+        && bashLongCmdEl.classList.contains("expandable")
+        && !bashLongCmdEl.classList.contains("expanded")
+        && !bashLongArgs.classList.contains("expanded"),
+        "cmd=" + (bashLongCmdEl && bashLongCmdEl.className) + " args=" + bashLongArgs.className);
+    const bashLongPreview = bashLongCmdEl && bashLongCmdEl.querySelector(".expand-preview");
+    const bashLongFull = bashLongCmdEl && bashLongCmdEl.querySelector(".expand-full");
+    const bashLongIdx = (cls) => bashLongCmdEl._children
+      .findIndex((c) => c instanceof El && c._classes.has(cls));
+    chk("bash long command preview→full split with 展开/复制 buttons in order",
+        !!bashLongPreview && !!bashLongFull
+        && bashLongFull.textContent === "$ " + bashLongCmd
+        && bashLongPreview.textContent.length < bashLongFull.textContent.length
+        && bashLongIdx("expand-preview") < bashLongIdx("expand-full")
+        && bashLongIdx("expand-full") + 1 === bashLongIdx("expand-toggle")
+        && bashLongIdx("expand-toggle") < bashLongIdx("copy-toggle"),
+        "idx=" + bashLongIdx("expand-preview") + "," + bashLongIdx("expand-full")
+        + "," + bashLongIdx("expand-toggle") + "," + bashLongIdx("copy-toggle"));
+    const bashLongBtn = bashLongCmdEl.querySelector(".expand-toggle");
+    chk("bash expand button labels the command", !!bashLongBtn
+        && bashLongBtn._target === bashLongCmdEl
+        && bashLongBtn.textContent === "展开全文（命令）",
+        "btn=" + (bashLongBtn && bashLongBtn.textContent));
+    const bashClicks = elsById["messages"]._listeners["click"] || [];
+    for (const fn of bashClicks) fn({ target: bashLongBtn });
+    chk("bash expand reveals full command and lifts outer .tool-args cap",
+        bashLongCmdEl.classList.contains("expanded") && bashLongArgs.classList.contains("expanded")
+        && bashLongBtn.textContent === "收起（命令）",
+        "cmd=" + bashLongCmdEl.className + " args=" + bashLongArgs.className
+        + " btn=" + bashLongBtn.textContent);
+    for (const fn of bashClicks) fn({ target: bashLongBtn });
+    chk("bash collapse restores compact view and 10em cap",
+        !bashLongCmdEl.classList.contains("expanded") && !bashLongArgs.classList.contains("expanded")
+        && bashLongBtn.textContent === "展开全文（命令）",
+        "cmd=" + bashLongCmdEl.className + " args=" + bashLongArgs.className);
+    // 长命令 + background:true：[background] 徽标仍在紧凑行内（不被命令区吞掉）
+    const bashLongBgCard = buildToolCard("bash",
+      JSON.stringify({ command: bashLongCmd, background: true }), "完成", "", "ok");
+    const bashLongBgArgs = bashLongBgCard.querySelector(".tool-args");
+    chk("bash long command keeps [background] chip",
+        bashLongBgArgs.textContent.includes("[background]")
+        && bashLongBgArgs.querySelector(".expandable").querySelector(".expand-full")
+          .textContent === "$ " + bashLongCmd,
+        "text=" + JSON.stringify(bashLongBgArgs.textContent.slice(0, 40)));
+    // 长命令的「复制全文」走同一委托路径：写入的是折叠/展开一致的那一行文本
+    // （含终端提示符 "$ "，与视图逐字一致；用户如需粘贴进 shell 自行去掉前缀）
+    let bashCopied = null;
+    const bashClipSave = navigator.clipboard;
+    navigator.clipboard = { writeText: (t) => { bashCopied = t; return Promise.resolve(); } };
+    for (const fn of bashClicks) fn({ target: bashLongCmdEl.querySelector(".copy-toggle") });
+    await flush();
+    chk("bash long command copy writes the full command line",
+        bashCopied === "$ " + bashLongCmd
+        && bashLongCmdEl.querySelector(".copy-toggle").classList.contains("copied"),
+        "len=" + (bashCopied == null ? "null" : bashCopied.length));
+    navigator.clipboard = bashClipSave;
+    // innerHTML 快照往返（缓存恢复 / resync 离屏替换）：_target expando 丢失，
+    // 委托回退 closest(".expandable") + closest(".tool-args") 仍能展开并放开帽
+    bashLongCard.innerHTML = bashLongCard.innerHTML;
+    const rBashArgs = bashLongCard.querySelector(".tool-args");
+    const rBashCmdEl = bashLongCard.querySelector(".expandable");
+    const rBashBtn = bashLongCard.querySelector(".expand-toggle");
+    for (const fn of bashClicks) fn({ target: rBashBtn });
+    chk("bash round-trip expand still works via delegation",
+        rBashCmdEl !== null && rBashBtn !== null
+        && rBashCmdEl.classList.contains("expanded") && rBashArgs.classList.contains("expanded")
+        && rBashBtn.textContent === "收起（命令）"
+        && rBashCmdEl.querySelector(".expand-full").textContent === "$ " + bashLongCmd,
+        "cmd=" + (rBashCmdEl && rBashCmdEl.className) + " args=" + (rBashArgs && rBashArgs.className)
+        + " btn=" + (rBashBtn && rBashBtn.textContent));
     // =====================================================================
     // 统一参数渲染（renderToolArgs）：各工具紧凑参数 / 隐藏 / 原文回退 /
     // XSS 防护（所有用户内容 textContent，<script> 不注入）
@@ -9029,6 +9115,13 @@ _args_expand_css_ok = bool(
     and re.search(r'\.tool-card\s+\.tool-args\.expanded\s*\{[^}]*max-height:\s*none', _css)
     and re.search(r'\.tool-card\s+\.tool-result\.delegate-result\s*\{[^}]*max-height:\s*none', _css))
 print(("PASS" if _args_expand_css_ok else "FAIL") + " delegate host .tool-args exempt + task body 10em cap in style.css")
+# bash 长命令（renderBashArgs）的展开按钮：折叠态整个 .tool-args 仍受 10em 帽
+# 约束（不改成 read/write 那种 raw 参数框），按钮必须 sticky 吸底，否则窄屏
+# 下 300 字符预览会把按钮推到滚动框外，「一键展开全文」入口要滚动才找得到。
+_bash_sticky_ok = bool(
+    re.search(r'\.tool-card\s+\.tool-args-compact\s+\.expand-toggle\s*\{[^}]*position:\s*sticky', _css)
+    and re.search(r'\.tool-card\s+\.tool-args-compact\s+\.expand-toggle\s*\{[^}]*bottom:\s*0', _css))
+print(("PASS" if _bash_sticky_ok else "FAIL") + " bash compact args expand button sticks to the 10em-capped args box")
 # 窄屏防溢出：.diff-text 必须可收缩（min-width:0）且允许任意位置断行
 # （overflow-wrap: anywhere，长 URL/长行不撑破卡片）
 _txt_rule = re.search(r'\.tool-card\s+\.tool-result\.tool-diff\s+\.diff-text\s*\{([^}]*)\}', _css)
