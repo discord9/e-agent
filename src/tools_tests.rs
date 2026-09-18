@@ -1618,7 +1618,9 @@ fn bash_spec_explains_async_command_choice_and_preserves_schema() {
             .all(|example| background.contains(example))
             && background.contains("long computations expected to finish")
             && background.contains("completion is delivered")
-            && background.contains("session waits/reacts")
+            && background.contains("BackgroundCompletionNotice")
+            && background.contains("Do NOT poll, sleep, or wait for it")
+            && background.contains("continue other work or end your turn")
     );
     assert!(
         detached.starts_with("RARE: ONLY")

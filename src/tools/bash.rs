@@ -175,7 +175,7 @@ impl Tool for Bash {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "background": {"type": "boolean", "description": "default for async builds, tests, downloads, translations, scripts, and long computations expected to finish; runs without blocking, completion is delivered, and the session waits/reacts"},
+                    "background": {"type": "boolean", "description": "default for async builds, tests, downloads, translations, scripts, and long computations expected to finish; runs without blocking. Do NOT poll, sleep, or wait for it: the completion is delivered automatically as a BackgroundCompletionNotice injected into this conversation when the task finishes, so continue other work or end your turn and react when it arrives"},
                     "detached": {"type": "boolean", "description": "RARE: ONLY for intentionally persistent daemon, service, or watcher processes. Requires background:true; completion is never delivered and this does not keep the session alive. NEVER use for builds/tests/downloads/translations/scripts or any command whose result/output the agent needs"},
                     "title": {"type": "string", "description": "optional background task title; whitespace is normalized to one line, and blank titles fall back to the command label"},
                     "command": {"type": "string", "description": "shell command"}
