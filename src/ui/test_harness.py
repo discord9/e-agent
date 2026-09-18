@@ -8588,6 +8588,12 @@ async function main(){
     chk("finished click expands", fbody.hidden === false
         && fhdr.getAttribute("aria-expanded") === "true",
         "hidden=" + fbody.hidden);
+    // 展开动作才按需拉取 finished（loadFinishedTasks，异步）：数据到达后小节
+    // 按签名重建，旧 header/body 元素被替换。必须先 flush 等数据应用，再重新
+    // 取小节的 header/body 引用，否则拿到的是没有行（且已脱离 DOM）的旧 body。
+    await flush();
+    fhdr = elsById["composerTasks"].querySelector(".tasks-finished-header");
+    fbody = elsById["composerTasks"].querySelector(".tasks-finished-body");
     const finishedRow = fbody.querySelector(".task-row-finished");
     const finishedOutput = finishedRow.querySelector(".task-output");
     finishedRow._listeners["click"][0]();
@@ -8643,12 +8649,14 @@ async function main(){
         && elsById["composerTasks"].querySelectorAll(".task-row").length === 4,
         "rows=" + elsById["composerTasks"].querySelectorAll(".task-row").length);
     // 折叠 → 重开仍折叠；22 条 → 只渲染 20 行 + 「还有 2 条」
-    elsById["composerTasks"].querySelector(".tasks-finished-header")._listeners["click"][0]();
     state.tasks.composerOpen = false;
     finishedData = [];
     for (let i = 0; i < 22; i++) finishedData.push({ session_id: "s1", seq: 1000 + i, id: 100 + i,
       kind: "bash", label: "bulk-" + i, status: "Finished", exit_code: 0, duration_ms: i * 10 });
+    // 22 条也必须先经展开态 pollTasks 的按需拉取进入缓存（折叠态一次都不拉
+    // finished，见 tasks.js），再折叠：验证折叠/重开后仍折叠且上限 20 行。
     await pollTasks(); await flush();
+    elsById["composerTasks"].querySelector(".tasks-finished-header")._listeners["click"][0]();
     state.tasks.composerOpen = true; renderComposerTasks(); await flush();
     fbody = elsById["composerTasks"].querySelector(".tasks-finished-body");
     const moreEl = elsById["composerTasks"].querySelector(".tasks-finished-more");
