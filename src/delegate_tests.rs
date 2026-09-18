@@ -1279,6 +1279,116 @@ async fn role_model_snapshot_used_without_live_source() {
     unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
 }
 
+#[tokio::test]
+// Test-only env isolation: the std Mutex guard is held across .execute()
+// awaits to serialize XDG_CONFIG_HOME mutation with roles.rs tests.
+#[allow(clippy::await_holding_lock)]
+async fn resume_without_role_uses_hot_reloaded_subagent_model() {
+    let _guard = crate::roles::XDG_TEST_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let xdg = temp.path().join("xdg-empty");
+    std::fs::create_dir_all(&xdg).unwrap();
+    unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
+
+    let (url, captured) = capturing_model().await;
+    let snapshot_model = ConfiguredModel::chat(
+        crate::model::OpenAiModel::new(url.clone(), "test-key".into(), "old-model".into(), None)
+            .unwrap(),
+    );
+    let live_model = ConfiguredModel::chat(
+        crate::model::OpenAiModel::new(url, "test-key".into(), "new-model".into(), None).unwrap(),
+    );
+    // Seed the resumable session on disk directly (one user entry): resume
+    // only needs a non-empty session file, no mock round-trip.
+    let root = temp.path().join("sessions");
+    crate::session::Session::append(
+        &root,
+        "sub-hot-reload",
+        &[crate::agent::SessionEntry::from(
+            crate::agent::Message::User {
+                content: "earlier task".into(),
+                images: vec![],
+            },
+        )],
+    )
+    .unwrap();
+    let live = live_model.clone();
+    let mut tool = delegate_with_url(temp.path(), "http://localhost".into())
+        .persist_sessions(root)
+        // Construction-time snapshot says old-model…
+        .with_subagent_model(snapshot_model)
+        // …but the live resolver (the session factory's hot-reload source)
+        // hands out new-model at spawn: a `[roles] subagent` edit lands in
+        // fallback (no-role) delegations without a restart.
+        .with_subagent_model_source(Arc::new(move || Some((live.clone(), None))));
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    tool.set_event_sender(sender);
+    // Resume without a role: the spawn-time model resolution runs, and the
+    // live source must win over the construction-time snapshot.
+    tool.execute(json!({
+        "task": "follow-up",
+        "resume": "sub-hot-reload",
+        "workspace": temp.path().to_str().unwrap()
+    }))
+    .await
+    .unwrap();
+    await_completion(&mut receiver).await;
+    let request = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+    assert!(request.contains("\"model\":\"new-model\""), "{request}");
+    assert!(!request.contains("\"model\":\"old-model\""), "{request}");
+
+    unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+}
+
+#[tokio::test]
+// Test-only env isolation: the std Mutex guard is held across .execute()
+// awaits to serialize XDG_CONFIG_HOME mutation with roles.rs tests.
+#[allow(clippy::await_holding_lock)]
+async fn unrouted_role_falls_back_to_hot_reloaded_subagent_model() {
+    let _guard = crate::roles::XDG_TEST_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let xdg = temp.path().join("xdg-empty");
+    std::fs::create_dir_all(&xdg).unwrap();
+    unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
+
+    let directory = temp.path().join("agents");
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(directory.join("fixer.md"), "You fix things.").unwrap();
+
+    let (url, captured) = capturing_model().await;
+    let snapshot_model = ConfiguredModel::chat(
+        crate::model::OpenAiModel::new(url.clone(), "test-key".into(), "old-model".into(), None)
+            .unwrap(),
+    );
+    let live_model = ConfiguredModel::chat(
+        crate::model::OpenAiModel::new(url, "test-key".into(), "new-model".into(), None).unwrap(),
+    );
+    let live = live_model.clone();
+    let mut tool = delegate_with_url(temp.path(), "http://localhost".into())
+        .with_roles_root(temp.path().to_path_buf())
+        .with_subagent_model(snapshot_model)
+        // The role source resolves (the session factory installed it) but
+        // the role is not routed: the fallback must consult the equally
+        // live default-subagent-model source, not the stale snapshot.
+        .with_role_model_source(Arc::new(|_role: &str| None))
+        .with_subagent_model_source(Arc::new(move || Some((live.clone(), None))));
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    tool.set_event_sender(sender);
+    tool.execute(json!({
+        "task": "fix",
+        "role": "fixer",
+        "workspace": temp.path().to_str().unwrap()
+    }))
+    .await
+    .unwrap();
+    await_completion(&mut receiver).await;
+    let request = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+    assert!(request.contains("\"model\":\"new-model\""), "{request}");
+    assert!(!request.contains("\"model\":\"old-model\""), "{request}");
+
+    unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+}
+
 /// Run one subagent through a capturing mock model and return the wire
 /// request body (tools array + system prompt) plus the tool result.
 async fn run_canonical_subagent_and_capture(

@@ -578,6 +578,36 @@ impl SessionFactory {
         })
     }
 
+    /// Resolve the default subagent model live from the reloadable state —
+    /// the fallback for delegated tasks with no routed role (no `role`
+    /// argument, or a role the live `[roles]` config does not route).
+    /// Returns `(model, context window)`, or `None` when the live state has
+    /// no subagent routing — the caller then falls back to its startup
+    /// snapshot. `'static`: the closure owns an `Arc` clone of the
+    /// reloadable cell plus the startup snapshot, so it survives the
+    /// factory and sees config hot reloads — exactly like
+    /// [`SessionFactory::role_models_resolver`], keeping the routed-role
+    /// path and the fallback path equally hot.
+    pub fn subagent_model_resolver(
+        &self,
+    ) -> Arc<dyn Fn() -> Option<(ConfiguredModel, Option<u64>)> + Send + Sync> {
+        let reloadable = self.reloadable.clone();
+        let snapshot_model = self.subagent_model.clone();
+        let snapshot_window = self.subagent_context_window;
+        Arc::new(move || {
+            let state = reloadable.read().unwrap();
+            match &state.models {
+                Some(models) => models
+                    .subagent
+                    .as_ref()
+                    .map(|model| (model.clone(), models.subagent_context_window)),
+                None => snapshot_model
+                    .as_ref()
+                    .map(|model| (model.clone(), snapshot_window)),
+            }
+        })
+    }
+
     /// Re-read the config files for this workspace and, when they changed
     /// and the new config parses + resolves, atomically swap it in. Returns
     /// the outcome for logging. Never fails the process: a bad edit keeps
@@ -870,6 +900,11 @@ impl SessionFactory {
                 tracing::info!("e-agent: subagent model {name}");
             }
         }
+        // Live default-subagent-model resolver: fallback delegations (no
+        // routed role) read `[roles] subagent` from the reloadable config at
+        // spawn time, exactly like the routed-role path above reads `[roles]
+        // <role>` — both survive config hot reloads without a restart.
+        delegate = delegate.with_subagent_model_source(self.subagent_model_resolver());
         let subagent_sessions = delegate.sessions();
         tools.push(Box::new(delegate));
         let mut agent = Agent::new(Box::new(main_model.clone()), tools);
@@ -2239,6 +2274,97 @@ fixer = "{role_profile}"
         );
         let snapshot_resolver = plain.role_models_resolver();
         let (model, _) = snapshot_resolver("fixer").expect("snapshot fallback");
+        assert_eq!(model.display_name(), "snapshot-model");
+    }
+
+    #[test]
+    fn subagent_model_resolver_reads_hot_reloaded_state() {
+        let temp = tempfile::tempdir().unwrap();
+        // The test factory starts with an empty reloadable cell
+        // (models = None); apply configs through the real reload path so
+        // runtime models exist, exactly like the watcher does.
+        let factory = SessionFactory::test_factory(temp.path().to_path_buf());
+        let with_subagent = |subagent_profile: Option<&str>| -> Config {
+            let routing = match subagent_profile {
+                Some(profile) => format!("subagent = \"{profile}\"\n"),
+                None => String::new(),
+            };
+            let source = format!(
+                r#"default = "p1/m1"
+[providers.p1]
+base_url = "http://one"
+api_key_env = "PATH"
+
+[models."p1/m1"]
+model = "m1"
+
+[providers.p2]
+base_url = "http://two"
+api_key_env = "PATH"
+
+[models."p2/m2"]
+model = "m2"
+
+[roles]
+{routing}"#
+            );
+            toml::from_str(&source).expect("test config parses")
+        };
+        {
+            let mut state = factory.reloadable.write().unwrap();
+            apply_reloaded_config(
+                &mut state,
+                Some(with_subagent(Some("p1/m1"))),
+                None,
+                &None,
+                &None,
+            );
+        }
+        let resolver = factory.subagent_model_resolver();
+        // Startup config routes the default subagent to p1/m1 (wire name
+        // "m1").
+        let (model, context_window) = resolver().expect("subagent routed");
+        assert_eq!(model.display_name(), "m1");
+        assert_eq!(context_window, None);
+
+        // Hot reload re-routes the default subagent to p2/m2: the SAME
+        // resolver sees it, so a resident Delegate's fallback delegations
+        // (no routed role) pick the new model up at spawn.
+        {
+            let mut state = factory.reloadable.write().unwrap();
+            apply_reloaded_config(
+                &mut state,
+                Some(with_subagent(Some("p2/m2"))),
+                None,
+                &None,
+                &None,
+            );
+        }
+        let (model, _) = resolver().expect("subagent still routed");
+        assert_eq!(model.display_name(), "m2");
+
+        // No `[roles] subagent` routing at all: the resolver returns None,
+        // so the caller falls back to its construction-time snapshot.
+        {
+            let mut state = factory.reloadable.write().unwrap();
+            apply_reloaded_config(&mut state, Some(with_subagent(None)), None, &None, &None);
+        }
+        assert!(resolver().is_none());
+
+        // No config at all (models = None): the closure falls back to the
+        // startup snapshot, exactly like build() does.
+        let mut plain = SessionFactory::test_factory(temp.path().to_path_buf());
+        plain.subagent_model = Some(ConfiguredModel::chat(
+            OpenAiModel::new(
+                "http://localhost".into(),
+                "test-key".into(),
+                "snapshot-model".into(),
+                None,
+            )
+            .expect("test model"),
+        ));
+        let snapshot_resolver = plain.subagent_model_resolver();
+        let (model, _) = snapshot_resolver().expect("snapshot fallback");
         assert_eq!(model.display_name(), "snapshot-model");
     }
 }
