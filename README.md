@@ -1423,7 +1423,11 @@ filters, provider registry or provider trait, fallback chain between backends,
 third provider, retries, cache, background search, or remote MCP support: it
 has exactly the two config-selected backends documented above (`exa`, the
 default, and `searxng`) and no per-engine behavior differences are
-special-cased.
+special-cased. The one SearXNG diagnostic exception: when `results` is empty
+while `unresponsive_engines` is non-empty, the tool output names the failed
+engines and reasons instead of a bare `no results`, so a broken backend is
+distinguishable from a genuinely empty query; a non-empty result set is
+returned unchanged.
 The web UI is a single self-contained HTML page, assembled from disk on
 every request in dev builds and compiled into the binary via `include_str!`
 in release builds: deliberately no frontend bundler/build pipeline, no
