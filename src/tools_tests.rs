@@ -360,6 +360,11 @@ async fn searxng_searches_without_a_key_and_formats_results() {
         result.content,
         "Rust ownership\nhttps://doc.rust-lang.org/book/ch04-00.html\nOwnership rules.\n\nBorrowing\nhttps://example.test/borrow\nReferences."
     );
+    assert!(
+        !result.content.contains("failed") && !result.content.contains("degraded"),
+        "a non-empty result set must not surface partial engine failures: {}",
+        result.content
+    );
 
     let request = String::from_utf8(server.await.unwrap()).unwrap();
     let request_line = request.lines().next().unwrap();
@@ -369,6 +374,40 @@ async fn searxng_searches_without_a_key_and_formats_results() {
     );
     assert!(request_line.contains("q=rust+ownership"), "{request_line}");
     assert!(!request.to_lowercase().contains("x-api-key"), "{request}");
+}
+
+#[tokio::test]
+async fn searxng_empty_results_surface_engine_failures() {
+    let (base_url, _server) = searxng_server(
+        "200 OK",
+        br#"{"results":[],"unresponsive_engines":[["google","CAPTCHA"],["brave","too many requests"]]}"#,
+    )
+    .await;
+    let result = WebSearch::for_test_searxng(base_url, Duration::from_secs(1))
+        .execute(json!({"query": "a game that exists"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        result.content,
+        "no results; 2 engine(s) failed: google (CAPTCHA), brave (too many requests) — the search backend is degraded, so this is not evidence the topic does not exist"
+    );
+}
+
+#[tokio::test]
+async fn searxng_empty_results_without_engine_failures_stay_bare() {
+    for body in [
+        // Field absent ...
+        br#"{"results":[]}"#.as_slice(),
+        // ... and present but empty.
+        br#"{"results":[],"unresponsive_engines":[]}"#.as_slice(),
+    ] {
+        let (base_url, _server) = searxng_server("200 OK", body).await;
+        let result = WebSearch::for_test_searxng(base_url, Duration::from_secs(1))
+            .execute(json!({"query": "nothing matches this"}))
+            .await
+            .unwrap();
+        assert_eq!(result.content, "no results");
+    }
 }
 
 #[tokio::test]
