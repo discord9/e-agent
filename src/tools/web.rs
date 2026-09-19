@@ -31,10 +31,14 @@ pub(super) struct ExaContextResponse {
 #[derive(Deserialize)]
 pub(super) struct SearxngResponse {
     /// Always present in a SearXNG JSON response (empty when nothing
-    /// matched). Unknown extra fields (`unresponsive_engines`, ...) are
-    /// ignored — engine behavior differences are not special-cased.
+    /// matched).
     #[serde(default)]
     results: Vec<SearxngResult>,
+    /// `[[engine, reason], ...]` for engines that failed during this query.
+    /// Only surfaced when `results` is empty: a partial engine failure
+    /// alongside a non-empty result set is normal and is not special-cased.
+    #[serde(default)]
+    unresponsive_engines: Vec<(String, String)>,
 }
 
 #[derive(Deserialize)]
@@ -210,7 +214,20 @@ impl WebSearch {
             }
         }
         let output = if entries.is_empty() {
-            "no results".to_owned()
+            if response.unresponsive_engines.is_empty() {
+                "no results".to_owned()
+            } else {
+                let failures = response
+                    .unresponsive_engines
+                    .iter()
+                    .map(|(engine, reason)| format!("{engine} ({reason})"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "no results; {} engine(s) failed: {failures} — the search backend is degraded, so this is not evidence the topic does not exist",
+                    response.unresponsive_engines.len()
+                )
+            }
         } else {
             entries.join("\n\n")
         };
