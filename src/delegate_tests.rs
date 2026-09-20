@@ -1429,6 +1429,32 @@ async fn unrouted_role_falls_back_to_hot_reloaded_subagent_model() {
     unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
 }
 
+/// The `None` half of the hot-reload contract: a live resolver that routes
+/// no subagent model (the user erased `[roles] subagent`) falls back to the
+/// construction-time snapshot, not a stale route or the main model.
+#[test]
+fn effective_subagent_model_uses_snapshot_when_live_source_returns_none() {
+    let temp = tempfile::tempdir().unwrap();
+    let snapshot = ConfiguredModel::chat(
+        crate::model::OpenAiModel::new(
+            "http://localhost".into(),
+            "test-key".into(),
+            "snapshot-model".into(),
+            None,
+        )
+        .unwrap(),
+    );
+    // Production always installs the resolver (session factory); here it is
+    // installed but currently returns None.
+    let tool = delegate(temp.path())
+        .with_subagent_model(snapshot)
+        .with_subagent_context_window(Some(20_000))
+        .with_subagent_model_source(Arc::new(|| None));
+    let (model, window) = tool.effective_subagent_model();
+    assert_eq!(model.display_name(), "snapshot-model");
+    assert_eq!(window, Some(20_000));
+}
+
 /// Run one subagent through a capturing mock model and return the wire
 /// request body (tools array + system prompt) plus the tool result.
 async fn run_canonical_subagent_and_capture(
