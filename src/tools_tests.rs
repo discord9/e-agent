@@ -1495,6 +1495,7 @@ fn bash_description_explains_the_sandbox_only_when_enabled() {
             enabled: true,
             network: false,
             workspace_writable: true,
+            gpu: false,
             writable_paths: vec!["/mnt/big/cargo-home".into()],
             readable_paths: vec!["~/.rustup".into()],
             readable_mounts: Vec::new(),
@@ -1546,6 +1547,7 @@ fn bash_description_explains_the_sandbox_only_when_enabled() {
             enabled: true,
             network: true,
             workspace_writable: false,
+            gpu: false,
             writable_paths: vec![],
             readable_paths: vec![],
             readable_mounts: Vec::new(),
@@ -1580,6 +1582,7 @@ fn bash_description_explains_the_sandbox_only_when_enabled() {
             enabled: true,
             network: true,
             workspace_writable: true,
+            gpu: false,
             writable_paths: vec![],
             readable_paths: vec![],
             readable_mounts: Vec::new(),
@@ -1703,6 +1706,7 @@ fn read_only_builtins_keep_bash_with_a_narrowed_sandbox() {
             enabled: true,
             network: true,
             workspace_writable: true,
+            gpu: false,
             writable_paths: vec!["/mnt/big/cargo-home".into()],
             readable_paths: vec!["~/.rustup".into()],
             readable_mounts: Vec::new(),
@@ -1774,6 +1778,7 @@ fn read_only_sandbox_derivation_narrows_and_keeps_readable_roots() {
         enabled: true,
         network: true,
         workspace_writable: true,
+        gpu: false,
         writable_paths: vec!["/mnt/big/cargo-home".into()],
         readable_paths: vec!["~/.rustup".into(), "~/.local".into()],
         writable_mounts: vec![("/mnt/big/cargo-home".into(), "/mnt/big/cargo-home".into())],
@@ -1804,6 +1809,13 @@ fn read_only_sandbox_derivation_narrows_and_keeps_readable_roots() {
         vec![("/home/x/.rustup".to_owned(), "/home/x/.rustup".to_owned())],
         "readable mounts must be preserved"
     );
+    // The gpu opt-in is a host-resource grant like network: read-only roles
+    // keep the main configuration's value.
+    let gpu_policy = crate::config::Sandbox {
+        gpu: true,
+        ..sandbox.clone()
+    };
+    assert!(read_only_sandbox(&gpu_policy).gpu);
 }
 
 #[test]
@@ -1812,6 +1824,7 @@ fn read_only_sandbox_follows_main_network_config() {
         enabled: true,
         network: true,
         workspace_writable: true,
+        gpu: false,
         writable_paths: vec!["/mnt/big/cargo-home".into()],
         readable_paths: vec!["~/.rustup".into()],
         readable_mounts: Vec::new(),
@@ -1925,6 +1938,7 @@ fn sandbox() -> Option<crate::config::Sandbox> {
         enabled: true,
         network: true,
         workspace_writable: true,
+        gpu: false,
         writable_paths: Vec::new(),
         readable_paths: Vec::new(),
         readable_mounts: Vec::new(),
@@ -1997,6 +2011,7 @@ async fn sandbox_mounts_configured_dests_at_their_configured_paths() {
         enabled: true,
         network: true,
         workspace_writable: true,
+        gpu: false,
         writable_paths: Vec::new(),
         readable_paths: Vec::new(),
         readable_mounts: vec![(
@@ -5357,6 +5372,7 @@ fn sandbox_bash_does_not_apply_git_command_scope_config() {
         enabled: true,
         network: true,
         workspace_writable: true,
+        gpu: false,
         writable_paths: Vec::new(),
         readable_paths: Vec::new(),
         readable_mounts: Vec::new(),
@@ -6042,6 +6058,7 @@ fn nested_host_submount_test_body() {
         enabled: true,
         network: true,
         workspace_writable: true,
+        gpu: false,
         writable_paths: Vec::new(),
         readable_paths: Vec::new(),
         readable_mounts: Vec::new(),
@@ -6259,6 +6276,7 @@ fn ancestor_guard_plan_ordering_and_edge_cases() {
         enabled: true,
         network: true,
         workspace_writable: true,
+        gpu: false,
         writable_paths: Vec::new(),
         readable_paths: Vec::new(),
         readable_mounts: Vec::new(),
@@ -6380,6 +6398,51 @@ fn ancestor_guard_plan_ordering_and_edge_cases() {
 
 #[cfg(unix)]
 #[test]
+fn gpu_binds_plan_ordering_and_opt_in() {
+    // Pure plan inspection (no bwrap): `[sandbox] gpu = true` adds
+    // `--dev-bind-try` pairs for the AMD nodes, and they must follow the
+    // `--dev /dev` pair that starts the minimal devtmpfs — a bind before it
+    // would be shadowed by that fresh /dev.
+    let workspace_dir = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(workspace_dir.path()).unwrap();
+    let root_str = workspace.root().to_string_lossy().into_owned();
+    let gpu_policy = crate::config::Sandbox {
+        gpu: true,
+        ..crate::config::Sandbox::default()
+    };
+    let plan = super::bash::build_bwrap_plan(&workspace, &gpu_policy, false, true, &root_str, None)
+        .unwrap();
+    let args: Vec<String> = plan
+        .args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let dev = args
+        .windows(2)
+        .position(|w| w[0] == "--dev" && w[1] == "/dev")
+        .expect("the plan must start the minimal /dev devtmpfs");
+    for node in ["/dev/kfd", "/dev/dri"] {
+        let bind = args
+            .windows(3)
+            .position(|w| w[0] == "--dev-bind-try" && w[1] == node && w[2] == node)
+            .unwrap_or_else(|| panic!("missing --dev-bind-try {node} {node}: {args:?}"));
+        assert!(
+            dev < bind,
+            "{node} must be bound after --dev /dev, not shadowed by it: {args:?}"
+        );
+    }
+    // Off by default: the same workspace without gpu carries no device binds.
+    let plain = crate::config::Sandbox::default();
+    let plan =
+        super::bash::build_bwrap_plan(&workspace, &plain, false, true, &root_str, None).unwrap();
+    assert!(
+        !plan.args.iter().any(|arg| arg == "--dev-bind-try"),
+        "gpu = false must not bind any device node"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn ancestor_guard_symlinked_ancestor_resolves_to_canonical_target() {
     // Regression: when an ancestor component of the workspace is a
     // symlink, the guard must shadow the REAL (canonical) directory, not
@@ -6392,6 +6455,7 @@ fn ancestor_guard_symlinked_ancestor_resolves_to_canonical_target() {
         enabled: true,
         network: true,
         workspace_writable: true,
+        gpu: false,
         writable_paths: Vec::new(),
         readable_paths: Vec::new(),
         readable_mounts: Vec::new(),
@@ -6468,6 +6532,7 @@ fn ancestor_guard_skips_tmp_scratch_and_policy_paths_untouched() {
         enabled: true,
         network: true,
         workspace_writable: true,
+        gpu: false,
         writable_paths: Vec::new(),
         readable_paths: Vec::new(),
         readable_mounts: Vec::new(),

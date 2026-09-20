@@ -215,6 +215,11 @@ pub struct Sandbox {
     /// Mount the workspace read-write inside the sandbox (default true).
     #[serde(default = "default_true")]
     pub workspace_writable: bool,
+    /// Expose GPU device nodes (/dev/kfd, /dev/dri, /dev/nvidia*) inside the
+    /// sandbox (default false). Global config only; project [sandbox] cannot
+    /// enable it.
+    #[serde(default)]
+    pub gpu: bool,
     /// Extra writable roots shared by bash mounts and file tools.
     #[serde(default)]
     pub writable_paths: Vec<String>,
@@ -242,6 +247,7 @@ impl Default for Sandbox {
             enabled: false,
             network: true,
             workspace_writable: true,
+            gpu: false,
             writable_paths: Vec::new(),
             readable_paths: Vec::new(),
             readable_mounts: Vec::new(),
@@ -830,6 +836,8 @@ pub fn config_dir() -> Option<PathBuf> {
     crate::home_dir().map(|home| home.join(".config/e-agent"))
 }
 
+// `gpu` is deliberately absent (global-config-only): a project `[sandbox]
+// gpu = true` is a parse error here.
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProjectSandbox {

@@ -322,10 +322,14 @@ sandbox is off unless explicitly enabled:
 enabled = true
 # network = false            # unshare the network namespace (default: shared)
 # workspace_writable = false # mount the workspace read-only (default: writable)
+# gpu = false                # expose GPU devices (/dev/kfd, /dev/dri, /dev/nvidia*) to sandboxed bash
 # Extra mounts, e.g. toolchain caches the agent needs inside the sandbox:
 # writable_paths = ["/mnt/big/cargo-home"]
 # readable_paths = ["~/.rustup", "~/.local"]
 ```
+
+`gpu` is global-config-only: a project `.e-agent/config.toml` that sets it is
+rejected at startup.
 
 When the sandbox is **enabled**, the workspace itself becomes a logical policy
 entry for the file tools: with `workspace_writable = false` the file tools
@@ -679,7 +683,11 @@ host's real `/tmp` (bound writable for main-agent and subagent Bash alike),
 blocked via `--new-session`. Network stays available by default; `network = false` unshares
 it. When the host uses systemd-resolved, the stub resolver at
 `/run/systemd/resolve` is mounted read-only so DNS resolution via the symlinked
-`/etc/resolv.conf` works inside the sandbox. The restriction constrains the
+`/etc/resolv.conf` works inside the sandbox. With `gpu = true` the sandbox
+also exposes the host GPU device nodes (AMD `/dev/kfd` + `/dev/dri`, NVIDIA
+`/dev/nvidia*`), which enlarges the kernel attack surface and shares the GPU
+with model-generated code; it is off by default and can only be enabled in the
+global config. The restriction constrains the
 spawned command, not the agent process itself. It is best-effort: bwrap is not
 setuid, the host network is shared by default, and environment variables of the
 parent process other than the stripped credential names (`EXA_API_KEY`,

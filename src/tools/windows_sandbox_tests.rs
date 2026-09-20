@@ -8,6 +8,7 @@ fn windows_policy(workspace_writable: bool, writable_paths: Vec<String>) -> crat
         enabled: true,
         network: true,
         workspace_writable,
+        gpu: false,
         writable_paths,
         readable_paths: Vec::new(),
         readable_mounts: Vec::new(),

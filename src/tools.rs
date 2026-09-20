@@ -268,6 +268,7 @@ pub(crate) fn read_only_sandbox(sandbox: &crate::config::Sandbox) -> crate::conf
         enabled: true,
         network: sandbox.network,
         workspace_writable: false,
+        gpu: sandbox.gpu,
         writable_paths: Vec::new(),
         readable_paths: sandbox.readable_paths.clone(),
         writable_mounts: Vec::new(),
