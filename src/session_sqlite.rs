@@ -687,7 +687,7 @@ impl SqliteSession {
         // `arguments` JSON strings (unescaping them), matching the raw strings
         // the JSONL backend searches instead of the array's escaped JSON text.
         //
-        // Two turso quirks shape this projection (both verified against
+        // Three turso quirks shape this projection (all verified against
         // turso 0.7.2; stock SQLite needs neither):
         //  1. `wr.payload` must be qualified — a bare outer column inside a
         //     table-valued function resolves only when the source is a named
@@ -697,11 +697,18 @@ impl SqliteSession {
         //     for any payload: malformed JSON, a missing path, and a
         //     non-array `tool_calls` all yield `'[]'` (zero rows), never an
         //     evaluation error.
+        //  3. `json_each` can also yield individual elements that are not
+        //     valid JSON at all (`tool_calls:["not-json"]`); `json_extract`
+        //     on such an element aborts the whole query under turso 0.7.2
+        //     (malformed-JSON error while stepping), not just that row. The
+        //     per-element `json_valid` guard makes a bad element contribute
+        //     an empty segment, so an all-malformed row stays inert and a
+        //     mixed row still matches its good elements.
         let text = r#"CASE WHEN json_valid(wr.payload) THEN CASE json_extract(wr.payload,'$.type')
  WHEN 'message' THEN concat(
   CASE WHEN json_type(wr.payload,'$.message.User.content')='text' THEN json_extract(wr.payload,'$.message.User.content') END,
   CASE WHEN json_type(wr.payload,'$.message.Assistant.content')='text' THEN json_extract(wr.payload,'$.message.Assistant.content') END,
-  (SELECT group_concat(COALESCE(json_extract(value,'$.name'),'')||char(10)||COALESCE(json_extract(value,'$.arguments'),''), char(10)) FROM json_each(CASE WHEN json_valid(wr.payload) THEN CASE WHEN json_type(wr.payload,'$.message.Assistant.tool_calls')='array' THEN json_extract(wr.payload,'$.message.Assistant.tool_calls') ELSE '[]' END ELSE '[]' END)))
+  (SELECT group_concat(CASE WHEN json_valid(value) THEN COALESCE(json_extract(value,'$.name'),'')||char(10)||COALESCE(json_extract(value,'$.arguments'),'') ELSE '' END, char(10)) FROM json_each(CASE WHEN json_valid(wr.payload) THEN CASE WHEN json_type(wr.payload,'$.message.Assistant.tool_calls')='array' THEN json_extract(wr.payload,'$.message.Assistant.tool_calls') ELSE '[]' END ELSE '[]' END)))
  WHEN 'notice' THEN CASE WHEN json_type(wr.payload,'$.text')='text' THEN json_extract(wr.payload,'$.text') END END END"#;
         let predicate = query
             .query

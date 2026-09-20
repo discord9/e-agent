@@ -601,28 +601,35 @@ impl GreptimeSession {
         dedup_raw_entries(&raw, session_id, workspace_id, "event_time").map_err(anyhow::Error::msg)
     }
 
+    /// Upper bound on the indexed tool-call scan in the projection. Parallel
+    /// tool calls in one turn are few; out-of-range indices render NULL and
+    /// vanish into `concat_ws`.
+    const TOOL_CALL_INDEX_LIMIT: usize = 8;
+
     /// Direct physical-record history search. Greptime search intentionally
     /// does not reconstruct latest seq winners: older matching versions remain
     /// searchable. `TRY_CAST(... AS BYTEA)` keeps malformed payloads NULL.
     ///
-    /// Unlike SQLite's `json_extract`, `json_get_string` cannot render JSON
-    /// containers here: `message.Assistant.tool_calls` is an array and comes
-    /// back NULL (verified against GreptimeDB 1.2.0), and no array-to-text
-    /// function exists, so assistant tool calls are searched through the
-    /// rendered `message.Assistant` object — the one container
-    /// `json_get_object` + `json_to_string` can produce. `reasoning` is
-    /// stripped from that rendering so reasoning stays out of the search
-    /// surface, exactly like the JSONL/SQLite backends.
-    ///
-    /// The rendered object escapes argument quotes (`"` as `\"`), so a quoted
-    /// needle is also tested against its JSON-escaped form. Residual
-    /// divergence: a needle mixing quotes with backslashes or control
-    /// characters matches JSONL/SQLite but not this backend (pathological
-    /// needle, accepted).
+    /// The projection is exactly the JSONL/SQLite search surface: user
+    /// content, assistant content, and each tool call's `name` + stored
+    /// `arguments` string. `json_get_string` cannot render the tool_calls
+    /// array (a container comes back NULL, verified against GreptimeDB
+    /// 1.2.0), so each call is read BY INDEX — the primitive that returns the
+    /// stored strings verbatim. Re-rendering the whole Assistant object
+    /// instead (`json_get_object` + `json_to_string`) doubles every `\` and
+    /// `\n` in `arguments`, breaking Windows paths and escaped newlines, and
+    /// exposes field names and call ids to the search. Reasoning and
+    /// tool-result content stay out, like the other backends, so neither
+    /// needle escaping nor a reasoning-stripping regexp is needed.
     pub async fn query_history(&self, query: &HistoryQuery) -> Result<Vec<HistoryEntry>> {
-        let text = r#"CASE json_get_string(TRY_CAST(payload AS BYTEA),'type')
- WHEN 'notice' THEN json_get_string(TRY_CAST(payload AS BYTEA),'text')
- WHEN 'message' THEN concat_ws(chr(10),json_get_string(TRY_CAST(payload AS BYTEA),'message.User.content'),json_get_string(TRY_CAST(payload AS BYTEA),'message.Assistant.content'),regexp_replace(json_to_string(json_get_object(TRY_CAST(payload AS BYTEA),'message.Assistant')),'"reasoning":"(\\.|[^"\\])*"','""')) END"#;
+        let payload = "TRY_CAST(payload AS BYTEA)";
+        let mut text = format!(
+            "CASE json_get_string({payload},'type') WHEN 'notice' THEN json_get_string({payload},'text') WHEN 'message' THEN concat_ws(chr(10),json_get_string({payload},'message.User.content'),json_get_string({payload},'message.Assistant.content')"
+        );
+        for index in 0..Self::TOOL_CALL_INDEX_LIMIT {
+            text.push_str(&format!(",json_get_string({payload},'message.Assistant.tool_calls[{index}].name'),json_get_string({payload},'message.Assistant.tool_calls[{index}].arguments')"));
+        }
+        text.push_str(") END");
         let workspace = query.workspace_id.as_deref();
         let session = query.session_id.as_deref();
         let limit = query.limit as i64;
@@ -632,9 +639,11 @@ impl GreptimeSession {
                 &[&workspace, &session, &seq],
             ).await
         } else if let Some(session) = session {
-            // Plain needles miss nothing new; the escaped form recovers the
-            // argument quotes rendered by `json_to_string` in the projection.
-            let predicate = query.query.as_ref().map(|_| format!(" AND (strpos({text},$3::string)>0 OR strpos({text},replace($3::string,'\"','\\\"'))>0)")).unwrap_or_default();
+            let predicate = query
+                .query
+                .as_ref()
+                .map(|_| format!(" AND strpos({text},$3::string)>0"))
+                .unwrap_or_default();
             let sql = format!(r#"SELECT workspace_id,session_id,seq,event_time,payload FROM session_entries
 WHERE workspace_id=$1::string AND session_id=$2::string{predicate}
 AND ($3::string IS NULL OR $3::string IS NOT NULL)
@@ -644,7 +653,11 @@ ORDER BY event_time DESC,seq DESC LIMIT $6::bigint"#);
             let after_seq = query.after.as_ref().map(|entry| entry.2);
             self.client.query(&sql, &[&workspace.expect("session has workspace"), &session, &query.query.as_deref(), &after_time, &after_seq, &limit]).await
         } else {
-            let predicate = query.query.as_ref().map(|_| format!(" AND (strpos({text},$2::string)>0 OR strpos({text},replace($2::string,'\"','\\\"'))>0)")).unwrap_or_default();
+            let predicate = query
+                .query
+                .as_ref()
+                .map(|_| format!(" AND strpos({text},$2::string)>0"))
+                .unwrap_or_default();
             let sql = format!(r#"SELECT workspace_id,session_id,seq,event_time,payload FROM session_entries
 WHERE ($1::string IS NULL OR workspace_id=$1::string){predicate}
 AND ($2::string IS NULL OR $2::string IS NOT NULL)
@@ -4451,15 +4464,13 @@ mod tests {
             .unwrap();
         assert_ne!(cross_first[0].event_time, cross_second[0].event_time);
 
-        // Verified against GreptimeDB 1.2.0: `json_get_string` renders JSON
-        // *containers* as NULL for a STRING payload, so the tool_calls array
-        // is not searchable directly and has no array-to-text equivalent. The
-        // projection therefore renders the Assistant object (the one
-        // container `json_get_object`+`json_to_string` can produce) with the
-        // `reasoning` field stripped. The turn also carries text, so an
-        // argument-only match proves the projection does not stop at the
-        // first non-empty segment. Quoted argument fragments match through
-        // the escaped-needle branch (`"` as `\"` in the rendered object).
+        // `json_get_string` cannot render the tool_calls array itself (a
+        // container renders as NULL, verified against GreptimeDB 1.2.0), so
+        // the projection reads each call BY INDEX, which returns the stored
+        // `name`/`arguments` strings verbatim — the exact JSONL/SQLite
+        // search surface. The turn also carries text, so an argument-only
+        // match proves the projection does not stop at the first non-empty
+        // segment.
         let tool_call = serde_json::to_string(&SessionEntry::Message {
             message: Message::Assistant(AssistantMessage {
                 content: Some("contentonlymarker".into()),
@@ -4501,7 +4512,7 @@ mod tests {
         let rendered = session
             .client
             .query(
-                "SELECT json_get_string(TRY_CAST(payload AS BYTEA),'message.Assistant.tool_calls') AS array_text, json_get_string(TRY_CAST(payload AS BYTEA),'message.Assistant.tool_calls[0].arguments') AS first_argument, json_to_string(json_get_object(TRY_CAST(payload AS BYTEA),'message.Assistant')) AS object_text FROM session_entries WHERE workspace_id=$1 AND session_id=$2 AND seq=12",
+                "SELECT json_get_string(TRY_CAST(payload AS BYTEA),'message.Assistant.tool_calls') AS array_text, json_get_string(TRY_CAST(payload AS BYTEA),'message.Assistant.tool_calls[0].name') AS first_name, json_get_string(TRY_CAST(payload AS BYTEA),'message.Assistant.tool_calls[0].arguments') AS first_argument FROM session_entries WHERE workspace_id=$1 AND session_id=$2 AND seq=12",
                 &[&wid, &sid],
             )
             .await
@@ -4511,17 +4522,17 @@ mod tests {
             array_text.is_none(),
             "json_get_string must still render the tool_calls array as NULL: {array_text:?}"
         );
+        let first_name: Option<String> = rendered[0].get("first_name");
+        assert_eq!(
+            first_name.as_deref(),
+            Some("write_file"),
+            "indexed extraction must return the stored call name"
+        );
         let first_argument: Option<String> = rendered[0].get("first_argument");
         assert_eq!(
             first_argument.as_deref(),
-            Some(r#"{"path":"/tmp/x","content":"toolneedle"}"#)
-        );
-        let object_text: Option<String> = rendered[0].get("object_text");
-        assert!(
-            object_text
-                .as_deref()
-                .is_some_and(|text| text.contains("toolneedle")),
-            "rendered Assistant object carries the tool-call arguments: {object_text:?}"
+            Some(r#"{"path":"/tmp/x","content":"toolneedle"}"#),
+            "indexed extraction must return the stored argument string unescaped"
         );
 
         let tool_calls = session
@@ -4543,8 +4554,8 @@ mod tests {
             vec![12],
             "argument-only fragment matches the turn that also has text; the Tool result with the same word does not"
         );
-        // The escaped-needle branch: real quotes must match the rendered
-        // (escaped) argument text the same way JSONL/SQLite do.
+        // Real quotes match the stored argument string literally, the same
+        // way JSONL/SQLite do (no escaped-needle compensation needed).
         let quoted_argument = session
             .query_history(&HistoryQuery {
                 workspace_id: Some(wid.clone()),
@@ -4565,8 +4576,156 @@ mod tests {
                 .map(|entry| entry.seq)
                 .collect::<Vec<_>>(),
             vec![12],
-            "quoted argument fragment matches through the escaped needle form"
+            "quoted argument fragment matches literally"
         );
+        // Field names and call ids are not part of the search surface: the
+        // serialized Assistant object used to expose both, so a marker living
+        // only in `tool_calls[].id` matched, and a bare `content` needle hit
+        // the `"content":null` field name of every assistant turn. This turn
+        // is tool-call-only and its stored arguments contain neither word.
+        let id_only_turn = serde_json::to_string(&SessionEntry::Message {
+            message: Message::Assistant(AssistantMessage {
+                content: None,
+                tool_calls: vec![crate::agent::ToolCall {
+                    id: "idonlymarker".into(),
+                    name: "bash".into(),
+                    arguments: r#"{"command":"echo hi"}"#.into(),
+                }],
+                reasoning: None,
+            }),
+        })
+        .unwrap();
+        session
+            .client
+            .execute(
+                "INSERT INTO session_entries (workspace_id, session_id, seq, event_time, entry_kind, payload, schema_version, is_error) VALUES ($1,$2,11,$3,'message',$4,1,false)",
+                &[
+                    &wid,
+                    &sid,
+                    &us_to_datetime(next_event_time_us()),
+                    &id_only_turn,
+                ],
+            )
+            .await
+            .unwrap();
+        let id_only = session
+            .query_history(&HistoryQuery {
+                workspace_id: Some(wid.clone()),
+                session_id: Some(sid.clone()),
+                query: Some("idonlymarker".into()),
+                after: None,
+                after_event_time: None,
+                offset: None,
+                exact_seq: None,
+                limit: 4,
+                default_search_window: false,
+            })
+            .await
+            .unwrap();
+        assert!(
+            id_only.is_empty(),
+            "a marker that only exists in tool_calls[].id must not be searchable"
+        );
+        let field_names = session
+            .query_history(&HistoryQuery {
+                workspace_id: Some(wid.clone()),
+                session_id: Some(sid.clone()),
+                query: Some("tool_calls".into()),
+                after: None,
+                after_event_time: None,
+                offset: None,
+                exact_seq: None,
+                limit: 4,
+                default_search_window: false,
+            })
+            .await
+            .unwrap();
+        assert!(
+            field_names.is_empty(),
+            "the `tool_calls` field name must not be searchable"
+        );
+        // Seq 12 stores the word `content` (assistant text and arguments);
+        // seq 11 is tool-call-only, so its `"content":null` field name must
+        // not put it on this list.
+        let content_word = session
+            .query_history(&HistoryQuery {
+                workspace_id: Some(wid.clone()),
+                session_id: Some(sid.clone()),
+                query: Some("content".into()),
+                after: None,
+                after_event_time: None,
+                offset: None,
+                exact_seq: None,
+                limit: 4,
+                default_search_window: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            content_word
+                .iter()
+                .map(|entry| entry.seq)
+                .collect::<Vec<_>>(),
+            vec![12],
+            "the bare word `content` matches only turns that genuinely store it"
+        );
+        // The stored argument string must be searchable verbatim.
+        // Re-rendering the whole Assistant object doubles every `\` and every
+        // `\n`, so the normal write_file payload (a Windows path, an escaped
+        // newline) stopped matching while JSONL/SQLite still matched it.
+        let windows_call = serde_json::to_string(&SessionEntry::Message {
+            message: Message::Assistant(AssistantMessage {
+                content: None,
+                tool_calls: vec![crate::agent::ToolCall {
+                    id: "call_win".into(),
+                    name: "write_file".into(),
+                    arguments: r#"{"path":"C:\\Users\\me\\new.txt","content":"line1\nline2"}"#
+                        .into(),
+                }],
+                reasoning: None,
+            }),
+        })
+        .unwrap();
+        session
+            .client
+            .execute(
+                "INSERT INTO session_entries (workspace_id, session_id, seq, event_time, entry_kind, payload, schema_version, is_error) VALUES ($1,$2,14,$3,'message',$4,1,false)",
+                &[
+                    &wid,
+                    &sid,
+                    &us_to_datetime(next_event_time_us()),
+                    &windows_call,
+                ],
+            )
+            .await
+            .unwrap();
+        for (needle, what) in [
+            (
+                r#"C:\\Users\\me\\new.txt"#,
+                "a Windows path with escaped backslashes",
+            ),
+            (r#"line1\nline2"#, "an escaped newline"),
+        ] {
+            let verbatim = session
+                .query_history(&HistoryQuery {
+                    workspace_id: Some(wid.clone()),
+                    session_id: Some(sid.clone()),
+                    query: Some(needle.into()),
+                    after: None,
+                    after_event_time: None,
+                    offset: None,
+                    exact_seq: None,
+                    limit: 4,
+                    default_search_window: false,
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                verbatim.iter().map(|entry| entry.seq).collect::<Vec<_>>(),
+                vec![14],
+                "{what} must match the stored argument string verbatim"
+            );
+        }
         let content_only = session
             .query_history(&HistoryQuery {
                 workspace_id: Some(wid.clone()),
@@ -4605,10 +4764,10 @@ mod tests {
             .unwrap();
         assert!(
             reasoning.is_empty(),
-            "stripped reasoning stays out of the search projection"
+            "reasoning stays out of the search projection"
         );
-        // Stripping happens before the needle tests, so a quoted reasoning
-        // fragment must not leak through the escaped-needle branch.
+        // Reasoning never enters the projection at all (no regexp stripping
+        // step), so neither a bare nor a quoted reasoning fragment matches.
         let quoted_reasoning = session
             .query_history(&HistoryQuery {
                 workspace_id: Some(wid.clone()),
