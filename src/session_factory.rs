@@ -597,13 +597,16 @@ impl SessionFactory {
     /// Resolve the default subagent model live from the reloadable state —
     /// the fallback for delegated tasks with no routed role (no `role`
     /// argument, or a role the live `[roles]` config does not route).
-    /// Returns `(model, context window)`, or `None` when the live state has
-    /// no subagent routing — the caller then falls back to its startup
-    /// snapshot. `'static`: the closure owns an `Arc` clone of the
-    /// reloadable cell plus the startup snapshot, so it survives the
-    /// factory and sees config hot reloads — exactly like
-    /// [`SessionFactory::role_models_resolver`], keeping the routed-role
-    /// path and the fallback path equally hot.
+    /// Returns `(model, context window)`: the routed `[roles] subagent`
+    /// model when one exists, else the live main model — the same fallback
+    /// [`SessionFactory::build`] uses, so a resident Delegate and a newly
+    /// built session never disagree about what "no subagent route" means.
+    /// `None` only when the live state has no config at all; the caller
+    /// then falls back to its startup snapshot as a last resort. `'static`:
+    /// the closure owns an `Arc` clone of the reloadable cell plus the
+    /// startup snapshot, so it survives the factory and sees config hot
+    /// reloads — exactly like [`SessionFactory::role_models_resolver`],
+    /// keeping the routed-role path and the fallback path equally hot.
     pub fn subagent_model_resolver(
         &self,
     ) -> Arc<dyn Fn() -> Option<(ConfiguredModel, Option<u64>)> + Send + Sync> {
@@ -613,10 +616,15 @@ impl SessionFactory {
         Arc::new(move || {
             let state = reloadable.read().unwrap();
             match &state.models {
-                Some(models) => models
-                    .subagent
-                    .as_ref()
-                    .map(|model| (model.clone(), models.subagent_context_window)),
+                // Model and context window always come from the same
+                // profile: main↔main window, subagent↔subagent window.
+                Some(models) => Some(
+                    models
+                        .subagent
+                        .clone()
+                        .map(|model| (model, models.subagent_context_window))
+                        .unwrap_or_else(|| (models.main.clone(), models.main_context_window)),
+                ),
                 None => snapshot_model
                     .as_ref()
                     .map(|model| (model.clone(), snapshot_window)),
@@ -2587,13 +2595,16 @@ model = "m2"
         let (model, _) = resolver().expect("subagent still routed");
         assert_eq!(model.display_name(), "m2");
 
-        // No `[roles] subagent` routing at all: the resolver returns None,
-        // so the caller falls back to its construction-time snapshot.
+        // No `[roles] subagent` routing at all: the resolver falls back to
+        // the live main model — the same fallback a newly built session
+        // uses, so a resident Delegate and a fresh session agree.
         {
             let mut state = factory.reloadable.write().unwrap();
             apply_reloaded_config(&mut state, Some(with_subagent(None)), None, &None, &None);
         }
-        assert!(resolver().is_none());
+        let (model, context_window) = resolver().expect("main fallback");
+        assert_eq!(model.display_name(), "m1");
+        assert_eq!(context_window, None);
 
         // No config at all (models = None): the closure falls back to the
         // startup snapshot, exactly like build() does.
@@ -2610,5 +2621,75 @@ model = "m2"
         let snapshot_resolver = plain.subagent_model_resolver();
         let (model, _) = snapshot_resolver().expect("snapshot fallback");
         assert_eq!(model.display_name(), "snapshot-model");
+    }
+
+    /// The erased-route lifecycle a resident Delegate sees: main=M, the
+    /// subagent route hot-reloads A → B, then the route is deleted — the
+    /// resolver must end on the live main model M, not on the stale A/B
+    /// route snapshot. Distinct context windows per profile pin the
+    /// model↔window pairing (main keeps main's window).
+    #[test]
+    fn subagent_model_lifecycle_falls_back_to_live_main() {
+        let temp = tempfile::tempdir().unwrap();
+        let factory = SessionFactory::test_factory(temp.path().to_path_buf());
+        let with_subagent = |profile: Option<&str>| -> Config {
+            let routing = match profile {
+                Some(profile) => format!("subagent = \"{profile}\"\n"),
+                None => String::new(),
+            };
+            let source = format!(
+                r#"default = "p1/m1"
+[providers.p1]
+base_url = "http://one"
+api_key_env = "PATH"
+
+[models."p1/m1"]
+model = "m1"
+context_window = 1000
+
+[providers.p2]
+base_url = "http://two"
+api_key_env = "PATH"
+
+[models."p2/m2"]
+model = "m2"
+context_window = 2000
+
+[providers.p3]
+base_url = "http://three"
+api_key_env = "PATH"
+
+[models."p3/m3"]
+model = "m3"
+context_window = 3000
+
+[roles]
+{routing}"#
+            );
+            toml::from_str(&source).expect("test config parses")
+        };
+        let apply = |config: Config| {
+            let mut state = factory.reloadable.write().unwrap();
+            apply_reloaded_config(&mut state, Some(config), None, &None, &None);
+        };
+        let resolver = factory.subagent_model_resolver();
+
+        // subagent = A.
+        apply(with_subagent(Some("p2/m2")));
+        let (model, context_window) = resolver().expect("subagent A routed");
+        assert_eq!(model.display_name(), "m2");
+        assert_eq!(context_window, Some(2000));
+
+        // Hot reload: subagent = B.
+        apply(with_subagent(Some("p3/m3")));
+        let (model, context_window) = resolver().expect("subagent B routed");
+        assert_eq!(model.display_name(), "m3");
+        assert_eq!(context_window, Some(3000));
+
+        // Hot reload: the route is deleted — main M and main's own window.
+        apply(with_subagent(None));
+        let (model, context_window) = resolver().expect("main fallback");
+        assert_eq!(model.display_name(), "m1");
+        assert_eq!(context_window, Some(1000));
     }
 }

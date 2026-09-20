@@ -1429,9 +1429,11 @@ async fn unrouted_role_falls_back_to_hot_reloaded_subagent_model() {
     unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
 }
 
-/// The `None` half of the hot-reload contract: a live resolver that routes
-/// no subagent model (the user erased `[roles] subagent`) falls back to the
-/// construction-time snapshot, not a stale route or the main model.
+/// The `None` arm of the subagent-model source protocol, now reached only
+/// when there is no config at all: a live resolver yields `None` (an erased
+/// `[roles] subagent` resolves to the live main model instead), and the
+/// Delegate then keeps its construction-time snapshot — model and window
+/// paired — as the last resort rather than inventing a model.
 #[test]
 fn effective_subagent_model_uses_snapshot_when_live_source_returns_none() {
     let temp = tempfile::tempdir().unwrap();
@@ -1444,12 +1446,13 @@ fn effective_subagent_model_uses_snapshot_when_live_source_returns_none() {
         )
         .unwrap(),
     );
-    // Production always installs the resolver (session factory); here it is
-    // installed but currently returns None.
+    // A real factory with no config (`models = None`): the production
+    // resolver it installs is exactly the one whose None arm applies.
+    let factory = crate::session_factory::SessionFactory::test_factory(temp.path().to_path_buf());
     let tool = delegate(temp.path())
         .with_subagent_model(snapshot)
         .with_subagent_context_window(Some(20_000))
-        .with_subagent_model_source(Arc::new(|| None));
+        .with_subagent_model_source(factory.subagent_model_resolver());
     let (model, window) = tool.effective_subagent_model();
     assert_eq!(model.display_name(), "snapshot-model");
     assert_eq!(window, Some(20_000));
