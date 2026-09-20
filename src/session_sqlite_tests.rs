@@ -633,12 +633,13 @@ async fn history_query_search_is_literal_and_ignores_unselected_bad_json() {
         .unwrap_err();
     assert!(selected_bad.contains("cannot decode"));
 
-    // Assistant tool calls are searchable: `json_extract` of the tool_calls
-    // array returns the array's JSON text, so tool names and raw argument
-    // strings match literally. The turn also carries text, so an argument-only
-    // match proves the projection does not stop at the first non-empty
-    // segment. A Tool result carrying the same word and an assistant
-    // `reasoning` field stay out of the projection.
+    // Assistant tool calls are searchable: `json_each` expands the tool_calls
+    // array and `json_extract` decodes each element's `name`/`arguments`
+    // JSON strings, so raw argument fragments match literally, including
+    // fragments containing real quotes. The turn also carries text, so an
+    // argument-only match proves the projection does not stop at the first
+    // non-empty segment. A Tool result carrying the same word and an
+    // assistant `reasoning` field stay out of the projection.
     let tool_call = serde_json::to_string(&SessionEntry::Message {
         message: Message::Assistant(AssistantMessage {
             content: Some("contentonlymarker".into()),
@@ -647,7 +648,7 @@ async fn history_query_search_is_literal_and_ignores_unselected_bad_json() {
                 name: "write_file".into(),
                 arguments: r#"{"path":"/tmp/x","content":"toolneedle"}"#.into(),
             }],
-            reasoning: Some("reasononly".into()),
+            reasoning: Some(r#"reasononly "quoted reasoning""#.into()),
         }),
     })
     .unwrap();
@@ -664,7 +665,7 @@ async fn history_query_search_is_literal_and_ignores_unselected_bad_json() {
     .unwrap();
     let conn = session.conn.lock().await;
     conn.execute(
-        "INSERT INTO session_entries (workspace_id,session_id,seq,event_time_us,entry_kind,payload,schema_version,is_error) VALUES (?1,?2,12,?3,'message',?4,1,0),(?1,?2,13,?5,'message',?6,1,0)",
+        "INSERT INTO session_entries (workspace_id,session_id,seq,event_time_us,entry_kind,payload,schema_version,is_error) VALUES (?1,?2,12,?3,'message',?4,1,0),(?1,?2,13,?5,'message',?6,1,0),(?1,?2,14,?7,'message',?8,1,0)",
         (
             session.workspace_id.as_str(),
             session.session_id.as_str(),
@@ -672,6 +673,12 @@ async fn history_query_search_is_literal_and_ignores_unselected_bad_json() {
             tool_call.as_str(),
             next_event_time_us(),
             tool_result.as_str(),
+            next_event_time_us(),
+            // A well-formed payload whose `tool_calls` is not an array: turso
+            // evaluates the `json_each` argument eagerly for every scanned
+            // row, so the json_valid + json_type guard chain must keep this
+            // row inert instead of erroring the whole search.
+            r#"{"type":"message","message":{"Assistant":{"content":null,"tool_calls":"notanarray"}}}"#,
         ),
     )
     .await
@@ -695,6 +702,30 @@ async fn history_query_search_is_literal_and_ignores_unselected_bad_json() {
         tool_calls.iter().map(|entry| entry.seq).collect::<Vec<_>>(),
         vec![12],
         "argument-only fragment matches the turn that also has text; the Tool result with the same word does not"
+    );
+    // The regression this locks: a needle with real quotes must match the
+    // decoded argument string, not the escaped JSON text of the raw array.
+    let quoted_argument = session
+        .query_history(&HistoryQuery {
+            workspace_id: Some(session.workspace_id.clone()),
+            session_id: Some(session.session_id.clone()),
+            query: Some(r#""path":"/tmp/x""#.into()),
+            after: None,
+            after_event_time: None,
+            offset: None,
+            exact_seq: None,
+            limit: 4,
+            default_search_window: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        quoted_argument
+            .iter()
+            .map(|entry| entry.seq)
+            .collect::<Vec<_>>(),
+        vec![12],
+        "quoted argument fragment matches the per-element decoded arguments string"
     );
     let content_only = session
         .query_history(&HistoryQuery {
@@ -735,6 +766,26 @@ async fn history_query_search_is_literal_and_ignores_unselected_bad_json() {
     assert!(
         reasoning.is_empty(),
         "assistant reasoning stays out of the search projection"
+    );
+    // A quoted reasoning fragment must also stay out; only the tool-call
+    // arguments are decoded, never `reasoning`.
+    let quoted_reasoning = session
+        .query_history(&HistoryQuery {
+            workspace_id: Some(session.workspace_id.clone()),
+            session_id: Some(session.session_id.clone()),
+            query: Some(r#""quoted reasoning""#.into()),
+            after: None,
+            after_event_time: None,
+            offset: None,
+            exact_seq: None,
+            limit: 4,
+            default_search_window: false,
+        })
+        .await
+        .unwrap();
+    assert!(
+        quoted_reasoning.is_empty(),
+        "quoted reasoning stays out of the search projection"
     );
 }
 

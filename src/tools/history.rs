@@ -806,6 +806,29 @@ mod tests {
             vec![108]
         );
 
+        // Cross-backend contract: a needle with real quotes matches the raw
+        // (deserialized) arguments string, never an escaped JSON rendering.
+        let quoted_arguments: Value = serde_json::from_str(
+            &execute(
+                &SessionStore::Jsonl,
+                temp.path(),
+                "current",
+                &json!({"action": "search", "query": r#""path":"/tmp/a.txt""#}),
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            quoted_arguments["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["seq"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![107]
+        );
+
         let empty: Value = serde_json::from_str(
             &execute(
                 &SessionStore::Jsonl,

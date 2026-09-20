@@ -682,15 +682,27 @@ impl SqliteSession {
     pub async fn query_history(&self, query: &HistoryQuery) -> Result<Vec<HistoryEntry>, String> {
         // `concat` keeps every non-empty segment instead of short-circuiting
         // on the first one: an assistant message that carries both text and
-        // tool calls must match on either. `json_extract` of the tool_calls
-        // array yields the array's JSON text (tool names and raw argument
-        // strings), the same surface the JSONL backend searches.
-        let text = r#"CASE WHEN json_valid(payload) THEN CASE json_extract(payload,'$.type')
+        // tool calls must match on either. `json_each` expands the tool_calls
+        // array and `json_extract` decodes each element's `name` and
+        // `arguments` JSON strings (unescaping them), matching the raw strings
+        // the JSONL backend searches instead of the array's escaped JSON text.
+        //
+        // Two turso quirks shape this projection (both verified against
+        // turso 0.7.2; stock SQLite needs neither):
+        //  1. `wr.payload` must be qualified — a bare outer column inside a
+        //     table-valued function resolves only when the source is a named
+        //     table, not a CTE (`Parse error: no such column: payload`).
+        //  2. The `json_each` argument is evaluated eagerly for every scanned
+        //     row, before the guarding CASE is entered, so it must be safe
+        //     for any payload: malformed JSON, a missing path, and a
+        //     non-array `tool_calls` all yield `'[]'` (zero rows), never an
+        //     evaluation error.
+        let text = r#"CASE WHEN json_valid(wr.payload) THEN CASE json_extract(wr.payload,'$.type')
  WHEN 'message' THEN concat(
-  CASE WHEN json_type(payload,'$.message.User.content')='text' THEN json_extract(payload,'$.message.User.content') END,
-  CASE WHEN json_type(payload,'$.message.Assistant.content')='text' THEN json_extract(payload,'$.message.Assistant.content') END,
-  CASE WHEN json_type(payload,'$.message.Assistant.tool_calls')='array' THEN json_extract(payload,'$.message.Assistant.tool_calls') END)
- WHEN 'notice' THEN CASE WHEN json_type(payload,'$.text')='text' THEN json_extract(payload,'$.text') END END END"#;
+  CASE WHEN json_type(wr.payload,'$.message.User.content')='text' THEN json_extract(wr.payload,'$.message.User.content') END,
+  CASE WHEN json_type(wr.payload,'$.message.Assistant.content')='text' THEN json_extract(wr.payload,'$.message.Assistant.content') END,
+  (SELECT group_concat(COALESCE(json_extract(value,'$.name'),'')||char(10)||COALESCE(json_extract(value,'$.arguments'),''), char(10)) FROM json_each(CASE WHEN json_valid(wr.payload) THEN CASE WHEN json_type(wr.payload,'$.message.Assistant.tool_calls')='array' THEN json_extract(wr.payload,'$.message.Assistant.tool_calls') ELSE '[]' END ELSE '[]' END)))
+ WHEN 'notice' THEN CASE WHEN json_type(wr.payload,'$.text')='text' THEN json_extract(wr.payload,'$.text') END END END"#;
         let predicate = query
             .query
             .as_ref()
@@ -709,9 +721,9 @@ impl SqliteSession {
             ""
         };
         let selected_from = if query.default_search_window {
-            "window_rows"
+            "window_rows wr"
         } else {
-            "winner_rows"
+            "winner_rows wr"
         };
         let sql = format!(
             r#"WITH latest AS (

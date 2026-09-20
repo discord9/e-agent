@@ -613,6 +613,12 @@ impl GreptimeSession {
     /// `json_get_object` + `json_to_string` can produce. `reasoning` is
     /// stripped from that rendering so reasoning stays out of the search
     /// surface, exactly like the JSONL/SQLite backends.
+    ///
+    /// The rendered object escapes argument quotes (`"` as `\"`), so a quoted
+    /// needle is also tested against its JSON-escaped form. Residual
+    /// divergence: a needle mixing quotes with backslashes or control
+    /// characters matches JSONL/SQLite but not this backend (pathological
+    /// needle, accepted).
     pub async fn query_history(&self, query: &HistoryQuery) -> Result<Vec<HistoryEntry>> {
         let text = r#"CASE json_get_string(TRY_CAST(payload AS BYTEA),'type')
  WHEN 'notice' THEN json_get_string(TRY_CAST(payload AS BYTEA),'text')
@@ -626,7 +632,9 @@ impl GreptimeSession {
                 &[&workspace, &session, &seq],
             ).await
         } else if let Some(session) = session {
-            let predicate = query.query.as_ref().map(|_| format!(" AND strpos({text},$3::string)>0")).unwrap_or_default();
+            // Plain needles miss nothing new; the escaped form recovers the
+            // argument quotes rendered by `json_to_string` in the projection.
+            let predicate = query.query.as_ref().map(|_| format!(" AND (strpos({text},$3::string)>0 OR strpos({text},replace($3::string,'\"','\\\"'))>0)")).unwrap_or_default();
             let sql = format!(r#"SELECT workspace_id,session_id,seq,event_time,payload FROM session_entries
 WHERE workspace_id=$1::string AND session_id=$2::string{predicate}
 AND ($3::string IS NULL OR $3::string IS NOT NULL)
@@ -636,7 +644,7 @@ ORDER BY event_time DESC,seq DESC LIMIT $6::bigint"#);
             let after_seq = query.after.as_ref().map(|entry| entry.2);
             self.client.query(&sql, &[&workspace.expect("session has workspace"), &session, &query.query.as_deref(), &after_time, &after_seq, &limit]).await
         } else {
-            let predicate = query.query.as_ref().map(|_| format!(" AND strpos({text},$2::string)>0")).unwrap_or_default();
+            let predicate = query.query.as_ref().map(|_| format!(" AND (strpos({text},$2::string)>0 OR strpos({text},replace($2::string,'\"','\\\"'))>0)")).unwrap_or_default();
             let sql = format!(r#"SELECT workspace_id,session_id,seq,event_time,payload FROM session_entries
 WHERE ($1::string IS NULL OR workspace_id=$1::string){predicate}
 AND ($2::string IS NULL OR $2::string IS NOT NULL)
@@ -4450,7 +4458,8 @@ mod tests {
         // container `json_get_object`+`json_to_string` can produce) with the
         // `reasoning` field stripped. The turn also carries text, so an
         // argument-only match proves the projection does not stop at the
-        // first non-empty segment.
+        // first non-empty segment. Quoted argument fragments match through
+        // the escaped-needle branch (`"` as `\"` in the rendered object).
         let tool_call = serde_json::to_string(&SessionEntry::Message {
             message: Message::Assistant(AssistantMessage {
                 content: Some("contentonlymarker".into()),
@@ -4459,7 +4468,7 @@ mod tests {
                     name: "write_file".into(),
                     arguments: r#"{"path":"/tmp/x","content":"toolneedle"}"#.into(),
                 }],
-                reasoning: Some("reasononly".into()),
+                reasoning: Some(r#"reasononly "quoted reasoning""#.into()),
             }),
         })
         .unwrap();
@@ -4534,6 +4543,30 @@ mod tests {
             vec![12],
             "argument-only fragment matches the turn that also has text; the Tool result with the same word does not"
         );
+        // The escaped-needle branch: real quotes must match the rendered
+        // (escaped) argument text the same way JSONL/SQLite do.
+        let quoted_argument = session
+            .query_history(&HistoryQuery {
+                workspace_id: Some(wid.clone()),
+                session_id: Some(sid.clone()),
+                query: Some(r#""path":"/tmp/x""#.into()),
+                after: None,
+                after_event_time: None,
+                offset: None,
+                exact_seq: None,
+                limit: 4,
+                default_search_window: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            quoted_argument
+                .iter()
+                .map(|entry| entry.seq)
+                .collect::<Vec<_>>(),
+            vec![12],
+            "quoted argument fragment matches through the escaped needle form"
+        );
         let content_only = session
             .query_history(&HistoryQuery {
                 workspace_id: Some(wid.clone()),
@@ -4573,6 +4606,26 @@ mod tests {
         assert!(
             reasoning.is_empty(),
             "stripped reasoning stays out of the search projection"
+        );
+        // Stripping happens before the needle tests, so a quoted reasoning
+        // fragment must not leak through the escaped-needle branch.
+        let quoted_reasoning = session
+            .query_history(&HistoryQuery {
+                workspace_id: Some(wid.clone()),
+                session_id: Some(sid.clone()),
+                query: Some(r#""quoted reasoning""#.into()),
+                after: None,
+                after_event_time: None,
+                offset: None,
+                exact_seq: None,
+                limit: 4,
+                default_search_window: false,
+            })
+            .await
+            .unwrap();
+        assert!(
+            quoted_reasoning.is_empty(),
+            "quoted reasoning stays out of the search projection"
         );
 
         let selected_bad = session
