@@ -179,8 +179,11 @@ struct ReloadableState {
     config: Option<Config>,
     /// ChatGPT auth, loaded when any resolved profile uses
     /// `auth = "chatgpt"`; re-loaded on reload when the new config needs
-    /// it. Kept here (not re-read per build) so chatgpt profiles keep
-    /// working exactly like they do at startup.
+    /// it. Kept here (not re-read per request) so chatgpt profiles keep
+    /// working exactly like they do at startup. A runtime resolution that
+    /// needs chatgpt auth while this is `None` (the process started before
+    /// `e-agent login` wrote the auth file) loads it from disk once and
+    /// caches it here — see [`lazy_chatgpt_auth`].
     auth: Option<CodexAuth>,
     /// Models re-resolved from `config` (main / subagent role / all routed
     /// roles). Pre-resolved at swap time so `build()` stays infallible on
@@ -312,7 +315,12 @@ impl SessionFactory {
                         .values()
                         .any(|value| value.auth == AuthMode::ChatGpt);
                 let auth = needs_chatgpt.then(CodexAuth::load).transpose()?;
-                let models = build_runtime_models(resolved, auth.as_ref(), &base_url, &model)?;
+                let models = build_runtime_models(
+                    resolved,
+                    AuthSource::Fixed(auth.as_ref()),
+                    &base_url,
+                    &model,
+                )?;
                 (Some(models), auth)
             }
             None => (None, None),
@@ -481,13 +489,21 @@ impl SessionFactory {
     /// `--base-url`/`--model` overrides the main model was built with and
     /// resolves against the CURRENT (possibly hot-reloaded) config. Errors
     /// when there is no config or the profile is unknown — the caller turns
-    /// that into a 400. The context window accompanies the concrete model so
-    /// a runtime switch updates both runner observations together.
+    /// that into a 400. A chatgpt-routed profile loads the login credentials
+    /// lazily on first use ([`AuthSource::Lazy`]), so a login that happened
+    /// after start works without a restart. The context window accompanies
+    /// the concrete model so a runtime switch updates both runner
+    /// observations together.
     pub fn resolve_profile(&self, profile: &str) -> anyhow::Result<(ConfiguredModel, Option<u64>)> {
-        let state = self.reloadable.read().unwrap();
-        let config = state
+        // Clone the config out of the state lock before building the model:
+        // the chatgpt branch may take the write half of the same lock to
+        // load (and cache) the login that arrived after start.
+        let config = self
+            .reloadable
+            .read()
+            .unwrap()
             .config
-            .as_ref()
+            .clone()
             .ok_or_else(|| anyhow!("no config file; cannot resolve model profile `{profile}`"))?;
         let resolved = config.resolve_profile(profile)?;
         // A `--model` override replaces the profile's wire model, so its
@@ -499,7 +515,7 @@ impl SessionFactory {
             .unwrap_or(resolved.context_window);
         let model = configured_model(
             resolved,
-            state.auth.as_ref(),
+            AuthSource::Lazy(&self.reloadable),
             self.base_url.clone(),
             self.model.clone(),
         )?;
@@ -1297,11 +1313,45 @@ pub fn read_skills_index(root: &Path, global_dir: Option<&Path>) -> anyhow::Resu
     Ok(Some(format!("## Skills\n\n{lines}")))
 }
 
+/// Where the ChatGPT credentials for a chatgpt-routed profile come from.
+#[derive(Clone, Copy)]
+enum AuthSource<'a> {
+    /// Startup and reload validation: the auth captured when the config was
+    /// resolved, all-or-nothing — a chatgpt profile without it is an error.
+    Fixed(Option<&'a CodexAuth>),
+    /// Runtime resolution (`/model` profile switches): the credentials
+    /// currently cached in the reloadable state, or a lazy
+    /// first-use load from disk, so a login that happened after start is
+    /// picked up without a restart or a config reload.
+    Lazy(&'a RwLock<ReloadableState>),
+}
+
+/// The ChatGPT credentials cached in the reloadable state, loading them from
+/// disk on first use when the process started without a login. `CodexAuth::load`
+/// is a pure disk read (no network, no rewrite), so a failure leaves the cache
+/// empty and the next resolution retries. Loaded once: the write lock is only
+/// taken while the cache is still empty, and re-checked under it so concurrent
+/// resolutions share one handle.
+fn lazy_chatgpt_auth(reloadable: &RwLock<ReloadableState>) -> anyhow::Result<CodexAuth> {
+    if let Some(auth) = reloadable.read().unwrap().auth.clone() {
+        return Ok(auth);
+    }
+    let mut state = reloadable.write().unwrap();
+    if let Some(auth) = state.auth.clone() {
+        return Ok(auth);
+    }
+    let auth = CodexAuth::load().map_err(|error| {
+        anyhow!("ChatGPT auth is not initialized ({error:#}); run `e-agent login`")
+    })?;
+    state.auth = Some(auth.clone());
+    Ok(auth)
+}
+
 /// Turn a resolved profile into a wire model, honoring `--base-url`/`--model`
 /// overrides for the main model.
 fn configured_model(
     resolved: ResolvedModel,
-    auth: Option<&CodexAuth>,
+    auth: AuthSource<'_>,
     base_url: Option<String>,
     model: Option<String>,
 ) -> anyhow::Result<ConfiguredModel> {
@@ -1323,10 +1373,15 @@ fn configured_model(
             Ok(cm)
         }
         AuthMode::ChatGpt => {
+            let auth = match auth {
+                AuthSource::Fixed(auth) => auth
+                    .cloned()
+                    .ok_or_else(|| anyhow!("ChatGPT auth was not initialized"))?,
+                AuthSource::Lazy(reloadable) => lazy_chatgpt_auth(reloadable)?,
+            };
             let mut cm = ConfiguredModel::codex(
                 CodexModel::new(
-                    auth.cloned()
-                        .ok_or_else(|| anyhow!("ChatGPT auth was not initialized"))?,
+                    auth,
                     model.unwrap_or(resolved.model),
                     resolved.reasoning_effort,
                 )?
@@ -1365,7 +1420,7 @@ fn resolved_profiles(config: &Config, profile: Option<&str>) -> anyhow::Result<P
 /// always see the same resolution rules).
 fn build_runtime_models(
     resolved: ProfilesResolved,
-    auth: Option<&CodexAuth>,
+    auth: AuthSource<'_>,
     base_url: &Option<String>,
     model: &Option<String>,
 ) -> anyhow::Result<RuntimeModels> {
@@ -1461,7 +1516,7 @@ fn apply_reloaded_config(
     } else {
         None
     };
-    match build_runtime_models(resolved, auth.as_ref(), base_url, model) {
+    match build_runtime_models(resolved, AuthSource::Fixed(auth.as_ref()), base_url, model) {
         Ok(models) => {
             state.config = Some(config);
             state.auth = auth;
@@ -2240,5 +2295,191 @@ fixer = "{role_profile}"
         let snapshot_resolver = plain.role_models_resolver();
         let (model, _) = snapshot_resolver("fixer").expect("snapshot fallback");
         assert_eq!(model.display_name(), "snapshot-model");
+    }
+
+    /// A chatgpt-routed config: one profile on the ChatGPT login plus extra
+    /// TOML (e.g. a `[roles]` block).
+    fn chatgpt_config(extra: &str) -> Config {
+        let source = format!(
+            r#"default = "cg/m1"
+[providers.cg]
+auth = "chatgpt"
+
+[models."cg/m1"]
+model = "m1"
+{extra}
+"#
+        );
+        toml::from_str(&source).expect("test config parses")
+    }
+
+    /// Write a decodable ChatGPT login exactly where `CodexAuth::load` looks
+    /// for it (`$XDG_CONFIG_HOME/e-agent/auth.json`).
+    fn write_auth_file(xdg: &std::path::Path) -> std::path::PathBuf {
+        let dir = xdg.join("e-agent");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("auth.json");
+        std::fs::write(
+            &path,
+            r#"{"tokens":{"id_token":"id","access_token":"access","refresh_token":"refresh","account_id":"account"},"last_refresh":"2024-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        path
+    }
+
+    /// Point the process-wide config/home lookup at a temp dir for the
+    /// duration of one test (serialized by `XDG_TEST_LOCK`), restoring both
+    /// previous values on drop.
+    struct XdgEnv {
+        xdg: std::path::PathBuf,
+        previous_xdg: Option<std::ffi::OsString>,
+        previous_home: Option<std::ffi::OsString>,
+    }
+
+    impl XdgEnv {
+        fn new(root: &std::path::Path) -> Self {
+            let xdg = root.join("xdg");
+            let home = root.join("home");
+            std::fs::create_dir_all(&xdg).unwrap();
+            std::fs::create_dir_all(&home).unwrap();
+            let previous_xdg = std::env::var_os("XDG_CONFIG_HOME");
+            let previous_home = std::env::var_os("HOME");
+            unsafe {
+                std::env::set_var("XDG_CONFIG_HOME", &xdg);
+                std::env::set_var("HOME", &home);
+            }
+            Self {
+                xdg,
+                previous_xdg,
+                previous_home,
+            }
+        }
+    }
+
+    impl Drop for XdgEnv {
+        fn drop(&mut self) {
+            restore_env("XDG_CONFIG_HOME", self.previous_xdg.take());
+            restore_env("HOME", self.previous_home.take());
+        }
+    }
+
+    fn restore_env(key: &str, previous: Option<std::ffi::OsString>) {
+        match previous {
+            Some(value) => unsafe { std::env::set_var(key, value) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
+    /// The `{:#}` error chain of a failing `resolve_profile`.
+    fn resolve_error(factory: &SessionFactory, profile: &str) -> String {
+        match factory.resolve_profile(profile) {
+            Ok(_) => panic!("expected `{profile}` to fail"),
+            Err(error) => format!("{error:#}"),
+        }
+    }
+
+    #[test]
+    fn lazy_load_after_login() {
+        let _guard = crate::roles::XDG_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let env = XdgEnv::new(temp.path());
+        let factory = SessionFactory::test_factory_with_config(
+            temp.path().to_path_buf(),
+            Some(chatgpt_config("")),
+        );
+
+        // No login yet: the runtime path reports it and points at the fix.
+        let error = resolve_error(&factory, "cg/m1");
+        assert!(error.contains("e-agent login"), "{error}");
+
+        // `e-agent login` in another process writes the file; the next
+        // resolution picks it up without a restart or a config reload.
+        write_auth_file(&env.xdg);
+        let (model, context_window) = factory.resolve_profile("cg/m1").unwrap();
+        assert_eq!(model.display_name(), "m1");
+        assert_eq!(context_window, None);
+        assert!(factory.reloadable.read().unwrap().auth.is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    // Test-only env isolation: the std Mutex guard is held across the awaits
+    // that join the resolution tasks (same pattern as delegate_tests).
+    #[allow(clippy::await_holding_lock)]
+    async fn lazy_load_concurrent() {
+        let _guard = crate::roles::XDG_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let env = XdgEnv::new(temp.path());
+        write_auth_file(&env.xdg);
+        let factory = SessionFactory::test_factory_with_config(
+            temp.path().to_path_buf(),
+            Some(chatgpt_config("")),
+        );
+
+        // Concurrent first-use resolutions must share one load without
+        // panicking or deadlocking on the reloadable lock.
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let factory = factory.clone();
+            tasks.push(tokio::spawn(async move {
+                factory.resolve_profile("cg/m1").map(|(model, _)| model)
+            }));
+        }
+        for task in tasks {
+            let model = task
+                .await
+                .expect("resolution task must not panic")
+                .expect("resolution must succeed after login");
+            assert_eq!(model.display_name(), "m1");
+        }
+        assert!(factory.reloadable.read().unwrap().auth.is_some());
+    }
+
+    #[test]
+    fn lazy_load_preserves_failed_error() {
+        let _guard = crate::roles::XDG_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let env = XdgEnv::new(temp.path());
+        let factory = SessionFactory::test_factory_with_config(
+            temp.path().to_path_buf(),
+            Some(chatgpt_config("")),
+        );
+
+        // No login: the actionable message names the fix.
+        let error = resolve_error(&factory, "cg/m1");
+        assert!(error.contains("ChatGPT auth is not initialized"), "{error}");
+        assert!(error.contains("e-agent login"), "{error}");
+
+        // A stored but undecodable login carries the underlying cause and is
+        // not cached: the next resolution retries the load (here it picks up
+        // the repaired file) without a restart.
+        let auth_file = write_auth_file(&env.xdg);
+        std::fs::write(&auth_file, "{not json").unwrap();
+        let error = resolve_error(&factory, "cg/m1");
+        assert!(error.contains("cannot decode"), "{error}");
+        assert!(factory.reloadable.read().unwrap().auth.is_none());
+
+        write_auth_file(&env.xdg);
+        let (model, _) = factory.resolve_profile("cg/m1").unwrap();
+        assert_eq!(model.display_name(), "m1");
+    }
+
+    #[test]
+    fn lazy_auth_is_cached_without_rereading_disk() {
+        let _guard = crate::roles::XDG_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let env = XdgEnv::new(temp.path());
+        let auth_file = write_auth_file(&env.xdg);
+        let factory = SessionFactory::test_factory_with_config(
+            temp.path().to_path_buf(),
+            Some(chatgpt_config("")),
+        );
+        assert!(factory.resolve_profile("cg/m1").is_ok());
+
+        // The credentials are cached: later resolutions neither re-read the
+        // file (deleted here) nor re-decode it (corrupt here).
+        std::fs::remove_file(&auth_file).unwrap();
+        assert!(factory.resolve_profile("cg/m1").is_ok());
+        std::fs::write(&auth_file, "{not json").unwrap();
+        assert!(factory.resolve_profile("cg/m1").is_ok());
     }
 }
