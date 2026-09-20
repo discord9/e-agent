@@ -538,8 +538,10 @@ is set to a non-whitespace value or when `[web_search]` sets `api_key_file` /
 With `provider = "searxng"`, it is registered from `base_url` alone — SearXNG
 needs no key, and setting `api_key_file` / `api_key_env` alongside it is a
 config error. SearXNG queries are `GET {base_url}/search?q=...&format=json`,
-and the `results` array (title/url/content) is returned as plain text. An
-unknown `provider` value is a config error. OpenCode's own Exa configuration
+and the `results` array (title/url/content) is returned as plain text. To stand
+up a local instance (uv + systemd `--user`), run
+`scripts/setup-searxng.sh`; it prints the config snippet above when done.
+An unknown `provider` value is a config error. OpenCode's own Exa configuration
 is not inherited. Configured local MCP servers may add their tools to the
 main agent separately.
 The three file tools use a capability-relative directory rooted at the
