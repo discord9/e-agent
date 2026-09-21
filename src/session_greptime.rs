@@ -601,79 +601,149 @@ impl GreptimeSession {
         dedup_raw_entries(&raw, session_id, workspace_id, "event_time").map_err(anyhow::Error::msg)
     }
 
-    /// Upper bound on the indexed tool-call scan in the projection. Parallel
-    /// tool calls in one turn are few; out-of-range indices render NULL and
-    /// vanish into `concat_ws`.
-    const TOOL_CALL_INDEX_LIMIT: usize = 8;
+    /// Upper bound on one candidate fetch; exact filtering can shorten a
+    /// page, so the loop keeps fetching until `limit` matches or the scan is
+    /// exhausted.
+    const HISTORY_CANDIDATE_PAGE: i64 = 64;
 
-    /// Direct physical-record history search. Greptime search intentionally
-    /// does not reconstruct latest seq winners: older matching versions remain
-    /// searchable. `TRY_CAST(... AS BYTEA)` keeps malformed payloads NULL.
-    ///
-    /// The projection is exactly the JSONL/SQLite search surface: user
-    /// content, assistant content, and each tool call's `name` + stored
-    /// `arguments` string. `json_get_string` cannot render the tool_calls
-    /// array (a container comes back NULL, verified against GreptimeDB
-    /// 1.2.0), so each call is read BY INDEX — the primitive that returns the
-    /// stored strings verbatim. Re-rendering the whole Assistant object
-    /// instead (`json_get_object` + `json_to_string`) doubles every `\` and
-    /// `\n` in `arguments`, breaking Windows paths and escaped newlines, and
-    /// exposes field names and call ids to the search. Reasoning and
-    /// tool-result content stay out, like the other backends, so neither
-    /// needle escaping nor a reasoning-stripping regexp is needed.
+    /// Direct physical-record history search (older matching versions stay
+    /// searchable). SQL narrows candidates to the JSON-escaped longest
+    /// non-empty needle line, or to any payload containing a literal `\u` or
+    /// `\/` — the alternate valid JSON encodings an external writer can use.
+    /// Rust then keeps only [`crate::tools::history::searchable_content`]
+    /// matches. Bounded candidate pages continue until `limit` matches:
+    /// session scope by `(event_time, seq)` keyset, session-less `offset`
+    /// counting exact matches, never candidates. Malformed payloads stay
+    /// unsearchable; the exact-seq read path keeps its decode error.
     pub async fn query_history(&self, query: &HistoryQuery) -> Result<Vec<HistoryEntry>> {
-        let payload = "TRY_CAST(payload AS BYTEA)";
-        let mut text = format!(
-            "CASE json_get_string({payload},'type') WHEN 'notice' THEN json_get_string({payload},'text') WHEN 'message' THEN concat_ws(chr(10),json_get_string({payload},'message.User.content'),json_get_string({payload},'message.Assistant.content')"
-        );
-        for index in 0..Self::TOOL_CALL_INDEX_LIMIT {
-            text.push_str(&format!(",json_get_string({payload},'message.Assistant.tool_calls[{index}].name'),json_get_string({payload},'message.Assistant.tool_calls[{index}].arguments')"));
-        }
-        text.push_str(") END");
         let workspace = query.workspace_id.as_deref();
         let session = query.session_id.as_deref();
         let limit = query.limit as i64;
-        let rows = if let (Some(workspace), Some(session), Some(seq)) = (workspace, session, query.exact_seq) {
-            self.client.query(
+        if let (Some(workspace), Some(session), Some(seq)) = (workspace, session, query.exact_seq) {
+            let rows = self.client.query(
                 "SELECT workspace_id,session_id,seq,event_time,payload FROM session_entries WHERE workspace_id=$1::string AND session_id=$2::string AND seq=$3::bigint ORDER BY event_time DESC LIMIT 1",
                 &[&workspace, &session, &seq],
-            ).await
-        } else if let Some(session) = session {
-            let predicate = query
-                .query
-                .as_ref()
-                .map(|_| format!(" AND strpos({text},$3::string)>0"))
-                .unwrap_or_default();
-            let sql = format!(r#"SELECT workspace_id,session_id,seq,event_time,payload FROM session_entries
-WHERE workspace_id=$1::string AND session_id=$2::string{predicate}
-AND ($3::string IS NULL OR $3::string IS NOT NULL)
-AND ($4::timestamp IS NULL OR event_time<$4::timestamp OR (event_time=$4::timestamp AND seq<$5::bigint))
-ORDER BY event_time DESC,seq DESC LIMIT $6::bigint"#);
-            let after_time = query.after_event_time;
-            let after_seq = query.after.as_ref().map(|entry| entry.2);
-            self.client.query(&sql, &[&workspace.expect("session has workspace"), &session, &query.query.as_deref(), &after_time, &after_seq, &limit]).await
+            ).await.context("cannot query session history")?;
+            return rows.iter().map(decode_history_row).collect();
+        }
+        let needle = query.query.as_deref();
+        // One fixed candidate: the JSON-escaped longest non-empty needle line
+        // occurs in every canonically written exact match's raw payload, even
+        // when a real newline joins two fields (each side keeps its own line).
+        // The escaped needle misses rows whose writer chose `\uXXXX` or an
+        // escaped `\/`, so those fixed patterns widen the candidate set; the
+        // extra rows are false positives Rust removes. An all-newline needle
+        // has no line, stays a full scan, and Rust decides exactly.
+        let candidate = needle.map(|needle| {
+            let longest = needle
+                .split('\n')
+                .filter(|line| !line.is_empty())
+                .max_by_key(|line| line.len())
+                .unwrap_or("");
+            let escaped = serde_json::to_string(longest).expect("a string always serializes");
+            escaped[1..escaped.len() - 1].to_owned()
+        });
+        // Search candidates stay bounded (Rust filters them); a plain list
+        // keeps its single fetch.
+        let page = if needle.is_some() {
+            Self::HISTORY_CANDIDATE_PAGE
         } else {
-            let predicate = query
-                .query
-                .as_ref()
-                .map(|_| format!(" AND strpos({text},$2::string)>0"))
-                .unwrap_or_default();
-            let sql = format!(r#"SELECT workspace_id,session_id,seq,event_time,payload FROM session_entries
-WHERE ($1::string IS NULL OR workspace_id=$1::string){predicate}
-AND ($2::string IS NULL OR $2::string IS NOT NULL)
-ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#);
-            let offset = query.offset.unwrap_or(0);
-            self.client.query(&sql, &[&workspace, &query.query.as_deref(), &limit, &offset]).await
-        }.context("cannot query session history")?;
-        rows.into_iter().map(|row| {
-            let workspace_id: String = row.get("workspace_id");
-            let session_id: String = row.get("session_id");
-            let seq: i64 = row.get("seq");
-            let event_time: chrono::NaiveDateTime = row.get("event_time");
-            let payload: String = row.get("payload");
-            let entry = serde_json::from_str(&payload).map_err(|error| anyhow::anyhow!("cannot decode session {session_id} (seq {seq} event_time {event_time}): {error}"))?;
-            Ok(HistoryEntry { workspace_id, session_id, seq, event_time: Some(event_time), entry })
-        }).collect()
+            limit.max(1)
+        };
+        // Session-less paging: a list keeps `offset` as SQL OFFSET (every row
+        // is a result); a search walks candidates from the start and drops the
+        // first `skip` EXACT matches, because the caller counts results.
+        let offset = if session.is_none() && needle.is_none() {
+            query.offset.unwrap_or(0).max(0)
+        } else {
+            0
+        };
+        let skip = if session.is_none() && needle.is_some() {
+            query.offset.unwrap_or(0).max(0)
+        } else {
+            0
+        };
+        // The needle placeholder is `$3` in the session branch, `$2` without.
+        let needle_at = if session.is_some() {
+            "$3::string"
+        } else {
+            "$2::string"
+        };
+        let predicate = if candidate.is_some() {
+            format!(
+                " AND (strpos(payload,{needle_at})>0 OR strpos(payload,chr(92)||'u')>0 OR strpos(payload,chr(92)||'/')>0)"
+            )
+        } else {
+            String::new()
+        };
+        let sql = if session.is_some() {
+            format!(
+                r#"SELECT workspace_id,session_id,seq,event_time,payload FROM session_entries
+WHERE workspace_id=$1::string AND session_id=$2::string AND ($3::string IS NULL OR $3::string IS NOT NULL){predicate}
+AND ($4::timestamp(9) IS NULL OR event_time<$4::timestamp(9) OR (event_time=$4::timestamp(9) AND seq<$5::bigint))
+ORDER BY event_time DESC,seq DESC LIMIT $6::bigint"#
+            )
+        } else {
+            format!(
+                r#"SELECT workspace_id,session_id,seq,event_time,payload FROM session_entries
+WHERE ($1::string IS NULL OR workspace_id=$1::string) AND ($2::string IS NULL OR $2::string IS NOT NULL){predicate}
+ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
+            )
+        };
+        let mut out = Vec::new();
+        let mut consumed = offset;
+        let mut dropped = 0i64;
+        let mut after_time = query.after_event_time;
+        let mut after_seq = query.after.as_ref().map(|entry| entry.2);
+        loop {
+            let rows = if let Some(session) = session {
+                let workspace = workspace.expect("session has workspace");
+                let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
+                    &workspace,
+                    &session,
+                    &candidate.as_deref(),
+                    &after_time,
+                    &after_seq,
+                    &page,
+                ];
+                self.client.query(&sql, params).await
+            } else {
+                let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] =
+                    &[&workspace, &candidate.as_deref(), &page, &consumed];
+                self.client.query(&sql, params).await
+            }
+            .context("cannot query session history")?;
+            let fetched = rows.len() as i64;
+            if session.is_some()
+                && let Some(last) = rows.last()
+            {
+                // Continue strictly after the last candidate row, so a page
+                // that filtering made short still reaches the next one.
+                after_time = Some(last.get("event_time"));
+                after_seq = Some(last.get("seq"));
+            }
+            consumed += fetched;
+            for row in rows {
+                if out.len() as i64 >= limit {
+                    break;
+                }
+                if let Some(needle) = needle {
+                    let payload: String = row.get("payload");
+                    if !history_payload_matches(&payload, needle) {
+                        continue;
+                    }
+                }
+                if dropped < skip {
+                    dropped += 1;
+                    continue;
+                }
+                out.push(decode_history_row(&row)?);
+            }
+            if fetched < page || out.len() as i64 >= limit {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// Page transcript identities, including transcripts without metadata.
@@ -2847,6 +2917,38 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#);
     }
 }
 
+/// Decode one candidate payload and keep it only when the exact search
+/// surface (the projection every backend shares) contains the needle.
+/// Undecodable payloads are unsearchable, exactly like the other backends.
+fn history_payload_matches(payload: &str, needle: &str) -> bool {
+    serde_json::from_str::<SessionEntry>(payload)
+        .ok()
+        .and_then(|entry| crate::tools::history::searchable_content(&entry))
+        .is_some_and(|text| text.contains(needle))
+}
+
+/// Decode one selected physical row; the error text is the read path's
+/// unchanged failure surface.
+fn decode_history_row(row: &tokio_postgres::Row) -> Result<HistoryEntry> {
+    let workspace_id: String = row.get("workspace_id");
+    let session_id: String = row.get("session_id");
+    let seq: i64 = row.get("seq");
+    let event_time: chrono::NaiveDateTime = row.get("event_time");
+    let payload: String = row.get("payload");
+    let entry = serde_json::from_str(&payload).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot decode session {session_id} (seq {seq} event_time {event_time}): {error}"
+        )
+    })?;
+    Ok(HistoryEntry {
+        workspace_id,
+        session_id,
+        seq,
+        event_time: Some(event_time),
+        entry,
+    })
+}
+
 /// The `WHERE` fragment for the sidebar's `?exclude=archived_children` set,
 /// appended after the latest-snapshot subquery in
 /// [`GreptimeSession::list_meta_diagnostic`]. Keeps pinned sessions,
@@ -4802,6 +4904,487 @@ mod tests {
             .await
             .unwrap_err();
         assert!(selected_bad.to_string().contains("cannot decode"));
+    }
+
+    /// Regression for the broad-candidate / exact-filter search: the SQL side
+    /// is only a superset (JSON-escaped needle lines against the raw payload),
+    /// so the Rust pass must reproduce the shared `searchable_content` surface
+    /// exactly — a raw-payload match in reasoning, a call id, a tool result, a
+    /// system/compaction/background entry or a field name is not a result —
+    /// while argument and name matches beyond the former 8-index projection
+    /// still are, and a full candidate page of false positives never hides an
+    /// older real hit.
+    #[tokio::test]
+    async fn history_search_filters_broad_candidates_exactly() {
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let prep = |entries: &[SessionEntry]| {
+            entries
+                .iter()
+                .enumerate()
+                .map(|(seq, entry)| {
+                    (
+                        seq as i64,
+                        us_to_datetime(next_event_time_us()),
+                        entry_kind(entry).to_string(),
+                        serde_json::to_string(entry).unwrap(),
+                        is_error(entry),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        async fn search(
+            session: &GreptimeSession,
+            wid: &str,
+            sid: &str,
+            query: &str,
+            limit: usize,
+        ) -> Vec<i64> {
+            session
+                .query_history(&HistoryQuery {
+                    workspace_id: Some(wid.to_owned()),
+                    session_id: Some(sid.to_owned()),
+                    query: Some(query.to_owned()),
+                    after: None,
+                    after_event_time: None,
+                    offset: None,
+                    exact_seq: None,
+                    limit,
+                    default_search_window: false,
+                })
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.seq)
+                .collect()
+        }
+
+        // ---- The exact surface with the matches at tool-call index 9 and
+        // index 19 out of 20 calls (the former projection stopped at index 7):
+        // 0  assistant, call 9 arguments (escaped path + literal \n + marker)
+        //    and call 19 name carry the only real matches
+        // 1  tool result  — raw candidate, never searchable
+        // 2  assistant    — marker only in reasoning and in the call id
+        // 3  system       — system content is not searchable
+        // 4  compaction   — summaries are not searchable
+        // 5  background   — completions are not searchable
+        // 6  user         — real match
+        // 7  notice       — real match
+        let marker = format!("exact-{}", crate::session::new_id());
+        let name_marker = format!("name-{}", crate::session::new_id());
+        let cross = format!("cross-{}", crate::session::new_id());
+        let escaped = r#"C:\\tmp\\dir"#;
+        let escaped_needle = format!(r#""path":"{escaped}""#);
+        let verbatim_needle = r#"line1\nline2"#;
+        let calls = (0..20)
+            .map(|index| crate::agent::ToolCall {
+                id: format!("call-{index}"),
+                name: if index == 19 {
+                    format!("tool-{name_marker}")
+                } else {
+                    format!("tool-{index}")
+                },
+                arguments: if index == 9 {
+                    format!(
+                        r#"{{"path":"{escaped}","content":"line1\nline2","payload":"{marker}"}}"#
+                    )
+                } else {
+                    format!(r#"{{"command":"echo {index}"}}"#)
+                },
+            })
+            .collect::<Vec<_>>();
+        let entries = vec![
+            SessionEntry::Message {
+                message: Message::Assistant(AssistantMessage {
+                    content: Some("plain".into()),
+                    tool_calls: calls,
+                    reasoning: None,
+                }),
+            },
+            SessionEntry::Message {
+                message: Message::Tool {
+                    call_id: "call-x".into(),
+                    name: "bash".into(),
+                    content: format!("{marker} {name_marker} {escaped_needle} {verbatim_needle}"),
+                    is_error: false,
+                    synthetic: false,
+                    images: vec![],
+                },
+            },
+            SessionEntry::Message {
+                message: Message::Assistant(AssistantMessage {
+                    content: Some("unrelated".into()),
+                    tool_calls: vec![crate::agent::ToolCall {
+                        id: format!("call-{marker}"),
+                        name: "bash".into(),
+                        arguments: r#"{"command":"echo hi"}"#.into(),
+                    }],
+                    reasoning: Some(format!("{marker} {name_marker}")),
+                }),
+            },
+            SessionEntry::Message {
+                message: Message::System {
+                    content: format!("{marker} {name_marker}"),
+                },
+            },
+            SessionEntry::Compaction {
+                summary: format!("{marker} {name_marker}"),
+                retained: vec![],
+                current_prompt_at: None,
+                no_current_prompt: false,
+            },
+            SessionEntry::BackgroundCompletion {
+                id: 7,
+                output: format!("{marker} {name_marker}"),
+                label: None,
+                started_at_ms: None,
+                duration_ms: None,
+                exit_code: None,
+                signal: None,
+                status: None,
+                kind: None,
+                cancellation_source: None,
+            },
+            SessionEntry::Message {
+                message: Message::User {
+                    content: marker.clone(),
+                    images: vec![],
+                },
+            },
+            SessionEntry::Notice {
+                text: marker.clone(),
+            },
+            // 8: the only match for the cross-field needle below is the
+            // newline JOIN between this turn's content and its call name —
+            // the raw payload never holds that needle contiguously.
+            SessionEntry::Message {
+                message: Message::Assistant(AssistantMessage {
+                    content: Some(format!("alpha-{cross}")),
+                    tool_calls: vec![crate::agent::ToolCall {
+                        id: "call-cross".into(),
+                        name: format!("beta-{cross}"),
+                        arguments: "{}".into(),
+                    }],
+                    reasoning: None,
+                }),
+            },
+        ];
+        let sid = format!("test-gt-history-exact-{}", crate::session::new_id());
+        let session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        session.insert_prepped(&prep(&entries)).await.unwrap();
+
+        assert_eq!(
+            search(&session, &wid, &sid, &marker, 10).await,
+            vec![7, 6, 0],
+            "only notice text, user content and the index-9 call argument match"
+        );
+        assert_eq!(
+            search(&session, &wid, &sid, &name_marker, 10).await,
+            vec![0],
+            "the index-19 call name stays searchable while reasoning and ids do not"
+        );
+        assert_eq!(
+            search(&session, &wid, &sid, &escaped_needle, 10).await,
+            vec![0],
+            "the escaped argument text matches verbatim at a high call index"
+        );
+        assert_eq!(
+            search(&session, &wid, &sid, verbatim_needle, 10).await,
+            vec![0],
+            "a literal \\n in the stored argument string matches verbatim"
+        );
+        // A real newline needle that only matches across the content + call
+        // name boundary: its two lines live in different payload fields, so
+        // the candidate predicate must keep both of them searchable.
+        assert_eq!(
+            search(
+                &session,
+                &wid,
+                &sid,
+                &format!("alpha-{cross}\nbeta-{cross}"),
+                10
+            )
+            .await,
+            vec![8],
+            "a needle joining content and tool name across the newline still matches"
+        );
+
+        // ---- A malformed payload whose raw text contains the needle is a
+        // candidate but never a result: the search stays an empty result, not
+        // a decode failure (the exact-seq read path below keeps that error).
+        let malformed_marker = format!("malformed-{}", crate::session::new_id());
+        session
+            .client
+            .execute(
+                "INSERT INTO session_entries (workspace_id,session_id,seq,event_time,entry_kind,payload,schema_version,is_error) VALUES ($1,$2,99,$3,'message',$4,1,false)",
+                &[&wid, &sid, &us_to_datetime(next_event_time_us()), &format!(r#"{{"type":"message","message":{{"User":{{"content":"{malformed_marker}"#)],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            search(&session, &wid, &sid, &malformed_marker, 10).await,
+            Vec::<i64>::new(),
+            "a malformed payload is unsearchable, never a failed search"
+        );
+
+        // ---- Alternate valid JSON encodings an external writer can produce:
+        // the canonical needle misses `\uXXXX` and an escaped `\/`, so the
+        // fixed `\u` / `\/` patterns keep those raw rows as candidates and
+        // Rust still decides exactly. A row holding literal `\u` text is one
+        // such candidate but never a match for an unrelated decoded needle.
+        let ext_unicode = format!("extuni-{}", crate::session::new_id());
+        let ext_slash = format!("extslash-{}", crate::session::new_id());
+        let ext_ctrl = format!("extctrl-{}", crate::session::new_id());
+        let lit_backslash = format!("lit-{}", crate::session::new_id());
+        for (seq, payload) in [
+            (
+                200i64,
+                format!(
+                    r#"{{"type":"message","message":{{"User":{{"content":"\u4f60\u597d-{ext_unicode}"}}}}}}"#
+                ),
+            ),
+            (
+                201,
+                format!(
+                    r#"{{"type":"message","message":{{"User":{{"content":"{ext_slash}\/file"}}}}}}"#
+                ),
+            ),
+            (
+                202,
+                format!(
+                    r#"{{"type":"message","message":{{"User":{{"content":"{ext_ctrl}A\u000aB"}}}}}}"#
+                ),
+            ),
+            (
+                203,
+                format!(
+                    r#"{{"type":"message","message":{{"User":{{"content":"\\u0061-{lit_backslash}"}}}}}}"#
+                ),
+            ),
+        ] {
+            session
+                .client
+                .execute(
+                    "INSERT INTO session_entries (workspace_id,session_id,seq,event_time,entry_kind,payload,schema_version,is_error) VALUES ($1,$2,$3,$4,'message',$5,1,false)",
+                    &[
+                        &wid,
+                        &sid,
+                        &seq,
+                        &us_to_datetime(next_event_time_us()),
+                        &payload,
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            search(&session, &wid, &sid, &format!("你好-{ext_unicode}"), 10).await,
+            vec![200],
+            "a \\uXXXX-escaped external payload stays searchable"
+        );
+        assert_eq!(
+            search(&session, &wid, &sid, &format!("{ext_slash}/file"), 10).await,
+            vec![201],
+            "an escaped-solidus external payload stays searchable"
+        );
+        assert_eq!(
+            search(&session, &wid, &sid, &format!("{ext_ctrl}A\nB"), 10).await,
+            vec![202],
+            "a \\u000a-escaped control char stays searchable"
+        );
+        // Seq 203 is a candidate for the needle above (its raw text holds
+        // `\\u`) yet is not an exact match; its literal text stays
+        // searchable as text.
+        assert_eq!(
+            search(
+                &session,
+                &wid,
+                &sid,
+                &format!(r"\u0061-{lit_backslash}"),
+                10
+            )
+            .await,
+            vec![203],
+            "literal backslash-u text is searchable as text, not as an escape"
+        );
+
+        // ---- A full candidate page of false positives must not end the
+        // scan: the only real hit is older than 70 reasoning-only candidates,
+        // so one bounded fetch (page = 64) would come back empty.
+        let page_marker = format!("page-{}", crate::session::new_id());
+        let paging_sid = format!("test-gt-history-page-{}", crate::session::new_id());
+        let paging = GreptimeSession::connect(&conn, &wid, &paging_sid)
+            .await
+            .unwrap();
+        let mut paging_entries = vec![SessionEntry::Message {
+            message: Message::User {
+                content: page_marker.clone(),
+                images: vec![],
+            },
+        }];
+        for _ in 0..70 {
+            paging_entries.push(SessionEntry::Message {
+                message: Message::Assistant(AssistantMessage {
+                    content: Some("unrelated".into()),
+                    tool_calls: vec![],
+                    reasoning: Some(page_marker.clone()),
+                }),
+            });
+        }
+        paging.insert_prepped(&prep(&paging_entries)).await.unwrap();
+        assert_eq!(
+            search(&paging, &wid, &paging_sid, &page_marker, 64).await,
+            vec![0],
+            "70 newer candidate-only rows must not hide the older real hit"
+        );
+    }
+
+    /// The `history` tool's cursor contract over Greptime: both the session
+    /// keyset cursor and the session-less exact-match offset must walk
+    /// interleaved false-positive candidates without skipping or repeating a
+    /// real match, and must terminate with a null cursor.
+    #[tokio::test]
+    async fn history_search_cursor_pages_exact_matches_in_both_scopes() {
+        use crate::config::SessionBackend;
+        use crate::session_store::SessionStore;
+
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let root = Path::new("/tmp/e-agent-test");
+        let sid = format!("test-gt-history-cursor-{}", crate::session::new_id());
+        let store =
+            SessionStore::connect(&SessionBackend::Greptime { conn: conn.clone() }, root, &sid)
+                .await
+                .unwrap();
+        let marker = format!("cursor-{}", crate::session::new_id());
+        let real = |seq: i64| SessionEntry::Message {
+            message: Message::User {
+                content: format!("{marker} {seq}"),
+                images: vec![],
+            },
+        };
+        let fake = SessionEntry::Message {
+            message: Message::Assistant(AssistantMessage {
+                content: Some("unrelated".into()),
+                tool_calls: vec![],
+                reasoning: Some(marker.clone()),
+            }),
+        };
+        // Exact matches, newest first: seq 5, 3, 1 — every gap is a candidate
+        // that fails the exact filter.
+        let entries = vec![
+            fake.clone(),
+            real(1),
+            fake.clone(),
+            real(3),
+            fake.clone(),
+            real(5),
+        ];
+        store.append(root, &sid, &entries).await.unwrap();
+        for scope in ["session", "workspace", "global"] {
+            let mut found = Vec::new();
+            let mut cursor: Option<String> = None;
+            for _ in 0..6 {
+                let mut args = serde_json::json!({
+                    "action": "search",
+                    "query": marker,
+                    "limit": 2,
+                    "scope": scope,
+                });
+                // `session` scope needs an explicit id; `workspace` scope
+                // rejects one.
+                if scope == "session" {
+                    args["session_id"] = serde_json::json!(sid.as_str());
+                }
+                if let Some(cursor) = cursor.take() {
+                    args["cursor"] = serde_json::json!(cursor);
+                }
+                let value: serde_json::Value = serde_json::from_str(
+                    &crate::tools::history::execute(&store, root, &sid, &args)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                for item in value["entries"].as_array().unwrap() {
+                    found.push(item["seq"].as_i64().unwrap());
+                }
+                assert!(
+                    !value["next_cursor"].is_null() || found.len() == 3,
+                    "{scope} scope: paging stopped before every exact match"
+                );
+                if value["next_cursor"].is_null() {
+                    break;
+                }
+                cursor = Some(value["next_cursor"].as_str().unwrap().to_owned());
+            }
+            assert_eq!(
+                found,
+                vec![5, 3, 1],
+                "{scope} cursor paging must return each exact match exactly once"
+            );
+            assert!(
+                cursor.is_none(),
+                "{scope} scope: a terminal page must not hand out another cursor"
+            );
+        }
+
+        // A plain session-less list keeps its historical SQL OFFSET paging.
+        // A dedicated workspace keeps the assertion independent of other
+        // tests sharing `/tmp/e-agent-test`.
+        let list_root = std::path::PathBuf::from(format!(
+            "/tmp/e-agent-test-list-{}",
+            crate::session::new_id()
+        ));
+        let list_sid = format!("test-gt-history-list-{}", crate::session::new_id());
+        let list_store = SessionStore::connect(
+            &SessionBackend::Greptime { conn: conn.clone() },
+            &list_root,
+            &list_sid,
+        )
+        .await
+        .unwrap();
+        let listed_entries = (1..=6).map(real).collect::<Vec<_>>();
+        list_store
+            .append(&list_root, &list_sid, &listed_entries)
+            .await
+            .unwrap();
+        let mut listed = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..6 {
+            let mut args = serde_json::json!({
+                "action": "list",
+                "limit": 2,
+                "scope": "workspace",
+            });
+            if let Some(cursor) = cursor.take() {
+                args["cursor"] = serde_json::json!(cursor);
+            }
+            let value: serde_json::Value = serde_json::from_str(
+                &crate::tools::history::execute(&list_store, &list_root, &list_sid, &args)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            for item in value["entries"].as_array().unwrap() {
+                listed.push(item["seq"].as_i64().unwrap());
+            }
+            if value["next_cursor"].is_null() {
+                break;
+            }
+            cursor = Some(value["next_cursor"].as_str().unwrap().to_owned());
+        }
+        assert_eq!(
+            listed,
+            vec![5, 4, 3, 2, 1, 0],
+            "session-less list paging must walk every row exactly once"
+        );
     }
 
     #[tokio::test]

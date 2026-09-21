@@ -384,7 +384,7 @@ fn ordered_entries(entries: &[(i64, SessionEntry)]) -> Vec<(i64, &SessionEntry)>
 /// Searchable text projection: User content, Assistant content plus every
 /// tool call's name and raw argument string, and Notice text. Tool result
 /// content and reasoning stay out.
-fn searchable_content(entry: &SessionEntry) -> Option<String> {
+pub(crate) fn searchable_content(entry: &SessionEntry) -> Option<String> {
     match entry {
         SessionEntry::Message {
             message: Message::User { content, .. },
