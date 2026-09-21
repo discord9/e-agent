@@ -72,6 +72,19 @@ request field with no CLI or environment override. For Kimi Coding `k3`, its
 canonical values are `low`, `high`, and `max`; omitting it uses Kimi Coding's
 `high` default. Other providers may define different values.
 
+Omitting both `api_key_file` and `api_key_env` configures an unauthenticated
+local provider (vLLM, Ollama, llama.cpp, ...). Requests to it omit the
+`Authorization` header entirely; a provider whose configured key file or
+environment variable trims to empty is still rejected. The minimal setup is:
+
+```toml
+[providers.local]
+base_url = "http://127.0.0.1:8000/v1"
+
+[models."local/qwen"]
+model = "qwen3-local"
+```
+
 DeepSeek Chat thinking mode has a wire contract of its own. `deepseek_compat`
 defaults to **false**, so every profile that does not set it — OpenAI, Kimi,
 any other OpenAI-compatible provider, and the Codex Responses wire — keeps
