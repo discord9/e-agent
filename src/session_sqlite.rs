@@ -686,6 +686,11 @@ impl SqliteSession {
         // array and `json_extract` decodes each element's `name` and
         // `arguments` JSON strings (unescaping them), matching the raw strings
         // the JSONL backend searches instead of the array's escaped JSON text.
+        // The `char(10)` prefixed to the tool-call segment mirrors the
+        // authoritative `history::searchable_content` newline layout
+        // (content + newline + name + newline + arguments), so content `foo`
+        // plus name `bar` cannot match `foobar` while `foo\nbar` does, and a
+        // contentless tool call keeps its leading newline.
         //
         // Three turso quirks shape this projection (all verified against
         // turso 0.7.2; stock SQLite needs neither):
@@ -708,7 +713,7 @@ impl SqliteSession {
  WHEN 'message' THEN concat(
   CASE WHEN json_type(wr.payload,'$.message.User.content')='text' THEN json_extract(wr.payload,'$.message.User.content') END,
   CASE WHEN json_type(wr.payload,'$.message.Assistant.content')='text' THEN json_extract(wr.payload,'$.message.Assistant.content') END,
-  (SELECT group_concat(CASE WHEN json_valid(value) THEN COALESCE(json_extract(value,'$.name'),'')||char(10)||COALESCE(json_extract(value,'$.arguments'),'') ELSE '' END, char(10)) FROM json_each(CASE WHEN json_valid(wr.payload) THEN CASE WHEN json_type(wr.payload,'$.message.Assistant.tool_calls')='array' THEN json_extract(wr.payload,'$.message.Assistant.tool_calls') ELSE '[]' END ELSE '[]' END)))
+  char(10)||(SELECT group_concat(CASE WHEN json_valid(value) THEN COALESCE(json_extract(value,'$.name'),'')||char(10)||COALESCE(json_extract(value,'$.arguments'),'') ELSE '' END, char(10)) FROM json_each(CASE WHEN json_valid(wr.payload) THEN CASE WHEN json_type(wr.payload,'$.message.Assistant.tool_calls')='array' THEN json_extract(wr.payload,'$.message.Assistant.tool_calls') ELSE '[]' END ELSE '[]' END)))
  WHEN 'notice' THEN CASE WHEN json_type(wr.payload,'$.text')='text' THEN json_extract(wr.payload,'$.text') END END END"#;
         let predicate = query
             .query

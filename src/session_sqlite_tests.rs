@@ -885,6 +885,110 @@ async fn history_query_search_is_literal_and_ignores_unselected_bad_json() {
     );
 }
 
+/// The search projection must join the assistant text and the first tool
+/// call with a newline, exactly like `history::searchable_content`
+/// (content + newline + name + newline + arguments). Content `foo` plus tool
+/// name `bar` therefore matches `foo\nbar` and must never match the glued
+/// `foobar`. A contentless tool call keeps its leading newline followed by
+/// name and raw arguments searchable.
+#[tokio::test]
+async fn history_query_separates_assistant_content_from_tool_call_name() {
+    async fn seqs(session: &SqliteSession, query: &str) -> Vec<i64> {
+        session
+            .query_history(&HistoryQuery {
+                workspace_id: Some(session.workspace_id.clone()),
+                session_id: Some(session.session_id.clone()),
+                query: Some(query.to_owned()),
+                after: None,
+                after_event_time: None,
+                offset: None,
+                exact_seq: None,
+                limit: 4,
+                default_search_window: false,
+            })
+            .await
+            .unwrap()
+            .iter()
+            .map(|entry| entry.seq)
+            .collect()
+    }
+    let (_dir, session, _sid) = fresh_session().await;
+    session
+        .append(&[
+            Message::Assistant(AssistantMessage {
+                content: Some("foo".into()),
+                tool_calls: vec![crate::agent::ToolCall {
+                    id: "call_bar".into(),
+                    name: "bar".into(),
+                    arguments: r#"{"path":"barargs"}"#.into(),
+                }],
+                reasoning: None,
+            })
+            .into(),
+            Message::Assistant(AssistantMessage {
+                content: None,
+                tool_calls: vec![crate::agent::ToolCall {
+                    id: "call_baz".into(),
+                    name: "baz".into(),
+                    arguments: r#"{"path":"bazargs"}"#.into(),
+                }],
+                reasoning: None,
+            })
+            .into(),
+        ])
+        .await
+        .unwrap();
+    assert!(
+        seqs(&session, "foobar").await.is_empty(),
+        "content and the first tool name must not be glued together without a separator"
+    );
+    assert_eq!(
+        seqs(&session, "foo\nbar").await,
+        vec![0],
+        "content and the first tool name must be newline-separated"
+    );
+    assert_eq!(
+        seqs(&session, "bar\n{\"path\"").await,
+        vec![0],
+        "the tool name and its raw arguments must be newline-separated"
+    );
+    assert_eq!(
+        seqs(&session, "foo\nbar\n{\"path\":\"barargs\"}").await,
+        vec![0],
+        "the projection is content + newline + name + newline + arguments"
+    );
+    assert_eq!(
+        seqs(&session, "foo").await,
+        vec![0],
+        "the turn's content stays searchable on its own"
+    );
+    assert_eq!(
+        seqs(&session, "bar").await,
+        vec![0],
+        "the turn's tool name stays searchable on its own"
+    );
+    assert_eq!(
+        seqs(&session, "baz").await,
+        vec![1],
+        "a contentless tool call stays searchable by name"
+    );
+    assert_eq!(
+        seqs(&session, "bazargs").await,
+        vec![1],
+        "a contentless tool call stays searchable by raw arguments"
+    );
+    assert_eq!(
+        seqs(&session, "\nbaz").await,
+        vec![1],
+        "a contentless tool call keeps the leading newline of its projection"
+    );
+    assert_eq!(
+        seqs(&session, "\nbaz\n{\"path\":\"bazargs\"}").await,
+        vec![1],
+        "the contentless projection is newline + name + newline + arguments"
+    );
+}
+
 #[tokio::test]
 async fn retry_different_payload_rejected_as_conflict() {
     let (_dir, session, _sid) = fresh_session().await;
