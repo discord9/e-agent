@@ -775,13 +775,16 @@ impl Config {
             .filter(|url| !url.is_empty())
             .ok_or_else(|| anyhow!("provider `{provider_name}` requires `base_url`"))?
             .to_owned();
+        // Neither key field means an unauthenticated local provider (vLLM,
+        // Ollama, llama.cpp): the key stays empty and the chat wire omits the
+        // Authorization header. A configured-but-empty credential is still an
+        // error.
+        let configured = provider.api_key_file.is_some() || provider.api_key_env.is_some();
         let api_key = match (&provider.api_key_file, &provider.api_key_env) {
             (Some(_), Some(_)) => bail!(
                 "provider `{provider_name}` must set exactly one of `api_key_file` or `api_key_env`"
             ),
-            (None, None) => bail!(
-                "provider `{provider_name}` requires exactly one of `api_key_file` or `api_key_env`"
-            ),
+            (None, None) => String::new(),
             (Some(file), None) => self.read_key_file(provider_name, file)?,
             (None, Some(variable)) => std::env::var(variable)
                 .with_context(|| {
@@ -790,7 +793,7 @@ impl Config {
                 .trim()
                 .to_owned(),
         };
-        if api_key.is_empty() {
+        if configured && api_key.is_empty() {
             bail!("credential for provider `{provider_name}` is empty");
         }
         Ok(ResolvedModel {

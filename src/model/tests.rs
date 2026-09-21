@@ -138,7 +138,11 @@ fn omits_thinking_switch_when_disabled_or_without_effort() {
     assert!(no_effort.get("thinking").is_none());
 }
 
-async fn read_request(stream: &mut TcpStream) -> serde_json::Value {
+/// Read one HTTP request, returning the raw header block (request line plus
+/// headers, blank-line terminated) alongside the decoded JSON body. Header
+/// assertions (e.g. whether `Authorization` was sent) read the first element;
+/// existing wire tests keep using `read_request`, which drops it.
+async fn read_request_with_headers(stream: &mut TcpStream) -> (String, serde_json::Value) {
     let mut bytes = Vec::new();
     let header_end = loop {
         let mut chunk = [0; 1024];
@@ -150,7 +154,9 @@ async fn read_request(stream: &mut TcpStream) -> serde_json::Value {
             break end + 4;
         }
     };
-    let headers = std::str::from_utf8(&bytes[..header_end]).unwrap();
+    let headers = std::str::from_utf8(&bytes[..header_end])
+        .unwrap()
+        .to_owned();
     let content_length = headers
         .split("\r\n")
         .skip(1)
@@ -167,7 +173,11 @@ async fn read_request(stream: &mut TcpStream) -> serde_json::Value {
         .read_exact(&mut body[bytes.len() - header_end..])
         .await
         .unwrap();
-    serde_json::from_slice(&body).unwrap()
+    (headers, serde_json::from_slice(&body).unwrap())
+}
+
+async fn read_request(stream: &mut TcpStream) -> serde_json::Value {
+    read_request_with_headers(stream).await.1
 }
 
 async fn reply_sse(stream: &mut TcpStream, chunks: &[serde_json::Value]) {
@@ -185,6 +195,60 @@ async fn reply_sse(stream: &mut TcpStream, chunks: &[serde_json::Value]) {
     stream.write_all(header.as_bytes()).await.unwrap();
     for chunk in body.chunks(7) {
         stream.write_all(chunk).await.unwrap();
+    }
+}
+
+/// An empty `api_key` marks an unauthenticated local provider (vLLM / Ollama
+/// / llama.cpp): the chat wire must omit the Authorization header entirely
+/// instead of sending `Bearer ` with an empty token. A configured key keeps
+/// sending `Bearer <key>`.
+#[tokio::test]
+async fn empty_api_key_omits_authorization_header() {
+    for (api_key, expected) in [("", None), ("secret-key", Some("Bearer secret-key"))] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (headers, request) = read_request_with_headers(&mut stream).await;
+            assert_eq!(request["stream"], true);
+            reply_sse(
+                &mut stream,
+                &[
+                    json!({"choices":[{"delta":{"content":"ok"},"finish_reason":null}]}),
+                    json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+                ],
+            )
+            .await;
+            headers
+        });
+        let mut model = OpenAiModel::with_timeout(
+            format!("http://{address}/v1"),
+            api_key.into(),
+            "test-model".into(),
+            None,
+            false,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let (message, _) = model
+            .complete(
+                &[Message::User {
+                    content: "hello".into(),
+                    images: vec![],
+                }],
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(message.content.as_deref(), Some("ok"));
+        let headers = server.await.unwrap();
+        let authorization = headers.split("\r\n").skip(1).find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("authorization")
+                .then(|| value.trim().to_owned())
+        });
+        assert_eq!(authorization.as_deref(), expected, "api_key={api_key:?}");
     }
 }
 

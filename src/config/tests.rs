@@ -1497,7 +1497,7 @@ model = "k3"
 }
 
 #[test]
-fn reports_missing_model_provider_and_credentials() {
+fn reports_missing_model_and_provider() {
     let temp = tempfile::tempdir().unwrap();
     let missing_model = write_config(temp.path(), "default = \"kimi/k3\"");
     assert!(
@@ -1518,19 +1518,95 @@ fn reports_missing_model_provider_and_credentials() {
             .to_string()
             .contains("provider `kimi` for profile `kimi/k3` is not defined")
     );
+}
 
-    let missing_credentials = write_config(
+#[test]
+fn resolves_keyless_local_provider_without_credentials() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = write_config(
         temp.path(),
-        "[providers.kimi]\nbase_url = \"https://example.test/v1\"\n[models.\"kimi/k3\"]\nmodel = \"k3\"",
+        r#"
+[providers.local]
+base_url = "http://127.0.0.1:8000/v1"
+[models."local/qwen"]
+model = "qwen3-local"
+"#,
+    );
+    let resolved = Config::from_path(&path)
+        .unwrap()
+        .resolve(Some("local/qwen"))
+        .unwrap();
+    assert!(resolved.api_key.is_empty());
+    assert_eq!(resolved.auth, AuthMode::ApiKey);
+    assert_eq!(resolved.base_url, "http://127.0.0.1:8000/v1");
+    assert_eq!(resolved.model, "qwen3-local");
+    assert_eq!(resolved.display, "local/qwen");
+}
+
+#[test]
+fn rejects_both_key_sources_and_empty_configured_credentials() {
+    let temp = tempfile::tempdir().unwrap();
+    let both = write_config(
+        temp.path(),
+        r#"
+[providers.local]
+base_url = "http://127.0.0.1:8000/v1"
+api_key_file = "key"
+api_key_env = "LOCAL_API_KEY"
+[models."local/qwen"]
+model = "qwen3-local"
+"#,
     );
     assert!(
-        Config::from_path(&missing_credentials)
+        Config::from_path(&both)
             .unwrap()
-            .resolve(Some("kimi/k3"))
+            .resolve(Some("local/qwen"))
             .unwrap_err()
             .to_string()
-            .contains("requires exactly one of `api_key_file` or `api_key_env`")
+            .contains("must set exactly one of `api_key_file` or `api_key_env`")
     );
+
+    // A configured credential that trims to empty is still an error: the
+    // empty-credential check is gated on a source being configured, not on
+    // the absence of both.
+    std::fs::write(temp.path().join("key"), " \n\t").unwrap();
+    let empty_file = write_config(
+        temp.path(),
+        r#"
+[providers.local]
+base_url = "http://127.0.0.1:8000/v1"
+api_key_file = "key"
+[models."local/qwen"]
+model = "qwen3-local"
+"#,
+    );
+    assert!(
+        Config::from_path(&empty_file)
+            .unwrap()
+            .resolve(Some("local/qwen"))
+            .unwrap_err()
+            .to_string()
+            .contains("credential for provider `local` is empty")
+    );
+
+    // An unset api_key_env stays an error too.
+    assert!(std::env::var("E_AGENT_TEST_UNSET_LOCAL_KEY").is_err());
+    let unset_env = write_config(
+        temp.path(),
+        r#"
+[providers.local]
+base_url = "http://127.0.0.1:8000/v1"
+api_key_env = "E_AGENT_TEST_UNSET_LOCAL_KEY"
+[models."local/qwen"]
+model = "qwen3-local"
+"#,
+    );
+    let error = Config::from_path(&unset_env)
+        .unwrap()
+        .resolve(Some("local/qwen"))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("is not set"), "{error}");
 }
 
 #[test]

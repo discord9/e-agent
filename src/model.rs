@@ -308,14 +308,18 @@ impl OpenAiModel {
         let mut attempt = 0u32;
         loop {
             attempt += 1;
-            match self
+            // An empty key marks an unauthenticated local provider: omit the
+            // Authorization header entirely instead of sending `Bearer `
+            // (some local servers reject an empty token).
+            let builder = self
                 .client
-                .post(format!("{}/chat/completions", self.base_url))
-                .bearer_auth(&self.api_key)
-                .json(request)
-                .send()
-                .await
-            {
+                .post(format!("{}/chat/completions", self.base_url));
+            let builder = if self.api_key.is_empty() {
+                builder
+            } else {
+                builder.bearer_auth(&self.api_key)
+            };
+            match builder.json(request).send().await {
                 Ok(response) => return Ok(response),
                 Err(error)
                     if attempt < CONNECT_RETRY_ATTEMPTS
