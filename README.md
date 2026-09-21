@@ -344,6 +344,49 @@ enabled = true
 `gpu` is global-config-only: a project `.e-agent/config.toml` that sets it is
 rejected at startup.
 
+`gpu` and the runtime installation are two separate halves of one policy.
+`gpu = true` grants the host GPU device nodes (`/dev/kfd`, `/dev/dri`, plus any
+`/dev/nvidia*`, mounted read-write) and the sysfs subtrees the AMD ROCm runtime
+reads: `/sys/devices` for the KFD topology and the DRM devices, `/sys/dev/char`
+for the device-number links HIP uses to match KFD nodes to render nodes, and
+`/sys/module/amdgpu` for the module state `rocminfo` gates on. The sysfs
+subtrees are mounted read-only. These grants are unconditional under the flag —
+they are not detected from the host GPU vendor, so they simply do not resolve
+on hosts without those paths. `gpu = true` alone does not make a ROCm
+installation visible: the loader, the `rocminfo` binary and the Python
+environment must be mounted through `readable_paths`. Both are needed for a
+working `rocminfo`/HIP inside the sandbox, e.g.
+
+```toml
+[sandbox]
+enabled = true
+gpu = true
+readable_paths = ["/opt/rocm", "/home/<user>/venv"]   # runtime + interpreter
+```
+
+`/opt/rocm` is usually a symlink chain (`/opt/rocm` → `/etc/alternatives/rocm`
+→ `/opt/rocm-<version>`); configured roots keep BOTH their configured location
+and their canonical source, so the whole chain resolves inside the sandbox.
+A root that does not exist on the host is skipped.
+
+Security exposure: `gpu = true` hands model-generated commands the host GPUs,
+which are shared resources with no isolation between the sandboxed command and
+other GPU users: compute and VRAM capacity are shared, and the exposed
+driver/device interfaces and the read-only `/sys/devices` device tree enlarge
+the kernel/driver attack surface. Because a configured path can overlap a
+device node, the GPU grants are installed last in the argument vector, so
+`gpu = true` wins over a configured `readable_paths`/`writable_paths` entry
+covering the same path — that precedence is deliberate (the explicit GPU opt-in
+is the narrower authority) and means an overlapping configured entry is NOT a
+way to device-block a GPU-enabled sandbox.
+
+On an AMD host, verify a working policy on the host with
+`scripts/verify_gpu_sandbox.sh`: it runs the ignored acceptance test
+(`tools::tests::gpu_acceptance_amd_rocm_sandbox`) through the production Bash
+tool and requires `rocminfo` to enumerate the requested architecture, PyTorch
+to see that HIP device, and a real tensor operation to match the CPU result.
+`--gpu=false` runs the negative control on the same path.
+
 When the sandbox is **enabled**, the workspace itself becomes a logical policy
 entry for the file tools: with `workspace_writable = false` the file tools
 deny writes/edits/removes inside the workspace (reads stay allowed), exactly
@@ -698,14 +741,16 @@ it. When the host uses systemd-resolved, the stub resolver at
 `/run/systemd/resolve` is mounted read-only so DNS resolution via the symlinked
 `/etc/resolv.conf` works inside the sandbox. With `gpu = true` the sandbox
 also exposes the host GPU device nodes (AMD `/dev/kfd` + `/dev/dri`, NVIDIA
-`/dev/nvidia*`), which enlarges the kernel attack surface and shares the GPU
-with model-generated code; it is off by default and can only be enabled in the
-global config. The restriction constrains the
-spawned command, not the agent process itself. It is best-effort: bwrap is not
-setuid, the host network is shared by default, and environment variables of the
-parent process other than the stripped credential names (`EXA_API_KEY`,
-`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY`,
-`KIMI_API_KEY`) remain visible.
+`/dev/nvidia*`) and the read-only AMD ROCm sysfs subtrees (`/sys/devices`,
+`/sys/dev/char`, `/sys/module/amdgpu`) the runtime reads to enumerate real
+devices; that enlarges the kernel/driver attack surface and shares the GPUs —
+a resource with no per-command isolation — with model-generated code. It is
+off by default and can only be enabled in the global config. The restriction
+constrains the spawned command, not the agent process itself. It is
+best-effort: bwrap is not setuid, the host network is shared by default, and
+environment variables of the parent process other than the stripped credential
+names (`EXA_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
+`DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY`, `KIMI_API_KEY`) remain visible.
 
 On Linux/Android, the workspace `.git` entry depends on the role. The main
 agent leaves it writable for repository operations. Delegated subagents/fixers
@@ -1414,6 +1459,13 @@ ConPTY, dedicated user, protected-git shell execution, or bwrap-equivalent
 filesystem view. Everyone/logon-SID writable public locations can remain
 writable, synthetic capability ACEs persist, and cancellation currently
 terminates only the top-level process.
+Sandboxed GPU access (`gpu = true`) is limited to mounting host GPU resources:
+the device nodes plus the three read-only AMD ROCm sysfs subtrees that make
+AMD enumeration work (granted unconditionally under the flag, not
+vendor-detected). There is no per-host PCI/DRM node enumeration (host-specific
+topology would rot), no runtime installation, no device filtering or GPU
+selection, and no new NVIDIA mechanism beyond the existing `/dev/nvidia*`
+binds.
 `run_rust` (experimental `[code_mode]`) has no Cargo/crates, network access,
 stdin, background or daemon execution, or custom env/mount/cwd/timeout;
 Cargo/toolchain is not supplied on the run-stage PATH/mounts (compile-only

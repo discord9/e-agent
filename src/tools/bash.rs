@@ -150,6 +150,13 @@ impl Tool for Bash {
                         sandbox.readable_paths.join(", ")
                     ));
                 }
+                if sandbox.gpu {
+                    description.push_str(
+                        " The host GPU is exposed (`[sandbox] gpu = true`): the AMD device \
+                     nodes plus the ROCm sysfs topology, so rocminfo and HIP/PyTorch can use \
+                     the GPU.",
+                    );
+                }
                 description.push_str(
                 " Bash mounts and read_file/write_file/edit_file capabilities are independent boundaries sharing this resolved path policy.",
             );
@@ -511,29 +518,6 @@ pub(super) fn build_bwrap_plan(
         "/etc".into(),
         "/etc".into(),
     ];
-    // GPU device nodes, opt-in via `[sandbox] gpu = true`. `--dev /dev`
-    // above starts a minimal devtmpfs (null/zero/random only); device nodes
-    // need `--dev-bind-try` (`--ro-bind` mounts are MS_NODEV and cannot open
-    // devices). `-try` doubles as detection: hosts without the node skip it.
-    // Covers AMD (amdgpu: /dev/kfd + /dev/dri) and NVIDIA (/dev/nvidia*).
-    if sandbox.gpu {
-        for node in ["/dev/kfd", "/dev/dri"] {
-            args.extend(["--dev-bind-try".into(), node.into(), node.into()]);
-        }
-        // NVIDIA nodes are per-driver enumerated; bind each that exists.
-        if let Ok(entries) = std::fs::read_dir("/dev") {
-            let mut nvidia: Vec<_> = entries
-                .filter_map(|entry| entry.ok())
-                .map(|entry| entry.file_name())
-                .filter(|name| name.to_string_lossy().starts_with("nvidia"))
-                .collect();
-            nvidia.sort();
-            for name in nvidia {
-                let path = format!("/dev/{}", name.to_string_lossy());
-                args.extend(["--dev-bind-try".into(), path.clone().into(), path.into()]);
-            }
-        }
-    }
     // systemd-resolved stub so symlinked /etc/resolv.conf works.
     if std::path::Path::new("/run/systemd/resolve").exists() {
         args.push("--dir".into());
@@ -801,6 +785,37 @@ pub(super) fn build_bwrap_plan(
             args.push("--ro-bind".into());
             args.push(git_path.clone().into());
             args.push(git_path.into());
+        }
+    }
+
+    // GPU access, opt-in via `[sandbox] gpu = true`. `--dev /dev` starts a
+    // minimal devtmpfs, so real devices need `--dev-bind-try` (a `--ro-bind`
+    // is MS_NODEV and cannot open devices); `-try` skips nodes the host lacks.
+    // AMD/ROCm enumeration additionally reads sysfs: `/sys/devices` (KFD
+    // topology + DRM devices), `/sys/dev/char` (the device-number links HIP
+    // uses to match KFD nodes to render nodes) and `/sys/module/amdgpu`
+    // (rocminfo's module gate) — all read-only.
+    // Installed after every configured mount so the `--dev-bind-try` devices
+    // win over any overlapping configured bind (last mount wins in bwrap).
+    if sandbox.gpu {
+        for node in ["/dev/kfd", "/dev/dri"] {
+            args.extend(["--dev-bind-try".into(), node.into(), node.into()]);
+        }
+        // NVIDIA nodes are per-driver enumerated; bind each that exists.
+        if let Ok(entries) = std::fs::read_dir("/dev") {
+            let mut nvidia: Vec<_> = entries
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name())
+                .filter(|name| name.to_string_lossy().starts_with("nvidia"))
+                .collect();
+            nvidia.sort();
+            for name in nvidia {
+                let path = format!("/dev/{}", name.to_string_lossy());
+                args.extend(["--dev-bind-try".into(), path.clone().into(), path.into()]);
+            }
+        }
+        for path in ["/sys/devices", "/sys/dev/char", "/sys/module/amdgpu"] {
+            args.extend(["--ro-bind-try".into(), path.into(), path.into()]);
         }
     }
 

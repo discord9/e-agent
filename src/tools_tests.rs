@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
@@ -6470,7 +6471,57 @@ fn gpu_binds_plan_ordering_and_opt_in() {
             "{node} must be bound after --dev /dev, not shadowed by it: {args:?}"
         );
     }
-    // Off by default: the same workspace without gpu carries no device binds.
+    // The AMD runtime also needs the ROCm sysfs subtrees (KFD topology,
+    // /sys/dev/char device links, amdgpu module state) read-only; without
+    // them rocminfo enumerates nothing and HIP reports no devices.
+    for path in ["/sys/devices", "/sys/dev/char", "/sys/module/amdgpu"] {
+        assert!(
+            args.windows(3)
+                .any(|w| w[0] == "--ro-bind-try" && w[1] == path && w[2] == path),
+            "gpu = true must grant {path} read-only: {args:?}"
+        );
+    }
+    // Last-wins precedence: the device/sysfs grants must come after every
+    // configured mount, or a configured read-only path overlapping a device
+    // node would land an MS_NODEV bind over the device and silently make it
+    // unopenable.
+    let configure = |extra: &str| -> Vec<String> {
+        let policy = super::bash::build_bwrap_plan(
+            &workspace,
+            &crate::config::Sandbox {
+                gpu: true,
+                readable_paths: vec![extra.to_owned()],
+                ..crate::config::Sandbox::default()
+            },
+            false,
+            true,
+            &root_str,
+            None,
+        )
+        .unwrap();
+        policy
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    };
+    // /dev is bindable as a configured readable path (it exists); the plan
+    // must still place the AMD device binds after that generic bind.
+    let configured = configure("/dev");
+    let generic = configured
+        .windows(3)
+        .position(|w| w[0] == "--ro-bind-try" && w[1] == "/dev" && w[2] == "/dev")
+        .expect("the configured /dev mount must be present");
+    let kfd = configured
+        .windows(3)
+        .position(|w| w[0] == "--dev-bind-try" && w[1] == "/dev/kfd" && w[2] == "/dev/kfd")
+        .expect("the gpu device bind must be present");
+    assert!(
+        generic < kfd,
+        "the GPU device bind must win over a configured /dev mount: {configured:?}"
+    );
+    // Off by default: the same workspace without gpu carries no device binds
+    // and no sysfs grants.
     let plain = crate::config::Sandbox::default();
     let plan =
         super::bash::build_bwrap_plan(&workspace, &plain, false, true, &root_str, None).unwrap();
@@ -6478,6 +6529,336 @@ fn gpu_binds_plan_ordering_and_opt_in() {
         !plan.args.iter().any(|arg| arg == "--dev-bind-try"),
         "gpu = false must not bind any device node"
     );
+    for path in ["/sys/devices", "/sys/dev/char", "/sys/module/amdgpu"] {
+        assert!(
+            !plan.args.iter().any(|arg| arg == path),
+            "gpu = false must not grant any sysfs path: {path}"
+        );
+    }
+}
+
+/// Host acceptance test for `[sandbox] gpu = true` on an AMD/ROCm host.
+///
+/// Ignored by default: it requires a real AMD GPU, a host ROCm installation,
+/// a ROCm-built PyTorch and a working `bwrap`. Run it on the HOST (never from
+/// inside another sandbox) via `scripts/verify_gpu_sandbox.sh`, or directly:
+///
+/// ```sh
+/// E_AGENT_GPU_ACCEPTANCE_PYTHON=/path/to/venv/bin/python \
+/// E_AGENT_GPU_ACCEPTANCE_ROCMINFO=/opt/rocm/bin/rocminfo \
+/// cargo test --lib -- --ignored --nocapture --exact \
+///     tools::tests::gpu_acceptance_amd_rocm_sandbox
+/// ```
+///
+/// It goes through the REAL production path — `bash_tool` → `Bash::execute` →
+/// `run_bash` → `wrap_bash_command` → `build_bwrap_plan` — and resolves the
+/// policy through the REAL config resolver (`Config::load_for_workspace` +
+/// `Config::sandbox`) from a temporary global config, so the user's global
+/// policy is never read.
+///
+/// Environment (no host path is hardcoded):
+/// - `E_AGENT_GPU_ACCEPTANCE_PYTHON` (required): host Python whose interpreter
+///   has a ROCm-built PyTorch (its environment root is granted read-only).
+/// - `E_AGENT_GPU_ACCEPTANCE_ROCMINFO` (required): host `rocminfo`; its ROCm
+///   prefix is granted read-only.
+/// - `E_AGENT_GPU_ACCEPTANCE_READABLE` (optional, `:`-separated): extra
+///   read-only roots to grant inside the sandbox.
+/// - `E_AGENT_GPU_ACCEPTANCE_WORKSPACE` (optional): workspace directory; a
+///   fresh temporary directory is used when unset.
+/// - `E_AGENT_GPU_ACCEPTANCE_ARCH` (optional, default `gfx1201`): the GPU
+///   architecture the acceptance run must enumerate AND compute on.
+/// - `E_AGENT_GPU_ACCEPTANCE_GPU` (optional, default `true`): `false` runs the
+///   negative control on the same path — with `gpu = false` the sandbox must
+///   NOT expose the GPU (no `/dev/kfd`, no rocminfo agents, no HIP device).
+///
+/// Runtime failures are hard failures: there is no SKIP for a host that has
+/// the toolchain but cannot use the GPU.
+#[cfg(all(unix, target_os = "linux"))]
+#[ignore = "host GPU acceptance: needs bwrap + ROCm + ROCm-built PyTorch; set E_AGENT_GPU_ACCEPTANCE_PYTHON/E_AGENT_GPU_ACCEPTANCE_ROCMINFO"]
+#[tokio::test]
+async fn gpu_acceptance_amd_rocm_sandbox() {
+    let python = required_env_path("E_AGENT_GPU_ACCEPTANCE_PYTHON");
+    let rocminfo = required_env_path("E_AGENT_GPU_ACCEPTANCE_ROCMINFO");
+    let arch = std::env::var("E_AGENT_GPU_ACCEPTANCE_ARCH").unwrap_or_else(|_| "gfx1201".into());
+    let gpu = std::env::var("E_AGENT_GPU_ACCEPTANCE_GPU").map_or(true, |value| value != "false");
+    // ROCm prefix: `<prefix>/bin/rocminfo` (a `/usr/bin/rocminfo` resolves to
+    // `/usr`, already mounted read-only by the sandbox).
+    let rocm_root = rocminfo
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or_else(|| Path::new("/usr"))
+        .to_path_buf();
+    let mut readable = vec![
+        rocm_root.display().to_string(),
+        python_environment_root(&python).display().to_string(),
+    ];
+    if let Ok(extra) = std::env::var("E_AGENT_GPU_ACCEPTANCE_READABLE") {
+        readable.extend(
+            extra
+                .split(':')
+                .filter(|path| !path.is_empty())
+                .map(str::to_owned),
+        );
+    }
+
+    let tempdir;
+    let workspace_path = match std::env::var_os("E_AGENT_GPU_ACCEPTANCE_WORKSPACE") {
+        Some(path) => PathBuf::from(path),
+        None => {
+            tempdir = tempfile::tempdir().unwrap();
+            tempdir.path().to_path_buf()
+        }
+    };
+    assert!(
+        workspace_path.is_dir(),
+        "E_AGENT_GPU_ACCEPTANCE_WORKSPACE={} is not a directory",
+        workspace_path.display()
+    );
+    let workspace = Workspace::new(&workspace_path).unwrap();
+
+    // Temporary global config, parsed and resolved by the production
+    // resolver. `readable_paths` are the runtime installation roots the
+    // sandbox exposes read-only: a configured alias (e.g. /opt/rocm ->
+    // /etc/alternatives -> /opt/rocm-VER) keeps BOTH its configured and its
+    // canonical location, which is what the loader needs.
+    let xdg = tempfile::tempdir().unwrap();
+    let config_dir = xdg.path().join("e-agent");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let quoted: Vec<String> = readable
+        .iter()
+        .map(|path| format!("\"{}\"", path.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect();
+    std::fs::write(
+        config_dir.join("config.toml"),
+        format!(
+            "[sandbox]\nenabled = true\ngpu = {gpu}\nnetwork = true\n\
+             workspace_writable = true\nreadable_paths = [{}]\n",
+            quoted.join(", ")
+        ),
+    )
+    .unwrap();
+
+    let sandbox = {
+        // XDG_CONFIG_HOME is process-global; serialize with the other tests
+        // that mutate it. The env is restored before the first await.
+        let _guard = crate::roles::XDG_TEST_LOCK.lock().unwrap();
+        let previous = std::env::var_os("XDG_CONFIG_HOME");
+        // SAFETY: guarded by XDG_TEST_LOCK; no other thread races this read.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", xdg.path()) };
+        let loaded = crate::config::Config::load_for_workspace(workspace.root())
+            .expect("the temporary global config must load");
+        let resolved = loaded
+            .as_ref()
+            .expect("the temporary global config must be present")
+            .sandbox(workspace.root());
+        match previous {
+            Some(value) => unsafe { std::env::set_var("XDG_CONFIG_HOME", value) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        resolved.expect("the sandbox policy must resolve")
+    };
+    assert_eq!(
+        sandbox.gpu, gpu,
+        "the temporary config must be the effective policy (sandbox={sandbox:?}), not the user's global config"
+    );
+    assert!(sandbox.enabled, "the acceptance sandbox must be enabled");
+    for root in &readable {
+        let canonical = crate::canonicalize_path(root)
+            .unwrap_or_else(|error| panic!("cannot canonicalize {root}: {error}"));
+        assert!(
+            sandbox
+                .readable_paths
+                .iter()
+                .any(|resolved| Path::new(resolved) == canonical),
+            "the temporary config root {root} (canonical {}) must be resolved read-only: {:?}",
+            canonical.display(),
+            sandbox.readable_paths
+        );
+    }
+    println!(
+        "resolved sandbox gpu={gpu} arch={arch} readable_paths={:?} readable_mounts={:?}",
+        sandbox.readable_paths, sandbox.readable_mounts
+    );
+
+    let bash = super::bash_tool(
+        workspace.clone(),
+        BackgroundTasks::new(Some(Duration::from_secs(60)), Some(sandbox.clone())),
+        Some(sandbox),
+        false,
+        Some(Duration::from_secs(600)),
+        None,
+    )
+    .unwrap();
+
+    let python_program = format!(
+        r#"import torch
+arch = {arch:?}
+print('HIP_AVAILABLE=%s' % torch.cuda.is_available())
+count = torch.cuda.device_count()
+print('HIP_DEVICE_COUNT=%d' % count)
+match = None
+for i in range(count):
+    props = torch.cuda.get_device_properties(i)
+    print('HIP_DEVICE %d %s %s' % (i, props.gcnArchName, props.name))
+    if match is None and arch in props.gcnArchName:
+        match = i
+if match is None:
+    raise SystemExit('TORCH_ACCEPTANCE_FAIL no %s device' % arch)
+torch.manual_seed(0)
+device = 'cuda:%d' % match
+a = torch.randn(256, 256, device=device, dtype=torch.float32)
+b = torch.randn(256, 256, device=device, dtype=torch.float32)
+product = a @ b
+torch.cuda.synchronize(match)
+reference = a.cpu() @ b.cpu()
+difference = (product.cpu() - reference).abs().max().item()
+finite = bool(torch.isfinite(product).all().item())
+print('TORCH_MAX_ABS_DIFF=%s' % difference)
+if not finite or difference > 1e-2:
+    raise SystemExit('TORCH_ACCEPTANCE_FAIL matmul mismatch finite=%s diff=%s' % (finite, difference))
+print('TORCH_ACCEPTANCE_OK %s device=%d max_abs_diff=%s' % (arch, match, difference))
+"#
+    );
+    let command = format!(
+        "printf '##ROCINFO\\n'\n{rocminfo} 2>&1\nrc=$?\nprintf 'rocminfo_rc=%s\\n' \"$rc\"\n\
+         printf '##DEV\\n'\nls -l /dev/kfd /dev/dri/renderD128 2>&1\nrc=$?\nprintf 'dev_rc=%s\\n' \"$rc\"\n\
+         test ! -e /dev/kfd && test ! -e /dev/dri\nrc=$?\nprintf 'devices_absent_rc=%s\\n' \"$rc\"\n\
+         printf '##TORCH\\n'\n{python} -c {program} 2>&1\nrc=$?\nprintf 'torch_rc=%s\\n' \"$rc\"\n",
+        rocminfo = shell_quote(&rocminfo.display().to_string()),
+        python = shell_quote(&python.display().to_string()),
+        program = shell_quote(&python_program),
+    );
+    let output = bash
+        .execute(json!({"command": command}))
+        .await
+        .unwrap_or_else(|error| panic!("sandboxed acceptance command failed to run: {error}"));
+    let text = output.content;
+    println!("--- acceptance output ---\n{text}\n--- end acceptance output ---");
+    let rocminfo_section = acceptance_section(&text, "##ROCINFO");
+    let device_section = acceptance_section(&text, "##DEV");
+    let torch_section = acceptance_section(&text, "##TORCH");
+
+    if gpu {
+        assert_eq!(
+            acceptance_rc(rocminfo_section, "rocminfo_rc"),
+            0,
+            "host rocminfo must succeed inside the sandbox: {rocminfo_section}"
+        );
+        assert!(
+            rocminfo_section.contains(&arch),
+            "rocminfo inside the sandbox must enumerate {arch}: {rocminfo_section}"
+        );
+        assert_eq!(
+            acceptance_rc(device_section, "dev_rc"),
+            0,
+            "the GPU device nodes must be present and listable inside the sandbox: {device_section}"
+        );
+        assert!(
+            device_section.contains("/dev/kfd"),
+            "gpu = true must expose /dev/kfd: {device_section}"
+        );
+        let count: u32 = torch_section
+            .lines()
+            .find_map(|line| line.strip_prefix("HIP_DEVICE_COUNT="))
+            .unwrap_or_else(|| panic!("missing HIP_DEVICE_COUNT in:\n{torch_section}"))
+            .trim()
+            .parse()
+            .unwrap_or_else(|error| panic!("bad HIP_DEVICE_COUNT in:\n{torch_section}: {error}"));
+        assert!(count >= 1, "HIP must enumerate a GPU: {torch_section}");
+        assert!(
+            torch_section.contains(&format!("TORCH_ACCEPTANCE_OK {arch} device=")),
+            "torch must compute on {arch} and verify the result: {torch_section}"
+        );
+        assert_eq!(
+            acceptance_rc(torch_section, "torch_rc"),
+            0,
+            "the torch acceptance program must exit 0: {torch_section}"
+        );
+        println!("PASS gpu=true: rocminfo enumerated {arch} and HIP computed with it");
+    } else {
+        assert!(
+            !rocminfo_section.contains(&arch),
+            "gpu = false must not expose {arch} through rocminfo: {rocminfo_section}"
+        );
+        assert!(
+            !torch_section
+                .lines()
+                .any(|line| line.starts_with("HIP_DEVICE ") && line.contains(&arch)),
+            "gpu = false must not expose an {arch} HIP device: {torch_section}"
+        );
+        assert!(
+            torch_section.contains("HIP_DEVICE_COUNT=0"),
+            "gpu = false must leave torch without HIP devices: {torch_section}"
+        );
+        assert_ne!(
+            acceptance_rc(torch_section, "torch_rc"),
+            0,
+            "the torch acceptance program must fail without a GPU: {torch_section}"
+        );
+        assert_eq!(
+            acceptance_rc(device_section, "devices_absent_rc"),
+            0,
+            "gpu = false must leave both /dev/kfd and /dev/dri absent: {device_section}"
+        );
+        println!("PASS gpu=false negative control: no ROCm device available inside the sandbox");
+    }
+}
+
+/// Read a required host path from the environment; a missing variable or a
+/// missing path is a hard failure (this test has no defaults to fall back on).
+#[cfg(all(unix, target_os = "linux"))]
+fn required_env_path(name: &str) -> PathBuf {
+    let value = std::env::var_os(name).unwrap_or_else(|| {
+        panic!("{name} must point at the host runtime (see the test doc comment)")
+    });
+    let path = PathBuf::from(value);
+    assert!(path.exists(), "{name}={} does not exist", path.display());
+    path
+}
+
+/// The environment root of a Python interpreter: the nearest lexical ancestor
+/// with a `pyvenv.cfg` (a venv), else the interpreter's own directory. The
+/// path is deliberately NOT canonicalized — a venv's `bin/python` is usually a
+/// symlink to a system interpreter, and resolving it would grant the wrong
+/// root.
+#[cfg(all(unix, target_os = "linux"))]
+fn python_environment_root(python: &Path) -> PathBuf {
+    let mut dir = python.parent();
+    while let Some(candidate) = dir {
+        if candidate.join("pyvenv.cfg").is_file() {
+            return candidate.to_path_buf();
+        }
+        dir = candidate.parent();
+    }
+    python.parent().unwrap_or(Path::new("/")).to_path_buf()
+}
+
+/// One `'…'`-quoted shell word.
+#[cfg(all(unix, target_os = "linux"))]
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// The text between a `##MARKER` line and the next `##` marker.
+#[cfg(all(unix, target_os = "linux"))]
+fn acceptance_section<'a>(text: &'a str, marker: &str) -> &'a str {
+    let start = text
+        .find(marker)
+        .unwrap_or_else(|| panic!("missing {marker} in the acceptance output:\n{text}"));
+    let rest = &text[start + marker.len()..];
+    let end = rest.find("##").unwrap_or(rest.len());
+    &rest[..end]
+}
+
+/// Parse a `<name>=<exit code>` line emitted by the acceptance command.
+#[cfg(all(unix, target_os = "linux"))]
+fn acceptance_rc(text: &str, name: &str) -> i32 {
+    text.lines()
+        .find_map(|line| line.strip_prefix(&format!("{name}=")))
+        .unwrap_or_else(|| panic!("missing {name} in the acceptance output:\n{text}"))
+        .trim()
+        .parse()
+        .unwrap_or_else(|error| panic!("bad {name} in the acceptance output:\n{text}: {error}"))
 }
 
 #[cfg(unix)]
