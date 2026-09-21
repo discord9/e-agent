@@ -680,11 +680,41 @@ impl SqliteSession {
     /// `(workspace_id, session_id, seq, event_time_us)` primary key makes each
     /// selected winner physical row unique; decoding remains selected-only.
     pub async fn query_history(&self, query: &HistoryQuery) -> Result<Vec<HistoryEntry>, String> {
-        let text = r#"CASE WHEN json_valid(payload) THEN CASE json_extract(payload,'$.type')
- WHEN 'message' THEN CASE
-  WHEN json_type(payload,'$.message.User.content')='text' THEN json_extract(payload,'$.message.User.content')
-  WHEN json_type(payload,'$.message.Assistant.content')='text' THEN json_extract(payload,'$.message.Assistant.content') END
- WHEN 'notice' THEN CASE WHEN json_type(payload,'$.text')='text' THEN json_extract(payload,'$.text') END END END"#;
+        // `concat` keeps every non-empty segment instead of short-circuiting
+        // on the first one: an assistant message that carries both text and
+        // tool calls must match on either. `json_each` expands the tool_calls
+        // array and `json_extract` decodes each element's `name` and
+        // `arguments` JSON strings (unescaping them), matching the raw strings
+        // the JSONL backend searches instead of the array's escaped JSON text.
+        // The `char(10)` prefixed to the tool-call segment mirrors the
+        // authoritative `history::searchable_content` newline layout
+        // (content + newline + name + newline + arguments), so content `foo`
+        // plus name `bar` cannot match `foobar` while `foo\nbar` does, and a
+        // contentless tool call keeps its leading newline.
+        //
+        // Three turso quirks shape this projection (all verified against
+        // turso 0.7.2; stock SQLite needs neither):
+        //  1. `wr.payload` must be qualified — a bare outer column inside a
+        //     table-valued function resolves only when the source is a named
+        //     table, not a CTE (`Parse error: no such column: payload`).
+        //  2. The `json_each` argument is evaluated eagerly for every scanned
+        //     row, before the guarding CASE is entered, so it must be safe
+        //     for any payload: malformed JSON, a missing path, and a
+        //     non-array `tool_calls` all yield `'[]'` (zero rows), never an
+        //     evaluation error.
+        //  3. `json_each` can also yield individual elements that are not
+        //     valid JSON at all (`tool_calls:["not-json"]`); `json_extract`
+        //     on such an element aborts the whole query under turso 0.7.2
+        //     (malformed-JSON error while stepping), not just that row. The
+        //     per-element `json_valid` guard makes a bad element contribute
+        //     an empty segment, so an all-malformed row stays inert and a
+        //     mixed row still matches its good elements.
+        let text = r#"CASE WHEN json_valid(wr.payload) THEN CASE json_extract(wr.payload,'$.type')
+ WHEN 'message' THEN concat(
+  CASE WHEN json_type(wr.payload,'$.message.User.content')='text' THEN json_extract(wr.payload,'$.message.User.content') END,
+  CASE WHEN json_type(wr.payload,'$.message.Assistant.content')='text' THEN json_extract(wr.payload,'$.message.Assistant.content') END,
+  char(10)||(SELECT group_concat(CASE WHEN json_valid(value) THEN COALESCE(json_extract(value,'$.name'),'')||char(10)||COALESCE(json_extract(value,'$.arguments'),'') ELSE '' END, char(10)) FROM json_each(CASE WHEN json_valid(wr.payload) THEN CASE WHEN json_type(wr.payload,'$.message.Assistant.tool_calls')='array' THEN json_extract(wr.payload,'$.message.Assistant.tool_calls') ELSE '[]' END ELSE '[]' END)))
+ WHEN 'notice' THEN CASE WHEN json_type(wr.payload,'$.text')='text' THEN json_extract(wr.payload,'$.text') END END END"#;
         let predicate = query
             .query
             .as_ref()
@@ -703,9 +733,9 @@ impl SqliteSession {
             ""
         };
         let selected_from = if query.default_search_window {
-            "window_rows"
+            "window_rows wr"
         } else {
-            "winner_rows"
+            "winner_rows wr"
         };
         let sql = format!(
             r#"WITH latest AS (

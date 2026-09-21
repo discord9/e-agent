@@ -632,6 +632,361 @@ async fn history_query_search_is_literal_and_ignores_unselected_bad_json() {
         .await
         .unwrap_err();
     assert!(selected_bad.contains("cannot decode"));
+
+    // Assistant tool calls are searchable: `json_each` expands the tool_calls
+    // array and `json_extract` decodes each element's `name`/`arguments`
+    // JSON strings, so raw argument fragments match literally, including
+    // fragments containing real quotes. The turn also carries text, so an
+    // argument-only match proves the projection does not stop at the first
+    // non-empty segment. A Tool result carrying the same word and an
+    // assistant `reasoning` field stay out of the projection.
+    let tool_call = serde_json::to_string(&SessionEntry::Message {
+        message: Message::Assistant(AssistantMessage {
+            content: Some("contentonlymarker".into()),
+            tool_calls: vec![crate::agent::ToolCall {
+                id: "call_1".into(),
+                name: "write_file".into(),
+                arguments: r#"{"path":"/tmp/x","content":"toolneedle"}"#.into(),
+            }],
+            reasoning: Some(r#"reasononly "quoted reasoning""#.into()),
+        }),
+    })
+    .unwrap();
+    let tool_result = serde_json::to_string(&SessionEntry::Message {
+        message: Message::Tool {
+            call_id: "call_1".into(),
+            name: "write_file".into(),
+            content: "toolneedle".into(),
+            images: vec![],
+            is_error: false,
+            synthetic: false,
+        },
+    })
+    .unwrap();
+    let conn = session.conn.lock().await;
+    conn.execute(
+        "INSERT INTO session_entries (workspace_id,session_id,seq,event_time_us,entry_kind,payload,schema_version,is_error) VALUES (?1,?2,12,?3,'message',?4,1,0),(?1,?2,13,?5,'message',?6,1,0),(?1,?2,14,?7,'message',?8,1,0)",
+        (
+            session.workspace_id.as_str(),
+            session.session_id.as_str(),
+            next_event_time_us(),
+            tool_call.as_str(),
+            next_event_time_us(),
+            tool_result.as_str(),
+            next_event_time_us(),
+            // A well-formed payload whose `tool_calls` is not an array: turso
+            // evaluates the `json_each` argument eagerly for every scanned
+            // row, so the json_valid + json_type guard chain must keep this
+            // row inert instead of erroring the whole search.
+            r#"{"type":"message","message":{"Assistant":{"content":null,"tool_calls":"notanarray"}}}"#,
+        ),
+    )
+    .await
+    .unwrap();
+    drop(conn);
+    let tool_calls = session
+        .query_history(&HistoryQuery {
+            workspace_id: Some(session.workspace_id.clone()),
+            session_id: Some(session.session_id.clone()),
+            query: Some("toolneedle".into()),
+            after: None,
+            after_event_time: None,
+            offset: None,
+            exact_seq: None,
+            limit: 4,
+            default_search_window: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        tool_calls.iter().map(|entry| entry.seq).collect::<Vec<_>>(),
+        vec![12],
+        "argument-only fragment matches the turn that also has text; the Tool result with the same word does not"
+    );
+    // The regression this locks: a needle with real quotes must match the
+    // decoded argument string, not the escaped JSON text of the raw array.
+    let quoted_argument = session
+        .query_history(&HistoryQuery {
+            workspace_id: Some(session.workspace_id.clone()),
+            session_id: Some(session.session_id.clone()),
+            query: Some(r#""path":"/tmp/x""#.into()),
+            after: None,
+            after_event_time: None,
+            offset: None,
+            exact_seq: None,
+            limit: 4,
+            default_search_window: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        quoted_argument
+            .iter()
+            .map(|entry| entry.seq)
+            .collect::<Vec<_>>(),
+        vec![12],
+        "quoted argument fragment matches the per-element decoded arguments string"
+    );
+    let content_only = session
+        .query_history(&HistoryQuery {
+            workspace_id: Some(session.workspace_id.clone()),
+            session_id: Some(session.session_id.clone()),
+            query: Some("contentonlymarker".into()),
+            after: None,
+            after_event_time: None,
+            offset: None,
+            exact_seq: None,
+            limit: 4,
+            default_search_window: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        content_only
+            .iter()
+            .map(|entry| entry.seq)
+            .collect::<Vec<_>>(),
+        vec![12],
+        "the same turn's assistant text stays searchable"
+    );
+    let reasoning = session
+        .query_history(&HistoryQuery {
+            workspace_id: Some(session.workspace_id.clone()),
+            session_id: Some(session.session_id.clone()),
+            query: Some("reasononly".into()),
+            after: None,
+            after_event_time: None,
+            offset: None,
+            exact_seq: None,
+            limit: 4,
+            default_search_window: false,
+        })
+        .await
+        .unwrap();
+    assert!(
+        reasoning.is_empty(),
+        "assistant reasoning stays out of the search projection"
+    );
+    // A quoted reasoning fragment must also stay out; only the tool-call
+    // arguments are decoded, never `reasoning`.
+    let quoted_reasoning = session
+        .query_history(&HistoryQuery {
+            workspace_id: Some(session.workspace_id.clone()),
+            session_id: Some(session.session_id.clone()),
+            query: Some(r#""quoted reasoning""#.into()),
+            after: None,
+            after_event_time: None,
+            offset: None,
+            exact_seq: None,
+            limit: 4,
+            default_search_window: false,
+        })
+        .await
+        .unwrap();
+    assert!(
+        quoted_reasoning.is_empty(),
+        "quoted reasoning stays out of the search projection"
+    );
+
+    // Bug C lock (turso 0.7.2): `json_each` can yield array elements that are
+    // not valid JSON at all (`tool_calls:["not-json"]`, where `json_each`
+    // yields the unquoted element text `not-json`); `json_extract` on such an
+    // element aborts the WHOLE query while stepping, not just that row. The
+    // per-element `json_valid` guard makes a bad element contribute an empty
+    // segment, so bad elements stay inert instead of failing the search.
+    //
+    // A row carrying such a hand-made element is itself not a decodable
+    // `SessionEntry` (a string element cannot deserialize into `ToolCall`),
+    // so it is observable through the scan of the other rows in the same
+    // session, never as a returned row: both inserts below sit in the scan
+    // set of every query in this transcript.
+    let conn = session.conn.lock().await;
+    conn.execute(
+        "INSERT INTO session_entries (workspace_id,session_id,seq,event_time_us,entry_kind,payload,schema_version,is_error) VALUES (?1,?2,15,?3,'message',?4,1,0),(?1,?2,16,?5,'message',?6,1,0)",
+        (
+            session.workspace_id.as_str(),
+            session.session_id.as_str(),
+            next_event_time_us(),
+            r#"{"type":"message","message":{"Assistant":{"content":null,"tool_calls":["not-json"]}}}"#,
+            next_event_time_us(),
+            r#"{"type":"message","message":{"Assistant":{"content":null,"tool_calls":["not-json",{"id":"call_mixed","name":"bash","arguments":"{\"command\":\"mixedneedle\"}"}]}}}"#,
+        ),
+    )
+    .await
+    .unwrap();
+    drop(conn);
+    // The good decodable row (seq 12) is still returned while rows 15/16 are
+    // scanned: before the guard this query failed outright with a
+    // malformed-JSON stepping error.
+    let good_row_survives = session
+        .query_history(&HistoryQuery {
+            workspace_id: Some(session.workspace_id.clone()),
+            session_id: Some(session.session_id.clone()),
+            query: Some("toolneedle".into()),
+            after: None,
+            after_event_time: None,
+            offset: None,
+            exact_seq: None,
+            limit: 4,
+            default_search_window: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        good_row_survives
+            .iter()
+            .map(|entry| entry.seq)
+            .collect::<Vec<_>>(),
+        vec![12],
+        "malformed array elements must not sink the good row or the query"
+    );
+    // A needle that only exists in a malformed element contributes nothing:
+    // the bad element is an empty segment, so nothing matches and nothing
+    // errors (the mixed row's good element does not carry this text).
+    let bad_element_only = session
+        .query_history(&HistoryQuery {
+            workspace_id: Some(session.workspace_id.clone()),
+            session_id: Some(session.session_id.clone()),
+            query: Some("not-json".into()),
+            after: None,
+            after_event_time: None,
+            offset: None,
+            exact_seq: None,
+            limit: 4,
+            default_search_window: false,
+        })
+        .await
+        .unwrap();
+    assert!(
+        bad_element_only.is_empty(),
+        "a malformed element contributes no searchable text"
+    );
+    // Positive proof that the mixed row's good element still decodes into the
+    // projection: the needle matches that row (a hand-made payload, so the
+    // match surfaces as the ordinary decode error — not as the query failing
+    // while stepping, which is what it did before the guard).
+    let mixed_match = session
+        .query_history(&HistoryQuery {
+            workspace_id: Some(session.workspace_id.clone()),
+            session_id: Some(session.session_id.clone()),
+            query: Some("mixedneedle".into()),
+            after: None,
+            after_event_time: None,
+            offset: None,
+            exact_seq: None,
+            limit: 4,
+            default_search_window: false,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        mixed_match.contains("cannot decode"),
+        "the mixed row must match through its decoded good element, got: {mixed_match}"
+    );
+}
+
+/// The search projection must join the assistant text and the first tool
+/// call with a newline, exactly like `history::searchable_content`
+/// (content + newline + name + newline + arguments). Content `foo` plus tool
+/// name `bar` therefore matches `foo\nbar` and must never match the glued
+/// `foobar`. A contentless tool call keeps its leading newline followed by
+/// name and raw arguments searchable.
+#[tokio::test]
+async fn history_query_separates_assistant_content_from_tool_call_name() {
+    async fn seqs(session: &SqliteSession, query: &str) -> Vec<i64> {
+        session
+            .query_history(&HistoryQuery {
+                workspace_id: Some(session.workspace_id.clone()),
+                session_id: Some(session.session_id.clone()),
+                query: Some(query.to_owned()),
+                after: None,
+                after_event_time: None,
+                offset: None,
+                exact_seq: None,
+                limit: 4,
+                default_search_window: false,
+            })
+            .await
+            .unwrap()
+            .iter()
+            .map(|entry| entry.seq)
+            .collect()
+    }
+    let (_dir, session, _sid) = fresh_session().await;
+    session
+        .append(&[
+            Message::Assistant(AssistantMessage {
+                content: Some("foo".into()),
+                tool_calls: vec![crate::agent::ToolCall {
+                    id: "call_bar".into(),
+                    name: "bar".into(),
+                    arguments: r#"{"path":"barargs"}"#.into(),
+                }],
+                reasoning: None,
+            })
+            .into(),
+            Message::Assistant(AssistantMessage {
+                content: None,
+                tool_calls: vec![crate::agent::ToolCall {
+                    id: "call_baz".into(),
+                    name: "baz".into(),
+                    arguments: r#"{"path":"bazargs"}"#.into(),
+                }],
+                reasoning: None,
+            })
+            .into(),
+        ])
+        .await
+        .unwrap();
+    assert!(
+        seqs(&session, "foobar").await.is_empty(),
+        "content and the first tool name must not be glued together without a separator"
+    );
+    assert_eq!(
+        seqs(&session, "foo\nbar").await,
+        vec![0],
+        "content and the first tool name must be newline-separated"
+    );
+    assert_eq!(
+        seqs(&session, "bar\n{\"path\"").await,
+        vec![0],
+        "the tool name and its raw arguments must be newline-separated"
+    );
+    assert_eq!(
+        seqs(&session, "foo\nbar\n{\"path\":\"barargs\"}").await,
+        vec![0],
+        "the projection is content + newline + name + newline + arguments"
+    );
+    assert_eq!(
+        seqs(&session, "foo").await,
+        vec![0],
+        "the turn's content stays searchable on its own"
+    );
+    assert_eq!(
+        seqs(&session, "bar").await,
+        vec![0],
+        "the turn's tool name stays searchable on its own"
+    );
+    assert_eq!(
+        seqs(&session, "baz").await,
+        vec![1],
+        "a contentless tool call stays searchable by name"
+    );
+    assert_eq!(
+        seqs(&session, "bazargs").await,
+        vec![1],
+        "a contentless tool call stays searchable by raw arguments"
+    );
+    assert_eq!(
+        seqs(&session, "\nbaz").await,
+        vec![1],
+        "a contentless tool call keeps the leading newline of its projection"
+    );
+    assert_eq!(
+        seqs(&session, "\nbaz\n{\"path\":\"bazargs\"}").await,
+        vec![1],
+        "the contentless projection is newline + name + newline + arguments"
+    );
 }
 
 #[tokio::test]
