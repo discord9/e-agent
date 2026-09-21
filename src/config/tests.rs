@@ -2910,6 +2910,35 @@ fn sandbox_project_scalars_can_enable_without_global_sandbox() {
 }
 
 #[test]
+fn sandbox_gpu_is_global_only() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("ws");
+    std::fs::create_dir_all(workspace.join(".e-agent")).unwrap();
+    let path = write_config(temp.path(), "[sandbox]\nenabled = true\ngpu = true\n");
+    let sandbox = Config::from_path(&path)
+        .unwrap()
+        .sandbox(&workspace)
+        .unwrap();
+    assert!(sandbox.gpu, "global gpu = true resolves into the policy");
+    // `gpu` is not a project-overlay key: a project `[sandbox] gpu = true`
+    // must fail closed at parse time rather than silently keep the global
+    // value (the project could otherwise not enable it, but must not look
+    // like it did).
+    std::fs::write(
+        workspace.join(".e-agent/config.toml"),
+        "[sandbox]\ngpu = true\n",
+    )
+    .unwrap();
+    let error = Config::from_path(&path)
+        .unwrap()
+        .sandbox(&workspace)
+        .unwrap_err();
+    let chain = format!("{error:#}");
+    assert!(chain.contains("cannot parse project config"), "{chain}");
+    assert!(chain.contains("gpu"), "{chain}");
+}
+
+#[test]
 fn sandbox_project_writable_path_without_global_sandbox_guides_user() {
     // No global [sandbox] at all + a project writable_paths entry must fail
     // with the offending path and actionable remediation, not a bare subset

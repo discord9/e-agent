@@ -1350,6 +1350,7 @@ async fn run_subagent_and_capture(
             enabled: true,
             network: true,
             workspace_writable: true,
+            gpu: false,
             writable_paths: vec!["/mnt/big/cargo-home".into()],
             readable_paths: vec!["~/.rustup".into()],
             readable_mounts: Vec::new(),

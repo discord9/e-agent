@@ -511,6 +511,29 @@ pub(super) fn build_bwrap_plan(
         "/etc".into(),
         "/etc".into(),
     ];
+    // GPU device nodes, opt-in via `[sandbox] gpu = true`. `--dev /dev`
+    // above starts a minimal devtmpfs (null/zero/random only); device nodes
+    // need `--dev-bind-try` (`--ro-bind` mounts are MS_NODEV and cannot open
+    // devices). `-try` doubles as detection: hosts without the node skip it.
+    // Covers AMD (amdgpu: /dev/kfd + /dev/dri) and NVIDIA (/dev/nvidia*).
+    if sandbox.gpu {
+        for node in ["/dev/kfd", "/dev/dri"] {
+            args.extend(["--dev-bind-try".into(), node.into(), node.into()]);
+        }
+        // NVIDIA nodes are per-driver enumerated; bind each that exists.
+        if let Ok(entries) = std::fs::read_dir("/dev") {
+            let mut nvidia: Vec<_> = entries
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name())
+                .filter(|name| name.to_string_lossy().starts_with("nvidia"))
+                .collect();
+            nvidia.sort();
+            for name in nvidia {
+                let path = format!("/dev/{}", name.to_string_lossy());
+                args.extend(["--dev-bind-try".into(), path.clone().into(), path.into()]);
+            }
+        }
+    }
     // systemd-resolved stub so symlinked /etc/resolv.conf works.
     if std::path::Path::new("/run/systemd/resolve").exists() {
         args.push("--dir".into());
