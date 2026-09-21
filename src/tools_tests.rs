@@ -6722,6 +6722,7 @@ print('TORCH_ACCEPTANCE_OK %s device=%d max_abs_diff=%s' % (arch, match, differe
     let command = format!(
         "printf '##ROCINFO\\n'\n{rocminfo} 2>&1\nrc=$?\nprintf 'rocminfo_rc=%s\\n' \"$rc\"\n\
          printf '##DEV\\n'\nls -l /dev/kfd /dev/dri/renderD128 2>&1\nrc=$?\nprintf 'dev_rc=%s\\n' \"$rc\"\n\
+         test ! -e /dev/kfd && test ! -e /dev/dri\nrc=$?\nprintf 'devices_absent_rc=%s\\n' \"$rc\"\n\
          printf '##TORCH\\n'\n{python} -c {program} 2>&1\nrc=$?\nprintf 'torch_rc=%s\\n' \"$rc\"\n",
         rocminfo = shell_quote(&rocminfo.display().to_string()),
         python = shell_quote(&python.display().to_string()),
@@ -6794,10 +6795,10 @@ print('TORCH_ACCEPTANCE_OK %s device=%d max_abs_diff=%s' % (arch, match, differe
             0,
             "the torch acceptance program must fail without a GPU: {torch_section}"
         );
-        assert_ne!(
-            acceptance_rc(device_section, "dev_rc"),
+        assert_eq!(
+            acceptance_rc(device_section, "devices_absent_rc"),
             0,
-            "gpu = false must leave the GPU device nodes absent: {device_section}"
+            "gpu = false must leave both /dev/kfd and /dev/dri absent: {device_section}"
         );
         println!("PASS gpu=false negative control: no ROCm device available inside the sandbox");
     }

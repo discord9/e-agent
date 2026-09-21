@@ -100,12 +100,8 @@ fi
 
 # cargo exits 0 with "0 passed; 0 filtered out" when --exact matches nothing,
 # so a successful exit alone is not evidence the acceptance test ran. Require
-# the named test's own result line and the harness summary for it.
-if ! grep -q "^test $test_name [.][.][.] ok$" "$output"; then
-    echo "FATAL: $test_name did not run and pass in $repo_root" >&2
-    echo "(cargo exit status 0 with zero matching tests is a failure)" >&2
-    exit 1
-fi
+# the harness summary for the exact selector. With --nocapture, single-thread
+# libtest output can split the test name and its final `ok` across lines.
 if ! grep -q "^test result: ok[.] 1 passed; 0 failed;" "$output"; then
     echo "FATAL: unexpected test result summary for $test_name in $repo_root" >&2
     exit 1
