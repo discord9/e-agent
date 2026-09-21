@@ -150,6 +150,13 @@ impl Tool for Bash {
                         sandbox.readable_paths.join(", ")
                     ));
                 }
+                if sandbox.gpu {
+                    description.push_str(
+                        " The host GPU is exposed (`[sandbox] gpu = true`): the AMD device \
+                     nodes plus the ROCm sysfs topology, so rocminfo and HIP/PyTorch can use \
+                     the GPU.",
+                    );
+                }
                 description.push_str(
                 " Bash mounts and read_file/write_file/edit_file capabilities are independent boundaries sharing this resolved path policy.",
             );
@@ -511,29 +518,6 @@ pub(super) fn build_bwrap_plan(
         "/etc".into(),
         "/etc".into(),
     ];
-    // GPU device nodes, opt-in via `[sandbox] gpu = true`. `--dev /dev`
-    // above starts a minimal devtmpfs (null/zero/random only); device nodes
-    // need `--dev-bind-try` (`--ro-bind` mounts are MS_NODEV and cannot open
-    // devices). `-try` doubles as detection: hosts without the node skip it.
-    // Covers AMD (amdgpu: /dev/kfd + /dev/dri) and NVIDIA (/dev/nvidia*).
-    if sandbox.gpu {
-        for node in ["/dev/kfd", "/dev/dri"] {
-            args.extend(["--dev-bind-try".into(), node.into(), node.into()]);
-        }
-        // NVIDIA nodes are per-driver enumerated; bind each that exists.
-        if let Ok(entries) = std::fs::read_dir("/dev") {
-            let mut nvidia: Vec<_> = entries
-                .filter_map(|entry| entry.ok())
-                .map(|entry| entry.file_name())
-                .filter(|name| name.to_string_lossy().starts_with("nvidia"))
-                .collect();
-            nvidia.sort();
-            for name in nvidia {
-                let path = format!("/dev/{}", name.to_string_lossy());
-                args.extend(["--dev-bind-try".into(), path.clone().into(), path.into()]);
-            }
-        }
-    }
     // systemd-resolved stub so symlinked /etc/resolv.conf works.
     if std::path::Path::new("/run/systemd/resolve").exists() {
         args.push("--dir".into());
@@ -801,6 +785,57 @@ pub(super) fn build_bwrap_plan(
             args.push("--ro-bind".into());
             args.push(git_path.clone().into());
             args.push(git_path.into());
+        }
+    }
+
+    // GPU access, opt-in via `[sandbox] gpu = true`. `--dev /dev` in the
+    // prologue starts a minimal devtmpfs (null/zero/random only); real
+    // device nodes need `--dev-bind-try` (`--ro-bind` mounts are MS_NODEV
+    // and cannot open devices). `-try` doubles as detection: a host without
+    // the node skips it.
+    //
+    // AMD/ROCm: the device nodes alone are not enough. HSA initialization
+    // reads the KFD topology from `/sys/devices` (virtual/kfd + the DRM
+    // devices), HIP maps each KFD node to its DRM render node through the
+    // `/sys/dev/char/<maj>:<min>` symlinks (whose targets live under
+    // `/sys/devices`), and `rocminfo` additionally gates on
+    // `/sys/module/amdgpu` (`initstate`: "ROCk module is loaded"). Without
+    // them a sandboxed `rocminfo` reports no agents (or "ROCk module is NOT
+    // loaded") and PyTorch enumerates zero HIP devices even though
+    // `/dev/kfd` opened successfully.
+    //
+    // Those three stable subtrees are the measured minimum for
+    // rocminfo + torch on amdgpu; a narrower grant of just the KFD nodes
+    // (`/sys/devices/virtual/kfd`, `/sys/class/kfd`) was measured
+    // insufficient (rocminfo: "hsa api call failure"; torch: 0 HIP devices),
+    // and per-node PCI/DRM topology paths are deliberately NOT enumerated
+    // (host-specific, would rot with every device).
+    //
+    // Installed AFTER every configured mount: bwrap layers later mounts on
+    // top, so a configured path that overlaps a device node (e.g. a
+    // `readable_paths` entry covering `/dev/dri`) would otherwise land an
+    // MS_NODEV read-only bind over the `--dev-bind-try` and silently make
+    // the device unopenable. Last-wins precedence keeps the explicit
+    // `gpu = true` authority authoritative without a new validation pass.
+    if sandbox.gpu {
+        for node in ["/dev/kfd", "/dev/dri"] {
+            args.extend(["--dev-bind-try".into(), node.into(), node.into()]);
+        }
+        // NVIDIA nodes are per-driver enumerated; bind each that exists.
+        if let Ok(entries) = std::fs::read_dir("/dev") {
+            let mut nvidia: Vec<_> = entries
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name())
+                .filter(|name| name.to_string_lossy().starts_with("nvidia"))
+                .collect();
+            nvidia.sort();
+            for name in nvidia {
+                let path = format!("/dev/{}", name.to_string_lossy());
+                args.extend(["--dev-bind-try".into(), path.clone().into(), path.into()]);
+            }
+        }
+        for path in ["/sys/devices", "/sys/dev/char", "/sys/module/amdgpu"] {
+            args.extend(["--ro-bind-try".into(), path.into(), path.into()]);
         }
     }
 
