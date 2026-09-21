@@ -788,35 +788,15 @@ pub(super) fn build_bwrap_plan(
         }
     }
 
-    // GPU access, opt-in via `[sandbox] gpu = true`. `--dev /dev` in the
-    // prologue starts a minimal devtmpfs (null/zero/random only); real
-    // device nodes need `--dev-bind-try` (`--ro-bind` mounts are MS_NODEV
-    // and cannot open devices). `-try` doubles as detection: a host without
-    // the node skips it.
-    //
-    // AMD/ROCm: the device nodes alone are not enough. HSA initialization
-    // reads the KFD topology from `/sys/devices` (virtual/kfd + the DRM
-    // devices), HIP maps each KFD node to its DRM render node through the
-    // `/sys/dev/char/<maj>:<min>` symlinks (whose targets live under
-    // `/sys/devices`), and `rocminfo` additionally gates on
-    // `/sys/module/amdgpu` (`initstate`: "ROCk module is loaded"). Without
-    // them a sandboxed `rocminfo` reports no agents (or "ROCk module is NOT
-    // loaded") and PyTorch enumerates zero HIP devices even though
-    // `/dev/kfd` opened successfully.
-    //
-    // Those three stable subtrees are the measured minimum for
-    // rocminfo + torch on amdgpu; a narrower grant of just the KFD nodes
-    // (`/sys/devices/virtual/kfd`, `/sys/class/kfd`) was measured
-    // insufficient (rocminfo: "hsa api call failure"; torch: 0 HIP devices),
-    // and per-node PCI/DRM topology paths are deliberately NOT enumerated
-    // (host-specific, would rot with every device).
-    //
-    // Installed AFTER every configured mount: bwrap layers later mounts on
-    // top, so a configured path that overlaps a device node (e.g. a
-    // `readable_paths` entry covering `/dev/dri`) would otherwise land an
-    // MS_NODEV read-only bind over the `--dev-bind-try` and silently make
-    // the device unopenable. Last-wins precedence keeps the explicit
-    // `gpu = true` authority authoritative without a new validation pass.
+    // GPU access, opt-in via `[sandbox] gpu = true`. `--dev /dev` starts a
+    // minimal devtmpfs, so real devices need `--dev-bind-try` (a `--ro-bind`
+    // is MS_NODEV and cannot open devices); `-try` skips nodes the host lacks.
+    // AMD/ROCm enumeration additionally reads sysfs: `/sys/devices` (KFD
+    // topology + DRM devices), `/sys/dev/char` (the device-number links HIP
+    // uses to match KFD nodes to render nodes) and `/sys/module/amdgpu`
+    // (rocminfo's module gate) — all read-only.
+    // Installed after every configured mount so the `--dev-bind-try` devices
+    // win over any overlapping configured bind (last mount wins in bwrap).
     if sandbox.gpu {
         for node in ["/dev/kfd", "/dev/dri"] {
             args.extend(["--dev-bind-try".into(), node.into(), node.into()]);
