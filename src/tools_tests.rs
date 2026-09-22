@@ -1238,14 +1238,14 @@ async fn failed_truncated_bash_writes_full_output_log() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn successful_long_bash_output_does_not_write_a_log() {
+async fn successful_truncated_bash_writes_full_output_log() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();
     let shell = Shell::detect().unwrap();
     let text = run_bash(
         &shell,
         &workspace,
-        "printf 'y%.0s' {1..100000}",
+        "for i in {1..100}; do printf 'y%.0s' {1..1000}; printf '\\n'; done",
         None,
         false,
         None,
@@ -1256,10 +1256,81 @@ async fn successful_long_bash_output_does_not_write_a_log() {
     )
     .await
     .unwrap();
-    // Truncated display, but success → no persistence, no hint.
     assert!(text.contains("[truncated: "), "{text}");
+    let path = text
+        .split("[full output: ")
+        .nth(1)
+        .and_then(|rest| rest.split(']').next())
+        .expect("successful+truncated output must hint the full log");
+    let content = std::fs::read_to_string(path).unwrap();
+    let stdout_section = content.split("--- stdout ---").nth(1).unwrap();
+    let stdout_only = stdout_section.split("--- stderr ---").next().unwrap();
+    assert_eq!(stdout_only.matches('y').count(), 100_000);
+
+    // The recovery hint is a workspace path accepted by read_file.
+    let recovered = ReadFile {
+        workspace: workspace.clone(),
+    }
+    .execute(json!({"path": path, "limit": 3}))
+    .await
+    .unwrap();
+    assert!(recovered.content.starts_with("$ for i in"), "{recovered:?}");
+    assert!(
+        recovered.content.contains(&"y".repeat(1000)),
+        "{recovered:?}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn successful_untruncated_bash_output_does_not_write_a_log() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(temp.path()).unwrap();
+    let shell = Shell::detect().unwrap();
+    let text = run_bash(
+        &shell,
+        &workspace,
+        "printf 'y'",
+        None,
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(!text.contains("[truncated: "), "{text}");
     assert!(!text.contains("[full output: "), "{text}");
     assert!(!temp.path().join(".e-agent/logs").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn successful_truncated_bash_ignores_archive_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    // A file at this path makes create_dir_all fail without relying on
+    // permission behavior that can vary for privileged test runners.
+    std::fs::write(temp.path().join(".e-agent"), "not a directory").unwrap();
+    let workspace = Workspace::new(temp.path()).unwrap();
+    let shell = Shell::detect().unwrap();
+    let text = run_bash(
+        &shell,
+        &workspace,
+        "printf 'z%.0s' {1..100000}",
+        None,
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("archive failure must not change successful command result");
+    assert!(text.contains("[truncated: "), "{text}");
+    assert!(!text.contains("[full output: "), "{text}");
 }
 
 #[cfg(target_os = "linux")]

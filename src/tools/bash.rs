@@ -1,9 +1,10 @@
 use super::*;
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 #[cfg(unix)]
 use std::os::unix::{
@@ -1593,20 +1594,19 @@ pub(super) async fn run_bash_with_stall_state(
             cancellation_source: None,
         };
     }
-    let text = format_output(status.code(), &stdout, &stderr);
+    let mut text = format_output(status.code(), &stdout, &stderr);
+    // A truncated visible projection needs a recoverable log regardless of
+    // exit status. Archive errors deliberately leave the command result
+    // unchanged: a successful command must remain successful when its log
+    // cannot be written.
+    if (stdout.truncated || stderr.truncated)
+        && let Some(path) = persist_full_output(workspace.root(), command, &stdout, &stderr)
+    {
+        text.push_str(&format!("\n[full output: {}]", path.display()));
+    }
     if status.success() {
         Ok(text)
     } else {
-        let mut text = text;
-        // rtk-style "tee on failure": a failed command whose visible output
-        // was truncated gets its full output written to a log file so the
-        // model can read_file the whole log instead of guessing from the
-        // surviving head+tail. Successful long output is not persisted.
-        if (stdout.truncated || stderr.truncated)
-            && let Some(path) = persist_full_output(workspace.root(), command, &stdout, &stderr)
-        {
-            text.push_str(&format!("\n[full output: {}]", path.display()));
-        }
         Err(text)
     }
 }
@@ -1620,11 +1620,11 @@ pub(super) async fn run_bash_with_stall_state(
 /// for a failed command.
 pub(super) const HEAD_LIMIT: usize = 48 * 1024;
 pub(super) const TAIL_LIMIT: usize = 16 * 1024;
-/// Upper bound on the full output retained in memory per stream for failure
-/// persistence (see [`persist_full_output`]). Always retaining up to
-/// 2 × `FULL_LIMIT` bytes is cheap for typical command output and avoids a
-/// spool-file round trip; a stream longer than this only gets its first
-/// `FULL_LIMIT` bytes written to the log.
+/// Upper bound on the full output retained in memory per stream for
+/// truncated-output persistence (see [`persist_full_output`]). Always
+/// retaining up to 2 × `FULL_LIMIT` bytes is cheap for typical command output
+/// and avoids a spool-file round trip; a stream longer than this only gets its
+/// first `FULL_LIMIT` bytes written to the log.
 pub(super) const FULL_LIMIT: usize = 16 * 1024 * 1024;
 
 /// Per-stream capture budget `(head, tail, output cap, full cap)`.
@@ -1648,8 +1648,8 @@ pub(super) struct Captured {
     /// Total bytes read from the stream (before head/tail alignment).
     pub(super) total: usize,
     pub(super) truncated: bool,
-    /// Complete stream up to `FULL_LIMIT` bytes, retained so a failed and
-    /// truncated command's full output can be persisted to a log file.
+    /// Complete stream up to `FULL_LIMIT` bytes, retained so a truncated
+    /// command's output can be persisted to a log file.
     pub(super) full: Vec<u8>,
 }
 
@@ -1684,7 +1684,7 @@ pub(super) async fn capture_with(
         let data = &buffer[..count];
         super::background::TaskSpool::capture_append(slot.as_ref(), spool.as_ref(), data);
         captured.total += count;
-        // Full output for potential failure persistence, capped at full_limit.
+        // Full output for potential truncated-output persistence, capped at full_limit.
         if captured.full.len() < full_limit {
             let room = full_limit - captured.full.len();
             captured.full.extend_from_slice(&data[..count.min(room)]);
@@ -1850,11 +1850,12 @@ pub(super) fn utf8_front_boundary(bytes: &[u8], offset: usize) -> usize {
     pos
 }
 
-/// Persist the full untruncated output of a failed command whose displayed
-/// text was truncated, to `<workspace>/.e-agent/logs/bash-{timestamp}-{slug}.log`,
-/// and return the path so the result can hint `[full output: …]` and the
-/// model can `read_file` the log for the whole text. Returns `None` when
-/// nothing could be written (I/O error — e.g. a read-only workspace).
+/// Persist capped full output whose displayed text was truncated, to
+/// `<workspace>/.e-agent/logs/bash-{timestamp}-{sequence}-{slug}.log`, and
+/// return the path so the result can hint `[full output: …]` and the model can
+/// `read_file` the log. Returns `None` when nothing could be written (I/O
+/// error — e.g. a read-only workspace). The sequence avoids overwriting logs
+/// from commands that complete within the same timestamp.
 /// Memory trade-off: `capture` always retains up to `FULL_LIMIT` bytes per
 /// stream so the full text is available here without re-running the command;
 /// streams longer than the cap are truncated in the log with a note.
@@ -1864,31 +1865,32 @@ pub(super) fn persist_full_output(
     stdout: &Captured,
     stderr: &Captured,
 ) -> Option<std::path::PathBuf> {
+    static LOG_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
     let logs_dir = workspace_root.join(".e-agent").join("logs");
     std::fs::create_dir_all(&logs_dir).ok()?;
     let path = logs_dir.join(format!(
-        "bash-{}-{}.log",
-        chrono::Local::now().format("%Y%m%d-%H%M%S%.3f"),
+        "bash-{}-{:016x}-{}.log",
+        chrono::Local::now().format("%Y%m%d-%H%M%S%.9f"),
+        LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed),
         command_slug(command)
     ));
-    let mut content = format!("$ {command}\n--- stdout ---\n");
-    content.push_str(&String::from_utf8_lossy(&stdout.full));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .ok()?;
+    write!(file, "$ {command}\n--- stdout ---\n").ok()?;
+    file.write_all(&stdout.full).ok()?;
     if stdout.total > stdout.full.len() {
-        content.push_str(&format!(
-            "\n[stdout log capped at {} bytes]\n",
-            stdout.full.len()
-        ));
+        writeln!(file, "\n[stdout log capped at {} bytes]", stdout.full.len()).ok()?;
     }
-    content.push_str("\n--- stderr ---\n");
-    content.push_str(&String::from_utf8_lossy(&stderr.full));
+    file.write_all(b"\n--- stderr ---\n").ok()?;
+    file.write_all(&stderr.full).ok()?;
     if stderr.total > stderr.full.len() {
-        content.push_str(&format!(
-            "\n[stderr log capped at {} bytes]\n",
-            stderr.full.len()
-        ));
+        writeln!(file, "\n[stderr log capped at {} bytes]", stderr.full.len()).ok()?;
     }
-    content.push('\n');
-    std::fs::write(&path, content).ok()?;
+    file.write_all(b"\n").ok()?;
     Some(path)
 }
 

@@ -1606,23 +1606,16 @@ pub(super) async fn run(
             cancellation_source: None,
         };
     }
-    let text = format_output(Some(code), &stdout, &stderr);
-    if code == 0 {
-        Ok(text)
-    } else {
-        let mut text = text;
-        // Same "tee on failure" as `bash::run`: a failed command whose
-        // visible output was truncated gets its full output written to a log
-        // file so the model can read_file the whole log instead of guessing
-        // from the surviving head+tail. Successful long output is not
-        // persisted.
-        if (stdout.truncated || stderr.truncated)
-            && let Some(path) = persist_full_output(workspace.root(), command, &stdout, &stderr)
-        {
-            text.push_str(&format!("\n[full output: {}]", path.display()));
-        }
-        Err(text)
+    let mut text = format_output(Some(code), &stdout, &stderr);
+    // Match `bash::run`: archive truncated output for recovery without
+    // changing a successful command into a failure if the archive cannot be
+    // written.
+    if (stdout.truncated || stderr.truncated)
+        && let Some(path) = persist_full_output(workspace.root(), command, &stdout, &stderr)
+    {
+        text.push_str(&format!("\n[full output: {}]", path.display()));
     }
+    if code == 0 { Ok(text) } else { Err(text) }
 }
 
 #[cfg(test)]
