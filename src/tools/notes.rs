@@ -328,9 +328,6 @@ impl Notes {
             .workspace
             .read(&logical.to_string_lossy())
             .map_err(|error| format!("note `{label}` read failed: {error}"))?;
-        if bytes.len() > READ_LIMIT {
-            return Err(format!("note `{label}` exceeds the 64 KiB read limit"));
-        }
         String::from_utf8(bytes).map_err(|_| format!("note `{label}` is not valid UTF-8"))
     }
 
@@ -361,6 +358,11 @@ impl Notes {
         let mut errors = files.errors;
         for path in files.paths {
             match self.note_text(Path::new(&path)) {
+                Ok(text) if text.len() > READ_LIMIT => Self::error(
+                    &mut errors,
+                    Path::new(&path),
+                    format!("note `{path}` exceeds the 64 KiB read limit"),
+                ),
                 Ok(text) => {
                     for (line, content) in text.lines().enumerate() {
                         if content.to_lowercase().contains(&query) {
@@ -911,13 +913,44 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.contains("note `bad` is not valid UTF-8"));
+    }
 
-        fs::write(root.join("oversized"), vec![b'x'; READ_LIMIT + 1]).unwrap();
-        let error = notes
-            .execute(json!({"action":"read","path":"oversized"}))
+    #[tokio::test]
+    async fn notes_read_pages_large_notes() {
+        let temp = tempfile::tempdir().unwrap();
+        let notes = tool(&temp, false);
+        notes
+            .execute(json!({
+                "action": "write",
+                "path": "large",
+                "content": "x".repeat(READ_LIMIT + 101),
+            }))
             .await
-            .unwrap_err();
-        assert!(error.contains("note `oversized` exceeds the 64 KiB read limit"));
+            .unwrap();
+
+        let first = output(
+            notes
+                .execute(json!({"action":"read","path":"large","offset":0,"limit":100}))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(first["content"], "x".repeat(100));
+        assert_eq!(first["offset"], 0);
+        assert_eq!(first["next_offset"], 100);
+        assert_eq!(first["has_more"], true);
+
+        let middle = output(
+            notes
+                .execute(json!({
+                    "action":"read", "path":"large", "offset":READ_LIMIT, "limit":100
+                }))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(middle["content"], "x".repeat(100));
+        assert_eq!(middle["offset"], READ_LIMIT);
+        assert_eq!(middle["next_offset"], READ_LIMIT + 100);
+        assert_eq!(middle["has_more"], true);
     }
 
     #[tokio::test]
