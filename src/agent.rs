@@ -5,7 +5,7 @@ use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 
-use crate::output_receipt::{FieldId, bound_field};
+use crate::output_receipt::{FieldId, bound_field, issue_direct};
 use crate::session_store::EntryLocation;
 
 /// Content of the synthetic error result inserted for every tool call left
@@ -57,6 +57,10 @@ pub(crate) fn tool_error_content(error: &str) -> &str {
 /// the compaction window becomes everything except this recent tail of tool
 /// activity, which keeps the agent working after the compaction.
 const RETAIN_TAIL: usize = 20;
+
+/// Number of newest provider messages whose eligible tool/background output
+/// stays verbatim in ordinary request projections.
+const RECEIPT_STUB_RECENT_MESSAGES: usize = 20;
 
 /// How a session's compaction chooses its retained tail. The mode is set
 /// explicitly by the caller — it is NEVER inferred from the history (a
@@ -1132,6 +1136,81 @@ impl ContextItem {
     }
 }
 
+/// First old item in an ordinary request. If the age cut lands in a tool
+/// result batch, retain its opening assistant call too, matching compaction's
+/// complete-batch boundary.
+fn receipt_stub_recent_start(items: &[ContextItem]) -> usize {
+    let candidate = items.len().saturating_sub(RECEIPT_STUB_RECENT_MESSAGES);
+    if candidate < items.len() && matches!(items[candidate].message, Message::Tool { .. }) {
+        items[..candidate]
+            .iter()
+            .rposition(|item| matches!(item.message, Message::Assistant(_)))
+            .unwrap_or(candidate)
+    } else {
+        candidate
+    }
+}
+
+/// Replace an eligible old output with a short direct receipt. This only
+/// operates on persisted textual tool results and structured background
+/// output; it deliberately leaves normal user-shaped retained entries alone.
+fn receipt_stub(item: &ContextItem) -> Option<Message> {
+    if item.keep_full {
+        return None;
+    }
+    let location = item.location.as_ref()?;
+    match &item.message {
+        Message::Tool {
+            call_id,
+            name,
+            content,
+            images,
+            is_error,
+            synthetic,
+        } if !*synthetic && images.is_empty() => {
+            let field = item.field.unwrap_or(FieldId::ToolContent);
+            let stub = receipt_stub_text(name, content.len(), location, field);
+            (stub.len() < content.len()).then(|| Message::Tool {
+                call_id: call_id.clone(),
+                name: name.clone(),
+                content: stub,
+                images: images.clone(),
+                is_error: *is_error,
+                synthetic: *synthetic,
+            })
+        }
+        Message::User { content, images }
+            if item.field == Some(FieldId::BgOutput) && images.is_empty() =>
+        {
+            let output = content.strip_prefix(&item.prefix)?;
+            let stub = receipt_stub_text("background", output.len(), location, FieldId::BgOutput);
+            let projected = format!("{}{stub}", item.prefix);
+            (projected.len() < content.len()).then(|| Message::User {
+                content: projected,
+                images: images.clone(),
+            })
+        }
+        Message::User { .. } | Message::Assistant(_) | Message::System { .. } => None,
+        Message::Tool { .. } => None,
+    }
+}
+
+fn receipt_stub_text(name: &str, bytes: usize, location: &EntryLocation, field: FieldId) -> String {
+    format!(
+        "[tool output: {name} ({})] [{}]",
+        receipt_size(bytes),
+        issue_direct(location, field)
+    )
+}
+
+fn receipt_size(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else {
+        format!("{}.{} KiB", bytes / 1024, (bytes % 1024) * 10 / 1024)
+    }
+}
+
 type WebHeadPage = (
     Vec<SessionEntry>,
     Vec<Option<EntryLocation>>,
@@ -1552,19 +1631,21 @@ impl Agent {
     }
 
     /// The bounded provider request copy: identical to [`Self::context`]
-    /// except that eligible oversized persisted fields (background
-    /// completion output, tool content, notice text, historical
-    /// user/assistant content, compaction summary/retained) are projected
-    /// as a UTF-8-safe head+tail plus a session-local `eout1` ref
-    /// (`read_output` ref). System messages, the session goal, the CURRENT
+    /// except that eligible persisted fields are bounded as a UTF-8-safe
+    /// head+tail plus a session-local `eout1` ref (`read_output` ref), and
+    /// old located textual tool/background outputs are further reduced to a
+    /// short receipt stub. System messages, the session goal, the CURRENT
     /// actual user message, tool call ids/names/arguments, reasoning, and
     /// images are kept exact. A field is left full when no located key
-    /// exists for its entry or when no registry is installed —
-    /// never an unusable ref.
+    /// exists for its entry or when no registry is installed — never an
+    /// unusable ref.
     pub fn context_request(&self) -> Vec<Message> {
-        self.repaired_items()
-            .into_iter()
-            .map(|item| self.project_item(&item))
+        let items = self.repaired_items();
+        let recent_start = receipt_stub_recent_start(&items);
+        items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| self.project_request_item(item, index < recent_start))
             .collect()
     }
 
@@ -1762,8 +1843,19 @@ impl Agent {
         items
     }
 
-    /// Project one context item to its bounded request copy (see
-    /// [`Self::context_request`] for the rules).
+    /// Project one ordinary provider-request item. Old, located textual tool
+    /// results and structured background outputs use a receipt-only stub;
+    /// every other item keeps the normal bounded projection.
+    fn project_request_item(&self, item: &ContextItem, old: bool) -> Message {
+        if old && let Some(stub) = receipt_stub(item) {
+            return stub;
+        }
+        self.project_item(item)
+    }
+
+    /// Project one context item to its normal bounded request copy (see
+    /// [`Self::context_request`] for the rules). Compaction requests use this
+    /// directly so their summarization view remains receipt-stub-free.
     fn project_item(&self, item: &ContextItem) -> Message {
         if item.keep_full {
             return item.message.clone();

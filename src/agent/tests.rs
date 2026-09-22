@@ -2195,6 +2195,150 @@ fn context_request_passes_small_outputs_through_byte_identical() {
 }
 
 #[test]
+fn context_request_receipt_stubs_old_located_outputs_only() {
+    let mut agent = Agent::new(
+        Box::new(ScriptedModel {
+            replies: vec![],
+            requests: Arc::new(Mutex::new(Vec::new())),
+            delays: Default::default(),
+        }),
+        vec![],
+    );
+    let root = tempfile::tempdir().unwrap();
+    let output = "old output ".repeat(40);
+    let history: Vec<_> = (0..22)
+        .map(|id| SessionEntry::BackgroundCompletion {
+            id,
+            output: output.clone(),
+            label: (id == 0).then(|| "first".into()),
+            started_at_ms: None,
+            duration_ms: None,
+            exit_code: None,
+            signal: None,
+            status: None,
+            kind: None,
+            cancellation_source: None,
+        })
+        .collect();
+    let locations: Vec<_> = (0..22)
+        .map(|ordinal| Some(jsonl_location(root.path(), "receipt-stubs", ordinal)))
+        .collect();
+    agent.restore_located(history, locations);
+
+    let request = agent.context_request();
+    assert!(matches!(
+        &request[0],
+        Message::User { content, .. }
+            if content == "[background task 0 completed: first]\n[tool output: background (440 B)] [eout1.0.b]"
+    ));
+    assert!(matches!(
+        &request[1],
+        Message::User { content, .. } if content.contains("[eout1.1.b]")
+    ));
+    assert!(matches!(
+        &request[2],
+        Message::User { content, .. }
+            if content == &format!("[background task 2 completed]\n{output}")
+    ));
+    assert_eq!(
+        agent.context()[0],
+        Message::User {
+            content: format!("[background task 0 completed: first]\n{output}"),
+            images: vec![],
+        }
+    );
+}
+
+#[test]
+fn context_request_receipt_stubs_preserve_tool_envelope_and_unlocated_output() {
+    let mut agent = Agent::new(
+        Box::new(ScriptedModel {
+            replies: vec![],
+            requests: Arc::new(Mutex::new(Vec::new())),
+            delays: Default::default(),
+        }),
+        vec![],
+    );
+    let root = tempfile::tempdir().unwrap();
+    let output = "old tool output ".repeat(40);
+    let mut history = Vec::new();
+    let mut locations = Vec::new();
+    for ordinal in 0..11 {
+        let tool_call = call(&format!("call-{ordinal}"), "bash", "{}");
+        history.push(
+            Message::Assistant(AssistantMessage {
+                content: None,
+                tool_calls: vec![tool_call.clone()],
+                reasoning: None,
+            })
+            .into(),
+        );
+        locations.push(Some(jsonl_location(
+            root.path(),
+            "tool-receipt-stubs",
+            ordinal * 2,
+        )));
+        history.push(
+            Message::Tool {
+                call_id: tool_call.id,
+                name: "bash".into(),
+                content: output.clone(),
+                images: vec![],
+                is_error: ordinal == 0,
+                synthetic: false,
+            }
+            .into(),
+        );
+        locations.push(Some(jsonl_location(
+            root.path(),
+            "tool-receipt-stubs",
+            ordinal * 2 + 1,
+        )));
+    }
+    agent.restore_located(history, locations);
+
+    let Message::Tool {
+        call_id,
+        name,
+        content,
+        images,
+        is_error,
+        synthetic,
+    } = &agent.context_request()[1]
+    else {
+        panic!("expected first tool result");
+    };
+    assert_eq!(call_id, "call-0");
+    assert_eq!(name, "bash");
+    assert_eq!(content, "[tool output: bash (640 B)] [eout1.1.t]");
+    assert!(images.is_empty());
+    assert!(*is_error);
+    assert!(!*synthetic);
+
+    let unlocated = SessionEntry::BackgroundCompletion {
+        id: 99,
+        output: output.clone(),
+        label: None,
+        started_at_ms: None,
+        duration_ms: None,
+        exit_code: None,
+        signal: None,
+        status: None,
+        kind: None,
+        cancellation_source: None,
+    };
+    agent.restore_located(
+        vec![unlocated; RECEIPT_STUB_RECENT_MESSAGES + 1],
+        vec![None; RECEIPT_STUB_RECENT_MESSAGES + 1],
+    );
+    assert!(matches!(
+        &agent.context_request()[0],
+        Message::User { content, .. }
+            if content == &format!("[background task 99 completed]\n{output}")
+    ));
+}
+
+#[test]
 fn context_request_bounds_oversized_background_completion_with_receipt() {
     let output = format!(
         "{}{}{}",
