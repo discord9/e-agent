@@ -94,6 +94,8 @@
   #contentWrap {
     flex: 1 1 auto;
     min-width: 0;          /* flex 子项默认 min-width:auto：侧边栏 + 长内容会横向溢出 */
+    max-width: 100%;       /* 双保险：即使内部内容意外撑宽，也不越过 #appBody 给的宽度，
+                            杜绝平板竖屏下的「wriggle room」横向滚动 */
     display: flex;
     flex-direction: column;
     position: relative;    /* 聊天区内 absolute 定位（回到底部按钮）的锚点 */
@@ -1199,7 +1201,13 @@
     font-size: 13px;
     line-height: 1.5;
     min-height: 40px;
-    max-height: 160px;
+    /* 上限取「160px」与「22vh」的较小值：桌面 900px 视口 22vh≈198px→用 160px
+       （与旧行为一致）；iPad 横屏 768px 视口 22vh≈169px→160px；iPad 竖屏键盘
+       弹出后 22vh≈130px→130px。JS autosizeInput() 用 inline style.height 设值，
+       但 inline 像素若超出 max-height，CSS max-height 仍生效（inline 只压过
+       同优先级的 height，不压 max-height）。避免长草稿把取消/发送按钮挤出
+       视口（平板实测 composer 620px→≤45% 高）。 */
+    max-height: min(160px, 22vh);
     overflow-y: auto;
   }
   .composer-actions {
