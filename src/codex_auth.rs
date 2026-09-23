@@ -237,9 +237,14 @@ pub async fn login() -> anyhow::Result<CodexAuth> {
     let port = listener.local_addr()?.port();
     let redirect_uri = format!("http://localhost:{port}/auth/callback");
     let authorize = authorize_url(&redirect_uri, &pkce)?;
-    if webbrowser::open(authorize.as_str()).is_err() {
-        eprintln!("Open this URL in a browser to continue:\n{authorize}");
-    }
+    // Always print the URL: webbrowser only reports whether it managed to spawn
+    // a launcher, not whether a browser actually opened (headless/remote sessions
+    // get Ok from a shim that displays nothing).
+    eprintln!(
+        "Open this URL in a browser to continue:\n{authorize}\n(remote session: forward the callback port with `ssh -L {port}:127.0.0.1:{port} <host>`)"
+    );
+    // Best effort: on a desktop session this still opens the browser for you.
+    let _ = webbrowser::open(authorize.as_str());
     let mut callback = receive_callback(listener, &pkce.state).await?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(600))
