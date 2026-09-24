@@ -6630,10 +6630,15 @@ fn gpu_binds_plan_ordering_and_opt_in() {
 /// Environment (no host path is hardcoded):
 /// - `E_AGENT_GPU_ACCEPTANCE_PYTHON` (required): host Python whose interpreter
 ///   has a ROCm-built PyTorch (its environment root is granted read-only).
-/// - `E_AGENT_GPU_ACCEPTANCE_ROCMINFO` (required): host `rocminfo`; its ROCm
-///   prefix is granted read-only.
+/// - `E_AGENT_GPU_ACCEPTANCE_ROCMINFO` (required): host `rocminfo` to run
+///   inside the sandbox. The acceptance proves that `gpu = true` ALONE
+///   exposes the runtime on a conventional `/opt/rocm` install — the ROCm
+///   prefix is NOT granted here, it arrives through the flag's auto-grant. A
+///   non-conventional install prefix can be supplied explicitly through
+///   `E_AGENT_GPU_ACCEPTANCE_READABLE`.
 /// - `E_AGENT_GPU_ACCEPTANCE_READABLE` (optional, `:`-separated): extra
-///   read-only roots to grant inside the sandbox.
+///   read-only roots to grant inside the sandbox (e.g. a non-conventional
+///   ROCm prefix).
 /// - `E_AGENT_GPU_ACCEPTANCE_WORKSPACE` (optional): workspace directory; a
 ///   fresh temporary directory is used when unset.
 /// - `E_AGENT_GPU_ACCEPTANCE_ARCH` (optional, default `gfx1201`): the GPU
@@ -6652,17 +6657,11 @@ async fn gpu_acceptance_amd_rocm_sandbox() {
     let rocminfo = required_env_path("E_AGENT_GPU_ACCEPTANCE_ROCMINFO");
     let arch = std::env::var("E_AGENT_GPU_ACCEPTANCE_ARCH").unwrap_or_else(|_| "gfx1201".into());
     let gpu = std::env::var("E_AGENT_GPU_ACCEPTANCE_GPU").map_or(true, |value| value != "false");
-    // ROCm prefix: `<prefix>/bin/rocminfo` (a `/usr/bin/rocminfo` resolves to
-    // `/usr`, already mounted read-only by the sandbox).
-    let rocm_root = rocminfo
-        .parent()
-        .and_then(Path::parent)
-        .unwrap_or_else(|| Path::new("/usr"))
-        .to_path_buf();
-    let mut readable = vec![
-        rocm_root.display().to_string(),
-        python_environment_root(&python).display().to_string(),
-    ];
+    // Only the Python environment root is granted explicitly: the ROCm
+    // runtime prefix must arrive through the `gpu = true` auto-grant on a
+    // conventional `/opt/rocm` install (`E_AGENT_GPU_ACCEPTANCE_READABLE`
+    // supplies a non-conventional prefix instead).
+    let mut readable = vec![python_environment_root(&python).display().to_string()];
     if let Ok(extra) = std::env::var("E_AGENT_GPU_ACCEPTANCE_READABLE") {
         readable.extend(
             extra
@@ -6688,10 +6687,10 @@ async fn gpu_acceptance_amd_rocm_sandbox() {
     let workspace = Workspace::new(&workspace_path).unwrap();
 
     // Temporary global config, parsed and resolved by the production
-    // resolver. `readable_paths` are the runtime installation roots the
-    // sandbox exposes read-only: a configured alias (e.g. /opt/rocm ->
-    // /etc/alternatives -> /opt/rocm-VER) keeps BOTH its configured and its
-    // canonical location, which is what the loader needs.
+    // resolver. `readable_paths` carries only the explicit grants above; the
+    // ROCm runtime prefix comes from `gpu = true` itself (the resolver adds
+    // it, and a configured alias keeps BOTH its configured and its canonical
+    // location, which is what the loader needs).
     let xdg = tempfile::tempdir().unwrap();
     let config_dir = xdg.path().join("e-agent");
     std::fs::create_dir_all(&config_dir).unwrap();

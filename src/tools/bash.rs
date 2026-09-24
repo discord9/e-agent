@@ -154,8 +154,8 @@ impl Tool for Bash {
                 if sandbox.gpu {
                     description.push_str(
                         " The host GPU is exposed (`[sandbox] gpu = true`): the AMD device \
-                     nodes plus the ROCm sysfs topology, so rocminfo and HIP/PyTorch can use \
-                     the GPU.",
+                     nodes, the ROCm sysfs topology and the conventional `/opt/rocm` runtime \
+                     prefix (read-only), so rocminfo and HIP/PyTorch can use the GPU.",
                     );
                 }
                 description.push_str(

@@ -344,30 +344,32 @@ enabled = true
 `gpu` is global-config-only: a project `.e-agent/config.toml` that sets it is
 rejected at startup.
 
-`gpu` and the runtime installation are two separate halves of one policy.
-`gpu = true` grants the host GPU device nodes (`/dev/kfd`, `/dev/dri`, plus any
-`/dev/nvidia*`, mounted read-write) and the sysfs subtrees the AMD ROCm runtime
-reads: `/sys/devices` for the KFD topology and the DRM devices, `/sys/dev/char`
-for the device-number links HIP uses to match KFD nodes to render nodes, and
-`/sys/module/amdgpu` for the module state `rocminfo` gates on. The sysfs
-subtrees are mounted read-only. These grants are unconditional under the flag —
-they are not detected from the host GPU vendor, so they simply do not resolve
-on hosts without those paths. `gpu = true` alone does not make a ROCm
-installation visible: the loader, the `rocminfo` binary and the Python
-environment must be mounted through `readable_paths`. Both are needed for a
-working `rocminfo`/HIP inside the sandbox, e.g.
+`gpu` and the runtime installation are one policy. `gpu = true` grants the host
+GPU device nodes (`/dev/kfd`, `/dev/dri`, plus any `/dev/nvidia*`, mounted
+read-write), the sysfs subtrees the AMD ROCm runtime reads — `/sys/devices` for
+the KFD topology and the DRM devices, `/sys/dev/char` for the device-number
+links HIP uses to match KFD nodes to render nodes, and `/sys/module/amdgpu` for
+the module state `rocminfo` gates on, all read-only — and the conventional ROCm
+runtime prefix `/opt/rocm`, read-only and skipped when the host does not have
+it. The device and sysfs grants are unconditional under the flag — they are not
+detected from the host GPU vendor, so they simply do not resolve on hosts
+without those paths. The `/opt/rocm` grant is what makes the runtime usable:
+without it the loader finds no `libamdhip64.so.7` and there is no `rocminfo` to
+run, so the flag grants it instead of requiring a `readable_paths` entry.
+`/opt/rocm` is usually a symlink chain (`/opt/rocm` → `/etc/alternatives/rocm`
+→ `/opt/rocm-<version>`); configured roots keep BOTH their configured location
+and their canonical source, so the whole chain — including the versioned
+`RUNPATH` directory the loader needs — resolves inside the sandbox. A root that
+does not exist on the host (including `/opt/rocm`) is skipped. A ROCm
+installation in a non-conventional prefix is NOT detected and still needs an
+explicit `readable_paths` entry, and the Python environment always does, e.g.
 
 ```toml
 [sandbox]
 enabled = true
 gpu = true
-readable_paths = ["/opt/rocm", "/home/<user>/venv"]   # runtime + interpreter
+readable_paths = ["/home/<user>/venv"]   # interpreter (the runtime comes from gpu)
 ```
-
-`/opt/rocm` is usually a symlink chain (`/opt/rocm` → `/etc/alternatives/rocm`
-→ `/opt/rocm-<version>`); configured roots keep BOTH their configured location
-and their canonical source, so the whole chain resolves inside the sandbox.
-A root that does not exist on the host is skipped.
 
 Security exposure: `gpu = true` hands model-generated commands the host GPUs,
 which are shared resources with no isolation between the sandboxed command and
@@ -741,9 +743,10 @@ it. When the host uses systemd-resolved, the stub resolver at
 `/run/systemd/resolve` is mounted read-only so DNS resolution via the symlinked
 `/etc/resolv.conf` works inside the sandbox. With `gpu = true` the sandbox
 also exposes the host GPU device nodes (AMD `/dev/kfd` + `/dev/dri`, NVIDIA
-`/dev/nvidia*`) and the read-only AMD ROCm sysfs subtrees (`/sys/devices`,
+`/dev/nvidia*`), the read-only AMD ROCm sysfs subtrees (`/sys/devices`,
 `/sys/dev/char`, `/sys/module/amdgpu`) the runtime reads to enumerate real
-devices; that enlarges the kernel/driver attack surface and shares the GPUs —
+devices, and the conventional ROCm runtime prefix `/opt/rocm` (read-only); that
+enlarges the kernel/driver attack surface and shares the GPUs —
 a resource with no per-command isolation — with model-generated code. It is
 off by default and can only be enabled in the global config. The restriction
 constrains the spawned command, not the agent process itself. It is
@@ -1464,12 +1467,14 @@ filesystem view. Everyone/logon-SID writable public locations can remain
 writable, synthetic capability ACEs persist, and cancellation currently
 terminates only the top-level process.
 Sandboxed GPU access (`gpu = true`) is limited to mounting host GPU resources:
-the device nodes plus the three read-only AMD ROCm sysfs subtrees that make
-AMD enumeration work (granted unconditionally under the flag, not
-vendor-detected). There is no per-host PCI/DRM node enumeration (host-specific
-topology would rot), no runtime installation, no device filtering or GPU
-selection, and no new NVIDIA mechanism beyond the existing `/dev/nvidia*`
-binds.
+the device nodes, the three read-only AMD ROCm sysfs subtrees that make AMD
+enumeration work and the conventional read-only `/opt/rocm` runtime prefix (all
+granted unconditionally under the flag, not vendor-detected). Only that
+conventional prefix is auto-granted: a ROCm installation elsewhere is not
+detected and must be named in `readable_paths`. There is no per-host PCI/DRM
+node enumeration (host-specific topology would rot), no runtime installation,
+no device filtering or GPU selection, and no new NVIDIA mechanism beyond the
+existing `/dev/nvidia*` binds.
 `run_rust` (experimental `[code_mode]`) has no Cargo/crates, network access,
 stdin, background or daemon execution, or custom env/mount/cwd/timeout;
 Cargo/toolchain is not supplied on the run-stage PATH/mounts (compile-only

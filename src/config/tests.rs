@@ -3015,6 +3015,86 @@ fn sandbox_gpu_is_global_only() {
 }
 
 #[test]
+fn sandbox_gpu_grants_the_rocm_runtime_prefix() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("ws");
+    std::fs::create_dir_all(workspace.join(".e-agent")).unwrap();
+    let load = |dir: &str, contents: &str| {
+        let dir = temp.path().join(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = write_config(&dir, contents);
+        Config::from_path(&path)
+            .unwrap()
+            .sandbox(&workspace)
+            .unwrap()
+    };
+
+    // Negative control: the flag alone is what grants the runtime prefix.
+    let off = load("gpu-off", "[sandbox]\nenabled = true\ngpu = false\n");
+    assert!(
+        !off.readable_paths
+            .iter()
+            .any(|p| p.starts_with("/opt/rocm")),
+        "gpu = false must not grant the ROCm runtime: {:?}",
+        off.readable_paths
+    );
+    assert!(
+        !off.readable_mounts
+            .iter()
+            .any(|(source, _)| source.starts_with("/opt/rocm")),
+        "gpu = false must not mount the ROCm runtime: {:?}",
+        off.readable_mounts
+    );
+
+    // `gpu = true` adds the conventional ROCm runtime prefix read-only, so
+    // the flag alone delivers a loadable runtime (device nodes + sysfs cannot
+    // load `libamdhip64.so.7`).
+    let on = load("gpu-on", "[sandbox]\nenabled = true\ngpu = true\n");
+    match std::fs::canonicalize("/opt/rocm") {
+        Ok(canonical) => {
+            assert!(
+                on.readable_paths.contains(&canonical.display().to_string()),
+                "the canonical ROCm target must be read-only: {:?}",
+                on.readable_paths
+            );
+            assert!(
+                on.readable_mounts
+                    .contains(&(canonical.display().to_string(), "/opt/rocm".to_owned())),
+                "the /opt/rocm alias must mount at its configured location: {:?}",
+                on.readable_mounts
+            );
+        }
+        // No conventional install: the grant is skipped silently, exactly
+        // like every other missing global readable root.
+        Err(_) => {
+            assert_eq!(
+                on.readable_paths, off.readable_paths,
+                "an absent /opt/rocm adds no readable root"
+            );
+            assert_eq!(
+                on.readable_mounts, off.readable_mounts,
+                "an absent /opt/rocm adds no mount"
+            );
+        }
+    }
+
+    // A user entry for the same prefix must not duplicate the canonical root
+    // or the (canonical source, configured dest) mount pair.
+    let explicit = load(
+        "gpu-explicit",
+        "[sandbox]\nenabled = true\ngpu = true\nreadable_paths = [\"/opt/rocm\"]\n",
+    );
+    assert_eq!(
+        explicit.readable_paths, on.readable_paths,
+        "the canonical ROCm root must appear exactly once"
+    );
+    assert_eq!(
+        explicit.readable_mounts, on.readable_mounts,
+        "the ROCm mount pair must appear exactly once"
+    );
+}
+
+#[test]
 fn sandbox_project_writable_path_without_global_sandbox_guides_user() {
     // No global [sandbox] at all + a project writable_paths entry must fail
     // with the offending path and actionable remediation, not a bare subset

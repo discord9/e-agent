@@ -878,6 +878,17 @@ struct ProjectSandbox {
 /// alias mounts whose source lies inside a final writable root survive.
 pub fn resolve_sandbox(config: Option<&Config>, workspace: &Path) -> anyhow::Result<Sandbox> {
     let mut result = config.and_then(|c| c.sandbox.clone()).unwrap_or_default();
+    // `gpu = true` also grants the conventional ROCm runtime prefix
+    // (read-only, skipped when absent): the device nodes and sysfs alone
+    // cannot load `libamdhip64.so.7`, `hipcc` or `rocminfo`, so the flag
+    // would otherwise promise GPU access it cannot deliver. The configured
+    // alias and its canonical target are both mounted by the readable-root
+    // machinery above (e.g. `/opt/rocm` -> `/opt/rocm-<version>`), so the
+    // loader finds the versioned `RUNPATH` directory too. A non-conventional
+    // install prefix still needs an explicit `readable_paths` entry.
+    if result.gpu {
+        result.readable_paths.push("/opt/rocm".to_owned());
+    }
     // Collect configured (canonical source, configured dest) mount pairs
     // from the RAW canonical_roots output, before merge/normalize narrowing.
     // normalize_roots drops a readable root shadowed by a writable root, but
