@@ -1,5 +1,5 @@
-//! Logical transcript history. Omitting scope preserves the original
-//! current-session API; explicit scopes query the configured store read-only.
+//! Logical transcript history. An omitted scope normalizes to the current
+//! session; list/search/read all take the scoped path with provenance.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -18,7 +18,7 @@ impl Tool for History {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "history".into(),
-            description: "Read logical transcripts. Without `scope`, the current session API is unchanged. Explicit `scope` is `global`, `workspace`, or `session`; scoped list/search return provenance and a cursor. `global` searches this configured store only. IDs require an explicit scope.".into(),
+            description: "Read logical transcripts. An omitted `scope` means `session`; omitted `workspace_id`/`session_id` default to the current workspace/session (in session scope, a `workspace_id` other than the current workspace requires `session_id`). list/search/read return provenance, list/search return `next_cursor`, and `global` searches this configured store only.".into(),
             parameters: json!({
                 "type": "object",
                 "oneOf": [
@@ -76,84 +76,76 @@ pub async fn execute(
     arguments: &Value,
 ) -> Result<String, String> {
     let args = parse_arguments(arguments)?;
-    if args.scope.is_none() {
-        return execute_current(store, root, session, args).await;
-    }
-    execute_scoped(store, root, session, args).await
+    let selectors = resolve_selectors(root, session, &args)?;
+    execute_scoped(store, root, selectors, args).await
 }
 
-async fn execute_current(
-    store: &SessionStore,
+/// Effective selectors after defaults. An omitted scope means `session`; an
+/// omitted `workspace_id` means the current workspace; an omitted
+/// `session_id` means the current session only while the selected workspace
+/// is the current one. A foreign workspace must name its session.
+struct Selectors {
+    scope: Scope,
+    workspace_id: Option<String>,
+    session_id: Option<String>,
+}
+
+fn resolve_selectors(
     root: &std::path::Path,
-    session: &str,
-    args: Args,
-) -> Result<String, String> {
-    if store.supports_history_query() {
-        let entries = store
-            .query_history(&HistoryQuery {
-                workspace_id: Some(derive_workspace_id(root)),
-                session_id: Some(session.to_owned()),
-                query: args.query.clone(),
-                after: None,
-                after_event_time: None,
-                offset: None,
-                exact_seq: args.seq,
-                limit: args.limit,
-                default_search_window: args.action == "search",
+    current_session: &str,
+    args: &Args,
+) -> Result<Selectors, String> {
+    let scope = args.scope.unwrap_or(Scope::Session);
+    let current_workspace = derive_workspace_id(root);
+    match scope {
+        Scope::Global => Ok(Selectors {
+            scope,
+            workspace_id: None,
+            session_id: None,
+        }),
+        Scope::Workspace => Ok(Selectors {
+            scope,
+            workspace_id: Some(args.workspace_id.clone().unwrap_or(current_workspace)),
+            session_id: None,
+        }),
+        Scope::Session => {
+            let workspace_id = args
+                .workspace_id
+                .clone()
+                .unwrap_or_else(|| current_workspace.clone());
+            let session_id = match args.session_id.clone() {
+                Some(id) => id,
+                None if workspace_id == current_workspace => current_session.to_owned(),
+                None => {
+                    return Err(
+                        "history requires `session_id` when `workspace_id` is not the current workspace"
+                            .into(),
+                    );
+                }
+            };
+            Ok(Selectors {
+                scope,
+                workspace_id: Some(workspace_id),
+                session_id: Some(session_id),
             })
-            .await
-            .map_err(history_load_error)?;
-        return match args.action.as_str() {
-            "list" | "search" => Ok(json!({"entries":entries.into_iter().map(|e| json!({"seq":e.seq,"entry":e.entry})).collect::<Vec<_>>()}).to_string()),
-            "read" => entries.into_iter().next().map(|e| json!({"seq":e.seq,"entry":e.entry}).to_string()).ok_or_else(|| "history entry not found".into()),
-            _ => unreachable!(),
-        };
-    }
-    let entries = store
-        .load_with_seq(root, session)
-        .await
-        .map_err(history_load_error)?;
-    match args.action.as_str() {
-        "list" => Ok(json!({"entries": ordered_entries(&entries).into_iter().take(args.limit).map(|(seq, entry)| json!({"seq":seq,"entry":entry})).collect::<Vec<_>>()}).to_string()),
-        "read" => {
-            let seq = args.seq.expect("validated");
-            let Some((_, entry)) = entries.iter().find(|(n, _)| *n == seq) else { return Err("history entry not found".into()) };
-            Ok(json!({"seq":seq,"entry":entry}).to_string())
         }
-        "search" => {
-            let query = args.query.expect("validated");
-            // Deliberately preserves the legacy newest-100 search window.
-            Ok(json!({"entries":ordered_entries(&entries).into_iter().take(HISTORY_MAX_LIMIT).filter(|(_, e)| searchable_content(e).is_some_and(|text| text.contains(&query))).take(args.limit).map(|(seq, entry)| json!({"seq":seq,"entry":entry})).collect::<Vec<_>>()}).to_string())
-        }
-        _ => unreachable!(),
     }
 }
 
 async fn execute_scoped(
     store: &SessionStore,
     root: &std::path::Path,
-    current_session: &str,
+    selectors: Selectors,
     args: Args,
 ) -> Result<String, String> {
-    let scope = args.scope.expect("scoped");
+    let Selectors {
+        scope,
+        workspace_id,
+        session_id,
+    } = selectors;
     if args.action == "read" && scope != Scope::Session {
         return Err("history read requires scope `session` or no scope".into());
     }
-    let current_workspace = derive_workspace_id(root);
-    let workspace_id = match scope {
-        Scope::Global => None,
-        Scope::Workspace | Scope::Session => {
-            Some(args.workspace_id.clone().unwrap_or(current_workspace))
-        }
-    };
-    let session_id = match scope {
-        Scope::Session => Some(
-            args.session_id
-                .clone()
-                .unwrap_or_else(|| current_session.to_owned()),
-        ),
-        _ => None,
-    };
     if args.action == "read" {
         if store.supports_history_query() {
             let entries = store
@@ -166,7 +158,6 @@ async fn execute_scoped(
                     offset: None,
                     exact_seq: args.seq,
                     limit: 1,
-                    default_search_window: false,
                 })
                 .await
                 .map_err(history_load_error)?;
@@ -253,7 +244,6 @@ async fn execute_scoped(
                     .flatten(),
                 exact_seq: None,
                 limit: args.limit + 1,
-                default_search_window: false,
             })
             .await
             .map_err(history_load_error)?;
@@ -449,10 +439,6 @@ fn parse_arguments(arguments: &Value) -> Result<Args, String> {
             "history `scope` must be `global`, `workspace`, or `session`".to_owned()
         })?),
     };
-    if scope.is_none() && (object.contains_key("workspace_id") || object.contains_key("session_id"))
-    {
-        return Err("history IDs require an explicit `scope`".into());
-    }
     let id = |key: &str| -> Result<Option<String>, String> {
         match object.get(key) {
             None => Ok(None),
@@ -503,15 +489,11 @@ fn parse_arguments(arguments: &Value) -> Result<Args, String> {
         crate::session::validate_session_name(id).map_err(|_| "invalid history session_id")?;
     }
     match scope {
-        None if cursor.is_some() => return Err("history cursor requires an explicit scope".into()),
         Some(Scope::Global) if workspace_id.is_some() || session_id.is_some() => {
             return Err("global history does not accept workspace_id or session_id".into());
         }
         Some(Scope::Workspace) if session_id.is_some() => {
             return Err("workspace history does not accept session_id".into());
-        }
-        Some(Scope::Session) if session_id.is_none() => {
-            return Err("session history requires session_id".into());
         }
         _ => {}
     }
@@ -621,7 +603,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_is_newest_first_and_capped_without_pagination_fields() {
+    async fn list_is_newest_first_provenanced_and_cursor_bounded() {
         let temp = tempfile::tempdir().unwrap();
         let entries: Vec<_> = (0..25).map(|index| notice(&index.to_string())).collect();
         SessionStore::Jsonl
@@ -648,8 +630,27 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![24, 23, 22]
         );
-        assert!(result.get("next_cursor").is_none());
+        assert_eq!(
+            result["entries"][0]["workspace_id"],
+            json!(derive_workspace_id(temp.path()))
+        );
+        assert_eq!(result["entries"][0]["session_id"], json!("current"));
+        assert!(result["next_cursor"].is_string());
         assert!(result.get("has_more").is_none());
+        // A page that covers the whole session ends with a null cursor.
+        let all: Value = serde_json::from_str(
+            &execute(
+                &SessionStore::Jsonl,
+                temp.path(),
+                "current",
+                &json!({"action": "list", "limit": 100}),
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(all["entries"].as_array().unwrap().len(), 25);
+        assert!(all["next_cursor"].is_null());
     }
 
     #[tokio::test]
@@ -746,6 +747,8 @@ mod tests {
         assert_eq!(found[1]["seq"], json!(107)); // tool-call arguments only
         assert_eq!(found[0]["entry"]["type"], json!("message"));
         assert_eq!(found[1]["entry"]["type"], json!("message"));
+        // More matches exist, so the page carries a continuation cursor.
+        assert!(result["next_cursor"].is_string());
 
         let all_matches: Value = serde_json::from_str(
             &execute(
@@ -774,12 +777,14 @@ mod tests {
                 ))
                 .collect::<Vec<_>>(),
             vec![
-                // newest-100 window starts at seq 9; seq 0 ("old needle") stays out
+                // The whole session is searched: the seq-0 "old needle"
+                // survives now that no newest-100 scan window applies.
                 (108, "message"),
                 (107, "message"),
                 (101, "message"),
                 (99, "notice"),
                 (98, "notice"),
+                (0, "message"),
             ]
         );
 
@@ -865,6 +870,11 @@ mod tests {
         .unwrap();
         assert_eq!(read["entry"], serde_json::to_value(complete).unwrap());
         assert_eq!(
+            read["workspace_id"],
+            json!(derive_workspace_id(temp.path()))
+        );
+        assert_eq!(read["session_id"], json!("current"));
+        assert_eq!(
             execute(
                 &SessionStore::Jsonl,
                 temp.path(),
@@ -886,7 +896,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert_eq!(empty, json!({"entries": []}));
+        assert_eq!(empty, json!({"entries": [], "next_cursor": null}));
     }
 
     #[tokio::test]
@@ -907,29 +917,421 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn default_shape_and_search_window_are_unchanged() {
+    async fn session_scope_with_omitted_ids_defaults_to_current_binding() {
         let temp = tempfile::tempdir().unwrap();
-        let entries = (0..102)
-            .map(|i| notice(&format!("{} needle", i)))
-            .collect::<Vec<_>>();
+        let mut entries = vec![notice("9276 old marker")];
+        entries.extend((0..120).map(|i| notice(&format!("filler {i}"))));
         SessionStore::Jsonl
             .append(temp.path(), "current", &entries)
             .await
             .unwrap();
+        let ws = derive_workspace_id(temp.path());
+        // The originally failing call shape: `scope: session` without IDs.
         let result: Value = serde_json::from_str(
             &execute(
                 &SessionStore::Jsonl,
                 temp.path(),
                 "current",
-                &json!({"action":"search","query":"needle","limit":100}),
+                &json!({"action":"search","query":"9276","scope":"session","limit":20}),
             )
             .await
             .unwrap(),
         )
         .unwrap();
-        assert!(result.get("next_cursor").is_none());
-        assert_eq!(result["entries"].as_array().unwrap().len(), 100);
-        assert_eq!(result["entries"][99]["seq"], 2);
+        let found = result["entries"].as_array().unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0]["seq"],
+            json!(0),
+            "marker is older than 100 entries"
+        );
+        assert_eq!(found[0]["entry"]["text"], json!("9276 old marker"));
+        assert_eq!(found[0]["workspace_id"], json!(ws));
+        assert_eq!(found[0]["session_id"], json!("current"));
+        assert!(result["next_cursor"].is_null());
+        // Omitted workspace, explicit current workspace, and fully explicit
+        // selectors select the same session.
+        for arguments in [
+            json!({"action":"search","query":"9276","scope":"session"}),
+            json!({"action":"search","query":"9276","scope":"session","workspace_id":ws}),
+            json!({"action":"search","query":"9276","scope":"session","workspace_id":ws,"session_id":"current"}),
+            json!({"action":"search","query":"9276","limit":20}),
+            json!({"action":"search","query":"9276","session_id":"current"}),
+        ] {
+            let value: Value = serde_json::from_str(
+                &execute(&SessionStore::Jsonl, temp.path(), "current", &arguments)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                value["entries"][0]["seq"],
+                json!(0),
+                "equivalent selectors {arguments} must select the current session"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn no_scope_and_explicit_session_selectors_are_equivalent() {
+        let temp = tempfile::tempdir().unwrap();
+        let entries = vec![
+            notice("9276 first"),
+            notice("filler"),
+            notice("9276 second"),
+        ];
+        SessionStore::Jsonl
+            .append(temp.path(), "current", &entries)
+            .await
+            .unwrap();
+        let ws = derive_workspace_id(temp.path());
+        let list_no_scope = execute(
+            &SessionStore::Jsonl,
+            temp.path(),
+            "current",
+            &json!({"action":"list","limit":2}),
+        )
+        .await
+        .unwrap();
+        let list_scoped = execute(
+            &SessionStore::Jsonl,
+            temp.path(),
+            "current",
+            &json!({"action":"list","scope":"session","limit":2}),
+        )
+        .await
+        .unwrap();
+        let list_explicit = execute(
+            &SessionStore::Jsonl,
+            temp.path(),
+            "current",
+            &json!({"action":"list","scope":"session","workspace_id":ws,"session_id":"current","limit":2}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(list_no_scope, list_scoped);
+        assert_eq!(list_no_scope, list_explicit);
+        let search_no_scope = execute(
+            &SessionStore::Jsonl,
+            temp.path(),
+            "current",
+            &json!({"action":"search","query":"9276"}),
+        )
+        .await
+        .unwrap();
+        let search_scoped = execute(
+            &SessionStore::Jsonl,
+            temp.path(),
+            "current",
+            &json!({"action":"search","query":"9276","scope":"session","workspace_id":ws,"session_id":"current"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(search_no_scope, search_scoped);
+        let read_no_scope = execute(
+            &SessionStore::Jsonl,
+            temp.path(),
+            "current",
+            &json!({"action":"read","seq":0}),
+        )
+        .await
+        .unwrap();
+        let read_scoped = execute(
+            &SessionStore::Jsonl,
+            temp.path(),
+            "current",
+            &json!({"action":"read","scope":"session","workspace_id":ws,"session_id":"current","seq":0}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_no_scope, read_scoped);
+        let read: Value = serde_json::from_str(&read_no_scope).unwrap();
+        assert_eq!(read["entry"]["text"], json!("9276 first"));
+    }
+
+    #[tokio::test]
+    async fn paged_search_recovers_every_match_then_terminates() {
+        let temp = tempfile::tempdir().unwrap();
+        let entries = (0..11)
+            .map(|i| {
+                if i % 2 == 0 {
+                    notice(&format!("needle {i}"))
+                } else {
+                    notice(&format!("filler {i}"))
+                }
+            })
+            .collect::<Vec<_>>();
+        SessionStore::Jsonl
+            .append(temp.path(), "pages", &entries)
+            .await
+            .unwrap();
+        let mut arguments = json!({"action":"search","query":"needle","limit":2});
+        let mut found = Vec::new();
+        let mut pages = 0;
+        loop {
+            let value: Value = serde_json::from_str(
+                &execute(&SessionStore::Jsonl, temp.path(), "pages", &arguments)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            pages += 1;
+            assert!(pages <= 6, "paging must terminate");
+            for item in value["entries"].as_array().unwrap() {
+                found.push(item["seq"].as_i64().unwrap());
+            }
+            if value["next_cursor"].is_null() {
+                break;
+            }
+            arguments["cursor"] = value["next_cursor"].clone();
+        }
+        assert!(pages > 1, "more than one result page was required");
+        assert_eq!(found, vec![10, 8, 6, 4, 2, 0]);
+    }
+
+    #[tokio::test]
+    async fn current_session_search_excludes_other_session_markers() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::Jsonl;
+        store
+            .append(temp.path(), "current", &[notice("9276 current")])
+            .await
+            .unwrap();
+        store
+            .append(temp.path(), "other", &[notice("9276 other")])
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_str(
+            &execute(
+                &store,
+                temp.path(),
+                "current",
+                &json!({"action":"search","query":"9276","scope":"session"}),
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        let found = value["entries"].as_array().unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0]["entry"]["text"], json!("9276 current"));
+        assert_eq!(found[0]["session_id"], json!("current"));
+        let foreign: Value = serde_json::from_str(
+            &execute(
+                &store,
+                temp.path(),
+                "current",
+                &json!({"action":"search","query":"9276","scope":"session","session_id":"other"}),
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(foreign["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(foreign["entries"][0]["entry"]["text"], json!("9276 other"));
+    }
+
+    #[tokio::test]
+    async fn cursor_interops_between_omitted_and_explicit_selectors() {
+        let temp = tempfile::tempdir().unwrap();
+        let entries = (0..5)
+            .map(|i| notice(&format!("entry {i}")))
+            .collect::<Vec<_>>();
+        SessionStore::Jsonl
+            .append(temp.path(), "cur", &entries)
+            .await
+            .unwrap();
+        let ws = derive_workspace_id(temp.path());
+        let page1: Value = serde_json::from_str(
+            &execute(
+                &SessionStore::Jsonl,
+                temp.path(),
+                "cur",
+                &json!({"action":"list","limit":2}),
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        let cursor = page1["next_cursor"].as_str().unwrap().to_owned();
+        // A no-scope cursor keeps working under the equivalent explicit selectors.
+        let page1_explicit: Value = serde_json::from_str(
+            &execute(
+                &SessionStore::Jsonl,
+                temp.path(),
+                "cur",
+                &json!({"action":"list","scope":"session","workspace_id":ws,"session_id":"cur","limit":2}),
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(page1, page1_explicit);
+        // ...and the cursor from the explicit page continues the no-scope page.
+        let explicit_cursor = page1_explicit["next_cursor"].as_str().unwrap().to_owned();
+        let next_no_scope: Value = serde_json::from_str(
+            &execute(
+                &SessionStore::Jsonl,
+                temp.path(),
+                "cur",
+                &json!({"action":"list","limit":2,"cursor":cursor}),
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        let next_explicit: Value = serde_json::from_str(
+            &execute(
+                &SessionStore::Jsonl,
+                temp.path(),
+                "cur",
+                &json!({"action":"list","scope":"session","limit":2,"cursor":explicit_cursor}),
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(next_no_scope, next_explicit);
+        assert_eq!(
+            next_no_scope["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["seq"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        // A changed selector or query invalidates the cursor.
+        assert!(
+            execute(
+                &SessionStore::Jsonl,
+                temp.path(),
+                "cur",
+                &json!({"action":"list","cursor":cursor,"session_id":"other"}),
+            )
+            .await
+            .unwrap_err()
+            .contains("cursor")
+        );
+        assert!(
+            execute(
+                &SessionStore::Jsonl,
+                temp.path(),
+                "cur",
+                &json!({"action":"list","cursor":cursor,"scope":"workspace"}),
+            )
+            .await
+            .unwrap_err()
+            .contains("cursor")
+        );
+        let search_page: Value = serde_json::from_str(
+            &execute(
+                &SessionStore::Jsonl,
+                temp.path(),
+                "cur",
+                &json!({"action":"search","query":"entry","limit":2}),
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        let search_cursor = search_page["next_cursor"].as_str().unwrap().to_owned();
+        assert!(
+            execute(
+                &SessionStore::Jsonl,
+                temp.path(),
+                "cur",
+                &json!({"action":"search","query":"other","cursor":search_cursor}),
+            )
+            .await
+            .unwrap_err()
+            .contains("cursor")
+        );
+    }
+
+    #[tokio::test]
+    async fn foreign_workspace_without_session_id_is_rejected_before_store_read() {
+        let temp = tempfile::tempdir().unwrap();
+        SessionStore::Jsonl
+            .append(temp.path(), "current", &[notice("9276 current")])
+            .await
+            .unwrap();
+        for arguments in [
+            json!({"action":"search","query":"9276","scope":"session","workspace_id":"/foreign"}),
+            json!({"action":"list","scope":"session","workspace_id":"/foreign"}),
+            json!({"action":"read","seq":0,"scope":"session","workspace_id":"/foreign"}),
+            json!({"action":"search","query":"9276","workspace_id":"/foreign"}),
+        ] {
+            let error = execute(&SessionStore::Jsonl, temp.path(), "current", &arguments)
+                .await
+                .unwrap_err();
+            assert!(
+                error.contains("requires `session_id`") && !error.contains("cannot load"),
+                "foreign workspace without session_id must be rejected before any store read: {arguments} -> {error}"
+            );
+        }
+        // The current workspace may be supplied explicitly with the session
+        // still omitted.
+        let ws = derive_workspace_id(temp.path());
+        let value: Value = serde_json::from_str(
+            &execute(
+                &SessionStore::Jsonl,
+                temp.path(),
+                "current",
+                &json!({"action":"search","query":"9276","scope":"session","workspace_id":ws}),
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(value["entries"][0]["session_id"], json!("current"));
+    }
+
+    #[tokio::test]
+    async fn invalid_ids_and_missing_sessions_never_fall_back() {
+        let temp = tempfile::tempdir().unwrap();
+        SessionStore::Jsonl
+            .append(temp.path(), "current", &[notice("9276 current")])
+            .await
+            .unwrap();
+        for arguments in [
+            json!({"action":"list","scope":"session","session_id":"bad/name"}),
+            json!({"action":"search","query":"9276","session_id":"bad/name"}),
+            json!({"action":"read","seq":0,"session_id":"bad/name"}),
+        ] {
+            let error = execute(&SessionStore::Jsonl, temp.path(), "current", &arguments)
+                .await
+                .unwrap_err();
+            assert!(
+                error.contains("session_id"),
+                "invalid ids must reject: {arguments} -> {error}"
+            );
+        }
+        // A missing but valid session is an empty selection, never the
+        // current session.
+        for arguments in [
+            json!({"action":"list","scope":"session","session_id":"ghost"}),
+            json!({"action":"search","query":"9276","scope":"session","session_id":"ghost"}),
+        ] {
+            let value: Value = serde_json::from_str(
+                &execute(&SessionStore::Jsonl, temp.path(), "current", &arguments)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(value, json!({"entries": [], "next_cursor": null}));
+        }
+        assert_eq!(
+            execute(
+                &SessionStore::Jsonl,
+                temp.path(),
+                "current",
+                &json!({"action":"read","seq":0,"scope":"session","session_id":"ghost"}),
+            )
+            .await
+            .unwrap_err(),
+            "history entry not found"
+        );
     }
     #[tokio::test]
     async fn scoped_workspace_paginates_and_keeps_provenance() {
@@ -953,10 +1355,24 @@ mod tests {
         );
     }
     #[test]
-    fn ids_without_scope_and_invalid_scope_are_rejected() {
-        assert!(parse_arguments(&json!({"action":"list","session_id":"x"})).is_err());
+    fn ids_without_scope_are_accepted_and_scope_restrictions_stay() {
+        // IDs without a scope normalize to `session` instead of rejecting.
+        let args = parse_arguments(&json!({"action":"list","session_id":"x"})).unwrap();
+        assert!(args.scope.is_none());
+        assert_eq!(args.session_id.as_deref(), Some("x"));
         assert!(parse_arguments(&json!({"action":"list","scope":"bad"})).is_err());
         assert!(parse_arguments(&json!({"action":"read","scope":"workspace","seq":1})).is_err());
+        assert!(
+            parse_arguments(&json!({"action":"list","scope":"workspace","session_id":"x"}))
+                .is_err()
+        );
+        assert!(
+            parse_arguments(&json!({"action":"list","scope":"global","workspace_id":"w"})).is_err()
+        );
+        assert!(
+            parse_arguments(&json!({"action":"list","scope":"session","session_id":"bad/name"}))
+                .is_err()
+        );
     }
     #[tokio::test]
     async fn scoped_pages_cross_sessions_without_missing_entries_or_sidecars() {
@@ -1122,5 +1538,101 @@ mod tests {
         )
         .unwrap();
         assert_eq!(default["entry"]["text"], "needle a0");
+    }
+
+    /// Temp SQLite only: the original scoped-session call defaults to the
+    /// bound session/workspace, scans the full logical history (no legacy
+    /// window), and pages with session-bound cursors.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_session_scope_defaults_scan_and_page_full_history() {
+        use crate::config::SessionBackend;
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("defaults.db");
+        let root = temp.path().join("ws");
+        std::fs::create_dir_all(&root).unwrap();
+        let backend = SessionBackend::Sqlite {
+            path: Some(db.to_str().unwrap().to_owned()),
+        };
+        let store = SessionStore::connect(&backend, &root, "same")
+            .await
+            .unwrap();
+        let mut entries = vec![notice("9276 old marker")];
+        entries.extend((0..120).map(|i| notice(&format!("filler {i}"))));
+        store.append(&root, "same", &entries).await.unwrap();
+        let ws = derive_workspace_id(&root);
+        let original: Value = serde_json::from_str(
+            &execute(
+                &store,
+                &root,
+                "same",
+                &json!({"action":"search","query":"9276","scope":"session","limit":20}),
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        let found = original["entries"].as_array().unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0]["seq"],
+            json!(0),
+            "marker is older than 100 entries"
+        );
+        assert_eq!(found[0]["workspace_id"], json!(ws));
+        assert_eq!(found[0]["session_id"], json!("same"));
+        assert!(original["next_cursor"].is_null());
+        // No-scope and fully explicit equivalent selectors match.
+        let no_scope = execute(
+            &store,
+            &root,
+            "same",
+            &json!({"action":"search","query":"9276"}),
+        )
+        .await
+        .unwrap();
+        let explicit = execute(
+            &store,
+            &root,
+            "same",
+            &json!({"action":"search","query":"9276","scope":"session","workspace_id":ws,"session_id":"same"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(no_scope, explicit);
+
+        // Session-scoped cursor paging returns every match exactly once.
+        let store = SessionStore::connect(&backend, &root, "paged")
+            .await
+            .unwrap();
+        let entries = (0..11)
+            .map(|i| {
+                if i % 2 == 0 {
+                    notice(&format!("9276 {i}"))
+                } else {
+                    notice(&format!("filler {i}"))
+                }
+            })
+            .collect::<Vec<_>>();
+        store.append(&root, "paged", &entries).await.unwrap();
+        let mut arguments = json!({"action":"search","query":"9276","limit":2});
+        let mut seen = Vec::new();
+        let mut pages = 0;
+        loop {
+            let value: Value =
+                serde_json::from_str(&execute(&store, &root, "paged", &arguments).await.unwrap())
+                    .unwrap();
+            pages += 1;
+            assert!(pages <= 6, "paging must terminate");
+            for item in value["entries"].as_array().unwrap() {
+                seen.push(item["seq"].as_i64().unwrap());
+            }
+            if value["next_cursor"].is_null() {
+                break;
+            }
+            arguments["cursor"] = value["next_cursor"].clone();
+        }
+        assert!(pages > 1, "more than one result page was required");
+        assert_eq!(seen, vec![10, 8, 6, 4, 2, 0]);
     }
 }

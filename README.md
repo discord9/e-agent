@@ -931,39 +931,50 @@ to fields that are certainly already persisted before replay.
 ## History tool
 
 The always-available `history` tool has `list`, `read`, and `search` actions.
-Without selectors it preserves the current runner-bound session API: `list`
-returns newest logical entries by `seq` (default limit 20, maximum 100), `read`
-returns one complete entry by `seq`, and literal, case-sensitive `search`
-examines User content, Assistant text and tool calls (tool name plus the
-unparsed argument JSON), and Notice text in the newest 100 entries.
-Default calls have no pagination fields. Recovering a lost edit means searching
-a distinctive fragment of what was written — a function name or another unique
-string — not `"write_file"`, which lists every write.
+`list` returns newest logical entries by `seq` (default limit 20, maximum 100),
+`read` returns one complete entry by `seq`, and literal, case-sensitive
+`search` examines User content, Assistant text and tool calls (tool name plus
+the unparsed argument JSON), and Notice text. Recovering a lost edit means
+searching a distinctive fragment of what was written — a function name or
+another unique string — not `"write_file"`, which lists every write.
+
+An omitted `scope` normalizes to `session`, and every call returns
+`workspace_id` and `session_id` provenance on each entry; `list`/`search`
+additionally return `next_cursor`. Selector defaults resolve against the
+runner-bound session: in session scope, an omitted `workspace_id` means the current workspace,
+and an omitted `session_id` means the current session only while the selected
+workspace is the current one — a foreign `workspace_id` must name its
+`session_id`. Supplying IDs without a `scope` is the same as `scope:
+"session"`.
 
 Explicit scopes query the same configured store read-only:
 
 - `scope: "global"`: list/search transcripts across workspace IDs in that store.
 - `scope: "workspace"`: list/search one `workspace_id` (defaults to current).
-- `scope: "session"`: list/search/read the required `session_id`, within
-  `workspace_id` (defaults to current). IDs require an explicit scope.
+- `scope: "session"`: list/search/read one session, within `workspace_id`
+  (defaults to current) and `session_id` (defaults to current when the
+  workspace is current).
 
 ```json
+{"action":"search","query":"9004","scope":"session"}
 {"action":"search","scope":"global","query":"9004","limit":20}
 {"action":"search","scope":"workspace","workspace_id":"/work/db","query":"9004"}
 {"action":"read","scope":"session","workspace_id":"/work/db","session_id":"review","seq":42}
 ```
 
-Scoped results include `workspace_id`, `session_id`, `seq`, and the complete
-logical `entry`. Scoped list/search return `next_cursor`; pass a non-null cursor
-with the same action, scope, selectors and query to continue. Ordering is
-workspace ID ascending, session ID ascending, then sequence descending—not
-cross-session chronological order. Explicit search scans beyond the legacy
-100-entry window, using the same searchable text projection. This is a live
-view, not a frozen snapshot: new entries before the cursor require a fresh
-query. No scan-depth cutoff silently hides older matches. Session identities
-are queried in bounded batches; one complete transcript is loaded at a time
-for logical winner resolution, so a very large individual session can still
-require substantial memory. Entry-count limits are not byte limits.
+Results include `workspace_id`, `session_id`, `seq`, and the complete logical
+`entry`. `list`/`search` return `next_cursor`; pass a non-null cursor with the
+same action, scope, selectors and query to continue — a cursor is bound to the
+resolved effective scope/workspace/session/query, so equivalent omitted and
+explicit selectors are interchangeable. Ordering is workspace ID ascending,
+session ID ascending, then sequence descending—not cross-session chronological
+order. Search scans the full logical history with the same searchable text
+projection; `limit` (default 20, maximum 100) caps the page, never the scan, so
+no fixed scan window silently hides older matches. This is a live view, not a
+frozen snapshot: new entries before the cursor require a fresh query. Session
+identities are queried in bounded batches; one complete transcript is loaded at
+a time for logical winner resolution, so a very large individual session can
+still require substantial memory. Entry-count limits are not byte limits.
 
 Database scopes use only the existing connection; they do not create/resume
 sessions, run schema setup, or select another database. SQLite global scope

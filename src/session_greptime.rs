@@ -4497,7 +4497,6 @@ mod tests {
                 offset: None,
                 exact_seq: None,
                 limit: 5,
-                default_search_window: false,
             })
             .await
             .unwrap();
@@ -4512,7 +4511,6 @@ mod tests {
                 offset: None,
                 exact_seq: None,
                 limit: 1,
-                default_search_window: false,
             })
             .await
             .unwrap();
@@ -4526,7 +4524,6 @@ mod tests {
                 offset: None,
                 exact_seq: None,
                 limit: 1,
-                default_search_window: false,
             })
             .await
             .unwrap();
@@ -4546,7 +4543,6 @@ mod tests {
                 offset: Some(0),
                 exact_seq: None,
                 limit: 1,
-                default_search_window: false,
             })
             .await
             .unwrap();
@@ -4560,7 +4556,6 @@ mod tests {
                 offset: Some(1),
                 exact_seq: None,
                 limit: 1,
-                default_search_window: false,
             })
             .await
             .unwrap();
@@ -4647,7 +4642,6 @@ mod tests {
                 offset: None,
                 exact_seq: None,
                 limit: 4,
-                default_search_window: false,
             })
             .await
             .unwrap();
@@ -4668,7 +4662,6 @@ mod tests {
                 offset: None,
                 exact_seq: None,
                 limit: 4,
-                default_search_window: false,
             })
             .await
             .unwrap();
@@ -4720,7 +4713,6 @@ mod tests {
                 offset: None,
                 exact_seq: None,
                 limit: 4,
-                default_search_window: false,
             })
             .await
             .unwrap();
@@ -4738,7 +4730,6 @@ mod tests {
                 offset: None,
                 exact_seq: None,
                 limit: 4,
-                default_search_window: false,
             })
             .await
             .unwrap();
@@ -4759,7 +4750,6 @@ mod tests {
                 offset: None,
                 exact_seq: None,
                 limit: 4,
-                default_search_window: false,
             })
             .await
             .unwrap();
@@ -4818,7 +4808,6 @@ mod tests {
                     offset: None,
                     exact_seq: None,
                     limit: 4,
-                    default_search_window: false,
                 })
                 .await
                 .unwrap();
@@ -4838,7 +4827,6 @@ mod tests {
                 offset: None,
                 exact_seq: None,
                 limit: 4,
-                default_search_window: false,
             })
             .await
             .unwrap();
@@ -4860,7 +4848,6 @@ mod tests {
                 offset: None,
                 exact_seq: None,
                 limit: 4,
-                default_search_window: false,
             })
             .await
             .unwrap();
@@ -4880,7 +4867,6 @@ mod tests {
                 offset: None,
                 exact_seq: None,
                 limit: 4,
-                default_search_window: false,
             })
             .await
             .unwrap();
@@ -4899,7 +4885,6 @@ mod tests {
                 offset: None,
                 exact_seq: Some(9),
                 limit: 1,
-                default_search_window: false,
             })
             .await
             .unwrap_err();
@@ -4954,7 +4939,6 @@ mod tests {
                     offset: None,
                     exact_seq: None,
                     limit,
-                    default_search_window: false,
                 })
                 .await
                 .unwrap()

@@ -722,21 +722,6 @@ impl SqliteSession {
             .unwrap_or_default();
         let exact = " AND (?7 IS NULL OR seq = ?7)";
         let cursor = " AND (?4 IS NULL OR workspace_id > ?4 OR (workspace_id = ?4 AND (session_id > ?5 OR (session_id = ?5 AND seq < ?6))))";
-        let key_order = if query.default_search_window {
-            "seq DESC"
-        } else {
-            "workspace_id ASC, session_id ASC, seq DESC"
-        };
-        let source = if query.default_search_window {
-            ", window_rows AS (SELECT * FROM winner_rows ORDER BY seq DESC LIMIT 100)"
-        } else {
-            ""
-        };
-        let selected_from = if query.default_search_window {
-            "window_rows wr"
-        } else {
-            "winner_rows wr"
-        };
         let sql = format!(
             r#"WITH latest AS (
  SELECT workspace_id,session_id,seq,MAX(event_time_us) winner_time FROM session_entries
@@ -745,9 +730,9 @@ impl SqliteSession {
 ), winner_rows AS (
  SELECT e.workspace_id,e.session_id,e.seq,e.event_time_us,e.payload FROM session_entries e JOIN latest l
  ON e.workspace_id=l.workspace_id AND e.session_id=l.session_id AND e.seq=l.seq AND e.event_time_us=l.winner_time
-){source}
-SELECT workspace_id,session_id,seq,event_time_us,payload FROM {selected_from} WHERE 1=1{predicate}
- ORDER BY {key_order} LIMIT ?8"#
+)
+SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHERE 1=1{predicate}
+ ORDER BY workspace_id ASC, session_id ASC, seq DESC LIMIT ?8"#
         );
         let mut params = vec![
             query

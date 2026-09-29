@@ -549,33 +549,11 @@ async fn history_query_search_is_literal_and_ignores_unselected_bad_json() {
             offset: None,
             exact_seq: None,
             limit: 2,
-            default_search_window: false,
         })
         .await
         .unwrap();
     assert_eq!(
         found.iter().map(|entry| entry.seq).collect::<Vec<_>>(),
-        vec![6, 0]
-    );
-    let default_window = session
-        .query_history(&HistoryQuery {
-            workspace_id: Some(session.workspace_id.clone()),
-            session_id: Some(session.session_id.clone()),
-            query: Some(needle.into()),
-            after: None,
-            after_event_time: None,
-            offset: None,
-            exact_seq: None,
-            limit: 4,
-            default_search_window: true,
-        })
-        .await
-        .unwrap();
-    assert_eq!(
-        default_window
-            .iter()
-            .map(|entry| entry.seq)
-            .collect::<Vec<_>>(),
         vec![6, 0]
     );
     let cursor_page = session
@@ -588,7 +566,6 @@ async fn history_query_search_is_literal_and_ignores_unselected_bad_json() {
             offset: None,
             exact_seq: None,
             limit: 4,
-            default_search_window: false,
         })
         .await
         .unwrap();
@@ -609,7 +586,6 @@ async fn history_query_search_is_literal_and_ignores_unselected_bad_json() {
             offset: None,
             exact_seq: None,
             limit: 4,
-            default_search_window: false,
         })
         .await
         .unwrap();
@@ -627,7 +603,6 @@ async fn history_query_search_is_literal_and_ignores_unselected_bad_json() {
             offset: None,
             exact_seq: Some(9),
             limit: 1,
-            default_search_window: false,
         })
         .await
         .unwrap_err();
@@ -694,7 +669,6 @@ async fn history_query_search_is_literal_and_ignores_unselected_bad_json() {
             offset: None,
             exact_seq: None,
             limit: 4,
-            default_search_window: false,
         })
         .await
         .unwrap();
@@ -715,7 +689,6 @@ async fn history_query_search_is_literal_and_ignores_unselected_bad_json() {
             offset: None,
             exact_seq: None,
             limit: 4,
-            default_search_window: false,
         })
         .await
         .unwrap();
@@ -737,7 +710,6 @@ async fn history_query_search_is_literal_and_ignores_unselected_bad_json() {
             offset: None,
             exact_seq: None,
             limit: 4,
-            default_search_window: false,
         })
         .await
         .unwrap();
@@ -759,7 +731,6 @@ async fn history_query_search_is_literal_and_ignores_unselected_bad_json() {
             offset: None,
             exact_seq: None,
             limit: 4,
-            default_search_window: false,
         })
         .await
         .unwrap();
@@ -779,7 +750,6 @@ async fn history_query_search_is_literal_and_ignores_unselected_bad_json() {
             offset: None,
             exact_seq: None,
             limit: 4,
-            default_search_window: false,
         })
         .await
         .unwrap();
@@ -828,7 +798,6 @@ async fn history_query_search_is_literal_and_ignores_unselected_bad_json() {
             offset: None,
             exact_seq: None,
             limit: 4,
-            default_search_window: false,
         })
         .await
         .unwrap();
@@ -853,7 +822,6 @@ async fn history_query_search_is_literal_and_ignores_unselected_bad_json() {
             offset: None,
             exact_seq: None,
             limit: 4,
-            default_search_window: false,
         })
         .await
         .unwrap();
@@ -875,7 +843,6 @@ async fn history_query_search_is_literal_and_ignores_unselected_bad_json() {
             offset: None,
             exact_seq: None,
             limit: 4,
-            default_search_window: false,
         })
         .await
         .unwrap_err();
@@ -904,7 +871,6 @@ async fn history_query_separates_assistant_content_from_tool_call_name() {
                 offset: None,
                 exact_seq: None,
                 limit: 4,
-                default_search_window: false,
             })
             .await
             .unwrap()

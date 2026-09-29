@@ -864,9 +864,6 @@ pub struct HistoryQuery {
     pub offset: Option<i64>,
     pub exact_seq: Option<i64>,
     pub limit: usize,
-    /// Preserve the no-scope search contract: consider newest 100 logical
-    /// records in the current session before applying the text predicate.
-    pub default_search_window: bool,
 }
 
 /// Decode only SQL-selected winner ties. Rows must be ordered so physical

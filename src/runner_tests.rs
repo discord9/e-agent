@@ -7447,6 +7447,97 @@ async fn history_runner_binds_only_its_current_session() {
     );
 }
 
+/// The originally failing call shape reaches the model→tool→model loop: a
+/// scripted model asks its runner-bound session for `scope: session` without
+/// IDs, and the persisted tool result must contain the marker that sits
+/// older than 100 entries (the legacy scan window would have hidden it).
+#[tokio::test]
+async fn history_runner_search_session_scope_finds_marker_older_than_100_entries() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = SessionStore::Jsonl;
+    let mut seeded = vec![SessionEntry::Notice {
+        text: "9276 old marker".into(),
+    }];
+    seeded.extend((0..120).map(|index| SessionEntry::Notice {
+        text: format!("filler {index}"),
+    }));
+    store.append(temp.path(), "current", &seeded).await.unwrap();
+    let agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: VecDeque::from(vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "history-old-marker".into(),
+                        name: "history".into(),
+                        arguments: serde_json::json!({
+                            "action": "search",
+                            "query": "9276",
+                            "scope": "session",
+                            "limit": 20,
+                        })
+                        .to_string(),
+                    }],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("done".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+            ]),
+        }),
+        vec![Box::new(crate::tools::history::History)],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        store.clone(),
+        temp.path().into(),
+        "current".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let task = runner.start(Some("find the old marker".into()));
+    let mut status = handle.status();
+    assert_eq!(
+        wait_for_status(&mut status, |status| matches!(
+            status,
+            SessionStatus::Finished(_)
+        ))
+        .await,
+        SessionStatus::Finished(SessionResult::Completed(Some("done".into())))
+    );
+    task.join().await.unwrap();
+
+    let loaded = store.load(temp.path(), "current").await.unwrap();
+    let result = loaded.entries.iter().find_map(|entry| match entry {
+        SessionEntry::Message {
+            message: Message::Tool { name, content, .. },
+        } if name == "history" => Some(content),
+        _ => None,
+    });
+    let result: Value =
+        serde_json::from_str(result.expect("history result must be persisted")).unwrap();
+    let entries = result["entries"].as_array().unwrap();
+    let marker = entries
+        .iter()
+        .find(|entry| entry["entry"]["text"] == serde_json::json!("9276 old marker"))
+        .expect("the marker older than 100 entries must be found");
+    assert_eq!(marker["seq"], serde_json::json!(0));
+    assert_eq!(marker["session_id"], serde_json::json!("current"));
+    assert_eq!(
+        marker["workspace_id"],
+        serde_json::json!(crate::session_store::derive_workspace_id(temp.path()))
+    );
+    // The search also matches the assistant turn that issued it: the call's
+    // own arguments carry the query and assistant tool calls are searchable.
+    assert_eq!(entries.len(), 2);
+    assert!(entries.iter().any(
+        |entry| entry["entry"]["type"] == serde_json::json!("message")
+            && entry["seq"] != serde_json::json!(0)
+    ));
+    assert!(result["next_cursor"].is_null());
+}
+
 #[tokio::test]
 async fn update_goal_tool_cas_updates_and_completes_with_evidence() {
     let temp = tempfile::tempdir().unwrap();

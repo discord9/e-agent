@@ -47,6 +47,21 @@ does not yet follow semantic versioning strictly.
   expect a shared writable scratch space (cargo, TMPDIR users) run
   directly. `run_rust`'s private scratch `/tmp` binding is unchanged.
 
+### Fixed
+
+- **`history` selector semantics** — a `scope: "session"` call without IDs
+  now defaults to the runner-bound session instead of erroring. An omitted
+  scope means session, including when IDs are supplied. In session scope,
+  omitted IDs default to the current workspace/session; a foreign workspace requires an
+  explicit `session_id` and is rejected before any store read. `list`,
+  `search`, and `read` all take the scoped path with `workspace_id`/
+  `session_id` provenance and (for list/search) `next_cursor`; no-scope
+  cursors work and are bound to the resolved selectors. The legacy newest-100
+  search window is gone — `limit` (default 20, maximum 100) caps the page,
+  never the scan — so matches older than 100 entries are found and paginated.
+  Explicit foreign scopes, ID validation, and the existing empty/not-found
+  behavior are unchanged.
+
 ## [0.1.1] — 2026-08-04
 
 ### Fixed
