@@ -1937,15 +1937,17 @@ function writePinOrder(order) {
 
 function pinOrderKey(wsId, sid) { return wsId + "\n" + sid; }
 
-/* 已记录项按存储顺序在前；新置顶（存储中没有）保持现有聚合顺序并沉底。 */
+/* 新置顶（存储中没有）排在最前：刚置顶的会话立刻出现在置顶列表顶部，而不是
+   被已有拖拽顺序挤到底部。已记录项按存储顺序跟随其后；都未记录时保持现有
+   聚合顺序。 */
 function sortPinnedSessions(items) {
   const rank = new Map(readPinOrder().map((x, i) => [pinOrderKey(x.wsId, x.sid), i]));
   return items.map((x, i) => ({ x, i, rank: rank.get(pinOrderKey(x.ws.id, x.s.id)) }))
     .sort((a, b) => {
       const ar = a.rank, br = b.rank;
       if (ar === undefined && br === undefined) return a.i - b.i;
-      if (ar === undefined) return 1;
-      if (br === undefined) return -1;
+      if (ar === undefined) return -1;
+      if (br === undefined) return 1;
       return ar - br;
     }).map((x) => x.x);
 }
@@ -2953,7 +2955,7 @@ async function togglePin(s, afterToggle, ws) {
     // 但数组每轮都是新的）：按 id 重新解析当前对象再写回，确保重绘反映新状态
     const cur = workspaceListFor(targetWs).find((x) => x.id === s.id) || s;
     cur.pinned = target;
-    // 取消后移除；重新置顶也先当作新项，按当前聚合顺序沉到已排序项之后。
+    // 取消后移除；重新置顶也先当作新项，排序时插到已记录项之前（最近置顶在最上）。
     removePinOrder(targetWs.id, s.id);
     afterToggle();
   } catch (e) {

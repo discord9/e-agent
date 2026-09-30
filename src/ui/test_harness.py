@@ -5250,15 +5250,17 @@ async function main(){
         && orderedPinNodes[0].getAttribute("data-pin-sid") === "pb1"
         && orderedPinNodes[1].getAttribute("data-pin-sid") === "pa1",
         "ids=" + [...orderedPinNodes].map((n) => n.getAttribute("data-pin-sid")).join(","));
-    // 新置顶不在存储中：已记录项保持在前，新项沉底。
+    // 新置顶不在存储中：新项插到已记录项之前（置顶列表顶部）。
     state.lastList.push({ id: "pa-new", status: "Idle", title: "A 新置顶",
       entry_count: 1, active: true, pinned: true });
     renderSidebarTree(true);
     orderedPinNodes = elsById["sidebarTree"].querySelector(".tree-ws-section.pinned")
       .querySelector(".tree-ws-body").children;
-    chk("pin order: newly pinned session appends after stored items",
+    chk("pin order: newly pinned session goes to top of pin list",
         orderedPinNodes.length === 3
-        && orderedPinNodes[2].getAttribute("data-pin-sid") === "pa-new",
+        && orderedPinNodes[0].getAttribute("data-pin-sid") === "pa-new"
+        && orderedPinNodes[1].getAttribute("data-pin-sid") === "pb1"
+        && orderedPinNodes[2].getAttribute("data-pin-sid") === "pa1",
         "ids=" + [...orderedPinNodes].map((n) => n.getAttribute("data-pin-sid")).join(","));
     // 取消置顶成功后清理该 wsId+sid（通过真实 togglePin 成功路径）。
     await togglePin(state.workspaceLists["wsB"].find((x) => x.id === "pb1"), () => {}, state.workspaces[1]);
