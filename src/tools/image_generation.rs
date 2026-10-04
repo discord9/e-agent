@@ -176,11 +176,16 @@ impl Tool for GenerateImage {
         //
         // Elsewhere `secure_dir_write` is fail-closed (macOS/BSD), so refuse
         // before spending a generation on a platform that cannot publish.
-        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "windows")))]
-        return Err(
-            "generate_image is unavailable on this platform: secure workspace file writes require Linux (Windows uses the degraded path)"
-                .to_owned(),
-        );
+        if cfg!(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "windows"
+        ))) {
+            return Err(
+                "generate_image is unavailable on this platform: secure workspace file writes require Linux (Windows uses the degraded path)"
+                    .to_owned(),
+            );
+        }
         if !self.workspace.targets_workspace(&path)? {
             return Err(format!(
                 "`{path}` must be inside the workspace; configured external roots are not writable by generate_image"
