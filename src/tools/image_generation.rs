@@ -4,7 +4,6 @@
 //! account store, no API-key fallback, no provider trait, and no automatic
 //! retry after an ambiguous network failure.
 
-use std::path::{Component, Path};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,6 +33,13 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 const MAX_PROMPT_BYTES: usize = 32_000;
 const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+/// Provider request-id bound (see [`safe_request_id`]).
+const MAX_REQUEST_ID_CHARS: usize = 128;
+/// Fixed auth-failure text: the credential chains (resolver/load/refresh)
+/// can carry serde diagnostics that quote file or response content, so the
+/// tool never reflects them.
+const AUTH_UNAVAILABLE: &str =
+    "ChatGPT credentials are unavailable; run `e-agent login` and try again";
 
 /// Resolves the shared ChatGPT credentials this tool sends with. The main
 /// session factory supplies its lazy reloadable-cache resolver (see
@@ -127,11 +133,12 @@ impl GenerateImage {
             .await
             .map_err(|error| format!("image generation request failed: {error}"))?;
         let status = response.status();
-        let provider_request_id = response
-            .headers()
-            .get(IMAGEGEN_REQUEST_ID_HEADER)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
+        let provider_request_id = safe_request_id(
+            response
+                .headers()
+                .get(IMAGEGEN_REQUEST_ID_HEADER)
+                .and_then(|value| value.to_str().ok()),
+        );
         // A failed status is reported by status (+ provider request id) only
         // and its body is never read, echoed, or retried.
         if !status.is_success() {
@@ -160,16 +167,29 @@ impl Tool for GenerateImage {
     async fn execute(&self, arguments: Value) -> Result<ToolOutput, String> {
         let (prompt, path, transparent) = parse_arguments(&arguments)?;
         // All path/policy checks run before any provider request, so an
-        // invalid, occupied, or unwritable target never spends anything. The
-        // output must stay inside the workspace itself: a configured
-        // writable external root does not widen this tool. The final
-        // exclusive create stays the authority against a race.
+        // invalid, occupied, or policy-denied target never spends anything.
+        // The output must stay inside the workspace itself: a configured
+        // writable external root does not widen this tool. These are
+        // POLICY checks, not filesystem-permission probes: a permission
+        // failure can still surface at the final exclusive create, which
+        // stays the authority against a race.
+        //
+        // Elsewhere `secure_dir_write` is fail-closed (macOS/BSD), so refuse
+        // before spending a generation on a platform that cannot publish.
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "windows")))]
+        return Err(
+            "generate_image is unavailable on this platform: secure workspace file writes require Linux (Windows uses the degraded path)"
+                .to_owned(),
+        );
         if !self.workspace.targets_workspace(&path)? {
             return Err(format!(
                 "`{path}` must be inside the workspace; configured external roots are not writable by generate_image"
             ));
         }
-        if self.workspace.exists(&path)? {
+        // Occupied-entry check on the final component WITHOUT following a
+        // final symlink: a dangling `out.png -> missing.png` is still an
+        // occupied directory entry that the exclusive create must refuse.
+        if self.workspace.entry_exists(&path)? {
             return Err(format!(
                 "`{path}` already exists; generate_image never overwrites (no request was sent)"
             ));
@@ -178,11 +198,11 @@ impl Tool for GenerateImage {
         // before the request too: a write that could never publish must not
         // spend a generation.
         self.workspace.check_writable(&path)?;
-        let auth = (self.auth)().map_err(|error| format!("{error:#}"))?;
+        let auth = (self.auth)().map_err(|_| AUTH_UNAVAILABLE.to_owned())?;
         let (access_token, account_id) = auth
             .access_token_and_account()
             .await
-            .map_err(|error| format!("{error:#}"))?;
+            .map_err(|_| AUTH_UNAVAILABLE.to_owned())?;
         let (bytes, provider_request_id) = self
             .request_image(&prompt, transparent, &access_token, &account_id)
             .await?;
@@ -240,14 +260,16 @@ fn validate_output_path(path: &str) -> Result<(), String> {
         "`path` must be a non-empty workspace-relative `.png` path with only normal components"
             .to_owned()
     };
+    // Lexical check on the literal segments: `Path::components` normalizes
+    // interior `.`/empty segments away, so it would accept `dir/./a.png` or
+    // `a//b.png` while the contract says only normal components.
     if path.is_empty()
         || path.contains('\\')
         || path.contains(':')
         || !path.ends_with(".png")
-        || Path::new(path).is_absolute()
-        || Path::new(path)
-            .components()
-            .any(|part| !matches!(part, Component::Normal(_)))
+        || path
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
     {
         return Err(invalid());
     }
@@ -304,10 +326,13 @@ struct ImageDatum {
 }
 
 /// Decode the response's single base64 image under the decoded-size cap.
-/// Empty, multiple, and non-`b64_json` entries are rejected.
+/// Empty, multiple, and non-`b64_json` entries are rejected. The decode
+/// failure text is fixed: a serde diagnostic can quote the offending body
+/// content, which must never reach the tool transcript.
 fn decode_single_image(body: &[u8], max_image_bytes: usize) -> Result<Vec<u8>, String> {
-    let response: ImagesResponse = serde_json::from_slice(body)
-        .map_err(|error| format!("cannot decode image generation response: {error}"))?;
+    let response: ImagesResponse = serde_json::from_slice(body).map_err(|_| {
+        "cannot decode image generation response (unexpected JSON shape)".to_owned()
+    })?;
     let [image] = response.data.as_slice() else {
         return Err(format!(
             "image generation response carried {} images; exactly one is required",
@@ -331,6 +356,19 @@ fn decode_single_image(body: &[u8], max_image_bytes: usize) -> Result<Vec<u8>, S
         return Err(too_large());
     }
     Ok(bytes)
+}
+
+/// Accept a provider request id only when it is a short safe identifier;
+/// anything longer or containing other bytes is omitted (the transcript
+/// field stays small and print-safe without a redaction layer).
+fn safe_request_id(value: Option<&str>) -> Option<String> {
+    let value = value?;
+    (value.len() <= MAX_REQUEST_ID_CHARS
+        && !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'))
+    .then(|| value.to_owned())
 }
 
 /// Bounded, non-reflecting error text: the HTTP status plus the optional
@@ -370,8 +408,13 @@ fn validate_png(bytes: &[u8]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::*;
     use crate::codex_auth::CodexAuth;
+    use crate::runner::{IdlePolicy, SessionResult, SessionRunner, SessionStatus};
+    use crate::session_store::SessionStore;
     use crate::tools::BackgroundTasks;
+    use async_trait::async_trait;
+    use std::sync::Mutex as StdMutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -764,7 +807,7 @@ mod tests {
         let (endpoint, server) = serve(image_response(&png_bytes())).await;
         let auth: AuthResolver = Arc::new(|| {
             Err(anyhow::anyhow!(
-                "ChatGPT auth is not initialized (cannot read auth file); run `e-agent login`"
+                "resolver detail ACCESS-SECRET; run `e-agent login`"
             ))
         });
         let tool = GenerateImage::for_test(
@@ -780,8 +823,92 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.contains("e-agent login"), "{error}");
+        // The resolver's own chain is never reflected into the transcript.
+        assert!(!error.contains("ACCESS-SECRET"), "{error}");
+        assert!(!error.contains("resolver detail"), "{error}");
         assert!(server.await.unwrap().is_empty());
         assert!(!fixture.temp.path().join("n.png").exists());
+    }
+
+    #[test]
+    fn generate_image_is_not_in_common_builtins() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new(temp.path()).unwrap();
+        let (main, _) =
+            crate::tools::builtins_with_bash_timeout(workspace.clone(), None, false, None, None);
+        assert!(!main.iter().any(|tool| tool.spec().name == "generate_image"));
+        let child = crate::tools::builtins_with_background(
+            workspace,
+            BackgroundTasks::new(None, None),
+            None,
+            false,
+            true,
+            Some("sub".into()),
+        );
+        assert!(
+            !child
+                .iter()
+                .any(|tool| tool.spec().name == "generate_image")
+        );
+    }
+
+    /// Red-before-fix regressions: a wrong-typed 200 body and hostile
+    /// provider metadata must never reach the transcript, and an occupied
+    /// (even dangling) directory entry must not spend a request.
+    #[tokio::test]
+    async fn schema_errors_and_hostile_metadata_never_echo_content_without_spend() {
+        let fixture = Fixture::new();
+        let body =
+            json!({"created": 1, "data": "BODY-SECRET", "prompt": "PROMPT-SECRET"}).to_string();
+        let (result, requests) = run_case(
+            &fixture,
+            http_response("200 OK", &[], body.as_bytes()),
+            json!({"prompt": "PROMPT-SECRET", "path": "w.png"}),
+        )
+        .await;
+        let error = result.unwrap_err();
+        assert!(
+            error.contains("cannot decode image generation response"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("BODY-SECRET") && !error.contains("PROMPT-SECRET"),
+            "{error}"
+        );
+        assert_eq!(requests.len(), 1);
+        assert!(!fixture.temp.path().join("w.png").exists());
+
+        let long = "r".repeat(MAX_REQUEST_ID_CHARS + 1);
+        for id in [long.as_str(), "bad id with spaces"] {
+            let response = http_response(
+                "500 Internal Server Error",
+                &[(IMAGEGEN_REQUEST_ID_HEADER, id)],
+                b"",
+            );
+            let (result, _) =
+                run_case(&fixture, response, json!({"prompt": "x", "path": "w.png"})).await;
+            let error = result.unwrap_err();
+            assert!(error.contains("HTTP 500"), "{error}");
+            assert!(!error.contains(id), "unsafe request id echoed: {error}");
+        }
+
+        use std::os::unix::fs::symlink;
+        symlink(
+            fixture.temp.path().join("missing.png"),
+            fixture.temp.path().join("dangling.png"),
+        )
+        .unwrap();
+        let (endpoint, server) = serve(image_response(&png_bytes())).await;
+        let tool = fixture.tool(&endpoint, MAX_RESPONSE_BYTES, MAX_IMAGE_BYTES);
+        let error = tool
+            .execute(json!({"prompt": "x", "path": "dangling.png"}))
+            .await
+            .unwrap_err();
+        assert!(error.contains("already exists"), "{error}");
+        assert!(
+            server.await.unwrap().is_empty(),
+            "the occupied entry spent a request"
+        );
     }
 
     #[tokio::test]
@@ -828,6 +955,15 @@ mod tests {
                 json!({"prompt": "x", "path": "./a.png"}),
                 "workspace-relative",
             ),
+            (
+                json!({"prompt": "x", "path": "dir/./a.png"}),
+                "workspace-relative",
+            ),
+            (
+                json!({"prompt": "x", "path": "a//b.png"}),
+                "workspace-relative",
+            ),
+            (json!({"prompt": "x", "path": "a/"}), "workspace-relative"),
             (
                 json!({"prompt": "x", "path": "/tmp/a.png"}),
                 "workspace-relative",
@@ -1026,25 +1162,220 @@ mod tests {
         let _ = server.await;
     }
 
-    #[test]
-    fn generate_image_is_not_in_common_builtins() {
+    /// Known-good 1x1 RGBA PNG (IHDR + IDAT + IEND, every chunk CRC valid): a
+    /// full valid image, not a header-only blob. No dependency, no validator.
+    const LOOP_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    const LOOP_PROMPT: &str = "one semi-transparent red pixel";
+
+    /// Scripted provider: round 1 asks for the real tool (a fresh path and an
+    /// occupied one), round 2 records the plain `role:"tool"` results it saw.
+    struct ImageLoopModel {
+        calls: usize,
+        results: Arc<StdMutex<Vec<(String, String)>>>,
+    }
+
+    #[async_trait]
+    impl Model for ImageLoopModel {
+        async fn complete(
+            &mut self,
+            messages: &[Message],
+            _: &[ToolSpec],
+            _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+        ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+            self.calls += 1;
+            if self.calls == 1 {
+                let call = |id: &str, path: &str| ToolCall {
+                    id: id.into(),
+                    name: "generate_image".into(),
+                    arguments: json!({"prompt": LOOP_PROMPT, "path": path}).to_string(),
+                };
+                let tool_calls = vec![
+                    call("call-image", "art/pixel.png"),
+                    call("call-occupied", "occupied.png"),
+                ];
+                return Ok((
+                    AssistantMessage {
+                        content: None,
+                        tool_calls,
+                        reasoning: None,
+                    },
+                    None,
+                ));
+            }
+            for message in messages {
+                if let Message::Tool {
+                    call_id, content, ..
+                } = message
+                {
+                    self.results
+                        .lock()
+                        .unwrap()
+                        .push((call_id.clone(), content.clone()));
+                }
+            }
+            Ok((
+                AssistantMessage {
+                    content: Some("loop complete".into()),
+                    tool_calls: Vec::new(),
+                    reasoning: None,
+                },
+                None,
+            ))
+        }
+    }
+
+    /// Bounded user-loop acceptance: a real `Agent`/`SessionRunner` session
+    /// (temp JSONL store, real runner tool path) drives the real
+    /// `generate_image` tool over a localhost socket; the scripted provider
+    /// observes the plain role-tool results in its next request. The accept
+    /// loop ends on a oneshot barrier after the runner task joins — no sleep,
+    /// no poll, no wall-clock wait.
+    #[tokio::test]
+    async fn user_loop_generates_valid_png_and_refuses_occupied_without_second_request() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = Workspace::new(temp.path()).unwrap();
-        let (main, _) =
-            crate::tools::builtins_with_bash_timeout(workspace.clone(), None, false, None, None);
-        assert!(!main.iter().any(|tool| tool.spec().name == "generate_image"));
-        let child = crate::tools::builtins_with_background(
+        std::fs::write(temp.path().join("occupied.png"), b"user bytes stay").unwrap();
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(LOOP_PNG_B64)
+            .unwrap();
+        assert_eq!(png.len(), 70, "known-good 1x1 RGBA PNG fixture");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!(
+            "http://{}/backend-api/codex/images/generations",
+            listener.local_addr().unwrap()
+        );
+        let auth = CodexAuth::test_auth(temp.path().join("auth.json"));
+        let tool = GenerateImage::for_test(
             workspace,
-            BackgroundTasks::new(None, None),
-            None,
-            false,
-            true,
-            Some("sub".into()),
+            Arc::new(move || Ok(auth.clone())),
+            endpoint,
+            Duration::from_secs(5),
+            MAX_RESPONSE_BYTES,
+            MAX_IMAGE_BYTES,
         );
+        let results = Arc::new(StdMutex::new(Vec::new()));
+        let agent = Agent::new(
+            Box::new(ImageLoopModel {
+                calls: 0,
+                results: results.clone(),
+            }),
+            vec![Box::new(tool) as Box<dyn Tool>],
+        );
+        let (runner, handle) = SessionRunner::new(
+            agent,
+            SessionStore::Jsonl,
+            temp.path().into(),
+            "image-loop".into(),
+            IdlePolicy::FinishWhenIdle,
+        );
+        let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<()>();
+        let response = image_response(&png);
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            loop {
+                tokio::select! {
+                    _ = &mut done_rx => break,
+                    accepted = listener.accept() => {
+                        let Ok((mut socket, _)) = accepted else { break };
+                        requests.push(read_request(&mut socket).await);
+                        let _ = socket.write_all(&response).await;
+                        let _ = socket.shutdown().await;
+                    }
+                }
+            }
+            requests
+        });
+
+        let task = runner.start(Some("generate the pixel".into()));
+        task.join().await.unwrap();
+        let _ = done_tx.send(());
+        let requests = server.await.unwrap();
+
+        assert_eq!(
+            *handle.status().borrow(),
+            SessionStatus::Finished(SessionResult::Completed(Some("loop complete".into())))
+        );
+        // Exactly one request: the occupied path was refused before HTTP.
+        assert_eq!(requests.len(), 1, "occupied path spent a request");
+        let request = &requests[0];
         assert!(
-            !child
-                .iter()
-                .any(|tool| tool.spec().name == "generate_image")
+            String::from_utf8_lossy(request)
+                .starts_with("POST /backend-api/codex/images/generations HTTP/1.1")
         );
+        assert_eq!(header_value(request, "authorization"), "Bearer access");
+        assert_eq!(header_value(request, "chatgpt-account-id"), "account");
+        assert_eq!(header_value(request, "originator"), "codex_cli_rs");
+        assert_uuid_shaped(&header_value(request, "x-codex-image-turn-id"));
+        assert_eq!(
+            request_json(request),
+            json!({
+                "prompt": LOOP_PROMPT,
+                "background": "opaque",
+                "model": "gpt-image-2",
+                "quality": "auto",
+                "size": "auto",
+            })
+        );
+
+        // The real artifact is the full known-good PNG; the occupied file
+        // keeps its user bytes.
+        let artifact = temp.path().join("art/pixel.png");
+        assert_eq!(std::fs::read(&artifact).unwrap(), png);
+        assert_eq!(
+            std::fs::read(temp.path().join("occupied.png")).unwrap(),
+            b"user bytes stay"
+        );
+
+        // The next provider request saw plain role-tool results: relative
+        // path + byte count only, no base64, no credential.
+        let results = results.lock().unwrap().clone();
+        assert_eq!(results.len(), 2, "{results:?}");
+        let saved = format!(
+            "generated image saved to art/pixel.png ({} bytes); request id test-image-request",
+            png.len()
+        );
+        assert_eq!(results[0], ("call-image".to_owned(), saved.clone()));
+        assert!(!saved.contains(LOOP_PNG_B64) && !saved.contains("Bearer"));
+        assert_eq!(results[1].0, "call-occupied");
+        assert!(results[1].1.contains("already exists"));
+        assert!(!results[1].1.contains("HTTP"), "{}", results[1].1);
+
+        // The existing fanout published the call, the success result, and
+        // the assistant answer.
+        let events = handle.snapshot();
+        assert!(events.iter().any(|event| matches!(event,
+            AgentEvent::ToolCall { call_id: Some(id), .. } if id == "call-image")));
+        assert!(events.iter().any(|event| matches!(event,
+            AgentEvent::ToolResult { is_error: false, call_id: Some(id), content, .. }
+                if id == "call-image" && content.contains("art/pixel.png"))));
+        assert!(events.iter().any(|event| matches!(event,
+            AgentEvent::AssistantText(text) if text == "loop complete")));
+
+        // The durable JSONL session holds both calls and the success result
+        // and never the image bytes.
+        let jsonl_path = temp.path().join(".e-agent/sessions/image-loop.jsonl");
+        let jsonl = std::fs::read_to_string(&jsonl_path).unwrap();
+        assert!(jsonl.contains("call-image") && jsonl.contains("art/pixel.png"));
+        assert!(jsonl.contains("already exists") && jsonl.contains("loop complete"));
+        assert!(!jsonl.contains(LOOP_PNG_B64), "base64 persisted");
+        let loaded = SessionStore::Jsonl
+            .load(temp.path(), "image-loop")
+            .await
+            .unwrap();
+        let tool_entries = loaded.entries.iter().filter(|entry| {
+            matches!(entry, SessionEntry::Message { message: Message::Tool { images, .. } }
+                if images.is_empty())
+        });
+        assert_eq!(tool_entries.count(), 2);
+
+        // Optional raw evidence export for the report (env-gated).
+        if let Ok(dir) = std::env::var("E_AGENT_IMAGE_LOOP_ARTIFACTS") {
+            let dir = std::path::PathBuf::from(dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::copy(&jsonl_path, dir.join("session.jsonl")).unwrap();
+            std::fs::copy(&artifact, dir.join("pixel.png")).unwrap();
+            std::fs::write(dir.join("request.http"), request).unwrap();
+        }
     }
 }

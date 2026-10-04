@@ -1657,20 +1657,31 @@ the ChatGPT Codex image endpoint
 lazy credential cache `auth = "chatgpt"` profiles resolve through, so an
 `e-agent login` after startup is picked up on first use.
 
-`path` must be a workspace-relative `.png` path with only normal
-components; it is validated, and an existing file or an unwritable target
-(read-only workspace, protected policy file) is refused, before any request
-is sent. The final write is an exclusive create (`O_EXCL` on Linux,
-`create_new` on the degraded Windows path), so a race can never overwrite an
-existing file. The image bytes are structurally checked (PNG signature +
-IHDR, nonzero dimensions — not decoded) before the file becomes visible, and
-the result names only the relative path and byte count, never base64.
-Response body and decoded image sizes are boundedly capped, redirects are
-not followed, and there is no automatic retry after an ambiguous network
-failure; a failure reports only the HTTP status and optional provider
-request id — never the response body — and HTTP 401 returns "run `e-agent
-login`" as a normal tool error. The request uses native HTTP, which the
-`[sandbox]` file-tool policy does not wrap (like `web_search`).
+`path` must be a workspace-relative `.png` path with only normal components
+(checked lexically: no `.`, `..`, empty, absolute, drive or backslash
+forms); it is validated, and an occupied directory entry (including a
+dangling final symlink) or a policy-denied target (read-only workspace,
+protected policy file) is refused, before any request is sent. Those early
+checks are policy checks, not filesystem-permission probes: a permission
+failure can still surface at the final write. The final write is an
+exclusive create (`O_EXCL` on Linux, `create_new` on the degraded Windows
+path), so a race can never overwrite an existing file; if the process cannot
+finish writing, a partial new file may remain — the error says so, and no
+automatic removal is attempted (an unlink could hit a concurrent
+replacement). Platforms whose secure workspace writes are fail-closed
+(macOS/BSD) refuse the tool before spending a generation. The image bytes
+are structurally checked (PNG signature + IHDR, nonzero dimensions — not
+decoded) before the file becomes visible, and the result names only the
+relative path and byte count, never base64. Response body and decoded image
+sizes are boundedly capped, redirects are not followed, and there is no
+automatic retry after an ambiguous network failure; a failure reports only
+the HTTP status and a short safe provider request id (≤128 identifier
+characters; omitted otherwise) — never the response body — and HTTP 401
+returns "run `e-agent login`" as a normal tool error. Credential-resolution
+failures always surface as one fixed actionable login message, so the auth
+chain's own diagnostics cannot reflect file contents. The request uses
+native HTTP, which the `[sandbox]` file-tool policy does not wrap (like
+`web_search`).
 
 ## SQLite session backend
 

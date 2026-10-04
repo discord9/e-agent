@@ -557,6 +557,40 @@ impl Workspace {
         }
     }
 
+    /// Whether `input` names an existing directory ENTRY at the final
+    /// component, without following a final symlink (a dangling
+    /// `out.png -> missing.png` counts as occupied). Used by `generate_image`
+    /// as its pre-request occupied-path gate; `exists` keeps the
+    /// follow-symlink semantics read paths rely on.
+    pub fn entry_exists(&self, input: &str) -> Result<bool, String> {
+        let not_found = |error: std::io::Error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                Ok(false)
+            } else {
+                Err(format!("stat failed: {error}"))
+            }
+        };
+        match self.resolve_path(input, false)? {
+            Resolved::Workspace { remainder } => self
+                .dir
+                .symlink_metadata(&remainder)
+                .map(|_| true)
+                .or_else(not_found),
+            Resolved::External { root, remainder } => match &root.capability {
+                ExternalCapability::Dir(dir) => dir
+                    .symlink_metadata(&remainder)
+                    .map(|_| true)
+                    .or_else(not_found),
+                // The capability is an open file handle; it exists by
+                // definition (opened at startup).
+                ExternalCapability::File(_) if remainder.as_os_str().is_empty() => Ok(true),
+                ExternalCapability::File(_) => {
+                    Err("external file capability does not authorize sibling paths".into())
+                }
+            },
+        }
+    }
+
     /// Whether `input` resolves to the workspace itself rather than a
     /// configured external root, using the same logical winner a write
     /// would pick. `generate_image` requires this: its output stays below
@@ -1018,14 +1052,16 @@ fn secure_dir_write(dir: &Dir, path: &Path, content: &[u8], mode: WriteMode) -> 
     };
     let mut file = File::from(fd);
     if let Err(error) = file.write_all(content).and_then(|()| file.flush()) {
-        if mode == WriteMode::CreateNew {
-            // The exclusive create succeeded, so the partial file is ours:
-            // remove it best-effort so a retry is not blocked by our own
-            // debris. A failed removal is reported through the write error.
-            drop(file);
-            let _ = parent.remove_file(*file_name);
-        }
-        return Err(format!("write failed: {error}"));
+        // Deliberately NO cleanup unlink: the exclusive create owns the
+        // inode, not the directory entry, so a rename/unlink race could make
+        // a later removal delete a replacement file somebody else installed.
+        // A partial file may remain; the error says so, truthfully.
+        return Err(match mode {
+            WriteMode::Replace => format!("write failed: {error}"),
+            WriteMode::CreateNew => {
+                format!("write failed (a partial new file may remain at this path): {error}")
+            }
+        });
     }
     Ok(())
 }
@@ -1143,11 +1179,15 @@ fn secure_dir_write(dir: &Dir, path: &Path, content: &[u8], mode: WriteMode) -> 
         Err(error) => return Err(format!("write failed: {error}")),
     };
     if let Err(error) = file.write_all(content).and_then(|()| file.flush()) {
-        if mode == WriteMode::CreateNew {
-            drop(file);
-            let _ = dir.remove_file(path);
-        }
-        return Err(format!("write failed: {error}"));
+        // Same no-cleanup rule as the Linux path: an unlink could delete a
+        // replacement installed after our exclusive create. A partial file
+        // may remain, and the error says so.
+        return Err(match mode {
+            WriteMode::Replace => format!("write failed: {error}"),
+            WriteMode::CreateNew => {
+                format!("write failed (a partial new file may remain at this path): {error}")
+            }
+        });
     }
     Ok(())
 }
