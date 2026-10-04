@@ -14,7 +14,9 @@ cover workspace files and shell commands, background work, and asynchronous
 subagent tasks. Background and subagent completion notifications are delivered
 to the session when they finish. A human can explicitly arm goal continuation
 with `/goal continue` indefinitely or `/goal continue N` with an actual-token
-soft cap; active goals and restarts do not arm it, and Cancel stops the driver
+soft cap; active goals and restarts do not arm it, each newly admitted
+automatic turn reminds the model to re-check the goal, turns wait for this
+session's own non-detached background work, and Cancel stops the driver
 without stopping existing background tasks. See [Session goals](#session-goals)
 for the full behavior. Local stdio MCP servers can optionally add tools.
 
@@ -886,7 +888,33 @@ verifier). Fields: `id`, `revision`, `objective`, `success_criteria`,
 - **Forks inherit**: `--fork`/`/fork`/btw forks copy the source prefix up to
   the fork boundary, including goal updates before it; the forked session
   folds the newest snapshot naturally.
-- **Explicit goal continuation**: `/goal continue` arms an in-memory indefinite driver; `/goal continue N` arms it with a cumulative actual-token soft cap. An active goal alone never auto-arms. The driver continues after ordinary text, empty text, no-tool rounds, and unchanged revisions, and resumes after required background follow-up. Usage is charged as input plus output tokens with saturation; a capped driver may overshoot on its final call but never starts another call after reaching the cap. Missing usage under an explicit cap fails closed. Driver state and notices are live-only and never persisted; restart starts unarmed. A prompt takes precedence over the next automatic call without implicitly disarming the driver; Cancel, inactive/cleared goals, unrecoverable errors, closed sessions, and budget exhaustion disarm it.
+- **Explicit goal continuation**: `/goal continue` arms an in-memory indefinite driver; `/goal continue N` arms it with a cumulative actual-token soft cap. An active goal alone never auto-arms. The driver continues after ordinary text, empty text, no-tool rounds, and unchanged revisions, and resumes after required background follow-up. Usage is charged as input plus output tokens with saturation; a capped driver may overshoot on its final call but never starts another call after reaching the cap. Missing usage under an explicit cap fails closed. Driver state is live-only and never persisted; restart starts unarmed. A prompt takes precedence over the next automatic call without implicitly disarming the driver; Cancel, inactive/cleared goals, unrecoverable errors, closed sessions, and budget exhaustion disarm it.
+- **Own background work suspends the next automatic turn**: a *fresh*
+  automatic Goal turn is admitted only while this session has no own
+  non-detached background work — `bash`/`pwsh` tasks (the pre-existing
+  `running_background` gate) and live `delegate`/btw children (registered
+  synchronously at spawn, released only after the child's completion entry was
+  durably committed). The interrupted turn's own model rounds, same-turn FIFO
+  maintenance resumes (a queued compaction, agent message, or goal command in
+  the turn that started the work), human input, the ordinary completion
+  reaction, and `FinishWhenIdle` are deliberately NOT gated by the child set:
+  a Goal turn that starts its own background work still finishes that turn,
+  and only the next automatically admitted turn waits for it. The child set is
+  Goal-admission state only — it is not a task registry, never cancels or
+  freezes an already-admitted child, and adds no scheduler, priority, or
+  generalized reservation.
+- **A fresh automatic turn announces itself durably**: each genuinely new
+  automatic Goal turn commits one `SessionEntry::Notice`
+  (`[goal continuation] Check the current goal …`) before its first provider
+  call, so the model re-reads status/remaining work/evidence with `get_goal`
+  and continues real work or updates the goal truthfully instead of repeating
+  its previous answer. It is a durable model-facing entry (a resumed or
+  late-attached view replays the audit line), not a user prompt and not a
+  UI-only display; it never arms a separate ordinary reaction request. One per
+  fresh automatic turn: same-turn maintenance resumes, queued prompts,
+  waiting-input answers, cap exhaustion, inactive goals, and cancelled
+  sessions add none. Replaying it never arms or wakes the driver — a restart
+  still starts unarmed.
 - **Subagent isolation**: subagents get the goal tools but their runner
   applies them against the subagent's own (usually empty) goal state — a
   subagent can never take a mutable reference to its parent's goal.
@@ -895,9 +923,11 @@ verifier). Fields: `id`, `revision`, `objective`, `success_criteria`,
   only, never a claim of independent verification.
 
 Non-goals (deliberately out of scope): todo/plan/workflow stages, deadlines,
-reminders, goal DAGs / multiple goals per session, and goal-specific
+reminders, goal DAGs / multiple goals per session, goal-specific
 verification (the verifier role independently checks risky product changes
-before integration).
+before integration), and any background-work scheduler, priority ordering, or
+generalized work reservation — the delegate/btw child set used by Goal
+admission is admission state only.
 
 ## Session output receipts (`eout1`) and the `read_output` tool
 
@@ -1533,7 +1563,11 @@ or concatenation.
 Session goals are a single-current-goal persistence layer only: no
 todo/plan/workflow stages, no deadlines, no reminders, no goal DAGs /
 multiple goals per session, no goal verifier agent, and no scheduler or persistent workflow driver —
-`/goal continue` is only a process-local runner loop; the goal remains a snapshot with a CAS, not a task runner.
+`/goal continue` is only a process-local runner loop; the goal remains a snapshot with a CAS, not a task runner. A fresh automatic
+continuation waits for this session's own non-detached background work (bash
+tasks and live delegate/btw children), but that child set is Goal-admission
+state only: no background-work scheduler, priority queue, preemption of
+already-admitted work, or generalized reservation.
 
 GreptimeDB-specific non-goals (when built with `--features greptime`):
 

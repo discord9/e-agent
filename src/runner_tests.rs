@@ -11065,11 +11065,18 @@ async fn oracle_followup_arm_and_missing_usage_displays_are_live_only_and_late_a
         .load(temp.path(), "oracle-followup-live-notices")
         .await
         .unwrap();
+    let serialized = serde_json::to_string(&loaded.entries).unwrap();
     assert!(
-        !serde_json::to_string(&loaded.entries)
-            .unwrap()
-            .contains("goal continuation"),
+        !serialized.contains("goal continuation armed")
+            && !serialized.contains("continuation stopped"),
         "driver displays must not become durable history"
+    );
+    assert_eq!(
+        goal_notice_history(temp.path(), "oracle-followup-live-notices")
+            .await
+            .len(),
+        1,
+        "the one admitted automatic turn's model-facing notice is durable"
     );
     handle.cancel();
     wait_for_status(&mut handle.status(), |status| {
@@ -14013,5 +14020,1219 @@ async fn terminal_provider_failure_flushes_pending_message_and_prompt_without_re
         notice < prompt,
         "terminal flush preserves accepted FIFO order"
     );
+    task.join().await.unwrap();
+}
+
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// Goal continuation × this session's own background work
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+//
+// A FRESH automatic Goal turn is admitted only while this session has no own
+// non-detached work outstanding: `bash`/`pwsh` tasks (the pre-existing
+// `Agent::running_background` gate) and live `delegate`/btw children (the
+// runner's Goal-only outstanding-child set). Same-turn maintenance resumes,
+// ordinary turns, human input and `FinishWhenIdle` are deliberately NOT gated
+// by the child set. Every admitted fresh turn consumes exactly one durable
+// model-facing notice.
+
+/// Prefix of the durable per-turn notice (the exact wording lives in
+/// `runner.rs`; tests pin the model-facing contract).
+const GOAL_TURN_NOTICE_PREFIX: &str = "[goal continuation]";
+
+async fn goal_notice_history(root: &std::path::Path, session: &str) -> Vec<String> {
+    SessionStore::Jsonl
+        .load(root, session)
+        .await
+        .unwrap()
+        .entries
+        .iter()
+        .filter_map(|entry| match entry {
+            SessionEntry::Notice { text } if text.starts_with(GOAL_TURN_NOTICE_PREFIX) => {
+                Some(text.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Goal notices this runner has fanned out (live log / late attach).
+fn goal_notices(handle: &SessionHandle) -> Vec<String> {
+    handle
+        .snapshot()
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::Notice(text) if text.starts_with(GOAL_TURN_NOTICE_PREFIX) => {
+                Some(text.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Goal notices carried by one captured provider request context.
+fn notices_in_request(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .filter(|message| {
+            matches!(message, Message::User { content, .. }
+                if content.starts_with(GOAL_TURN_NOTICE_PREFIX))
+        })
+        .count()
+}
+
+/// Flips to `true` once `calls` reaches `expected` entries. `timeout` wraps
+/// this in negative assertions, so no test needs a fixed sleep to prove
+/// "still no call".
+async fn calls_reached(calls: &Mutex<Vec<Vec<Message>>>, expected: usize) {
+    while calls.lock().unwrap().len() < expected {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+/// `calls_reached` as a proof obligation: fails after 5s instead of hanging
+/// the suite.
+async fn wait_for_calls(calls: &Mutex<Vec<Vec<Message>>>, expected: usize) {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        calls_reached(calls, expected),
+    )
+    .await
+    .expect("timed out waiting for provider calls");
+}
+
+/// Bash facade that starts an owned non-detached background task, then blocks
+/// until released: a test can queue FIFO maintenance while the owning turn is
+/// still inside its tool batch.
+struct BlockingBackgroundBash {
+    id: u64,
+    label: &'static str,
+    sender: Arc<Mutex<Option<mpsc::UnboundedSender<AgentEvent>>>>,
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait]
+impl Tool for BlockingBackgroundBash {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "bash".into(),
+            description: "test only".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+    async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok(ToolOutput::text(format!(
+            "started background task {}: {}",
+            self.id, self.label
+        )))
+    }
+    fn set_event_sender(&mut self, sender: mpsc::UnboundedSender<AgentEvent>) {
+        *self.sender.lock().unwrap() = Some(sender);
+    }
+}
+
+fn owned_background_completed(id: u64, output: &str, label: &str) -> AgentEvent {
+    AgentEvent::BackgroundCompleted {
+        id,
+        output: output.into(),
+        label: Some(label.into()),
+        started_at_ms: None,
+        duration_ms: None,
+        exit_code: None,
+        signal: None,
+        status: None,
+        kind: None,
+        cancellation_source: None,
+    }
+}
+
+#[tokio::test]
+async fn goal_continue_own_background_with_fifo_compaction_resumes_before_completion() {
+    // The fresh Goal turn starts its OWN non-detached background bash and a
+    // manual compaction arrives while that tool batch runs (FIFO maintenance
+    // inside the same turn). Owned work suspends only FRESH automatic turns:
+    // the interrupted same-turn work still issues its provider call BEFORE
+    // the completion, the durable notice belongs to the fresh turn alone, and
+    // only the durably committed completion admits the next automatic turn.
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let tool_entered = Arc::new(Notify::new());
+    let release_tool = Arc::new(Notify::new());
+    let fresh_goal = Arc::new(Notify::new());
+    let sender = Arc::new(Mutex::new(None));
+    let starts = Arc::new(AtomicUsize::new(0));
+    let mut agent = Agent::new(
+        Box::new(BlockingContextCaptureModel {
+            replies: vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![background_bash_call("own job", false)],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("maintenance summary".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("resumed same-turn goal work".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("completion reaction".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("fresh automatic goal".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+            ]
+            .into(),
+            block_call: 5,
+            entered: fresh_goal.clone(),
+            release: Arc::new(Notify::new()),
+            dropped: None,
+            calls: calls.clone(),
+            call_count: 0,
+        }),
+        vec![
+            Box::new(BlockingBackgroundBash {
+                id: 61,
+                label: "own job",
+                sender: sender.clone(),
+                entered: tool_entered.clone(),
+                release: release_tool.clone(),
+            }),
+            Box::new(TurnStartMarkerTool(starts.clone())),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    history_for_compaction(&mut agent);
+    let (runner, handle) = SessionRunner::new_with_bootstrap(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-own-bg-fifo-compact".into(),
+        IdlePolicy::WaitForInput,
+        SessionBootstrap {
+            recovery_tasks: vec![],
+            legacy: false,
+            initial_entries: vec![test_goal_entry()],
+        },
+    )
+    .await
+    .unwrap();
+    let task = runner.start(None);
+    handle.continue_goal(None);
+    wait_for_notify(&tool_entered, "own background bash tool").await;
+    handle.compact();
+    release_tool.notify_one();
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::Display(text) if text == "compacted: maintenance summary"),
+    )
+    .await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), calls_reached(&calls, 3))
+            .await
+            .is_ok(),
+        "the interrupted same-turn work must resume before its own background task completes"
+    );
+    assert_eq!(
+        starts.load(Ordering::SeqCst),
+        1,
+        "the maintenance resume continues the interrupted Goal turn (no fresh turn), \
+         instead of suspending it until the owned task completes"
+    );
+    assert_eq!(
+        goal_notices(&handle).len(),
+        1,
+        "one notice for the fresh turn; the resume repeats nothing"
+    );
+    {
+        let calls = calls.lock().unwrap();
+        assert_eq!(notices_in_request(&calls[0]), 1, "the fresh turn's request");
+        assert_eq!(
+            notices_in_request(&calls[2]),
+            1,
+            "the resumed same-turn request carries it once, not twice"
+        );
+    }
+    // The owned task is still running: no NEW automatic Goal turn may start.
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            calls_reached(&calls, 4)
+        )
+        .await
+        .is_err(),
+        "a running owned background task must suspend the next automatic Goal turn"
+    );
+    sender
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .send(owned_background_completed(61, "own job done", "own job"))
+        .unwrap();
+    wait_for_calls(&calls, 5).await;
+    {
+        let calls = calls.lock().unwrap();
+        assert!(
+            calls[3].iter().any(|message| matches!(
+                message,
+                Message::User { content, .. }
+                    if content.contains("[background task 61 completed") && content.contains("own job done")
+            )),
+            "the completion's ordinary reaction carries the durable completion"
+        );
+        assert_eq!(
+            notices_in_request(&calls[3]),
+            1,
+            "the reaction adds no notice"
+        );
+        assert_eq!(
+            notices_in_request(&calls[4]),
+            2,
+            "the remounted automatic turn carries its own second notice"
+        );
+    }
+    assert_eq!(
+        goal_notice_history(temp.path(), "goal-own-bg-fifo-compact")
+            .await
+            .len(),
+        2,
+        "each fresh automatic turn persists exactly one notice"
+    );
+    handle.cancel();
+    wait_for_status(&mut handle.status(), |status| {
+        matches!(status, SessionStatus::Idle)
+    })
+    .await;
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn goal_continue_own_delegate_suspends_fresh_goal_until_completion_commits() {
+    // A live `delegate` child is this session's own non-detached work: while
+    // it runs no FRESH automatic Goal turn may start (however often the driver
+    // is re-armed), human input still works, and only the child's durably
+    // committed completion admits the next automatic turn.
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let fresh_goal = Arc::new(Notify::new());
+    let (handle, task, background) = parent_with_delegate_child(
+        temp.path(),
+        DelegateParent {
+            session: "goal-own-delegate".into(),
+            policy: IdlePolicy::WaitForInput,
+            replies: vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![delegate_call(temp.path(), "audit the workspace")],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("goal turn one".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("human answer".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("delegate completion reaction".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("fresh automatic goal".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("another automatic goal".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+            ],
+            block_call: 6,
+            initial_prompt: None,
+            arm_goal: true,
+        },
+        fresh_goal.clone(),
+        calls.clone(),
+    )
+    .await;
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "goal turn one"),
+    )
+    .await;
+    for _ in 0..2 {
+        handle.continue_goal(None);
+    }
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            calls_reached(&calls, 3)
+        )
+        .await
+        .is_err(),
+        "a live delegate child must suspend fresh automatic Goal turns, even after repeated Continue"
+    );
+    assert_eq!(calls.lock().unwrap().len(), 2, "only the Goal turn ran");
+    assert_eq!(goal_notices(&handle).len(), 1, "one notice for that turn");
+    handle.prompt("human question");
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "human answer"),
+    )
+    .await;
+    assert_eq!(calls.lock().unwrap().len(), 3, "human input is not gated");
+    // Deliver the child's cancellation + completion through the real registry.
+    let live = background.running();
+    assert_eq!(live.len(), 1, "exactly one delegated child: {live:?}");
+    let child_id = live[0].id;
+    background.cancel_with_source(child_id, crate::agent::CancellationSource::System);
+    wait_for_calls(&calls, 5).await;
+    {
+        let calls = calls.lock().unwrap();
+        assert!(
+            calls[3].iter().any(|message| matches!(
+                message,
+                Message::User { content, .. }
+                    if content.contains("subagent session:") && content.contains("cancelled")
+            )),
+            "the completion's ordinary reaction carries the durable completion"
+        );
+        assert_eq!(
+            notices_in_request(&calls[3]),
+            1,
+            "the reaction adds no notice"
+        );
+        assert_eq!(
+            notices_in_request(&calls[4]),
+            2,
+            "the next fresh automatic Goal turn carries its own notice"
+        );
+    }
+    wait_for_notify(&fresh_goal, "blocked automatic goal call").await;
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        6,
+        "the driver keeps mounting fresh automatic turns after the completion"
+    );
+    assert_eq!(
+        goal_notices(&handle).len(),
+        3,
+        "one notice per fresh automatic turn, no duplicates"
+    );
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "goal-own-delegate")
+        .await
+        .unwrap()
+        .entries;
+    let completion = entries
+        .iter()
+        .position(|entry| matches!(entry, SessionEntry::BackgroundCompletion { id, .. } if *id == child_id))
+        .expect("the child completion is durable");
+    let notices: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| match entry {
+            SessionEntry::Notice { text } if text.starts_with(GOAL_TURN_NOTICE_PREFIX) => {
+                Some(index)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        notices.len(),
+        3,
+        "three fresh automatic turns, three notices"
+    );
+    assert!(
+        notices[0] < completion && completion < notices[1],
+        "the suspended attempt wrote no notice after the completion: notices={notices:?} completion={completion}"
+    );
+    handle.cancel();
+    wait_for_status(&mut handle.status(), |status| {
+        matches!(status, SessionStatus::Idle)
+    })
+    .await;
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+/// Provider that accepts connections and never answers: a delegated child
+/// blocks in its first model call until its task is cancelled.
+async fn hanging_child_provider() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    format!("http://{address}")
+}
+
+fn delegate_call(workspace: &std::path::Path, task: &str) -> ToolCall {
+    ToolCall {
+        id: "delegate-1".into(),
+        name: "delegate".into(),
+        arguments: serde_json::json!({"task": task, "workspace": workspace.to_str().unwrap()})
+            .to_string(),
+    }
+}
+
+/// Fixture for `parent_with_delegate_child`.
+struct DelegateParent {
+    session: String,
+    policy: IdlePolicy,
+    replies: Vec<AssistantMessage>,
+    block_call: usize,
+    initial_prompt: Option<String>,
+    /// Arm the Goal driver before the first turn closes (required for
+    /// `FinishWhenIdle`, which finalizes an idle session).
+    arm_goal: bool,
+}
+
+/// Parent runner holding a REAL `delegate` tool (real spawn, shared task
+/// registry, `on_id` registration, completion delivery) whose child hangs in
+/// its first provider call, so the test controls when the completion reaches
+/// the parent.
+async fn parent_with_delegate_child(
+    root: &std::path::Path,
+    fixture: DelegateParent,
+    entered: Arc<Notify>,
+    calls: Arc<Mutex<Vec<Vec<Message>>>>,
+) -> (SessionHandle, SessionTask, crate::tools::BackgroundTasks) {
+    let DelegateParent {
+        session,
+        policy,
+        replies,
+        block_call,
+        initial_prompt,
+        arm_goal,
+    } = fixture;
+    let workspace = crate::workspace::Workspace::new(root).unwrap();
+    let (_, background) = crate::tools::builtins(workspace.clone(), None, false, None);
+    let child_model = crate::model::ConfiguredModel::chat(
+        crate::model::OpenAiModel::new(
+            hanging_child_provider().await,
+            "test-key".into(),
+            "child-model".into(),
+            None,
+        )
+        .unwrap(),
+    );
+    let delegate = crate::delegate::Delegate::new(child_model, workspace, background.clone())
+        .with_persist_store(crate::config::SessionBackend::Jsonl)
+        .persist_sessions(root.join("subagents"));
+    let agent = Agent::new(
+        Box::new(BlockingContextCaptureModel {
+            replies: replies.into(),
+            block_call,
+            entered,
+            release: Arc::new(Notify::new()),
+            dropped: None,
+            calls,
+            call_count: 0,
+        }),
+        vec![Box::new(delegate) as Box<dyn Tool>],
+    );
+    let (runner, handle) = SessionRunner::new_with_bootstrap(
+        agent,
+        SessionStore::Jsonl,
+        root.into(),
+        session,
+        policy,
+        SessionBootstrap {
+            recovery_tasks: vec![],
+            legacy: false,
+            initial_entries: vec![test_goal_entry()],
+        },
+    )
+    .await
+    .unwrap();
+    if arm_goal {
+        // Arm before the first turn closes: FinishWhenIdle finalizes an idle
+        // session, so the driver must already be queued when it does.
+        handle.continue_goal(None);
+    }
+    let task = runner.start(initial_prompt);
+    (handle, task, background)
+}
+
+#[tokio::test]
+async fn goal_notice_append_race_cancel_before_provider_never_starts_a_call() {
+    // A Cancel admitted while the fresh turn's notice is being appended stops
+    // the turn before its provider request; the committed notice stays as
+    // durable audit. A later, explicitly re-armed turn then REUSES that unseen
+    // notice instead of writing a duplicate (its cap is spent on that one
+    // call, so no further automatic turn follows).
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![(
+                AssistantMessage {
+                    content: Some("goal after reuse".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                Some(Usage {
+                    input_tokens: 5,
+                    output_tokens: 0,
+                    ..Usage::default()
+                }),
+            )]
+            .into(),
+            calls: calls.clone(),
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    let (mut runner, handle) = SessionRunner::new_with_bootstrap(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-notice-race-cancel".into(),
+        IdlePolicy::WaitForInput,
+        SessionBootstrap {
+            recovery_tasks: vec![],
+            legacy: false,
+            initial_entries: vec![test_goal_entry()],
+        },
+    )
+    .await
+    .unwrap();
+    // The hook owns the only extra handle clone; the runner consumes the hook
+    // right after the notice commit.
+    let cancel_handle = handle.clone();
+    runner.before_goal_notice_drain = Some(Box::new(move || cancel_handle.cancel()));
+    let task = runner.start(None);
+    handle.continue_goal(None);
+    // The notice commit is the deterministic marker that the race hook ran.
+    wait_for_log_event(&handle, |event| {
+        matches!(event, AgentEvent::Notice(text) if text.starts_with(GOAL_TURN_NOTICE_PREFIX))
+    })
+    .await;
+    // The Cancel is consumed at the admission revalidation: the turn stops
+    // without a provider request, while its committed notice stays durable.
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::Display(text) if text == "turn cancelled"),
+    )
+    .await;
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "no automatic call after the Cancel"
+    );
+    assert_eq!(
+        goal_notices(&handle).len(),
+        1,
+        "the committed notice stays as durable audit"
+    );
+    // A later, explicitly armed turn consumes that same notice exactly once.
+    handle.continue_goal(Some(5));
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "goal after reuse"),
+    )
+    .await;
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        1,
+        "only the re-armed Goal turn ran"
+    );
+    assert_eq!(
+        notices_in_request(&calls.lock().unwrap()[0]),
+        1,
+        "the re-armed turn carries the previously unseen notice exactly once"
+    );
+    assert_eq!(
+        goal_notice_history(temp.path(), "goal-notice-race-cancel")
+            .await
+            .len(),
+        1,
+        "the abandoned attempt does not leave a duplicate notice"
+    );
+    assert_eq!(
+        goal_notices(&handle).len(),
+        1,
+        "and it fans out to the live log once"
+    );
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn goal_notice_append_race_child_registration_reuses_the_unseen_notice() {
+    // A `delegate`/btw child registers while the fresh turn's notice is being
+    // appended. Fresh automatic Goal turns must suspend, and the notice
+    // already written is the one the next admitted turn consumes — the
+    // abandoned attempt must not leave a duplicate notice behind.
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let registered = Arc::new(Notify::new());
+    let agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![(
+                AssistantMessage {
+                    content: Some("human answer".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                None,
+            )]
+            .into(),
+            calls: calls.clone(),
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    let (mut runner, handle) = SessionRunner::new_with_bootstrap(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-notice-race-child".into(),
+        IdlePolicy::WaitForInput,
+        SessionBootstrap {
+            recovery_tasks: vec![],
+            legacy: false,
+            initial_entries: vec![test_goal_entry()],
+        },
+    )
+    .await
+    .unwrap();
+    // A non-owning endpoint (exactly what a spawn path holds) does not keep
+    // the session alive, so the test's own handle stays the only owner.
+    let child_endpoint = handle.downgrade();
+    let registered_hook = registered.clone();
+    runner.before_goal_notice_drain = Some(Box::new(move || {
+        // Stands in for a `delegate`/btw spawn's `on_id` registration: the
+        // child is live from here on.
+        assert!(child_endpoint.register_goal_child(999));
+        registered_hook.notify_one();
+    }));
+    let task = runner.start(None);
+    handle.continue_goal(None);
+    wait_for_notify(&registered, "goal child registration").await;
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            calls_reached(&calls, 1)
+        )
+        .await
+        .is_err(),
+        "a child registered during the notice append must suspend the fresh turn"
+    );
+    assert_eq!(
+        goal_notice_history(temp.path(), "goal-notice-race-child")
+            .await
+            .len(),
+        1,
+        "the suspended attempt leaves exactly one durable notice"
+    );
+    // Human input is unaffected while the child is outstanding.
+    handle.prompt("human question");
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "human answer"),
+    )
+    .await;
+    assert_eq!(calls.lock().unwrap().len(), 1, "the human turn ran");
+    assert_eq!(
+        goal_notice_history(temp.path(), "goal-notice-race-child")
+            .await
+            .len(),
+        1,
+        "the human turn writes no notice"
+    );
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn goal_notice_append_race_queued_compact_preserves_the_driver() {
+    // A manual compaction admitted while the notice is being appended runs as
+    // FIFO maintenance, keeps the driver armed, and is charged to the
+    // continuation's run; the Goal turn then starts with the notice seen
+    // exactly once. The notice must never be duplicated by the requeued turn.
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![
+                (
+                    AssistantMessage {
+                        content: Some("charged summary".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    Some(Usage {
+                        input_tokens: 1,
+                        output_tokens: 0,
+                        ..Usage::default()
+                    }),
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("goal after maintenance".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    Some(Usage {
+                        input_tokens: 1,
+                        output_tokens: 0,
+                        ..Usage::default()
+                    }),
+                ),
+            ]
+            .into(),
+            calls: calls.clone(),
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    history_for_compaction(&mut agent);
+    let (mut runner, handle) = SessionRunner::new_with_bootstrap(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-notice-race-compact".into(),
+        IdlePolicy::WaitForInput,
+        SessionBootstrap {
+            recovery_tasks: vec![],
+            legacy: false,
+            initial_entries: vec![test_goal_entry()],
+        },
+    )
+    .await
+    .unwrap();
+    // The hook owns the only extra handle clone; the runner consumes the hook
+    // right after the notice commit.
+    let compact_handle = handle.clone();
+    runner.before_goal_notice_drain = Some(Box::new(move || compact_handle.compact()));
+    let task = runner.start(None);
+    handle.continue_goal(Some(2));
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "goal after maintenance"),
+    )
+    .await;
+    {
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2, "maintenance, then the resumed Goal call");
+        assert_eq!(
+            notices_in_request(&calls[1]),
+            1,
+            "the Goal call carries the same single notice the abandoned attempt wrote"
+        );
+    }
+    assert!(
+        SessionStore::Jsonl
+            .load(temp.path(), "goal-notice-race-compact")
+            .await
+            .unwrap()
+            .entries
+            .iter()
+            .any(|entry| matches!(entry, SessionEntry::Compaction { .. })),
+        "the queued compaction really ran as FIFO maintenance"
+    );
+    assert_eq!(
+        goal_notice_history(temp.path(), "goal-notice-race-compact")
+            .await
+            .len(),
+        1,
+        "maintenance before the request must not duplicate the notice"
+    );
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn finish_when_idle_still_finalizes_with_a_live_delegate_child() {
+    // `FinishWhenIdle` keeps its pre-existing rule: only this session's own
+    // non-detached BASH tasks keep it alive. A live `delegate` child is
+    // deliberately not added there, so a one-shot session still finalizes.
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let (handle, task, background) = parent_with_delegate_child(
+        temp.path(),
+        DelegateParent {
+            session: "goal-finish-with-delegate".into(),
+            policy: IdlePolicy::FinishWhenIdle,
+            replies: vec![
+                AssistantMessage {
+                    content: Some("user turn".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![delegate_call(temp.path(), "audit the workspace")],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("goal turn done".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                // Never reached when the fix holds; on the gate-less baseline
+                // the block makes the session visibly fail to finalize.
+                AssistantMessage {
+                    content: Some("unexpected automatic call".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+            ],
+            block_call: 4,
+            initial_prompt: Some("start".into()),
+            arm_goal: true,
+        },
+        Arc::new(Notify::new()),
+        calls.clone(),
+    )
+    .await;
+    let mut status = handle.status();
+    let finished = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        wait_for_status(&mut status, |status| matches!(status, SessionStatus::Finished(_))),
+    )
+    .await
+    .expect("FinishWhenIdle must finalize even with a live delegate child (a 4th call means it did not)");
+    assert!(
+        matches!(&finished, SessionStatus::Finished(SessionResult::Completed(answer)) if answer.as_deref() == Some("goal turn done")),
+        "FinishWhenIdle finalizes on its own rule, got {finished:?}"
+    );
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        3,
+        "user turn, Goal turn, closing round"
+    );
+    assert_eq!(
+        background.running().len(),
+        1,
+        "the delegated child is still live and untouched by the finalize"
+    );
+    let live = background.running();
+    background.cancel_with_source(live[0].id, crate::agent::CancellationSource::System);
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn goal_continuation_notice_does_not_arm_an_ordinary_reaction_turn() {
+    // The notice is runner-generated ingress for the automatic turn itself,
+    // not a background completion: it must not force an extra ordinary
+    // provider request. With the cap spent by this one Goal call the driver
+    // disarms, and a wrongly armed reaction would still produce a 2nd call.
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![(
+                AssistantMessage {
+                    content: Some("capped goal answer".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                Some(Usage {
+                    input_tokens: 5,
+                    output_tokens: 0,
+                    ..Usage::default()
+                }),
+            )]
+            .into(),
+            calls: calls.clone(),
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    let (runner, handle) = SessionRunner::new_with_bootstrap(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-notice-no-reaction".into(),
+        IdlePolicy::WaitForInput,
+        SessionBootstrap {
+            recovery_tasks: vec![],
+            legacy: false,
+            initial_entries: vec![test_goal_entry()],
+        },
+    )
+    .await
+    .unwrap();
+    let task = runner.start(None);
+    let mut status = handle.status();
+    handle.continue_goal(Some(5));
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "capped goal answer"),
+    )
+    .await;
+    wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)).await;
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            calls_reached(&calls, 2)
+        )
+        .await
+        .is_err(),
+        "the durable notice must not arm an ordinary reaction turn"
+    );
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        1,
+        "one automatic call, cap spent"
+    );
+    assert_eq!(goal_notices(&handle).len(), 1);
+    assert_eq!(notices_in_request(&calls.lock().unwrap()[0]), 1);
+    assert_eq!(
+        goal_notice_history(temp.path(), "goal-notice-no-reaction")
+            .await
+            .len(),
+        1,
+        "and it is durable"
+    );
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn goal_continuation_notice_absent_for_paused_goal_and_cancel() {
+    // Neither an inactive goal nor a discarded Continue may admit a turn, so
+    // neither may write a notice.
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![(
+                AssistantMessage {
+                    content: Some("ordinary after cancel".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                None,
+            )]
+            .into(),
+            calls: calls.clone(),
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-notice-inactive".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let task = runner.start(None);
+    handle.goal_command(GoalCommand::Create {
+        objective: "paused".into(),
+        success_criteria: vec![],
+    });
+    wait_for_goal(&handle, |goal| goal.is_some()).await;
+    handle.goal_command(GoalCommand::Action(crate::agent::GoalAction::Pause));
+    wait_for_goal(&handle, |goal| {
+        matches!(goal.map(|goal| goal.status), Some(GoalStatus::Paused))
+    })
+    .await;
+    handle.continue_goal(None);
+    handle.cancel();
+    handle.prompt("ordinary after cancel");
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "ordinary after cancel"),
+    )
+    .await;
+    assert_eq!(calls.lock().unwrap().len(), 1, "only the user turn ran");
+    assert!(goal_notices(&handle).is_empty(), "no notice without a turn");
+    assert!(
+        goal_notice_history(temp.path(), "goal-notice-inactive")
+            .await
+            .is_empty()
+    );
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_shared_registry_task_this_session_did_not_start_does_not_suspend_the_driver() {
+    // Goal admission is per session: the pre-existing bash gate records only
+    // tasks THIS session's own agent started. A task another session put into
+    // the shared registry (same registry object, no `running_background`
+    // entry here) must not hold back this session's fresh automatic turns.
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let fresh_goal = Arc::new(Notify::new());
+    let workspace = crate::workspace::Workspace::new(temp.path()).unwrap();
+    let (_, mut background) = crate::tools::builtins(workspace, None, false, None);
+    // A registry only accepts spawns while completion delivery is wired; the
+    // sink here belongs to another (unrelated) session.
+    let (other_sender, _other_completions) = mpsc::unbounded_channel::<AgentEvent>();
+    background.set_event_sender(other_sender);
+    let other_session_started = Arc::new(Notify::new());
+    let release_other = Arc::new(Notify::new());
+    let notify = other_session_started.clone();
+    let release = release_other.clone();
+    let started = background
+        .spawn(
+            "other session's task".into(),
+            None,
+            None,
+            move || async move {
+                notify.notify_one();
+                release.notified().await;
+                "other done".into()
+            },
+        )
+        .unwrap();
+    assert!(started.starts_with("started background task"));
+    let agent = Agent::new(
+        Box::new(BlockingContextCaptureModel {
+            replies: vec![
+                AssistantMessage {
+                    content: Some("goal turn one".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("fresh automatic goal".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+            ]
+            .into(),
+            block_call: 2,
+            entered: fresh_goal.clone(),
+            release: Arc::new(Notify::new()),
+            dropped: None,
+            calls: calls.clone(),
+            call_count: 0,
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    let (runner, handle) = SessionRunner::new_with_bootstrap(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-shared-registry".into(),
+        IdlePolicy::WaitForInput,
+        SessionBootstrap {
+            recovery_tasks: vec![],
+            legacy: false,
+            initial_entries: vec![test_goal_entry()],
+        },
+    )
+    .await
+    .unwrap();
+    let task = runner.start(None);
+    handle.continue_goal(None);
+    wait_for_notify(&fresh_goal, "fresh automatic goal call").await;
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        2,
+        "the driver is not held back"
+    );
+    assert_eq!(
+        goal_notices(&handle).len(),
+        2,
+        "each fresh turn announced itself"
+    );
+    assert_eq!(
+        background.running().len(),
+        1,
+        "the unrelated task is still live"
+    );
+    release_other.notify_one();
+    drop(handle);
+    task.join().await.unwrap();
+    drop(background);
+}
+
+#[tokio::test]
+async fn own_detached_background_does_not_suspend_fresh_automatic_goal() {
+    // A detached daemon is deliberately not owned blocking work: the driver
+    // remounts immediately and the new automatic turn announces itself again.
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let fresh_goal = Arc::new(Notify::new());
+    let sender = Arc::new(Mutex::new(None));
+    let agent = Agent::new(
+        Box::new(BlockingContextCaptureModel {
+            replies: vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![background_bash_call("daemon", true)],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("goal turn one".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("fresh automatic goal".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+            ]
+            .into(),
+            block_call: 3,
+            entered: fresh_goal.clone(),
+            release: Arc::new(Notify::new()),
+            dropped: None,
+            calls: calls.clone(),
+            call_count: 0,
+        }),
+        vec![Box::new(MockBackgroundBash {
+            id: 71,
+            label: "daemon",
+            sender: sender.clone(),
+        })],
+    );
+    let (runner, handle) = SessionRunner::new_with_bootstrap(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-detached-daemon".into(),
+        IdlePolicy::WaitForInput,
+        SessionBootstrap {
+            recovery_tasks: vec![],
+            legacy: false,
+            initial_entries: vec![test_goal_entry()],
+        },
+    )
+    .await
+    .unwrap();
+    let task = runner.start(None);
+    handle.continue_goal(None);
+    wait_for_notify(&fresh_goal, "fresh automatic goal call").await;
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        3,
+        "a detached daemon never suspends the driver"
+    );
+    assert_eq!(
+        goal_notices(&handle).len(),
+        2,
+        "the remounted turn announced itself"
+    );
+    handle.cancel();
+    wait_for_status(&mut handle.status(), |status| {
+        matches!(status, SessionStatus::Idle)
+    })
+    .await;
+    drop(handle);
     task.join().await.unwrap();
 }

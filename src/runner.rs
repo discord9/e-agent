@@ -45,6 +45,11 @@ pub enum PromptSubmission {
 
 const EVENT_CAPACITY: usize = 256;
 
+/// Model-facing notice committed once per genuinely new automatic Goal turn
+/// (never on a same-turn maintenance resume); replay is audit-only and by
+/// itself arms/wakes nothing.
+const GOAL_TURN_NOTICE: &str = "[goal continuation] Check the current goal with the `get_goal` tool, assess its status, remaining work, and evidence, then continue the relevant work — or update the goal with `update_goal` so it stays truthful.";
+
 /// Outcome of polling an in-flight operation against the command channel.
 /// A `Cancel` command is a *release*: the in-flight future is dropped
 /// (preempted) so queued messages are processed immediately — it never
@@ -267,6 +272,13 @@ struct Shared {
     /// Latest goal snapshot, mirrored from the runner for UI reads
     /// (REPL `/goal`, TUI GoalBar, web `GET /api/sessions/{id}/goal`).
     goal: Option<crate::agent::GoalSnapshot>,
+    /// Goal-admission state only: ids of this session's own live
+    /// `delegate`/btw children whose completion is not durably committed yet.
+    /// Registered at spawn (before the wrapper's work runs) and released only
+    /// by `commit_backgrounds` after append + owner ack — never by registry
+    /// removal, Cancel, or a failed append. It owns no work and gates FRESH
+    /// automatic Goal turns only.
+    goal_children: std::collections::HashSet<u64>,
 }
 impl Shared {
     fn set_history_boundary(&mut self, history_boundary: usize) {
@@ -350,6 +362,23 @@ impl WeakSessionHandle {
                 shared.commands_open = false;
                 "target session is no longer live".to_owned()
             })
+    }
+
+    /// Register one just-spawned live child (`delegate` / btw fork) as this
+    /// session's own outstanding background work for Goal admission. Called
+    /// from the spawn path's `on_id` hook, i.e. before the wrapper work is
+    /// released; `false` means the session is no longer live (nothing to
+    /// gate). The child itself is never affected.
+    pub fn register_goal_child(&self, id: u64) -> bool {
+        let Some(shared) = self.shared.upgrade() else {
+            return false;
+        };
+        let mut shared = shared.lock().unwrap();
+        if !shared.commands_open {
+            return false;
+        }
+        shared.goal_children.insert(id);
+        true
     }
 }
 
@@ -646,6 +675,7 @@ pub(crate) fn session_test_channel() -> (
         waiting_input: None,
         input_claimed: false,
         goal: None,
+        goal_children: std::collections::HashSet::new(),
     }));
     let (commands, receiver) = mpsc::unbounded_channel();
     (
@@ -798,6 +828,10 @@ pub struct SessionRunner {
     goal_continuation_usage_unavailable: bool,
     /// A natural turn end is the only mount point for the driver.
     turn_just_ended: bool,
+    /// The last committed fresh-turn notice has not reached a provider
+    /// request yet (its turn was abandoned). The next admitted fresh turn
+    /// reuses it instead of writing a duplicate.
+    goal_notice_unconsumed: bool,
     /// FIFO maintenance interrupted a live turn; resume it without resetting
     /// per-turn tool state. The Goal trigger still carries its charge class.
     maintenance_resume: bool,
@@ -809,6 +843,8 @@ pub struct SessionRunner {
     bootstrap: Option<SessionBootstrap>,
     #[cfg(test)]
     before_finalize: Option<Box<dyn FnOnce() + Send>>,
+    #[cfg(test)]
+    before_goal_notice_drain: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl Drop for SessionRunner {
@@ -924,6 +960,7 @@ impl SessionRunner {
             waiting_input: None,
             input_claimed: false,
             goal,
+            goal_children: std::collections::HashSet::new(),
         }));
         let handler_shared = shared.clone();
         agent.set_event_handler(Box::new(move |event| {
@@ -951,12 +988,15 @@ impl SessionRunner {
                 turn_just_ended: false,
                 maintenance_resume: false,
                 pending_regular_reaction: false,
+                goal_notice_unconsumed: false,
                 goal_continuation_remaining: None,
                 goal_continuation_usage_unavailable: false,
                 goal_continuation_armed: false,
                 bootstrap: None,
                 #[cfg(test)]
                 before_finalize: None,
+                #[cfg(test)]
+                before_goal_notice_drain: None,
             },
             handle,
         )
@@ -1226,13 +1266,25 @@ impl SessionRunner {
             // A fresh durable ingress gets its ordinary reaction before a
             // continuation can spend another Goal call.
             self.armed_trigger = Some(RunnerTrigger::Background);
-        } else if !self.agent.has_blocking_background() {
+        } else if !self.goal_owned_background_outstanding() {
             // Continue owns FIFO maintenance already queued before the next
             // provider call. Prompt intake still clears this trigger, so a
             // real user message remains a User turn. It cannot replace an
-            // accepted input answer's maintenance resume.
+            // accepted input answer's maintenance resume. Owned non-detached
+            // work suspends the fresh mount; its completion brings the driver
+            // back at the natural end of the ordinary follow-up.
             self.armed_trigger = Some(RunnerTrigger::Goal);
         }
+    }
+
+    /// Goal-admission predicate for *fresh* automatic Goal turns: this
+    /// session's own non-detached background work is outstanding — bash/pwsh
+    /// tasks (the pre-existing gate) or a live `delegate`/btw child without a
+    /// durably committed completion. Same-turn maintenance resumes, ordinary
+    /// turns, human input and `FinishWhenIdle` never consult the child set.
+    fn goal_owned_background_outstanding(&self) -> bool {
+        self.agent.has_blocking_background()
+            || !self.shared.lock().unwrap().goal_children.is_empty()
     }
 
     /// Cap exhaustion is a runner-local live event: it stays available to
@@ -1880,6 +1932,10 @@ impl SessionRunner {
             // Persist the completion first, but do not apply or publish it
             // until its owner row is durably clear. Resume may therefore
             // never observe a live completion paired with a stale owner.
+            let child_id = match &entry {
+                SessionEntry::BackgroundCompletion { id, .. } => Some(*id),
+                _ => None,
+            };
             let locations = self
                 .store
                 .append_located(&self.root, &self.session, std::slice::from_ref(&entry))
@@ -1889,6 +1945,11 @@ impl SessionRunner {
                 .ack_background_entry()
                 .await
                 .map_err(anyhow::Error::msg)?;
+            if let Some(id) = child_id {
+                // Durable now (append + owner ack above): only now may the
+                // child stop suspending fresh automatic Goal turns.
+                self.shared.lock().unwrap().goal_children.remove(&id);
+            }
             let event = match &entry {
                 SessionEntry::Notice { text } => AgentEvent::Notice(text.clone()),
                 SessionEntry::BackgroundCompletion {
@@ -2418,13 +2479,19 @@ impl SessionRunner {
             if self.pending.is_empty() && self.armed_trigger == Some(RunnerTrigger::Goal) {
                 // Goal mutations at the precedence boundary can make the
                 // already-armed continuation ineligible. Drop it before the
-                // provider call, without charging or emitting its Display projection.
+                // provider call, without charging or emitting its Display
+                // projection. Owned work suspends FRESH automatic turns only:
+                // a same-turn maintenance resume continues the interrupted
+                // turn (the work this turn started must not gate its own
+                // resume); every other eligibility rule applies to both.
+                let owned_background_blocks =
+                    !self.maintenance_resume && self.goal_owned_background_outstanding();
                 let eligible = self.goal_continuation_armed
                     && matches!(
                         self.agent.goal().as_ref().map(|goal| goal.status),
                         Some(GoalStatus::Active)
                     )
-                    && !self.agent.has_blocking_background()
+                    && !owned_background_blocks
                     && self.goal_continuation_remaining != Some(0)
                     && !self.goal_continuation_usage_unavailable;
                 if !eligible {
@@ -2481,12 +2548,12 @@ impl SessionRunner {
                         && self.goal_continuation_remaining != Some(0)
                         && !self.goal_continuation_usage_unavailable
                     {
-                        if !self.agent.has_blocking_background() {
+                        if !self.goal_owned_background_outstanding() {
                             self.armed_trigger = Some(RunnerTrigger::Goal);
                             continue;
                         }
-                        // Owned background work suspends the live driver. Its
-                        // completion gets the ordinary follow-up, whose
+                        // Owned non-detached work suspends the live driver;
+                        // its completion gets the ordinary follow-up, whose
                         // natural end mounts this still-armed Goal again.
                     } else {
                         self.goal_continuation_armed = false;
@@ -2564,6 +2631,72 @@ impl SessionRunner {
                     return;
                 }
             }
+            // A genuinely NEW automatic Goal turn announces itself once with
+            // a durable model-facing notice before its first provider request
+            // (without it a continuation re-emits its previous answer).
+            // Same-turn maintenance resumes and ordinary/human turns never
+            // write it; it does NOT arm `pending_regular_reaction`.
+            if goal_turn && !resume_turn && !self.goal_notice_unconsumed {
+                if let Err(error) = self
+                    .commit(SessionEntry::Notice {
+                        text: GOAL_TURN_NOTICE.to_owned(),
+                    })
+                    .await
+                {
+                    // No provider request may start from an uncommitted
+                    // notice: the session fails and stops.
+                    self.terminate(SessionResult::Failed(format!("{error:#}")), Vec::new())
+                        .await;
+                    return;
+                }
+                self.goal_notice_unconsumed = true;
+                #[cfg(test)]
+                if let Some(hook) = self.before_goal_notice_drain.take() {
+                    hook();
+                }
+            }
+            if goal_turn && !resume_turn {
+                // The append is a new await before the request boundary, so
+                // revalidate instead of trusting the pre-append gate: a
+                // Cancel stops this turn before its request (the notice stays
+                // as durable audit), queued work is consumed by the outer
+                // loop, and a child registration or fresh ingress that raced
+                // the append suspends it. Later races are caught by the
+                // operation waits.
+                let steering = self.drain_ready_commands();
+                if steering != Steering::None {
+                    self.shared
+                        .lock()
+                        .unwrap()
+                        .emit_presentation(AgentEvent::Display("turn cancelled".into()));
+                    if self.release_after_preempt(steering) {
+                        return;
+                    }
+                    continue;
+                }
+                if self.has_work() {
+                    // Queued work runs first; the driver keeps its precedence
+                    // boundary for afterwards (a real prompt instead starts a
+                    // User turn, whose natural end remounts the driver).
+                    if !self.has_prompt_work() {
+                        self.armed_trigger = Some(RunnerTrigger::Goal);
+                    }
+                    continue;
+                }
+                if self.goal_owned_background_outstanding() {
+                    // A child registered during the append suspends this
+                    // fresh turn; its durably committed completion remounts
+                    // the driver.
+                    continue;
+                }
+                self.agent.drain_background_ready();
+                if self.agent.peek_background_entry().is_some() {
+                    // Fresh durable ingress must not be consumed by an
+                    // automatic Goal call: its ordinary reaction goes first.
+                    self.armed_trigger = Some(RunnerTrigger::Background);
+                    continue;
+                }
+            }
             // True turn starts here (fresh/queued prompt, or the idle
             // background-completion follow-up turn from an empty prompt
             // batch): reset per-turn tool state (poll guard).
@@ -2606,6 +2739,11 @@ impl SessionRunner {
                 // not a Goal call, and consumes ingress already committed
                 // before it. That preserves answer priority without issuing a
                 // second empty Background request afterward.
+                // A provider request consumes every notice already in
+                // history (an abandoned attempt's, or one already seen by an
+                // ordinary turn): the next fresh automatic turn announces
+                // itself again.
+                self.goal_notice_unconsumed = false;
                 let reaction_request = self.pending_regular_reaction && !goal_turn;
                 // The request boundary, rather than a successful provider
                 // response, consumes the already-durable ingress: this call's

@@ -902,7 +902,7 @@ pub async fn spawn_btw_subagent(
         // A btw fork is an interactive main-style conversation (real user
         // turns, current turn kept verbatim).
         CompactionMode::Main,
-        Some(parent_handle),
+        Some(parent_handle.clone()),
     )
     .await?;
     // Sessions metadata: the subagent's row links back to the parent
@@ -961,6 +961,11 @@ pub async fn spawn_btw_subagent(
     // child to the system.
     let exit_slot = new_exit_slot();
     let work_exit = exit_slot.clone();
+    // Live source-session endpoint: registers this btw fork in the source
+    // session's Goal-admission set from the `on_id` hook below (before the
+    // wrapper's work is released), so a `/btw` fork is the main session's own
+    // outstanding background work exactly like a `delegate` child.
+    let goal_registration = parent_handle.clone();
     background.spawn_with_id_target(
         background.sender.lock().unwrap().clone(),
         label,
@@ -979,6 +984,7 @@ pub async fn spawn_btw_subagent(
                 Ok(mut slot) => *slot = Some(id),
                 Err(poisoned) => *poisoned.into_inner() = Some(id),
             }
+            goal_registration.register_goal_child(id);
             sessions_hook.insert(id, entry_for_hook);
             spawn_subagent_meta_create(
                 meta_store.clone(),
@@ -1371,6 +1377,11 @@ impl Tool for Delegate {
             self.sandbox.clone()
         };
         let parent_endpoint = self.parent_endpoint.clone();
+        // The same live parent endpoint registers this child's task id in the
+        // parent's Goal-admission set from the `on_id` hook below — before the
+        // wrapper's work is released, so a running child is always visible to
+        // a fresh automatic Goal turn.
+        let goal_registration = self.parent_endpoint.clone();
         let (handle, runner_task) = Self::start_runner(
             model,
             context_window,
@@ -1444,6 +1455,9 @@ impl Tool for Delegate {
                 match slot_in_hook.lock() {
                     Ok(mut slot) => *slot = Some(id),
                     Err(poisoned) => *poisoned.into_inner() = Some(id),
+                }
+                if let Some(parent) = &goal_registration {
+                    parent.register_goal_child(id);
                 }
                 sessions.insert(id, entry_for_hook);
                 spawn_subagent_meta_create(

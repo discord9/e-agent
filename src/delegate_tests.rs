@@ -3420,3 +3420,230 @@ async fn delegate_weak_parent_endpoint_does_not_keep_runner_command_intake_open(
         .expect("Delegate's weak parent endpoint must not retain command intake")
         .unwrap();
 }
+
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// Goal continuation × a live btw fork (frontend registration path)
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+/// Prefix of the durable per-turn goal notice (see `runner.rs`; the test
+/// pins the model-facing contract, not the exact wording).
+const GOAL_TURN_NOTICE_PREFIX: &str = "[goal continuation]";
+
+/// Parent-side scripted model for the btw goal-gate test: counts calls,
+/// captures every request context and can block one designated call.
+struct GoalParentModel {
+    replies: std::collections::VecDeque<String>,
+    calls: Arc<AtomicUsize>,
+    contexts: Arc<Mutex<Vec<Vec<Message>>>>,
+    block_call: usize,
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait]
+impl Model for GoalParentModel {
+    async fn complete(
+        &mut self,
+        messages: &[Message],
+        _: &[ToolSpec],
+        _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        self.contexts.lock().unwrap().push(messages.to_vec());
+        let reply = self.replies.pop_front().expect("unexpected model call");
+        if call == self.block_call {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        Ok((
+            AssistantMessage {
+                content: Some(reply),
+                tool_calls: vec![],
+                reasoning: None,
+            },
+            None,
+        ))
+    }
+}
+
+fn goal_notices_in(messages: &[Message]) -> Vec<&str> {
+    messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::User { content, .. } if content.starts_with(GOAL_TURN_NOTICE_PREFIX) => {
+                Some(content.as_str())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// `/btw` (the frontend path) registers the fork as the SOURCE session's own
+/// outstanding child: while the fork lives, no fresh automatic Goal turn may
+/// start, and only its durably committed completion admits the next one —
+/// with its own durable goal notice.
+#[tokio::test]
+async fn btw_child_suspends_fresh_automatic_goal_until_completion_commits() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("sessions");
+    // A persisted source session the fork can cut at its last completed turn.
+    let prior = vec![
+        crate::agent::SessionEntry::from(Message::User {
+            content: "hello".into(),
+            images: vec![],
+        }),
+        crate::agent::SessionEntry::from(Message::Assistant(AssistantMessage {
+            content: Some("hi".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        })),
+    ];
+    Session::append(&root, "btw-goal-main", &prior).unwrap();
+
+    let workspace = Workspace::new(temp.path()).unwrap();
+    let (_, background) = builtins(workspace.clone(), None, false, None);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let contexts = Arc::new(Mutex::new(Vec::new()));
+    let blocked = Arc::new(Notify::new());
+    // The registry's completion sink is wired exactly like production: the
+    // parent session's own `Delegate` (never executed here) holds this
+    // registry, so the fork's completion arrives in the parent's runner.
+    let dummy = Delegate::new(
+        ConfiguredModel::chat(
+            crate::model::OpenAiModel::new(
+                "http://localhost".into(),
+                "test-key".into(),
+                "unused".into(),
+                None,
+            )
+            .unwrap(),
+        ),
+        workspace.clone(),
+        background.clone(),
+    );
+    let agent = Agent::new(
+        Box::new(GoalParentModel {
+            replies: ["goal answer after the fork".into(), "unexpected".into()].into(),
+            calls: calls.clone(),
+            contexts: contexts.clone(),
+            block_call: 2,
+            entered: blocked.clone(),
+            release: Arc::new(Notify::new()),
+        }),
+        vec![Box::new(dummy) as Box<dyn Tool>],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        root.clone(),
+        "btw-goal-main".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let task = runner.start(None);
+    let id = spawn_btw_subagent(
+        "btw-goal-main",
+        "side question",
+        BtwContext {
+            model: ConfiguredModel::chat(
+                crate::model::OpenAiModel::new(
+                    hanging_model().await,
+                    "test-key".into(),
+                    "child".into(),
+                    None,
+                )
+                .unwrap(),
+            ),
+            context_window: None,
+            workspace: workspace.clone(),
+            sandbox: None,
+            read_only: false,
+            background: background.clone(),
+            sessions: Sessions::default(),
+            persist_root: root.clone(),
+            backend: SessionBackend::Jsonl,
+            record_in: None,
+            local_sessions: crate::session_factory::LocalSessionRegistry::default(),
+            parent_handle: handle.downgrade(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(id.starts_with("btw-"), "btw session id, got {id}");
+
+    // Arm the source session's driver: the live fork must hold it back.
+    assert!(handle.goal_command(crate::runner::GoalCommand::Create {
+        objective: "gate on the fork".into(),
+        success_criteria: vec![],
+    }));
+    assert!(handle.continue_goal(None));
+    let premature = tokio::time::timeout(std::time::Duration::from_millis(250), async {
+        while calls.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(
+        premature.is_err(),
+        "a live btw child must suspend fresh automatic Goal turns"
+    );
+    assert!(
+        goal_notices_in(&contexts.lock().unwrap().concat()).is_empty(),
+        "no provider request may carry a goal notice while the fork holds the driver"
+    );
+
+    // Closing the fork delivers its completion; that, and only that, admits
+    // the next automatic turn.
+    let live = background.running();
+    assert_eq!(live.len(), 1, "exactly one btw task: {live:?}");
+    let fork_id = live[0].id;
+    background.cancel_with_source(fork_id, crate::agent::CancellationSource::System);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while calls.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "the completion reaction, then one fresh automatic Goal turn"
+    );
+    {
+        let contexts = contexts.lock().unwrap();
+        assert!(
+            contexts[0].iter().any(|message| matches!(
+                message,
+                Message::User { content, .. }
+                    if content.contains("btw session:") && content.contains("cancelled")
+            )),
+            "the reaction request carries the durably committed fork completion"
+        );
+        assert!(
+            goal_notices_in(&contexts[0]).is_empty(),
+            "an ordinary completion reaction carries no goal notice"
+        );
+        assert_eq!(
+            goal_notices_in(&contexts[1]).len(),
+            1,
+            "the next fresh automatic Goal turn carries exactly one notice"
+        );
+    }
+    let entries = SessionStore::Jsonl
+        .load(&root, "btw-goal-main")
+        .await
+        .unwrap()
+        .entries;
+    let completion = entries
+        .iter()
+        .position(|entry| matches!(entry, crate::agent::SessionEntry::BackgroundCompletion { id, .. } if *id == fork_id))
+        .expect("the fork completion is durable");
+    let notice = entries
+        .iter()
+        .position(|entry| matches!(entry, crate::agent::SessionEntry::Notice { text } if text.starts_with(GOAL_TURN_NOTICE_PREFIX)))
+        .expect("the admitted turn's notice is durable");
+    assert!(
+        completion < notice,
+        "the notice belongs to the turn admitted AFTER the durable completion: completion={completion} notice={notice}"
+    );
+    handle.cancel();
+    drop(handle);
+    task.join().await.unwrap();
+}
