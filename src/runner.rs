@@ -1282,6 +1282,10 @@ impl SessionRunner {
     /// tasks (the pre-existing gate) or a live `delegate`/btw child without a
     /// durably committed completion. Same-turn maintenance resumes, ordinary
     /// turns, human input and `FinishWhenIdle` never consult the child set.
+    /// Goal-admission predicate for a fresh automatic turn: this session's
+    /// own live non-detached background work. The last call before a request
+    /// is the admission linearization point — work registered after it does
+    /// not revoke the request, it only blocks the next fresh turn.
     fn goal_owned_background_outstanding(&self) -> bool {
         self.agent.has_blocking_background()
             || !self.shared.lock().unwrap().goal_children.is_empty()
@@ -2659,10 +2663,23 @@ impl SessionRunner {
                 // The append is a new await before the request boundary, so
                 // revalidate instead of trusting the pre-append gate: a
                 // Cancel stops this turn before its request (the notice stays
-                // as durable audit), queued work is consumed by the outer
-                // loop, and a child registration or fresh ingress that raced
-                // the append suspends it. Later races are caught by the
-                // operation waits.
+                // as durable audit), a command channel that closed during the
+                // append (the last frontend handle dropped) terminates the
+                // session Closed with no provider request, queued work is
+                // consumed by the outer loop, and a child registration or
+                // fresh ingress that raced the append suspends it. A child
+                // registration is not an operation command, so the later
+                // operation waits do not observe it: the owned-set check
+                // below is this turn's admission linearization point —
+                // registrations before it suspend this fresh turn, later ones
+                // only gate the NEXT automatic turn instead of revoking an
+                // already-admitted request.
+                if self.commands.is_closed() {
+                    // Terminate through the ordinary Closed path: accepted
+                    // queued prompts are still flushed durably by terminate.
+                    self.terminate(SessionResult::Closed, Vec::new()).await;
+                    return;
+                }
                 let steering = self.drain_ready_commands();
                 if steering != Steering::None {
                     self.shared
@@ -2684,9 +2701,10 @@ impl SessionRunner {
                     continue;
                 }
                 if self.goal_owned_background_outstanding() {
-                    // A child registered during the append suspends this
-                    // fresh turn; its durably committed completion remounts
-                    // the driver.
+                    // A child registered before this check suspends the fresh
+                    // turn; its durably committed completion remounts the
+                    // driver. A later registration does not revoke this
+                    // admission — it gates the next automatic turn.
                     continue;
                 }
                 self.agent.drain_background_ready();

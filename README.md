@@ -893,8 +893,16 @@ verifier). Fields: `id`, `revision`, `objective`, `success_criteria`,
   automatic Goal turn is admitted only while this session has no own
   non-detached background work — `bash`/`pwsh` tasks (the pre-existing
   `running_background` gate) and live `delegate`/btw children (registered
-  synchronously at spawn, released only after the child's completion entry was
-  durably committed). The interrupted turn's own model rounds, same-turn FIFO
+  synchronously by the spawn wrapper's `on_id` hook, i.e. before the
+  wrapper's work is released, and released only after the child's completion
+  entry was durably committed). The fresh owned-set check at that point is the
+  admission linearization point: a child registered before it suspends the
+  fresh turn; one registered after it gates the *next* automatic turn and
+  never revokes an already-admitted turn. `/btw` API acceptance and child
+  startup happen before that registration, so suspension is not promised from
+  the moment the fork request is accepted; an idle interactive btw child stays
+  outstanding (suspending fresh automatic turns) until its conversation closes
+  or is cancelled. The interrupted turn's own model rounds, same-turn FIFO
   maintenance resumes (a queued compaction, agent message, or goal command in
   the turn that started the work), human input, the ordinary completion
   reaction, and `FinishWhenIdle` are deliberately NOT gated by the child set:
@@ -906,15 +914,20 @@ verifier). Fields: `id`, `revision`, `objective`, `success_criteria`,
 - **A fresh automatic turn announces itself durably**: each genuinely new
   automatic Goal turn commits one `SessionEntry::Notice`
   (`[goal continuation] Check the current goal …`) before its first provider
-  call, so the model re-reads status/remaining work/evidence with `get_goal`
-  and continues real work or updates the goal truthfully instead of repeating
-  its previous answer. It is a durable model-facing entry (a resumed or
-  late-attached view replays the audit line), not a user prompt and not a
-  UI-only display; it never arms a separate ordinary reaction request. One per
-  fresh automatic turn: same-turn maintenance resumes, queued prompts,
-  waiting-input answers, cap exhaustion, inactive goals, and cancelled
-  sessions add none. Replaying it never arms or wakes the driver — a restart
-  still starts unarmed.
+  call: it asks the model to re-read status/remaining work/evidence with
+  `get_goal` and then continue the relevant work or update the goal, instead
+  of repeating its previous answer. It is an instruction to the model, not a
+  guarantee that the model complies or reports truthfully. It is a durable
+  model-facing entry (a resumed or late-attached view replays the audit line),
+  not a user prompt and not a UI-only display; it never arms a separate
+  ordinary reaction request. One per fresh automatic turn: same-turn
+  maintenance resumes, queued prompts, waiting-input answers, cap exhaustion,
+  inactive goals, and cancelled sessions do not generate a new reminder of
+  their own. Because the Notice is committed before the provider request, a
+  Cancel (or the last command handle closing) admitted after that durable
+  append but before the request can end the turn with the audit Notice
+  already on disk and no Goal provider call. Replaying it never arms or wakes
+  the driver — a restart still starts unarmed.
 - **Subagent isolation**: subagents get the goal tools but their runner
   applies them against the subagent's own (usually empty) goal state — a
   subagent can never take a mutable reference to its parent's goal.

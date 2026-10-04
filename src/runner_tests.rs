@@ -15236,3 +15236,66 @@ async fn own_detached_background_does_not_suspend_fresh_automatic_goal() {
     drop(handle);
     task.join().await.unwrap();
 }
+
+// Oracle follow-up probe (tmp/goal-oracle-review.md, P1): closing the last
+// command handle while a fresh automatic turn's durable Notice is being
+// appended must stop the turn before any provider request starts; the
+// committed Notice stays as durable audit (no provider call may follow).
+#[tokio::test]
+async fn oracle_goal_notice_append_close_before_provider() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![(
+                AssistantMessage {
+                    content: Some("must not run after close".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                Some(Usage {
+                    input_tokens: 1,
+                    ..Usage::default()
+                }),
+            )]
+            .into(),
+            calls: calls.clone(),
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    let (mut runner, handle) = SessionRunner::new_with_bootstrap(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "oracle-notice-close".into(),
+        IdlePolicy::WaitForInput,
+        SessionBootstrap {
+            recovery_tasks: vec![],
+            legacy: false,
+            initial_entries: vec![test_goal_entry()],
+        },
+    )
+    .await
+    .unwrap();
+    let status = handle.status(); // watch receiver does not own command sender
+    handle.continue_goal(Some(1));
+    runner.before_goal_notice_drain = Some(Box::new(move || drop(handle)));
+    let task = runner.start(None);
+    tokio::time::timeout(std::time::Duration::from_secs(3), task.join())
+        .await
+        .expect("runner should close")
+        .unwrap();
+    let count = calls.lock().unwrap().len();
+    eprintln!(
+        "ORACLE_CLOSE_PROBE provider_calls={count}, final_status={:?}",
+        *status.borrow()
+    );
+    assert!(matches!(
+        &*status.borrow(),
+        SessionStatus::Finished(SessionResult::Closed)
+    ));
+    assert_eq!(
+        count, 0,
+        "closed during Notice append: no automatic provider request may start"
+    );
+}
