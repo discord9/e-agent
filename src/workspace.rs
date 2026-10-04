@@ -533,28 +533,46 @@ impl Workspace {
         String::from_utf8(self.read(input)?).map_err(|error| format!("read failed: {error}"))
     }
 
+    /// Whether `input` names an existing file or directory, resolved with
+    /// the same logical-winner rules as a read. Used by `generate_image` as
+    /// an early occupied-path check before any provider request; the final
+    /// exclusive create stays the authority against races.
+    pub fn exists(&self, input: &str) -> Result<bool, String> {
+        match self.resolve_path(input, false)? {
+            Resolved::Workspace { remainder } => self
+                .dir
+                .try_exists(&remainder)
+                .map_err(|error| format!("stat failed: {error}")),
+            Resolved::External { root, remainder } => match &root.capability {
+                ExternalCapability::Dir(dir) => dir
+                    .try_exists(&remainder)
+                    .map_err(|error| format!("stat failed: {error}")),
+                // The capability is an open file handle; it exists by
+                // definition (opened at startup).
+                ExternalCapability::File(_) if remainder.as_os_str().is_empty() => Ok(true),
+                ExternalCapability::File(_) => {
+                    Err("external file capability does not authorize sibling paths".into())
+                }
+            },
+        }
+    }
+
+    /// Whether `input` resolves to the workspace itself rather than a
+    /// configured external root, using the same logical winner a write
+    /// would pick. `generate_image` requires this: its output stays below
+    /// the workspace root even when a writable external root is configured.
+    pub fn targets_workspace(&self, input: &str) -> Result<bool, String> {
+        Ok(matches!(
+            self.resolve_path(input, false)?,
+            Resolved::Workspace { .. }
+        ))
+    }
+
     /// Read a file as UTF-8, mapping a missing file to `None` — callers can
     /// distinguish "the file did not exist" from other read failures (used
     /// by write_file's undo snapshot, where `None` means undo = delete).
     pub fn try_read_to_string(&self, input: &str) -> Result<Option<String>, String> {
-        let exists = match self.resolve_path(input, false)? {
-            Resolved::Workspace { remainder } => self
-                .dir
-                .try_exists(&remainder)
-                .map_err(|error| format!("stat failed: {error}"))?,
-            Resolved::External { root, remainder } => match &root.capability {
-                ExternalCapability::Dir(dir) => dir
-                    .try_exists(&remainder)
-                    .map_err(|error| format!("stat failed: {error}"))?,
-                // The capability is an open file handle; it exists by
-                // definition (opened at startup).
-                ExternalCapability::File(_) if remainder.as_os_str().is_empty() => true,
-                ExternalCapability::File(_) => {
-                    return Err("external file capability does not authorize sibling paths".into());
-                }
-            },
-        };
-        if !exists {
+        if !self.exists(input)? {
             return Ok(None);
         }
         self.read_to_string(input).map(Some)
@@ -579,31 +597,62 @@ impl Workspace {
     }
 
     pub fn write(&self, input: &str, content: impl AsRef<[u8]>) -> Result<(), String> {
+        self.write_inner(input, content.as_ref(), WriteMode::Replace)
+    }
+
+    /// Like [`write`] but creates a NEW file and fails when it already
+    /// exists: the final open is exclusive (Linux `O_EXCL`, Windows
+    /// `create_new`), so a concurrent creator always wins and this call
+    /// reports the conflict instead of truncating their bytes. Only the
+    /// workspace itself is addressed — a configured external root is
+    /// rejected even when writable — while policy rejection and the
+    /// no-escape guarantees stay identical to [`write`].
+    pub fn write_new(&self, input: &str, content: impl AsRef<[u8]>) -> Result<(), String> {
+        self.write_inner(input, content.as_ref(), WriteMode::CreateNew)
+    }
+
+    fn write_inner(&self, input: &str, content: &[u8], mode: WriteMode) -> Result<(), String> {
         let path = Path::new(input);
         self.reject_policy_write(path)?;
         match self.resolve_path(input, true)? {
             Resolved::Workspace { remainder } => {
-                secure_dir_write(&self.dir, &remainder, content.as_ref())
+                secure_dir_write(&self.dir, &remainder, content, mode)
             }
-            Resolved::External { root, remainder } => match &root.capability {
-                ExternalCapability::Dir(dir) => secure_dir_write(dir, &remainder, content.as_ref()),
-                ExternalCapability::File(file) if remainder.as_os_str().is_empty() => {
-                    let mut file = file.lock().map_err(|_| {
-                        "write failed: external file capability lock is poisoned".to_owned()
-                    })?;
-                    file.set_len(0)
-                        .map_err(|error| format!("write failed: {error}"))?;
-                    file.seek(SeekFrom::Start(0))
-                        .map_err(|error| format!("write failed: {error}"))?;
-                    file.write_all(content.as_ref())
-                        .and_then(|()| file.flush())
-                        .map_err(|error| format!("write failed: {error}"))
+            Resolved::External { root, remainder } => {
+                if mode == WriteMode::CreateNew {
+                    return Err("write failed: new files must be inside the workspace".into());
                 }
-                ExternalCapability::File(_) => {
-                    Err("external file capability does not authorize sibling paths".into())
+                match &root.capability {
+                    ExternalCapability::Dir(dir) => {
+                        secure_dir_write(dir, &remainder, content, mode)
+                    }
+                    ExternalCapability::File(file) if remainder.as_os_str().is_empty() => {
+                        let mut file = file.lock().map_err(|_| {
+                            "write failed: external file capability lock is poisoned".to_owned()
+                        })?;
+                        file.set_len(0)
+                            .map_err(|error| format!("write failed: {error}"))?;
+                        file.seek(SeekFrom::Start(0))
+                            .map_err(|error| format!("write failed: {error}"))?;
+                        file.write_all(content)
+                            .and_then(|()| file.flush())
+                            .map_err(|error| format!("write failed: {error}"))
+                    }
+                    ExternalCapability::File(_) => {
+                        Err("external file capability does not authorize sibling paths".into())
+                    }
                 }
-            },
+            }
         }
+    }
+
+    /// Fail when a write to `input` would be denied by policy, without
+    /// touching the filesystem — the pre-request check `generate_image`
+    /// uses so a read-only workspace or protected policy file is refused
+    /// before anything is spent. The final write stays the authority.
+    pub fn check_writable(&self, input: &str) -> Result<(), String> {
+        self.reject_policy_write(Path::new(input))?;
+        self.resolve_path(input, true).map(|_| ())
     }
 
     fn reject_policy_write(&self, path: &Path) -> Result<(), String> {
@@ -839,6 +888,14 @@ fn open_regular_file_nofollow(
     Ok(Some(fd))
 }
 
+/// Whether a secure directory write may replace an existing file
+/// (`write`) or must exclusively create a new one (`write_new`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WriteMode {
+    Replace,
+    CreateNew,
+}
+
 #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
 fn android_open_dir_nofollow_impl(base: &Dir, path: &Path) -> rustix::io::Result<Dir> {
     use rustix::fs::{Mode, OFlags, openat};
@@ -911,7 +968,7 @@ fn android_open_regular_file_nofollow_impl(
 }
 
 #[cfg(target_os = "linux")]
-fn secure_dir_write(dir: &Dir, path: &Path, content: &[u8]) -> Result<(), String> {
+fn secure_dir_write(dir: &Dir, path: &Path, content: &[u8], mode: WriteMode) -> Result<(), String> {
     use rustix::fs::{Mode, OFlags, ResolveFlags, mkdirat, openat2};
 
     let components: Vec<_> = path
@@ -942,23 +999,44 @@ fn secure_dir_write(dir: &Dir, path: &Path, content: &[u8]) -> Result<(), String
         };
         parent = Dir::from(opened);
     }
-    let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::CLOEXEC;
-    let fd = openat2(
+    let flags = match mode {
+        WriteMode::Replace => OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::CLOEXEC,
+        WriteMode::CreateNew => OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
+    };
+    let fd = match openat2(
         &parent,
         *file_name,
         flags,
         Mode::from(0o666),
         ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
-    )
-    .map_err(|error| format!("write failed: {error}"))?;
+    ) {
+        Ok(fd) => fd,
+        Err(error) if mode == WriteMode::CreateNew && error == rustix::io::Errno::EXIST => {
+            return Err("write failed: file already exists (not overwritten)".to_owned());
+        }
+        Err(error) => return Err(format!("write failed: {error}")),
+    };
     let mut file = File::from(fd);
-    file.write_all(content)
-        .and_then(|()| file.flush())
-        .map_err(|error| format!("write failed: {error}"))
+    if let Err(error) = file.write_all(content).and_then(|()| file.flush()) {
+        if mode == WriteMode::CreateNew {
+            // The exclusive create succeeded, so the partial file is ours:
+            // remove it best-effort so a retry is not blocked by our own
+            // debris. A failed removal is reported through the write error.
+            drop(file);
+            let _ = parent.remove_file(*file_name);
+        }
+        return Err(format!("write failed: {error}"));
+    }
+    Ok(())
 }
 
 #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
-fn secure_dir_write_android_impl(dir: &Dir, path: &Path, content: &[u8]) -> Result<(), String> {
+fn secure_dir_write_android_impl(
+    dir: &Dir,
+    path: &Path,
+    content: &[u8],
+    mode: WriteMode,
+) -> Result<(), String> {
     // Do not use openat2 here: Android app seccomp policies may TRAP it with SIGSYS.
     use rustix::fs::{Mode, OFlags, mkdirat, openat};
 
@@ -989,13 +1067,22 @@ fn secure_dir_write_android_impl(dir: &Dir, path: &Path, content: &[u8]) -> Resu
         };
         parent = Dir::from(opened);
     }
-    let fd = openat(
+    let flags = match mode {
+        WriteMode::Replace => OFlags::CREATE | OFlags::TRUNC,
+        WriteMode::CreateNew => OFlags::CREATE | OFlags::EXCL,
+    };
+    let fd = match openat(
         &parent,
         *file_name,
-        OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        flags | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::from(0o666),
-    )
-    .map_err(|error| format!("write failed: {error}"))?;
+    ) {
+        Ok(fd) => fd,
+        Err(error) if mode == WriteMode::CreateNew && error == rustix::io::Errno::EXIST => {
+            return Err("write failed: file already exists (not overwritten)".to_owned());
+        }
+        Err(error) => return Err(format!("write failed: {error}")),
+    };
     let mut file = File::from(fd);
     file.write_all(content)
         .and_then(|()| file.flush())
@@ -1014,12 +1101,12 @@ fn open_regular_file_nofollow(
     android_open_regular_file_nofollow_impl(base, path)
 }
 #[cfg(target_os = "android")]
-fn secure_dir_write(dir: &Dir, path: &Path, content: &[u8]) -> Result<(), String> {
-    secure_dir_write_android_impl(dir, path, content)
+fn secure_dir_write(dir: &Dir, path: &Path, content: &[u8], mode: WriteMode) -> Result<(), String> {
+    secure_dir_write_android_impl(dir, path, content, mode)
 }
 
 #[cfg(windows)]
-fn secure_dir_write(dir: &Dir, path: &Path, content: &[u8]) -> Result<(), String> {
+fn secure_dir_write(dir: &Dir, path: &Path, content: &[u8], mode: WriteMode) -> Result<(), String> {
     // Degraded write for Windows only (openat2 is Linux-only): fall back to
     // cap-std's regular capability-relative open/truncate/write. The
     // BENEATH|NO_SYMLINKS resolution guarantees of the Linux path are lost
@@ -1036,17 +1123,42 @@ fn secure_dir_write(dir: &Dir, path: &Path, content: &[u8]) -> Result<(), String
             .map_err(|error| format!("create directory failed: {error}"))?;
     }
     let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    let mut file = dir
-        .open_with(path, &options)
-        .map_err(|error| format!("write failed: {error}"))?;
-    file.write_all(content)
-        .and_then(|()| file.flush())
-        .map_err(|error| format!("write failed: {error}"))
+    options.write(true);
+    match mode {
+        WriteMode::Replace => {
+            options.create(true).truncate(true);
+        }
+        WriteMode::CreateNew => {
+            options.create_new(true);
+        }
+    }
+    let mut file = match dir.open_with(path, &options) {
+        Ok(file) => file,
+        Err(error)
+            if mode == WriteMode::CreateNew
+                && error.kind() == std::io::ErrorKind::AlreadyExists =>
+        {
+            return Err("write failed: file already exists (not overwritten)".to_owned());
+        }
+        Err(error) => return Err(format!("write failed: {error}")),
+    };
+    if let Err(error) = file.write_all(content).and_then(|()| file.flush()) {
+        if mode == WriteMode::CreateNew {
+            drop(file);
+            let _ = dir.remove_file(path);
+        }
+        return Err(format!("write failed: {error}"));
+    }
+    Ok(())
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
-fn secure_dir_write(_dir: &Dir, _path: &Path, _content: &[u8]) -> Result<(), String> {
+fn secure_dir_write(
+    _dir: &Dir,
+    _path: &Path,
+    _content: &[u8],
+    _mode: WriteMode,
+) -> Result<(), String> {
     // Other non-Linux platforms (macOS, BSD, …) keep the original
     // fail-closed behavior: secure directory writes require Linux's
     // openat2. The C plan deliberately covers Windows only.

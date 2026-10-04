@@ -1646,6 +1646,32 @@ response: error decoding response body: ...`), and provider HTTP failures
 include a preview of the response body. Provider requests time out after
 600 seconds in total, including the complete streaming response body.
 
+### Image generation (`generate_image`)
+
+The main agent (never read-only sessions, subagents, or btw forks) can
+generate an image from a text prompt:
+`generate_image {prompt, path, transparent_background?}` POSTs directly to
+the ChatGPT Codex image endpoint
+(`https://chatgpt.com/backend-api/codex/images/generations`, model
+`gpt-image-2`, quality/size `auto`) with the shared ChatGPT login — the same
+lazy credential cache `auth = "chatgpt"` profiles resolve through, so an
+`e-agent login` after startup is picked up on first use.
+
+`path` must be a workspace-relative `.png` path with only normal
+components; it is validated, and an existing file or an unwritable target
+(read-only workspace, protected policy file) is refused, before any request
+is sent. The final write is an exclusive create (`O_EXCL` on Linux,
+`create_new` on the degraded Windows path), so a race can never overwrite an
+existing file. The image bytes are structurally checked (PNG signature +
+IHDR, nonzero dimensions — not decoded) before the file becomes visible, and
+the result names only the relative path and byte count, never base64.
+Response body and decoded image sizes are boundedly capped, redirects are
+not followed, and there is no automatic retry after an ambiguous network
+failure; a failure reports only the HTTP status and optional provider
+request id — never the response body — and HTTP 401 returns "run `e-agent
+login`" as a normal tool error. The request uses native HTTP, which the
+`[sandbox]` file-tool policy does not wrap (like `web_search`).
+
 ## SQLite session backend
 
 A local SQLite session storage backend is available and compiled in by
@@ -1937,6 +1963,12 @@ while `unresponsive_engines` is non-empty, the tool output names the failed
 engines and reasons instead of a bare `no results`, so a broken backend is
 distinguishable from a genuinely empty query; a non-empty result set is
 returned unchanged.
+Image generation (`generate_image`) is deliberately one concrete tool: one
+fixed model/quality/size, no CLI, SDK, account store, API-key fallback,
+generic provider framework, or per-call knobs beyond the prompt and
+transparent background; no URL fetching, automatic retries, or idempotency
+keys after an ambiguous failure; and no inline base64 in the result or the
+session log.
 The web UI is a single self-contained HTML page, assembled from disk on
 every request in dev builds and compiled into the binary via `include_str!`
 in release builds: deliberately no frontend bundler/build pipeline, no

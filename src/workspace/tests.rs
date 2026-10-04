@@ -12,15 +12,26 @@ fn android_openat_write_helpers_preserve_capability_and_nofollow_rules() {
     fs::write(outside.join("sentinel"), "unchanged").unwrap();
     let dir = Dir::open_ambient_dir(&root, ambient_authority()).unwrap();
 
-    secure_dir_write_android_impl(&dir, Path::new("item"), b"initial").unwrap();
-    secure_dir_write_android_impl(&dir, Path::new("nested/item"), b"nested").unwrap();
-    secure_dir_write_android_impl(&dir, Path::new("nested/item"), &vec![b'x'; 1024 * 1024])
-        .unwrap();
+    secure_dir_write_android_impl(&dir, Path::new("item"), b"initial", WriteMode::Replace).unwrap();
+    secure_dir_write_android_impl(
+        &dir,
+        Path::new("nested/item"),
+        b"nested",
+        WriteMode::Replace,
+    )
+    .unwrap();
+    secure_dir_write_android_impl(
+        &dir,
+        Path::new("nested/item"),
+        &vec![b'x'; 1024 * 1024],
+        WriteMode::Replace,
+    )
+    .unwrap();
     assert_eq!(
         fs::read(root.join("nested/item")).unwrap(),
         vec![b'x'; 1024 * 1024]
     );
-    secure_dir_write_android_impl(&dir, Path::new("item"), b"").unwrap();
+    secure_dir_write_android_impl(&dir, Path::new("item"), b"", WriteMode::Replace).unwrap();
     assert_eq!(fs::read(root.join("item")).unwrap(), b"");
 
     #[cfg(unix)]
@@ -31,21 +42,98 @@ fn android_openat_write_helpers_preserve_capability_and_nofollow_rules() {
         symlink(root.join("item"), root.join("internal-final-link")).unwrap();
         symlink("missing", root.join("dangling")).unwrap();
         symlink(outside.join("sentinel"), root.join("final-link")).unwrap();
-        assert!(secure_dir_write_android_impl(&dir, Path::new("escape/sentinel"), b"bad").is_err());
         assert!(
-            secure_dir_write_android_impl(&dir, Path::new("internal-parent-link/child"), b"bad")
-                .is_err()
+            secure_dir_write_android_impl(
+                &dir,
+                Path::new("escape/sentinel"),
+                b"bad",
+                WriteMode::Replace
+            )
+            .is_err()
         );
         assert!(
-            secure_dir_write_android_impl(&dir, Path::new("internal-final-link"), b"bad").is_err()
+            secure_dir_write_android_impl(
+                &dir,
+                Path::new("internal-parent-link/child"),
+                b"bad",
+                WriteMode::Replace
+            )
+            .is_err()
         );
-        assert!(secure_dir_write_android_impl(&dir, Path::new("dangling/file"), b"bad").is_err());
-        assert!(secure_dir_write_android_impl(&dir, Path::new("final-link"), b"bad").is_err());
+        assert!(
+            secure_dir_write_android_impl(
+                &dir,
+                Path::new("internal-final-link"),
+                b"bad",
+                WriteMode::Replace
+            )
+            .is_err()
+        );
+        assert!(
+            secure_dir_write_android_impl(
+                &dir,
+                Path::new("dangling/file"),
+                b"bad",
+                WriteMode::Replace
+            )
+            .is_err()
+        );
+        assert!(
+            secure_dir_write_android_impl(
+                &dir,
+                Path::new("final-link"),
+                b"bad",
+                WriteMode::Replace
+            )
+            .is_err()
+        );
         assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"unchanged");
     }
-    assert!(secure_dir_write_android_impl(&dir, Path::new("../outside"), b"bad").is_err());
-    assert!(secure_dir_write_android_impl(&dir, Path::new("/tmp/outside"), b"bad").is_err());
-    assert!(secure_dir_write_android_impl(&dir, Path::new("nested"), b"bad").is_err());
+    assert!(
+        secure_dir_write_android_impl(&dir, Path::new("../outside"), b"bad", WriteMode::Replace)
+            .is_err()
+    );
+    assert!(
+        secure_dir_write_android_impl(&dir, Path::new("/tmp/outside"), b"bad", WriteMode::Replace)
+            .is_err()
+    );
+    assert!(
+        secure_dir_write_android_impl(&dir, Path::new("nested"), b"bad", WriteMode::Replace)
+            .is_err()
+    );
+}
+
+/// The deprecated-API-safe Android write path also honors the exclusive
+/// `WriteMode::CreateNew` contract `write_new` relies on: an existing entry
+/// (file or symlink) is never replaced, and a fresh path is created.
+#[cfg(target_os = "linux")]
+#[test]
+fn android_impl_create_new_is_exclusive() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = Dir::open_ambient_dir(temp.path(), ambient_authority()).unwrap();
+    secure_dir_write_android_impl(&dir, Path::new("new.png"), b"one", WriteMode::CreateNew)
+        .unwrap();
+    assert_eq!(fs::read(temp.path().join("new.png")).unwrap(), b"one");
+    let error =
+        secure_dir_write_android_impl(&dir, Path::new("new.png"), b"two", WriteMode::CreateNew)
+            .unwrap_err();
+    assert!(error.contains("already exists"), "{error}");
+    assert_eq!(fs::read(temp.path().join("new.png")).unwrap(), b"one");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        symlink("new.png", temp.path().join("link.png")).unwrap();
+        let error = secure_dir_write_android_impl(
+            &dir,
+            Path::new("link.png"),
+            b"two",
+            WriteMode::CreateNew,
+        )
+        .unwrap_err();
+        assert!(error.contains("already exists"), "{error}");
+        // The symlink target is untouched: O_EXCL never follows it.
+        assert_eq!(fs::read(temp.path().join("new.png")).unwrap(), b"one");
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -100,6 +188,7 @@ fn android_helpers_survive_openat2_seccomp_trap() {
                 &dir,
                 Path::new("root/nested/file"),
                 &vec![b'z'; 1024 * 1024],
+                WriteMode::Replace,
             )
             .unwrap();
             assert_eq!(
@@ -112,14 +201,28 @@ fn android_helpers_survive_openat2_seccomp_trap() {
                 fs::create_dir(temp.path().join("internal")).unwrap();
                 symlink(temp.path().join("internal"), temp.path().join("alias")).unwrap();
                 assert!(
-                    secure_dir_write_android_impl(&dir, Path::new("alias/fail"), b"x").is_err()
+                    secure_dir_write_android_impl(
+                        &dir,
+                        Path::new("alias/fail"),
+                        b"x",
+                        WriteMode::Replace
+                    )
+                    .is_err()
                 );
                 symlink(
                     temp.path().join("internal/missing"),
                     temp.path().join("dangling"),
                 )
                 .unwrap();
-                assert!(secure_dir_write_android_impl(&dir, Path::new("dangling"), b"x").is_err());
+                assert!(
+                    secure_dir_write_android_impl(
+                        &dir,
+                        Path::new("dangling"),
+                        b"x",
+                        WriteMode::Replace
+                    )
+                    .is_err()
+                );
             }
             fs::create_dir_all(temp.path().join(".git/worktrees/child")).unwrap();
             fs::write(temp.path().join(".git/worktrees/child/index"), b"index").unwrap();
@@ -1618,4 +1721,153 @@ fn reroot_exact_file_source_rejects_without_fallback_to_broader_rw() {
     let sub = parent.join("sub");
     fs::create_dir(&sub).unwrap();
     assert_eq!(workspace.reroot(&sub).unwrap().root(), sub);
+}
+
+#[test]
+fn write_new_creates_exclusively_while_write_still_replaces() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(temp.path()).unwrap();
+    assert!(!workspace.exists("art/new.png").unwrap());
+    assert!(workspace.targets_workspace("art/new.png").unwrap());
+    // A new nested path is created (parents included).
+    workspace.write_new("art/new.png", b"first").unwrap();
+    assert_eq!(fs::read(temp.path().join("art/new.png")).unwrap(), b"first");
+    assert!(workspace.exists("art/new.png").unwrap());
+    // Baseline `write` keeps its historical truncate/replace semantics.
+    workspace.write("art/new.png", b"second").unwrap();
+    assert_eq!(
+        fs::read(temp.path().join("art/new.png")).unwrap(),
+        b"second"
+    );
+    // `write_new` refuses to replace and leaves the bytes untouched.
+    let error = workspace.write_new("art/new.png", b"third").unwrap_err();
+    assert!(error.contains("already exists"), "{error}");
+    assert_eq!(
+        fs::read(temp.path().join("art/new.png")).unwrap(),
+        b"second"
+    );
+}
+
+#[test]
+fn write_new_rejects_policy_file_and_read_only_workspace() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir_all(temp.path().join(".e-agent")).unwrap();
+    fs::write(temp.path().join(".e-agent/config.toml"), "[sandbox]\n").unwrap();
+    let workspace = Workspace::new(temp.path()).unwrap();
+    let error = workspace
+        .write_new(".e-agent/config.toml", b"no")
+        .unwrap_err();
+    assert!(
+        error.contains("controls sandbox and file capabilities"),
+        "{error}"
+    );
+    assert_eq!(
+        fs::read_to_string(temp.path().join(".e-agent/config.toml")).unwrap(),
+        "[sandbox]\n"
+    );
+
+    // A read-only workspace denies the new-file write exactly like `write`.
+    let ro_temp = tempfile::tempdir().unwrap();
+    let policy = crate::config::Sandbox {
+        enabled: true,
+        workspace_writable: false,
+        ..Default::default()
+    };
+    let ro = Workspace::new(ro_temp.path())
+        .unwrap()
+        .with_external_roots(&policy)
+        .unwrap();
+    let error = ro.write_new("new.png", b"no").unwrap_err();
+    assert!(error.contains("read-only"), "{error}");
+    assert!(!ro_temp.path().join("new.png").exists());
+}
+
+#[test]
+fn write_new_rejects_symlink_escape_without_an_outside_file() {
+    use std::os::unix::fs::symlink;
+    let temp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    symlink(outside.path(), temp.path().join("escape")).unwrap();
+    let workspace = Workspace::new(temp.path()).unwrap();
+    // The path components are normal, but the parent walk must not follow
+    // the escaping symlink.
+    assert!(workspace.write_new("escape/new.png", b"no").is_err());
+    assert!(!outside.path().join("new.png").exists());
+}
+
+#[test]
+fn write_new_rejects_external_roots_even_when_writable() {
+    let temp = tempfile::tempdir().unwrap();
+    let external = temp.path().join("external");
+    let child = temp.path().join("child");
+    fs::create_dir(&external).unwrap();
+    fs::create_dir(&child).unwrap();
+    let policy = crate::config::Sandbox {
+        // A writable sibling root plus a writable entry lexically inside
+        // the workspace.
+        writable_paths: vec![
+            external.to_str().unwrap().to_owned(),
+            child.to_str().unwrap().to_owned(),
+        ],
+        ..Default::default()
+    };
+    let workspace = Workspace::new(temp.path())
+        .unwrap()
+        .with_external_roots(&policy)
+        .unwrap();
+    // Normal writes keep addressing external roots (unchanged semantics).
+    workspace
+        .write(external.join("keep.png").to_str().unwrap(), b"old")
+        .unwrap();
+    workspace.write("child/ok", b"old").unwrap();
+    assert_eq!(fs::read(external.join("keep.png")).unwrap(), b"old");
+    // New-file writes refuse both, before touching anything.
+    for path in [
+        external.join("out.png").to_str().unwrap().to_owned(),
+        "child/out.png".to_owned(),
+    ] {
+        let error = workspace.write_new(&path, b"no").unwrap_err();
+        assert!(error.contains("inside the workspace"), "{path}: {error}");
+        assert!(!workspace.targets_workspace(&path).unwrap(), "{path}");
+    }
+    assert!(!external.join("out.png").exists());
+    assert!(!child.join("out.png").exists());
+    assert!(workspace.targets_workspace("plain.png").unwrap());
+}
+
+#[test]
+fn check_writable_refuses_read_only_workspace_and_policy_file_without_writing() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir_all(temp.path().join(".e-agent")).unwrap();
+    fs::write(temp.path().join(".e-agent/config.toml"), "[sandbox]\n").unwrap();
+    let workspace = Workspace::new(temp.path()).unwrap();
+    let error = workspace
+        .check_writable(".e-agent/config.toml")
+        .unwrap_err();
+    assert!(
+        error.contains("controls sandbox and file capabilities"),
+        "{error}"
+    );
+    workspace.check_writable("new.png").unwrap();
+
+    // Read-only workspace (sandbox on, workspace_writable = false): denied
+    // for both relative and absolute forms, with nothing created.
+    let ro_temp = tempfile::tempdir().unwrap();
+    let policy = crate::config::Sandbox {
+        enabled: true,
+        workspace_writable: false,
+        ..Default::default()
+    };
+    let ro = Workspace::new(ro_temp.path())
+        .unwrap()
+        .with_external_roots(&policy)
+        .unwrap();
+    for path in [
+        "new.png".to_owned(),
+        ro_temp.path().join("new.png").to_str().unwrap().to_owned(),
+    ] {
+        let error = ro.check_writable(&path).unwrap_err();
+        assert!(error.contains("read-only"), "{path}: {error}");
+    }
+    assert!(!ro_temp.path().join("new.png").exists());
 }

@@ -30,8 +30,8 @@ use crate::model::{ConfiguredModel, OpenAiModel};
 use crate::runner::{IdlePolicy, SessionBootstrap, SessionHandle, SessionRunner};
 use crate::session_store::SessionStore;
 use crate::tools::{
-    BackgroundTasks, DEEPSEEK_API_KEY_ENV, SEARXNG_BASE_URL_ENV, add_root_user_input_tool,
-    builtins_with_bash_timeout,
+    AuthResolver, BackgroundTasks, DEEPSEEK_API_KEY_ENV, SEARXNG_BASE_URL_ENV,
+    add_root_user_input_tool, builtins_with_bash_timeout, generate_image_tool,
 };
 use crate::workspace::Workspace;
 
@@ -811,6 +811,15 @@ impl SessionFactory {
         self.read_only
     }
 
+    /// The shared lazy ChatGPT-auth resolver `generate_image` uses: the same
+    /// reloadable cache chatgpt-routed profiles resolve through, so a login
+    /// that arrives after startup is picked up on first use without a
+    /// restart, and every session shares one credential handle.
+    fn generate_image_auth(&self) -> AuthResolver {
+        let reloadable = self.reloadable.clone();
+        Arc::new(move || lazy_chatgpt_auth(&reloadable))
+    }
+
     /// Build one session end-to-end, in the exact order `main.rs::run()`
     /// used: store connect → fork → tools → MCP → delegate → agent →
     /// context prefix → history restore → unfinished-background handling →
@@ -1005,6 +1014,15 @@ impl SessionFactory {
         register_run_rust(&mut tools, &tools_workspace, self.code_mode, self.read_only, self.sandbox.clone());
         // Only the root/main session can pause for Web human input.
         add_root_user_input_tool(&mut tools);
+        // Main-agent only: `generate_image` (direct Codex image HTTP).
+        // Read-only sessions skip it (it creates files), and children/btw
+        // forks use the common builtins, so they never see it.
+        register_generate_image(
+            &mut tools,
+            &self.workspace,
+            self.generate_image_auth(),
+            self.read_only,
+        );
         // Read-only sessions skip MCP entirely: MCP tools carry no read-only
         // marker, so exposing them would defeat the policy. Delegation stays —
         // spawning a subagent does not mutate this session's host state, and
@@ -1295,6 +1313,22 @@ pub(crate) fn register_run_rust(tools: &mut Vec<Box<dyn crate::agent::Tool>>, wo
     if code_mode && (!read_only || sandbox.is_some()) {
         let narrowed = if read_only { sandbox.as_ref().map(crate::tools::read_only_sandbox) } else { sandbox };
         tools.push(crate::tools::run_rust_tool(workspace, narrowed.as_ref()));
+    }
+}
+
+/// Register the main-agent-only `generate_image` tool. Read-only sessions
+/// skip it entirely (it creates files in the workspace), and children/btw
+/// forks build the common builtins without it. A client-construction
+/// failure skips the tool (mirroring `bash_tool`) instead of failing the
+/// whole session build.
+pub(crate) fn register_generate_image(
+    tools: &mut Vec<Box<dyn crate::agent::Tool>>,
+    workspace: &Workspace,
+    auth: AuthResolver,
+    read_only: bool,
+) {
+    if !read_only && let Ok(tool) = generate_image_tool(workspace.clone(), auth) {
+        tools.push(tool);
     }
 }
 fn preflight_sandbox(policy: &Sandbox, announce: bool) -> anyhow::Result<()> {
@@ -3688,5 +3722,45 @@ mod user_input_gate_tests {
             "a delegate/btw/fork runner must never park for user input"
         );
         drop(child_handle);
+    }
+}
+
+/// Main-agent-only `generate_image` registration: the decision function the
+/// session build calls, plus the lazy shared ChatGPT-auth handle.
+#[cfg(test)]
+mod generate_image_registration_tests {
+    use super::*;
+
+    fn tool_names(tools: &[Box<dyn crate::agent::Tool>]) -> Vec<String> {
+        tools.iter().map(|tool| tool.spec().name).collect()
+    }
+
+    #[test]
+    fn main_session_registers_generate_image_read_only_does_not() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new(temp.path()).unwrap();
+        let auth: AuthResolver = Arc::new(|| unreachable!("registration resolves no auth"));
+        let mut main = Vec::new();
+        register_generate_image(&mut main, &workspace, auth.clone(), false);
+        assert_eq!(tool_names(&main), vec!["generate_image"]);
+        assert_eq!(main[0].spec().name, "generate_image");
+        let mut read_only = Vec::new();
+        register_generate_image(&mut read_only, &workspace, auth, true);
+        assert!(read_only.is_empty(), "read-only sessions must not see it");
+    }
+
+    #[tokio::test]
+    async fn generate_image_auth_shares_the_reloadable_login_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let factory = SessionFactory::test_factory(temp.path().to_path_buf());
+        let fixture = CodexAuth::test_auth(temp.path().join("auth.json"));
+        factory.reloadable.write().unwrap().auth = Some(fixture);
+        let resolver = factory.generate_image_auth();
+        let auth = resolver().expect("cached login");
+        // The fixture handle: no disk read, no network, no refresh.
+        assert_eq!(
+            auth.current_access_token_and_account().await.unwrap(),
+            ("access".to_owned(), "account".to_owned())
+        );
     }
 }
