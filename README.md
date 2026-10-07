@@ -44,11 +44,13 @@ until those assets exist. In Termux, install the small prerequisites and run:
 
 ```sh
 pkg install curl coreutils tar
-curl -fsSL https://github.com/discord9/e-agent/releases/latest/download/install-termux.sh | bash
+(installer=$(mktemp) && curl -fsSL https://github.com/discord9/e-agent/releases/latest/download/install-termux.sh -o "$installer" && bash "$installer"; status=$?; rm -f "$installer"; exit "$status")
 ```
 
-To pin a release instead, download its installer and run
-`bash install-termux.sh --version TAG`. The installer requires Termux on
+The installer resolves the latest release tag once, then fetches every payload
+from that pinned tag. To pin a release explicitly, download that tag's
+`install-termux.sh` asset and run `bash install-termux.sh --version TAG`.
+The installer requires Termux on
 ARM64/aarch64; it does not install an APK or configure a provider. Configure
 `~/.config/e-agent/config.toml` separately. It preserves existing config,
 workspaces, and credentials; the Widget server uses

@@ -7,6 +7,14 @@ binary=$1
 out=$2
 ndk=$3
 readelf="$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+clang="$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
+props="$ndk/source.properties"
+if [[ -f "$props" ]]; then
+  revision=$(sed -n 's/^Pkg.Revision[[:space:]]*=[[:space:]]*//p' "$props")
+  echo "Android NDK revision: ${revision:-unknown}"
+fi
+if [[ -x "$clang" ]]; then "$clang" --version | sed -n '1p'; fi
+if command -v rustc >/dev/null 2>&1; then rustc --version; fi
 if [[ ! -x "$readelf" ]]; then
   echo "Android NDK llvm-readelf not found or not executable: $readelf" >&2
   exit 1
@@ -23,16 +31,21 @@ needed=$("$readelf" -d "$binary" | sed -n 's/.*Shared library: \[\([^]]*\)\].*/\
 while IFS= read -r lib; do
   [[ -z "$lib" ]] && continue
   case "$lib" in
-    libc.so|libm.so|libdl.so|liblog.so|libandroid.so|libz.so|libcutils.so|libnativewindow.so|libjnigraphics.so) ;;
+    libc.so|libm.so|libdl.so|liblog.so|libandroid.so|libz.so) ;;
     *) echo "Unexpected non-base Android runtime dependency: $lib" >&2; exit 1 ;;
   esac
 done <<<"$needed"
 
 mkdir -p "$out"
-rm -f "$out/e-agent" "$out/e-agent-aarch64-linux-android.tar.gz" "$out/install-termux.sh" "$out/termux-web.sh" "$out/SHA256SUMS"
-install -m 755 "$binary" "$out/e-agent"
-install -m 644 scripts/install-termux.sh "$out/install-termux.sh"
-install -m 644 scripts/termux-web.sh "$out/termux-web.sh"
-tar -C "$out" --owner=0 --group=0 --numeric-owner --mode=755 -czf "$out/e-agent-aarch64-linux-android.tar.gz" e-agent
+archive="$out/e-agent-aarch64-linux-android.tar.gz"
+rm -f "$out/e-agent"
+tmp_binary="$out/.e-agent-package-tmp"
+trap 'rm -f "$tmp_binary"' EXIT
+install -m 755 "$binary" "$tmp_binary"
+install -m 644 "$(dirname "$0")/install-termux.sh" "$out/install-termux.sh"
+install -m 644 "$(dirname "$0")/termux-web.sh" "$out/termux-web.sh"
+# Keep only the executable in the archive, under the installer-expected name.
+tar --transform='s|^\.e-agent-package-tmp$|e-agent|' --owner=0 --group=0 --numeric-owner -czf "$archive" -C "$out" .e-agent-package-tmp
+rm -f "$tmp_binary"
 (cd "$out" && sha256sum e-agent-aarch64-linux-android.tar.gz install-termux.sh termux-web.sh > SHA256SUMS)
 echo "Packaged Android ARM64 artifact in $out"
