@@ -210,6 +210,7 @@ impl OpenAiModel {
         timeout: Duration,
     ) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
+            .redirect(openai_redirect_policy())
             .timeout(timeout)
             .build()
             .context("cannot create HTTP client")?;
@@ -310,6 +311,22 @@ impl Model for OpenAiModel {
     }
 }
 
+fn opencode_host(url: &reqwest::Url) -> bool {
+    url.host_str()
+        .is_some_and(|host| host.eq_ignore_ascii_case("opencode.ai"))
+}
+
+fn openai_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let starts_at_opencode = attempt.previous().first().is_some_and(opencode_host);
+        if starts_at_opencode && !opencode_host(attempt.url()) {
+            attempt.stop()
+        } else {
+            reqwest::redirect::Policy::default().redirect(attempt)
+        }
+    })
+}
+
 /// Send a chat/completions request, retrying transient connect/timeout errors
 /// (no bytes were exchanged: "tls handshake eof", ECONNREFUSED, TLS decrypt
 /// send failures) with the shared exponential policy — 8 attempts,
@@ -328,12 +345,7 @@ impl OpenAiModel {
                 reqwest::header::USER_AGENT,
                 concat!("e-agent/", env!("CARGO_PKG_VERSION")),
             );
-            let builder = if reqwest::Url::parse(&url)
-                .ok()
-                .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
-                .as_deref()
-                == Some("opencode.ai")
-            {
+            let builder = if reqwest::Url::parse(&url).is_ok_and(|url| opencode_host(&url)) {
                 builder.header("x-opencode-session", &self.request_session_id)
             } else {
                 builder

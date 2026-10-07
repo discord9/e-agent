@@ -50,7 +50,25 @@ fn runner_binds_deterministic_distinct_request_session_ids() {
     assert_eq!(id, bind(first.path(), "root-session"));
     assert_ne!(id, bind(first.path(), "child-session"));
     assert_ne!(id, bind(second.path(), "root-session"));
-    assert!(!id.is_empty());
+    assert_eq!(id.len(), 64);
+    assert!(id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert!(!id.contains("root-session"));
+    assert!(!id.contains("child-session"));
+    assert!(!id.contains(first.path().to_str().unwrap()));
+}
+
+#[test]
+fn agent_rebinds_replacement_model_to_request_session_identity() {
+    let first = Arc::new(Mutex::new(None));
+    let replacement = Arc::new(Mutex::new(None));
+    let mut agent = Agent::new(Box::new(IdentityCaptureModel(first.clone())), vec![]);
+    agent.set_request_session_id("agent-session".into());
+    assert_eq!(first.lock().unwrap().as_deref(), Some("agent-session"));
+    agent.set_model(Box::new(IdentityCaptureModel(replacement.clone())), None);
+    assert_eq!(
+        replacement.lock().unwrap().as_deref(),
+        Some("agent-session")
+    );
 }
 
 struct ControlledModel {

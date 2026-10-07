@@ -51,27 +51,163 @@ async fn opencode_send_chat_sets_session_and_agent_user_agent() {
 }
 
 #[test]
+fn configured_model_clone_rebinding_is_isolated() {
+    let model = OpenAiModel::new(
+        "https://opencode.ai/v1".into(),
+        "".into(),
+        "test".into(),
+        None,
+    )
+    .unwrap();
+    let original_id = model.request_session_id.clone();
+    let parent = ConfiguredModel::chat(model);
+    let mut child = parent.clone();
+    child.set_request_session_id("child-session");
+    let ConfiguredModelKind::Chat(parent_chat) = &parent.kind else {
+        panic!("expected chat model")
+    };
+    let ConfiguredModelKind::Chat(child_chat) = &child.kind else {
+        panic!("expected chat model")
+    };
+    assert_eq!(parent_chat.request_session_id, original_id);
+    assert_eq!(child_chat.request_session_id, "child-session");
+}
+
+#[tokio::test]
+async fn non_opencode_hosts_do_not_send_session_header() {
+    for host in ["example.com", "notopencode.ai", "opencode.ai.example"] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (headers, _) = read_request_with_headers(&mut stream).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            headers
+        });
+        let mut model = OpenAiModel::new(
+            format!("http://{host}:80/v1"),
+            "".into(),
+            "test".into(),
+            None,
+        )
+        .unwrap();
+        model.client = reqwest::Client::builder()
+            .no_proxy()
+            .resolve(host, address)
+            .build()
+            .unwrap();
+        model.set_request_session_id("must-not-leak");
+        let request = ChatRequest::from_internal("test", None, false, false, &[], &[], None);
+        model.send_chat(&request).await.unwrap();
+        let headers = server.await.unwrap().to_ascii_lowercase();
+        assert!(
+            !headers.contains("x-opencode-session:"),
+            "unexpected header for {host}: {headers}"
+        );
+    }
+}
+
+#[test]
 fn opencode_session_id_is_not_part_of_chat_json() {
     let request = ChatRequest::from_internal("test", None, false, false, &[], &[], None);
     let body = serde_json::to_value(request).unwrap();
     assert!(body.get("x-opencode-session").is_none());
 }
 
-#[test]
-fn opencode_session_host_matching_is_exact_and_case_insensitive() {
-    for (url, expected) in [
-        ("https://opencode.ai/v1", true),
-        ("https://OPENCODE.AI/v1", true),
-        ("https://notopencode.ai/v1", false),
-        ("https://opencode.ai.example/v1", false),
-        ("https://example.com/opencode.ai/v1", false),
-    ] {
-        let actual = reqwest::Url::parse(url)
-            .ok()
-            .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
-            .as_deref()
-            == Some("opencode.ai");
-        assert_eq!(actual, expected, "{url}");
+#[tokio::test]
+async fn opencode_redirect_to_other_host_does_not_forward_session_header() {
+    let redirect_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let redirect_address = redirect_listener.local_addr().unwrap();
+    let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_address = target_listener.local_addr().unwrap();
+    let target = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_millis(250), target_listener.accept()).await
+    });
+    let redirect = tokio::spawn(async move {
+        let (mut stream, _) = redirect_listener.accept().await.unwrap();
+        let _ = read_request_with_headers(&mut stream).await;
+        let response = format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{}/next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            target_address.port()
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+    });
+    let mut model = OpenAiModel::new(
+        "http://opencode.ai:80/zen/go/v1".into(),
+        "".into(),
+        "test".into(),
+        None,
+    )
+    .unwrap();
+    model.client = reqwest::Client::builder()
+        .no_proxy()
+        .resolve("opencode.ai", redirect_address)
+        .redirect(openai_redirect_policy())
+        .build()
+        .unwrap();
+    model.set_request_session_id("must-not-leave-opencode");
+    let request = ChatRequest::from_internal("test", None, false, false, &[], &[], None);
+    let response = model.send_chat(&request).await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+    redirect.await.unwrap();
+    assert!(
+        target.await.unwrap().is_err(),
+        "redirect target was contacted"
+    );
+}
+
+#[tokio::test]
+async fn opencode_session_header_is_stable_across_complete_retries_and_calls() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut headers_seen = Vec::new();
+        for attempt in 0..3 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (headers, _) = read_request_with_headers(&mut stream).await;
+            headers_seen.push(headers.to_ascii_lowercase());
+            if attempt == 0 {
+                stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+            } else {
+                reply_sse(
+                    &mut stream,
+                    &[
+                        json!({"choices":[{"delta":{"content":"ok"},"finish_reason":null}]}),
+                        json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+                    ],
+                )
+                .await;
+            }
+        }
+        headers_seen
+    });
+    let mut model = OpenAiModel::new(
+        "http://opencode.ai:80/v1".into(),
+        "".into(),
+        "test".into(),
+        None,
+    )
+    .unwrap();
+    model.client = reqwest::Client::builder()
+        .no_proxy()
+        .resolve("opencode.ai", address)
+        .build()
+        .unwrap();
+    model.set_request_session_id("same-session");
+    for _ in 0..2 {
+        let (message, _) = model.complete(&[], &[], None).await.unwrap();
+        assert_eq!(message.content.as_deref(), Some("ok"));
+    }
+    let headers = server.await.unwrap();
+    assert_eq!(headers.len(), 3);
+    for request in headers {
+        assert!(
+            request.contains("x-opencode-session: same-session"),
+            "{request}"
+        );
     }
 }
 
