@@ -37,21 +37,24 @@ UI when stdout is a terminal.
 
 ### Android / Termux (ARM64)
 
-A precompiled Android/Termux ARM64 release installer and Widget launcher are
-provided when a release publishes `e-agent-aarch64-linux-android.tar.gz`,
-`SHA256SUMS`, `install-termux.sh`, and `termux-web.sh`. This is not available
-until those assets exist. In Termux, install the small prerequisites and run:
+The Android/Termux ARM64 release installer uses
+`e-agent-aarch64-linux-android.tar.gz`, `SHA256SUMS`, `install-termux.sh`, and
+`termux-web.sh` from a published release. The package is cross-compiled;
+installation and Widget behavior have not yet been validated on a phone.
+In Termux, run this one command to install the prerequisites and download and
+run the installer:
 
 ```sh
-pkg install curl coreutils tar
-(installer=$(mktemp) && curl -fsSL https://github.com/discord9/e-agent/releases/latest/download/install-termux.sh -o "$installer" && bash "$installer"; status=$?; rm -f "$installer"; exit "$status")
+pkg install curl coreutils tar && (installer=$(mktemp) && curl -fsSL https://github.com/discord9/e-agent/releases/latest/download/install-termux.sh -o "$installer" && bash "$installer"; status=$?; rm -f "$installer"; exit "$status")
 ```
 
 The installer resolves the latest release tag once, then fetches every payload
 from that pinned tag. To pin a release explicitly, download that tag's
 `install-termux.sh` asset and run `bash install-termux.sh --version TAG`.
 The installer requires Termux on
-ARM64/aarch64; it does not install an APK or configure a provider. Configure
+ARM64/aarch64; it does not install an APK, configure a provider, or enable or
+configure ADB. ADB is optional and requires the separate manual setup below;
+normal e-agent CLI and Web use do not need ADB. Configure
 `~/.config/e-agent/config.toml` separately. It preserves existing config,
 workspaces, and credentials; the Widget server uses
 `$HOME/e-agent-workspace` by default (edit the shortcut to change this).
