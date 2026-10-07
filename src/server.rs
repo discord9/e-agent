@@ -2735,6 +2735,9 @@ async fn generate_summary(state: &AppState, id: &str, digest: &str) {
     // 用专门的 summarizer 角色（[roles] summarizer，如 deepseek/flash 关思考），
     // 便宜且不占主模型；未配置时回退主模型。
     let mut model = state.factory.summarizer_model();
+    // This is a stateless one-shot conversation: bind its request identity to
+    // this invocation rather than reusing the parent's session identity.
+    model.set_request_session_id(&crate::session::new_id_prefixed("summary-"));
     let messages = vec![
         Message::System {
             content: "你是 e-agent 桌宠的会话总结器。用一句不超过 30 字的中文，\
