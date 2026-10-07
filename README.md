@@ -67,6 +67,59 @@ explain asynchronous work. Further reference: [session history](#history-tool),
 [web server](#web-ui--headless-server), [local MCP](#mcp-local-servers), and
 [storage backends](#sqlite-session-backend).
 
+#### Termux APKs and domestic downloads
+
+Install Termux and Termux:Widget from the **same distribution channel**. Their
+APK signatures must match; do not mix F-Droid and GitHub builds. The official
+[F-Droid Termux page](https://f-droid.org/packages/com.termux/) and
+[Termux:Widget page](https://f-droid.org/packages/com.termux.widget/) are the
+stable download references. F-Droid is not required if you download APKs
+directly; Android 7 or later is required. In China, TUNA provides an F-Droid
+mirror ([setup guidance](https://mirrors.tuna.tsinghua.edu.cn/help/fdroid/));
+its direct APK links are a convenience and may change as releases update:
+
+- [Termux 0.118.3 (TUNA mirror)](https://mirrors.tuna.tsinghua.edu.cn/fdroid/repo/com.termux_1002.apk)
+- [Termux:Widget 0.15.0 (TUNA mirror)](https://mirrors.tuna.tsinghua.edu.cn/fdroid/repo/com.termux.widget_1001.apk)
+
+These mirror URLs were checked on 2026-10-07; availability and download speed
+are not guaranteed. Install/update both from the same channel. On first use,
+open Termux once and add or refresh the `e-agent-web` shortcut in Termux:Widget.
+Android 10 may require allowing the Widget shortcut activity under the system's
+“Display over other apps” settings; the shortcut cannot enable that setting
+for you.
+
+#### Optional experimental same-phone ADB
+
+On Android 11 or later, Termux can optionally use Android's wireless debugging
+to control the **same phone**. This is experimental: Android's official ADB
+guidance primarily describes a workstation, and loopback self-connection and
+device/OEM support are not verified. Install the optional client with
+`pkg install android-tools`, then enable Developer options and Wireless
+debugging yourself. Pair using the pairing port and code shown by Android;
+enter the code only at the interactive prompt, not in a script or agent log.
+The pairing and connection ports are different:
+
+```sh
+adb pair 127.0.0.1:PAIR_PORT
+adb connect 127.0.0.1:CONNECT_PORT
+adb devices
+adb -s 127.0.0.1:CONNECT_PORT shell input keyevent KEYCODE_HOME
+adb -s 127.0.0.1:CONNECT_PORT exec-out screencap -p > screenshot.png
+```
+
+Replace the port placeholders with the current values shown in Wireless
+debugging. Always select the exact intended device serial; never rely on
+implicit selection when multiple devices are listed. Ports can change and
+reconnection may be needed. Disconnect only the selected target when finished
+with `adb disconnect 127.0.0.1:CONNECT_PORT`. This does not require root or
+grant access to private app data. ADB commands can affect the phone and files
+outside the e-agent workspace; workspace and shell sandbox settings do not
+contain those effects. Do not use ADB to automate pairing, enable TCP port
+5555, change global settings, or bypass user permission prompts.
+
+References: [Android ADB](https://developer.android.com/tools/adb) and
+[Termux android-tools package](https://github.com/termux/termux-packages/tree/master/packages/android-tools).
+
 ## Run
 
 The usual setup needs no environment variables. Create
