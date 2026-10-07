@@ -29,7 +29,7 @@ cleanup() {
     kill -0 "$pid" 2>/dev/null && kill -INT "$pid" 2>/dev/null || true
     for _ in 1 2 3; do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
     kill -0 "$pid" 2>/dev/null && kill "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || status=$?
+    wait "$pid" 2>/dev/null || true
     pid=
   fi
   rm -rf "$tmp"

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Focused acceptance tests for the Termux installer and Widget launcher."""
+"""Installer acceptance fixtures; launcher execution is verified separately."""
 import hashlib
 import os
 import pathlib
