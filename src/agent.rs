@@ -1035,6 +1035,9 @@ pub fn fork_prefix(
 
 #[async_trait]
 pub trait Model: Send {
+    /// Bind a stable routing identity for requests belonging to one session.
+    fn set_request_session_id(&mut self, _id: &str) {}
+
     async fn complete(
         &mut self,
         messages: &[Message],
@@ -1143,6 +1146,7 @@ type WebHeadPage = (
 
 pub struct Agent {
     model: Box<dyn Model>,
+    request_session_id: Option<String>,
     tools: Vec<Box<dyn Tool>>,
     history: Vec<SessionEntry>,
     event_handler: Option<Box<dyn FnMut(AgentEvent) + Send>>,
@@ -1210,6 +1214,7 @@ impl Agent {
         }
         Self {
             model,
+            request_session_id: None,
             tools,
             history: Vec::new(),
             event_handler: None,
@@ -1284,10 +1289,19 @@ impl Agent {
         self.context_window = Some(window);
     }
 
+    /// Bind the stable request identity for this agent's session.
+    pub fn set_request_session_id(&mut self, id: String) {
+        self.model.set_request_session_id(&id);
+        self.request_session_id = Some(id);
+    }
+
     /// Switch the session's model and context window at runtime (web/TUI
     /// `/model`). The replacement applies from the next model call on.
     /// Usage from the prior model is not a baseline for the new profile.
-    pub fn set_model(&mut self, model: Box<dyn Model>, context_window: Option<u64>) {
+    pub fn set_model(&mut self, mut model: Box<dyn Model>, context_window: Option<u64>) {
+        if let Some(id) = &self.request_session_id {
+            model.set_request_session_id(id);
+        }
         self.model = model;
         self.context_window = context_window;
         self.last_context_input = None;

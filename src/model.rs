@@ -72,6 +72,12 @@ impl ConfiguredModel {
 
 #[async_trait::async_trait]
 impl Model for ConfiguredModel {
+    fn set_request_session_id(&mut self, id: &str) {
+        if let ConfiguredModelKind::Chat(model) = &mut self.kind {
+            model.set_request_session_id(id);
+        }
+    }
+
     fn name(&self) -> &str {
         match &self.kind {
             ConfiguredModelKind::Chat(model) => model.name(),
@@ -126,6 +132,7 @@ pub struct OpenAiModel {
     /// None when no HOME/XDG_STATE_HOME: image refs then degrade to text
     /// placeholders on the wire.
     image_store: Option<PathBuf>,
+    request_session_id: String,
 }
 
 impl OpenAiModel {
@@ -203,6 +210,7 @@ impl OpenAiModel {
         timeout: Duration,
     ) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
+            .redirect(openai_redirect_policy())
             .timeout(timeout)
             .build()
             .context("cannot create HTTP client")?;
@@ -216,6 +224,7 @@ impl OpenAiModel {
             deepseek_compat: false,
             vision,
             image_store: crate::agent::image_store_dir(),
+            request_session_id: crate::session::new_id_prefixed("e-agent-"),
         })
     }
 
@@ -227,6 +236,10 @@ impl OpenAiModel {
 
 #[async_trait::async_trait]
 impl Model for OpenAiModel {
+    fn set_request_session_id(&mut self, id: &str) {
+        self.request_session_id = id.to_owned();
+    }
+
     fn name(&self) -> &str {
         self.name()
     }
@@ -298,6 +311,22 @@ impl Model for OpenAiModel {
     }
 }
 
+fn opencode_host(url: &reqwest::Url) -> bool {
+    url.host_str()
+        .is_some_and(|host| host.eq_ignore_ascii_case("opencode.ai"))
+}
+
+fn openai_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let starts_at_opencode = attempt.previous().first().is_some_and(opencode_host);
+        if starts_at_opencode && !opencode_host(attempt.url()) {
+            attempt.stop()
+        } else {
+            reqwest::redirect::Policy::default().redirect(attempt)
+        }
+    })
+}
+
 /// Send a chat/completions request, retrying transient connect/timeout errors
 /// (no bytes were exchanged: "tls handshake eof", ECONNREFUSED, TLS decrypt
 /// send failures) with the shared exponential policy — 8 attempts,
@@ -311,9 +340,16 @@ impl OpenAiModel {
             // An empty key marks an unauthenticated local provider: omit the
             // Authorization header entirely instead of sending `Bearer `
             // (some local servers reject an empty token).
-            let builder = self
-                .client
-                .post(format!("{}/chat/completions", self.base_url));
+            let url = format!("{}/chat/completions", self.base_url);
+            let builder = self.client.post(&url).header(
+                reqwest::header::USER_AGENT,
+                concat!("e-agent/", env!("CARGO_PKG_VERSION")),
+            );
+            let builder = if reqwest::Url::parse(&url).is_ok_and(|url| opencode_host(&url)) {
+                builder.header("x-opencode-session", &self.request_session_id)
+            } else {
+                builder
+            };
             let builder = if self.api_key.is_empty() {
                 builder
             } else {

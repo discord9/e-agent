@@ -925,6 +925,18 @@ impl SessionRunner {
         session: String,
         policy: IdlePolicy,
     ) -> (Self, SessionHandle) {
+        let workspace = crate::session_store::workspace_root_fingerprint(&root);
+        let mut identity = sha2::Sha256::new();
+        use sha2::Digest;
+        identity.update(workspace.as_bytes());
+        identity.update([0]);
+        identity.update(session.as_bytes());
+        let digest = identity.finalize();
+        let request_session_id = digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        agent.set_request_session_id(request_session_id);
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
         let (status, _) = watch::channel(SessionStatus::Idle);
         let replay: Vec<LogEvent> = agent

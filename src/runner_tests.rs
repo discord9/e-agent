@@ -11,6 +11,66 @@ use std::sync::{
 };
 use tokio::sync::Notify;
 
+struct IdentityCaptureModel(Arc<Mutex<Option<String>>>);
+
+#[async_trait]
+impl Model for IdentityCaptureModel {
+    fn set_request_session_id(&mut self, id: &str) {
+        *self.0.lock().unwrap() = Some(id.to_owned());
+    }
+
+    async fn complete(
+        &mut self,
+        _: &[Message],
+        _: &[ToolSpec],
+        _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        anyhow::bail!("identity capture test does not complete turns")
+    }
+}
+
+#[test]
+fn runner_binds_deterministic_distinct_request_session_ids() {
+    fn bind(root: &std::path::Path, session: &str) -> String {
+        let captured = Arc::new(Mutex::new(None));
+        let agent = Agent::new(Box::new(IdentityCaptureModel(captured.clone())), vec![]);
+        let _ = SessionRunner::new(
+            agent,
+            SessionStore::Jsonl,
+            root.into(),
+            session.into(),
+            IdlePolicy::FinishWhenIdle,
+        );
+        captured.lock().unwrap().clone().unwrap()
+    }
+
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let id = bind(first.path(), "root-session");
+    assert_eq!(id, bind(first.path(), "root-session"));
+    assert_ne!(id, bind(first.path(), "child-session"));
+    assert_ne!(id, bind(second.path(), "root-session"));
+    assert_eq!(id.len(), 64);
+    assert!(id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert!(!id.contains("root-session"));
+    assert!(!id.contains("child-session"));
+    assert!(!id.contains(first.path().to_str().unwrap()));
+}
+
+#[test]
+fn agent_rebinds_replacement_model_to_request_session_identity() {
+    let first = Arc::new(Mutex::new(None));
+    let replacement = Arc::new(Mutex::new(None));
+    let mut agent = Agent::new(Box::new(IdentityCaptureModel(first.clone())), vec![]);
+    agent.set_request_session_id("agent-session".into());
+    assert_eq!(first.lock().unwrap().as_deref(), Some("agent-session"));
+    agent.set_model(Box::new(IdentityCaptureModel(replacement.clone())), None);
+    assert_eq!(
+        replacement.lock().unwrap().as_deref(),
+        Some("agent-session")
+    );
+}
+
 struct ControlledModel {
     replies: VecDeque<anyhow::Result<String>>,
     block_first: bool,
