@@ -34,6 +34,32 @@ cargo run -- --workspace /path/to/workspace web                                 
 
 With no prompt, `cargo run -- --workspace /path/to/workspace` opens the terminal
 UI when stdout is a terminal.
+
+### Android / Termux (ARM64)
+
+A precompiled Android/Termux ARM64 release installer and Widget launcher are
+provided when a release publishes `e-agent-aarch64-linux-android.tar.gz`,
+`SHA256SUMS`, `install-termux.sh`, and `termux-web.sh`. This is not available
+until those assets exist. In Termux, install the small prerequisites and run:
+
+```sh
+pkg install curl coreutils tar
+curl -fsSL https://github.com/discord9/e-agent/releases/latest/download/install-termux.sh | bash
+```
+
+To pin a release instead, download its installer and run
+`bash install-termux.sh --version TAG`. The installer requires Termux on
+ARM64/aarch64; it does not install an APK or configure a provider. Configure
+`~/.config/e-agent/config.toml` separately. It preserves existing config,
+workspaces, and credentials; the Widget server uses
+`$HOME/e-agent-workspace` by default (edit the shortcut to change this).
+Install Termux:Widget from the same source as the Termux app. Add or refresh
+the `e-agent-web` shortcut in the Widget list. The shortcut keeps the server
+in the foreground; clicking again opens the existing e-agent UI if it is
+already serving on localhost. On first visit, paste the server token into the
+UI. The server listens only on `127.0.0.1:8766`; other occupants of that port
+are not treated as e-agent.
+
 For session IDs, storage, and CLI options, continue in [Run](#run). See
 [Safety boundaries](#safety-boundaries) before enabling or relying on sandbox
 settings; [Background tasks](#background-tasks) and [Subagents](#subagents)

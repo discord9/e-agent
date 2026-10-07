@@ -1,0 +1,40 @@
+name: Termux ARM64 build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.92.0
+        with:
+          targets: aarch64-linux-android
+      - name: Test package script
+        run: python3 scripts/test_termux_package.py
+      - name: Build and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          ndk="${ANDROID_NDK_LATEST_HOME:-}"
+          if [[ -z "$ndk" || ! -d "$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin" ]]; then
+            echo "GitHub runner did not provide a usable ANDROID_NDK_LATEST_HOME" >&2
+            exit 1
+          fi
+          toolchain="$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$toolchain/aarch64-linux-android24-clang"
+          export CC_aarch64_linux_android="$toolchain/aarch64-linux-android24-clang"
+          export AR_aarch64_linux_android="$toolchain/llvm-ar"
+          export CXX_aarch64_linux_android="$toolchain/aarch64-linux-android24-clang++"
+          cargo build --locked --release --target aarch64-linux-android --bin e-agent
+          mkdir -p dist/termux
+          scripts/package-termux.sh target/aarch64-linux-android/release/e-agent dist/termux "$ndk"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: termux-aarch64
+          path: dist/termux/
+          if-no-files-found: error
