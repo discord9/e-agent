@@ -72,6 +72,12 @@ impl ConfiguredModel {
 
 #[async_trait::async_trait]
 impl Model for ConfiguredModel {
+    fn set_request_session_id(&mut self, id: &str) {
+        if let ConfiguredModelKind::Chat(model) = &mut self.kind {
+            model.set_request_session_id(id);
+        }
+    }
+
     fn name(&self) -> &str {
         match &self.kind {
             ConfiguredModelKind::Chat(model) => model.name(),
@@ -126,6 +132,7 @@ pub struct OpenAiModel {
     /// None when no HOME/XDG_STATE_HOME: image refs then degrade to text
     /// placeholders on the wire.
     image_store: Option<PathBuf>,
+    request_session_id: String,
 }
 
 impl OpenAiModel {
@@ -216,6 +223,7 @@ impl OpenAiModel {
             deepseek_compat: false,
             vision,
             image_store: crate::agent::image_store_dir(),
+            request_session_id: crate::session::new_id_prefixed("e-agent-"),
         })
     }
 
@@ -227,6 +235,10 @@ impl OpenAiModel {
 
 #[async_trait::async_trait]
 impl Model for OpenAiModel {
+    fn set_request_session_id(&mut self, id: &str) {
+        self.request_session_id = id.to_owned();
+    }
+
     fn name(&self) -> &str {
         self.name()
     }
@@ -311,9 +323,21 @@ impl OpenAiModel {
             // An empty key marks an unauthenticated local provider: omit the
             // Authorization header entirely instead of sending `Bearer `
             // (some local servers reject an empty token).
-            let builder = self
-                .client
-                .post(format!("{}/chat/completions", self.base_url));
+            let url = format!("{}/chat/completions", self.base_url);
+            let builder = self.client.post(&url).header(
+                reqwest::header::USER_AGENT,
+                concat!("e-agent/", env!("CARGO_PKG_VERSION")),
+            );
+            let builder = if reqwest::Url::parse(&url)
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+                .as_deref()
+                == Some("opencode.ai")
+            {
+                builder.header("x-opencode-session", &self.request_session_id)
+            } else {
+                builder
+            };
             let builder = if self.api_key.is_empty() {
                 builder
             } else {

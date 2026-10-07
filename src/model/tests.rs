@@ -7,6 +7,74 @@ use tokio::net::{TcpListener, TcpStream};
 use super::*;
 use crate::agent::{Agent, Tool, ToolOutput};
 
+#[tokio::test]
+async fn opencode_send_chat_sets_session_and_agent_user_agent() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let (headers, body) = read_request_with_headers(&mut stream).await;
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        (headers, body)
+    });
+    let mut model = OpenAiModel::new(
+        "http://opencode.ai:80/zen/go/v1".into(),
+        "".into(),
+        "test".into(),
+        None,
+    )
+    .unwrap();
+    model.client = reqwest::Client::builder()
+        .no_proxy()
+        .resolve("opencode.ai", address)
+        .build()
+        .unwrap();
+    model.set_request_session_id("stable-id");
+    let request = ChatRequest::from_internal("test", None, false, false, &[], &[], None);
+    model.send_chat(&request).await.unwrap();
+    let (headers, body) = server.await.unwrap();
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("x-opencode-session: stable-id")
+    );
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains(concat!("user-agent: e-agent/", env!("CARGO_PKG_VERSION")))
+    );
+    assert_eq!(body["model"], "test");
+    assert!(body.get("x-opencode-session").is_none());
+}
+
+#[test]
+fn opencode_session_id_is_not_part_of_chat_json() {
+    let request = ChatRequest::from_internal("test", None, false, false, &[], &[], None);
+    let body = serde_json::to_value(request).unwrap();
+    assert!(body.get("x-opencode-session").is_none());
+}
+
+#[test]
+fn opencode_session_host_matching_is_exact_and_case_insensitive() {
+    for (url, expected) in [
+        ("https://opencode.ai/v1", true),
+        ("https://OPENCODE.AI/v1", true),
+        ("https://notopencode.ai/v1", false),
+        ("https://opencode.ai.example/v1", false),
+        ("https://example.com/opencode.ai/v1", false),
+    ] {
+        let actual = reqwest::Url::parse(url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+            .as_deref()
+            == Some("opencode.ai");
+        assert_eq!(actual, expected, "{url}");
+    }
+}
+
 #[test]
 fn converts_internal_messages_and_function_schemas() {
     let tools = [ToolSpec {
