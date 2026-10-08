@@ -1199,6 +1199,9 @@ function appendBackgroundCompletion(id, label, output) {
  * ===================================================================*/
 function renderQueueBar() {
   const bar = els.queueBar;
+  bar.tabIndex = 0;
+  bar.setAttribute("role", "region");
+  bar.setAttribute("aria-label", "排队消息，可滚动查看");
   if (!state.queue.length) {
     bar.hidden = true;
     bar.textContent = "";

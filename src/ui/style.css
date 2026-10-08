@@ -1324,12 +1324,17 @@
     border-radius: 4px;
     padding: 4px 8px;
     white-space: pre-wrap;
-    overflow-wrap: break-word;
+    overflow-wrap: anywhere;
     line-height: 1.5;
-    flex: 0 0 auto;
+    flex: 0 1 auto;
+    min-height: 0;
+    max-height: min(20rem, 20vh);
+    overflow-y: auto;
   }
   .queue-bar .queue-item { line-height: 1.6; }
   .queue-bar .queue-toggle {
+    position: sticky;
+    bottom: 0;
     margin-top: 2px;
     padding: 1px 8px;
     border: 1px dashed var(--yellow);
