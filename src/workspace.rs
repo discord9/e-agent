@@ -2,7 +2,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(target_os = "linux")]
 use std::os::fd::AsFd;
 
 use cap_std::ambient_authority;
@@ -792,7 +792,7 @@ fn push_external_root(
     Ok(())
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(target_os = "linux")]
 fn open_dir_nofollow(base: &Dir, path: &Path) -> rustix::io::Result<Dir> {
     use rustix::fs::{Mode, OFlags, ResolveFlags, openat2};
     let fd = openat2(
@@ -805,7 +805,7 @@ fn open_dir_nofollow(base: &Dir, path: &Path) -> rustix::io::Result<Dir> {
     Ok(Dir::from(fd))
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(target_os = "linux")]
 fn open_regular_file_nofollow(
     base: &Dir,
     path: &Path,
@@ -839,7 +839,78 @@ fn open_regular_file_nofollow(
     Ok(Some(fd))
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+fn android_open_dir_nofollow_impl(base: &Dir, path: &Path) -> rustix::io::Result<Dir> {
+    use rustix::fs::{Mode, OFlags, openat};
+    let mut dir = base.try_clone().map_err(|_| rustix::io::Errno::IO)?;
+    for component in path.components() {
+        let Component::Normal(name) = component else {
+            return Err(rustix::io::Errno::INVAL);
+        };
+        let fd = openat(
+            &dir,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        dir = Dir::from(fd);
+    }
+    Ok(dir)
+}
+
+#[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+fn android_open_regular_file_nofollow_impl(
+    base: &Dir,
+    path: &Path,
+) -> Result<Option<rustix::fd::OwnedFd>, String> {
+    use rustix::fs::{FileType, Mode, OFlags, fstat, openat};
+    let mut dir = base
+        .try_clone()
+        .map_err(|error| format!("cannot read linked worktree .git: {error}"))?;
+    let mut components = path.components().peekable();
+    while let Some(component) = components.next() {
+        let Component::Normal(name) = component else {
+            return Err("linked worktree .git pointer is unauthorized".into());
+        };
+        if components.peek().is_some() {
+            let fd = openat(
+                &dir,
+                name,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|error| format!("cannot read linked worktree .git: {error}"))?;
+            dir = Dir::from(fd);
+        } else {
+            let fd = match openat(
+                &dir,
+                name,
+                OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            ) {
+                Ok(fd) => fd,
+                Err(rustix::io::Errno::NOENT) => return Ok(None),
+                Err(rustix::io::Errno::LOOP) => {
+                    return Err("linked worktree .git pointer is unauthorized".into());
+                }
+                Err(error) => return Err(format!("cannot read linked worktree .git: {error}")),
+            };
+            if !FileType::from_raw_mode(
+                fstat(&fd)
+                    .map_err(|error| format!("cannot read linked worktree .git: {error}"))?
+                    .st_mode,
+            )
+            .is_file()
+            {
+                return Ok(None);
+            }
+            return Ok(Some(fd));
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(target_os = "linux")]
 fn secure_dir_write(dir: &Dir, path: &Path, content: &[u8]) -> Result<(), String> {
     use rustix::fs::{Mode, OFlags, ResolveFlags, mkdirat, openat2};
 
@@ -884,6 +955,67 @@ fn secure_dir_write(dir: &Dir, path: &Path, content: &[u8]) -> Result<(), String
     file.write_all(content)
         .and_then(|()| file.flush())
         .map_err(|error| format!("write failed: {error}"))
+}
+
+#[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+fn secure_dir_write_android_impl(dir: &Dir, path: &Path, content: &[u8]) -> Result<(), String> {
+    // Do not use openat2 here: Android app seccomp policies may TRAP it with SIGSYS.
+    use rustix::fs::{Mode, OFlags, mkdirat, openat};
+
+    let components: Vec<_> = path
+        .components()
+        .map(|component| match component {
+            Component::Normal(name) => Ok(name),
+            _ => Err("write failed: path must contain only normal components".to_owned()),
+        })
+        .collect::<Result<_, _>>()?;
+    let (file_name, parents) = components
+        .split_last()
+        .ok_or("write failed: path must name a file")?;
+    let mut parent = dir
+        .try_clone()
+        .map_err(|error| format!("write failed: {error}"))?;
+    for name in parents {
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let opened = match openat(&parent, *name, flags, Mode::empty()) {
+            Ok(fd) => fd,
+            Err(error) if error == rustix::io::Errno::NOENT => {
+                mkdirat(&parent, *name, Mode::RWXU)
+                    .map_err(|error| format!("create directory failed: {error}"))?;
+                openat(&parent, *name, flags, Mode::empty())
+                    .map_err(|error| format!("create directory failed: {error}"))?
+            }
+            Err(error) => return Err(format!("write failed: {error}")),
+        };
+        parent = Dir::from(opened);
+    }
+    let fd = openat(
+        &parent,
+        *file_name,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from(0o666),
+    )
+    .map_err(|error| format!("write failed: {error}"))?;
+    let mut file = File::from(fd);
+    file.write_all(content)
+        .and_then(|()| file.flush())
+        .map_err(|error| format!("write failed: {error}"))
+}
+
+#[cfg(target_os = "android")]
+fn open_dir_nofollow(base: &Dir, path: &Path) -> rustix::io::Result<Dir> {
+    android_open_dir_nofollow_impl(base, path)
+}
+#[cfg(target_os = "android")]
+fn open_regular_file_nofollow(
+    base: &Dir,
+    path: &Path,
+) -> Result<Option<rustix::fd::OwnedFd>, String> {
+    android_open_regular_file_nofollow_impl(base, path)
+}
+#[cfg(target_os = "android")]
+fn secure_dir_write(dir: &Dir, path: &Path, content: &[u8]) -> Result<(), String> {
+    secure_dir_write_android_impl(dir, path, content)
 }
 
 #[cfg(windows)]

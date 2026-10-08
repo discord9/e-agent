@@ -1,6 +1,280 @@
 use super::*;
 use std::fs;
 
+#[cfg(target_os = "linux")]
+#[test]
+fn android_openat_write_helpers_preserve_capability_and_nofollow_rules() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
+    let outside = temp.path().join("outside");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("sentinel"), "unchanged").unwrap();
+    let dir = Dir::open_ambient_dir(&root, ambient_authority()).unwrap();
+
+    secure_dir_write_android_impl(&dir, Path::new("item"), b"initial").unwrap();
+    secure_dir_write_android_impl(&dir, Path::new("nested/item"), b"nested").unwrap();
+    secure_dir_write_android_impl(&dir, Path::new("nested/item"), &vec![b'x'; 1024 * 1024])
+        .unwrap();
+    assert_eq!(
+        fs::read(root.join("nested/item")).unwrap(),
+        vec![b'x'; 1024 * 1024]
+    );
+    secure_dir_write_android_impl(&dir, Path::new("item"), b"").unwrap();
+    assert_eq!(fs::read(root.join("item")).unwrap(), b"");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        symlink(&outside, root.join("escape")).unwrap();
+        symlink(root.join("nested"), root.join("internal-parent-link")).unwrap();
+        symlink(root.join("item"), root.join("internal-final-link")).unwrap();
+        symlink("missing", root.join("dangling")).unwrap();
+        symlink(outside.join("sentinel"), root.join("final-link")).unwrap();
+        assert!(secure_dir_write_android_impl(&dir, Path::new("escape/sentinel"), b"bad").is_err());
+        assert!(
+            secure_dir_write_android_impl(&dir, Path::new("internal-parent-link/child"), b"bad")
+                .is_err()
+        );
+        assert!(
+            secure_dir_write_android_impl(&dir, Path::new("internal-final-link"), b"bad").is_err()
+        );
+        assert!(secure_dir_write_android_impl(&dir, Path::new("dangling/file"), b"bad").is_err());
+        assert!(secure_dir_write_android_impl(&dir, Path::new("final-link"), b"bad").is_err());
+        assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"unchanged");
+    }
+    assert!(secure_dir_write_android_impl(&dir, Path::new("../outside"), b"bad").is_err());
+    assert!(secure_dir_write_android_impl(&dir, Path::new("/tmp/outside"), b"bad").is_err());
+    assert!(secure_dir_write_android_impl(&dir, Path::new("nested"), b"bad").is_err());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn android_nofollow_helpers_open_pinned_git_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
+    fs::create_dir_all(root.join(".git/worktrees/child")).unwrap();
+    fs::create_dir_all(root.join("outside/worktrees/child")).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(root.join("outside"), root.join("alias")).unwrap();
+    fs::write(root.join(".git/worktrees/child/index"), "index").unwrap();
+    fs::write(root.join(".git-pointer"), "gitdir: path\n").unwrap();
+    let dir = Dir::open_ambient_dir(&root, ambient_authority()).unwrap();
+    let opened = android_open_dir_nofollow_impl(&dir, Path::new(".git/worktrees/child")).unwrap();
+    assert!(
+        android_open_regular_file_nofollow_impl(&dir, Path::new(".git-pointer"))
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        android_open_regular_file_nofollow_impl(&dir, Path::new("missing"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(android_open_dir_nofollow_impl(&dir, Path::new(".git-pointer")).is_err());
+    assert!(android_open_dir_nofollow_impl(&dir, Path::new("../outside")).is_err());
+    assert!(android_open_dir_nofollow_impl(&dir, Path::new("alias/worktrees/child")).is_err());
+    let fifo = root.join(".git-fifo");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let started = std::time::Instant::now();
+    assert!(
+        android_open_regular_file_nofollow_impl(&dir, Path::new(".git-fifo"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "FIFO open blocked"
+    );
+    drop(opened);
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn android_helpers_survive_openat2_seccomp_trap() {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    const CHILD: &str = "E_AGENT_OPENAT2_TRAP_CHILD";
+    if let Some(mode) = std::env::var_os(CHILD) {
+        if mode == "raw" {
+            unsafe {
+                install_openat2_trap();
+                raw_openat2_probe();
+            }
+            panic!("raw openat2 did not receive SIGSYS");
+        }
+        unsafe {
+            install_openat2_trap();
+            let temp = tempfile::tempdir().unwrap();
+            let dir = Dir::open_ambient_dir(temp.path(), ambient_authority()).unwrap();
+            secure_dir_write_android_impl(
+                &dir,
+                Path::new("root/nested/file"),
+                &vec![b'z'; 1024 * 1024],
+            )
+            .unwrap();
+            assert_eq!(
+                fs::read(temp.path().join("root/nested/file")).unwrap(),
+                vec![b'z'; 1024 * 1024]
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::symlink;
+                fs::create_dir(temp.path().join("internal")).unwrap();
+                symlink(temp.path().join("internal"), temp.path().join("alias")).unwrap();
+                assert!(
+                    secure_dir_write_android_impl(&dir, Path::new("alias/fail"), b"x").is_err()
+                );
+                symlink(
+                    temp.path().join("internal/missing"),
+                    temp.path().join("dangling"),
+                )
+                .unwrap();
+                assert!(secure_dir_write_android_impl(&dir, Path::new("dangling"), b"x").is_err());
+            }
+            fs::create_dir_all(temp.path().join(".git/worktrees/child")).unwrap();
+            fs::write(temp.path().join(".git/worktrees/child/index"), b"index").unwrap();
+            assert!(
+                android_open_dir_nofollow_impl(&dir, Path::new(".git/worktrees/child")).is_ok()
+            );
+            let fifo = temp.path().join(".git-fifo");
+            assert!(
+                Command::new("mkfifo")
+                    .arg(&fifo)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            assert!(
+                android_open_regular_file_nofollow_impl(&dir, Path::new(".git-fifo"))
+                    .unwrap()
+                    .is_none()
+            );
+            return;
+        }
+    }
+    let raw = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "workspace::tests::android_helpers_survive_openat2_seccomp_trap",
+            "--nocapture",
+        ])
+        .env(CHILD, "raw")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(
+        raw.signal(),
+        Some(31),
+        "raw openat2 syscall should be trapped by SIGSYS"
+    );
+
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "workspace::tests::android_helpers_survive_openat2_seccomp_trap",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "seccomp child failed: {status}");
+            break;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            panic!("seccomp child exceeded timeout");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+unsafe fn install_openat2_trap() {
+    use std::ffi::c_void;
+    #[repr(C)]
+    struct Filter {
+        code: u16,
+        jt: u8,
+        jf: u8,
+        k: u32,
+    }
+    #[repr(C)]
+    struct Program {
+        len: u16,
+        filter: *const Filter,
+    }
+    unsafe extern "C" {
+        fn prctl(option: i32, ...) -> i32;
+    }
+    const BPF_LD_W_ABS: u16 = 0x20;
+    const BPF_JMP_JEQ_K: u16 = 0x15;
+    const BPF_RET_K: u16 = 0x06;
+    const SECCOMP_RET_TRAP: u32 = 0x0003_0000;
+    const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+    const FILTER: [Filter; 4] = [
+        Filter {
+            code: BPF_LD_W_ABS,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        },
+        Filter {
+            code: BPF_JMP_JEQ_K,
+            jt: 0,
+            jf: 1,
+            k: 437,
+        },
+        Filter {
+            code: BPF_RET_K,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_TRAP,
+        },
+        Filter {
+            code: BPF_RET_K,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_ALLOW,
+        },
+    ];
+    let program = Program {
+        len: FILTER.len() as u16,
+        filter: FILTER.as_ptr(),
+    };
+    assert_eq!(unsafe { prctl(38, 1, 0, 0, 0) }, 0, "PR_SET_NO_NEW_PRIVS");
+    assert_eq!(
+        unsafe { prctl(22, 2, &program as *const Program as *const c_void) },
+        0,
+        "PR_SET_SECCOMP"
+    );
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+unsafe fn raw_openat2_probe() {
+    unsafe extern "C" {
+        fn syscall(number: i64, ...) -> i64;
+    }
+    let path = b".\0";
+    let _ = unsafe { syscall(437, -100i32, path.as_ptr(), std::ptr::null::<u8>(), 0u32) };
+}
+
 #[test]
 fn linked_worktree_metadata_requires_authorized_literal_admin_path() {
     let temp = tempfile::tempdir().unwrap();
