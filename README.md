@@ -49,8 +49,25 @@ pkg install curl coreutils tar && (installer=$(mktemp) && curl -fsSL https://git
 ```
 
 The installer resolves the latest release tag once, then fetches every payload
-from that pinned tag. To pin a release explicitly, download that tag's
-`install-termux.sh` asset and run `bash install-termux.sh --version TAG`.
+from that pinned tag. Re-running the same latest-release command above installs
+an upgrade in place after downloading and validating all assets. It replaces
+`$PREFIX/bin/e-agent` and creates or refreshes the default Widget shortcut;
+existing config, credentials, workspace, token, and other files are not reset.
+To install a particular release, download that release's `install-termux.sh`
+asset and run `bash install-termux.sh --version TAG`; this is an explicit pin,
+not automatic rollback.
+
+A customized `$HOME/.shortcuts/e-agent-web` is preserved with a notice while
+the binary upgrade proceeds. Only pass `--force-shortcut` when you explicitly
+want the installer to replace that shortcut. The installer does not replace
+Cargo's usual `$HOME/.cargo/bin/e-agent`; a pre-existing `$PREFIX/bin/e` alias
+is also left untouched. Check which executable is selected with
+`command -v e-agent`, and verify the release binary directly with
+`$PREFIX/bin/e-agent --version`. An already-running Web server is not upgraded
+in place: stop your own old server and restart the installed release using the
+same workspace as before. If you kept a custom shortcut, check that it points
+to `$PREFIX/bin/e-agent` rather than an older Cargo binary.
+
 The installer requires Termux on
 ARM64/aarch64; it does not install an APK, configure a provider, or enable or
 configure ADB. ADB is optional and requires the separate manual setup below;

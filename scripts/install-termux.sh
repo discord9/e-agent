@@ -43,8 +43,11 @@ shortcut_dir="$HOME/.shortcuts"
 shortcut="$shortcut_dir/e-agent-web"
 [ ! -d "$shortcut" ] || { echo "Shortcut path is a directory: $shortcut" >&2; exit 1; }
 sed "s|@PREFIX_BIN@|$PREFIX/bin|g" "$tmp/termux-web.sh" > "$tmp/shortcut"
+preserve_shortcut=0
 if [ -e "$shortcut" ] || [ -L "$shortcut" ]; then
-  if [ "$force_shortcut" -ne 1 ] && ! cmp -s "$shortcut" "$tmp/shortcut"; then echo "Refusing to overwrite edited shortcut: $shortcut (use --force-shortcut to replace)" >&2; exit 1; fi
+  if [ "$force_shortcut" -ne 1 ] && ! cmp -s "$shortcut" "$tmp/shortcut"; then
+    preserve_shortcut=1
+  fi
 fi
 [ ! -d "$PREFIX/bin/e-agent" ] || { echo "Binary path is a directory: $PREFIX/bin/e-agent" >&2; exit 1; }
 mkdir -p "$PREFIX/bin"
@@ -58,15 +61,21 @@ stage=
 if [ -e "$PREFIX/bin/e" ] || [ -L "$PREFIX/bin/e" ]; then
   [ -L "$PREFIX/bin/e" ] && [ "$(readlink "$PREFIX/bin/e")" = e-agent ] || echo "Note: leaving existing $PREFIX/bin/e untouched"
 else ln -s e-agent "$PREFIX/bin/e"; fi
-if [ ! -d "$shortcut_dir" ]; then mkdir -m 700 "$shortcut_dir"; fi
-sed "s|@PREFIX_BIN@|$PREFIX/bin|g" "$tmp/termux-web.sh" > "$tmp/shortcut"
-chmod 700 "$tmp/shortcut"
-shortcut_stage=$(mktemp "$shortcut_dir/.e-agent-web.XXXXXX")
-cp "$tmp/shortcut" "$shortcut_stage"
-chmod 700 "$shortcut_stage"
-mv -fT "$shortcut_stage" "$shortcut"
-shortcut_stage=
+if [ "$preserve_shortcut" -eq 1 ]; then
+  echo "Note: preserving edited Widget shortcut: $shortcut (use --force-shortcut to replace)"
+else
+  if [ ! -d "$shortcut_dir" ]; then mkdir -m 700 "$shortcut_dir"; fi
+  sed "s|@PREFIX_BIN@|$PREFIX/bin|g" "$tmp/termux-web.sh" > "$tmp/shortcut"
+  chmod 700 "$tmp/shortcut"
+  shortcut_stage=$(mktemp "$shortcut_dir/.e-agent-web.XXXXXX")
+  cp "$tmp/shortcut" "$shortcut_stage"
+  chmod 700 "$shortcut_stage"
+  mv -fT "$shortcut_stage" "$shortcut"
+  shortcut_stage=
+fi
 echo "Installed e-agent $version at $PREFIX/bin/e-agent"
+echo "Check the installed release with: $PREFIX/bin/e-agent --version"
+echo 'An already-running Web server is not upgraded in place; stop your old server and restart it using the installed release binary or its shortcut.'
 echo "Widget shortcut: $shortcut"
 echo 'Install Termux:Widget from the same source as Termux, add/refresh the e-agent-web shortcut, then open http://127.0.0.1:8766 and paste your existing token on first visit.'
 echo 'Configure a provider in ~/.config/e-agent/config.toml before using model features.'
