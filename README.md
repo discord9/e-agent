@@ -51,8 +51,11 @@ pkg install curl coreutils tar && (installer=$(mktemp) && curl -fsSL https://git
 The installer resolves the latest release tag once, then fetches every payload
 from that pinned tag. Re-running the same latest-release command above installs
 an upgrade in place after downloading and validating all assets. It replaces
-`$PREFIX/bin/e-agent` and creates or refreshes the default Widget shortcut;
-existing config, credentials, workspace, token, and other files are not reset.
+`$PREFIX/bin/e-agent`. Any different existing Widget shortcut is retained,
+including an older default launcher; only a shortcut identical to the current
+generated template is recognized as unchanged. Use `--force-shortcut` to
+explicitly replace an existing shortcut. Existing config, credentials,
+workspace, token, and other files are not reset.
 To install a particular release, download that release's `install-termux.sh`
 asset and run `bash install-termux.sh --version TAG`; this is an explicit pin,
 not automatic rollback.

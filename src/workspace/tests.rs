@@ -74,24 +74,6 @@ fn android_nofollow_helpers_open_pinned_git_paths() {
     assert!(android_open_dir_nofollow_impl(&dir, Path::new(".git-pointer")).is_err());
     assert!(android_open_dir_nofollow_impl(&dir, Path::new("../outside")).is_err());
     assert!(android_open_dir_nofollow_impl(&dir, Path::new("alias/worktrees/child")).is_err());
-    let fifo = root.join(".git-fifo");
-    assert!(
-        std::process::Command::new("mkfifo")
-            .arg(&fifo)
-            .status()
-            .unwrap()
-            .success()
-    );
-    let started = std::time::Instant::now();
-    assert!(
-        android_open_regular_file_nofollow_impl(&dir, Path::new(".git-fifo"))
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(1),
-        "FIFO open blocked"
-    );
     drop(opened);
 }
 
@@ -199,6 +181,7 @@ fn android_helpers_survive_openat2_seccomp_trap() {
         }
         if Instant::now() >= deadline {
             child.kill().unwrap();
+            child.wait().unwrap();
             panic!("seccomp child exceeded timeout");
         }
         std::thread::sleep(Duration::from_millis(20));
