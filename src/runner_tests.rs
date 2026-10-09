@@ -7574,7 +7574,7 @@ async fn assert_read_only_runner_cancel_while_sqlite_read_pending(read_output: b
                     tool_calls: vec![ToolCall {
                         id: "pending-read".into(),
                         name: name.into(),
-                        arguments,
+                        arguments: arguments.clone(),
                     }],
                     reasoning: None,
                 },
@@ -7689,9 +7689,44 @@ async fn assert_read_only_runner_cancel_while_sqlite_read_pending(read_output: b
         AgentEvent::AssistantText(text) if text == "resumed"
     )));
     let loaded = store.load(temp.path(), &session_id).await.unwrap();
-    assert!(loaded.entries.iter().any(|entry| matches!(entry,
-        SessionEntry::Message { message: Message::User { content, .. } } if content == "resume after cancel"
-    )));
+    let count = |predicate: &dyn Fn(&SessionEntry) -> bool| {
+        loaded
+            .entries
+            .iter()
+            .filter(|entry| predicate(entry))
+            .count()
+    };
+    assert_eq!(
+        count(&|entry| matches!(entry,
+            SessionEntry::Message { message: Message::User { content, .. } } if content == "run pending read"
+        )),
+        1
+    );
+    assert_eq!(
+        count(&|entry| matches!(entry,
+            SessionEntry::Message { message: Message::User { content, .. } } if content == "resume after cancel"
+        )),
+        1
+    );
+    let target = if read_output {
+        "persisted output target"
+    } else {
+        "global needle target"
+    };
+    assert_eq!(
+        count(&|entry| matches!(entry,
+            SessionEntry::Notice { text } if text == target
+        )),
+        1
+    );
+    assert_eq!(
+        count(&|entry| matches!(entry,
+            SessionEntry::Message { message: Message::Assistant(message) }
+                if message.tool_calls.iter().any(|call| call.id == "pending-read"
+                    && call.name == expected_name && call.arguments == arguments)
+        )),
+        1
+    );
     assert!(!loaded.entries.iter().any(|entry| matches!(entry,
         SessionEntry::Message { message: Message::Tool { call_id, .. } } if call_id == "pending-read"
     )));

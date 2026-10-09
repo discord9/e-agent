@@ -1600,8 +1600,8 @@ impl SessionRunner {
     }
 
     /// Commit and publish a runner-intercepted tool result. The same result
-    /// path is used by goal, history, and read_output so their errors retain
-    /// the normal persisted tool semantics.
+    /// path is used by goal tools so their errors retain normal persisted
+    /// tool semantics.
     async fn finish_intercepted_tool(
         &mut self,
         call: &ToolCall,
