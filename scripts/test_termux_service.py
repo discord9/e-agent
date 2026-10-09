@@ -29,13 +29,13 @@ with tempfile.TemporaryDirectory(prefix="termux-sv-test-") as tmp:
     for name in ("sh", "sv", "svlogd"):
         (bindir / name).symlink_to(shutil.which(name))
     pidfile = root / "pid"
-    (bindir / "e-agent").write_text('#!/bin/sh\necho $$ > "$PIDFILE"\necho fixture-started\necho fixture-stderr >&2\nexec sleep 60\n')
+    (bindir / "e-agent").write_text('#!/bin/sh\necho $$ > "$PIDFILE"\necho fixture-started\necho fixture-stderr >&2\n[ ! -e "$STUBBORN" ] || trap "" TERM\nexec sleep 60\n')
     (bindir / "service-daemon").write_text("#!/bin/sh\nexit 0\n")
     (bindir / "curl").write_text("#!/bin/sh\nexit 7\n")
     for name in ("e-agent", "service-daemon", "curl"):
         (bindir / name).chmod(0o755)
     env = dict(os.environ, PREFIX=str(prefix), HOME=str(home), SVDIR=str(svdir),
-               LOGDIR=str(prefix / "var/log"), PIDFILE=str(pidfile), PATH=str(bindir)+os.pathsep+os.environ["PATH"])
+               LOGDIR=str(prefix / "var/log"), PIDFILE=str(pidfile), STUBBORN=str(root / "stubborn"), PATH=str(bindir)+os.pathsep+os.environ["PATH"])
     service = svdir / "e-agent-web"
     logfile = prefix / "var/log/sv/e-agent-web/current"
     with (root / "supervisor.log").open("wb") as output:
@@ -50,6 +50,11 @@ with tempfile.TemporaryDirectory(prefix="termux-sv-test-") as tmp:
             os.kill(oldpid, signal.SIGTERM)
             wait_for(lambda: int(pidfile.read_text()) != oldpid)
             wait_for(lambda: logfile.read_text().count("fixture-started") >= 2)
+            # The stop icon must escalate when the server ignores TERM.
+            (root / "stubborn").touch()
+            oldpid = int(pidfile.read_text())
+            subprocess.run(["sv", "-w", "5", "restart", str(service)], env=env, check=True)
+            wait_for(lambda: int(pidfile.read_text()) != oldpid)
             stop = root / "stop.sh"
             stop.write_text((ROOT / "termux-stop.sh").read_text().replace("@PREFIX_BIN@", str(bindir)))
             subprocess.run(["bash", str(stop)], env=env, check=True)

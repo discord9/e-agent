@@ -10,6 +10,6 @@ service="$SVDIR/e-agent-web"
 umask 077
 touch "$service/down"
 if [ -p "$service/supervise/ok" ]; then
-  "$PREFIX/bin/sv" -w 5 force-stop "$service"
+  "$PREFIX/bin/sv" -w 5 force-stop "$service" || "$PREFIX/bin/sv" -w 2 down "$service"
 fi
 echo 'e-agent stopped. Click e-agent-web to start it again.'
