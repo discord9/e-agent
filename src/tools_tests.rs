@@ -3955,8 +3955,6 @@ async fn background_timeout_is_delivered_as_completion() {
         bash.shell.executable = wrapper.to_string_lossy().into_owned();
         bash
     };
-    #[cfg(not(unix))]
-    let bash = bash;
     bash.execute(json!({"command": "sleep 30 & echo $! > child.pid; wait", "background": true}))
         .await
         .unwrap();
