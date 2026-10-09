@@ -3,6 +3,7 @@ on:
   pull_request:
     paths:
       - 'scripts/*termux*'
+      - 'scripts/termux-icons/**'
       - '.github/workflows/termux-scripts.yml'
   workflow_dispatch:
 permissions:

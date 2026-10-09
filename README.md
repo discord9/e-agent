@@ -39,7 +39,7 @@ UI when stdout is a terminal.
 
 The Android/Termux ARM64 release installer uses
 `e-agent-aarch64-linux-android.tar.gz`, `SHA256SUMS`, `install-termux.sh`, and
-`termux-web.sh`, `termux-stop.sh`, and `termux-service.sh` from a published release. The package is cross-compiled;
+`termux-web.sh`, `termux-stop.sh`, `termux-service.sh`, and both shortcut PNG icons from a published release. The package is cross-compiled;
 the installer also configures Termux service supervision and rotating logs.
 In Termux, run this one command to install the prerequisites and download and
 run the installer:
@@ -94,6 +94,10 @@ Install Termux:Widget from the same source as Termux. At the end of installation
 the installer opens its Android shortcut chooser: select `e-agent-web` to add a
 **one-icon (1×1) desktop shortcut** and approve any launcher permission prompt.
 Use the Termux shortcut picker again to add `e-agent-stop` as the second icon.
+The installer places a green play icon (start/open) and a red square icon (stop)
+in `$HOME/.shortcuts/icons`. Custom icons are preserved unless `--force-shortcut`
+is used. If existing desktop shortcuts keep their old icons, remove them from
+the launcher and add them again through the picker.
 Alternatively add/refresh the Termux Widget list. Clicking starts the supervised
 service if needed, waits for authenticated readiness, opens the browser, and
 returns; closing the terminal or browser does not stop the service. The stop

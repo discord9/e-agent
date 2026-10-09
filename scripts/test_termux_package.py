@@ -9,7 +9,7 @@ import tempfile
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PACKAGER = ROOT / "scripts/package-termux.sh"
 EXPECTED = {
-    "e-agent-aarch64-linux-android.tar.gz", "install-termux.sh", "termux-web.sh", "termux-service.sh", "termux-stop.sh", "SHA256SUMS"
+    "e-agent-aarch64-linux-android.tar.gz", "install-termux.sh", "termux-web.sh", "termux-service.sh", "termux-stop.sh", "e-agent-web.png", "e-agent-stop.png", "SHA256SUMS"
 }
 
 with tempfile.TemporaryDirectory(prefix="termux-package-test-") as tmp:

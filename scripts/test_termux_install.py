@@ -37,8 +37,10 @@ class TermuxInstallTests(unittest.TestCase):
         (self.root / "termux-service.sh").write_bytes(service_helper)
         stop_launcher = (ROOT / "termux-stop.sh").read_bytes()
         (self.root / "termux-stop.sh").write_bytes(stop_launcher)
+        for name in ("e-agent-web.png", "e-agent-stop.png"):
+            (self.root / name).write_bytes((ROOT / "termux-icons" / name).read_bytes())
         sums = "".join(hashlib.sha256((self.root / f).read_bytes()).hexdigest() + "  " + f + "\n"
-                       for f in (archive.name, "termux-web.sh", "termux-service.sh", "termux-stop.sh"))
+                       for f in (archive.name, "termux-web.sh", "termux-service.sh", "termux-stop.sh", "e-agent-web.png", "e-agent-stop.png"))
         (self.root / "SHA256SUMS").write_text(sums)
         self.releases = self.root / "releases"
         for tag, payload in (("vtest-old", self.bin_payload), ("vtest-new", b"new release payload\n")):
@@ -53,8 +55,10 @@ class TermuxInstallTests(unittest.TestCase):
             (release / "termux-web.sh").write_bytes(launcher)
             (release / "termux-service.sh").write_bytes(service_helper)
             (release / "termux-stop.sh").write_bytes(stop_launcher)
+            for name in ("e-agent-web.png", "e-agent-stop.png"):
+                (release / name).write_bytes((ROOT / "termux-icons" / name).read_bytes())
             release_sums = "".join(hashlib.sha256((release / f).read_bytes()).hexdigest() + "  " + f + "\n"
-                                   for f in (archive.name, "termux-web.sh", "termux-service.sh", "termux-stop.sh"))
+                                   for f in (archive.name, "termux-web.sh", "termux-service.sh", "termux-stop.sh", "e-agent-web.png", "e-agent-stop.png"))
             (release / "SHA256SUMS").write_text(release_sums)
         (self.fake / "curl").write_text('''#!/usr/bin/env python3
 import os,sys,shutil
@@ -73,7 +77,7 @@ if url.endswith('/latest'):
  if '-w' in args: print(os.environ.get('LATEST_URL','https://github.com/discord9/e-agent/releases/tag/vtest'))
  sys.exit(0)
 name=url.rsplit('/',1)[-1]
-if name not in ('e-agent-aarch64-linux-android.tar.gz','SHA256SUMS','termux-web.sh','termux-service.sh','termux-stop.sh'): sys.exit('curl fake: unexpected asset '+name)
+if name not in ('e-agent-aarch64-linux-android.tar.gz','SHA256SUMS','termux-web.sh','termux-service.sh','termux-stop.sh','e-agent-web.png','e-agent-stop.png'): sys.exit('curl fake: unexpected asset '+name)
 out=args[args.index('-o')+1] if '-o' in args else None
 if not out: sys.exit('curl fake: expected download output path')
 if os.environ.get('DOWNLOAD_FAIL')==name: sys.exit('simulated download failure '+name)
@@ -117,7 +121,7 @@ shutil.copyfile(source,out)
         self.assertEqual(list(self.prefix.glob("bin/.e-agent.*")), [])
         calls = (self.root / "curl.log").read_text().splitlines()
         self.assertEqual(sum("releases/latest" in line for line in calls), 1)
-        self.assertEqual(sum("/download/vtest-new/" in line for line in calls), 5)
+        self.assertEqual(sum("/download/vtest-new/" in line for line in calls), 7)
         self.assertFalse(any("/download/vtest/" in line for line in calls))
         self.assertIn("proxy=http://proxy.fixture:8123", "\\n".join(calls))
 
@@ -231,7 +235,7 @@ shutil.copyfile(source,out)
         result = self.run_installer("--version", "vtest"); self.assertNotEqual(result.returncode, 0)
 
     def refresh_sums(self):
-        names=("e-agent-aarch64-linux-android.tar.gz", "termux-web.sh", "termux-service.sh", "termux-stop.sh")
+        names=("e-agent-aarch64-linux-android.tar.gz", "termux-web.sh", "termux-service.sh", "termux-stop.sh", "e-agent-web.png", "e-agent-stop.png")
         (self.root / "SHA256SUMS").write_text("".join(hashlib.sha256((self.root/n).read_bytes()).hexdigest()+"  "+n+"\n" for n in names))
 
     def test_service_log_install_upgrade_and_user_edits(self):
@@ -269,6 +273,31 @@ shutil.copyfile(source,out)
         result = self.run_installer("--version", "vtest")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Checksum verification failed: termux-service.sh", result.stderr)
+        self.assertEqual(target.read_bytes(), b"old binary")
+
+    def test_icons_install_preserve_custom_and_force_replace(self):
+        result = self.run_installer("--version", "vtest")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name in ("e-agent-web.png", "e-agent-stop.png"):
+            icon = self.home / ".shortcuts/icons" / name
+            self.assertEqual(icon.read_bytes(), (ROOT / "termux-icons" / name).read_bytes())
+            icon.write_bytes(b"custom icon")
+        result = self.run_installer("--version", "vtest")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(icon.read_bytes(), b"custom icon")
+        result = self.run_installer("--version", "vtest", "--force-shortcut")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name in ("e-agent-web.png", "e-agent-stop.png"):
+            self.assertEqual((self.home / ".shortcuts/icons" / name).read_bytes(), (ROOT / "termux-icons" / name).read_bytes())
+
+    def test_bad_icon_checksum_does_not_replace_binary(self):
+        target = self.prefix / "bin/e-agent"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"old binary")
+        (self.root / "e-agent-stop.png").write_bytes(b"corrupt")
+        result = self.run_installer("--version", "vtest")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Checksum verification failed: e-agent-stop.png", result.stderr)
         self.assertEqual(target.read_bytes(), b"old binary")
 
     def test_rejects_non_termux_and_non_arm(self):

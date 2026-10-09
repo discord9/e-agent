@@ -29,8 +29,8 @@ stage=
 shortcut_stage=
 cleanup() { [ -z "$stage" ] || rm -f "$stage"; [ -z "$shortcut_stage" ] || rm -f "$shortcut_stage"; rm -rf "$tmp"; }
 trap cleanup EXIT
-for file in e-agent-aarch64-linux-android.tar.gz SHA256SUMS termux-web.sh termux-service.sh termux-stop.sh; do curl -q -fsSL "$base/$file" -o "$tmp/$file" || { echo "Download failed: $file ($version)" >&2; exit 1; }; done
-for file in e-agent-aarch64-linux-android.tar.gz termux-web.sh termux-service.sh termux-stop.sh; do
+for file in e-agent-aarch64-linux-android.tar.gz SHA256SUMS termux-web.sh termux-service.sh termux-stop.sh e-agent-web.png e-agent-stop.png; do curl -q -fsSL "$base/$file" -o "$tmp/$file" || { echo "Download failed: $file ($version)" >&2; exit 1; }; done
+for file in e-agent-aarch64-linux-android.tar.gz termux-web.sh termux-service.sh termux-stop.sh e-agent-web.png e-agent-stop.png; do
   expected=$(awk -v f="$file" '$2==f || $2=="*"f {print $1}' "$tmp/SHA256SUMS")
   if [ "$(printf '%s\n' "$expected" | wc -l | tr -d ' ')" != 1 ] || [ "${#expected}" != 64 ]; then
     echo "Missing or ambiguous checksum for $file" >&2; exit 1
@@ -90,6 +90,21 @@ else
   mv -fT "$shortcut_stage" "$stop_shortcut"
   shortcut_stage=
 fi
+icon_dir="$shortcut_dir/icons"
+mkdir -p "$icon_dir"
+for name in e-agent-web e-agent-stop; do
+  icon="$icon_dir/$name.png"
+  if { [ -e "$icon" ] || [ -L "$icon" ]; } && [ "$force_shortcut" -ne 1 ] && ! cmp -s "$icon" "$tmp/$name.png"; then
+    echo "Note: preserving custom Widget icon: $icon (use --force-shortcut to replace)"
+  else
+    [ ! -d "$icon" ] || { echo "Icon path is a directory: $icon" >&2; exit 1; }
+    shortcut_stage=$(mktemp "$icon_dir/.$name.XXXXXX")
+    cp "$tmp/$name.png" "$shortcut_stage"
+    chmod 600 "$shortcut_stage"
+    mv -fT "$shortcut_stage" "$icon"
+    shortcut_stage=
+  fi
+done
 bash "$tmp/termux-service.sh"
 echo "Installed e-agent $version at $PREFIX/bin/e-agent"
 echo "Check the installed release with: $PREFIX/bin/e-agent --version"
@@ -100,5 +115,6 @@ if command -v am >/dev/null; then
   am start -a android.intent.action.CREATE_SHORTCUT -n com.termux.widget/.TermuxCreateShortcutActivity >/dev/null 2>&1 || echo 'Open the Termux:Widget shortcut chooser manually, or add/refresh its Widget list.'
 fi
 echo 'Add e-agent-web (start) and e-agent-stop (stop) through the Termux shortcut picker; allow desktop shortcut creation if Android asks.'
+echo 'Icons: green play = start/open, red square = stop. Remove and re-add existing desktop shortcuts if the launcher caches their old icons.'
 echo 'Paste your server token into the Web UI on first visit.'
 echo 'Configure a provider in ~/.config/e-agent/config.toml before using model features.'
