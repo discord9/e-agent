@@ -515,15 +515,20 @@ function renderBackgroundTaskList(resEl, content) {
   resEl.appendChild(wrap);
 }
 
-/* read_image 结果：后端只发文本摘要（结构化图片引用不进入事件流），
-   保持现有行为（纯文本，长摘要可展开） */
-function renderImageReceipt(resEl, content) {
-  renderPlainResult(resEl, String(content == null ? "" : content), "(无输出)");
+/* read_image 结果：文字 receipt 保持原有可展开/复制渲染，图片作为独立兄弟节点追加，
+   避免长文本预览/复制结构影响图片可见性；带图结果移除外层结果高度帽。 */
+function renderImageReceipt(resEl, content, images) {
+  resEl.textContent = "";
+  resEl.classList.remove("expandable", "expanded");
+  const receipt = el("pre", "tool-image-receipt");
+  renderPlainResult(receipt, String(content == null ? "" : content), "(无输出)");
+  resEl.appendChild(receipt);
+  if (appendImagesToTarget(resEl, images)) resEl.classList.add("tool-image");
 }
 
 /* 统一结果入口：isError → 纯文本（保持完整可复制）；否则按工具名分派。
    args 只对文件工具传入（diff 渲染需要）；其余工具结果渲染只依赖 content。 */
-function renderToolResult(resEl, name, args, content, isError) {
+function renderToolResult(resEl, name, args, content, isError, images) {
   resEl.textContent = "";
   resEl.classList.remove("expandable", "expanded");
   if (isError) { renderPlainResult(resEl, content, "(无错误信息)"); return; }
@@ -543,7 +548,7 @@ function renderToolResult(resEl, name, args, content, isError) {
       renderBackgroundTaskList(resEl, content);
       return;
     case "read_image":
-      renderImageReceipt(resEl, content);
+      renderImageReceipt(resEl, content, images);
       return;
     default:
       renderPlainResult(resEl, content, "(无输出)");
@@ -860,8 +865,9 @@ function appendUserMsg(text) {
    （服务端白名单校验）。URL 用 encodeURIComponent 转义（hash 是服务端
    生成的 64 位 hex、mime 来自白名单，转义是防御性的）；属性一律
    setAttribute，不拼 innerHTML。 */
-function appendUserImages(images) {
-  if (!images || !images.length) return;
+function appendImagesToTarget(target, images) {
+  if (!images || !images.length) return false;
+  let appended = false;
   const base = (state.workspace && state.workspace.url) ? state.workspace.url : "";
   const token = workspaceToken(state.workspace);
   for (const img of images) {
@@ -881,8 +887,15 @@ function appendUserImages(images) {
     imgEl.setAttribute("loading", "lazy");
     imgEl.setAttribute("alt", "附带图片");
     link.appendChild(imgEl);
-    els.messages.appendChild(link);
+    target.appendChild(link);
+    appended = true;
   }
+  return appended;
+}
+
+function appendUserImages(images) {
+  if (!images || !images.length) return;
+  appendImagesToTarget(els.messages, images);
   scrollBottom(false);
   pruneMessages();
 }
@@ -987,7 +1000,7 @@ function appendToolCall(name, args, acc, callId) {
   pruneMessages();      // 卡片是「执行中…」：进行中，不折叠
 }
 
-function appendToolResult(isError, content, acc, callId) {
+function appendToolResult(isError, content, acc, callId, images) {
   let card = null;
   if (callId && acc.pendingByCall.has(callId)) {
     card = acc.pendingByCall.get(callId);
@@ -1007,22 +1020,28 @@ function appendToolResult(isError, content, acc, callId) {
     resEl.classList.remove("pending");
     resEl.classList.toggle("err", isError);
     // 统一结果渲染（与 history 的 renderMessage 同一条 renderToolResult 路径）。
-    // 文件工具（edit/read/write）成功 → 差异化渲染（diff / 行号视图）；
-    // 结果要可见，卡片保持展开。其余工具维持原行为：文本 + 收起。
+    // 文件工具成功与带图片 read_image 结果需要保持可见；其余工具维持原行为：文本 + 收起。
     const name = cardToolName(card);
     const tArgs = (name === "edit_file" || name === "read_file" || name === "write_file")
       ? cardArgs(card) : null;
     const isFileTool = tArgs !== null;
-    renderToolResult(resEl, name, tArgs, content, isError);
-    if (isFileTool && !isError) {
+    renderToolResult(resEl, name, tArgs, content, isError, images);
+    if ((isFileTool || (name === "read_image" && resEl.querySelector("img.attached-image"))) && !isError) {
       card.setAttribute("open", "");
     } else {
       card.removeAttribute("open");   // 结果到达：收起为标题行（默认折叠）
     }
   } else {
     // 没有可配对的卡片：独立展示结果行
+    const hasOrphanImages = !isError && images && images.length;
     const card2 = buildToolCard("工具结果", "", isError ? "失败" : "完成",
-      isError ? "err" : "", content || "");
+      isError ? "err" : "", content || "", !!hasOrphanImages);
+    const orphanResult = card2.querySelector(".tool-result");
+    orphanResult.classList.toggle("err", isError);
+    if (hasOrphanImages) {
+      renderImageReceipt(orphanResult, content, images);
+      if (orphanResult.querySelector("img.attached-image")) card2.setAttribute("open", "");
+    }
     els.messages.appendChild(card2);
     pruneMessages();
   }
@@ -1030,10 +1049,10 @@ function appendToolResult(isError, content, acc, callId) {
                         // stateText/resultText 也随此调用被包含）
 }
 
-function buildToolCard(name, args, stateText, stateCls, resultText) {
+function buildToolCard(name, args, stateText, stateCls, resultText, structuredResultOverride) {
   // 工具卡片：details 可折叠。pending（执行中/等待结果）时默认展开，
   // 结果到达后由 appendToolResult 收起（details.removeAttribute("open")）。
-  // 文件工具（edit/read/write）例外：结果到达后保持展开（diff/行号要可见）。
+  // 文件工具与成功的图片 read_image 结果例外：结果到达后保持展开。
   const card = el("details", "tool-card");
   if (stateCls === "pending") card.setAttribute("open", "");
   const head = el("summary", "tool-head");
@@ -1044,9 +1063,8 @@ function buildToolCard(name, args, stateText, stateCls, resultText) {
   const argsText = args != null ? String(args) : "";
   let parsed = null;
   try { parsed = JSON.parse(argsText); } catch (e) { /* 原文回退 */ }
-  // 结构化结果（diff 行 / markdown / 任务列表）用 div；其余保持 pre 语义。
-  // read_image 结果仍是文本摘要，维持 pre。
-  const structuredResult = name === "edit_file" || name === "read_file"
+  // 结构化结果（diff 行 / markdown / 任务列表）及 read_image receipt+图片容器用 div。
+  const structuredResult = structuredResultOverride || name === "read_image" || name === "edit_file" || name === "read_file"
     || name === "write_file" || name === "web_search" || name === "delegate"
     || name === "get_background_tasks";
   const argsEl = el("div", "tool-args");
@@ -1356,11 +1374,20 @@ function renderMessage(m, acc, pendingCards) {
         ? cardArgs(card) : null;
       // 与 live 路径同一 renderToolResult：特殊结果（web_search / delegate /
       // get_background_tasks / 文件 diff）在 history 重放时渲染一致
-      renderToolResult(resEl, name, tArgs, t.content, t.is_error);
+      renderToolResult(resEl, name, tArgs, t.content, t.is_error, t.images);
+      if (name === "read_image" && !t.is_error && resEl.querySelector("img.attached-image")) {
+        card.setAttribute("open", "");
+      }
     } else {
-      // 无对应 ToolCall（如历史截断后）：独立卡片
+      // 无对应 ToolCall 保持基线纯文本行为；图片 read_image 结果需要结构化容器。
+      const hasImages = t.name === "read_image" && !t.is_error && t.images && t.images.length;
       const card2 = buildToolCard(t.name, "", t.is_error ? "失败" : "完成",
-        t.is_error ? "err" : "", t.content || "");
+        t.is_error ? "err" : "", t.content || "", !!hasImages);
+      if (hasImages) {
+        const result = card2.querySelector(".tool-result");
+        renderImageReceipt(result, t.content, t.images);
+        if (result.querySelector("img.attached-image")) card2.setAttribute("open", "");
+      }
       els.messages.appendChild(card2);
     }
     scrollBottom(false);

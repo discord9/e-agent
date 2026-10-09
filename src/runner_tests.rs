@@ -11,6 +11,35 @@ use std::sync::{
 };
 use tokio::sync::Notify;
 
+#[test]
+fn entry_event_projects_tool_images_for_durable_replay() {
+    let images = vec![
+        crate::agent::ImagePart {
+            hash: "first".into(),
+            mime: "image/png".into(),
+        },
+        crate::agent::ImagePart {
+            hash: "second".into(),
+            mime: "image/jpeg".into(),
+        },
+    ];
+    let entry = SessionEntry::Message {
+        message: Message::Tool {
+            call_id: "call-image-replay".into(),
+            name: "read_image".into(),
+            content: "persisted image result".into(),
+            images: images.clone(),
+            is_error: false,
+            synthetic: false,
+        },
+    };
+    assert!(matches!(
+        entry_event(&entry),
+        Some(AgentEvent::ToolResult { is_error: false, content, images: projected, call_id: Some(call_id) })
+            if content == "persisted image result" && call_id == "call-image-replay" && projected == images
+    ));
+}
+
 struct IdentityCaptureModel(Arc<Mutex<Option<String>>>);
 
 #[async_trait]
@@ -4393,6 +4422,10 @@ async fn runner_commits_image_bearing_tool_and_strips_requests_without_vision() 
             mime: "image/png".into(),
         }]
     );
+    assert!(handle.snapshot().iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolResult { images, is_error: false, .. } if images == &tool.1
+    )));
     // No synthetic user message ever.
     assert!(!loaded.entries.iter().any(|entry| match entry {
         SessionEntry::Message {

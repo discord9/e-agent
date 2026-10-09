@@ -1612,6 +1612,7 @@ impl SessionRunner {
             Err(error) => (error.clone(), Vec::new()),
         };
         let is_error = result.is_err();
+        let event_images = images.clone();
         let entry = Message::Tool {
             call_id: call.id.clone(),
             name: call.name.clone(),
@@ -1628,6 +1629,7 @@ impl SessionRunner {
             .emit_durable(AgentEvent::ToolResult {
                 is_error,
                 content: tool_text,
+                images: event_images,
                 call_id: Some(call.id.clone()),
             });
         let steering = self.intake_after_operation(Vec::new());
@@ -3011,6 +3013,7 @@ impl SessionRunner {
                                     .emit_durable(AgentEvent::ToolResult {
                                         is_error: true,
                                         content: error,
+                                        images: Vec::new(),
                                         call_id: Some(call.id.clone()),
                                     });
                                 continue;
@@ -3061,6 +3064,7 @@ impl SessionRunner {
                                     .emit_durable(AgentEvent::ToolResult {
                                         is_error: false,
                                         content,
+                                        images: Vec::new(),
                                         call_id: Some(call.id.clone()),
                                     });
                                 let steering = self.intake_after_operation(waited.pending);
@@ -3266,7 +3270,7 @@ impl SessionRunner {
                         call_id: call.id.clone(),
                         name: call.name.clone(),
                         content: tool_text.clone(),
-                        images,
+                        images: images.clone(),
                         is_error,
                         synthetic: false,
                     }
@@ -3286,6 +3290,7 @@ impl SessionRunner {
                         .emit_durable(AgentEvent::ToolResult {
                             is_error,
                             content: tool_text,
+                            images,
                             call_id: Some(call.id.clone()),
                         });
                     // A release that raced the tool's own completion: the
@@ -3535,12 +3540,14 @@ fn entry_event(entry: &SessionEntry) -> Option<AgentEvent> {
                 Message::Tool {
                     call_id,
                     content,
+                    images,
                     is_error,
                     ..
                 },
         } => Some(AgentEvent::ToolResult {
             is_error: *is_error,
             content: content.clone(),
+            images: images.clone(),
             call_id: Some(call_id.clone()),
         }),
         SessionEntry::Compaction { summary, .. } => {
