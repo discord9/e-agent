@@ -64,9 +64,41 @@ with tempfile.TemporaryDirectory(prefix="termux-sv-test-") as tmp:
             assert pidfile.read_text() == current, "disabled service restarted"
             assert (logfile.parent.stat().st_mode & 0o077) == 0, "service log directory is not private"
             assert (logfile.parent / "config").read_text() == "s1048576\nn10\nt86400\n"
-            print("real runit: stdout/stderr captured, crash restart, stop shortcut, private rotating log config passed")
+            # A click after stop re-enables the service, opens the UI, then exits.
+            token = home / ".local/state/e-agent/server.token"
+            token.parent.mkdir(parents=True)
+            token.write_text("fixture-token")
+            (bindir / "curl").write_text("""#!/bin/sh
+[ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null || exit 7
+case "$*" in
+  */api/models*) data='["fixture"]' ;;
+  *) data='<title>e-agent · Web UI</title>' ;;
+esac
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = -o ]; then printf '%s' "$data" > "$2"; exit 0; fi
+  shift
+done
+printf '%s' "$data"
+""")
+            opened = root / "opened"
+            env["OPENED_FILE"] = str(opened)
+            (bindir / "termux-open-url").write_text('#!/bin/sh\n echo "$1" >> "$OPENED_FILE"\n')
+            (bindir / "termux-open-url").chmod(0o755)
+            start = root / "start.sh"
+            start.write_text((ROOT / "termux-web.sh").read_text().replace("@PREFIX_BIN@", str(bindir)))
+            launched = subprocess.run(["bash", str(start)], env=env, text=True, capture_output=True, timeout=15)
+            assert launched.returncode == 0, (launched.stdout, launched.stderr)
+            assert not (service / "down").exists(), "start shortcut did not re-enable service"
+            assert opened.read_text().strip() == "http://127.0.0.1:8766"
+            running_pid = int(pidfile.read_text())
+            again = subprocess.run(["bash", str(start)], env=env, capture_output=True, timeout=5)
+            assert again.returncode == 0
+            assert int(pidfile.read_text()) == running_pid, "repeated click spawned another server"
+            subprocess.run(["bash", str(stop)], env=env, check=True, timeout=10)
+            print("real runit: stdout/stderr logs, crash restart, forced stop, persistent disable, start/reopen shortcuts passed")
         finally:
             if service.exists():
+                subprocess.run(["sv", "-w", "2", "force-stop", str(service)], env=env, capture_output=True)
                 subprocess.run(["sv", "-w", "5", "exit", str(service)], env=env, capture_output=True)
             supervisor.terminate()
             supervisor.wait(timeout=8)
