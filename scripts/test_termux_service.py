@@ -29,7 +29,7 @@ with tempfile.TemporaryDirectory(prefix="termux-sv-test-") as tmp:
     for name in ("sh", "sv", "svlogd"):
         (bindir / name).symlink_to(shutil.which(name))
     pidfile = root / "pid"
-    (bindir / "e-agent").write_text('#!/bin/sh\necho $$ > "$PIDFILE"\necho fixture-started\necho fixture-stderr >&2\n[ ! -e "$STUBBORN" ] || trap "" TERM\nexec sleep 60\n')
+    (bindir / "e-agent").write_text('#!/bin/sh\necho $$ > "$PIDFILE.tmp"\nmv "$PIDFILE.tmp" "$PIDFILE"\necho fixture-started\necho fixture-stderr >&2\n[ ! -e "$STUBBORN" ] || trap "" TERM\nexec sleep 60\n')
     (bindir / "service-daemon").write_text("#!/bin/sh\nexit 0\n")
     (bindir / "curl").write_text("#!/bin/sh\necho 'Connection refused' >&2\nexit 7\n")
     for name in ("e-agent", "service-daemon", "curl"):
