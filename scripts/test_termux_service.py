@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""Exercise generated services with real runsvdir/svlogd, not supervisor mocks."""
+import os
+from pathlib import Path
+import shutil
+import signal
+import subprocess
+import tempfile
+import time
+
+ROOT = Path(__file__).resolve().parent
+
+def wait_for(predicate, timeout=8):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.1)
+    raise AssertionError("service did not reach expected state")
+
+with tempfile.TemporaryDirectory(prefix="termux-sv-test-") as tmp:
+    root = Path(tmp)
+    prefix = root / "data/data/com.termux/files/usr"
+    home = root / "home"
+    bindir = prefix / "bin"
+    svdir = prefix / "var/service"
+    for path in (bindir, svdir, prefix / "tmp", home):
+        path.mkdir(parents=True, exist_ok=True)
+    for name in ("sh", "sv", "svlogd"):
+        (bindir / name).symlink_to(shutil.which(name))
+    pidfile = root / "pid"
+    (bindir / "e-agent").write_text('#!/bin/sh\necho $$ > "$PIDFILE"\necho fixture-started\necho fixture-stderr >&2\nexec sleep 60\n')
+    (bindir / "service-daemon").write_text("#!/bin/sh\nexit 0\n")
+    (bindir / "curl").write_text("#!/bin/sh\nexit 7\n")
+    for name in ("e-agent", "service-daemon", "curl"):
+        (bindir / name).chmod(0o755)
+    env = dict(os.environ, PREFIX=str(prefix), HOME=str(home), SVDIR=str(svdir),
+               LOGDIR=str(prefix / "var/log"), PIDFILE=str(pidfile), PATH=str(bindir)+os.pathsep+os.environ["PATH"])
+    service = svdir / "e-agent-web"
+    logfile = prefix / "var/log/sv/e-agent-web/current"
+    with (root / "supervisor.log").open("wb") as output:
+        supervisor = subprocess.Popen(["runsvdir", str(svdir)], env=env, stdout=output, stderr=output)
+        try:
+            install = subprocess.run(["bash", str(ROOT / "termux-service.sh")], env=env,
+                                     text=True, capture_output=True, timeout=15)
+            assert install.returncode == 0, (install.stdout, install.stderr)
+            wait_for(pidfile.exists)
+            oldpid = int(pidfile.read_text())
+            wait_for(lambda: logfile.exists() and "fixture-stderr" in logfile.read_text())
+            os.kill(oldpid, signal.SIGTERM)
+            wait_for(lambda: int(pidfile.read_text()) != oldpid)
+            wait_for(lambda: logfile.read_text().count("fixture-started") >= 2)
+            subprocess.run(["sv", "-w", "5", "down", str(service)], env=env, check=True)
+            current = pidfile.read_text()
+            time.sleep(1.2)
+            assert pidfile.read_text() == current, "disabled service restarted"
+            assert (logfile.stat().st_mode & 0o077) == 0, "service log is not private"
+            assert (logfile.parent / "config").read_text() == "s1048576\nn10\nt86400\n"
+            print("real runit: stdout/stderr captured, crash restart, sv down, private rotating log config passed")
+        finally:
+            if service.exists():
+                subprocess.run(["sv", "-w", "5", "exit", str(service)], env=env, capture_output=True)
+            supervisor.terminate()
+            supervisor.wait(timeout=8)

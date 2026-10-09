@@ -39,8 +39,8 @@ UI when stdout is a terminal.
 
 The Android/Termux ARM64 release installer uses
 `e-agent-aarch64-linux-android.tar.gz`, `SHA256SUMS`, `install-termux.sh`, and
-`termux-web.sh` from a published release. The package is cross-compiled;
-installation and Widget behavior have not yet been validated on a phone.
+`termux-web.sh`, and `termux-service.sh` from a published release. The package is cross-compiled;
+the installer also configures Termux service supervision and rotating logs.
 In Termux, run this one command to install the prerequisites and download and
 run the installer:
 
@@ -66,24 +66,46 @@ want the installer to replace that shortcut. The installer does not replace
 Cargo's usual `$HOME/.cargo/bin/e-agent`; a pre-existing `$PREFIX/bin/e` alias
 is also left untouched. Check which executable is selected with
 `command -v e-agent`, and verify the release binary directly with
-`$PREFIX/bin/e-agent --version`. An already-running Web server is not upgraded
-in place: stop your own old server and restart the installed release using the
-same workspace as before. If you kept a custom shortcut, check that it points
-to `$PREFIX/bin/e-agent` rather than an older Cargo binary.
+`$PREFIX/bin/e-agent --version`. To activate an upgraded binary, run
+`sv restart e-agent-web`. An older foreground server must be stopped first;
+the installer leaves its new service disabled if port 8766 is already occupied.
 
-The installer requires Termux on
-ARM64/aarch64; it does not install an APK, configure a provider, or enable or
-configure ADB. ADB is optional and requires the separate manual setup below;
-normal e-agent CLI and Web use do not need ADB. Configure
-`~/.config/e-agent/config.toml` separately. It preserves existing config,
-workspaces, and credentials; the Widget server uses
-`$HOME/e-agent-workspace` by default (edit the shortcut to change this).
-Install Termux:Widget from the same source as the Termux app. Add or refresh
-the `e-agent-web` shortcut in the Widget list. The shortcut keeps the server
-in the foreground; clicking again opens the existing e-agent UI if it is
-already serving on localhost. On first visit, paste the server token into the
-UI. The server listens only on `127.0.0.1:8766`; other occupants of that port
-are not treated as e-agent.
+The installer installs `termux-services` if needed and creates
+`$PREFIX/var/service/e-agent-web/run` plus its `log/run` subservice. The Web
+server runs under runit, which restarts it after it exits; stdout and stderr
+feed `svlogd`, rather than the Widget terminal. Logs are private and rotate
+at 1 MiB, retaining up to ten archives, with daily rotation:
+
+```sh
+sv status e-agent-web
+sv restart e-agent-web
+sv down e-agent-web                       # stop until next startup/click
+sv-disable e-agent-web                    # keep disabled across Termux starts
+tail -n 100 "$PREFIX/var/log/sv/e-agent-web/current"
+```
+
+Reinstalling updates generated service files, preserves edited `run`,
+`log/run`, and log rotation settings, and keeps a previously disabled service
+disabled. To change the workspace permanently, edit the service's `run` file
+(default: `$HOME/e-agent-workspace`); changing a Widget's environment does not
+reconfigure an already-running supervisor.
+
+Install Termux:Widget from the same source as Termux. At the end of installation,
+the installer opens its Android shortcut chooser: select `e-agent-web` to add a
+**one-icon (1×1) desktop shortcut** and approve any launcher permission prompt.
+Alternatively add/refresh the Termux Widget list. Clicking starts the supervised
+service if needed, waits for authenticated readiness, opens the browser, and
+returns; closing the terminal or browser does not stop the service. On first
+visit, paste the server token into the UI. Only an authenticated e-agent server
+on `127.0.0.1:8766` is opened; unrelated services are refused.
+
+Android can still kill Termux and its child processes. Allow Termux background
+operation and exclude it from battery optimization in your device settings.
+The enabled service starts when Termux's service daemon starts; phone-boot
+startup additionally requires Termux:Boot and is not installed automatically.
+The installer does not install APKs, configure model credentials, grant Android
+permissions, or configure ADB; configure `~/.config/e-agent/config.toml`
+separately. Existing credentials, token, and workspace are preserved.
 
 For session IDs, storage, and CLI options, continue in [Run](#run). See
 [Safety boundaries](#safety-boundaries) before enabling or relying on sandbox
@@ -1598,6 +1620,9 @@ GREPTIME_PG="host=127.0.0.1 port=4002 dbname=public" cargo test --features grept
 
 Without `GREPTIME_PG` the integration tests skip with a message.
 ## Non-goals
+
+Termux service setup does not install APKs, bypass Android permission prompts,
+configure ADB, or promise survival of Android process killing or phone reboot.
 
 This is deliberately not a daemon, JSONL protocol, subagent
 framework, permission framework, plugin host, generic provider/auth framework,

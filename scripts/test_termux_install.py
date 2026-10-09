@@ -33,8 +33,10 @@ class TermuxInstallTests(unittest.TestCase):
             tf.addfile(info, io.BytesIO(self.bin_payload))
         launcher = (ROOT / "termux-web.sh").read_bytes()
         (self.root / "termux-web.sh").write_bytes(launcher)
+        service_helper = (ROOT / "termux-service.sh").read_bytes()
+        (self.root / "termux-service.sh").write_bytes(service_helper)
         sums = "".join(hashlib.sha256((self.root / f).read_bytes()).hexdigest() + "  " + f + "\n"
-                       for f in (archive.name, "termux-web.sh"))
+                       for f in (archive.name, "termux-web.sh", "termux-service.sh"))
         (self.root / "SHA256SUMS").write_text(sums)
         self.releases = self.root / "releases"
         for tag, payload in (("vtest-old", self.bin_payload), ("vtest-new", b"new release payload\n")):
@@ -47,15 +49,18 @@ class TermuxInstallTests(unittest.TestCase):
                 info.size = len(payload)
                 tf.addfile(info, io.BytesIO(payload))
             (release / "termux-web.sh").write_bytes(launcher)
+            (release / "termux-service.sh").write_bytes(service_helper)
             release_sums = "".join(hashlib.sha256((release / f).read_bytes()).hexdigest() + "  " + f + "\n"
-                                   for f in (archive.name, "termux-web.sh"))
+                                   for f in (archive.name, "termux-web.sh", "termux-service.sh"))
             (release / "SHA256SUMS").write_text(release_sums)
         (self.fake / "curl").write_text('''#!/usr/bin/env python3
 import os,sys,shutil
 args=sys.argv[1:]
 urls=[a for a in args if a.startswith('https://')]
 with open(os.environ['CURL_LOG'],'a') as f: f.write(repr(args)+' proxy='+os.environ.get('HTTPS_PROXY','')+'\\n')
-if '--noproxy' in args: sys.exit('curl fake: installer must preserve external proxy settings')
+if '--noproxy' in args:
+ if os.environ.get('PORT_OCCUPIED'): sys.exit(0)
+ sys.exit(7)
 if len(urls)!=1: sys.exit('curl fake: expected exactly one URL, got '+repr(urls))
 url=urls[0]
 if url!='https://github.com/discord9/e-agent/releases/latest' and not any(url.startswith('https://github.com/discord9/e-agent/releases/download/'+tag+'/') for tag in ('vtest','vtest-old','vtest-new')):
@@ -65,7 +70,7 @@ if url.endswith('/latest'):
  if '-w' in args: print(os.environ.get('LATEST_URL','https://github.com/discord9/e-agent/releases/tag/vtest'))
  sys.exit(0)
 name=url.rsplit('/',1)[-1]
-if name not in ('e-agent-aarch64-linux-android.tar.gz','SHA256SUMS','termux-web.sh'): sys.exit('curl fake: unexpected asset '+name)
+if name not in ('e-agent-aarch64-linux-android.tar.gz','SHA256SUMS','termux-web.sh','termux-service.sh'): sys.exit('curl fake: unexpected asset '+name)
 out=args[args.index('-o')+1] if '-o' in args else None
 if not out: sys.exit('curl fake: expected download output path')
 if os.environ.get('DOWNLOAD_FAIL')==name: sys.exit('simulated download failure '+name)
@@ -79,8 +84,13 @@ shutil.copyfile(source,out)
         (self.fake / "curl").chmod(0o755)
         (self.fake / "uname").write_text("#!/bin/sh\necho aarch64\n")
         (self.fake / "uname").chmod(0o755)
+        for name in ("sv", "svlogd", "pkg", "am"):
+            (self.fake / name).write_text("#!/bin/sh\necho \"$0 $*\" >> \"$SERVICE_LOG\"\n")
+            (self.fake / name).chmod(0o755)
+        (self.fake / "service-daemon").write_text("#!/bin/sh\nmkdir -p \"$SVDIR/e-agent-web/supervise\"\n[ -p \"$SVDIR/e-agent-web/supervise/ok\" ] || mkfifo \"$SVDIR/e-agent-web/supervise/ok\"\n")
+        (self.fake / "service-daemon").chmod(0o755)
         env = os.environ.copy()
-        env.update(PREFIX=str(self.prefix), HOME=str(self.home), ASSETS=str(self.root), CURL_LOG=str(self.root / "curl.log"), HTTPS_PROXY="http://proxy.fixture:8123", PATH=str(self.fake)+os.pathsep+env["PATH"])
+        env.update(PREFIX=str(self.prefix), HOME=str(self.home), ASSETS=str(self.root), CURL_LOG=str(self.root / "curl.log"), SERVICE_LOG=str(self.root / "service.log"), HTTPS_PROXY="http://proxy.fixture:8123", PATH=str(self.fake)+os.pathsep+env["PATH"])
         self.env = env
 
     def run_installer(self, *args):
@@ -103,7 +113,7 @@ shutil.copyfile(source,out)
         self.assertEqual(list(self.prefix.glob("bin/.e-agent.*")), [])
         calls = (self.root / "curl.log").read_text().splitlines()
         self.assertEqual(sum("releases/latest" in line for line in calls), 1)
-        self.assertEqual(sum("/download/vtest-new/" in line for line in calls), 3)
+        self.assertEqual(sum("/download/vtest-new/" in line for line in calls), 4)
         self.assertFalse(any("/download/vtest/" in line for line in calls))
         self.assertIn("proxy=http://proxy.fixture:8123", "\\n".join(calls))
 
@@ -217,8 +227,45 @@ shutil.copyfile(source,out)
         result = self.run_installer("--version", "vtest"); self.assertNotEqual(result.returncode, 0)
 
     def refresh_sums(self):
-        names=("e-agent-aarch64-linux-android.tar.gz", "termux-web.sh")
+        names=("e-agent-aarch64-linux-android.tar.gz", "termux-web.sh", "termux-service.sh")
         (self.root / "SHA256SUMS").write_text("".join(hashlib.sha256((self.root/n).read_bytes()).hexdigest()+"  "+n+"\n" for n in names))
+
+    def test_service_log_install_upgrade_and_user_edits(self):
+        result = self.run_installer("--version", "vtest")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        service = self.prefix / "var/service/e-agent-web"
+        logdir = self.prefix / "var/log/sv/e-agent-web"
+        self.assertIn('exec 2>&1', (service / "run").read_text())
+        self.assertIn('exec "$PREFIX/bin/e-agent" web', (service / "run").read_text())
+        self.assertIn('svlogd', (service / "log/run").read_text())
+        self.assertEqual((logdir / "config").read_text(), "s1048576\nn10\nt86400\n")
+        self.assertFalse((service / "down").exists())
+        self.assertIn('intent.action.CREATE_SHORTCUT', (self.root / "service.log").read_text())
+        (service / "run").write_text("custom run\n")
+        (logdir / "config").write_text("s2048\nn3\n")
+        (service / "down").touch()
+        result = self.run_installer("--version", "vtest")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((service / "run").read_text(), "custom run\n")
+        self.assertEqual((logdir / "config").read_text(), "s2048\nn3\n")
+        self.assertTrue((service / "down").exists())
+
+    def test_occupied_port_leaves_new_service_disabled(self):
+        self.env["PORT_OCCUPIED"] = "1"
+        result = self.run_installer("--version", "vtest")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.prefix / "var/service/e-agent-web/down").exists())
+        self.assertIn("left down", result.stdout)
+
+    def test_bad_service_helper_checksum_does_not_replace_binary(self):
+        target = self.prefix / "bin/e-agent"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"old binary")
+        (self.root / "termux-service.sh").write_bytes(b"corrupt")
+        result = self.run_installer("--version", "vtest")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Checksum verification failed: termux-service.sh", result.stderr)
+        self.assertEqual(target.read_bytes(), b"old binary")
 
     def test_rejects_non_termux_and_non_arm(self):
         env = self.env.copy(); env.pop("PREFIX")

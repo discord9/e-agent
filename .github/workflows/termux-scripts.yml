@@ -1,0 +1,32 @@
+name: Termux installer and services
+on:
+  pull_request:
+    paths:
+      - 'scripts/*termux*'
+      - '.github/workflows/termux-scripts.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: sudo apt-get update && sudo apt-get install -y runit shellcheck
+      - run: shellcheck scripts/install-termux.sh scripts/termux-web.sh scripts/termux-service.sh scripts/package-termux.sh
+      - run: uv run --python 3.12 python scripts/test_termux_install.py
+      - run: uv run --python 3.12 python scripts/test_termux_service.py
+      - run: uv run --python 3.12 python scripts/test_termux_package.py
+  rust:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      - run: cargo build
