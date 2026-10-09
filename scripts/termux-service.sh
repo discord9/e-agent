@@ -36,6 +36,7 @@ set -eu
 umask 077
 logdir="$PREFIX/var/log/sv/e-agent-web"
 mkdir -p "$logdir"
+chmod 700 "$logdir"
 exec "$PREFIX/bin/svlogd" -tt "$logdir"
 LOG
 sed -i "1c#!$PREFIX/bin/sh" "$tmp/run" "$tmp/log-run"

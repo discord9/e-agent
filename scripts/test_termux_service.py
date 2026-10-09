@@ -57,7 +57,7 @@ with tempfile.TemporaryDirectory(prefix="termux-sv-test-") as tmp:
             current = pidfile.read_text()
             time.sleep(1.2)
             assert pidfile.read_text() == current, "disabled service restarted"
-            assert (logfile.stat().st_mode & 0o077) == 0, "service log is not private"
+            assert (logfile.parent.stat().st_mode & 0o077) == 0, "service log directory is not private"
             assert (logfile.parent / "config").read_text() == "s1048576\nn10\nt86400\n"
             print("real runit: stdout/stderr captured, crash restart, stop shortcut, private rotating log config passed")
         finally:

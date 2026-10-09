@@ -28,5 +28,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
-      - run: cargo build
+      - if: ${{ !cancelled() }}
+        run: cargo test
+      - if: ${{ !cancelled() }}
+        run: cargo build
