@@ -1155,6 +1155,9 @@ async function main(){
       }
       const noImages=liveImage("legacy receipt");
       chk("missing images preserve collapsed receipt", !noImages.hasAttribute("open") && !noImages.querySelector("img") && noImages.textContent.includes("legacy receipt"));
+      const longLegacy=liveImage(longReceipt);
+      chk("legacy long receipt expands on the original outer result", longLegacy.querySelector(".tool-result").classList.contains("expandable")
+        && !longLegacy.querySelector(".tool-image-receipt") && longLegacy.querySelector(".expand-full").textContent === longReceipt);
       const oldHistory=histImage("legacy history receipt", undefined, false);
       chk("missing history images keep receipt without preview", !oldHistory.querySelector("img") && oldHistory.textContent.includes("legacy history receipt"));
       const failed=liveImage("error receipt",refs,true);

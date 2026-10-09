@@ -634,6 +634,7 @@
     overflow-y: visible;
   }
   .tool-card .tool-result.tool-image { max-height: none; }
+  .tool-image-receipt { white-space: inherit; margin: 0; }
   .tool-card .tool-result {
     margin: 0;
     font-size: 12px;

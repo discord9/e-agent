@@ -518,6 +518,10 @@ function renderBackgroundTaskList(resEl, content) {
 /* read_image 结果：文字 receipt 保持原有可展开/复制渲染，图片作为独立兄弟节点追加，
    避免长文本预览/复制结构影响图片可见性；带图结果移除外层结果高度帽。 */
 function renderImageReceipt(resEl, content, images) {
+  if (!images || !images.some(image => image && image.hash)) {
+    renderPlainResult(resEl, String(content == null ? "" : content), "(无输出)");
+    return;
+  }
   resEl.textContent = "";
   resEl.classList.remove("expandable", "expanded");
   const receipt = el("pre", "tool-image-receipt");
