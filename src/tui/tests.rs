@@ -164,10 +164,9 @@ async fn attached_waiting_submission_routes_and_restores_unicode_cursor_on_confl
     let attached = state.attached.as_ref().unwrap();
     assert_eq!(attached.input.text, "你好");
     assert_eq!(attached.input.cursor, 1);
-    let mut attached_status = attached.status.borrow().clone();
     let _ = attached;
     emitter.set_status(SessionStatus::Idle);
-    attached_status = handle.status().borrow().clone();
+    let attached_status = handle.status().borrow().clone();
     let attached = state.attached.as_mut().unwrap();
     project_main_status(&mut attached.state, &attached_status);
     assert!(attached.state.waiting_question.is_none());

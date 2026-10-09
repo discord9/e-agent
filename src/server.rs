@@ -2830,17 +2830,16 @@ fn spawn_summary_listener(state: Arc<AppState>, id: String, session: Arc<LiveSes
                             // turn 起点基线：只有该 turn 新增的实质事件才触发总结
                             baseline = substantive;
                         }
-                        SessionStatus::Idle => {
-                            if substantive > baseline {
-                                baseline = substantive;
-                                generate_summary(
-                                    &state,
-                                    &id,
-                                    &digest_recent(&recent, SUMMARY_MAX_EVENTS),
-                                )
-                                .await;
-                            }
+                        SessionStatus::Idle if substantive > baseline => {
+                            baseline = substantive;
+                            generate_summary(
+                                &state,
+                                &id,
+                                &digest_recent(&recent, SUMMARY_MAX_EVENTS),
+                            )
+                            .await;
                         }
+                        SessionStatus::Idle => {}
                         _ => {} // Compacting / Finished：不是 turn，不触发
                     }
                 }

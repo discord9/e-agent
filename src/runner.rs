@@ -585,22 +585,23 @@ impl SessionHandle {
     pub fn goal(&self) -> Option<crate::agent::GoalSnapshot> {
         self.shared.lock().unwrap().goal.clone()
     }
-    pub async fn web_attach(&self) -> Result<WebAttach, ()> {
+    pub async fn web_attach(&self) -> anyhow::Result<WebAttach> {
         let (tx, rx) = oneshot::channel();
         {
             let mut shared = self.shared.lock().unwrap();
             if !shared.commands_open || self.commands.is_closed() {
                 shared.commands_open = false;
-                return Err(());
+                return Err(anyhow::anyhow!("session command channel is closed"));
             }
             // Status is descriptive, not an attach-readiness signal. The
             // runner command loop answers only at its own safe points.
             if self.commands.send(SessionCommand::WebAttach(tx)).is_err() {
                 shared.commands_open = false;
-                return Err(());
+                return Err(anyhow::anyhow!("session command channel is closed"));
             }
         }
-        rx.await.map_err(|_| ())
+        rx.await
+            .map_err(|_| anyhow::anyhow!("session attach reply channel is closed"))
     }
 
     pub fn snapshot(&self) -> Vec<AgentEvent> {
