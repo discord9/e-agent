@@ -31,7 +31,7 @@ with tempfile.TemporaryDirectory(prefix="termux-sv-test-") as tmp:
     pidfile = root / "pid"
     (bindir / "e-agent").write_text('#!/bin/sh\necho $$ > "$PIDFILE"\necho fixture-started\necho fixture-stderr >&2\n[ ! -e "$STUBBORN" ] || trap "" TERM\nexec sleep 60\n')
     (bindir / "service-daemon").write_text("#!/bin/sh\nexit 0\n")
-    (bindir / "curl").write_text("#!/bin/sh\nexit 7\n")
+    (bindir / "curl").write_text("#!/bin/sh\necho 'Connection refused' >&2\nexit 7\n")
     for name in ("e-agent", "service-daemon", "curl"):
         (bindir / name).chmod(0o755)
     env = dict(os.environ, PREFIX=str(prefix), HOME=str(home), SVDIR=str(svdir),
@@ -69,7 +69,7 @@ with tempfile.TemporaryDirectory(prefix="termux-sv-test-") as tmp:
             token.parent.mkdir(parents=True)
             token.write_text("fixture-token")
             (bindir / "curl").write_text("""#!/bin/sh
-[ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null || exit 7
+[ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null || { echo 'Connection refused' >&2; exit 7; }
 case "$*" in
   */api/models*) data='["fixture"]' ;;
   *) data='<title>e-agent · Web UI</title>' ;;

@@ -67,7 +67,9 @@ urls=[a for a in args if a.startswith('https://')]
 with open(os.environ['CURL_LOG'],'a') as f: f.write(repr(args)+' proxy='+os.environ.get('HTTPS_PROXY','')+'\\n')
 if '--noproxy' in args:
  if os.environ.get('PORT_OCCUPIED'): sys.exit(0)
- sys.exit(7)
+ code=int(os.environ.get('PROBE_CODE','7'))
+ if code==7: print('Connection refused',file=sys.stderr)
+ sys.exit(code)
 if len(urls)!=1: sys.exit('curl fake: expected exactly one URL, got '+repr(urls))
 url=urls[0]
 if url!='https://github.com/discord9/e-agent/releases/latest' and not any(url.startswith('https://github.com/discord9/e-agent/releases/download/'+tag+'/') for tag in ('vtest','vtest-old','vtest-new')):
@@ -299,6 +301,39 @@ shutil.copyfile(source,out)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Checksum verification failed: e-agent-stop.png", result.stderr)
         self.assertEqual(target.read_bytes(), b"old binary")
+
+    def test_uncertain_port_does_not_enable_service_or_start_shortcut(self):
+        for code in (28, 56, 52, 7):
+            with self.subTest(code=code):
+                self.env["PROBE_CODE"] = str(code)
+                # Code 7 without explicit refusal is also uncertain.
+                if code == 7:
+                    curl = self.fake / "curl"
+                    curl.write_text(curl.read_text().replace("print('Connection refused',file=sys.stderr)", "print('connect failed',file=sys.stderr)"))
+                service = self.prefix / "var/service/e-agent-web"
+                if service.exists():
+                    import shutil
+                    shutil.rmtree(service)
+                result = self.run_installer("--version", "vtest")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue((service / "down").exists())
+                started = subprocess.run(["bash", str(self.home / ".shortcuts/e-agent-web")], env=self.env, text=True, capture_output=True)
+                self.assertNotEqual(started.returncode, 0)
+                self.assertTrue((service / "down").exists())
+
+    def test_preserved_legacy_launcher_stop_does_not_claim_success(self):
+        shortcut = self.home / ".shortcuts/e-agent-web"
+        shortcut.parent.mkdir()
+        shortcut.write_text("#!/bin/sh\ne-agent web &\n")
+        self.env["PORT_OCCUPIED"] = "1"
+        result = self.run_installer("--version", "vtest")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("e-agent web &", shortcut.read_text())
+        result = subprocess.run(["bash", str(self.home / ".shortcuts/e-agent-stop")], env=self.env, text=True, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("old foreground launcher", result.stderr)
+        self.assertNotIn("e-agent stopped", result.stdout)
+        self.assertTrue((self.prefix / "var/service/e-agent-web/down").exists())
 
     def test_rejects_non_termux_and_non_arm(self):
         env = self.env.copy(); env.pop("PREFIX")

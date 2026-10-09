@@ -19,6 +19,7 @@ jobs:
       - run: uv run --python 3.12 python scripts/test_termux_install.py
       - run: uv run --python 3.12 python scripts/test_termux_service.py
       - run: uv run --python 3.12 python scripts/test_termux_package.py
+      - run: uv run --python 3.12 python scripts/test_termux_ports.py
   rust:
     runs-on: ubuntu-24.04
     steps:

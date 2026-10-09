@@ -68,7 +68,10 @@ is also left untouched. Check which executable is selected with
 `command -v e-agent`, and verify the release binary directly with
 `$PREFIX/bin/e-agent --version`. To activate an upgraded binary, run
 `sv restart e-agent-web`. An older foreground server must be stopped first;
-the installer leaves its new service disabled if port 8766 is already occupied.
+the installer leaves its new service disabled if port 8766 is already occupied
+or its state is uncertain. Only an explicit TCP connection refusal permits
+initial startup; HTTP timeouts, resets and non-HTTP listeners are not treated
+as a free port. The start shortcut applies the same check.
 
 The installer installs `termux-services` if needed and creates
 `$PREFIX/var/service/e-agent-web/run` plus its `log/run` subservice. The Web
@@ -103,10 +106,16 @@ service if needed, waits for authenticated readiness, opens the browser, and
 returns; closing the terminal or browser does not stop the service. The stop
 icon disables and stops the entire e-agent service, forcing termination after
 five seconds if needed. It stays stopped across Termux starts until the start
-icon is clicked again. It stops agent execution in that process; it does not
+icon is clicked again. The stop shortcut then checks port 8766: if it still
+responds or the check is uncertain, it returns an error instead of claiming
+success. A preserved older foreground launcher must be stopped separately;
+the stop shortcut does not kill unmanaged processes. It stops agent execution in that process; it does not
 undo actions already sent to other apps or stop independently detached programs. On first
 visit, paste the server token into the UI. Only an authenticated e-agent server
 on `127.0.0.1:8766` is opened; unrelated services are refused.
+
+The latest port-check and stop-reporting changes have not yet been verified
+on a phone. Earlier service, log and shortcut behavior was checked separately.
 
 Android can still kill Termux and its child processes. Allow Termux background
 operation and exclude it from battery optimization in your device settings.

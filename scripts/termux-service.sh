@@ -62,8 +62,11 @@ managed_file "$tmp/log-run" "$service/log/run" 700
 managed_file "$tmp/config" "$logdir/config" 600
 # Never kill an existing foreground server or silently re-enable a disabled service.
 if [ "$fresh" -eq 1 ]; then
-  if curl -q --noproxy '*' -sS --max-time 2 http://127.0.0.1:8766/ -o /dev/null 2>/dev/null; then
-    echo 'Port 8766 is occupied; service installed but left down. Stop your old server, then run: sv-enable e-agent-web'
+  probe=0
+  LC_ALL=C curl -q --noproxy '*' --verbose --max-time 2 http://127.0.0.1:8766/ -o /dev/null 2> "$tmp/port-error" || probe=$?
+  # Only an explicit TCP connection refusal proves there is no listener.
+  if [ "$probe" -ne 7 ] || ! grep -F 'Connection refused' "$tmp/port-error" >/dev/null; then
+    echo 'Port 8766 is occupied or its state is uncertain; service installed but left down. Stop your old server, then run: sv-enable e-agent-web'
   else
     service-daemon start >/dev/null 2>&1 || true
     for _ in 1 2 3 4 5; do [ -p "$service/supervise/ok" ] && break; sleep 1; done

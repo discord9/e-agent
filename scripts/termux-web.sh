@@ -25,8 +25,11 @@ open_ui() {
 tmp=$(mktemp -d "${TMPDIR:-$HOME}/e-agent-web.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 if owned; then open_ui; exit 0; fi
-if curl -q --noproxy '*' -sS --max-time 2 "$URL/" -o /dev/null 2>/dev/null; then
-  echo 'Port 8766 is occupied by a service that is not an authenticated e-agent; refusing to open it.' >&2; exit 1
+probe=0
+LC_ALL=C curl -q --noproxy '*' --verbose --max-time 2 http://127.0.0.1:8766/ -o /dev/null 2> "$tmp/port-error" || probe=$?
+  # Only an explicit TCP connection refusal proves there is no listener.
+  if [ "$probe" -ne 7 ] || ! grep -F 'Connection refused' "$tmp/port-error" >/dev/null; then
+  echo 'Port 8766 is occupied or uncertain and is not an authenticated e-agent; refusing to start or open it.' >&2; exit 1
 fi
 if [ ! -x "$service/run" ] || ! command -v sv >/dev/null; then
   echo 'Re-run the Termux installer to configure the e-agent-web service.' >&2; exit 1
