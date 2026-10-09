@@ -845,6 +845,8 @@ pub struct SessionRunner {
     before_finalize: Option<Box<dyn FnOnce() + Send>>,
     #[cfg(test)]
     before_goal_notice_drain: Option<Box<dyn FnOnce() + Send>>,
+    #[cfg(test)]
+    before_read_only_tool: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl Drop for SessionRunner {
@@ -1009,6 +1011,8 @@ impl SessionRunner {
                 before_finalize: None,
                 #[cfg(test)]
                 before_goal_notice_drain: None,
+                #[cfg(test)]
+                before_read_only_tool: None,
             },
             handle,
         )
@@ -1595,17 +1599,6 @@ impl SessionRunner {
         }
     }
 
-    /// Intercepted current-session history tool. The binding is entirely
-    /// runner-owned: model arguments never select a store, root, or session.
-    async fn execute_history_tool(&mut self, call: &ToolCall) -> Result<ToolOutput, String> {
-        let arguments: serde_json::Value = serde_json::from_str(&call.arguments)
-            .map_err(|error| format!("invalid JSON arguments: {error}"))?;
-        let text =
-            crate::tools::history::execute(&self.store, &self.root, &self.session, &arguments)
-                .await?;
-        Ok(ToolOutput::text(text))
-    }
-
     /// Commit and publish a runner-intercepted tool result. The same result
     /// path is used by goal, history, and read_output so their errors retain
     /// the normal persisted tool semantics.
@@ -1645,26 +1638,6 @@ impl SessionRunner {
                 .emit_presentation(AgentEvent::Display("turn cancelled".into()));
         }
         Ok(steering)
-    }
-
-    /// Intercepted `read_output` tool execution (the always-on read-only
-    /// pager for bounded provider projections): resolve the session-local
-    /// `eout1` ref (or a historical long ref), read the persisted field,
-    /// page it, and render the closed JSON page.
-    async fn execute_read_output(&mut self, call: &ToolCall) -> Result<ToolOutput, String> {
-        let arguments: serde_json::Value = serde_json::from_str(&call.arguments)
-            .map_err(|error| format!("invalid JSON arguments: {error}"))?;
-        let (reference, offset, limit) = crate::tools::output::parse_arguments(&arguments)?;
-        let text = crate::tools::output::execute(
-            &self.store,
-            &self.root,
-            &self.session,
-            &reference,
-            offset,
-            limit,
-        )
-        .await?;
-        Ok(ToolOutput::text(text))
     }
 
     fn begin_waiting_input(&mut self, request: UserInputRequest) {
@@ -3203,60 +3176,41 @@ impl SessionRunner {
                         }
                         continue;
                     }
-                    // history is intercepted by the runner: it is bound to
-                    // this session's store/root/session and cannot be pointed
-                    // elsewhere by model arguments.
-                    if call.name == "history" {
-                        let result = self.execute_history_tool(&call).await;
-                        match self.finish_intercepted_tool(&call, result).await {
-                            Ok(Steering::None) => {}
-                            Ok(steering) => {
-                                if self.release_after_preempt(steering) {
-                                    return;
-                                }
-                                break 'turn;
-                            }
-                            Err(error) => {
-                                self.terminate(
-                                    SessionResult::Failed(format!("{error:#}")),
-                                    Vec::new(),
-                                )
-                                .await;
-                                return;
-                            }
-                        }
-                        continue;
-                    }
-                    // read_output is intercepted by the runner: it needs the
-                    // session's store + ref registry (a plain tool cannot
-                    // reach them). Its result is committed like any other
-                    // tool result — and is itself an eligible persisted
-                    // field (`tool_content`), so an oversized page is
-                    // bounded with its own receipt in the next request.
-                    if call.name == "read_output" {
-                        let result = self.execute_read_output(&call).await;
-                        match self.finish_intercepted_tool(&call, result).await {
-                            Ok(Steering::None) => {}
-                            Ok(steering) => {
-                                if self.release_after_preempt(steering) {
-                                    return;
-                                }
-                                break 'turn;
-                            }
-                            Err(error) => {
-                                self.terminate(
-                                    SessionResult::Failed(format!("{error:#}")),
-                                    Vec::new(),
-                                )
-                                .await;
-                                return;
-                            }
-                        }
-                        continue;
-                    }
                     self.prepare_web_attach();
-                    let waited =
-                        await_tool(&mut self.agent, &call, &mut self.commands, &self.shared).await;
+                    let waited = if call.name == "history" || call.name == "read_output" {
+                        #[cfg(test)]
+                        if let Some(hook) = self.before_read_only_tool.take() {
+                            hook();
+                        }
+                        // These runner-bound, read-only tools still use the
+                        // normal operation wait so attach/cancel remain live.
+                        // Own the binding in the future to avoid borrowing the
+                        // runner while its command receiver is mutably borrowed.
+                        let store = self.store.clone();
+                        let root = self.root.clone();
+                        let session = self.session.clone();
+                        let call = &call;
+                        let mut operation = Box::pin(async move {
+                            let arguments: serde_json::Value =
+                                serde_json::from_str(&call.arguments)
+                                    .map_err(|error| format!("invalid JSON arguments: {error}"))?;
+                            let text = if call.name == "history" {
+                                crate::tools::history::execute(&store, &root, &session, &arguments)
+                                    .await?
+                            } else {
+                                let (reference, offset, limit) =
+                                    crate::tools::output::parse_arguments(&arguments)?;
+                                crate::tools::output::execute(
+                                    &store, &root, &session, &reference, offset, limit,
+                                )
+                                .await?
+                            };
+                            Ok::<ToolOutput, String>(ToolOutput::text(text))
+                        });
+                        wait_for_operation(&mut operation, &mut self.commands, &self.shared).await
+                    } else {
+                        await_tool(&mut self.agent, &call, &mut self.commands, &self.shared).await
+                    };
                     let result = match waited.outcome {
                         WaitOutcome::Completed(result) => result,
                         WaitOutcome::Released => {
