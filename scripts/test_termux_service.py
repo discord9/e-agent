@@ -50,13 +50,16 @@ with tempfile.TemporaryDirectory(prefix="termux-sv-test-") as tmp:
             os.kill(oldpid, signal.SIGTERM)
             wait_for(lambda: int(pidfile.read_text()) != oldpid)
             wait_for(lambda: logfile.read_text().count("fixture-started") >= 2)
-            subprocess.run(["sv", "-w", "5", "down", str(service)], env=env, check=True)
+            stop = root / "stop.sh"
+            stop.write_text((ROOT / "termux-stop.sh").read_text().replace("@PREFIX_BIN@", str(bindir)))
+            subprocess.run(["bash", str(stop)], env=env, check=True)
+            assert (service / "down").exists(), "stop shortcut did not persist disabled state"
             current = pidfile.read_text()
             time.sleep(1.2)
             assert pidfile.read_text() == current, "disabled service restarted"
             assert (logfile.stat().st_mode & 0o077) == 0, "service log is not private"
             assert (logfile.parent / "config").read_text() == "s1048576\nn10\nt86400\n"
-            print("real runit: stdout/stderr captured, crash restart, sv down, private rotating log config passed")
+            print("real runit: stdout/stderr captured, crash restart, stop shortcut, private rotating log config passed")
         finally:
             if service.exists():
                 subprocess.run(["sv", "-w", "5", "exit", str(service)], env=env, capture_output=True)

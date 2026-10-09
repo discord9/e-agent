@@ -45,8 +45,9 @@ install -m 755 "$binary" "$tmp_binary"
 install -m 644 "$(dirname "$0")/install-termux.sh" "$out/install-termux.sh"
 install -m 644 "$(dirname "$0")/termux-web.sh" "$out/termux-web.sh"
 install -m 644 "$(dirname "$0")/termux-service.sh" "$out/termux-service.sh"
+install -m 644 "$(dirname "$0")/termux-stop.sh" "$out/termux-stop.sh"
 # Keep only the executable in the archive, under the installer-expected name.
 tar --transform='s|^\.e-agent-package-tmp$|e-agent|' --owner=0 --group=0 --numeric-owner -czf "$archive" -C "$out" .e-agent-package-tmp
 rm -f "$tmp_binary"
-(cd "$out" && sha256sum e-agent-aarch64-linux-android.tar.gz install-termux.sh termux-web.sh termux-service.sh > SHA256SUMS)
+(cd "$out" && sha256sum e-agent-aarch64-linux-android.tar.gz install-termux.sh termux-web.sh termux-service.sh termux-stop.sh > SHA256SUMS)
 echo "Packaged Android ARM64 artifact in $out"

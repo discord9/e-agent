@@ -39,7 +39,7 @@ UI when stdout is a terminal.
 
 The Android/Termux ARM64 release installer uses
 `e-agent-aarch64-linux-android.tar.gz`, `SHA256SUMS`, `install-termux.sh`, and
-`termux-web.sh`, and `termux-service.sh` from a published release. The package is cross-compiled;
+`termux-web.sh`, `termux-stop.sh`, and `termux-service.sh` from a published release. The package is cross-compiled;
 the installer also configures Termux service supervision and rotating logs.
 In Termux, run this one command to install the prerequisites and download and
 run the installer:
@@ -93,9 +93,14 @@ reconfigure an already-running supervisor.
 Install Termux:Widget from the same source as Termux. At the end of installation,
 the installer opens its Android shortcut chooser: select `e-agent-web` to add a
 **one-icon (1×1) desktop shortcut** and approve any launcher permission prompt.
+Use the Termux shortcut picker again to add `e-agent-stop` as the second icon.
 Alternatively add/refresh the Termux Widget list. Clicking starts the supervised
 service if needed, waits for authenticated readiness, opens the browser, and
-returns; closing the terminal or browser does not stop the service. On first
+returns; closing the terminal or browser does not stop the service. The stop
+icon disables and stops the entire e-agent service, forcing termination after
+five seconds if needed. It stays stopped across Termux starts until the start
+icon is clicked again. It stops agent execution in that process; it does not
+undo actions already sent to other apps or stop independently detached programs. On first
 visit, paste the server token into the UI. Only an authenticated e-agent server
 on `127.0.0.1:8766` is opened; unrelated services are refused.
 

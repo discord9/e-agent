@@ -33,6 +33,7 @@ if [ ! -x "$service/run" ] || ! command -v sv >/dev/null; then
 fi
 service-daemon start >/dev/null 2>&1 || true
 for _ in 1 2 3 4 5; do [ -p "$service/supervise/ok" ] && break; sleep 1; done
+rm -f "$service/down"
 sv -w 5 up "$service"
 deadline=$(( $(date +%s) + 30 ))
 while [ "$(date +%s)" -lt "$deadline" ]; do
