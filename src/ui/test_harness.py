@@ -55,7 +55,8 @@ function serEl(e){
   if (e._classes.size) out += ' class="' + [...e._classes].join(" ") + '"';
   // 属性序列化（与真实 DOM 一致）：data-* 携带原始数据（data-tool-args），
   // hidden/open 反映折叠与可见状态——innerHTML 快照往返后都保留
-  const attrs = Object.keys(e._attrs).filter((k) => k.startsWith("data-")).sort();
+  const attrs = Object.keys(e._attrs).filter((k) => k.startsWith("data-")
+    || ["href", "src", "target", "rel", "loading", "alt"].includes(k)).sort();
   for (const k of attrs) out += ' ' + k + '="' + escHtml(e._attrs[k]) + '"';
   if (e.hidden) out += ' hidden=""';
   if (e.hasAttribute("open")) out += ' open=""';
@@ -1122,6 +1123,56 @@ async function main(){
           && elsById["sendBtn"].disabled && elsById["waitingInputError"].textContent.includes("仅支持一个问题"));
       console.log(fail===0 ? "ALL PASS" : fail+" FAILURES");
       imports.system.exit(0);
+    }
+
+    if (MODE === 'read-image') {
+      state.sessionId = "s1";
+      state.acc = newAccumulator();
+      const refs = [{ hash: "d/unsafe hash", mime: "image/png" }];
+      const longReceipt = "receipt-copy-" + "x".repeat(LONG_TEXT_THRESHOLD + 8);
+      const cards = () => elsById["messages"].querySelectorAll("details.tool-card");
+      const last = () => cards()[cards().length - 1];
+      const liveImage = (content, images, error) => {
+        const id = "read-image-focused";
+        applyLiveEvent("ToolCall", {name:"read_image", arguments:"{}", call_id:id});
+        applyLiveEvent("ToolResult", {call_id:id, content, images, is_error:!!error});
+        return last();
+      };
+      let histId = 0;
+      const histImage = (content, images, orphan) => {
+        const id = "hist-image-focused-" + (++histId), map = new Map();
+        if (!orphan) renderMessage({Assistant:{content:"", reasoning:null,
+          tool_calls:[{id, name:"read_image", arguments:"{}"}]}}, state.acc, map);
+        renderMessage({Tool:{call_id:id, name:"read_image", content, images, is_error:false}}, state.acc, map);
+        return last();
+      };
+      for (const [label, card] of [["live",liveImage("receipt",refs)],
+        ["history matched",histImage("receipt",refs,false)], ["history orphan",histImage("receipt",refs,true)]]) {
+        const result=card.querySelector(".tool-result"), img=result.querySelector("img.attached-image"), link=result.querySelector("a.attached-image-link");
+        chk(label+" image/ref and visible open card", !!img && !!link && card.hasAttribute("open")
+          && result.classList.contains("tool-image") && link.getAttribute("href")===img.getAttribute("src") && link.getAttribute("rel")==="noopener"
+          && img.getAttribute("src").includes("/api/images/d%2Funsafe%20hash?mime=image%2Fpng&token=test-token"));
+      }
+      const noImages=liveImage("legacy receipt");
+      chk("missing images preserve collapsed receipt", !noImages.hasAttribute("open") && !noImages.querySelector("img") && noImages.textContent.includes("legacy receipt"));
+      const longLegacy=liveImage(longReceipt);
+      chk("legacy long receipt expands on the original outer result", longLegacy.querySelector(".tool-result").classList.contains("expandable")
+        && !longLegacy.querySelector(".tool-image-receipt") && longLegacy.querySelector(".expand-full").textContent === longReceipt);
+      const oldHistory=histImage("legacy history receipt", undefined, false);
+      chk("missing history images keep receipt without preview", !oldHistory.querySelector("img") && oldHistory.textContent.includes("legacy history receipt"));
+      const failed=liveImage("error receipt",refs,true);
+      chk("error keeps text and suppresses images", !failed.querySelector("img") && failed.textContent.includes("error receipt"));
+      const ordinary=(()=>{appendToolCall("bash","{}",state.acc,null); const c=last(); appendToolResult(false,"ordinary receipt",state.acc,null); return c;})();
+      chk("ordinary tool remains collapsed/plain",!ordinary.hasAttribute("open")&&!ordinary.querySelector("img")&&ordinary.textContent.includes("ordinary receipt"));
+      const long=liveImage(longReceipt,refs), full=long.querySelector(".expand-full");
+      chk("long receipt remains fully copyable with image",!!full&&full.textContent===longReceipt&&!!long.querySelector("img.attached-image")&&long.querySelector(".copy-toggle")._srcText===longReceipt);
+      const snapshotHost=el("div"); snapshotHost.appendChild(long);
+      const snapshot=snapshotHost.innerHTML;
+      const restoredHost=el("div"); restoredHost.innerHTML=snapshot;
+      const restored=restoredHost.querySelector("details.tool-card");
+      chk("image/open/token URL survives innerHTML round-trip",restored.hasAttribute("open")
+        && !!restored.querySelector("img.attached-image")&&restored.querySelector("img.attached-image").getAttribute("src").includes("token=test-token"));
+      console.log(fail===0?"ALL PASS":""+fail+" FAILURES"); imports.system.exit(0);
     }
 
     openSession("s1");
@@ -3488,14 +3539,14 @@ async function main(){
         bgtBad.querySelector(".tool-result").querySelector(".task-empty") === null
         && resText(bgtBad) === "weird output",
         "text=" + JSON.stringify(resText(bgtBad)));
-    // read_image：结果保持纯文本摘要
+    // 旧 read_image 无图片字段：保持纯文字，不从文字摘要反推图片。
     for (const [path, c] of [
       ["live", liveToolResult("read_image", '{"path":"pics/cat.png"}', "一张猫的图片（1024x768）", false)],
       ["history", histToolResult("read_image", '{"path":"pics/cat.png"}', "一张猫的图片（1024x768）", false)],
     ]) {
       const r = c.querySelector(".tool-result");
-      chk("read_image result stays plain summary (" + path + ")",
-          r.tag === "pre" && resText(c).includes("一张猫的图片"),
+      chk("read_image legacy result stays text (" + path + ")",
+          !r.querySelector("img") && resText(c).includes("一张猫的图片"),
           "cls=" + resCls(c) + " text=" + JSON.stringify(resText(c)));
     }
     // data-tool-args：属性随 innerHTML 快照往返保留，cardArgs 优先读它
@@ -8919,7 +8970,8 @@ main();
    .replace("MODE === 'markdown'", 'true' if MODE == 'markdown' else 'false') \
    .replace("MODE === 'waiting-input'", 'true' if MODE == 'waiting-input' else 'false') \
    .replace("MODE === 'refresh-deep-link'", 'true' if MODE == 'refresh-deep-link' else 'false') \
-   .replace("MODE === 'fragment'", 'true' if MODE == 'fragment' else 'false')
+   .replace("MODE === 'fragment'", 'true' if MODE == 'fragment' else 'false') \
+   .replace("MODE === 'read-image'", 'true' if MODE == 'read-image' else 'false')
 
 # DEEP_LINK env → location.search 注入（init() 启动时 URL 解析入口）
 HARNESS = HARNESS.replace('globalThis.location={ pathname:', 'globalThis.__fragmentHarness=' + ('true' if MODE == 'fragment' else 'false') + '; globalThis.location={ pathname:')

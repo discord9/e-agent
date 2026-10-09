@@ -707,6 +707,8 @@ pub enum AgentEvent {
     ToolResult {
         is_error: bool,
         content: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImagePart>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         call_id: Option<String>,
     },
@@ -2320,6 +2322,7 @@ impl Agent {
                 self.emit(AgentEvent::ToolResult {
                     is_error,
                     content: content.clone(),
+                    images: images.clone(),
                     call_id: Some(call.id.clone()),
                 });
                 self.push_message(Message::Tool {

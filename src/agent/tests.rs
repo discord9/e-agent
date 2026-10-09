@@ -1307,6 +1307,7 @@ async fn emits_assistant_tool_and_result_events_in_order() {
             AgentEvent::ToolResult {
                 is_error: false,
                 content: "\"ok\"".into(),
+                images: vec![],
                 call_id: Some("call-1".into()),
             },
         ]
@@ -1333,6 +1334,7 @@ async fn emits_deltas_without_duplicate_assistant_text() {
             AgentEvent::ToolResult {
                 is_error: false,
                 content: "\"ok\"".into(),
+                images: vec![],
                 call_id: Some("call-1".into()),
             },
         ]
@@ -3500,6 +3502,7 @@ impl Model for ImageRoundModel {
 async fn run_loop_commits_image_bearing_tool_without_synthetic_user() {
     let temp = tempfile::tempdir().unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
+    let events = Arc::new(Mutex::new(Vec::new()));
     let mut agent = Agent::new(
         Box::new(ImageRoundModel {
             requests: requests.clone(),
@@ -3508,6 +3511,8 @@ async fn run_loop_commits_image_bearing_tool_without_synthetic_user() {
         }),
         vec![Box::new(ImageTool { workspace: temp })],
     );
+    let captured = events.clone();
+    agent.set_event_handler(Box::new(move |event| captured.lock().unwrap().push(event)));
     let answer = agent.run("describe".into()).await.unwrap();
     assert_eq!(answer, "final");
     let history = agent.history();
@@ -3529,6 +3534,10 @@ async fn run_loop_commits_image_bearing_tool_without_synthetic_user() {
     assert!(!tool.0.contains("fake-png"));
     assert_eq!(tool.1.len(), 1);
     assert_eq!(tool.1[0].mime, "image/png");
+    assert!(events.lock().unwrap().iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolResult { images, is_error: false, .. } if images == &tool.1
+    )));
     assert!(!history.iter().any(|entry| match entry {
         SessionEntry::Message {
             message: Message::User { content, .. },

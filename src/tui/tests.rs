@@ -1069,6 +1069,7 @@ fn attached_view_replays_snapshot_and_marks_finished_on_completion() {
     sink.emit(AgentEvent::ToolResult {
         is_error: false,
         content: "files".into(),
+        images: vec![],
         call_id: None,
     });
     attach_test(&mut state, 7, "demo task", handle);
@@ -3734,6 +3735,7 @@ fn scrolling_is_bounded_and_events_append_echo_lines() {
     state.push_agent_event(AgentEvent::ToolResult {
         is_error: false,
         content: "done".into(),
+        images: vec![],
         call_id: None,
     });
     assert_eq!(state.lines.last().unwrap().text, "  ok: done");
@@ -3745,6 +3747,7 @@ fn scrolling_is_bounded_and_events_append_echo_lines() {
     state.push_agent_event(AgentEvent::ToolResult {
         is_error: true,
         content: "failed".into(),
+        images: vec![],
         call_id: None,
     });
     assert_eq!(state.lines.last().unwrap().text, "  error: failed");
@@ -3796,6 +3799,7 @@ fn edit_file_tool_calls_render_as_a_numbered_diff_on_result() {
     state.push_agent_event(AgentEvent::ToolResult {
         is_error: false,
         content: "file edited (line 7)".into(),
+        images: vec![],
         call_id: None,
     });
     let lines: Vec<_> = state
