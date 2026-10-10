@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Stdlib security and lifecycle tests for multi_web."""
-import importlib.util, json, os, socket, subprocess, tempfile, unittest
+import importlib.util, json, os, socket, subprocess, tempfile, unittest, sys
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -151,7 +151,8 @@ class ReadinessAndRunTests(Base, unittest.TestCase):
             '--port', '19002', '--workspace', str((self.r / 'a dir').resolve()), '--profile', 'p', '--read-only'])
         self.assertEqual(child.proc.cwd, str((self.r / 'a dir').resolve()))
         self.assertFalse(child.proc.kw['shell'])
-        self.assertEqual(tuple(child.proc.kw[k] for k in ('stdin', 'stdout', 'stderr')), (subprocess.DEVNULL,) * 3)
+        self.assertEqual(tuple(child.proc.kw[k] for k in ('stdin', 'stdout', 'stderr')),
+                         (subprocess.DEVNULL, None, None))
         child.stop()
 
         port = free(); cfg = self.load(landing_port=port); made = []
@@ -172,6 +173,32 @@ class ReadinessAndRunTests(Base, unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'after children'): launcher.run()
         self.assertTrue(all(child.reaped for child in launcher.children))
         self.assertTrue(multi.port_is_free(port))
+
+    def test_sigterm_stops_only_launcher_owned_children(self):
+        import signal
+        landing, child_port = free(), free()
+        record, fake = self.r / 'child.pid', self.r / 'fake-server'
+        fake.write_text('#!/usr/bin/env python3\nimport os,sys\nfrom http.server import HTTPServer,BaseHTTPRequestHandler\nopen(%r,"w").write(str(os.getpid()))\nclass H(BaseHTTPRequestHandler):\n def do_GET(self): self.send_response(200); self.end_headers()\n def log_message(self,*a): pass\nHTTPServer(("127.0.0.1",int(sys.argv[sys.argv.index("--port")+1])),H).serve_forever()\n' % str(record))
+        fake.chmod(0o755)
+        path = self.r / 'launcher.json'; path.write_text(json.dumps(self.raw(command=str(fake), landing_port=landing, servers=[
+            {'id':'a','label':'A','cwd':'a dir','port':child_port,'enabled':True,'args':[]}])) )
+        proc = subprocess.Popen([sys.executable, str(Path(multi.__file__)), '--config', str(path)],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            import time
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and not record.exists(): time.sleep(.02)
+            if not record.exists():
+                _, stderr = proc.communicate(timeout=2)
+                self.fail('fake child did not start: %s' % stderr.decode())
+            child_pid = int(record.read_text())
+            proc.send_signal(signal.SIGTERM)
+            _, stderr = proc.communicate(timeout=8)
+            self.assertEqual(proc.returncode, 0, stderr.decode())
+            with self.assertRaises(ProcessLookupError): os.kill(child_pid, 0)
+            self.assertTrue(multi.port_is_free(landing)); self.assertTrue(multi.port_is_free(child_port))
+        finally:
+            if proc.poll() is None: proc.kill(); proc.wait()
 
     def test_primary_exit_before_browser_is_not_imported(self):
         cfg = self.load(open_browser=True); cfg['servers'][1]['enabled'] = True

@@ -1259,6 +1259,42 @@ down gracefully: SSE streams self-close on the shutdown signal and in-flight
 requests get a hard 2-second drain deadline before the process force-exits; a
 second Ctrl-C kills it outright.
 
+### Multi-workspace launcher (development)
+
+`scripts/multi_web.py` can launch several local web servers from a JSON config;
+`scripts/multi_web.example.json` is a development example, not a replacement for
+existing configs. The example's explicit `../target/debug/e-agent` command is
+resolved relative to the config file, so keep the example config under `scripts`
+or set an explicit debug-binary path (including `CARGO_TARGET_DIR` if used).
+Build it from the repository root with `cargo build --locked --bin e-agent`;
+the launcher does not build implicitly. Rust changes require a rebuild and
+launcher restart; for frontend changes, use the web UI's refresh action. The
+runtime still reads UI assets from the Rust source checkout, which must remain
+available. The example's landing port is 18765 to
+avoid common preview-port collisions, and browser opening is off by default in
+this development example; adjust both for your local use.
+
+For an optional per-user systemd service, edit
+`scripts/e-agent-multi-web.service.example` for your checkout and config, then
+install it with `install -Dm644 scripts/e-agent-multi-web.service.example
+"$HOME/.config/systemd/user/e-agent-multi-web.service"` and run
+`systemctl --user daemon-reload`; explicitly enable/start it only if desired.
+These are manual instructions, not launcher actions. It runs one foreground
+launcher, not a build or a supervisor for each web server. Children start
+sequentially; startup/runtime failures go to the journal, and unhealthy children
+are not automatically restarted. SIGTERM stops only children started by that
+launcher, with bounded per-child waits. `Restart=on-failure` applies only to
+the launcher process.
+
+The e-agent startup log includes its server token. The sample service inherits
+child output into the user journal; treat journal access as private and do not
+share logs containing startup output. This does not change HTTP logging or
+expose tokens through the launcher landing page. Existing servers are never
+adopted: before a planned cutover, arrange to stop the old instances and decide
+how to preserve their live sessions. Do not point a new launcher at occupied
+ports expecting it to take them over. Per-workspace session storage remains
+whatever each server's own configuration selects.
+
 A known limitation of `DELETE /api/sessions/{id}` (pre-existing, tracked
 separately): for a WaitForInput web session it can leave an idle runner
 behind. `cancel` is a *release* that parks a WaitForInput session at Idle,

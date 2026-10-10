@@ -1,0 +1,14 @@
+[Unit]
+Description=e-agent multi-web launcher (user service)
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/e-agent/scripts/multi_web.py --config %h/e-agent/.e-agent/multi_web.json
+Restart=on-failure
+KillMode=control-group
+TimeoutStopSec=120
+StandardInput=null
+UMask=0077
+
+[Install]
+WantedBy=default.target

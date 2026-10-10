@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -225,12 +226,14 @@ class Child:
         self.probe, self.clock, self.pause, self.reaped = probe, clock, pause, False
         if not port_is_free(spec["port"]):
             self.status = "failed"
+            print("multi-web: port %d is occupied; not starting %s" % (spec["port"], spec["id"]), file=sys.stderr, flush=True)
             return
         try:
             self.proc = popen(server_argv(config, spec), cwd=spec["cwd"], stdin=subprocess.DEVNULL,
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, shell=False)
-        except OSError:
+                              stdout=None, stderr=None, shell=False)
+        except OSError as exc:
             self.status = "failed"
+            print("multi-web: failed to start %s: %s" % (spec["id"], exc), file=sys.stderr, flush=True)
 
     def _reap_exited(self):
         if self.proc and not self.reaped:
@@ -243,17 +246,26 @@ class Child:
         deadline = self.clock() + STARTUP_SECONDS
         while not stop_requested() and self.clock() < deadline:
             if self.proc.poll() is not None:
-                self.status = "failed"; self._reap_exited(); return False
+                code = self.proc.poll()
+                self.status = "failed"; self._reap_exited()
+                print("multi-web: server %s exited during startup with status %s" %
+                      (self.spec["id"], code), file=sys.stderr, flush=True)
+                return False
             if self.probe(self.spec["port"]):
                 self.status = "ready"; return True
             self.pause(.05)
         self.status = "failed"
+        if not stop_requested():
+            print("multi-web: server %s did not become ready within %.0f seconds" %
+                  (self.spec["id"], STARTUP_SECONDS), file=sys.stderr, flush=True)
         self.stop()  # cancellation and timeout both fully reap before the next child.
         return False
 
     def update(self):
         if self.proc and self.status == "ready" and self.proc.poll() is not None:
+            code = self.proc.poll()
             self.status = "failed"; self._reap_exited()
+            print("multi-web: server %s exited with status %s" % (self.spec["id"], code), file=sys.stderr, flush=True)
 
     def stop(self):
         if not self.proc or self.reaped:
@@ -359,15 +371,17 @@ class Launcher:
             self.httpd.shutdown(); self.httpd.server_close(); self.httpd = None
 
     def run(self):
+        previous_sigterm = signal.signal(signal.SIGTERM, lambda _signum, _frame: setattr(self, "stopping", True))
         try:
             self.start()
-            while True:
+            while not self.stopping:
                 for child in self.children: child.update()
                 time.sleep(.2)
         except KeyboardInterrupt:
             pass
         finally:
             self.cleanup()
+            signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 def main(argv=None):
