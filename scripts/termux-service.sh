@@ -69,7 +69,15 @@ if [ "$fresh" -eq 1 ]; then
     echo 'Port 8766 is occupied or its state is uncertain; service installed but left down. Stop your old server, then run: sv-enable e-agent-web'
   else
     service-daemon start >/dev/null 2>&1 || true
-    for _ in 1 2 3 4 5; do [ -p "$service/supervise/ok" ] && break; sleep 1; done
+    ready=0
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+      if sv status "$service" >/dev/null 2>&1; then ready=1; break; fi
+      sleep 1
+    done
+    if [ "$ready" -ne 1 ]; then
+      echo 'Service supervisor is not ready; reopen Termux and run: sv up e-agent-web' >&2
+      exit 1
+    fi
     rm -f "$service/down"
     sv -w 5 up "$service" || { echo 'Service supervisor is not ready; reopen Termux and run: sv up e-agent-web' >&2; exit 1; }
   fi

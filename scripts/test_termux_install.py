@@ -93,10 +93,33 @@ shutil.copyfile(source,out)
         (self.fake / "curl").chmod(0o755)
         (self.fake / "uname").write_text("#!/bin/sh\necho aarch64\n")
         (self.fake / "uname").chmod(0o755)
-        for name in ("sv", "svlogd", "pkg", "am"):
+        for name in ("svlogd", "pkg", "am"):
             (self.fake / name).write_text("#!/bin/sh\necho \"$0 $*\" >> \"$SERVICE_LOG\"\n")
             (self.fake / name).chmod(0o755)
-        (self.fake / "service-daemon").write_text("#!/bin/sh\nmkdir -p \"$SVDIR/e-agent-web/supervise\"\n[ -p \"$SVDIR/e-agent-web/supervise/ok\" ] || mkfifo \"$SVDIR/e-agent-web/supervise/ok\"\n")
+        (self.fake / "sv").write_text('''#!/usr/bin/env python3
+import os, pathlib, sys
+args=sys.argv[1:]
+with open(os.environ['SERVICE_LOG'],'a') as f: f.write('sv '+ ' '.join(args)+'\\n')
+if args and args[0]=='status' and 'STATUS_READY_AFTER' in os.environ:
+ count=pathlib.Path(os.environ['STATUS_COUNT'])
+ n=int(count.read_text())+1 if count.exists() else 1
+ count.write_text(str(n))
+ down=pathlib.Path(args[1])/'down'
+ with open(os.environ['STATUS_LOG'],'a') as f: f.write(f'{n} down={down.exists()}\\n')
+ sys.exit(0 if n>=int(os.environ['STATUS_READY_AFTER']) else 1)
+if 'up' in args and 'STATUS_READY_AFTER' in os.environ:
+ count=pathlib.Path(os.environ['STATUS_COUNT'])
+ sys.exit(0 if count.exists() and int(count.read_text())>=int(os.environ['STATUS_READY_AFTER']) else 1)
+sys.exit(0)
+''')
+        (self.fake / "sv").chmod(0o755)
+        (self.fake / "sleep").write_text("#!/bin/sh\nexit 0\n")
+        (self.fake / "sleep").chmod(0o755)
+        (self.fake / "service-daemon").write_text('''#!/bin/sh
+mkdir -p "$SVDIR/e-agent-web/supervise"
+[ -p "$SVDIR/e-agent-web/supervise/ok" ] || mkfifo "$SVDIR/e-agent-web/supervise/ok"
+[ -z "$EXISTING_DAEMON" ]
+''')
         (self.fake / "service-daemon").chmod(0o755)
         env = os.environ.copy()
         env.update(PREFIX=str(self.prefix), HOME=str(self.home), ASSETS=str(self.root), CURL_LOG=str(self.root / "curl.log"), SERVICE_LOG=str(self.root / "service.log"), HTTPS_PROXY="http://proxy.fixture:8123", PATH=str(self.fake)+os.pathsep+env["PATH"])
@@ -301,6 +324,33 @@ shutil.copyfile(source,out)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Checksum verification failed: e-agent-stop.png", result.stderr)
         self.assertEqual(target.read_bytes(), b"old binary")
+
+    def test_existing_daemon_waits_for_status_before_enabling_service(self):
+        service = self.prefix / "var/service/e-agent-web"
+        self.env.update(EXISTING_DAEMON="1", STATUS_READY_AFTER="7",
+                        STATUS_COUNT=str(self.root / "status-count"), STATUS_LOG=str(self.root / "status.log"))
+        result = self.run_installer("--version", "vtest")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = (self.root / "status.log").read_text().splitlines()
+        self.assertEqual(len(lines), 7)
+        self.assertTrue(all("down=True" in line for line in lines))
+        self.assertFalse((service / "down").exists())
+        calls = (self.root / "service.log").read_text().splitlines()
+        status_index = max(i for i, line in enumerate(calls) if line.startswith("sv status "))
+        up_index = next(i for i, line in enumerate(calls) if line.startswith("sv -w 5 up "))
+        self.assertLess(status_index, up_index)
+
+    def test_existing_daemon_timeout_keeps_service_down_without_up(self):
+        service = self.prefix / "var/service/e-agent-web"
+        self.env.update(EXISTING_DAEMON="1", STATUS_READY_AFTER="99",
+                        STATUS_COUNT=str(self.root / "status-count"), STATUS_LOG=str(self.root / "status.log"))
+        result = self.run_installer("--version", "vtest")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Service supervisor is not ready", result.stderr)
+        self.assertTrue((service / "down").exists())
+        self.assertEqual(len((self.root / "status.log").read_text().splitlines()), 15)
+        calls = (self.root / "service.log").read_text().splitlines()
+        self.assertFalse(any(" up " in f" {line} " for line in calls))
 
     def test_uncertain_port_does_not_enable_service_or_start_shortcut(self):
         for code in (28, 56, 52, 7):
