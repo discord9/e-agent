@@ -1544,14 +1544,26 @@ async fn unsandboxed_background_shell_dies_with_parent() {
 async fn bash_timeout_kills_its_background_process_group() {
     let temp = tempfile::tempdir().unwrap();
     let pid_file = temp.path().join("child.pid");
+    // Exercise 300 ms of shell startup latency without host-wide load.
+    // The one-second fixture timeout leaves time for PID publication before cleanup.
+    use std::os::unix::fs::PermissionsExt;
+    let wrapper = temp.path().join("delayed-bash");
+    std::fs::write(
+        &wrapper,
+        "#!/bin/sh\n/bin/sleep 0.3\nexec /bin/bash \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut shell = Shell::detect().unwrap();
+    shell.executable = wrapper.to_string_lossy().into_owned();
     let tool = Bash {
         workspace: Workspace::new(temp.path()).unwrap(),
-        timeout: Some(Duration::from_millis(100)),
+        timeout: Some(Duration::from_secs(1)),
         sender: None,
         background: BackgroundTasks::new(Some(Duration::from_secs(30 * 60)), None),
         sandbox: None,
         protect_git: false,
-        shell: Shell::detect().unwrap(),
+        shell,
         owner_session: None,
     };
     assert!(
@@ -1561,10 +1573,12 @@ async fn bash_timeout_kills_its_background_process_group() {
             .contains("timed out")
     );
     let pid = std::fs::read_to_string(pid_file).unwrap();
+    let pid = pid.trim().parse::<u32>().expect("child PID is numeric");
+    assert!(pid > 0, "child PID must be nonzero");
     tokio::time::sleep(Duration::from_millis(50)).await;
     let status = std::process::Command::new("/bin/kill")
         .arg("-0")
-        .arg(pid.trim())
+        .arg(pid.to_string())
         .status()
         .unwrap();
     assert!(!status.success(), "background child survived timeout");
@@ -3924,11 +3938,14 @@ async fn background_bash_completion_carries_exit_trace() {
 #[tokio::test]
 async fn background_timeout_is_delivered_as_completion() {
     let temp = tempfile::tempdir().unwrap();
-    let (bash, mut receiver) = background_bash(&temp, Duration::from_millis(50));
-    bash.execute(json!({"command": "sleep 30 & echo $! > child.pid; wait", "background": true}))
-        .await
-        .unwrap();
-    let event = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+    let (bash, mut receiver) = background_bash(&temp, Duration::from_secs(1));
+    // Delay PID publication itself by 300 ms inside the registry's actual command.
+    bash.execute(
+        json!({"command": "sleep 0.3; sleep 30 & echo $! > child.pid; wait", "background": true}),
+    )
+    .await
+    .unwrap();
+    let event = tokio::time::timeout(Duration::from_secs(3), receiver.recv())
         .await
         .unwrap()
         .unwrap();
@@ -3941,11 +3958,13 @@ async fn background_timeout_is_delivered_as_completion() {
         } if output.contains("timed out")
     ));
     let pid = std::fs::read_to_string(temp.path().join("child.pid")).unwrap();
+    let pid = pid.trim().parse::<u32>().expect("child PID is numeric");
+    assert!(pid > 0, "child PID must be nonzero");
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(
         !std::process::Command::new("/bin/kill")
             .arg("-0")
-            .arg(pid.trim())
+            .arg(pid.to_string())
             .status()
             .unwrap()
             .success()

@@ -707,6 +707,8 @@ pub enum AgentEvent {
     ToolResult {
         is_error: bool,
         content: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImagePart>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         call_id: Option<String>,
     },
@@ -1038,6 +1040,7 @@ pub trait Model: Send {
     /// Bind a stable routing identity for requests belonging to one session.
     fn set_request_session_id(&mut self, _id: &str) {}
 
+    #[must_use = "model completion results must be handled"]
     async fn complete(
         &mut self,
         messages: &[Message],
@@ -1060,6 +1063,7 @@ pub trait Model: Send {
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
+    #[must_use = "tool execution results must be handled"]
     async fn execute(&self, arguments: Value) -> Result<ToolOutput, String>;
     fn set_event_sender(&mut self, _sender: mpsc::UnboundedSender<AgentEvent>) {}
     /// Bind this tool to the live session that owns the agent. Tools that
@@ -2320,6 +2324,7 @@ impl Agent {
                 self.emit(AgentEvent::ToolResult {
                     is_error,
                     content: content.clone(),
+                    images: images.clone(),
                     call_id: Some(call.id.clone()),
                 });
                 self.push_message(Message::Tool {

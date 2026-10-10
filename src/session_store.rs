@@ -3032,7 +3032,7 @@ fn jsonl_list_meta_diagnostic(
             }
         }
     }
-    out.sort_by(|a, b| b.last_active_at.cmp(&a.last_active_at));
+    out.sort_by_key(|a| std::cmp::Reverse(a.last_active_at));
     diagnostic.logical_rows = out.len();
     diagnostic.filesystem_parse_ms = started.elapsed().as_millis();
     Ok((out, diagnostic))

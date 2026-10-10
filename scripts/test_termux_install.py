@@ -33,8 +33,14 @@ class TermuxInstallTests(unittest.TestCase):
             tf.addfile(info, io.BytesIO(self.bin_payload))
         launcher = (ROOT / "termux-web.sh").read_bytes()
         (self.root / "termux-web.sh").write_bytes(launcher)
+        service_helper = (ROOT / "termux-service.sh").read_bytes()
+        (self.root / "termux-service.sh").write_bytes(service_helper)
+        stop_launcher = (ROOT / "termux-stop.sh").read_bytes()
+        (self.root / "termux-stop.sh").write_bytes(stop_launcher)
+        for name in ("e-agent-web.png", "e-agent-stop.png"):
+            (self.root / name).write_bytes((ROOT / "termux-icons" / name).read_bytes())
         sums = "".join(hashlib.sha256((self.root / f).read_bytes()).hexdigest() + "  " + f + "\n"
-                       for f in (archive.name, "termux-web.sh"))
+                       for f in (archive.name, "termux-web.sh", "termux-service.sh", "termux-stop.sh", "e-agent-web.png", "e-agent-stop.png"))
         (self.root / "SHA256SUMS").write_text(sums)
         self.releases = self.root / "releases"
         for tag, payload in (("vtest-old", self.bin_payload), ("vtest-new", b"new release payload\n")):
@@ -47,15 +53,23 @@ class TermuxInstallTests(unittest.TestCase):
                 info.size = len(payload)
                 tf.addfile(info, io.BytesIO(payload))
             (release / "termux-web.sh").write_bytes(launcher)
+            (release / "termux-service.sh").write_bytes(service_helper)
+            (release / "termux-stop.sh").write_bytes(stop_launcher)
+            for name in ("e-agent-web.png", "e-agent-stop.png"):
+                (release / name).write_bytes((ROOT / "termux-icons" / name).read_bytes())
             release_sums = "".join(hashlib.sha256((release / f).read_bytes()).hexdigest() + "  " + f + "\n"
-                                   for f in (archive.name, "termux-web.sh"))
+                                   for f in (archive.name, "termux-web.sh", "termux-service.sh", "termux-stop.sh", "e-agent-web.png", "e-agent-stop.png"))
             (release / "SHA256SUMS").write_text(release_sums)
         (self.fake / "curl").write_text('''#!/usr/bin/env python3
 import os,sys,shutil
 args=sys.argv[1:]
 urls=[a for a in args if a.startswith('https://')]
 with open(os.environ['CURL_LOG'],'a') as f: f.write(repr(args)+' proxy='+os.environ.get('HTTPS_PROXY','')+'\\n')
-if '--noproxy' in args: sys.exit('curl fake: installer must preserve external proxy settings')
+if '--noproxy' in args:
+ if os.environ.get('PORT_OCCUPIED'): sys.exit(0)
+ code=int(os.environ.get('PROBE_CODE','7'))
+ if code==7: print('Connection refused',file=sys.stderr)
+ sys.exit(code)
 if len(urls)!=1: sys.exit('curl fake: expected exactly one URL, got '+repr(urls))
 url=urls[0]
 if url!='https://github.com/discord9/e-agent/releases/latest' and not any(url.startswith('https://github.com/discord9/e-agent/releases/download/'+tag+'/') for tag in ('vtest','vtest-old','vtest-new')):
@@ -65,7 +79,7 @@ if url.endswith('/latest'):
  if '-w' in args: print(os.environ.get('LATEST_URL','https://github.com/discord9/e-agent/releases/tag/vtest'))
  sys.exit(0)
 name=url.rsplit('/',1)[-1]
-if name not in ('e-agent-aarch64-linux-android.tar.gz','SHA256SUMS','termux-web.sh'): sys.exit('curl fake: unexpected asset '+name)
+if name not in ('e-agent-aarch64-linux-android.tar.gz','SHA256SUMS','termux-web.sh','termux-service.sh','termux-stop.sh','e-agent-web.png','e-agent-stop.png'): sys.exit('curl fake: unexpected asset '+name)
 out=args[args.index('-o')+1] if '-o' in args else None
 if not out: sys.exit('curl fake: expected download output path')
 if os.environ.get('DOWNLOAD_FAIL')==name: sys.exit('simulated download failure '+name)
@@ -79,8 +93,36 @@ shutil.copyfile(source,out)
         (self.fake / "curl").chmod(0o755)
         (self.fake / "uname").write_text("#!/bin/sh\necho aarch64\n")
         (self.fake / "uname").chmod(0o755)
+        for name in ("svlogd", "pkg", "am"):
+            (self.fake / name).write_text("#!/bin/sh\necho \"$0 $*\" >> \"$SERVICE_LOG\"\n")
+            (self.fake / name).chmod(0o755)
+        (self.fake / "sv").write_text('''#!/usr/bin/env python3
+import os, pathlib, sys
+args=sys.argv[1:]
+with open(os.environ['SERVICE_LOG'],'a') as f: f.write('sv '+ ' '.join(args)+'\\n')
+if args and args[0]=='status' and 'STATUS_READY_AFTER' in os.environ:
+ count=pathlib.Path(os.environ['STATUS_COUNT'])
+ n=int(count.read_text())+1 if count.exists() else 1
+ count.write_text(str(n))
+ down=pathlib.Path(args[1])/'down'
+ with open(os.environ['STATUS_LOG'],'a') as f: f.write(f'{n} down={down.exists()}\\n')
+ sys.exit(0 if n>=int(os.environ['STATUS_READY_AFTER']) else 1)
+if 'up' in args and 'STATUS_READY_AFTER' in os.environ:
+ count=pathlib.Path(os.environ['STATUS_COUNT'])
+ sys.exit(0 if count.exists() and int(count.read_text())>=int(os.environ['STATUS_READY_AFTER']) else 1)
+sys.exit(0)
+''')
+        (self.fake / "sv").chmod(0o755)
+        (self.fake / "sleep").write_text("#!/bin/sh\nexit 0\n")
+        (self.fake / "sleep").chmod(0o755)
+        (self.fake / "service-daemon").write_text('''#!/bin/sh
+mkdir -p "$SVDIR/e-agent-web/supervise"
+[ -p "$SVDIR/e-agent-web/supervise/ok" ] || mkfifo "$SVDIR/e-agent-web/supervise/ok"
+[ -z "$EXISTING_DAEMON" ]
+''')
+        (self.fake / "service-daemon").chmod(0o755)
         env = os.environ.copy()
-        env.update(PREFIX=str(self.prefix), HOME=str(self.home), ASSETS=str(self.root), CURL_LOG=str(self.root / "curl.log"), HTTPS_PROXY="http://proxy.fixture:8123", PATH=str(self.fake)+os.pathsep+env["PATH"])
+        env.update(PREFIX=str(self.prefix), HOME=str(self.home), ASSETS=str(self.root), CURL_LOG=str(self.root / "curl.log"), SERVICE_LOG=str(self.root / "service.log"), HTTPS_PROXY="http://proxy.fixture:8123", PATH=str(self.fake)+os.pathsep+env["PATH"])
         self.env = env
 
     def run_installer(self, *args):
@@ -94,6 +136,7 @@ shutil.copyfile(source,out)
         shortcut = (self.home / ".shortcuts/e-agent-web").read_text()
         self.assertIn(str(self.prefix / "bin") + "/e-agent", shortcut)
         self.assertTrue((self.prefix / "bin/e").is_symlink())
+        self.assertIn("force-stop", (self.home / ".shortcuts/e-agent-stop").read_text())
 
     def test_latest_resolves_once_and_downloads_pinned_assets(self):
         env = self.env.copy(); env["LATEST_URL"] = "https://github.com/discord9/e-agent/releases/tag/vtest-new"
@@ -103,7 +146,7 @@ shutil.copyfile(source,out)
         self.assertEqual(list(self.prefix.glob("bin/.e-agent.*")), [])
         calls = (self.root / "curl.log").read_text().splitlines()
         self.assertEqual(sum("releases/latest" in line for line in calls), 1)
-        self.assertEqual(sum("/download/vtest-new/" in line for line in calls), 3)
+        self.assertEqual(sum("/download/vtest-new/" in line for line in calls), 7)
         self.assertFalse(any("/download/vtest/" in line for line in calls))
         self.assertIn("proxy=http://proxy.fixture:8123", "\\n".join(calls))
 
@@ -217,8 +260,130 @@ shutil.copyfile(source,out)
         result = self.run_installer("--version", "vtest"); self.assertNotEqual(result.returncode, 0)
 
     def refresh_sums(self):
-        names=("e-agent-aarch64-linux-android.tar.gz", "termux-web.sh")
+        names=("e-agent-aarch64-linux-android.tar.gz", "termux-web.sh", "termux-service.sh", "termux-stop.sh", "e-agent-web.png", "e-agent-stop.png")
         (self.root / "SHA256SUMS").write_text("".join(hashlib.sha256((self.root/n).read_bytes()).hexdigest()+"  "+n+"\n" for n in names))
+
+    def test_service_log_install_upgrade_and_user_edits(self):
+        result = self.run_installer("--version", "vtest")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        service = self.prefix / "var/service/e-agent-web"
+        logdir = self.prefix / "var/log/sv/e-agent-web"
+        self.assertIn('exec 2>&1', (service / "run").read_text())
+        self.assertIn('exec "$PREFIX/bin/e-agent" web', (service / "run").read_text())
+        self.assertIn('svlogd', (service / "log/run").read_text())
+        self.assertEqual((logdir / "config").read_text(), "s1048576\nn10\nt86400\n")
+        self.assertFalse((service / "down").exists())
+        self.assertIn('intent.action.CREATE_SHORTCUT', (self.root / "service.log").read_text())
+        (service / "run").write_text("custom run\n")
+        (logdir / "config").write_text("s2048\nn3\n")
+        (service / "down").touch()
+        result = self.run_installer("--version", "vtest")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((service / "run").read_text(), "custom run\n")
+        self.assertEqual((logdir / "config").read_text(), "s2048\nn3\n")
+        self.assertTrue((service / "down").exists())
+
+    def test_occupied_port_leaves_new_service_disabled(self):
+        self.env["PORT_OCCUPIED"] = "1"
+        result = self.run_installer("--version", "vtest")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.prefix / "var/service/e-agent-web/down").exists())
+        self.assertIn("left down", result.stdout)
+
+    def test_bad_service_helper_checksum_does_not_replace_binary(self):
+        target = self.prefix / "bin/e-agent"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"old binary")
+        (self.root / "termux-service.sh").write_bytes(b"corrupt")
+        result = self.run_installer("--version", "vtest")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Checksum verification failed: termux-service.sh", result.stderr)
+        self.assertEqual(target.read_bytes(), b"old binary")
+
+    def test_icons_install_preserve_custom_and_force_replace(self):
+        result = self.run_installer("--version", "vtest")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name in ("e-agent-web.png", "e-agent-stop.png"):
+            icon = self.home / ".shortcuts/icons" / name
+            self.assertEqual(icon.read_bytes(), (ROOT / "termux-icons" / name).read_bytes())
+            icon.write_bytes(b"custom icon")
+        result = self.run_installer("--version", "vtest")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(icon.read_bytes(), b"custom icon")
+        result = self.run_installer("--version", "vtest", "--force-shortcut")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name in ("e-agent-web.png", "e-agent-stop.png"):
+            self.assertEqual((self.home / ".shortcuts/icons" / name).read_bytes(), (ROOT / "termux-icons" / name).read_bytes())
+
+    def test_bad_icon_checksum_does_not_replace_binary(self):
+        target = self.prefix / "bin/e-agent"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"old binary")
+        (self.root / "e-agent-stop.png").write_bytes(b"corrupt")
+        result = self.run_installer("--version", "vtest")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Checksum verification failed: e-agent-stop.png", result.stderr)
+        self.assertEqual(target.read_bytes(), b"old binary")
+
+    def test_existing_daemon_waits_for_status_before_enabling_service(self):
+        service = self.prefix / "var/service/e-agent-web"
+        self.env.update(EXISTING_DAEMON="1", STATUS_READY_AFTER="7",
+                        STATUS_COUNT=str(self.root / "status-count"), STATUS_LOG=str(self.root / "status.log"))
+        result = self.run_installer("--version", "vtest")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = (self.root / "status.log").read_text().splitlines()
+        self.assertEqual(len(lines), 7)
+        self.assertTrue(all("down=True" in line for line in lines))
+        self.assertFalse((service / "down").exists())
+        calls = (self.root / "service.log").read_text().splitlines()
+        status_index = max(i for i, line in enumerate(calls) if line.startswith("sv status "))
+        up_index = next(i for i, line in enumerate(calls) if line.startswith("sv -w 5 up "))
+        self.assertLess(status_index, up_index)
+
+    def test_existing_daemon_timeout_keeps_service_down_without_up(self):
+        service = self.prefix / "var/service/e-agent-web"
+        self.env.update(EXISTING_DAEMON="1", STATUS_READY_AFTER="99",
+                        STATUS_COUNT=str(self.root / "status-count"), STATUS_LOG=str(self.root / "status.log"))
+        result = self.run_installer("--version", "vtest")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Service supervisor is not ready", result.stderr)
+        self.assertTrue((service / "down").exists())
+        self.assertEqual(len((self.root / "status.log").read_text().splitlines()), 15)
+        calls = (self.root / "service.log").read_text().splitlines()
+        self.assertFalse(any(" up " in f" {line} " for line in calls))
+
+    def test_uncertain_port_does_not_enable_service_or_start_shortcut(self):
+        for code in (28, 56, 52, 7):
+            with self.subTest(code=code):
+                self.env["PROBE_CODE"] = str(code)
+                # Code 7 without explicit refusal is also uncertain.
+                if code == 7:
+                    curl = self.fake / "curl"
+                    curl.write_text(curl.read_text().replace("print('Connection refused',file=sys.stderr)", "print('connect failed',file=sys.stderr)"))
+                service = self.prefix / "var/service/e-agent-web"
+                if service.exists():
+                    import shutil
+                    shutil.rmtree(service)
+                result = self.run_installer("--version", "vtest")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue((service / "down").exists())
+                started = subprocess.run(["bash", str(self.home / ".shortcuts/e-agent-web")], env=self.env, text=True, capture_output=True)
+                self.assertNotEqual(started.returncode, 0)
+                self.assertTrue((service / "down").exists())
+
+    def test_preserved_legacy_launcher_stop_does_not_claim_success(self):
+        shortcut = self.home / ".shortcuts/e-agent-web"
+        shortcut.parent.mkdir()
+        shortcut.write_text("#!/bin/sh\ne-agent web &\n")
+        self.env["PORT_OCCUPIED"] = "1"
+        result = self.run_installer("--version", "vtest")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("e-agent web &", shortcut.read_text())
+        result = subprocess.run(["bash", str(self.home / ".shortcuts/e-agent-stop")], env=self.env, text=True, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("old foreground launcher", result.stderr)
+        self.assertNotIn("e-agent stopped", result.stdout)
+        self.assertTrue((self.prefix / "var/service/e-agent-web/down").exists())
 
     def test_rejects_non_termux_and_non_arm(self):
         env = self.env.copy(); env.pop("PREFIX")

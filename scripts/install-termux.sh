@@ -29,18 +29,24 @@ stage=
 shortcut_stage=
 cleanup() { [ -z "$stage" ] || rm -f "$stage"; [ -z "$shortcut_stage" ] || rm -f "$shortcut_stage"; rm -rf "$tmp"; }
 trap cleanup EXIT
-for file in e-agent-aarch64-linux-android.tar.gz SHA256SUMS termux-web.sh; do curl -q -fsSL "$base/$file" -o "$tmp/$file" || { echo "Download failed: $file ($version)" >&2; exit 1; }; done
-for file in e-agent-aarch64-linux-android.tar.gz termux-web.sh; do
+for file in e-agent-aarch64-linux-android.tar.gz SHA256SUMS termux-web.sh termux-service.sh termux-stop.sh e-agent-web.png e-agent-stop.png; do curl -q -fsSL "$base/$file" -o "$tmp/$file" || { echo "Download failed: $file ($version)" >&2; exit 1; }; done
+for file in e-agent-aarch64-linux-android.tar.gz termux-web.sh termux-service.sh termux-stop.sh e-agent-web.png e-agent-stop.png; do
   expected=$(awk -v f="$file" '$2==f || $2=="*"f {print $1}' "$tmp/SHA256SUMS")
-  [ "$(printf '%s\n' "$expected" | wc -l | tr -d ' ')" = 1 ] && [ "${#expected}" = 64 ] || { echo "Missing or ambiguous checksum for $file" >&2; exit 1; }
+  if [ "$(printf '%s\n' "$expected" | wc -l | tr -d ' ')" != 1 ] || [ "${#expected}" != 64 ]; then
+    echo "Missing or ambiguous checksum for $file" >&2; exit 1
+  fi
   actual=$(sha256sum "$tmp/$file" | awk '{print $1}')
   [ "$actual" = "$expected" ] || { echo "Checksum verification failed: $file" >&2; exit 1; }
 done
 tar -tzf "$tmp/e-agent-aarch64-linux-android.tar.gz" > "$tmp/list"
-[ "$(wc -l < "$tmp/list" | tr -d ' ')" = 1 ] && [ "$(cat "$tmp/list")" = e-agent ] || { echo 'Archive must contain only the regular top-level file e-agent' >&2; exit 1; }
+if [ "$(wc -l < "$tmp/list" | tr -d ' ')" != 1 ] || [ "$(cat "$tmp/list")" != e-agent ]; then
+  echo 'Archive must contain only the regular top-level file e-agent' >&2; exit 1
+fi
 [ "$(tar -tvzf "$tmp/e-agent-aarch64-linux-android.tar.gz" | awk 'NR==1 {print substr($1,1,1)}')" = - ] || { echo 'Archive entry must be a regular file' >&2; exit 1; }
 shortcut_dir="$HOME/.shortcuts"
 shortcut="$shortcut_dir/e-agent-web"
+stop_shortcut="$shortcut_dir/e-agent-stop"
+[ ! -d "$stop_shortcut" ] || { echo "Shortcut path is a directory: $stop_shortcut" >&2; exit 1; }
 [ ! -d "$shortcut" ] || { echo "Shortcut path is a directory: $shortcut" >&2; exit 1; }
 sed "s|@PREFIX_BIN@|$PREFIX/bin|g" "$tmp/termux-web.sh" > "$tmp/shortcut"
 preserve_shortcut=0
@@ -73,9 +79,42 @@ else
   mv -fT "$shortcut_stage" "$shortcut"
   shortcut_stage=
 fi
+sed "s|@PREFIX_BIN@|$PREFIX/bin|g" "$tmp/termux-stop.sh" > "$tmp/stop-shortcut"
+if { [ -e "$stop_shortcut" ] || [ -L "$stop_shortcut" ]; } && [ "$force_shortcut" -ne 1 ] && ! cmp -s "$stop_shortcut" "$tmp/stop-shortcut"; then
+  echo "Note: preserving edited Widget shortcut: $stop_shortcut (use --force-shortcut to replace)"
+else
+  [ -d "$shortcut_dir" ] || mkdir -m 700 "$shortcut_dir"
+  shortcut_stage=$(mktemp "$shortcut_dir/.e-agent-stop.XXXXXX")
+  cp "$tmp/stop-shortcut" "$shortcut_stage"
+  chmod 700 "$shortcut_stage"
+  mv -fT "$shortcut_stage" "$stop_shortcut"
+  shortcut_stage=
+fi
+icon_dir="$shortcut_dir/icons"
+mkdir -p "$icon_dir"
+for name in e-agent-web e-agent-stop; do
+  icon="$icon_dir/$name.png"
+  if { [ -e "$icon" ] || [ -L "$icon" ]; } && [ "$force_shortcut" -ne 1 ] && ! cmp -s "$icon" "$tmp/$name.png"; then
+    echo "Note: preserving custom Widget icon: $icon (use --force-shortcut to replace)"
+  else
+    [ ! -d "$icon" ] || { echo "Icon path is a directory: $icon" >&2; exit 1; }
+    shortcut_stage=$(mktemp "$icon_dir/.$name.XXXXXX")
+    cp "$tmp/$name.png" "$shortcut_stage"
+    chmod 600 "$shortcut_stage"
+    mv -fT "$shortcut_stage" "$icon"
+    shortcut_stage=
+  fi
+done
+bash "$tmp/termux-service.sh"
 echo "Installed e-agent $version at $PREFIX/bin/e-agent"
 echo "Check the installed release with: $PREFIX/bin/e-agent --version"
-echo 'An already-running Web server is not upgraded in place; stop your old server and restart it using the installed release binary or its shortcut.'
-echo "Widget shortcut: $shortcut"
-echo 'Install Termux:Widget from the same source as Termux, add/refresh the e-agent-web shortcut, then open http://127.0.0.1:8766 and paste your existing token on first visit.'
+echo 'To activate an upgraded binary: sv restart e-agent-web (an old foreground server must be stopped first).'
+echo "Widget shortcuts: $shortcut (start), $stop_shortcut (stop)"
+echo 'Install Termux:Widget from the same source as Termux; the chooser below adds a one-icon desktop shortcut.'
+if command -v am >/dev/null; then
+  am start -a android.intent.action.CREATE_SHORTCUT -n com.termux.widget/.TermuxCreateShortcutActivity >/dev/null 2>&1 || echo 'Open the Termux:Widget shortcut chooser manually, or add/refresh its Widget list.'
+fi
+echo 'Add e-agent-web (start) and e-agent-stop (stop) through the Termux shortcut picker; allow desktop shortcut creation if Android asks.'
+echo 'Icons: green play = start/open, red square = stop. Remove and re-add existing desktop shortcuts if the launcher caches their old icons.'
+echo 'Paste your server token into the Web UI on first visit.'
 echo 'Configure a provider in ~/.config/e-agent/config.toml before using model features.'

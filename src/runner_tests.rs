@@ -11,6 +11,35 @@ use std::sync::{
 };
 use tokio::sync::Notify;
 
+#[test]
+fn entry_event_projects_tool_images_for_durable_replay() {
+    let images = vec![
+        crate::agent::ImagePart {
+            hash: "first".into(),
+            mime: "image/png".into(),
+        },
+        crate::agent::ImagePart {
+            hash: "second".into(),
+            mime: "image/jpeg".into(),
+        },
+    ];
+    let entry = SessionEntry::Message {
+        message: Message::Tool {
+            call_id: "call-image-replay".into(),
+            name: "read_image".into(),
+            content: "persisted image result".into(),
+            images: images.clone(),
+            is_error: false,
+            synthetic: false,
+        },
+    };
+    assert!(matches!(
+        entry_event(&entry),
+        Some(AgentEvent::ToolResult { is_error: false, content, images: projected, call_id: Some(call_id) })
+            if content == "persisted image result" && call_id == "call-image-replay" && projected == images
+    ));
+}
+
 struct IdentityCaptureModel(Arc<Mutex<Option<String>>>);
 
 #[async_trait]
@@ -4393,6 +4422,10 @@ async fn runner_commits_image_bearing_tool_and_strips_requests_without_vision() 
             mime: "image/png".into(),
         }]
     );
+    assert!(handle.snapshot().iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolResult { images, is_error: false, .. } if images == &tool.1
+    )));
     // No synthetic user message ever.
     assert!(!loaded.entries.iter().any(|entry| match entry {
         SessionEntry::Message {
@@ -7505,6 +7538,234 @@ async fn history_runner_binds_only_its_current_session() {
             .iter()
             .any(|entry| entry["entry"]["text"] == "other-only")
     );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn history_runner_global_search_attach_and_cancel_while_sqlite_read_pending() {
+    assert_read_only_runner_cancel_while_sqlite_read_pending(false).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn read_output_runner_attach_and_cancel_while_sqlite_read_pending() {
+    assert_read_only_runner_cancel_while_sqlite_read_pending(true).await;
+}
+
+#[cfg(feature = "sqlite")]
+async fn assert_read_only_runner_cancel_while_sqlite_read_pending(read_output: bool) {
+    let temp = tempfile::tempdir().unwrap();
+    let session_id = format!("read-only-pending-{}", crate::session::new_id());
+    let store = SessionStore::connect(
+        &crate::config::SessionBackend::Sqlite { path: None },
+        temp.path(),
+        &session_id,
+    )
+    .await
+    .unwrap();
+    let (arguments, name) = if read_output {
+        store
+            .append(
+                temp.path(),
+                &session_id,
+                &[SessionEntry::Notice {
+                    text: "persisted output target".into(),
+                }],
+            )
+            .await
+            .unwrap();
+        let loaded = store.load_located(temp.path(), &session_id).await.unwrap();
+        let location = loaded.locations.last().unwrap().as_ref().unwrap();
+        (serde_json::json!({
+            "ref": crate::output_receipt::issue_direct(location, crate::output_receipt::FieldId::NoticeText),
+            "limit": 100,
+        }).to_string(), "read_output")
+    } else {
+        store
+            .append(
+                temp.path(),
+                &session_id,
+                &[SessionEntry::Notice {
+                    text: "global needle target".into(),
+                }],
+            )
+            .await
+            .unwrap();
+        (
+            serde_json::json!({
+                "action": "search", "scope": "global", "query": "needle", "limit": 20
+            })
+            .to_string(),
+            "history",
+        )
+    };
+    let agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: VecDeque::from(vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "pending-read".into(),
+                        name: name.into(),
+                        arguments: arguments.clone(),
+                    }],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "keep-alive".into(),
+                        name: "keep_alive".into(),
+                        arguments: "{}".into(),
+                    }],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("resumed".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+            ]),
+        }),
+        vec![
+            Box::new(crate::tools::history::History),
+            Box::new(crate::tools::output::ReadOutput),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    let (mut runner, handle) = SessionRunner::new(
+        agent,
+        store.clone(),
+        temp.path().into(),
+        session_id.clone(),
+        IdlePolicy::WaitForInput,
+    );
+    let SessionStore::Sqlite { session, .. } = &store else {
+        unreachable!()
+    };
+    let sqlite = session.clone();
+    let held = Arc::new(std::sync::Mutex::new(None));
+    let held_hook = held.clone();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let entered_tx = Arc::new(std::sync::Mutex::new(Some(entered_tx)));
+    runner.before_read_only_tool = Some(Box::new(move || {
+        *held_hook.lock().unwrap() = Some(sqlite.clone().try_lock_owned().unwrap());
+        entered_tx.lock().unwrap().take().unwrap().send(()).unwrap();
+    }));
+    let mut task = runner.start(Some("run pending read".into()));
+    tokio::time::timeout(std::time::Duration::from_secs(2), entered_rx)
+        .await
+        .expect("read-only tool hook was not reached")
+        .unwrap();
+
+    let mut attach = tokio::time::timeout(std::time::Duration::from_secs(1), handle.web_attach())
+        .await
+        .unwrap()
+        .unwrap();
+    let expected_name = if read_output {
+        "read_output"
+    } else {
+        "history"
+    };
+    assert!(attach.entries.iter().any(|entry| matches!(
+        entry, SessionEntry::Message { message: Message::Assistant(message) }
+            if message.tool_calls.iter().any(|call| call.name == expected_name)
+    )));
+    handle.cancel();
+    let cancel_wait = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if matches!(attach.live.recv().await.unwrap(), AgentEvent::Display(ref text) if text == "turn cancelled") {
+                break;
+            }
+        }
+        let mut status = handle.status();
+        loop {
+            if *status.borrow() == SessionStatus::Idle {
+                break;
+            }
+            status.changed().await.unwrap();
+        }
+    }).await;
+    assert!(
+        cancel_wait.is_ok(),
+        "cancel observation timed out: status={:?}, snapshot={:?}",
+        handle.status().borrow().clone(),
+        handle.snapshot()
+    );
+    assert!(!handle.snapshot().iter().any(|event| matches!(
+        event, AgentEvent::ToolResult { call_id: Some(id), .. } if id == "pending-read"
+    )));
+    drop(held.lock().unwrap().take());
+    handle.prompt("resume after cancel");
+    let mut saw_prompt = false;
+    let mut saw_answer = false;
+    for _ in 0..16 {
+        match tokio::time::timeout(std::time::Duration::from_secs(2), attach.live.recv())
+            .await
+            .expect("runner emitted no event after the queued prompt")
+            .unwrap()
+        {
+            AgentEvent::UserPrompt(text) if text == "resume after cancel" => saw_prompt = true,
+            AgentEvent::AssistantText(text) if text == "resumed" => saw_answer = true,
+            AgentEvent::Error(error) => panic!("runner failed after cancel: {error}"),
+            _ => {}
+        }
+        if saw_prompt && saw_answer {
+            break;
+        }
+    }
+    assert!(
+        saw_prompt && saw_answer,
+        "runner did not resume after releasing SQLite lock"
+    );
+    assert!(handle.snapshot().iter().any(|event| matches!(event,
+        AgentEvent::AssistantText(text) if text == "resumed"
+    )));
+    let loaded = store.load(temp.path(), &session_id).await.unwrap();
+    let count = |predicate: &dyn Fn(&SessionEntry) -> bool| {
+        loaded
+            .entries
+            .iter()
+            .filter(|entry| predicate(entry))
+            .count()
+    };
+    assert_eq!(
+        count(&|entry| matches!(entry,
+            SessionEntry::Message { message: Message::User { content, .. } } if content == "run pending read"
+        )),
+        1
+    );
+    assert_eq!(
+        count(&|entry| matches!(entry,
+            SessionEntry::Message { message: Message::User { content, .. } } if content == "resume after cancel"
+        )),
+        1
+    );
+    let target = if read_output {
+        "persisted output target"
+    } else {
+        "global needle target"
+    };
+    assert_eq!(
+        count(&|entry| matches!(entry,
+            SessionEntry::Notice { text } if text == target
+        )),
+        1
+    );
+    assert_eq!(
+        count(&|entry| matches!(entry,
+            SessionEntry::Message { message: Message::Assistant(message) }
+                if message.tool_calls.iter().any(|call| call.id == "pending-read"
+                    && call.name == expected_name && call.arguments == arguments)
+        )),
+        1
+    );
+    assert!(!loaded.entries.iter().any(|entry| matches!(entry,
+        SessionEntry::Message { message: Message::Tool { call_id, .. } } if call_id == "pending-read"
+    )));
+    drop(attach);
+    drop(handle);
+    task.abort();
 }
 
 /// The originally failing call shape reaches the model→tool→model loop: a

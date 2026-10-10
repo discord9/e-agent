@@ -2830,17 +2830,16 @@ fn spawn_summary_listener(state: Arc<AppState>, id: String, session: Arc<LiveSes
                             // turn 起点基线：只有该 turn 新增的实质事件才触发总结
                             baseline = substantive;
                         }
-                        SessionStatus::Idle => {
-                            if substantive > baseline {
-                                baseline = substantive;
-                                generate_summary(
-                                    &state,
-                                    &id,
-                                    &digest_recent(&recent, SUMMARY_MAX_EVENTS),
-                                )
-                                .await;
-                            }
+                        SessionStatus::Idle if substantive > baseline => {
+                            baseline = substantive;
+                            generate_summary(
+                                &state,
+                                &id,
+                                &digest_recent(&recent, SUMMARY_MAX_EVENTS),
+                            )
+                            .await;
                         }
+                        SessionStatus::Idle => {}
                         _ => {} // Compacting / Finished：不是 turn，不触发
                     }
                 }
@@ -3560,9 +3559,14 @@ fn event_payload(event: &AgentEvent) -> serde_json::Value {
         AgentEvent::ToolResult {
             is_error,
             content,
+            images,
             call_id,
         } => {
-            json!({ "is_error": is_error, "content": content, "call_id": call_id })
+            if images.is_empty() {
+                json!({ "is_error": is_error, "content": content, "call_id": call_id })
+            } else {
+                json!({ "is_error": is_error, "content": content, "call_id": call_id, "images": images })
+            }
         }
         AgentEvent::BackgroundCompleted {
             id,
@@ -4393,10 +4397,27 @@ mod tests {
         let some_result = serde_json::to_value(AgentEvent::ToolResult {
             is_error: false,
             content: "ok".into(),
+            images: vec![],
             call_id: Some("call-2".into()),
         })
         .unwrap();
         assert_eq!(some_result["data"]["call_id"], "call-2");
+        assert!(some_result["data"].get("images").is_none());
+        let image_result = serde_json::to_value(AgentEvent::ToolResult {
+            is_error: false,
+            content: "image result".into(),
+            images: vec![crate::agent::ImagePart {
+                hash: "abc".into(),
+                mime: "image/png".into(),
+            }],
+            call_id: Some("call-image".into()),
+        })
+        .unwrap();
+        assert_eq!(image_result["data"]["is_error"], false);
+        assert_eq!(image_result["data"]["content"], "image result");
+        assert_eq!(image_result["data"]["call_id"], "call-image");
+        assert_eq!(image_result["data"]["images"][0]["hash"], "abc");
+        assert_eq!(image_result["data"]["images"][0]["mime"], "image/png");
         assert_eq!(
             serde_json::to_value(AgentEvent::Notice("hi".into())).unwrap(),
             serde_json::json!({"type": "notice", "data": "hi"})
@@ -4439,6 +4460,7 @@ mod tests {
             name(&AgentEvent::ToolResult {
                 is_error: false,
                 content: "o".into(),
+                images: vec![],
                 call_id: None,
             }),
             "ToolResult"
@@ -4525,9 +4547,22 @@ mod tests {
             event_payload(&AgentEvent::ToolResult {
                 is_error: true,
                 content: "boom".into(),
+                images: vec![],
                 call_id: None,
             }),
             json!({"is_error": true, "content": "boom", "call_id": null})
+        );
+        assert_eq!(
+            event_payload(&AgentEvent::ToolResult {
+                is_error: false,
+                content: "image result".into(),
+                images: vec![crate::agent::ImagePart {
+                    hash: "abc".into(),
+                    mime: "image/png".into()
+                }],
+                call_id: Some("c".into()),
+            }),
+            json!({"is_error": false, "content": "image result", "call_id": "c", "images": [{"hash": "abc", "mime": "image/png"}]})
         );
         assert_eq!(
             event_payload(&AgentEvent::Notice("hi".into())),
@@ -4608,6 +4643,7 @@ mod tests {
             AgentEvent::ToolResult {
                 is_error: false,
                 content: "ok".into(),
+                images: vec![],
                 call_id: None,
             },
             AgentEvent::ReasoningDelta("思考".into()),
@@ -8885,6 +8921,7 @@ model = "deepseek-chat"
                 AgentEvent::ToolResult {
                     is_error: true,
                     content: "no".into(),
+                    images: vec![],
                     call_id: None,
                 },
                 "ToolResult",

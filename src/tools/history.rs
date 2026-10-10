@@ -368,7 +368,7 @@ fn ordered_entries(entries: &[(i64, SessionEntry)]) -> Vec<(i64, &SessionEntry)>
         .iter()
         .map(|(seq, entry)| (*seq, entry))
         .collect::<Vec<_>>();
-    out.sort_by(|a, b| b.0.cmp(&a.0));
+    out.sort_by_key(|a| std::cmp::Reverse(a.0));
     out
 }
 /// Searchable text projection: User content, Assistant content plus every

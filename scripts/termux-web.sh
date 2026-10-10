@@ -3,17 +3,19 @@ set -eu
 BIN='@PREFIX_BIN@/e-agent'
 [ -x "$BIN" ] || { echo "e-agent not installed at $BIN; run the Termux installer first" >&2; exit 1; }
 : "${HOME:?HOME is unset}"
-WORKSPACE=${E_AGENT_WORKSPACE:-"$HOME/e-agent-workspace"}
+export PREFIX="${BIN%/bin/e-agent}"
+export SVDIR="$PREFIX/var/service" LOGDIR="$PREFIX/var/log"
+service="$SVDIR/e-agent-web"
 URL=http://127.0.0.1:8766
 state=${XDG_STATE_HOME:-"$HOME/.local/state"}/e-agent/server.token
 owned() {
   [ -r "$state" ] || return 1
   token=$(cat "$state") || return 1
   [ -n "$token" ] || return 1
-  curl -q --noproxy '*' -fsS --max-time 2 "$URL/" -o "$probe_root" 2>/dev/null || return 1
-  grep -F '<title>e-agent · Web UI</title>' "$probe_root" >/dev/null || return 1
-  printf 'header = "Authorization: Bearer %s"\n' "$token" | curl -q --noproxy '*' --config - -fsS --max-time 2 "$URL/api/models" -o "$probe_models" 2>/dev/null || return 1
-  case "$(cat "$probe_models")" in \[*\]) return 0;; *) return 1;; esac
+  curl -q --noproxy '*' -fsS --max-time 2 "$URL/" -o "$tmp/root" 2>/dev/null || return 1
+  grep -F '<title>e-agent · Web UI</title>' "$tmp/root" >/dev/null || return 1
+  printf 'header = "Authorization: Bearer %s"\n' "$token" | curl -q --noproxy '*' --config - -fsS --max-time 2 "$URL/api/models" -o "$tmp/models" 2>/dev/null || return 1
+  case "$(cat "$tmp/models")" in \[*\]) return 0;; *) return 1;; esac
 }
 open_ui() {
   if command -v termux-open-url >/dev/null 2>&1; then termux-open-url "$URL" || echo "Open $URL manually" >&2
@@ -21,45 +23,25 @@ open_ui() {
   else echo "Open $URL in your browser"; fi
 }
 tmp=$(mktemp -d "${TMPDIR:-$HOME}/e-agent-web.XXXXXX")
-pid=
-# shellcheck disable=SC2329
-cleanup() {
-  status=$?
-  if [ -n "$pid" ]; then
-    kill -0 "$pid" 2>/dev/null && kill -INT "$pid" 2>/dev/null || true
-    for _ in 1 2 3; do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
-    kill -0 "$pid" 2>/dev/null && kill "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
-    pid=
-  fi
-  rm -rf "$tmp"
-  exit "$status"
-}
-trap 'cleanup' EXIT
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 143' TERM
-probe_root=$tmp/root
-probe_models=$tmp/models
+trap 'rm -rf "$tmp"' EXIT
 if owned; then open_ui; exit 0; fi
-if curl -q --noproxy '*' -sS --max-time 2 "$URL/" -o "$tmp/occupied" 2>/dev/null; then echo "Port 8766 is occupied by a service that is not an authenticated e-agent; refusing to open it." >&2; exit 1; fi
-if [ ! -d "$WORKSPACE" ]; then mkdir -p "$WORKSPACE"; chmod 700 "$WORKSPACE"; fi
-"$BIN" web --host 127.0.0.1 --port 8766 --workspace "$WORKSPACE" &
-pid=$!
-ready=0
+probe=0
+LC_ALL=C curl -q --noproxy '*' --verbose --max-time 2 http://127.0.0.1:8766/ -o /dev/null 2> "$tmp/port-error" || probe=$?
+  # Only an explicit TCP connection refusal proves there is no listener.
+  if [ "$probe" -ne 7 ] || ! grep -F 'Connection refused' "$tmp/port-error" >/dev/null; then
+  echo 'Port 8766 is occupied or uncertain and is not an authenticated e-agent; refusing to start or open it.' >&2; exit 1
+fi
+if [ ! -x "$service/run" ] || ! command -v sv >/dev/null; then
+  echo 'Re-run the Termux installer to configure the e-agent-web service.' >&2; exit 1
+fi
+service-daemon start >/dev/null 2>&1 || true
+for _ in 1 2 3 4 5; do [ -p "$service/supervise/ok" ] && break; sleep 1; done
+rm -f "$service/down"
+sv -w 5 up "$service"
 deadline=$(( $(date +%s) + 30 ))
 while [ "$(date +%s)" -lt "$deadline" ]; do
-  if ! kill -0 "$pid" 2>/dev/null; then echo 'e-agent web exited before becoming ready; check its configuration and startup output.' >&2; exit 1; fi
-  if owned; then
-    if ! kill -0 "$pid" 2>/dev/null; then echo 'e-agent web exited during readiness check.' >&2; exit 1; fi
-    ready=1; break
-  fi
+  if owned; then open_ui; exit 0; fi
   sleep 1
 done
-[ "$ready" -eq 1 ] || { echo 'e-agent did not become ready within approximately 30 seconds on 127.0.0.1:8766.' >&2; exit 1; }
-echo "e-agent web is ready at $URL (workspace: $WORKSPACE); leave this running in Termux, or press Ctrl-C to stop it."
-(open_ui) &
-status=0
-wait "$pid" || status=$?
-pid=
-exit "$status"
+echo "e-agent did not become ready within approximately 30 seconds. Check sv status e-agent-web and $LOGDIR/sv/e-agent-web/current." >&2
+exit 1

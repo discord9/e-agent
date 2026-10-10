@@ -612,7 +612,7 @@ function applyLiveEvent(name, payload) {
       let content = p.content;
       if (content && typeof content === "object") content = JSON.stringify(content);
       else content = pickText(p, ["content", "text", "result", "error"]);
-      appendToolResult(isErr, content, acc, p.call_id);
+      appendToolResult(isErr, content, acc, p.call_id, p.images);
       break;
     }
     case "Display":
