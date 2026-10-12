@@ -6,6 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use super::*;
+use crate::tools::bash::DO_NOT_WAIT_LINE;
 
 fn web_search(endpoint: String) -> WebSearch {
     WebSearch::for_test("test-api-key".into(), endpoint, Duration::from_secs(1))
@@ -4160,7 +4161,10 @@ async fn background_title_labels_task_but_keeps_full_command() {
         .content;
     assert_eq!(
         started,
-        format!("started background task 1: {normalized_title}")
+        format!(
+            "started background task 1: {normalized_title}\n{}",
+            DO_NOT_WAIT_LINE
+        )
     );
 
     let running = background.running();
@@ -4211,7 +4215,8 @@ async fn background_title_blank_falls_back_and_foreground_is_ignored() {
         .await
         .unwrap()
         .content;
-    assert_eq!(started, "started background task 1: sleep 30");
+    assert!(started.starts_with("started background task 1: sleep 30\n"));
+    assert!(started.ends_with(DO_NOT_WAIT_LINE), "{started}");
     assert_eq!(bash.background.running()[0].label, "sleep 30");
     assert_eq!(
         bash.background
@@ -4875,6 +4880,8 @@ async fn completion_delivery_available_requires_an_open_receiver() {
             || async { "done".into() },
         )
         .unwrap();
+    // spawn_with_id is the raw registry receipt (also reused by delegate/
+    // detached); the do-not-wait line is appended only by Bash::execute.
     assert_eq!(started, "started background task 1: starts now");
     assert!(matches!(
         receiver.recv().await,

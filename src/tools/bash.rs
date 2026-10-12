@@ -89,6 +89,10 @@ pub(super) struct Bash {
     pub(super) owner_session: Option<String>,
 }
 
+/// The do-not-wait reminder appended to every non-detached background bash
+/// receipt. Test-visible so exact-equality assertions share one source.
+pub(crate) const DO_NOT_WAIT_LINE: &str = "Do not wait for it: no sleep, no polling, no re-checks. The completion is delivered automatically as [background task completed] injected into this conversation; continue other work or end your turn now.";
+
 #[async_trait]
 impl Tool for Bash {
     fn spec(&self) -> ToolSpec {
@@ -233,7 +237,13 @@ impl Tool for Bash {
                     self.owner_session.clone(),
                     title,
                 )
-                .map(ToolOutput::text);
+                .map(|receipt| {
+                    // The tool schema says this, but the receipt is what the
+                    // model reads at the moment it decides what to do next:
+                    // repeat the do-not-wait contract here so a background
+                    // task is not followed by sleep/poll busywork.
+                    ToolOutput::text(format!("{receipt}\n{DO_NOT_WAIT_LINE}"))
+                });
         }
         run_bash(
             &self.shell,
