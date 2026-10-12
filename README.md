@@ -35,6 +35,21 @@ cargo run -- --workspace /path/to/workspace web                                 
 With no prompt, `cargo run -- --workspace /path/to/workspace` opens the terminal
 UI when stdout is a terminal.
 
+This checkout pins Rust 1.99.0 in `rust-toolchain.toml`, which rustup installs
+and applies automatically to the `cargo` commands above. Rust 1.101 nightly is
+incompatible with the default `sqlite` feature: `branches` 0.4.5 (pulled in by
+`turso_core` 0.7.2) selects `core::intrinsics::abort`, removed in that
+nightly, so the build there fails to compile; 1.99.0 stable compiles it. An
+explicit toolchain overrides the pinned file: the `RUSTUP_TOOLCHAIN`
+environment variable and `cargo +<toolchain>` both take precedence over
+`rust-toolchain.toml`. Check or force it with:
+
+```sh
+unset RUSTUP_TOOLCHAIN             # if an inherited override is active
+rustup show active-toolchain       # expect 1.99.0-...
+cargo +1.99.0 build --release --locked
+```
+
 ### Android / Termux (ARM64)
 
 The Android/Termux ARM64 release installer uses
