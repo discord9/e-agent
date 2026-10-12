@@ -991,7 +991,11 @@ exact session ID and a child targets only `parent`. The receipt means queued,
 not delivered. Endpoints and unconsumed queues are process-local and are not
 durable or recoverable after restart; only a successfully committed Notice
 survives replay, and replay never wakes a model turn. Messages cannot target
-siblings, other main sessions, or finished sessions. Hard abort/restart, or a
+siblings, other main sessions, or finished sessions — a finished child is no
+longer live; continue it with the `delegate` tool (`resume` its session id
+with a fresh `task`, plus the original `role`/`workspace` if the task used
+them). The `send_message` error message says the same when a target is not a
+live child. Hard abort/restart, or a
 persistence/consumption failure, can discard an accepted queued body; there is
 no retry.
 

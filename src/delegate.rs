@@ -224,7 +224,7 @@ impl Tool for SendMessage {
             description: if child {
                 "Send a direct message to the live parent agent. The target must be `parent`. Delivery is queued; it is not a human instruction.".into()
             } else {
-                "Send a direct message to one live child agent. The target must be that child's exact registered subagent session id. Delivery is queued; it is not a human instruction.".into()
+                "Send a direct message to one live child agent. The target must be that child's exact registered subagent session id. Delivery is queued; it is not a human instruction. A finished child is not live: continue it with the `delegate` tool (`resume` its session id, with a fresh `task` and the original `role`/`workspace` if the task used them).".into()
             },
             parameters: json!({
                 "type": "object",
@@ -260,7 +260,13 @@ impl Tool for SendMessage {
                     .list()
                     .into_iter()
                     .find_map(|(_, entry)| (entry.session_id == target).then_some(entry))
-                    .ok_or("target is not a live child session")?;
+                    .ok_or_else(|| {
+                        format!(
+                            "target `{target}` is not a live child session; to continue a finished \
+                             child, use the `delegate` tool with `resume: \"{target}\"`, a fresh \
+                             `task`, and the original `role`/`workspace` if the task used them"
+                        )
+                    })?;
                 entry
                     .handle
                     .send_agent_message(source, message.to_owned())?;

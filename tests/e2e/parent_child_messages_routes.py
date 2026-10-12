@@ -90,7 +90,9 @@ def tool_result(request, call_id):
 
 def error_receipt(request, call_id):
     values = tool_result(request, call_id)
-    assert len(values) == 1 and values[0] == "ERROR: target is not a live child session", (call_id, values)
+    assert len(values) == 1 and "is not a live child session" in values[0], (call_id, values)
+    # The refusal must teach the model the explicit resume path.
+    assert "delegate" in values[0] and "resume" in values[0], (call_id, values)
 
 
 def delegate_id(request, call_id):
@@ -370,7 +372,8 @@ try:
     for call_id in ("reject-unknown", "reject-sibling", "reject-finished"):
         receipts = [entry["message"]["Tool"]["content"] for entry in rejection_history
                     if entry.get("message", {}).get("Tool", {}).get("call_id") == call_id]
-        assert receipts == ["target is not a live child session"], (call_id, receipts)
+        assert len(receipts) == 1 and "is not a live child session" in receipts[0], (call_id, receipts)
+        assert "delegate" in receipts[0] and "resume" in receipts[0], (call_id, receipts)
 
     # Inspect the actual /btw route: it accepts a live main parent (201), but not a subagent (409).
     btw = api("POST", f"/api/sessions/{MAIN_A}/btw", {"prompt": "BTW_START"}, 201)["id"]
