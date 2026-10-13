@@ -1639,6 +1639,12 @@ GREPTIME_PG="host=127.0.0.1 port=4002 dbname=public" cargo test --features grept
 Without `GREPTIME_PG` the integration tests skip with a message.
 ## Non-goals
 
+The proposed [quick command approval RFC](docs/command-auto-review-rfc.md) is
+not implemented. Its scope is opt-in review of local shell calls, without
+sandbox escalation, persistent allow rules, or approval coverage for file,
+`run_rust`, MCP, and web tools. It does not introduce a permission framework
+or promise complete execution isolation.
+
 Termux service setup does not install APKs, bypass Android permission prompts,
 configure ADB, or promise survival of Android process killing or phone reboot.
 
