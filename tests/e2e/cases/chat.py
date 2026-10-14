@@ -451,9 +451,9 @@ async def run_waiting_input(c):
     c.check("SSE 初始状态重建回答面板",
             await c.page.locator("#waitingInputPanel").is_visible()
             and await c.page.locator("#waitingInputQuestions").text_content() == "请选择部署区域？", "")
-    c.check("WaitingInput amber + visible text",
+    c.check("WaitingInput cyan + visible text",
             await c.page.locator("#chatStatus").text_content() == "等待回答"
-            and await c.ev("getComputedStyle(els.chatStatus).borderColor === 'rgb(181, 137, 0)'"),
+            and await c.ev("getComputedStyle(els.chatStatus).borderColor === 'rgb(42, 161, 152)'"),
             await c.ev("getComputedStyle(els.chatStatus).cssText"))
     c.check("回答面板和错误区 ARIA 语义",
             await c.ev("els.waitingInputPanel.getAttribute('role') === 'status'"
@@ -490,9 +490,9 @@ async def run_waiting_input(c):
             and await c.page.locator("#sendBtn").is_disabled(), "")
     await c.ev("handleSSEBlock('event: status\\ndata: {\"status\":\"Busy\"}\\n\\n',"
                " state.sessionId, state.workspace.id, sessionOpenEpoch)")
-    c.check("Busy 为蓝色且回答面板收起",
+    c.check("Busy 为红色且回答面板收起",
             not await c.page.locator("#waitingInputPanel").is_visible()
-            and await c.ev("getComputedStyle(els.chatStatus).borderColor === 'rgb(38, 139, 210)'"), "")
+            and await c.ev("getComputedStyle(els.chatStatus).borderColor === 'rgb(220, 50, 47)'"), "")
 
     async def show_wait(call_id, prompt):
         await c.page.evaluate("([callId,prompt]) => handleSSEBlock('event: status\\ndata: '"
@@ -542,11 +542,13 @@ async def run_waiting_input(c):
     c.check("Idle 为绿色",
             await c.ev("getComputedStyle(els.chatStatus).borderColor === 'rgb(133, 153, 0)'"), "")
     await c.ev("applyStatus('Failed(test)')")
-    c.check("Error 为红色并有可见文字",
+    c.check("Error 为黄色并有可见文字",
             await c.page.locator("#chatStatus").text_content() == "失败"
-            and await c.ev("getComputedStyle(els.chatStatus).borderColor === 'rgb(220, 50, 47)'"), "")
+            and await c.ev("getComputedStyle(els.chatStatus).borderColor === 'rgb(181, 137, 0)'"), "")
 
     await c.page.set_viewport_size({"width": 390, "height": 844})
+    if await c.ev("state.sidebar.open"):
+        await c.close_sidebar()
     await show_wait("call-mobile", "手机上仍可阅读并回答这个问题吗？")
     await c.page.wait_for_timeout(100)
     c.check("390px 无页面横向溢出",
@@ -557,6 +559,70 @@ async def run_waiting_input(c):
     c.check("移动端 composer 输入与回答按钮可用",
             bool(box and send_box and box["width"] > 250 and send_box["width"] >= 44)
             and await textarea.is_editable(), f"textarea={box} send={send_box}")
+
+    # Bounded long-question regressions: real WaitingInput DOM through the same SSE path.
+    long_prompt = "\n".join(f"第{i:03d}行：这是用于验证内部滚动的中文问题内容。" for i in range(100)) + "\nTAIL-完整问题末尾"
+    long_unbroken = "X" * 12000 + "UNBROKEN-TAIL"
+    for width, height, app_height, prompt in [
+            (390, 844, None, long_prompt), (320, 568, None, long_prompt),
+            (390, 420, None, long_prompt), (390, 844, 420, long_unbroken)]:
+        await c.page.set_viewport_size({"width": width, "height": height})
+        if await c.ev("state.sidebar.open"):
+            await c.close_sidebar()
+        await c.ev("new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))")
+        await c.ev("document.documentElement.style.removeProperty('--app-height')")
+        if app_height is not None:
+            await c.ev(f"document.documentElement.style.setProperty('--app-height', '{app_height}px')")
+        await c.ev("new Promise(resolve => requestAnimationFrame(resolve))")
+        await show_wait(f"call-long-{width}-{height}-{app_height}", prompt)
+        question = c.page.locator("#waitingInputQuestions")
+        await question.evaluate("el => el.scrollTop = el.scrollHeight")
+        await c.ev("new Promise(resolve => requestAnimationFrame(resolve))")
+        bounds = await c.page.evaluate("""() => {
+          const q=document.querySelector('#waitingInputQuestions');
+          const input=document.querySelector('#promptInput'), button=document.querySelector('#sendBtn');
+          const rect=el=>{const r=el.getBoundingClientRect();return {top:r.top,bottom:r.bottom,left:r.left,right:r.right,width:r.width,height:r.height};};
+          const visible=el=>{const r=el.getBoundingClientRect();return r.top>=0 && r.bottom<=window.innerHeight && r.left>=0 && r.right<=window.innerWidth;};
+          const hit=el=>{const r=el.getBoundingClientRect();const x=(r.left+r.right)/2,y=(r.top+r.bottom)/2;return document.elementFromPoint(x,y)===el;};
+          return {q:rect(q), qClient:q.clientHeight,qScroll:q.scrollHeight,qTop:q.scrollTop,
+            input:rect(input),button:rect(button),inputVisible:visible(input),buttonVisible:visible(button),
+            inputHit:hit(input),buttonHit:hit(button),appHeight:getComputedStyle(document.documentElement).getPropertyValue('--app-height').trim()};
+        }""")
+        actual = await question.text_content()
+        app_bound = app_height if app_height is not None else height
+        if app_height is not None:
+            c.check("模拟键盘 --app-height 测试值保留", bounds["appHeight"] == f"{app_height}px", bounds["appHeight"])
+        c.check(f"{width}x{height} WaitingInput full question text",
+                actual == prompt and actual.endswith("TAIL-完整问题末尾" if prompt == long_prompt else "UNBROKEN-TAIL"),
+                f"length={len(actual)} tail={actual[-30:]!r}")
+        c.check(f"{width}x{height} question internally scrolls to tail",
+                bounds["qScroll"] > bounds["qClient"] and bounds["qTop"] + bounds["qClient"] >= bounds["qScroll"] - 2,
+                json.dumps(bounds, ensure_ascii=False))
+        c.check(f"{width}x{height} textarea/send reachable within app height {app_bound}",
+                bounds["input"]["top"] >= 0 and bounds["button"]["bottom"] <= app_bound
+                and bounds["inputVisible"] and bounds["buttonVisible"]
+                and bounds["inputHit"] and bounds["buttonHit"], json.dumps(bounds))
+
+    await textarea.fill("\n".join(f"长答案第{i:03d}行内容" for i in range(80)))
+    answer_bounds = await c.page.evaluate("""() => {
+      const input=document.querySelector('#promptInput'), button=document.querySelector('#sendBtn');
+      const ir=input.getBoundingClientRect(), br=button.getBoundingClientRect();
+      const hit=el=>{const r=el.getBoundingClientRect();return document.elementFromPoint((r.left+r.right)/2,(r.top+r.bottom)/2)===el;};
+      return {input:{top:ir.top,bottom:ir.bottom,height:ir.height},button:{top:br.top,bottom:br.bottom},
+        inputHit:hit(input),buttonHit:hit(button),appHeight:getComputedStyle(document.documentElement).getPropertyValue('--app-height').trim()};
+    }""")
+    answer_text = await textarea.input_value()
+    c.check("长问题后长答案可输入且回答按钮在模拟键盘上方可达",
+            len(answer_text.splitlines()) == 80 and answer_bounds["input"]["top"] >= 0
+            and answer_bounds["button"]["bottom"] <= 420
+            and answer_bounds["inputHit"] and answer_bounds["buttonHit"]
+            and await c.page.locator("#sendBtn").is_enabled(),
+            json.dumps({"length": len(answer_text), **answer_bounds}))
+    await c.page.locator("#sendBtn").click()
+    c.check("长答案 regular click 精确提交 WaitingInput call_id",
+            json.loads(c.records["prompt"][-1][1]) == {"text": answer_text, "call_id": "call-long-390-844-420"},
+            c.records["prompt"][-1][1])
+    await textarea.fill("")
 
 
 CASES = [
