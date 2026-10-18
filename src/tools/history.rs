@@ -1,6 +1,8 @@
 //! Logical transcript history. An omitted scope normalizes to the current
 //! session; list/search/read all take the scoped path with provenance.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -10,6 +12,10 @@ use crate::session_store::{HistoryEntry, HistoryQuery, SessionStore, derive_work
 
 pub const HISTORY_DEFAULT_LIMIT: usize = 20;
 pub const HISTORY_MAX_LIMIT: usize = 100;
+/// A bounded search keeps one runaway global scan from occupying a turn for
+/// minutes. On expiry the caller gets an explicit error, never a partial or
+/// empty result page.
+const HISTORY_SEARCH_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct History;
 
@@ -18,7 +24,7 @@ impl Tool for History {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "history".into(),
-            description: "Read logical transcripts. An omitted `scope` means `session`; omitted `workspace_id`/`session_id` default to the current workspace/session (in session scope, a `workspace_id` other than the current workspace requires `session_id`). list/search/read return provenance, list/search return `next_cursor`, and `global` searches this configured store only.".into(),
+            description: "Read logical transcripts. An omitted `scope` means `session`; omitted `workspace_id`/`session_id` default to the current workspace/session (in session scope, a `workspace_id` other than the current workspace requires `session_id`). list/search/read return provenance, list/search return `next_cursor`, and `global` searches this configured store only. A search is bounded to 60 seconds; a timeout is an explicit error, never an empty or partial result.".into(),
             parameters: json!({
                 "type": "object",
                 "oneOf": [
@@ -77,7 +83,32 @@ pub async fn execute(
 ) -> Result<String, String> {
     let args = parse_arguments(arguments)?;
     let selectors = resolve_selectors(root, session, &args)?;
+    if args.action == "search" {
+        return search_with_timeout(
+            HISTORY_SEARCH_TIMEOUT,
+            execute_scoped(store, root, selectors, args),
+        )
+        .await;
+    }
     execute_scoped(store, root, selectors, args).await
+}
+
+/// Bound a search without turning a timeout into an empty result page: an
+/// unfinished scan is reported as an error so it can never be mistaken for
+/// "no matches". `limit` only caps returned entries, not scan work, so the
+/// error points at narrowing the scope/query instead.
+async fn search_with_timeout<F>(timeout: Duration, search: F) -> Result<String, String>
+where
+    F: std::future::Future<Output = Result<String, String>>,
+{
+    tokio::time::timeout(timeout, search).await.map_err(|_| {
+        format!(
+            "history search timed out after {}s and was stopped; no results were returned. \
+             This is a timeout, not an empty result. Narrow the search: use scope \"session\" or \
+             \"workspace\" instead of \"global\", or a more specific literal query fragment.",
+            timeout.as_secs_f64()
+        )
+    })?
 }
 
 /// Effective selectors after defaults. An omitted scope means `session`; an
@@ -651,6 +682,26 @@ mod tests {
         .unwrap();
         assert_eq!(all["entries"].as_array().unwrap().len(), 25);
         assert!(all["next_cursor"].is_null());
+    }
+
+    #[tokio::test]
+    async fn search_timeout_is_an_error_never_an_empty_page() {
+        let error = search_with_timeout(
+            std::time::Duration::from_millis(10),
+            std::future::pending::<Result<String, String>>(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("timed out"), "{error}");
+        assert!(error.contains("not an empty result"), "{error}");
+        assert!(!error.contains("\"entries\""), "{error}");
+        // A search that finishes inside the budget passes straight through.
+        let done = search_with_timeout(std::time::Duration::from_secs(1), async {
+            Ok("{\"entries\":[]}".to_owned())
+        })
+        .await
+        .unwrap();
+        assert_eq!(done, "{\"entries\":[]}");
     }
 
     #[tokio::test]

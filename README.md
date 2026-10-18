@@ -1143,6 +1143,8 @@ The always-available `history` tool has `list`, `read`, and `search` actions.
 the unparsed argument JSON), and Notice text. Recovering a lost edit means
 searching a distinctive fragment of what was written — a function name or
 another unique string — not `"write_file"`, which lists every write.
+A `search` is bounded to 60 seconds; expiry returns an explicit timeout error
+(never an empty or partial result page), so narrow the scope or query.
 
 An omitted `scope` normalizes to `session`, and every call returns
 `workspace_id` and `session_id` provenance on each entry; `list`/`search`
