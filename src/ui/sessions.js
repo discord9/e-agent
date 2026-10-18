@@ -133,6 +133,7 @@ function afterPollRound() {
     if (state.sessionId) {
       updateComposerMeta();
       updateCurrentSessionBusy();
+      syncDocumentTitle();   // 服务端后台生成的标题在轮询后同步到标签页
       const cur = (state.lastList || []).find((s) => s.id === state.sessionId);
       if (cur) els.backParentBtn.hidden = !cur.parent_session_id;
     }
@@ -817,11 +818,24 @@ function updateCurrentSessionBusy() {
   els.chatBusy.hidden = !mainRunning && !waiting && !errored && runningKidCount === 0;
 }
 
+/* 标签页标题跟随当前会话名：无会话/会话未命名时回退 id；仪表盘打开时
+   由仪表盘自管标题，轮询刷新不能覆盖它。 */
+function syncDocumentTitle() {
+  if (els.usageDashboard && !els.usageDashboard.hidden) return;
+  if (!state.sessionId) {
+    document.title = "e-agent · Web UI";
+    return;
+  }
+  const s = (state.lastList || []).find((x) => x.id === state.sessionId);
+  document.title = (s && s.title ? String(s.title) : state.sessionId) + " · e-agent";
+}
+
 function renderChatSessionId(id) {
   const el0 = els.chatSessionId;
   if (!el0) return;
   const s = (state.lastList || []).find((x) => x.id === id);
   updateCurrentSessionBusy();
+  syncDocumentTitle();
   const title = s && s.title ? String(s.title) : "";
   el0.innerHTML = "";
   const t = el("span", "chat-sid-title", title || id);
@@ -2484,6 +2498,7 @@ function clearCurrentSession() {
   els.chatSessionId.textContent = "";
   updateCurrentSessionBusy();
   els.usageInfo.textContent = "";
+  syncDocumentTitle();
   history.replaceState(null, "", "/");
   applyStatus("Idle");
   if (!state.sidebar.open) openSidebar();
@@ -2919,6 +2934,7 @@ async function saveTitle(s, newTitle) {
       return false;
     }
     s.title = newTitle || null;
+    syncDocumentTitle();   // /rename 或行内重命名成功后同步标签页标题
     return true;
   } catch (e) {
     setBanner("⚠ 重命名失败：" + e.message, true);

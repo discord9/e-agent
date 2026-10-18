@@ -370,7 +370,7 @@ function openUsageDashboard() {
 function closeUsageDashboard(restoreFocus = true) {
   usageDashboardState.open = false; usageDashboardState.request += 1; destroyUsageVisuals();
   els.usageDashboard.hidden = true; els.chatView.classList.remove("hidden");
-  els.usageDashboardBtn.setAttribute("aria-pressed", "false"); document.title = "e-agent · Web UI";
+  els.usageDashboardBtn.setAttribute("aria-pressed", "false"); syncDocumentTitle();
   if (restoreFocus) els.usageDashboardBtn.focus();
 }
 

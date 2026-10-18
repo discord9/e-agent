@@ -71,6 +71,8 @@ async def run_commands(c):
           and c.records["title"][0][1] == '{"title":"新标题甲"}')
     c.check("/rename 新标题：PUT body 正确", ok, str(c.records["title"]))
     c.check("/rename 新标题：输入框清空", await c.ev("els.promptInput.value") == "", "")
+    c.check("/rename 新标题：标签页标题同步", await c.ev("document.title") == "新标题甲 · e-agent",
+            await c.ev("document.title"))
 
     # ---------- /rename 空标题（清除） ----------
     await c.page.fill("#promptInput", "/rename ")
@@ -80,6 +82,8 @@ async def run_commands(c):
           and c.records["title"][1][0].endswith("/main-idle/title")
           and c.records["title"][1][1] == '{"title":""}')
     c.check("/rename 空标题：PUT {title:''}（清除）", ok, str(c.records["title"]))
+    c.check("/rename 空标题：标签页回退会话 id", await c.ev("document.title") == "main-idle · e-agent",
+            await c.ev("document.title"))
 
     # ---------- /btw 裸命令 -> 用法 ----------
     await c.page.fill("#promptInput", "/btw")

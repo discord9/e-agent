@@ -61,6 +61,8 @@ async def run_chat_open_sse(c):
     c.check("openSession：标题与会话 id 显示",
             "主会话" in (await c.page.locator("#chatSessionId").text_content())
             and "main-idle" in (await c.page.locator("#chatSessionId").text_content()), "")
+    c.check("标签页标题同步当前会话名",
+            await c.ev("document.title") == "主会话 · e-agent", await c.ev("document.title"))
     c.check("openSession：chatView 可见且退出空状态",
             await c.ev("!els.chatView.classList.contains('hidden') && !els.chatView.classList.contains('no-session')"), "")
 

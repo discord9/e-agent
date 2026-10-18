@@ -505,6 +505,7 @@ async function switchWorkspace(id, epoch) {
   els.composerMeta.textContent = "";
   els.tokenInput.value = state.globalToken;   // 顶部输入框编辑的是全局 token
   applyStatus("Idle");               // 重置状态条/按钮/placeholder
+  syncDocumentTitle();               // 新 workspace 空会话：标签页回到默认标题
   closeWorkspaceEditor();
   renderWorkspaceSelect();
   refreshBanner();
