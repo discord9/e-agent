@@ -358,11 +358,6 @@ impl Notes {
         let mut errors = files.errors;
         for path in files.paths {
             match self.note_text(Path::new(&path)) {
-                Ok(text) if text.len() > READ_LIMIT => Self::error(
-                    &mut errors,
-                    Path::new(&path),
-                    format!("note `{path}` exceeds the 64 KiB read limit"),
-                ),
                 Ok(text) => {
                     for (line, content) in text.lines().enumerate() {
                         if content.to_lowercase().contains(&query) {
@@ -783,13 +778,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn notes_search_distinguishes_invalid_notes_from_no_matches_and_oversize() {
+    async fn notes_search_distinguishes_invalid_notes_from_no_matches_and_scans_large_notes() {
         let temp = tempfile::tempdir().unwrap();
         let notes = tool(&temp, false);
         let root = temp.path().join(".e-agent/notes");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("invalid"), [0xff]).unwrap();
-        fs::write(root.join("large"), vec![b'x'; READ_LIMIT + 1]).unwrap();
+        let mut large = vec![b'x'; READ_LIMIT + 1];
+        large.extend_from_slice(b"\nneedle");
+        fs::write(root.join("large"), large).unwrap();
 
         let incomplete = output(
             notes
@@ -799,25 +796,19 @@ mod tests {
         );
         assert_eq!(incomplete["results"], json!([]));
         assert_eq!(incomplete["incomplete"], true);
-        assert_eq!(incomplete["errors"].as_array().unwrap().len(), 2);
-        assert_eq!(incomplete["errors"][0]["path"], "invalid");
-        assert!(
-            incomplete["errors"][1]["reason"]
-                .as_str()
-                .unwrap()
-                .contains("64 KiB")
+        assert_eq!(
+            incomplete["errors"],
+            json!([{"path": "invalid", "reason": "note `invalid` is not valid UTF-8"}])
         );
 
         fs::remove_file(root.join("invalid")).unwrap();
-        fs::remove_file(root.join("large")).unwrap();
-        fs::write(root.join("plain"), "unrelated").unwrap();
         let complete = output(
             notes
-                .execute(json!({"action":"search","query":"missing"}))
+                .execute(json!({"action":"search","query":"needle"}))
                 .await
                 .unwrap(),
         );
-        assert_eq!(complete["results"], json!([]));
+        assert_eq!(complete["results"], json!(["large:2: needle"]));
         assert_eq!(complete["incomplete"], false);
         assert_eq!(complete["errors"], json!([]));
     }
@@ -830,7 +821,9 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("a"), "hit").unwrap();
         fs::write(root.join("b"), [0xff]).unwrap();
-        fs::write(root.join("b-large"), vec![b'x'; READ_LIMIT + 1]).unwrap();
+        let mut large = vec![b'x'; READ_LIMIT + 1];
+        large.extend_from_slice(b"\nhit");
+        fs::write(root.join("b-large"), large).unwrap();
         fs::write(root.join("c"), "hit").unwrap();
 
         let first = output(
@@ -845,18 +838,24 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let errors = json!([
-            {"path": "b", "reason": "note `b` is not valid UTF-8"},
-            {"path": "b-large", "reason": "note `b-large` exceeds the 64 KiB read limit"}
-        ]);
+        let third = output(
+            notes
+                .execute(json!({"action":"search","cursor":second["cursor"],"limit":1}))
+                .await
+                .unwrap(),
+        );
+        let errors = json!([{"path": "b", "reason": "note `b` is not valid UTF-8"}]);
         assert_eq!(first["results"], json!(["a:1: hit"]));
-        assert_eq!(second["results"], json!(["c:1: hit"]));
+        assert_eq!(second["results"], json!(["b-large:2: hit"]));
+        assert_eq!(third["results"], json!(["c:1: hit"]));
         assert_eq!(first["errors"], errors);
         assert_eq!(second["errors"], errors);
+        assert_eq!(third["errors"], errors);
         assert_eq!(first["incomplete"], true);
         assert_eq!(second["incomplete"], true);
-        assert_eq!(second["has_more"], false);
-        assert_eq!(second["cursor"], Value::Null);
+        assert_eq!(third["incomplete"], true);
+        assert_eq!(third["has_more"], false);
+        assert_eq!(third["cursor"], Value::Null);
     }
 
     #[tokio::test]
