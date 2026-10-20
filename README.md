@@ -1251,6 +1251,7 @@ The `/api` surface (JSON except for the SSE endpoint):
 | PUT | `/api/sessions/{id}/archive` | archive a session |
 | DELETE | `/api/sessions/{id}` | cancel + remove from the registry |
 | GET | `/api/usage/dashboard` | **public** read-only usage JSON (SQLite/Greptime; JSONL returns 503) |
+| GET | `/api/provider-quotas` | account balance/quota cards for configured providers (authenticated) |
 | GET | `/api/tasks` | running background tasks, all sessions |
 | DELETE | `/api/sessions/{id}/tasks/{task_id}` | cancel one background task |
 | GET | `/api/sessions/{id}/tasks/{task_id}/output` | full output of a running bash task |
@@ -1272,6 +1273,22 @@ configuration, database credentials, arbitrary SQL, or write capability.
 ```sh
 curl 'http://127.0.0.1:8766/api/usage/dashboard?bucket=day&top_n=10'
 ```
+
+The web UI's usage view also shows an account row above its filters,
+backed by the authenticated `GET /api/provider-quotas`. It returns one card
+per configured provider endpoint, recognized by the provider `base_url` host:
+DeepSeek balance, SiliconFlow balance, Zhipu/GLM Coding Plan and Kimi Code
+quota windows, OpenCode Go rolling/weekly/monthly percentages, and the
+ChatGPT/Codex plan and rate windows (through the existing `e-agent login`
+credentials). The endpoint caches nothing and has no background poller:
+each request queries the live upstream APIs concurrently, and one provider's
+failure is reported as that provider's own card. The browser fetches the
+cards once on page load, then at most every 10 minutes (a hidden tab pauses
+the timer; returning after a short switch reuses the cached result), and the
+card row's 刷新 button forces an immediate refresh. Opening the usage view
+only renders the cached row. Non-goals: billing history, cost accounting or
+price calculation, auto top-up, arbitrary user-supplied usage endpoints, and
+background quota monitoring or notifications.
 
 SSE connections are kept alive with 15-second heartbeat pings. SSE clients
 must handle live `Display` events; the bundled web UI does. `Display` is not a

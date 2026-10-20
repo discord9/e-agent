@@ -1,9 +1,9 @@
 //! Provider account balance / quota cards for `GET /api/provider-quotas`.
 //!
-//! One card per distinct provider endpoint. The config only names providers
-//! and their base URLs; a small host -> endpoint table (below) decides which
-//! upstream usage API answers for it. Every field is always serialized, and
-//! `kind` is one of `balance` / `quota` / `error`.
+//! One card per distinct provider account (endpoint URL and API key). The
+//! config only names providers and their base URLs; a small host -> endpoint
+//! table (below) decides which upstream usage API answers for it. Every field
+//! is always serialized, and `kind` is one of `balance` / `quota` / `error`.
 //!
 //! Failure policy: a provider never aborts the response. Non-2xx responses,
 //! timeouts, connection failures, and unparsable bodies all become that
@@ -134,9 +134,10 @@ struct Target {
 }
 
 /// Resolve configured providers to endpoints, skipping unknown hosts and
-/// duplicates. Deduplication is by endpoint URL, so aliases of one provider
-/// (`opencode.ai` / `api.opencode.ai`) produce a single card. Accounts arrive
-/// sorted by provider name, so the surviving `id` is stable.
+/// duplicates. Deduplication is by endpoint URL *and* API key: aliases of one
+/// provider (`opencode.ai` / `api.opencode.ai`) with the same key produce a
+/// single card, while the same host with different keys stays two accounts.
+/// Accounts arrive sorted by provider name, so the surviving `id` is stable.
 fn targets(accounts: &[ProviderAccount]) -> Vec<Target> {
     let mut targets: Vec<Target> = Vec::new();
     for account in accounts {
@@ -153,7 +154,10 @@ fn targets(accounts: &[ProviderAccount]) -> Vec<Target> {
         let Some((url, source, api_key)) = resolved else {
             continue;
         };
-        if targets.iter().any(|target| target.url == url) {
+        if targets
+            .iter()
+            .any(|target| target.url == url && target.api_key == api_key)
+        {
             continue;
         }
         targets.push(Target {
@@ -181,39 +185,33 @@ pub async fn fetch(accounts: &[ProviderAccount], chatgpt: Option<CodexAuth>) -> 
     }
 }
 
-/// A parsed upstream answer, before it is attached to a provider id/label.
-#[derive(Debug)]
-struct Card {
-    kind: QuotaKind,
-    amount: Option<f64>,
-    currency: Option<String>,
-    plan: Option<String>,
-    windows: Vec<QuotaWindow>,
-}
-
-impl Card {
-    fn balance(amount: f64, currency: Option<String>) -> Self {
+impl ProviderQuota {
+    fn balance(id: &str, label: &str, amount: f64, currency: Option<String>) -> Self {
         Self {
+            id: id.to_owned(),
+            label: label.to_owned(),
             kind: QuotaKind::Balance,
             amount: Some(amount),
             currency,
             plan: None,
             windows: Vec::new(),
+            error: None,
         }
     }
 
-    fn quota(plan: Option<String>, windows: Vec<QuotaWindow>) -> Self {
+    fn quota(id: &str, label: &str, plan: Option<String>, windows: Vec<QuotaWindow>) -> Self {
         Self {
+            id: id.to_owned(),
+            label: label.to_owned(),
             kind: QuotaKind::Quota,
             amount: None,
             currency: None,
             plan,
             windows,
+            error: None,
         }
     }
-}
 
-impl ProviderQuota {
     fn error(id: &str, label: &str, error: String) -> Self {
         Self {
             id: id.to_owned(),
@@ -234,9 +232,10 @@ async fn query(
     chatgpt: Option<&CodexAuth>,
     now: DateTime<Utc>,
 ) -> ProviderQuota {
+    let label = target.source.label();
     let parsed = match target.source {
         Source::ChatGpt => match chatgpt {
-            Some(auth) => chatgpt_card(client, auth, now).await,
+            Some(auth) => chatgpt_card(client, auth, now, &target.id, label).await,
             // Configured for ChatGPT auth, but no login is available: name
             // the actual remedy instead of reporting a generic HTTP 401.
             None => Err(ERR_NOT_LOGGED_IN.to_owned()),
@@ -252,34 +251,30 @@ async fn query(
         {
             Ok(response) => json_body(response)
                 .await
-                .and_then(|value| parse(source, &value, now)),
+                .and_then(|value| parse(source, &value, now, &target.id, label)),
             Err(error) => Err(transport(error)),
         },
     };
-    let label = target.source.label();
     match parsed {
-        Ok(card) => ProviderQuota {
-            id: target.id.clone(),
-            label: label.to_owned(),
-            kind: card.kind,
-            amount: card.amount,
-            currency: card.currency,
-            plan: card.plan,
-            windows: card.windows,
-            error: None,
-        },
+        Ok(card) => card,
         Err(error) => ProviderQuota::error(&target.id, label, error),
     }
 }
 
-fn parse(source: Source, value: &Value, now: DateTime<Utc>) -> Result<Card, String> {
+fn parse(
+    source: Source,
+    value: &Value,
+    now: DateTime<Utc>,
+    id: &str,
+    label: &str,
+) -> Result<ProviderQuota, String> {
     match source {
-        Source::DeepSeek => parse_deepseek(value),
-        Source::SiliconFlow => parse_siliconflow(value),
-        Source::Zhipu => parse_zhipu(value),
-        Source::Kimi => parse_kimi(value),
-        Source::OpenCode => parse_opencode(value, now),
-        Source::ChatGpt => parse_chatgpt(value, now),
+        Source::DeepSeek => parse_deepseek(value, id, label),
+        Source::SiliconFlow => parse_siliconflow(value, id, label),
+        Source::Zhipu => parse_zhipu(value, id, label),
+        Source::Kimi => parse_kimi(value, id, label),
+        Source::OpenCode => parse_opencode(value, now, id, label),
+        Source::ChatGpt => parse_chatgpt(value, now, id, label),
     }
 }
 
@@ -288,7 +283,7 @@ fn parse(source: Source, value: &Value, now: DateTime<Utc>) -> Result<Card, Stri
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 /// `{"is_available":true,"balance_infos":[{"currency":"CNY","total_balance":"10.44",...}]}`
-fn parse_deepseek(value: &Value) -> Result<Card, String> {
+fn parse_deepseek(value: &Value, id: &str, label: &str) -> Result<ProviderQuota, String> {
     let infos = value
         .get("balance_infos")
         .and_then(Value::as_array)
@@ -302,7 +297,9 @@ fn parse_deepseek(value: &Value) -> Result<Card, String> {
         .get("total_balance")
         .and_then(number)
         .ok_or_else(parse_error)?;
-    Ok(Card::balance(
+    Ok(ProviderQuota::balance(
+        id,
+        label,
         amount,
         info.get("currency")
             .and_then(Value::as_str)
@@ -311,19 +308,24 @@ fn parse_deepseek(value: &Value) -> Result<Card, String> {
 }
 
 /// `{"code":20000,...,"data":{"balance":"0.88","totalBalance":"88.88"}}`
-fn parse_siliconflow(value: &Value) -> Result<Card, String> {
+fn parse_siliconflow(value: &Value, id: &str, label: &str) -> Result<ProviderQuota, String> {
     let amount = value
         .get("data")
         .and_then(|data| data.get("totalBalance"))
         .and_then(number)
         .ok_or_else(parse_error)?;
-    Ok(Card::balance(amount, Some("CNY".to_owned())))
+    Ok(ProviderQuota::balance(
+        id,
+        label,
+        amount,
+        Some("CNY".to_owned()),
+    ))
 }
 
 /// `{"code":200,"data":{"limits":[{"unit":3,"percentage":0,...}],"level":"max"}}`
 /// Units: 3 = 5-hour window, 6 = weekly, 5 = monthly. `percentage` is already
 /// 0-100; `nextResetTime` is a millisecond timestamp.
-fn parse_zhipu(value: &Value) -> Result<Card, String> {
+fn parse_zhipu(value: &Value, id: &str, label: &str) -> Result<ProviderQuota, String> {
     if value.get("code").and_then(Value::as_i64) != Some(200) {
         return Err(ERR_PARSE.to_owned());
     }
@@ -332,8 +334,13 @@ fn parse_zhipu(value: &Value) -> Result<Card, String> {
         .get("limits")
         .and_then(Value::as_array)
         .ok_or_else(parse_error)?;
-    let windows = limits.iter().filter_map(zhipu_window).collect();
-    Ok(Card::quota(
+    let windows: Vec<QuotaWindow> = limits.iter().filter_map(zhipu_window).collect();
+    if windows.is_empty() {
+        return Err(parse_error());
+    }
+    Ok(ProviderQuota::quota(
+        id,
+        label,
         data.get("level").and_then(Value::as_str).map(str::to_owned),
         windows,
     ))
@@ -360,10 +367,10 @@ fn zhipu_window(limit: &Value) -> Option<QuotaWindow> {
 
 /// Prefers the `usages` block; falls back to the legacy `usage` + `limits`
 /// shape when it is absent.
-fn parse_kimi(value: &Value) -> Result<Card, String> {
+fn parse_kimi(value: &Value, id: &str, label: &str) -> Result<ProviderQuota, String> {
     kimi_usages(value)
         .or_else(|| kimi_legacy(value))
-        .map(|windows| Card::quota(None, windows))
+        .map(|windows| ProviderQuota::quota(id, label, None, windows))
         .ok_or_else(parse_error)
 }
 
@@ -423,7 +430,12 @@ fn kimi_percent(entry: &Value) -> Option<f64> {
 }
 
 /// `{"usage":{"rolling":{"percent":12.5,"resetInSec":3600},"weekly":{...}}}`
-fn parse_opencode(value: &Value, now: DateTime<Utc>) -> Result<Card, String> {
+fn parse_opencode(
+    value: &Value,
+    now: DateTime<Utc>,
+    id: &str,
+    label: &str,
+) -> Result<ProviderQuota, String> {
     let usage = value.get("usage").ok_or_else(parse_error)?;
     let mut windows = Vec::new();
     for (key, label) in [
@@ -449,11 +461,16 @@ fn parse_opencode(value: &Value, now: DateTime<Utc>) -> Result<Card, String> {
     if windows.is_empty() {
         return Err(ERR_PARSE.to_owned());
     }
-    Ok(Card::quota(None, windows))
+    Ok(ProviderQuota::quota(id, label, None, windows))
 }
 
 /// `{"plan_type":"pro","rate_limit":{"primary_window":{...},"secondary_window":null}}`
-fn parse_chatgpt(value: &Value, now: DateTime<Utc>) -> Result<Card, String> {
+fn parse_chatgpt(
+    value: &Value,
+    now: DateTime<Utc>,
+    id: &str,
+    label: &str,
+) -> Result<ProviderQuota, String> {
     let rate_limit = value.get("rate_limit");
     let mut windows = Vec::new();
     if let Some(window) = rate_limit
@@ -473,7 +490,12 @@ fn parse_chatgpt(value: &Value, now: DateTime<Utc>) -> Result<Card, String> {
     {
         windows.push(window);
     }
-    Ok(Card::quota(
+    if windows.is_empty() {
+        return Err(ERR_PARSE.to_owned());
+    }
+    Ok(ProviderQuota::quota(
+        id,
+        label,
         value
             .get("plan_type")
             .and_then(Value::as_str)
@@ -522,7 +544,7 @@ fn client() -> reqwest::Client {
             reqwest::Client::builder()
                 .timeout(REQUEST_TIMEOUT)
                 .build()
-                .unwrap_or_else(|_| reqwest::Client::new())
+                .expect("cannot build the quota HTTP client")
         })
         .clone()
 }
@@ -531,7 +553,9 @@ async fn chatgpt_card(
     client: &reqwest::Client,
     auth: &CodexAuth,
     now: DateTime<Utc>,
-) -> Result<Card, String> {
+    id: &str,
+    label: &str,
+) -> Result<ProviderQuota, String> {
     let (token, account) = auth
         .access_token_and_account()
         .await
@@ -547,7 +571,7 @@ async fn chatgpt_card(
         .map_err(transport)?;
     json_body(response)
         .await
-        .and_then(|value| parse_chatgpt(&value, now))
+        .and_then(|value| parse_chatgpt(&value, now, id, label))
 }
 
 /// Status handling for every provider: non-2xx becomes a fixed message that
@@ -635,9 +659,9 @@ mod tests {
         DateTime::from_timestamp(seconds, 0).unwrap()
     }
 
-    fn parse_value(source: Source, body: &str) -> Result<Card, String> {
+    fn parse_value(source: Source, body: &str) -> Result<ProviderQuota, String> {
         let value: Value = serde_json::from_str(body).unwrap();
-        parse(source, &value, at(1_760_000_000))
+        parse(source, &value, at(1_760_000_000), "test", source.label())
     }
 
     fn labels(windows: &[QuotaWindow]) -> Vec<&str> {
@@ -648,7 +672,7 @@ mod tests {
         (left - right).abs() < 1e-9
     }
 
-    const DEEPSEEK: &str = r#"{"is_available":true,"balance_infos":[{"currency":"CNY","total_balance":"10.44","granted_balance":"0.00","topped_up_balance":"10.44"}]}"#;
+    const DEEPSEEK: &str = r#"{"is_available":true,"balance_infos":[{"currency":"USD","total_balance":"1.50"},{"currency":"CNY","total_balance":"10.44","granted_balance":"0.00","topped_up_balance":"10.44"}]}"#;
     const SILICONFLOW: &str = r#"{"code":20000,"message":"OK","status":true,"data":{"balance":"0.88","chargeBalance":"88.00","totalBalance":"88.88"}}"#;
     const ZHIPU: &str = r#"{"code":200,"data":{"limits":[{"type":"CREDIT_LIMIT","unit":3,"number":5,"usage":28000,"currentValue":0,"remaining":28000,"percentage":0},{"type":"CREDIT_LIMIT","unit":6,"number":1,"usage":140000,"currentValue":0,"remaining":140000,"percentage":0,"nextResetTime":1792985375998}],"level":"max"},"success":true}"#;
     const KIMI: &str = r#"{"usage":{"limit":"100","used":"1","remaining":"99","resetTime":"2026-10-27T06:49:31.626557Z"},"limits":[{"window":{"duration":300,"timeUnit":"TIME_UNIT_MINUTE"},"detail":{"limit":"100","used":"7","remaining":"93","resetTime":"2026-10-20T11:49:31.626557Z"}}],"usages":{"limit_5h":{"used_ratio":0.0709,"reset_time":"2026-10-20T11:49:31Z"},"limit_7d":{"used_ratio":0.0143,"reset_time":"2026-10-27T06:49:31Z"}}}"#;
@@ -663,6 +687,16 @@ mod tests {
         assert_eq!(card.currency.as_deref(), Some("CNY"));
         assert!(card.windows.is_empty());
         assert_eq!(Source::DeepSeek.label(), "DeepSeek");
+    }
+
+    #[test]
+    fn deepseek_without_cny_takes_the_first_balance() {
+        let body =
+            r#"{"is_available":true,"balance_infos":[{"currency":"USD","total_balance":"1.50"}]}"#;
+        let card = parse_value(Source::DeepSeek, body).unwrap();
+        assert_eq!(card.kind, QuotaKind::Balance);
+        assert_eq!(card.amount, Some(1.5));
+        assert_eq!(card.currency.as_deref(), Some("USD"));
     }
 
     #[test]
@@ -706,9 +740,25 @@ mod tests {
             {"unit":5,"percentage":25.5},
             {"unit":1,"percentage":1.0}
         ]}});
-        let card = parse(Source::Zhipu, &body, at(1_760_000_000)).unwrap();
+        let card = parse(
+            Source::Zhipu,
+            &body,
+            at(1_760_000_000),
+            "test",
+            Source::Zhipu.label(),
+        )
+        .unwrap();
         assert_eq!(labels(&card.windows), ["每月"]);
         assert!(close(card.windows[0].used_percent, 25.5));
+    }
+
+    #[test]
+    fn zhipu_all_unknown_units_is_an_error_card() {
+        let body = r#"{"code":200,"data":{"limits":[{"unit":1,"percentage":1.0},{"unit":2,"percentage":2.0}]}}"#;
+        assert_eq!(
+            parse_value(Source::Zhipu, body).unwrap_err(),
+            "响应格式无法解析"
+        );
     }
 
     #[test]
@@ -736,7 +786,14 @@ mod tests {
             "limits":[{"window":{"duration":300,"timeUnit":"TIME_UNIT_MINUTE"},
                 "detail":{"limit":"100","used":"7","remaining":"93","resetTime":"2026-10-20T11:49:31.626557Z"}}]
         });
-        let card = parse(Source::Kimi, &body, at(1_760_000_000)).unwrap();
+        let card = parse(
+            Source::Kimi,
+            &body,
+            at(1_760_000_000),
+            "test",
+            Source::Kimi.label(),
+        )
+        .unwrap();
         assert_eq!(labels(&card.windows), ["5 小时", "每周"]);
         assert!(close(card.windows[0].used_percent, 7.0));
         assert_eq!(
@@ -799,7 +856,14 @@ mod tests {
                 "secondary_window":{"used_percent":2.5,"reset_after_seconds":600}
             }
         });
-        let card = parse(Source::ChatGpt, &body, at(1_760_000_000)).unwrap();
+        let card = parse(
+            Source::ChatGpt,
+            &body,
+            at(1_760_000_000),
+            "test",
+            Source::ChatGpt.label(),
+        )
+        .unwrap();
         assert_eq!(labels(&card.windows), ["5 小时", "次级窗口"]);
         // Neither `reset_at` nor `reset_after_seconds` on the primary window.
         assert_eq!(card.windows[0].reset_at, None);
@@ -819,8 +883,23 @@ mod tests {
                 "secondary_window":{"used_percent":1,"limit_window_seconds":3600}
             }
         });
-        let card = parse(Source::ChatGpt, &body, at(1_760_000_000)).unwrap();
+        let card = parse(
+            Source::ChatGpt,
+            &body,
+            at(1_760_000_000),
+            "test",
+            Source::ChatGpt.label(),
+        )
+        .unwrap();
         assert_eq!(labels(&card.windows), ["48 小时", "次级窗口"]);
+    }
+
+    #[test]
+    fn chatgpt_without_windows_is_an_error_card() {
+        assert_eq!(
+            parse_value(Source::ChatGpt, "{}").unwrap_err(),
+            "响应格式无法解析"
+        );
     }
 
     #[test]
@@ -872,15 +951,18 @@ mod tests {
         assert_eq!(http_error(404, ""), "查询接口不可用（HTTP 404）");
         assert_eq!(http_error(429, ""), "请求过于频繁（HTTP 429）");
         assert_eq!(http_error(500, "secret body"), "HTTP 500");
-        assert!(!http_error(500, "secret body").contains("secret"));
     }
 
     fn account(name: &str, base_url: &str) -> ProviderAccount {
+        account_with_key(name, base_url, &format!("key-{name}"))
+    }
+
+    fn account_with_key(name: &str, base_url: &str, api_key: &str) -> ProviderAccount {
         ProviderAccount {
             name: name.to_owned(),
             base_url: Some(base_url.to_owned()),
             auth: None,
-            api_key: format!("key-{name}"),
+            api_key: api_key.to_owned(),
         }
     }
 
@@ -900,10 +982,14 @@ mod tests {
     #[test]
     fn path_prefix_is_ignored_and_aliases_dedupe() {
         let accounts = [
-            account("zhipu", "https://open.bigmodel.cn/api/coding/paas/v4"),
-            account("zhipu-alt", "https://open.bigmodel.cn/v4"),
-            account("opencode", "https://opencode.ai/zen/go/v1"),
-            account("opencode-alt", "https://api.opencode.ai/v1"),
+            account_with_key(
+                "zhipu",
+                "https://open.bigmodel.cn/api/coding/paas/v4",
+                "zhipu-key",
+            ),
+            account_with_key("zhipu-alt", "https://open.bigmodel.cn/v4", "zhipu-key"),
+            account_with_key("opencode", "https://opencode.ai/zen/go/v1", "opencode-key"),
+            account_with_key("opencode-alt", "https://api.opencode.ai/v1", "opencode-key"),
         ];
         let targets = targets(&accounts);
         assert_eq!(targets.len(), 2);
@@ -914,6 +1000,30 @@ mod tests {
         );
         assert_eq!(targets[1].id, "opencode");
         assert_eq!(targets[1].url, "https://opencode.ai/zen/go/v1/usage");
+    }
+
+    #[test]
+    fn same_host_is_one_card_only_for_the_same_key() {
+        let accounts = [
+            account_with_key("zhipu-main", "https://open.bigmodel.cn/v4", "key-main"),
+            account_with_key("zhipu-backup", "https://open.bigmodel.cn/v4", "key-backup"),
+        ];
+        let different_keys = targets(&accounts);
+        assert_eq!(different_keys.len(), 2);
+        assert_eq!(different_keys[0].id, "zhipu-main");
+        assert_eq!(different_keys[1].id, "zhipu-backup");
+
+        let same_key = [
+            account_with_key("zhipu", "https://open.bigmodel.cn/v4", "one-key"),
+            account_with_key(
+                "zhipu-alt",
+                "https://open.bigmodel.cn/api/coding/paas/v4",
+                "one-key",
+            ),
+        ];
+        let deduped = targets(&same_key);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].id, "zhipu");
     }
 
     #[test]

@@ -7,6 +7,9 @@ const usageDashboardState = {
   open: false,
   request: 0,
   quotaRequest: 0,
+  quotaProviders: null,
+  quotaFetchedAt: 0,
+  quotaTimer: null,
   charts: [],
   grid: null,
   resizeObserver: null,
@@ -367,28 +370,59 @@ function renderQuotaCards(providers) {
   }
 }
 
+/* Account quotas are fetched in the background every QUOTA_REFRESH_MS, and
+   only when stale on tab focus. Opening the usage view never triggers a
+   request: it renders whatever the last poll left in quotaProviders. */
+const QUOTA_REFRESH_MS = 10 * 60 * 1000;
+
 async function loadProviderQuotas() {
   const request = ++usageDashboardState.quotaRequest;
-  const current = () => request === usageDashboardState.quotaRequest && usageDashboardState.open;
+  const button = $("quotaRefreshBtn");
+  if (button) button.disabled = true;
   try {
     const res = await apiFor(state.workspace, "/api/provider-quotas");
-    if (!current()) return;
+    if (request !== usageDashboardState.quotaRequest) return;
     if (res.status === 404) { $("quotaCards").hidden = true; return; }
     if (!res.ok) throw new Error("额度信息暂不可用（HTTP " + res.status + "）");
     const data = await res.json();
-    if (!current()) return;
+    if (request !== usageDashboardState.quotaRequest) return;
     if (!Array.isArray(data.providers)) throw new Error();
+    usageDashboardState.quotaProviders = data.providers;
+    usageDashboardState.quotaFetchedAt = Date.now();
     renderQuotaCards(data.providers);
+    $("quotaUpdatedAt").textContent = "更新于 " + new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false });
   } catch (error) {
-    if (!current()) return;
+    if (request !== usageDashboardState.quotaRequest) return;
     $("quotaCardsRow").replaceChildren(el("p", "quota-unavailable", /^额度信息暂不可用（HTTP \d+）$/.test(error?.message) ? error.message : "额度信息暂不可用"));
     $("quotaCards").hidden = false;
+  } finally {
+    if (request === usageDashboardState.quotaRequest && button) button.disabled = false;
+  }
+}
+
+function quotaIsStale() {
+  return Date.now() - usageDashboardState.quotaFetchedAt >= QUOTA_REFRESH_MS;
+}
+
+/* Starts the 10-minute timer (idempotent) and fetches immediately only when
+   the cached result is missing or stale — a tab regaining focus after a short
+   switch does not spend an extra request. */
+function startQuotaPolling() {
+  if (usageDashboardState.quotaTimer === null) {
+    usageDashboardState.quotaTimer = setInterval(loadProviderQuotas, QUOTA_REFRESH_MS);
+  }
+  if (quotaIsStale()) loadProviderQuotas();
+}
+
+function stopQuotaPolling() {
+  if (usageDashboardState.quotaTimer !== null) {
+    clearInterval(usageDashboardState.quotaTimer);
+    usageDashboardState.quotaTimer = null;
   }
 }
 
 async function loadUsageDashboard() {
   if (!usageDashboardState.open) return;
-  loadProviderQuotas();
   const request = ++usageDashboardState.request;
   destroyUsageVisuals();
   els.usageContent.hidden = true;
@@ -446,9 +480,19 @@ function resetUsageFilters() {
   els.usageBucket.value = "day"; els.usageFrom.value = ""; els.usageTo.value = ""; setDefaultUsageDates(); loadUsageDashboard();
 }
 
+$("quotaRefreshBtn").addEventListener("click", loadProviderQuotas);
 els.usageDashboardBtn.addEventListener("click", () => usageDashboardState.open ? closeUsageDashboard() : openUsageDashboard());
 els.usageCloseBtn.addEventListener("click", closeUsageDashboard);
 els.usageRefreshBtn.addEventListener("click", loadUsageDashboard);
 els.usageResetBtn.addEventListener("click", resetUsageFilters);
 els.usageFilters.addEventListener("submit", (event) => { event.preventDefault(); loadUsageDashboard(); });
 document.addEventListener("keydown", (event) => { if (event.key === "Escape" && usageDashboardState.open) closeUsageDashboard(); });
+/* Quota polling is started here, not in sse.js: this file is a separate
+   <script> parsed after the app bundle, so its functions do not exist while
+   init() runs. A hidden tab stops the timer; regaining visibility only
+   refetches when the cached result is older than the interval. */
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) stopQuotaPolling();
+  else startQuotaPolling();
+});
+startQuotaPolling();
