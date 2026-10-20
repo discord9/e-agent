@@ -563,6 +563,13 @@ impl SessionFactory {
         self.reloadable.read().unwrap().config.clone()
     }
 
+    /// The cached ChatGPT credentials, loading them from disk on first use
+    /// (a login after start is picked up without a restart). Read-only for
+    /// the account/quota overview: no network on the factory side.
+    pub(crate) fn chatgpt_auth(&self) -> anyhow::Result<CodexAuth> {
+        lazy_chatgpt_auth(&self.reloadable)
+    }
+
     /// Resolve a role's model live from the reloadable state, for a Delegate
     /// that outlives individual session builds (the resident delegate tool).
     /// Returns `(model, context window)` for the role, or `None` when the

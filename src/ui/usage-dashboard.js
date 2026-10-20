@@ -6,6 +6,7 @@
 const usageDashboardState = {
   open: false,
   request: 0,
+  quotaRequest: 0,
   charts: [],
   grid: null,
   resizeObserver: null,
@@ -320,8 +321,74 @@ function renderUsageTable(data) {
     : "全部 " + rows.length + " 个结果（按总 Token）；上方 KPI、趋势和分组均为完整筛选范围";
 }
 
+function renderQuotaCards(providers) {
+  const section = $("quotaCards");
+  const row = $("quotaCardsRow");
+  row.replaceChildren();
+  section.hidden = !providers.length;
+  for (const provider of providers) {
+    const card = el("article", "quota-card");
+    const head = el("div", "quota-card-head");
+    head.append(el("h3", "", provider.label));
+    if (provider.plan) head.append(el("span", "quota-plan", provider.plan));
+    card.append(head);
+    if (provider.kind === "balance") {
+      const currency = provider.currency === "CNY" ? "¥" : provider.currency === "USD" ? "$" : (provider.currency || "");
+      card.append(el("p", "quota-amount", provider.amount === null ? "暂不可用" : currency + Number(provider.amount).toFixed(2)));
+    } else if (provider.kind === "quota") {
+      for (const window of provider.windows) {
+        const used = Number(window.used_percent);
+        const level = used >= 90 ? "danger" : used >= 70 ? "warning" : "normal";
+        const item = el("div", "quota-window " + level);
+        const caption = el("div", "quota-window-caption");
+        caption.append(el("span", "", window.label), el("span", "quota-percent", used.toFixed(1) + "%"));
+        const track = el("div", "quota-track");
+        track.setAttribute("role", "progressbar");
+        track.setAttribute("aria-label", provider.label + " · " + window.label);
+        track.setAttribute("aria-valuemin", "0");
+        track.setAttribute("aria-valuemax", "100");
+        const clamped = Math.min(100, Math.max(0, used));
+        track.setAttribute("aria-valuenow", String(clamped));
+        track.setAttribute("aria-valuetext", used.toFixed(1) + "% 已使用");
+        const fill = el("div", "quota-fill");
+        fill.style.width = clamped + "%";
+        track.append(fill);
+        item.append(caption, track);
+        if (window.reset_at) {
+          const reset = new Date(window.reset_at).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }).replace(/\//g, "-");
+          item.append(el("p", "quota-reset", "· 重置于 " + reset));
+        }
+        card.append(item);
+      }
+    } else if (provider.kind === "error") {
+      card.append(el("p", "quota-error", provider.error || "额度信息暂不可用"));
+    }
+    row.append(card);
+  }
+}
+
+async function loadProviderQuotas() {
+  const request = ++usageDashboardState.quotaRequest;
+  const current = () => request === usageDashboardState.quotaRequest && usageDashboardState.open;
+  try {
+    const res = await apiFor(state.workspace, "/api/provider-quotas");
+    if (!current()) return;
+    if (res.status === 404) { $("quotaCards").hidden = true; return; }
+    if (!res.ok) throw new Error("额度信息暂不可用（HTTP " + res.status + "）");
+    const data = await res.json();
+    if (!current()) return;
+    if (!Array.isArray(data.providers)) throw new Error();
+    renderQuotaCards(data.providers);
+  } catch (error) {
+    if (!current()) return;
+    $("quotaCardsRow").replaceChildren(el("p", "quota-unavailable", /^额度信息暂不可用（HTTP \d+）$/.test(error?.message) ? error.message : "额度信息暂不可用"));
+    $("quotaCards").hidden = false;
+  }
+}
+
 async function loadUsageDashboard() {
   if (!usageDashboardState.open) return;
+  loadProviderQuotas();
   const request = ++usageDashboardState.request;
   destroyUsageVisuals();
   els.usageContent.hidden = true;
