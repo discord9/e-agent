@@ -431,11 +431,12 @@ A read-only role gets no `write_file`/`edit_file` tools. Its `bash`, when the
 sandbox is enabled, runs in a narrowed bubblewrap policy: the workspace is
 mounted read-only, extra writable roots are dropped, and the network is
 disabled (`--unshare-net`). `read_file`, `get_background_tasks`,
-`cancel_background_task`, and `web_search` (when configured) stay available —
-`web_search` deliberately still reaches the network. Background bash commands
-started inside the subagent inherit the role's narrowed sandbox too (they
-never fall back to the parent's wider policy). If the sandbox is not enabled
-(or bwrap is unavailable), a read-only role gets **no `bash` tool at all** —
+`cancel_background_task`, `web_search` (when configured) and DeepSeek's
+`web_fetch` stay available — both deliberately still reach the network.
+Background bash commands started inside the subagent inherit the role's
+narrowed sandbox too (they never fall back to the parent's wider policy). If
+the sandbox is not enabled (or bwrap is unavailable), a read-only role gets
+**no `bash` tool at all** —
 fail closed rather than an unsandboxed shell.
 
 Read-only is a tool boundary, not a host security framework: it constrains
@@ -749,7 +750,7 @@ configured:
 
 ```toml
 [web_search]
-provider = "searxng"                 # default: "exa"
+provider = "searxng"                 # default: "exa"; or "deepseek"
 base_url = "http://127.0.0.1:8088"   # SearXNG only; no API key needed
 ```
 
@@ -763,8 +764,23 @@ and the `results` array (title/url/content) is returned as plain text. To stand
 up a local instance (uv + systemd `--user`), run
 `scripts/setup-searxng.sh`; it prints the config snippet above when done.
 An unknown `provider` value is a config error. OpenCode's own Exa configuration
-is not inherited. Configured local MCP servers may add their tools to the
-main agent separately.
+is not inherited, and the backend never falls back to another provider: switch
+`provider` explicitly.
+
+With `provider = "deepseek"`, `api_key_file` / `api_key_env` supply the
+DeepSeek key (same rules as Exa, again with a configured process env winning),
+and `base_url` is a config error because both endpoints are fixed at
+`https://api.deepseek.com/v1/tools/{search,fetch}`. This backend registers two
+tools: `web_search` posts the query with a fixed `count = 5` and
+`need_content = false` and returns title/URL/summary(/date) as plain text, and
+the separate `web_fetch` tool takes one required `url` and returns the page
+title plus Markdown. Both truncate output at 64 KiB and redact the key from
+upstream error text; `web_fetch` also validates that the URL is `http(s)` and
+is at most 8192 characters. `web_fetch` exists only on the
+DeepSeek backend (Exa and SearXNG have no fetch endpoint); like `web_search`,
+it is available to read-only sessions and subagents because it is a network
+read. Configured local MCP servers may add their tools to the main agent
+separately.
 The three file tools use a capability-relative directory rooted at the
 canonical workspace (the current directory by default). At startup, e-agent
 loads a non-empty `AGENTS.md` from that workspace root into the system context
@@ -930,15 +946,16 @@ parent's role.
 - The compile stage mounts the host rustc/rustup toolchain and runs with its PATH/RUSTUP_HOME; the run stage gets PATH `/bin:/usr/bin` and no toolchain mounts added by run_rust, so Cargo/toolchain is not supplied on the run-stage PATH/mounts (the prebuilt `/tmp/runner` and `/tmp/main` still run on system runtime libraries; no claim against a user-supplied cargo binary invoked by explicit path). No Cargo/crates, stdin, background/daemon execution, or custom env/mount/cwd/timeout; 60-second compile / 30-second run timeouts kill the group, reap, bound the drain, and confirm the group is gone before removing the scratch (uncertain teardown retains/quarantines it); output capped at 24 KiB head + 8 KiB tail. The run status is an in-sandbox wrapper over a private inherited socketpair (dumpable-off + CLOEXEC before exec, so no descendant can forge; exactly one packet then EOF, gated on outer bwrap exit 0), so an explicit `process::exit(134)` is never misreported as a signal; the result reports the source SHA-256, the stable commands, both stage statuses and captured output — the source text is not repeated.
 - Enabling `[code_mode]` fails closed at startup without Linux+bwrap+rustc; experimental, Linux-only, main-agent-only, no sandbox-escape model claimed beyond the exact bwrap policy above.
 
-Every `web_search` query is disclosed to the configured backend — Exa, or the
+Every `web_search` query is disclosed to the configured backend — Exa, the
 SearXNG instance from `[web_search] base_url` (which forwards it to its
-upstream search engines). Never include credentials, tokens, private repository
-contents, customer data, personal data, private issue text, or internal URLs.
-Returned text is untrusted web content:
-it may contain prompt injection, insecure code, or false claims. The tool does
-not open links, execute returned code, or fetch arbitrary URLs. This guidance
-is not a sandbox and cannot guarantee that a model will not disclose sensitive
-context.
+upstream search engines), or DeepSeek. `web_fetch` (DeepSeek only) also sends
+the requested URL to DeepSeek, which retrieves the page. Never include
+credentials, tokens, private repository contents, customer data, personal data,
+private issue text, or internal URLs. Returned text is untrusted web content:
+it may contain prompt injection, insecure code, or false claims. Apart from
+`web_fetch`'s explicit URL argument, the tools do not open links, execute
+returned code, or fetch arbitrary URLs. This guidance is not a sandbox and
+cannot guarantee that a model will not disclose sensitive context.
 
 ## Background tasks
 
@@ -1753,12 +1770,16 @@ wholesale and the last good config is kept).
 Reasoning-model `reasoning_content` is persisted in the session for
 display/audit; it is never sent back to the API, except by an explicit
 `deepseek_compat = true` thinking-mode tool-call profile (see Run).
-Web search deliberately has no browser, crawler, URL fetch, citations, domain
-filters, provider registry or provider trait, fallback chain between backends,
-third provider, retries, cache, background search, or remote MCP support: it
-has exactly the two config-selected backends documented above (`exa`, the
-default, and `searxng`) and no per-engine behavior differences are
-special-cased. The one SearXNG diagnostic exception: when `results` is empty
+Web search deliberately has no browser, crawler, citations, domain filters,
+provider registry or provider trait, fallback chain between backends, third
+search provider, retries, cache, background search, or remote MCP support: it
+has exactly the three config-selected backends documented above (`exa`, the
+default; `searxng`; and `deepseek`, which additionally registers the separate
+`web_fetch` tool) and no per-engine behavior differences are special-cased.
+`web_fetch` is deliberately one DeepSeek-side retrieval of the single
+model-supplied `http(s)` URL: no JavaScript/browser rendering, no crawling or
+link following, no robots.txt handling, no per-site rules, no retries, and no
+cache. The one SearXNG diagnostic exception: when `results` is empty
 while `unresponsive_engines` is non-empty, the tool output names the failed
 engines and reasons instead of a bare `no results`, so a broken backend is
 distinguishable from a genuinely empty query; a non-empty result set is

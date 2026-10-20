@@ -30,7 +30,8 @@ use crate::model::{ConfiguredModel, OpenAiModel};
 use crate::runner::{IdlePolicy, SessionBootstrap, SessionHandle, SessionRunner};
 use crate::session_store::SessionStore;
 use crate::tools::{
-    BackgroundTasks, SEARXNG_BASE_URL_ENV, add_root_user_input_tool, builtins_with_bash_timeout,
+    BackgroundTasks, DEEPSEEK_API_KEY_ENV, SEARXNG_BASE_URL_ENV, add_root_user_input_tool,
+    builtins_with_bash_timeout,
 };
 use crate::workspace::Workspace;
 
@@ -279,22 +280,35 @@ impl SessionFactory {
             .unwrap_or_default();
         // Web search reads its backend from the process env (tools.rs and
         // subagents pick it up there): EXA_API_KEY for the default Exa
-        // provider, and the internal `E_AGENT_SEARXNG_BASE_URL` for
-        // `[web_search] provider = "searxng"`. The section is validated once
-        // here, which keeps the single transport mechanism and avoids
-        // threading the setting through every tools constructor. Startup is
-        // single-threaded, so set_var is safe.
+        // provider, the internal `E_AGENT_SEARXNG_BASE_URL` for
+        // `[web_search] provider = "searxng"`, and the internal
+        // `E_AGENT_DEEPSEEK_API_KEY` for `provider = "deepseek"`. The
+        // section is validated once here, which keeps the single transport
+        // mechanism and avoids threading the setting through every tools
+        // constructor. Startup is single-threaded, so set_var is safe.
         if let Some(config) = &config {
-            if let Some(WebSearchProvider::Searxng { base_url }) = config.web_search_provider()?
-                && std::env::var_os(SEARXNG_BASE_URL_ENV).is_none()
-            {
-                unsafe { std::env::set_var(SEARXNG_BASE_URL_ENV, base_url) };
-            }
-            // Process env EXA_API_KEY still wins over a configured Exa key.
-            if std::env::var_os("EXA_API_KEY").is_none()
-                && let Some(key) = config.web_search_key()?
-            {
-                unsafe { std::env::set_var("EXA_API_KEY", key) };
+            match config.web_search_provider()? {
+                Some(WebSearchProvider::Searxng { base_url }) => {
+                    if std::env::var_os(SEARXNG_BASE_URL_ENV).is_none() {
+                        unsafe { std::env::set_var(SEARXNG_BASE_URL_ENV, base_url) };
+                    }
+                }
+                // Process env still wins over a configured key, and an
+                // absent `[web_search]` section resolves to no key at all.
+                Some(WebSearchProvider::Exa) | None => {
+                    if std::env::var_os("EXA_API_KEY").is_none()
+                        && let Some(key) = config.web_search_key()?
+                    {
+                        unsafe { std::env::set_var("EXA_API_KEY", key) };
+                    }
+                }
+                Some(WebSearchProvider::Deepseek) => {
+                    if std::env::var_os(DEEPSEEK_API_KEY_ENV).is_none()
+                        && let Some(key) = config.web_search_key()?
+                    {
+                        unsafe { std::env::set_var(DEEPSEEK_API_KEY_ENV, key) };
+                    }
+                }
             }
         }
         let (runtime, auth) = match &config {
@@ -1527,15 +1541,23 @@ fn apply_reloaded_config(
         return ReloadResult::Reloaded;
     };
     // Mirror the startup web-search gate: provider/base_url validation
-    // always applies, and a malformed Exa key section is a config error when
-    // process env EXA_API_KEY does not shadow it. The resolved values are
-    // NOT re-injected at runtime — `std::env::set_var` is only safe at
-    // startup (single-threaded), so web-search backend changes still need a
-    // restart.
-    if let Err(error) = config.web_search_provider() {
-        return ReloadResult::Rejected(format!("{error:#}"));
-    }
-    if std::env::var_os("EXA_API_KEY").is_none()
+    // always applies, and a provider key section that is malformed is a
+    // config error when the matching internal/process env variable does not
+    // shadow it (EXA_API_KEY for Exa, the internal DeepSeek key for
+    // DeepSeek, no key at all for SearXNG). The resolved values are NOT
+    // re-injected at runtime — `std::env::set_var` is only safe at startup
+    // (single-threaded), so web-search backend changes still need a restart.
+    let web_search_provider = match config.web_search_provider() {
+        Ok(provider) => provider,
+        Err(error) => return ReloadResult::Rejected(format!("{error:#}")),
+    };
+    let key_env = match &web_search_provider {
+        Some(WebSearchProvider::Searxng { .. }) => None,
+        Some(WebSearchProvider::Deepseek) => Some(DEEPSEEK_API_KEY_ENV),
+        Some(WebSearchProvider::Exa) | None => Some("EXA_API_KEY"),
+    };
+    if let Some(variable) = key_env
+        && std::env::var_os(variable).is_none()
         && let Err(error) = config.web_search_key()
     {
         return ReloadResult::Rejected(format!("{error:#}"));

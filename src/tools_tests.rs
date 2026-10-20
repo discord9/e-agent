@@ -412,6 +412,330 @@ async fn searxng_empty_results_without_engine_failures_stay_bare() {
     }
 }
 
+fn deepseek_search(base: String) -> WebSearch {
+    WebSearch::for_test_deepseek("test-api-key".into(), base, Duration::from_secs(1))
+}
+
+fn deepseek_fetch(base: String) -> WebFetch {
+    WebFetch::for_test("test-api-key".into(), base, Duration::from_secs(1))
+}
+
+/// A POST-capable server whose URL has no path: the DeepSeek tools append
+/// `/v1/tools/search` / `/v1/tools/fetch` themselves.
+async fn deepseek_server(response: Vec<u8>) -> (String, tokio::task::JoinHandle<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let request = read_http_request(&mut socket).await;
+        let _ = socket.write_all(&response).await;
+        request
+    });
+    (base, task)
+}
+
+/// Split a captured HTTP request into (head, JSON body).
+fn request_parts(request: &[u8]) -> (String, Value) {
+    let header_end = request
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .unwrap()
+        + 4;
+    let head = std::str::from_utf8(&request[..header_end])
+        .unwrap()
+        .to_owned();
+    let body: Value = serde_json::from_slice(&request[header_end..]).unwrap();
+    (head, body)
+}
+
+#[test]
+fn web_search_source_priority_is_deepseek_then_searxng_then_exa() {
+    let resolve = |deepseek: Option<&str>, searxng: Option<&str>, exa: Option<&str>| {
+        web_search_source_from(
+            deepseek.map(str::to_owned),
+            searxng.map(str::to_owned),
+            exa.map(str::to_owned),
+        )
+    };
+    assert_eq!(
+        resolve(Some(" ds-key "), Some("http://sx"), Some("exa-key")),
+        Some(WebSearchSource::Deepseek("ds-key".into()))
+    );
+    assert_eq!(
+        resolve(None, Some("http://sx"), Some("exa-key")),
+        Some(WebSearchSource::Searxng("http://sx".into()))
+    );
+    assert_eq!(
+        resolve(None, None, Some("exa-key")),
+        Some(WebSearchSource::Exa("exa-key".into()))
+    );
+    // Blank values are ignored, so an unconfigured DeepSeek backend leaves
+    // the existing Exa/SearXNG behavior untouched.
+    assert_eq!(
+        resolve(Some("   "), Some("  "), Some("exa-key")),
+        Some(WebSearchSource::Exa("exa-key".into()))
+    );
+    assert_eq!(resolve(None, None, None), None);
+}
+
+#[test]
+fn deepseek_registration_registers_web_fetch_next_to_web_search() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(temp.path()).unwrap();
+    let tool_names = |source: Option<WebSearchSource>| -> Vec<String> {
+        let (tools, _) =
+            builtins_with_web_search(workspace.clone(), source, None, false, None, None);
+        tools.iter().map(|tool| tool.spec().name).collect()
+    };
+
+    // DeepSeek registers the fetch tool right after web_search.
+    let names = tool_names(Some(WebSearchSource::Deepseek(" key ".into())));
+    let search_at = names
+        .iter()
+        .position(|name| name == "web_search")
+        .expect("deepseek registers web_search");
+    assert_eq!(names[search_at + 1], "web_fetch");
+
+    // A blank key registers neither, exactly like a blank Exa key.
+    let names = tool_names(Some(WebSearchSource::Deepseek("   ".into())));
+    assert!(!names.iter().any(|name| name == "web_search"), "{names:?}");
+    assert!(!names.iter().any(|name| name == "web_fetch"), "{names:?}");
+
+    // Exa and SearXNG keep web_search only: no fetch backend exists for them.
+    for source in [
+        Some(WebSearchSource::Exa("key".into())),
+        Some(WebSearchSource::Searxng("http://127.0.0.1:8088".into())),
+    ] {
+        let names = tool_names(source);
+        assert!(names.iter().any(|name| name == "web_search"), "{names:?}");
+        assert!(!names.iter().any(|name| name == "web_fetch"), "{names:?}");
+    }
+}
+
+#[tokio::test]
+async fn deepseek_search_sends_count_and_need_content_and_formats_results() {
+    let (base, server) = deepseek_server(http_response(
+        "200 OK",
+        br#"{"results":[
+            {"title":"Rust ownership","url":"https://doc.rust-lang.org/book/ch04-00.html","summary":" Ownership rules. ","date":"2024-01-02","content":"raw page body","site_name":"docs","authority":"high","rerank_score":0.9},
+            {"title":" Borrowing ","url":"https://example.test/borrow","summary":"References."}
+        ]}"#,
+    ))
+    .await;
+    let result = deepseek_search(base)
+        .execute(json!({"query": "  rust ownership  "}))
+        .await
+        .unwrap();
+    // Title, URL, summary and the optional date; no JSON, no raw response and
+    // no `content`.
+    assert_eq!(
+        result.content,
+        "Rust ownership\nhttps://doc.rust-lang.org/book/ch04-00.html\nOwnership rules.\n2024-01-02\n\nBorrowing\nhttps://example.test/borrow\nReferences."
+    );
+    assert!(!result.content.contains("raw page body"));
+
+    let (head, body) = request_parts(&server.await.unwrap());
+    assert!(
+        head.starts_with("POST /v1/tools/search HTTP/1.1\r\n"),
+        "{head}"
+    );
+    assert!(
+        head.contains("authorization: Bearer test-api-key\r\n"),
+        "{head}"
+    );
+    assert!(
+        head.contains("content-type: application/json\r\n"),
+        "{head}"
+    );
+    assert_eq!(
+        body,
+        json!({"query": "rust ownership", "count": 5, "need_content": false})
+    );
+}
+
+#[tokio::test]
+async fn deepseek_empty_results_stay_bare() {
+    for body in [
+        // Field absent ...
+        br#"{}"#.as_slice(),
+        // ... and present but empty.
+        br#"{"results":[]}"#.as_slice(),
+    ] {
+        let (base, _server) = deepseek_server(http_response("200 OK", body)).await;
+        let result = deepseek_search(base)
+            .execute(json!({"query": "nothing matches this"}))
+            .await
+            .unwrap();
+        assert_eq!(result.content, "no results");
+    }
+}
+
+#[tokio::test]
+async fn deepseek_fetch_posts_the_url_and_returns_title_and_markdown() {
+    let (base, server) = deepseek_server(http_response(
+        "200 OK",
+        br##"{"title":"Page title","content":"# Heading\n\nBody text."}"##,
+    ))
+    .await;
+    let result = deepseek_fetch(base)
+        .execute(json!({"url": "  https://example.test/page  "}))
+        .await
+        .unwrap();
+    assert_eq!(result.content, "Page title\n\n# Heading\n\nBody text.");
+
+    let (head, body) = request_parts(&server.await.unwrap());
+    assert!(
+        head.starts_with("POST /v1/tools/fetch HTTP/1.1\r\n"),
+        "{head}"
+    );
+    assert!(
+        head.contains("authorization: Bearer test-api-key\r\n"),
+        "{head}"
+    );
+    assert_eq!(body, json!({"url": "https://example.test/page"}));
+}
+
+#[tokio::test]
+async fn web_fetch_spec_exposes_only_a_required_url() {
+    let spec = WebFetch::deepseek("key".into()).spec();
+    assert_eq!(spec.name, "web_fetch");
+    assert_eq!(
+        spec.parameters,
+        json!({
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "An absolute http or https URL."
+                }
+            },
+            "required": ["url"],
+            "additionalProperties": false
+        })
+    );
+}
+
+#[tokio::test]
+async fn web_fetch_validates_the_url_before_connecting() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let tool = deepseek_fetch(base);
+    for arguments in [
+        json!({"url": ""}),
+        json!({"url": "   "}),
+        json!({"url": 7}),
+        json!({"url": "example.test/page"}),
+        json!({"url": "ftp://example.test/page"}),
+        json!({"url": "file:///etc/passwd"}),
+        json!({"url": format!("https://example.test/{}", "a".repeat(WEB_FETCH_URL_LIMIT))}),
+    ] {
+        assert!(tool.execute(arguments).await.is_err());
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err(),
+        "an invalid URL must not reach the network"
+    );
+}
+
+#[tokio::test]
+async fn deepseek_errors_are_bounded_and_redact_the_key() {
+    for status in ["401 Unauthorized", "429 Too Many Requests"] {
+        let (base, server) = deepseek_server(http_response(
+            status,
+            format!(r#"{{"error":{{"message":"bad key test-api-key","type":"auth"}}}} ({status})"#),
+        ))
+        .await;
+        let error = deepseek_search(base)
+            .execute(json!({"query": "public query"}))
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains(status.split_whitespace().next().unwrap()),
+            "{error}"
+        );
+        assert!(error.contains("bad key"), "{error}");
+        assert!(!error.contains("test-api-key"), "{error}");
+        server.await.unwrap();
+    }
+
+    let (base, server) = deepseek_server(http_response(
+        "500 Internal Server Error",
+        "fetch failed for test-api-key",
+    ))
+    .await;
+    let error = deepseek_fetch(base)
+        .execute(json!({"url": "https://example.test/page"}))
+        .await
+        .unwrap_err();
+    assert!(
+        error.starts_with("web fetch failed with status 500 Internal Server Error"),
+        "{error}"
+    );
+    assert!(!error.contains("test-api-key"), "{error}");
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn deepseek_caps_success_and_error_bodies() {
+    // A summary larger than OUTPUT_LIMIT is truncated with the shared marker.
+    let summary = "界".repeat(OUTPUT_LIMIT / 2);
+    let response = json!({"results": [{"title": "big", "summary": summary}]}).to_string();
+    let (base, server) = deepseek_server(http_response("200 OK", response)).await;
+    let result = deepseek_search(base)
+        .execute(json!({"query": "public query"}))
+        .await
+        .unwrap();
+    assert!(result.content.len() <= OUTPUT_LIMIT);
+    assert!(result.content.is_char_boundary(result.content.len()));
+    assert!(result.content.ends_with("\n...[truncated]"));
+    server.await.unwrap();
+
+    // Both tools reject a response body past the shared response limit.
+    let response =
+        json!({"results": [{"summary": "x".repeat(WEB_SEARCH_RESPONSE_LIMIT * 2)}]}).to_string();
+    let (base, server) = deepseek_server(http_response("200 OK", response)).await;
+    assert!(
+        deepseek_search(base)
+            .execute(json!({"query": "public query"}))
+            .await
+            .unwrap_err()
+            .contains("web search response body exceeds")
+    );
+    server.await.unwrap();
+
+    let response =
+        json!({"title": "big", "content": "x".repeat(WEB_SEARCH_RESPONSE_LIMIT * 2)}).to_string();
+    let (base, server) = deepseek_server(http_response("200 OK", response)).await;
+    assert!(
+        deepseek_fetch(base)
+            .execute(json!({"url": "https://example.test/page"}))
+            .await
+            .unwrap_err()
+            .contains("web fetch response body exceeds")
+    );
+    server.await.unwrap();
+
+    // An oversized error body is bounded like the Exa preview.
+    let (base, server) = deepseek_server(http_response(
+        "500 Internal Server Error",
+        "e".repeat(WEB_SEARCH_ERROR_PREVIEW_LIMIT * 2),
+    ))
+    .await;
+    let error = deepseek_search(base)
+        .execute(json!({"query": "public query"}))
+        .await
+        .unwrap_err();
+    assert!(
+        error.len()
+            <= "web search failed with status 500 Internal Server Error: ".len()
+                + WEB_SEARCH_ERROR_PREVIEW_LIMIT
+    );
+    assert!(error.ends_with("\n...[truncated]"));
+    server.await.unwrap();
+}
+
 #[tokio::test]
 async fn web_search_sends_the_expected_request_and_returns_response() {
     let (endpoint, server) = web_server(

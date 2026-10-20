@@ -292,9 +292,10 @@ fn default_true() -> bool {
 
 #[derive(Clone, Debug, Deserialize)]
 struct WebSearch {
-    /// Backend: `"exa"` (default when absent) or `"searxng"`.
+    /// Backend: `"exa"` (default when absent), `"searxng"` or `"deepseek"`.
     provider: Option<String>,
     /// SearXNG only: the base URL, e.g. `http://127.0.0.1:8088`.
+    /// Rejected for `provider = "deepseek"`, whose endpoints are fixed.
     base_url: Option<String>,
     api_key_file: Option<PathBuf>,
     api_key_env: Option<String>,
@@ -307,6 +308,10 @@ pub enum WebSearchProvider {
     Exa,
     /// SearXNG: searches go to `{base_url}/search` with no credential.
     Searxng { base_url: String },
+    /// DeepSeek: `tools/search` plus `tools/fetch` at the fixed
+    /// `https://api.deepseek.com` endpoints; the credential comes from
+    /// `web_search_key`.
+    Deepseek,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -599,9 +604,10 @@ impl Config {
     /// The provider selected by `[web_search]`, or None when the section is
     /// absent; `exa` is the default when `provider` is unset. Validated
     /// without resolving credentials: `provider = "searxng"` requires
-    /// `base_url` and forbids `api_key_file` / `api_key_env`, and any other
-    /// provider value is a config error. The Exa key itself comes from
-    /// [`Self::web_search_key`].
+    /// `base_url` and forbids `api_key_file` / `api_key_env`,
+    /// `provider = "deepseek"` forbids `base_url` (its endpoints are fixed),
+    /// and any other provider value is a config error. Credentials come from
+    /// [`Self::web_search_key`] for both `exa` and `deepseek`.
     pub fn web_search_provider(&self) -> anyhow::Result<Option<WebSearchProvider>> {
         let Some(web_search) = &self.web_search else {
             return Ok(None);
@@ -626,23 +632,36 @@ impl Config {
                     base_url: base_url.to_owned(),
                 }))
             }
+            Some("deepseek") => {
+                if web_search
+                    .base_url
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|base_url| !base_url.is_empty())
+                {
+                    bail!(
+                        "[web_search] provider `deepseek` must not set `base_url` (the DeepSeek Search/Fetch endpoints are fixed at https://api.deepseek.com)"
+                    );
+                }
+                Ok(Some(WebSearchProvider::Deepseek))
+            }
             Some(provider) => bail!(
-                "[web_search] provider `{provider}` is not supported (expected `exa` or `searxng`)"
+                "[web_search] provider `{provider}` is not supported (expected `exa`, `searxng` or `deepseek`)"
             ),
         }
     }
 
-    /// The Exa web-search API key from `[web_search]`, or None when the
-    /// section is absent or selects the SearXNG provider. Process env
-    /// `EXA_API_KEY` always wins over this (callers check it first). Exactly
-    /// one of `api_key_file` / `api_key_env` must be set for the Exa
-    /// provider.
+    /// The web-search API key from `[web_search]` (Exa or DeepSeek), or None
+    /// when the section is absent or selects the SearXNG provider. Process
+    /// env `EXA_API_KEY` always wins over this for Exa (callers check it
+    /// first). Exactly one of `api_key_file` / `api_key_env` must be set for
+    /// the Exa and DeepSeek providers.
     pub fn web_search_key(&self) -> anyhow::Result<Option<String>> {
-        if matches!(
-            self.web_search_provider()?,
-            Some(WebSearchProvider::Searxng { .. }) | None
-        ) {
-            return Ok(None);
+        match self.web_search_provider()? {
+            // SearXNG carries no credential; an absent section has nothing
+            // to resolve.
+            Some(WebSearchProvider::Searxng { .. }) | None => return Ok(None),
+            Some(WebSearchProvider::Exa) | Some(WebSearchProvider::Deepseek) => {}
         }
         let Some(web_search) = &self.web_search else {
             return Ok(None);

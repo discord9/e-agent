@@ -68,11 +68,13 @@ const READ_LIMIT: usize = 64 * 1024;
 const DEFAULT_READ_LINES: usize = 2000;
 const OUTPUT_LIMIT: usize = 64 * 1024;
 
-/// Resolved `web_search` backend: the Exa API key or a SearXNG base URL.
+/// Resolved web-search backend: the Exa API key, a SearXNG base URL, or a
+/// DeepSeek API key (which serves both `web_search` and `web_fetch`).
 /// The session factory resolves `[web_search]` once at startup and hands
 /// the setting over via the process environment (see
-/// [`SEARXNG_BASE_URL_ENV`]); the registration helpers below take it
-/// explicitly, so both backends are testable without touching the env.
+/// [`SEARXNG_BASE_URL_ENV`] and [`DEEPSEEK_API_KEY_ENV`]); the registration
+/// helpers below take it explicitly, so every backend stays testable without
+/// touching the env.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum WebSearchSource {
     /// Exa (the default provider): the API key.
@@ -80,20 +82,40 @@ pub(super) enum WebSearchSource {
     /// SearXNG: the base URL; requests go to `{base_url}/search` and carry
     /// no credential.
     Searxng(String),
+    /// DeepSeek: the API key used by `tools/search` and `tools/fetch`.
+    Deepseek(String),
 }
 
 impl WebSearchSource {
-    /// The registered tool, or None when the configured value is blank
-    /// (the tool stays unregistered, exactly like an absent Exa key).
-    fn into_tool(self) -> Option<WebSearch> {
+    /// The registered tool(s), empty when the configured value is blank (the
+    /// tools stay unregistered, exactly like an absent Exa key). DeepSeek
+    /// registers `web_fetch` next to `web_search`; Exa and SearXNG have no
+    /// fetch backend, so `web_fetch` is never registered for them.
+    fn into_tools(self) -> Vec<Box<dyn Tool>> {
         match self {
             Self::Exa(key) => {
                 let key = key.trim().to_owned();
-                (!key.is_empty()).then(|| WebSearch::new(key))
+                if key.is_empty() {
+                    return Vec::new();
+                }
+                vec![Box::new(WebSearch::new(key))]
             }
             Self::Searxng(base_url) => {
                 let base_url = base_url.trim().to_owned();
-                (!base_url.is_empty()).then(|| WebSearch::searxng(base_url))
+                if base_url.is_empty() {
+                    return Vec::new();
+                }
+                vec![Box::new(WebSearch::searxng(base_url))]
+            }
+            Self::Deepseek(key) => {
+                let key = key.trim().to_owned();
+                if key.is_empty() {
+                    return Vec::new();
+                }
+                vec![
+                    Box::new(WebSearch::deepseek(key.clone())),
+                    Box::new(WebFetch::deepseek(key)),
+                ]
             }
         }
     }
@@ -105,19 +127,41 @@ impl WebSearchSource {
 /// same backend. It is internal plumbing, never a user-facing knob.
 pub(crate) const SEARXNG_BASE_URL_ENV: &str = "E_AGENT_SEARXNG_BASE_URL";
 
+/// Internal transport for a config-selected DeepSeek backend: the session
+/// factory sets this variable once at startup (single-threaded, like
+/// `EXA_API_KEY`) so subagent sessions, which load no global config, see the
+/// same backend. It is internal plumbing, never a user-facing knob: users
+/// configure `[web_search] provider = "deepseek"` plus a key file/env.
+pub(crate) const DEEPSEEK_API_KEY_ENV: &str = "E_AGENT_DEEPSEEK_API_KEY";
+
 /// The resolved web-search backend from the process environment: the
-/// internal SearXNG base URL (an explicit `[web_search] provider` choice)
-/// wins over `EXA_API_KEY`; blank values are ignored.
+/// internal DeepSeek key (an explicit `[web_search] provider` choice) wins
+/// over the internal SearXNG base URL, which wins over `EXA_API_KEY`.
 fn web_search_source_from_env() -> Option<WebSearchSource> {
-    let env_value = |name: &str| {
-        std::env::var(name)
-            .ok()
+    web_search_source_from(
+        std::env::var(DEEPSEEK_API_KEY_ENV).ok(),
+        std::env::var(SEARXNG_BASE_URL_ENV).ok(),
+        std::env::var("EXA_API_KEY").ok(),
+    )
+}
+
+/// Priority: deepseek > searxng > exa, so an unconfigured DeepSeek backend
+/// leaves the existing Exa/SearXNG behavior untouched. Blank values are
+/// ignored (a blank internal variable falls through to the next backend).
+fn web_search_source_from(
+    deepseek_key: Option<String>,
+    searxng_base_url: Option<String>,
+    exa_key: Option<String>,
+) -> Option<WebSearchSource> {
+    let usable = |value: Option<String>| {
+        value
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
     };
-    env_value(SEARXNG_BASE_URL_ENV)
-        .map(WebSearchSource::Searxng)
-        .or_else(|| env_value("EXA_API_KEY").map(WebSearchSource::Exa))
+    usable(deepseek_key)
+        .map(WebSearchSource::Deepseek)
+        .or_else(|| usable(searxng_base_url).map(WebSearchSource::Searxng))
+        .or_else(|| usable(exa_key).map(WebSearchSource::Exa))
 }
 
 /// Check whether bwrap is installed and user namespaces work.
@@ -329,9 +373,9 @@ fn tools_with_background_and_web_search(
     {
         tools.push(tool);
     }
-    if let Some(tool) = web_search.and_then(WebSearchSource::into_tool) {
-        tools.push(Box::new(tool));
-    }
+    // Web search backends: `web_search` for Exa/SearXNG/DeepSeek, and
+    // `web_fetch` only for DeepSeek (the sole fetch backend).
+    tools.extend(web_search.into_iter().flat_map(WebSearchSource::into_tools));
     // Goal tools ride on every session (main + subagents): each session's
     // runner executes them against ITS OWN goal state, so a subagent can
     // never touch its parent's goal.
