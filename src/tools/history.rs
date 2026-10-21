@@ -24,7 +24,7 @@ impl Tool for History {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "history".into(),
-            description: "Read logical transcripts. An omitted `scope` means `session`; omitted `workspace_id`/`session_id` default to the current workspace/session (in session scope, a `workspace_id` other than the current workspace requires `session_id`). list/search/read return provenance, list/search return `next_cursor`, and `global` searches this configured store only. A search is bounded to 60 seconds; a timeout is an explicit error, never an empty or partial result.".into(),
+            description: "Read logical transcripts. An omitted `scope` means `session`; omitted `workspace_id`/`session_id` default to the current workspace/session (in session scope, a `workspace_id` other than the current workspace requires `session_id`). list/search/read return provenance, list/search return `next_cursor`, and `global` searches this configured store only. `search` matches `query` literally and case-sensitively over User content, Assistant text and tool calls (tool name plus the unparsed argument JSON), and Notice text; it does not search tool results, reasoning, or other fields. A search is bounded to 60 seconds; a timeout is an explicit error, never an empty or partial result.".into(),
             parameters: json!({
                 "type": "object",
                 "oneOf": [
@@ -620,6 +620,21 @@ mod tests {
             parameters["oneOf"][2]["properties"]["limit"]["maximum"],
             json!(100)
         );
+    }
+
+    #[test]
+    fn description_states_the_search_matching_contract() {
+        let description = History.spec().description;
+        for phrase in [
+            "literally and case-sensitively",
+            "User content",
+            "Assistant text and tool calls",
+            "unparsed argument JSON",
+            "Notice text",
+            "does not search tool results, reasoning",
+        ] {
+            assert!(description.contains(phrase), "{description}");
+        }
     }
 
     #[test]

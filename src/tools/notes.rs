@@ -14,6 +14,10 @@ use crate::workspace::Workspace;
 
 const DEFAULT_LIMIT: usize = 100;
 const READ_LIMIT: usize = 64 * 1024;
+/// A single search hit's content preview is capped at this many bytes.
+const SEARCH_HIT_LIMIT: usize = 4 * 1024;
+/// A single search stops accumulating matches after this many bytes.
+const SEARCH_MATCH_LIMIT: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CursorKind {
@@ -356,17 +360,29 @@ impl Notes {
         };
         let mut results = Vec::new();
         let mut errors = files.errors;
-        for path in files.paths {
+        let mut matched_bytes = 0usize;
+        'files: for path in files.paths {
             match self.note_text(Path::new(&path)) {
-                Ok(text) if text.len() > READ_LIMIT => Self::error(
-                    &mut errors,
-                    Path::new(&path),
-                    format!("note `{path}` exceeds the 64 KiB read limit"),
-                ),
                 Ok(text) => {
                     for (line, content) in text.lines().enumerate() {
                         if content.to_lowercase().contains(&query) {
-                            results.push(format!("{path}:{}: {content}", line + 1));
+                            let hit = format!(
+                                "{path}:{}: {}",
+                                line + 1,
+                                truncate_hit(content, SEARCH_HIT_LIMIT)
+                            );
+                            matched_bytes = matched_bytes.saturating_add(hit.len());
+                            results.push(hit);
+                            if matched_bytes > SEARCH_MATCH_LIMIT {
+                                Self::error(
+                                    &mut errors,
+                                    Path::new(&path),
+                                    format!(
+                                        "notes search stopped after {SEARCH_MATCH_LIMIT} bytes of matches; narrow the query or scope it to a smaller `path` (stopped at `{path}`)"
+                                    ),
+                                );
+                                break 'files;
+                            }
                         }
                     }
                 }
@@ -444,7 +460,7 @@ impl Tool for Notes {
         }
         ToolSpec {
             name: "notes".into(),
-            description: "Project-shared UTF-8 notes rooted at .e-agent/notes. List and search return deterministic pages with one process-local cursor per tool instance; a new list or search replaces it, and cursors are not persisted. Continuations accept only action, cursor, and limit. Read uses stateless UTF-8 byte paging. Write replaces a complete note and is unavailable in read-only roles.".into(),
+            description: "Project-shared UTF-8 notes rooted at .e-agent/notes. List and search return deterministic pages with one process-local cursor per tool instance; a new list or search replaces it, and cursors are not persisted. Continuations accept only action, cursor, and limit. Search matches the query as a case-insensitive substring of each line; a hit's content is previewed up to 4 KiB and marked `…[truncated]`, and one search stops after 1 MiB of matches with `incomplete` plus an error, so narrow the query and search again. Read uses stateless UTF-8 byte paging. Write replaces a complete note and is unavailable to read-only roles.".into(),
             parameters: json!({"type":"object", "properties":properties, "required":["action"]}),
         }
     }
@@ -472,6 +488,22 @@ impl Tool for Notes {
             _ => Err("notes action must be one of: list, read, search, write".into()),
         }
     }
+}
+
+/// Cap a search hit at `limit` bytes on a UTF-8 boundary, appending a marker.
+fn truncate_hit(text: &str, limit: usize) -> String {
+    const MARKER: &str = "…[truncated]";
+    if text.len() <= limit {
+        return text.to_owned();
+    }
+    let mut end = limit.saturating_sub(MARKER.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut output = String::with_capacity(end + MARKER.len());
+    output.push_str(&text[..end]);
+    output.push_str(MARKER);
+    output
 }
 
 #[cfg(test)]
@@ -783,13 +815,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn notes_search_distinguishes_invalid_notes_from_no_matches_and_oversize() {
+    async fn notes_search_distinguishes_invalid_notes_from_no_matches_and_scans_large_notes() {
         let temp = tempfile::tempdir().unwrap();
         let notes = tool(&temp, false);
         let root = temp.path().join(".e-agent/notes");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("invalid"), [0xff]).unwrap();
-        fs::write(root.join("large"), vec![b'x'; READ_LIMIT + 1]).unwrap();
+        let mut large = vec![b'x'; READ_LIMIT + 1];
+        large.extend_from_slice(b"\nneedle");
+        fs::write(root.join("large"), large).unwrap();
 
         let incomplete = output(
             notes
@@ -799,25 +833,19 @@ mod tests {
         );
         assert_eq!(incomplete["results"], json!([]));
         assert_eq!(incomplete["incomplete"], true);
-        assert_eq!(incomplete["errors"].as_array().unwrap().len(), 2);
-        assert_eq!(incomplete["errors"][0]["path"], "invalid");
-        assert!(
-            incomplete["errors"][1]["reason"]
-                .as_str()
-                .unwrap()
-                .contains("64 KiB")
+        assert_eq!(
+            incomplete["errors"],
+            json!([{"path": "invalid", "reason": "note `invalid` is not valid UTF-8"}])
         );
 
         fs::remove_file(root.join("invalid")).unwrap();
-        fs::remove_file(root.join("large")).unwrap();
-        fs::write(root.join("plain"), "unrelated").unwrap();
         let complete = output(
             notes
-                .execute(json!({"action":"search","query":"missing"}))
+                .execute(json!({"action":"search","query":"needle"}))
                 .await
                 .unwrap(),
         );
-        assert_eq!(complete["results"], json!([]));
+        assert_eq!(complete["results"], json!(["large:2: needle"]));
         assert_eq!(complete["incomplete"], false);
         assert_eq!(complete["errors"], json!([]));
     }
@@ -830,7 +858,9 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("a"), "hit").unwrap();
         fs::write(root.join("b"), [0xff]).unwrap();
-        fs::write(root.join("b-large"), vec![b'x'; READ_LIMIT + 1]).unwrap();
+        let mut large = vec![b'x'; READ_LIMIT + 1];
+        large.extend_from_slice(b"\nhit");
+        fs::write(root.join("b-large"), large).unwrap();
         fs::write(root.join("c"), "hit").unwrap();
 
         let first = output(
@@ -845,18 +875,91 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let errors = json!([
-            {"path": "b", "reason": "note `b` is not valid UTF-8"},
-            {"path": "b-large", "reason": "note `b-large` exceeds the 64 KiB read limit"}
-        ]);
+        let third = output(
+            notes
+                .execute(json!({"action":"search","cursor":second["cursor"],"limit":1}))
+                .await
+                .unwrap(),
+        );
+        let errors = json!([{"path": "b", "reason": "note `b` is not valid UTF-8"}]);
         assert_eq!(first["results"], json!(["a:1: hit"]));
-        assert_eq!(second["results"], json!(["c:1: hit"]));
+        assert_eq!(second["results"], json!(["b-large:2: hit"]));
+        assert_eq!(third["results"], json!(["c:1: hit"]));
         assert_eq!(first["errors"], errors);
         assert_eq!(second["errors"], errors);
+        assert_eq!(third["errors"], errors);
         assert_eq!(first["incomplete"], true);
         assert_eq!(second["incomplete"], true);
-        assert_eq!(second["has_more"], false);
-        assert_eq!(second["cursor"], Value::Null);
+        assert_eq!(third["incomplete"], true);
+        assert_eq!(third["has_more"], false);
+        assert_eq!(third["cursor"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn notes_search_truncates_a_giant_single_line_hit() {
+        let temp = tempfile::tempdir().unwrap();
+        let notes = tool(&temp, false);
+        let root = temp.path().join(".e-agent/notes");
+        fs::create_dir_all(&root).unwrap();
+        let mut giant = vec![b'x'; 200 * 1024];
+        giant.extend_from_slice(b"needle");
+        fs::write(root.join("giant"), giant).unwrap();
+
+        let result = output(
+            notes
+                .execute(json!({"action":"search","query":"needle","limit":1}))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(result["incomplete"], false);
+        assert_eq!(result["errors"], json!([]));
+        let hit = result["results"][0].as_str().unwrap();
+        let prefix = "giant:1: ";
+        let bound = prefix.len() + SEARCH_HIT_LIMIT + "…[truncated]".len();
+        assert!(
+            hit.len() <= bound,
+            "a {}-byte hit exceeds the {bound}-byte preview bound",
+            hit.len()
+        );
+        assert!(hit.starts_with(prefix));
+        assert!(hit.contains("…[truncated]"));
+    }
+
+    #[tokio::test]
+    async fn notes_search_stops_at_the_match_budget_and_says_so() {
+        let temp = tempfile::tempdir().unwrap();
+        let notes = tool(&temp, false);
+        let root = temp.path().join(".e-agent/notes");
+        fs::create_dir_all(&root).unwrap();
+        let line = format!("{}needle", "x".repeat(SEARCH_HIT_LIMIT - 8));
+        let total = SEARCH_MATCH_LIMIT / line.len() + 2;
+        for index in 0..total {
+            fs::write(root.join(format!("note{index:04}")), &line).unwrap();
+        }
+
+        let result = output(
+            notes
+                .execute(json!({"action":"search","query":"needle","limit":1}))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(result["incomplete"], true);
+        let errors = result["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("narrow the query")
+        );
+        let results = result["results"].as_array().unwrap();
+        assert!(!results.is_empty());
+        let returned: usize = results.iter().map(|hit| hit.as_str().unwrap().len()).sum();
+        let one_hit = "note0000:1: ".len() + SEARCH_HIT_LIMIT + "…[truncated]".len();
+        assert!(
+            returned <= SEARCH_MATCH_LIMIT + one_hit,
+            "{returned} returned bytes exceed the budget plus one hit"
+        );
     }
 
     #[tokio::test]
