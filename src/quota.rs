@@ -24,6 +24,12 @@ use crate::config::ProviderAccount;
 /// Per-request timeout; every provider is queried concurrently.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Total per-provider budget, covering both credential acquisition and the
+/// quota request. It is a ceiling on one card, not on the whole response:
+/// providers still run concurrently, so one slow account cannot stretch the
+/// endpoint beyond this budget.
+const PROVIDER_BUDGET: Duration = Duration::from_secs(20);
+
 const ERR_EXPIRED: &str = "API 密钥已过期，请重新生成";
 const ERR_UNAUTHORIZED: &str = "认证失败（HTTP 401）";
 const ERR_NOT_LOGGED_IN: &str = "未登录 ChatGPT（运行 e-agent login）";
@@ -32,6 +38,7 @@ const ERR_PAYMENT_REQUIRED: &str = "余额不足（HTTP 402）";
 const ERR_NOT_FOUND: &str = "查询接口不可用（HTTP 404）";
 const ERR_RATE_LIMITED: &str = "请求过于频繁（HTTP 429）";
 const ERR_TIMEOUT: &str = "请求超时";
+const ERR_QUERY_TIMEOUT: &str = "查询超时";
 const ERR_CONNECT: &str = "连接失败";
 const ERR_PARSE: &str = "响应格式无法解析";
 
@@ -170,15 +177,32 @@ fn targets(accounts: &[ProviderAccount]) -> Vec<Target> {
     targets
 }
 
+/// A provider that exceeded its budget still gets its own error card, using
+/// the same fixed-message shape as every other failure.
+fn timeout_card(target: &Target) -> ProviderQuota {
+    ProviderQuota::error(
+        &target.id,
+        target.source.label(),
+        ERR_QUERY_TIMEOUT.to_owned(),
+    )
+}
+
 /// Query every configured provider concurrently. Never fails: an upstream
-/// problem becomes that provider's error card.
+/// problem becomes that provider's error card. Each provider runs under its
+/// own `PROVIDER_BUDGET`, so a slow credential refresh only times out that
+/// provider's card while the others still answer.
 pub async fn fetch(accounts: &[ProviderAccount], chatgpt: Option<CodexAuth>) -> ProviderQuotas {
     let client = client();
     let now = Utc::now();
     let cards = targets(accounts).into_iter().map(|target| {
         let client = client.clone();
         let chatgpt = chatgpt.clone();
-        async move { query(&client, &target, chatgpt.as_ref(), now).await }
+        async move {
+            let query = query(&client, &target, chatgpt.as_ref(), now);
+            tokio::time::timeout(PROVIDER_BUDGET, query)
+                .await
+                .unwrap_or_else(|_| timeout_card(&target))
+        }
     });
     ProviderQuotas {
         providers: futures_util::future::join_all(cards).await,
@@ -556,9 +580,16 @@ async fn chatgpt_card(
     id: &str,
     label: &str,
 ) -> Result<ProviderQuota, String> {
-    let (token, account) = auth
-        .access_token_and_account()
+    // Credential refresh must survive this card's timeout: the token endpoint
+    // may have already rotated the refresh token, and `refresh_if_needed`
+    // only persists it after the exchange returns. Dropping a JoinHandle
+    // detaches the task, so a timed-out quota card cannot lose a rotated
+    // credential. Only ChatGPT has this exposure; other providers carry a
+    // static API key and are queried inline.
+    let auth = auth.clone();
+    let (token, account) = tokio::spawn(async move { auth.access_token_and_account().await })
         .await
+        .map_err(|_| ERR_UNAUTHORIZED.to_owned())?
         .map_err(|_| ERR_UNAUTHORIZED.to_owned())?;
     let response = client
         .get(CHATGPT_USAGE_URL)
@@ -951,6 +982,22 @@ mod tests {
         assert_eq!(http_error(404, ""), "查询接口不可用（HTTP 404）");
         assert_eq!(http_error(429, ""), "请求过于频繁（HTTP 429）");
         assert_eq!(http_error(500, "secret body"), "HTTP 500");
+    }
+
+    #[test]
+    fn budget_timeout_is_a_fixed_error_card() {
+        let target = Target {
+            id: "zhipu".to_owned(),
+            url: "https://open.bigmodel.cn/api/monitor/usage/quota/limit",
+            source: Source::Zhipu,
+            api_key: String::new(),
+        };
+        let card = timeout_card(&target);
+        assert_eq!(card.id, "zhipu");
+        assert_eq!(card.label, "GLM Coding Plan");
+        assert_eq!(card.kind, QuotaKind::Error);
+        assert_eq!(card.error.as_deref(), Some("查询超时"));
+        assert!(card.windows.is_empty());
     }
 
     fn account(name: &str, base_url: &str) -> ProviderAccount {

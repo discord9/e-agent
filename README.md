@@ -1276,7 +1276,9 @@ curl 'http://127.0.0.1:8766/api/usage/dashboard?bucket=day&top_n=10'
 
 The web UI's usage view also shows an account row above its filters,
 backed by the authenticated `GET /api/provider-quotas`. It returns one card
-per configured provider endpoint, recognized by the provider `base_url` host:
+per distinct `(endpoint URL, api key)` account; providers whose `base_url`
+host has no known usage endpoint are skipped, and ChatGPT is recognized by its
+login credentials rather than by host:
 DeepSeek balance, SiliconFlow balance, Zhipu/GLM Coding Plan and Kimi Code
 quota windows, OpenCode Go rolling/weekly/monthly percentages, and the
 ChatGPT/Codex plan and rate windows (through the existing `e-agent login`

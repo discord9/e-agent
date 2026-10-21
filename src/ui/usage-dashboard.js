@@ -9,6 +9,7 @@ const usageDashboardState = {
   quotaRequest: 0,
   quotaProviders: null,
   quotaFetchedAt: 0,
+  quotaWorkspace: null,
   quotaTimer: null,
   charts: [],
   grid: null,
@@ -371,46 +372,72 @@ function renderQuotaCards(providers) {
 }
 
 /* Account quotas are fetched in the background every QUOTA_REFRESH_MS, and
-   only when stale on tab focus. Opening the usage view never triggers a
-   request: it renders whatever the last poll left in quotaProviders. */
+   only when stale on tab focus. Opening the usage view normally never triggers
+   a request: it renders whatever the last poll left in quotaProviders. */
 const QUOTA_REFRESH_MS = 10 * 60 * 1000;
+const QUOTA_REQUEST_TIMEOUT_MS = 30 * 1000;
+
+function quotaCacheMatchesWorkspace() {
+  return usageDashboardState.quotaWorkspace === state.workspace;
+}
+
+/* Drop a cache (and its rendered numbers) that belongs to another workspace,
+   then paint the neutral placeholder until the replacement request returns. */
+function resetQuotaView() {
+  usageDashboardState.quotaProviders = null;
+  usageDashboardState.quotaFetchedAt = 0;
+  usageDashboardState.quotaWorkspace = null;
+  $("quotaUpdatedAt").textContent = "";
+  $("quotaCardsRow").replaceChildren(el("p", "quota-unavailable", "额度尚未加载"));
+  $("quotaCards").hidden = false;
+}
 
 async function loadProviderQuotas() {
   const request = ++usageDashboardState.quotaRequest;
+  const workspace = state.workspace;
   const button = $("quotaRefreshBtn");
   if (button) button.disabled = true;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), QUOTA_REQUEST_TIMEOUT_MS);
   try {
-    const res = await apiFor(state.workspace, "/api/provider-quotas");
-    if (request !== usageDashboardState.quotaRequest) return;
+    const res = await apiFor(workspace, "/api/provider-quotas", { signal: controller.signal });
+    if (request !== usageDashboardState.quotaRequest || state.workspace !== workspace) return;
     if (res.status === 404) { $("quotaCards").hidden = true; return; }
     if (!res.ok) throw new Error("额度信息暂不可用（HTTP " + res.status + "）");
     const data = await res.json();
-    if (request !== usageDashboardState.quotaRequest) return;
+    if (request !== usageDashboardState.quotaRequest || state.workspace !== workspace) return;
     if (!Array.isArray(data.providers)) throw new Error();
     usageDashboardState.quotaProviders = data.providers;
     usageDashboardState.quotaFetchedAt = Date.now();
+    usageDashboardState.quotaWorkspace = workspace;
     renderQuotaCards(data.providers);
     $("quotaUpdatedAt").textContent = "更新于 " + new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false });
   } catch (error) {
-    if (request !== usageDashboardState.quotaRequest) return;
+    if (request !== usageDashboardState.quotaRequest || state.workspace !== workspace) return;
     $("quotaCardsRow").replaceChildren(el("p", "quota-unavailable", /^额度信息暂不可用（HTTP \d+）$/.test(error?.message) ? error.message : "额度信息暂不可用"));
     $("quotaCards").hidden = false;
   } finally {
+    clearTimeout(timeout);
+    controller.abort();
+    /* Every request ends here — success, HTTP error, timeout abort, or a
+       discarded workspace mismatch — so the guard only stops a superseded
+       request from unlocking a newer one; the newest request always unlocks. */
     if (request === usageDashboardState.quotaRequest && button) button.disabled = false;
   }
 }
 
 function quotaIsStale() {
-  return Date.now() - usageDashboardState.quotaFetchedAt >= QUOTA_REFRESH_MS;
+  return !quotaCacheMatchesWorkspace() || Date.now() - usageDashboardState.quotaFetchedAt >= QUOTA_REFRESH_MS;
 }
 
 /* Starts the 10-minute timer (idempotent) and fetches immediately only when
-   the cached result is missing or stale — a tab regaining focus after a short
-   switch does not spend an extra request. */
+   the cached result is missing, stale, or owned by another workspace — a tab
+   regaining focus after a short switch does not spend an extra request. */
 function startQuotaPolling() {
   if (usageDashboardState.quotaTimer === null) {
     usageDashboardState.quotaTimer = setInterval(loadProviderQuotas, QUOTA_REFRESH_MS);
   }
+  if (!quotaCacheMatchesWorkspace()) resetQuotaView();
   if (quotaIsStale()) loadProviderQuotas();
 }
 
@@ -423,6 +450,11 @@ function stopQuotaPolling() {
 
 async function loadUsageDashboard() {
   if (!usageDashboardState.open) return;
+  /* Same-workspace panel opens reuse the polled cache and never fetch. A
+     workspace switch invalidates that cache, so this is the one panel-opening
+     path allowed to request quotas: startQuotaPolling() drops the previous
+     workspace's numbers and fetches the active workspace's cards. */
+  if (!quotaCacheMatchesWorkspace()) startQuotaPolling();
   const request = ++usageDashboardState.request;
   destroyUsageVisuals();
   els.usageContent.hidden = true;
