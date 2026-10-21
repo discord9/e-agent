@@ -8,7 +8,8 @@ e-agent is a deliberately minimal Rust coding agent: single crate, streaming
 OpenAI-compatible Chat Completions plus ChatGPT Codex Responses, six always-on
 local tools (`read_file`, `write_file`, `edit_file`, `bash`,
 `get_background_tasks`, `cancel_background_task`) plus conditional
-`web_search` and main-agent-only `delegate`, a text REPL, a ratatui TUI, a
+`web_search` (`web_fetch` too on the DeepSeek backend) and main-agent-only
+`delegate`, a text REPL, a ratatui TUI, a
 headless HTTP server (`--serve` / `web`) with a token-authenticated `/api`
 and a browser web UI, and session persistence over three backends (JSONL
 default, GreptimeDB, SQLite). Keep it that way.

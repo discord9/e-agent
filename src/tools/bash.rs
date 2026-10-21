@@ -1351,12 +1351,9 @@ pub(super) fn wrap_bash_command(
     // sandboxed command. The agent reads these from the parent
     // process env directly, not via bash, so removing them here
     // does not break anything.
-    cmd.env_remove("EXA_API_KEY");
-    cmd.env_remove("OPENAI_API_KEY");
-    cmd.env_remove("ANTHROPIC_API_KEY");
-    cmd.env_remove("DEEPSEEK_API_KEY");
-    cmd.env_remove("MOONSHOT_API_KEY");
-    cmd.env_remove("KIMI_API_KEY");
+    for name in SANDBOX_SECRET_ENV {
+        cmd.env_remove(name);
+    }
     // The plan fds are CLOEXEC in the parent; clear CLOEXEC on exactly
     // these numbers in the forked child so bwrap can bind them. Nothing
     // else ever inherits them.

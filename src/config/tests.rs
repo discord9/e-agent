@@ -468,6 +468,85 @@ provider = "google"
 }
 
 #[test]
+fn web_search_deepseek_requires_one_key_and_forbids_base_url() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("ds-key"), "  deepseek-secret\n").unwrap();
+    let config_for = |section: &str| {
+        let path = write_config(
+            temp.path(),
+            &format!(
+                r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://x"
+api_key_file = "ds-key"
+[models."kimi/k3"]
+model = "k3"
+[web_search]
+provider = "deepseek"
+{section}"#
+            ),
+        );
+        Config::from_path(&path).unwrap()
+    };
+    let key_error = |section: &str| {
+        config_for(section)
+            .web_search_key()
+            .unwrap_err()
+            .to_string()
+    };
+
+    // api_key_file (relative to the config file's directory).
+    let config = config_for("api_key_file = \"ds-key\"\n");
+    assert_eq!(
+        config.web_search_provider().unwrap(),
+        Some(WebSearchProvider::Deepseek)
+    );
+    assert_eq!(
+        config.web_search_key().unwrap(),
+        Some("deepseek-secret".into())
+    );
+
+    // api_key_env resolves (trimmed).
+    unsafe { std::env::set_var("E_AGENT_TEST_WEB_SEARCH_KEY", " env-secret ") };
+    let config = config_for("api_key_env = \"E_AGENT_TEST_WEB_SEARCH_KEY\"\n");
+    assert_eq!(config.web_search_key().unwrap(), Some("env-secret".into()));
+
+    // An unset api_key_env is an error, like Exa.
+    let error = key_error("api_key_env = \"E_AGENT_TEST_UNSET_WEB_SEARCH_KEY\"\n");
+    assert!(error.contains("is not set"), "{error}");
+
+    // A blank env value is an error too.
+    unsafe { std::env::set_var("E_AGENT_TEST_WEB_SEARCH_KEY", "   ") };
+    let error = key_error("api_key_env = \"E_AGENT_TEST_WEB_SEARCH_KEY\"\n");
+    assert!(error.contains("is empty"), "{error}");
+
+    // No key source at all.
+    let error = key_error("");
+    assert!(error.contains("exactly one"), "{error}");
+
+    // Both key sources set.
+    let error =
+        key_error("api_key_file = \"ds-key\"\napi_key_env = \"E_AGENT_TEST_WEB_SEARCH_KEY\"\n");
+    assert!(error.contains("exactly one"), "{error}");
+
+    // An unreadable key file disables the tool instead of failing, like Exa.
+    let config = config_for("api_key_file = \"missing-key\"\n");
+    assert_eq!(config.web_search_key().unwrap(), None);
+
+    // `base_url` is rejected: the DeepSeek endpoints are fixed.
+    for base_url in [
+        "base_url = \"https://proxy.example\"\n",
+        "base_url = \"https://api.deepseek.com\"\n",
+    ] {
+        let config = config_for(&format!("api_key_file = \"ds-key\"\n{base_url}"));
+        let error = config.web_search_provider().unwrap_err().to_string();
+        assert!(error.contains("must not set `base_url`"), "{error}");
+    }
+    unsafe { std::env::remove_var("E_AGENT_TEST_WEB_SEARCH_KEY") };
+}
+
+#[test]
 fn resolves_role_routing_and_falls_back_when_unrouted() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("key"), "key").unwrap();
