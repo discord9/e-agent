@@ -270,6 +270,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/cancel", post(session_cancel))
         .route("/api/sessions/{id}/compact", post(session_compact))
         .route("/api/models", get(list_models))
+        .route("/api/provider-quotas", get(provider_quotas))
         .route("/api/pet/config", get(pet_config))
         .route("/api/pet/sprite", get(serve_pet_sprite))
         .route("/api/sessions/{id}/model", post(session_model))
@@ -1493,6 +1494,24 @@ struct ModelBody {
 /// strings; `[]` when there is no config.
 async fn list_models(State(state): State<Arc<AppState>>) -> Json<Vec<String>> {
     Json(state.factory.model_profiles())
+}
+
+/// `GET /api/provider-quotas` — one balance/quota/error card per configured
+/// provider endpoint. Reads the live (possibly hot-reloaded) config, so a new
+/// provider appears without a restart, and always answers 200: an upstream
+/// failure becomes that provider's `kind:"error"` card.
+async fn provider_quotas(State(state): State<Arc<AppState>>) -> Json<crate::quota::ProviderQuotas> {
+    let accounts = state
+        .factory
+        .current_config()
+        .map(|config| config.provider_accounts())
+        .unwrap_or_default();
+    let chatgpt = accounts
+        .iter()
+        .any(|account| account.auth.as_deref() == Some("chatgpt"))
+        .then(|| state.factory.chatgpt_auth().ok())
+        .flatten();
+    Json(crate::quota::fetch(&accounts, chatgpt).await)
 }
 
 #[derive(Debug, Serialize)]

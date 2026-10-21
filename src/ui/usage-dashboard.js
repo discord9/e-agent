@@ -6,6 +6,11 @@
 const usageDashboardState = {
   open: false,
   request: 0,
+  quotaRequest: 0,
+  quotaProviders: null,
+  quotaFetchedAt: 0,
+  quotaWorkspace: null,
+  quotaTimer: null,
   charts: [],
   grid: null,
   resizeObserver: null,
@@ -320,8 +325,136 @@ function renderUsageTable(data) {
     : "全部 " + rows.length + " 个结果（按总 Token）；上方 KPI、趋势和分组均为完整筛选范围";
 }
 
+function renderQuotaCards(providers) {
+  const section = $("quotaCards");
+  const row = $("quotaCardsRow");
+  row.replaceChildren();
+  section.hidden = !providers.length;
+  for (const provider of providers) {
+    const card = el("article", "quota-card");
+    const head = el("div", "quota-card-head");
+    head.append(el("h3", "", provider.label));
+    if (provider.plan) head.append(el("span", "quota-plan", provider.plan));
+    card.append(head);
+    if (provider.kind === "balance") {
+      const currency = provider.currency === "CNY" ? "¥" : provider.currency === "USD" ? "$" : (provider.currency || "");
+      card.append(el("p", "quota-amount", provider.amount === null ? "暂不可用" : currency + Number(provider.amount).toFixed(2)));
+    } else if (provider.kind === "quota") {
+      for (const window of provider.windows) {
+        const used = Number(window.used_percent);
+        const level = used >= 90 ? "danger" : used >= 70 ? "warning" : "normal";
+        const item = el("div", "quota-window " + level);
+        const caption = el("div", "quota-window-caption");
+        caption.append(el("span", "", window.label), el("span", "quota-percent", used.toFixed(1) + "%"));
+        const track = el("div", "quota-track");
+        track.setAttribute("role", "progressbar");
+        track.setAttribute("aria-label", provider.label + " · " + window.label);
+        track.setAttribute("aria-valuemin", "0");
+        track.setAttribute("aria-valuemax", "100");
+        const clamped = Math.min(100, Math.max(0, used));
+        track.setAttribute("aria-valuenow", String(clamped));
+        track.setAttribute("aria-valuetext", used.toFixed(1) + "% 已使用");
+        const fill = el("div", "quota-fill");
+        fill.style.width = clamped + "%";
+        track.append(fill);
+        item.append(caption, track);
+        if (window.reset_at) {
+          const reset = new Date(window.reset_at).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }).replace(/\//g, "-");
+          item.append(el("p", "quota-reset", "· 重置于 " + reset));
+        }
+        card.append(item);
+      }
+    } else if (provider.kind === "error") {
+      card.append(el("p", "quota-error", provider.error || "额度信息暂不可用"));
+    }
+    row.append(card);
+  }
+}
+
+/* Account quotas are fetched in the background every QUOTA_REFRESH_MS, and
+   only when stale on tab focus. Opening the usage view normally never triggers
+   a request: it renders whatever the last poll left in quotaProviders. */
+const QUOTA_REFRESH_MS = 10 * 60 * 1000;
+const QUOTA_REQUEST_TIMEOUT_MS = 30 * 1000;
+
+function quotaCacheMatchesWorkspace() {
+  return usageDashboardState.quotaWorkspace === state.workspace;
+}
+
+/* Drop a cache (and its rendered numbers) that belongs to another workspace,
+   then paint the neutral placeholder until the replacement request returns. */
+function resetQuotaView() {
+  usageDashboardState.quotaProviders = null;
+  usageDashboardState.quotaFetchedAt = 0;
+  usageDashboardState.quotaWorkspace = null;
+  $("quotaUpdatedAt").textContent = "";
+  $("quotaCardsRow").replaceChildren(el("p", "quota-unavailable", "额度尚未加载"));
+  $("quotaCards").hidden = false;
+}
+
+async function loadProviderQuotas() {
+  const request = ++usageDashboardState.quotaRequest;
+  const workspace = state.workspace;
+  const button = $("quotaRefreshBtn");
+  if (button) button.disabled = true;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), QUOTA_REQUEST_TIMEOUT_MS);
+  try {
+    const res = await apiFor(workspace, "/api/provider-quotas", { signal: controller.signal });
+    if (request !== usageDashboardState.quotaRequest || state.workspace !== workspace) return;
+    if (res.status === 404) { $("quotaCards").hidden = true; return; }
+    if (!res.ok) throw new Error("额度信息暂不可用（HTTP " + res.status + "）");
+    const data = await res.json();
+    if (request !== usageDashboardState.quotaRequest || state.workspace !== workspace) return;
+    if (!Array.isArray(data.providers)) throw new Error();
+    usageDashboardState.quotaProviders = data.providers;
+    usageDashboardState.quotaFetchedAt = Date.now();
+    usageDashboardState.quotaWorkspace = workspace;
+    renderQuotaCards(data.providers);
+    $("quotaUpdatedAt").textContent = "更新于 " + new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false });
+  } catch (error) {
+    if (request !== usageDashboardState.quotaRequest || state.workspace !== workspace) return;
+    $("quotaCardsRow").replaceChildren(el("p", "quota-unavailable", /^额度信息暂不可用（HTTP \d+）$/.test(error?.message) ? error.message : "额度信息暂不可用"));
+    $("quotaCards").hidden = false;
+  } finally {
+    clearTimeout(timeout);
+    controller.abort();
+    /* Every request ends here — success, HTTP error, timeout abort, or a
+       discarded workspace mismatch — so the guard only stops a superseded
+       request from unlocking a newer one; the newest request always unlocks. */
+    if (request === usageDashboardState.quotaRequest && button) button.disabled = false;
+  }
+}
+
+function quotaIsStale() {
+  return !quotaCacheMatchesWorkspace() || Date.now() - usageDashboardState.quotaFetchedAt >= QUOTA_REFRESH_MS;
+}
+
+/* Starts the 10-minute timer (idempotent) and fetches immediately only when
+   the cached result is missing, stale, or owned by another workspace — a tab
+   regaining focus after a short switch does not spend an extra request. */
+function startQuotaPolling() {
+  if (usageDashboardState.quotaTimer === null) {
+    usageDashboardState.quotaTimer = setInterval(loadProviderQuotas, QUOTA_REFRESH_MS);
+  }
+  if (!quotaCacheMatchesWorkspace()) resetQuotaView();
+  if (quotaIsStale()) loadProviderQuotas();
+}
+
+function stopQuotaPolling() {
+  if (usageDashboardState.quotaTimer !== null) {
+    clearInterval(usageDashboardState.quotaTimer);
+    usageDashboardState.quotaTimer = null;
+  }
+}
+
 async function loadUsageDashboard() {
   if (!usageDashboardState.open) return;
+  /* Same-workspace panel opens reuse the polled cache and never fetch. A
+     workspace switch invalidates that cache, so this is the one panel-opening
+     path allowed to request quotas: startQuotaPolling() drops the previous
+     workspace's numbers and fetches the active workspace's cards. */
+  if (!quotaCacheMatchesWorkspace()) startQuotaPolling();
   const request = ++usageDashboardState.request;
   destroyUsageVisuals();
   els.usageContent.hidden = true;
@@ -379,9 +512,19 @@ function resetUsageFilters() {
   els.usageBucket.value = "day"; els.usageFrom.value = ""; els.usageTo.value = ""; setDefaultUsageDates(); loadUsageDashboard();
 }
 
+$("quotaRefreshBtn").addEventListener("click", loadProviderQuotas);
 els.usageDashboardBtn.addEventListener("click", () => usageDashboardState.open ? closeUsageDashboard() : openUsageDashboard());
 els.usageCloseBtn.addEventListener("click", closeUsageDashboard);
 els.usageRefreshBtn.addEventListener("click", loadUsageDashboard);
 els.usageResetBtn.addEventListener("click", resetUsageFilters);
 els.usageFilters.addEventListener("submit", (event) => { event.preventDefault(); loadUsageDashboard(); });
 document.addEventListener("keydown", (event) => { if (event.key === "Escape" && usageDashboardState.open) closeUsageDashboard(); });
+/* Quota polling is started here, not in sse.js: this file is a separate
+   <script> parsed after the app bundle, so its functions do not exist while
+   init() runs. A hidden tab stops the timer; regaining visibility only
+   refetches when the cached result is older than the interval. */
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) stopQuotaPolling();
+  else startQuotaPolling();
+});
+startQuotaPolling();

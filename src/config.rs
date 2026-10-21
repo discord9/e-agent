@@ -317,6 +317,17 @@ struct Provider {
     api_key_env: Option<String>,
 }
 
+/// One configured provider with its resolved credential, as returned by
+/// [`Config::provider_accounts`]. Read-only view for the account/quota
+/// overview; it never exposes anything beyond what the config already holds.
+#[derive(Clone, Debug)]
+pub struct ProviderAccount {
+    pub name: String,
+    pub base_url: Option<String>,
+    pub auth: Option<String>,
+    pub api_key: String,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ModelProfile {
@@ -594,6 +605,38 @@ impl Config {
         }
         profiles.sort();
         profiles
+    }
+
+    /// Configured providers with their resolved credentials, sorted by
+    /// provider name so callers get a stable order. A credential that cannot
+    /// be resolved (both `api_key_file` and `api_key_env` set, unreadable key
+    /// file, unset or empty env variable) leaves `api_key` empty rather than
+    /// dropping the provider: the account overview then reports an explicit
+    /// credential error card instead of silently hiding a configured provider.
+    /// A provider with `auth = "chatgpt"` is also kept with an empty
+    /// `api_key`; it queries through the ChatGPT credentials instead.
+    pub fn provider_accounts(&self) -> Vec<ProviderAccount> {
+        let mut names: Vec<&String> = self.providers.keys().collect();
+        names.sort();
+        names
+            .into_iter()
+            .map(|name| {
+                let provider = &self.providers[name];
+                let api_key = match (&provider.api_key_file, &provider.api_key_env) {
+                    (Some(file), None) => self.read_key_file(name, file).unwrap_or_default(),
+                    (None, Some(variable)) => std::env::var(variable)
+                        .map(|value| value.trim().to_owned())
+                        .unwrap_or_default(),
+                    _ => String::new(),
+                };
+                ProviderAccount {
+                    name: name.clone(),
+                    base_url: provider.base_url.clone(),
+                    auth: provider.auth.clone(),
+                    api_key,
+                }
+            })
+            .collect()
     }
 
     /// The provider selected by `[web_search]`, or None when the section is
