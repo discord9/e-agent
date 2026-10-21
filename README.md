@@ -769,14 +769,18 @@ is not inherited, and the backend never falls back to another provider: switch
 
 With `provider = "deepseek"`, `api_key_file` / `api_key_env` supply the
 DeepSeek key (same rules as Exa, again with a configured process env winning),
-and `base_url` is a config error because both endpoints are fixed at
-`https://api.deepseek.com/v1/tools/{search,fetch}`. This backend registers two
-tools: `web_search` posts the query with a fixed `count = 5` and
+and a **non-empty** `base_url` is a config error because both endpoints are
+fixed at `https://api.deepseek.com/v1/tools/{search,fetch}` (an empty or
+all-whitespace `base_url` counts as unset, not as a conflict). This backend
+registers two tools: `web_search` posts the query with a fixed `count = 5` and
 `need_content = false` and returns title/URL/summary(/date) as plain text, and
 the separate `web_fetch` tool takes one required `url` and returns the page
 title plus Markdown. Both truncate output at 64 KiB and redact the key from
-upstream error text; `web_fetch` also validates that the URL is `http(s)` and
-is at most 8192 characters. `web_fetch` exists only on the
+upstream error text before that text is truncated. `web_fetch` validates only
+that the URL starts with a lowercase `http://` or `https://` prefix and is at
+most 8192 characters: it does not parse or check the rest of the URL, and it
+does not reject private-network or `localhost` targets, because the target URL
+is handed to the DeepSeek side to fetch. `web_fetch` exists only on the
 DeepSeek backend (Exa and SearXNG have no fetch endpoint); like `web_search`,
 it is available to read-only sessions and subagents because it is a network
 read. Configured local MCP servers may add their tools to the main agent
@@ -1771,11 +1775,11 @@ Reasoning-model `reasoning_content` is persisted in the session for
 display/audit; it is never sent back to the API, except by an explicit
 `deepseek_compat = true` thinking-mode tool-call profile (see Run).
 Web search deliberately has no browser, crawler, citations, domain filters,
-provider registry or provider trait, fallback chain between backends, third
-search provider, retries, cache, background search, or remote MCP support: it
-has exactly the three config-selected backends documented above (`exa`, the
-default; `searxng`; and `deepseek`, which additionally registers the separate
-`web_fetch` tool) and no per-engine behavior differences are special-cased.
+provider registry or provider trait, fallback chain between backends, retries,
+cache, background search, or remote MCP support: it has exactly the three
+config-selected backends documented above (`exa`, the default; `searxng`; and
+`deepseek`, which additionally registers the separate `web_fetch` tool) and no
+per-engine behavior differences are special-cased.
 `web_fetch` is deliberately one DeepSeek-side retrieval of the single
 model-supplied `http(s)` URL: no JavaScript/browser rendering, no crawling or
 link following, no robots.txt handling, no per-site rules, no retries, and no

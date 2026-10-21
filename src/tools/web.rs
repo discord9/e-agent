@@ -294,8 +294,7 @@ impl Tool for WebFetch {
             .await
             .map_err(|_| "web fetch request failed".to_string())?;
         if !response.status().is_success() {
-            let error = status_error(&mut response, "web fetch").await?;
-            return Err(redact_api_key(error, &self.api_key));
+            return Err(status_error(&mut response, "web fetch", &self.api_key).await?);
         }
 
         let (body, truncated) = read_response_prefix(&mut response, WEB_SEARCH_RESPONSE_LIMIT)
@@ -348,8 +347,7 @@ impl WebSearch {
             .await
             .map_err(|_| "web search request failed".to_string())?;
         if !response.status().is_success() {
-            let error = status_error(&mut response, "web search").await?;
-            return Err(redact_api_key(error, api_key));
+            return Err(status_error(&mut response, "web search", api_key).await?);
         }
 
         let (body, truncated) = read_response_prefix(&mut response, WEB_SEARCH_RESPONSE_LIMIT)
@@ -382,7 +380,7 @@ impl WebSearch {
             .await
             .map_err(|_| "web search request failed".to_string())?;
         if !response.status().is_success() {
-            return Err(status_error(&mut response, "web search").await?);
+            return Err(status_error(&mut response, "web search", "").await?);
         }
 
         let (body, truncated) = read_response_prefix(&mut response, WEB_SEARCH_RESPONSE_LIMIT)
@@ -452,8 +450,7 @@ impl WebSearch {
             .await
             .map_err(|_| "web search request failed".to_string())?;
         if !response.status().is_success() {
-            let error = status_error(&mut response, "web search").await?;
-            return Err(redact_api_key(error, api_key));
+            return Err(status_error(&mut response, "web search", api_key).await?);
         }
 
         let (body, truncated) = read_response_prefix(&mut response, WEB_SEARCH_RESPONSE_LIMIT)
@@ -497,15 +494,38 @@ fn project_deepseek_results(results: Vec<DeepseekSearchResult>) -> String {
 }
 
 /// The shared `{tool} failed with status ...` error for a non-success
-/// response, bounded like the response-body read. Callers add credential
-/// redaction where the backend has a credential.
-async fn status_error(response: &mut reqwest::Response, tool: &str) -> Result<String, String> {
+/// response, bounded like the response-body read. The backend's credential is
+/// redacted here, before truncation, so a key that straddles the preview limit
+/// cannot leave a prefix behind. `api_key` is `""` for a backend with no
+/// credential (redaction is then a no-op).
+async fn status_error(
+    response: &mut reqwest::Response,
+    tool: &str,
+    api_key: &str,
+) -> Result<String, String> {
     let status = response.status();
-    let (body, truncated) = read_response_prefix(response, WEB_SEARCH_ERROR_PREVIEW_LIMIT)
-        .await
-        .map_err(|_| format!("{tool} failed with status {status}"))?;
+    // Read one key's length past the preview limit: a credential cut by that
+    // limit must still be complete in the text redaction sees.
+    let (body, truncated) =
+        read_response_prefix(response, WEB_SEARCH_ERROR_PREVIEW_LIMIT + api_key.len())
+            .await
+            .map_err(|_| format!("{tool} failed with status {status}"))?;
+    Ok(bounded_error_context(
+        tool, status, &body, truncated, api_key,
+    ))
+}
+
+/// Redact first, then truncate: truncation can cut a credential in half, and a
+/// leftover prefix is just as much a leak as the whole key.
+fn bounded_error_context(
+    tool: &str,
+    status: reqwest::StatusCode,
+    body: &[u8],
+    truncated: bool,
+    api_key: &str,
+) -> String {
     let mut context = truncate_utf8(
-        String::from_utf8_lossy(&body).into_owned(),
+        redact_api_key(String::from_utf8_lossy(body).into_owned(), api_key),
         WEB_SEARCH_ERROR_PREVIEW_LIMIT,
     );
     if truncated {
@@ -514,11 +534,11 @@ async fn status_error(response: &mut reqwest::Response, tool: &str) -> Result<St
             WEB_SEARCH_ERROR_PREVIEW_LIMIT,
         );
     }
-    Ok(if context.is_empty() {
+    if context.is_empty() {
         format!("{tool} failed with status {status}")
     } else {
         format!("{tool} failed with status {status}: {context}")
-    })
+    }
 }
 
 pub(super) async fn read_response_prefix(

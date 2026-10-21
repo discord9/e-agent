@@ -134,6 +134,20 @@ pub(crate) const SEARXNG_BASE_URL_ENV: &str = "E_AGENT_SEARXNG_BASE_URL";
 /// configure `[web_search] provider = "deepseek"` plus a key file/env.
 pub(crate) const DEEPSEEK_API_KEY_ENV: &str = "E_AGENT_DEEPSEEK_API_KEY";
 
+/// Environment variables stripped from sandboxed child processes on every
+/// platform; the agent reads credentials directly, bash never needs them.
+/// Every internal credential transport (like [`DEEPSEEK_API_KEY_ENV`]) must be
+/// listed here too, or a sandboxed `env` prints it.
+pub(crate) const SANDBOX_SECRET_ENV: &[&str] = &[
+    "EXA_API_KEY",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "MOONSHOT_API_KEY",
+    "KIMI_API_KEY",
+    DEEPSEEK_API_KEY_ENV,
+];
+
 /// The resolved web-search backend from the process environment: the
 /// internal DeepSeek key (an explicit `[web_search] provider` choice) wins
 /// over the internal SearXNG base URL, which wins over `EXA_API_KEY`.

@@ -478,6 +478,31 @@ fn web_search_source_priority_is_deepseek_then_searxng_then_exa() {
     assert_eq!(resolve(None, None, None), None);
 }
 
+/// Drift guard for the shared sandbox strip list: both sandbox backends read
+/// [`SANDBOX_SECRET_ENV`], so a credential that is missing here is inherited by
+/// a sandboxed `env`. It does not fork a sandbox; it proves the list contains
+/// the user-visible DeepSeek key and the internal transport variable the
+/// session factory injects, and that no entry is duplicated.
+#[test]
+fn sandbox_secret_env_covers_the_internal_deepseek_key() {
+    assert!(
+        SANDBOX_SECRET_ENV.contains(&"DEEPSEEK_API_KEY"),
+        "the user-visible DeepSeek key must be stripped: {SANDBOX_SECRET_ENV:?}"
+    );
+    assert!(
+        SANDBOX_SECRET_ENV.contains(&DEEPSEEK_API_KEY_ENV),
+        "the internal DeepSeek transport key must be stripped too: {SANDBOX_SECRET_ENV:?}"
+    );
+    let mut unique = SANDBOX_SECRET_ENV.to_vec();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        SANDBOX_SECRET_ENV.len(),
+        "duplicate entry in {SANDBOX_SECRET_ENV:?}"
+    );
+}
+
 #[test]
 fn deepseek_registration_registers_web_fetch_next_to_web_search() {
     let temp = tempfile::tempdir().unwrap();
@@ -733,6 +758,36 @@ async fn deepseek_caps_success_and_error_bodies() {
                 + WEB_SEARCH_ERROR_PREVIEW_LIMIT
     );
     assert!(error.ends_with("\n...[truncated]"));
+    server.await.unwrap();
+}
+
+/// A key that straddles the error-preview limit must not survive even as a
+/// prefix: redaction runs before truncation.
+#[tokio::test]
+async fn deepseek_error_redacts_a_key_across_the_preview_limit() {
+    const KEY: &str = "test-api-key";
+    const MARKER: usize = "\n...[truncated]".len();
+    // Truncation keeps the first `limit - MARKER` bytes, so a truncate-then-
+    // redact ordering would leave the first 8 bytes of the key in the output.
+    let body = format!(
+        "{}{KEY}{}",
+        "x".repeat(WEB_SEARCH_ERROR_PREVIEW_LIMIT - MARKER - 8),
+        "y".repeat(64)
+    );
+    let (base, server) = deepseek_server(http_response("500 Internal Server Error", &body)).await;
+    let error = deepseek_search(base)
+        .execute(json!({"query": "public query"}))
+        .await
+        .unwrap_err();
+    assert!(error.contains("[redact"), "{error}");
+    assert!(error.ends_with("\n...[truncated]"), "{error}");
+    for start in 0..=KEY.len() - 8 {
+        assert!(
+            !error.contains(&KEY[start..start + 8]),
+            "leaked {:?} in {error}",
+            &KEY[start..start + 8]
+        );
+    }
     server.await.unwrap();
 }
 

@@ -30,6 +30,7 @@ use crate::tools::background::{OutputSlot, TaskSpool};
 use crate::workspace::Workspace;
 
 use super::OUTPUT_LIMIT;
+use super::SANDBOX_SECRET_ENV;
 use super::bash::{
     Captured, FULL_LIMIT, HEAD_LIMIT, Shell, TAIL_LIMIT, format_output, persist_full_output,
     utf8_back_boundary, utf8_front_boundary,
@@ -1256,18 +1257,10 @@ fn quote_arg(arg: &str) -> String {
 }
 
 fn environment_block() -> Vec<u16> {
-    const SECRET_KEYS: &[&str] = &[
-        "EXA_API_KEY",
-        "OPENAI_API_KEY",
-        "ANTHROPIC_API_KEY",
-        "DEEPSEEK_API_KEY",
-        "MOONSHOT_API_KEY",
-        "KIMI_API_KEY",
-    ];
     let mut env: Vec<(String, String)> = std::env::vars_os()
         .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
         .filter(|(key, _)| {
-            !SECRET_KEYS
+            !SANDBOX_SECRET_ENV
                 .iter()
                 .any(|secret| key.eq_ignore_ascii_case(secret))
         })
