@@ -325,11 +325,23 @@ function renderUsageTable(data) {
     : "全部 " + rows.length + " 个结果（按总 Token）；上方 KPI、趋势和分组均为完整筛选范围";
 }
 
+/* One neutral line where the cards would be. Every "no cards" outcome gets a
+   message instead of hiding the whole section: a row that flashes a
+   placeholder and then vanishes reads as a rendering bug, not as an answer. */
+function renderQuotaNotice(message) {
+  $("quotaCardsRow").replaceChildren(el("p", "quota-unavailable", message));
+  $("quotaCards").hidden = false;
+}
+
 function renderQuotaCards(providers) {
   const section = $("quotaCards");
   const row = $("quotaCardsRow");
   row.replaceChildren();
-  section.hidden = !providers.length;
+  if (!providers.length) {
+    renderQuotaNotice("当前配置没有可查询额度的 provider");
+    return;
+  }
+  section.hidden = false;
   for (const provider of providers) {
     const card = el("article", "quota-card");
     const head = el("div", "quota-card-head");
@@ -388,15 +400,18 @@ function quotaCacheMatchesWorkspace() {
   return usageDashboardState.quotaWorkspace === state.workspace;
 }
 
-/* Drop a cache (and its rendered numbers) that belongs to another workspace,
-   then paint the neutral placeholder until the replacement request returns. */
+/* Drop a cache (and its rendered numbers) that belongs to another workspace.
+   A first load has nothing on screen yet, so it stays hidden rather than
+   flashing a placeholder that may be replaced by "no providers" a moment
+   later. After a workspace switch the old numbers are already visible, so
+   clear them and say what is happening. */
 function resetQuotaView() {
   usageDashboardState.quotaProviders = null;
   usageDashboardState.quotaFetchedAt = 0;
   usageDashboardState.quotaWorkspace = null;
   $("quotaUpdatedAt").textContent = "";
-  $("quotaCardsRow").replaceChildren(el("p", "quota-unavailable", "额度尚未加载"));
-  $("quotaCards").hidden = false;
+  $("quotaCardsRow").replaceChildren();
+  if (!$("quotaCards").hidden) renderQuotaNotice("额度加载中…");
 }
 
 async function loadProviderQuotas() {
@@ -409,7 +424,14 @@ async function loadProviderQuotas() {
   try {
     const res = await apiFor(workspace, "/api/provider-quotas", { signal: controller.signal });
     if (request !== usageDashboardState.quotaRequest || state.workspace !== workspace) return;
-    if (res.status === 404) { $("quotaCards").hidden = true; return; }
+    if (res.status === 404) {
+      usageDashboardState.quotaProviders = [];
+      usageDashboardState.quotaFetchedAt = Date.now();
+      usageDashboardState.quotaWorkspace = workspace;
+      $("quotaUpdatedAt").textContent = "";
+      renderQuotaNotice("服务端未提供额度接口（更新并重启服务端后可用）");
+      return;
+    }
     if (!res.ok) throw new Error("额度信息暂不可用（HTTP " + res.status + "）");
     const data = await res.json();
     if (request !== usageDashboardState.quotaRequest || state.workspace !== workspace) return;
@@ -421,8 +443,7 @@ async function loadProviderQuotas() {
     $("quotaUpdatedAt").textContent = "更新于 " + new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false });
   } catch (error) {
     if (request !== usageDashboardState.quotaRequest || state.workspace !== workspace) return;
-    $("quotaCardsRow").replaceChildren(el("p", "quota-unavailable", /^额度信息暂不可用（HTTP \d+）$/.test(error?.message) ? error.message : "额度信息暂不可用"));
-    $("quotaCards").hidden = false;
+    renderQuotaNotice(/^额度信息暂不可用（HTTP \d+）$/.test(error?.message) ? error.message : "额度信息暂不可用");
   } finally {
     clearTimeout(timeout);
     controller.abort();
