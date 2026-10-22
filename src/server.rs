@@ -2768,6 +2768,7 @@ async fn generate_summary(state: &AppState, id: &str, digest: &str) {
             images: Vec::new(),
         },
     ];
+    let model_name = model.name().to_owned();
     let Ok(Ok((assistant, usage))) =
         tokio::time::timeout(SUMMARY_TIMEOUT, model.complete(&messages, &[], None)).await
     else {
@@ -2775,11 +2776,9 @@ async fn generate_summary(state: &AppState, id: &str, digest: &str) {
     };
     // summarizer 调用的 token 用量落盘（kind="summarizer"）：走 workspace
     // 级 meta_store（与 sessions 表同 scope），session 维度用该会话 id；
-    // JSONL 后端静默跳过，失败只告警不影响总结。model 名用 summarizer
-    // 角色的 profile_key（与 create_meta 存 model 的取法一致）。
-    if let Some(usage) = usage {
-        let model_name = state.factory.summarizer_model().profile_key();
-        if let Err(error) = async {
+    // JSONL 后端静默跳过，失败只告警不影响总结。model 名为实际请求使用的 wire model。
+    if let Some(usage) = usage
+        && let Err(error) = async {
             let store = meta_store(state).await?;
             store
                 .append_usage(
@@ -2793,9 +2792,8 @@ async fn generate_summary(state: &AppState, id: &str, digest: &str) {
                 .await
         }
         .await
-        {
-            tracing::warn!("e-agent: cannot record summarizer usage: {error:#}");
-        }
+    {
+        tracing::warn!("e-agent: cannot record summarizer usage: {error:#}");
     }
     let Some(text) = assistant.content else {
         return;
