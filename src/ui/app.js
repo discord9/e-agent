@@ -440,6 +440,7 @@ async function switchWorkspace(id, epoch) {
   // Invalidate an open dashboard before changing workspace: its response must
   // not be allowed to paint into the newly active workspace.
   if (usageDashboardState.open) closeUsageDashboard(false);
+  if (typeof closeQuotaPopover === "function") closeQuotaPopover(false);
   stopPolling();
   stopTaskRows();
   closeForkMenu();

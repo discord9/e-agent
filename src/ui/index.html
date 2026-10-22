@@ -37,6 +37,12 @@
         <rect x="13" y="4" width="2.5" height="12" rx=".5"/>
       </svg><span class="nav-label">用量</span>
     </button>
+    <button id="quotaPopoverBtn" type="button" class="nav-btn" aria-controls="quotaPopover" aria-expanded="false" title="查看账号额度">
+      <svg aria-hidden="true" focusable="false" width="16" height="16" viewBox="0 0 20 20" fill="currentColor">
+        <path d="M3 5.5A2.5 2.5 0 0 1 5.5 3H16a2 2 0 0 1 2 2v1H5.5A2.5 2.5 0 0 0 3 8.5v-3Z"/>
+        <path d="M3 8.5A1.5 1.5 0 0 1 4.5 7H17a1 1 0 0 1 1 1v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8.5Zm11 2.5a1 1 0 1 0 0 2h2v-2h-2Z"/>
+      </svg><span class="nav-label">额度</span>
+    </button>
   </nav>
   <div class="top-actions" id="topActions" hidden>
     <button id="backParentBtn" title="返回主会话" hidden>← 主会话</button>
@@ -52,6 +58,16 @@
     <input id="wsTokenInput" type="password" placeholder="Token（可选）" autocomplete="off" spellcheck="false">
     <button id="wsSaveBtn" type="button" class="primary">保存</button>
     <button id="wsCancelBtn" type="button">取消</button>
+  </div>
+  <div id="quotaPopover" class="quota-popover" hidden role="dialog" aria-labelledby="quotaPopoverTitle">
+    <div class="quota-popover-head">
+      <h2 id="quotaPopoverTitle">账号额度</h2>
+      <span id="quotaUpdatedAt" class="quota-updated" aria-live="polite"></span>
+      <button id="quotaRefreshBtn" type="button" class="quota-refresh" title="立即刷新账号额度">刷新</button>
+      <button id="quotaPopoverClose" type="button" class="quota-popover-close" title="关闭（Esc）" aria-label="关闭">×</button>
+    </div>
+    <p class="quota-cards-note">账户级，不受用量筛选影响</p>
+    <div id="quotaCardsRow" class="quota-cards-row"></div>
   </div>
   <div class="token-box">
     <!-- 默认折叠成小按钮：点击展开输入框，再点 / Esc / 失焦收起（app.js） -->
@@ -150,18 +166,6 @@
       <button id="usageCloseBtn" type="button">返回对话</button>
     </div>
   </header>
-
-  <section id="quotaCards" class="quota-cards" aria-labelledby="quotaCardsTitle" hidden>
-    <div class="quota-cards-head">
-      <h2 id="quotaCardsTitle">账号额度</h2>
-      <div class="quota-cards-meta">
-        <span class="quota-cards-note">账户级，不受下方筛选影响</span>
-        <span id="quotaUpdatedAt" class="quota-updated" aria-live="polite"></span>
-        <button id="quotaRefreshBtn" type="button" class="quota-refresh" title="立即刷新账号额度">刷新</button>
-      </div>
-    </div>
-    <div id="quotaCardsRow" class="quota-cards-row"></div>
-  </section>
 
   <form id="usageFilters" class="usage-filters" aria-label="用量筛选条件">
     <label><span>从</span><input id="usageFrom" name="from" type="datetime-local"></label>
