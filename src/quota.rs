@@ -659,11 +659,12 @@ fn parse_error() -> String {
 /// Numbers and numeric strings are both accepted: these APIs mix them
 /// (`"total_balance":"10.44"` vs `"percent":12.5`).
 fn number(value: &Value) -> Option<f64> {
-    match value {
+    let parsed = match value {
         Value::Number(number) => number.as_f64(),
         Value::String(text) => text.trim().parse().ok(),
         _ => None,
-    }
+    };
+    parsed.filter(|number| number.is_finite())
 }
 
 fn rfc3339_seconds(seconds: i64) -> Option<String> {
@@ -701,6 +702,15 @@ mod tests {
 
     fn close(left: f64, right: f64) -> bool {
         (left - right).abs() < 1e-9
+    }
+
+    #[test]
+    fn non_finite_percentages_are_rejected() {
+        assert_eq!(number(&json!("NaN")), None);
+        assert_eq!(number(&json!("inf")), None);
+        assert_eq!(number(&json!("-inf")), None);
+        assert_eq!(number(&json!("12.5")), Some(12.5));
+        assert_eq!(number(&json!(12.5)), Some(12.5));
     }
 
     const DEEPSEEK: &str = r#"{"is_available":true,"balance_infos":[{"currency":"USD","total_balance":"1.50"},{"currency":"CNY","total_balance":"10.44","granted_balance":"0.00","topped_up_balance":"10.44"}]}"#;

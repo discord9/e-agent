@@ -1309,7 +1309,12 @@ failure is reported as that provider's own card. The browser fetches the
 cards once on page load, then at most every 10 minutes (a hidden tab pauses
 the timer; returning after a short switch reuses the cached result), and the
 card row's 刷新 button forces an immediate refresh. Opening the usage view
-only renders the cached row. Non-goals: billing history, cost accounting or
+only renders the cached row. Quota windows are drawn as **remaining** credit:
+a full bar means plenty left, and the color tracks what is left (>30% normal,
+10–30% warning, ≤10% danger), while the used percentage stays in the tooltip
+and `aria-valuetext`. A window whose upstream percentage is missing renders
+as unknown (no `aria-valuenow`, neutral color) instead of being read as a
+full bar. Non-goals: billing history, cost accounting or
 price calculation, auto top-up, arbitrary user-supplied usage endpoints, and
 background quota monitoring or notifications.
 

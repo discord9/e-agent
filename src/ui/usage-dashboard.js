@@ -341,19 +341,26 @@ function renderQuotaCards(providers) {
       card.append(el("p", "quota-amount", provider.amount === null ? "暂不可用" : currency + Number(provider.amount).toFixed(2)));
     } else if (provider.kind === "quota") {
       for (const window of provider.windows) {
-        const used = Number(window.used_percent);
-        const level = used >= 90 ? "danger" : used >= 70 ? "warning" : "normal";
+        /* `Number(null)` is 0, which would paint an unknown window as a full
+           "remaining 100%" bar — the exact false-available signal this view is
+           meant to avoid. Only a real finite number counts as known. */
+        const known = typeof window.used_percent === "number" && Number.isFinite(window.used_percent);
+        const used = known ? window.used_percent : null;
+        const remaining = used === null ? null : 100 - used;
+        const level = remaining === null ? "unknown"
+          : remaining > 30 ? "normal" : remaining > 10 ? "warning" : "danger";
         const item = el("div", "quota-window " + level);
+        item.title = known ? "已用 " + used.toFixed(1) + "%" : "用量数据不可用";
         const caption = el("div", "quota-window-caption");
-        caption.append(el("span", "", window.label), el("span", "quota-percent", used.toFixed(1) + "%"));
+        caption.append(el("span", "", window.label), el("span", "quota-percent", remaining === null ? "剩余 —" : "剩余 " + remaining.toFixed(1) + "%"));
         const track = el("div", "quota-track");
         track.setAttribute("role", "progressbar");
         track.setAttribute("aria-label", provider.label + " · " + window.label);
         track.setAttribute("aria-valuemin", "0");
         track.setAttribute("aria-valuemax", "100");
-        const clamped = Math.min(100, Math.max(0, used));
-        track.setAttribute("aria-valuenow", String(clamped));
-        track.setAttribute("aria-valuetext", used.toFixed(1) + "% 已使用");
+        const clamped = remaining === null ? 0 : Math.min(100, Math.max(0, remaining));
+        if (remaining !== null) track.setAttribute("aria-valuenow", String(clamped));
+        track.setAttribute("aria-valuetext", remaining === null ? "用量数据不可用" : "剩余 " + remaining.toFixed(1) + "%（已用 " + used.toFixed(1) + "%）");
         const fill = el("div", "quota-fill");
         fill.style.width = clamped + "%";
         track.append(fill);
