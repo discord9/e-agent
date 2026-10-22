@@ -1379,8 +1379,11 @@ function renderMessage(m, acc, pendingCards) {
       // 与 live 路径同一 renderToolResult：特殊结果（web_search / delegate /
       // get_background_tasks / 文件 diff）在 history 重放时渲染一致
       renderToolResult(resEl, name, tArgs, t.content, t.is_error, t.images);
-      if (name === "read_image" && !t.is_error && resEl.querySelector("img.attached-image")) {
+      const isFileTool = tArgs !== null;
+      if ((isFileTool || (name === "read_image" && resEl.querySelector("img.attached-image"))) && !t.is_error) {
         card.setAttribute("open", "");
+      } else {
+        card.removeAttribute("open");
       }
     } else {
       // 无对应 ToolCall 保持基线纯文本行为；图片 read_image 结果需要结构化容器。

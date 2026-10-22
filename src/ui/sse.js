@@ -366,8 +366,23 @@ function handleSSEBlock(block, id, wsId, epoch) {
     const anchor = [...els.messages.children].find((node) => node.offsetTop >= oldTop && node.dataset.entryLocation);
     const anchorKey = anchor && anchor.dataset.entryLocation;
     const anchorOffset = anchor ? anchor.offsetTop - oldTop : 0;
-    const expanded = new Set([...els.messages.querySelectorAll("details[open]")]
-      .map((node) => node.closest("[data-entry-location]")?.dataset.entryLocation).filter(Boolean));
+    // Expansion is restored per entry, not per detail: `renderEntries` stamps
+    // `data-entry-location` on each direct child of the message list, so a
+    // thinking block or tool card is its own host. Number every detail in
+    // document order within its location; both the collect and restore passes
+    // walk the same order, so the index is stable across a re-render.
+    const expandedKeys = new Set();
+    {
+      const seen = new Map();
+      for (const node of els.messages.querySelectorAll("details")) {
+        const host = node.closest("[data-entry-location]");
+        const location = host && host.dataset.entryLocation;
+        if (!location) continue;
+        const index = seen.get(location) ?? 0;
+        seen.set(location, index + 1);
+        if (node.open) expandedKeys.add(location + "#" + index);
+      }
+    }
     const locationKey = (location) => location ? JSON.stringify(location) : null;
     const headKeys = new Set((bootstrap.locations || []).map(locationKey).filter(Boolean));
     // Older pages retain their own physical keys. A new head may overlap a
@@ -428,8 +443,16 @@ function handleSSEBlock(block, id, wsId, epoch) {
       state.compactionUsagePending = false;
       applyUsage(bootstrap.usage.data);
     }
-    for (const node of els.messages.querySelectorAll("details")) {
-      if (expanded.has(node.closest("[data-entry-location]")?.dataset.entryLocation)) node.open = true;
+    {
+      const seen = new Map();
+      for (const node of els.messages.querySelectorAll("details")) {
+        const host = node.closest("[data-entry-location]");
+        const location = host && host.dataset.entryLocation;
+        if (!location) continue;
+        const index = seen.get(location) ?? 0;
+        seen.set(location, index + 1);
+        if (expandedKeys.has(location + "#" + index)) node.open = true;
+      }
     }
     if (!wasAtBottom) {
       // Same physical older pages were reinserted above the refreshed head;
