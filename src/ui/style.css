@@ -199,6 +199,7 @@
     position: absolute;
     top: calc(100% + 6px);
     right: 14px;
+    left: auto;
     z-index: 20;
     width: min(680px, calc(100vw - 24px));
     max-height: min(70vh, 520px);
@@ -2270,7 +2271,7 @@
   /* =====================================================================
    * 用量仪表盘：沿用 Solarized tokens，作为与聊天并列的独立内容视图。
    * ===================================================================*/
-  .primary-nav { display: flex; align-items: center; flex: 0 0 auto; }
+  .primary-nav { display: flex; align-items: center; flex: 0 0 auto; margin-left: auto; }
   .nav-btn {
     display: inline-flex;
     align-items: center;
@@ -2436,7 +2437,6 @@
     .usage-panel { padding: 13px; }
   }
   @media (max-width: 440px) {
-    .primary-nav { margin-left: auto; }
     .nav-btn { padding: 3px 7px; }
     .nav-btn .nav-label { display: none; }
     .usage-filters { grid-template-columns: 1fr; }

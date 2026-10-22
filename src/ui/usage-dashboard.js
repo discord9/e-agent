@@ -543,9 +543,33 @@ els.usageRefreshBtn.addEventListener("click", loadUsageDashboard);
 els.usageResetBtn.addEventListener("click", resetUsageFilters);
 els.usageFilters.addEventListener("submit", (event) => { event.preventDefault(); loadUsageDashboard(); });
 
+/* Anchor the popover to its trigger. The trigger now sits on the right, so
+   prefer aligning right edges; fall back to the left edge when there is room,
+   then clamp inside the viewport. */
+function positionQuotaPopover() {
+  const btn = $("quotaPopoverBtn");
+  const popover = $("quotaPopover");
+  if (!btn || !popover) return;
+  /* On phones the stylesheet owns the layout (full width, 8px insets); clear
+     the inline values so the media query applies. */
+  if (window.matchMedia("(max-width: 600px)").matches) {
+    popover.style.left = "";
+    popover.style.right = "";
+    return;
+  }
+  const rect = btn.getBoundingClientRect();
+  const width = popover.offsetWidth || 680;
+  let left = rect.right - width;                 // right-align to the trigger
+  if (left < 8) left = rect.left;                // not enough room on the left
+  left = Math.max(8, Math.min(left, window.innerWidth - width - 8));
+  popover.style.left = left + "px";
+  popover.style.right = "auto";
+}
+
 function openQuotaPopover() {
   const popover = $("quotaPopover");
   popover.hidden = false;
+  positionQuotaPopover();
   $("quotaPopoverBtn").setAttribute("aria-expanded", "true");
   if (!quotaCacheMatchesWorkspace()) startQuotaPolling();
   if (!$("quotaCardsRow").hasChildNodes()) {
@@ -565,6 +589,7 @@ $("quotaPopoverBtn").addEventListener("click", () => {
   $("quotaPopover").hidden ? openQuotaPopover() : closeQuotaPopover();
 });
 $("quotaPopoverClose").addEventListener("click", closeQuotaPopover);
+window.addEventListener("resize", () => { if (!$("quotaPopover").hidden) positionQuotaPopover(); });
 document.addEventListener("click", (event) => {
   if ($("quotaPopover").hidden) return;
   if (event.target.closest("#quotaPopover") || event.target.closest("#quotaPopoverBtn")) return;
