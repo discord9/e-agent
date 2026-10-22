@@ -367,7 +367,12 @@ function handleSSEBlock(block, id, wsId, epoch) {
     const anchorKey = anchor && anchor.dataset.entryLocation;
     const anchorOffset = anchor ? anchor.offsetTop - oldTop : 0;
     const expanded = new Set([...els.messages.querySelectorAll("details[open]")]
-      .map((node) => node.closest("[data-entry-location]")?.dataset.entryLocation).filter(Boolean));
+      .map((node) => {
+        const host = node.closest("[data-entry-location]");
+        if (!host) return null;
+        const index = [...host.querySelectorAll("details")].indexOf(node);
+        return index < 0 ? null : host.dataset.entryLocation + "#" + index;
+      }).filter(Boolean));
     const locationKey = (location) => location ? JSON.stringify(location) : null;
     const headKeys = new Set((bootstrap.locations || []).map(locationKey).filter(Boolean));
     // Older pages retain their own physical keys. A new head may overlap a
@@ -428,8 +433,13 @@ function handleSSEBlock(block, id, wsId, epoch) {
       state.compactionUsagePending = false;
       applyUsage(bootstrap.usage.data);
     }
-    for (const node of els.messages.querySelectorAll("details")) {
-      if (expanded.has(node.closest("[data-entry-location]")?.dataset.entryLocation)) node.open = true;
+    for (const host of els.messages.querySelectorAll("[data-entry-location]")) {
+      const key = host.dataset.entryLocation;
+      if (!key) continue;
+      const nodes = [...host.querySelectorAll("details")];
+      nodes.forEach((node, index) => {
+        if (expanded.has(key + "#" + index)) node.open = true;
+      });
     }
     if (!wasAtBottom) {
       // Same physical older pages were reinserted above the refreshed head;
