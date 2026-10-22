@@ -1279,6 +1279,14 @@ impl Agent {
         self.context_prefix = Some(prefix);
     }
 
+    pub(crate) fn context_prefix(&self) -> Option<&str> {
+        self.context_prefix.as_deref()
+    }
+
+    pub(crate) fn compaction_reminder_text(&self) -> Option<&str> {
+        self.compaction_reminder.as_deref()
+    }
+
     /// Install a role-derived directive for compacted summary projections.
     /// Not persisted in sessions.
     pub fn set_compaction_reminder(&mut self, text: String) {

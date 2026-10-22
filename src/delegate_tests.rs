@@ -3669,3 +3669,45 @@ async fn btw_child_suspends_fresh_automatic_goal_until_completion_commits() {
     drop(handle);
     task.join().await.unwrap();
 }
+
+#[test]
+fn send_message_spec_is_identical_for_parent_and_child() {
+    let parent = SendMessage::parent(Sessions::default());
+    let (handle, _events, _commands) = crate::runner::session_test_channel();
+    let child = SendMessage::child(handle.downgrade());
+    assert_eq!(parent.spec(), child.spec());
+}
+
+#[test]
+fn fork_child_delegate_spec_matches_parent() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(temp.path()).unwrap();
+    let (_, background) = builtins(workspace.clone(), None, false, None);
+    let model = ConfiguredModel::chat(
+        crate::model::OpenAiModel::new(
+            "http://localhost".into(),
+            "test-key".into(),
+            "test-model".into(),
+            None,
+        )
+        .unwrap(),
+    );
+    let head_model = model.clone();
+    let parent = Delegate::new(model, workspace, background)
+        .persist_sessions(temp.path().join("sessions"))
+        .with_roles_root(temp.path().join("roles"))
+        .with_role_models(std::collections::HashMap::new())
+        .with_fork_head(Arc::new(move || crate::session_factory::RequestHead {
+            model: head_model.clone(),
+            context_window: None,
+            context_prefix: None,
+            compaction_reminder: None,
+            sandbox: None,
+            read_only: false,
+            protect_git: true,
+            code_mode: false,
+            mcp_servers: std::collections::HashMap::new(),
+        }));
+    let child = parent.fork_child_delegate();
+    assert_eq!(parent.spec(), child.spec());
+}

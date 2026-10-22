@@ -35,6 +35,20 @@ use crate::tools::{
 };
 use crate::workspace::Workspace;
 
+/// Everything before a main session's history, participating in prefix-cache matching.
+#[derive(Clone)]
+pub(crate) struct RequestHead {
+    pub model: ConfiguredModel,
+    pub context_window: Option<u64>,
+    pub context_prefix: Option<String>,
+    pub compaction_reminder: Option<String>,
+    pub sandbox: Option<crate::config::Sandbox>,
+    pub read_only: bool,
+    pub protect_git: bool,
+    pub code_mode: bool,
+    pub mcp_servers: HashMap<String, crate::mcp::McpServerConfig>,
+}
+
 /// What to do with background-task records left behind by a previous run
 /// when building a session.
 ///
@@ -927,12 +941,14 @@ impl SessionFactory {
         // marker, so exposing them would defeat the policy. Delegation stays —
         // spawning a subagent does not mutate this session's host state, and
         // each subagent resolves its own role template (read-only or not).
-        let (mcp_tools, mcp_instructions) = if self.read_only {
+        let mcp_servers_for_fork = config.as_ref().map(|c| c.mcp.clone()).unwrap_or_default();
+        let (mut mcp_tools, mcp_instructions) = if self.read_only {
             (Vec::new(), Vec::new())
         } else {
-            let mcp_servers = config.as_ref().map(|c| c.mcp.clone()).unwrap_or_default();
-            mcp::connect_all(mcp_servers, &self.root).await
+            mcp::connect_all(mcp_servers_for_fork.clone(), &self.root).await
         };
+        // Deterministic order is required for prefix-cache parity.
+        mcp_tools.sort_by_key(|tool| tool.spec().name);
         tools.extend(mcp_tools);
         let mut delegate = Delegate::new(
             main_model.clone(),
@@ -961,6 +977,15 @@ impl SessionFactory {
         // spawn time, exactly like the routed-role path above reads `[roles]
         // <role>` — both survive config hot reloads without a restart.
         delegate = delegate.with_subagent_model_source(self.subagent_model_resolver());
+        let head_cell = Arc::new(std::sync::Mutex::new(None::<RequestHead>));
+        let cell = head_cell.clone();
+        delegate = delegate.with_fork_head(Arc::new(move || {
+            cell.lock()
+                .unwrap()
+                .as_ref()
+                .expect("main request head initialized")
+                .clone()
+        }));
         let subagent_sessions = delegate.sessions();
         tools.push(Box::new(crate::delegate::SendMessage::parent(
             subagent_sessions.clone(),
@@ -991,6 +1016,26 @@ impl SessionFactory {
         if !context.is_empty() {
             agent.set_context_prefix(context.join("\n\n"));
         }
+        let head_prefix = agent.context_prefix().map(str::to_owned);
+        let head_reminder = agent.compaction_reminder_text().map(str::to_owned);
+        let head_model = main_model.clone();
+        let head_window = main_context_window;
+        let head_sandbox = self.sandbox.clone();
+        let head_read_only = self.read_only;
+        let head_code_mode = self.code_mode;
+        let head_value = RequestHead {
+            model: head_model.clone(),
+            context_window: head_window,
+            context_prefix: head_prefix.clone(),
+            compaction_reminder: head_reminder.clone(),
+            sandbox: head_sandbox.clone(),
+            read_only: head_read_only,
+            protect_git: false,
+            code_mode: head_code_mode,
+
+            mcp_servers: mcp_servers_for_fork.clone(),
+        };
+        *head_cell.lock().unwrap() = Some(head_value);
         if let Some(rounds) = max_rounds {
             agent = agent.max_tool_rounds(rounds);
         }

@@ -201,18 +201,13 @@ impl SendMessage {
 #[async_trait]
 impl Tool for SendMessage {
     fn spec(&self) -> ToolSpec {
-        let child = matches!(self.mode, MessageMode::Child { .. });
         ToolSpec {
             name: "send_message".into(),
-            description: if child {
-                "Send a direct message to the live parent agent. The target must be `parent`. Delivery is queued; it is not a human instruction.".into()
-            } else {
-                "Send a direct message to one live child agent. The target must be that child's exact registered subagent session id. Delivery is queued; it is not a human instruction. A finished child is not live: continue it with the `delegate` tool (`resume` its session id, with a fresh `task` and the original `role`/`workspace` if the task used them).".into()
-            },
+            description: "Send a direct message to a live session. From the main agent, `target` must be the exact registered child subagent session id. From a subagent, `target` must be `parent`. Delivery is queued; it is not a human instruction.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "target": {"type": "string", "description": if child { "REQUIRED — `parent`" } else { "REQUIRED — exact live child subagent session id" }},
+                    "target": {"type": "string", "description": "REQUIRED — the target session id (`parent` when sent from a subagent)"},
                     "message": {"type": "string", "description": "REQUIRED — message body"}
                 },
                 "required": ["target", "message"],
@@ -332,6 +327,8 @@ pub struct Delegate {
     persist_backend: SessionBackend,
     /// Current live parent runner endpoint, installed after runner creation.
     parent_endpoint: Option<WeakSessionHandle>,
+    fork_head: Option<Arc<dyn Fn() -> crate::session_factory::RequestHead + Send + Sync>>,
+    fork_child: bool,
 }
 
 /// Where a subagent writes its own session file.
@@ -381,12 +378,62 @@ struct DelegatedTask {
     interactive: bool,
 }
 
+struct DisabledTool {
+    inner: Box<dyn Tool>,
+    reason: &'static str,
+}
+
+fn label_arg(args: &Value) -> Option<String> {
+    args.get("label").and_then(Value::as_str).map(str::to_owned)
+}
+#[async_trait]
+impl Tool for DisabledTool {
+    fn spec(&self) -> ToolSpec {
+        self.inner.spec()
+    }
+    async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
+        Err(self.reason.into())
+    }
+    fn set_event_sender(&mut self, sender: tokio::sync::mpsc::UnboundedSender<AgentEvent>) {
+        self.inner.set_event_sender(sender);
+    }
+    fn has_event_sender(&self) -> bool {
+        self.inner.has_event_sender()
+    }
+    fn on_turn_start(&mut self) {
+        self.inner.on_turn_start();
+    }
+}
+
 impl Delegate {
     /// The effective default subagent model at spawn time: the live source
     /// (session factory, hot-reloadable) when installed, else the
     /// construction-time snapshot. Shared by both fallback paths in
     /// `execute` — the no-`role` branch and the routed-role branch when the
     /// live `[roles]` config does not route the role.
+    fn fork_child_delegate(&self) -> Delegate {
+        Delegate {
+            subagent_model: self.subagent_model.clone(),
+            subagent_context_window: self.subagent_context_window,
+            workspace: self.workspace.clone(),
+            background: self.background.clone(),
+            sessions: self.sessions.clone(),
+            persist_root: self.persist_root.clone(),
+            role_models: self.role_models.clone(),
+            role_context_windows: self.role_context_windows.clone(),
+            role_model_source: self.role_model_source.clone(),
+            subagent_model_source: self.subagent_model_source.clone(),
+            roles_root: self.roles_root.clone(),
+            sandbox: self.sandbox.clone(),
+            record_in: self.record_in.clone(),
+            local_sessions: self.local_sessions.clone(),
+            persist_backend: self.persist_backend.clone(),
+            parent_endpoint: self.parent_endpoint.clone(),
+            fork_head: self.fork_head.clone(),
+            fork_child: true,
+        }
+    }
+
     fn effective_subagent_model(&self) -> (ConfiguredModel, Option<u64>) {
         match &self.subagent_model_source {
             Some(source) => source()
@@ -413,6 +460,8 @@ impl Delegate {
             local_sessions: crate::session_factory::LocalSessionRegistry::default(),
             persist_backend: SessionBackend::default(),
             parent_endpoint: None,
+            fork_head: None,
+            fork_child: false,
         }
     }
 
@@ -527,6 +576,14 @@ impl Delegate {
         registry: crate::session_factory::LocalSessionRegistry,
     ) -> Self {
         self.local_sessions = registry;
+        self
+    }
+
+    pub(crate) fn with_fork_head(
+        mut self,
+        head: Arc<dyn Fn() -> crate::session_factory::RequestHead + Send + Sync>,
+    ) -> Self {
+        self.fork_head = Some(head);
         self
     }
 
@@ -650,6 +707,157 @@ impl Delegate {
         let runner = runner.with_background_tasks(background.clone());
         let runner_task = runner.start(Some(task.task));
         Ok((handle, runner_task))
+    }
+
+    async fn spawn_fork(
+        &self,
+        task: String,
+        label: Option<String>,
+        record: crate::session_store::BackgroundRecord,
+        prefix: Vec<crate::agent::SessionEntry>,
+        head: crate::session_factory::RequestHead,
+    ) -> Result<String, String> {
+        let session_id = crate::session::new_id_prefixed("sub-");
+        let workspace = self.workspace.clone();
+        let persist_root = self
+            .persist_root
+            .clone()
+            .ok_or("fork requires subagent persistence")?;
+        let persist = PersistConfig {
+            root: persist_root.clone(),
+            session_id: session_id.clone(),
+            backend: self.persist_backend.clone(),
+        };
+        let mut tools = crate::tools::builtins_with_background(
+            workspace.clone(),
+            self.background.clone(),
+            head.sandbox.clone(),
+            head.read_only,
+            head.protect_git,
+            Some(session_id.clone()),
+        );
+        #[cfg(target_os = "linux")]
+        if head.code_mode && (!head.read_only || head.sandbox.is_some()) {
+            let rust = crate::tools::run_rust_tool(&workspace, head.sandbox.as_ref());
+            tools.push(Box::new(DisabledTool {
+                inner: rust,
+                reason: "run_rust is unavailable in forked subagents",
+            }));
+        }
+        let input = Box::new(crate::tools::user_input::RequestUserInput) as Box<dyn Tool>;
+        tools.push(Box::new(DisabledTool {
+            inner: input,
+            reason: "forked subagents cannot ask the user questions",
+        }));
+        let mut mcp_tools = if head.read_only {
+            Vec::new()
+        } else {
+            crate::mcp::connect_all(head.mcp_servers.clone(), workspace.root())
+                .await
+                .0
+        };
+        // Deterministic order is required for prefix-cache parity.
+        mcp_tools.sort_by_key(|tool| tool.spec().name);
+        tools.extend(mcp_tools);
+        let child_delegate = self.fork_child_delegate();
+        tools.push(Box::new(SendMessage::child(
+            self.parent_endpoint
+                .clone()
+                .ok_or("parent session endpoint unavailable")?,
+        )));
+        tools.push(Box::new(child_delegate));
+        let mut agent = Agent::new(Box::new(head.model.clone()), tools);
+        if let Some(prefix) = head.context_prefix {
+            agent.set_context_prefix(prefix);
+        }
+        if let Some(reminder) = head.compaction_reminder {
+            agent.set_compaction_reminder(reminder);
+        }
+        if let Some(window) = head.context_window {
+            agent.set_context_window(window);
+        }
+        let at = prefix.len();
+        let mut initial_entries = prefix;
+        initial_entries.push(crate::agent::SessionEntry::ForkedFrom {
+            source: record.session.clone(),
+            at,
+            event_time: None,
+            seq: None,
+        });
+        let bootstrap = SessionBootstrap {
+            recovery_tasks: Vec::new(),
+            legacy: false,
+            initial_entries,
+        };
+        let store = SessionStore::connect(&persist.backend, &persist.root, &session_id)
+            .await
+            .map_err(|e| format!("fork failed: {e:#}"))?;
+        agent.record_background_tasks_in(persist.root.clone(), &session_id, store.clone());
+        let (runner, handle) = SessionRunner::new_with_bootstrap(
+            agent,
+            store.clone(),
+            persist.root.clone(),
+            session_id.clone(),
+            IdlePolicy::FinishWhenIdle,
+            bootstrap,
+        )
+        .await
+        .map_err(|e| format!("fork failed: {e:#}"))?;
+        let runner_task = runner.start(Some(format!("{task}\n\n[You are a forked subagent continuing the parent session's completed history. You run on the parent's model with the parent's tools. You cannot delegate further and cannot ask the user questions; work autonomously and return a concise final answer.]")));
+        let id_slot = Arc::new(Mutex::new(None::<u64>));
+        let slot_hook = id_slot.clone();
+        let sessions = self.sessions.clone();
+        let entry = Arc::new(SessionEntry {
+            handle: handle.clone(),
+            model: head.model.display_name().to_owned(),
+            role: None,
+            cwd: workspace.root().display().to_string(),
+            session_id: session_id.clone(),
+            context_window: head.context_window,
+            store: store.clone(),
+            local_permit: None,
+        });
+        let entry_hook = entry.clone();
+        let child_record = crate::session_store::BackgroundRecord {
+            root: persist.root.clone(),
+            session: session_id.clone(),
+            store,
+        };
+        let abort = runner_task.abort_handle();
+        let title = task_label(label.as_deref(), None, &task);
+        let cleanup = DelegateCleanup::new(id_slot, self.sessions.clone(), Some(record.clone()));
+        let background = self.background.clone();
+        let child_for_cleanup = child_record.clone();
+        let session_id_for_output = session_id.clone();
+        self.background
+            .spawn_with_id_target(
+                self.background.sender.lock().unwrap().clone(),
+                title,
+                None,
+                None,
+                Some(crate::tools::TaskDisplayMeta {
+                    background: true,
+                    workspace: None,
+                    subagent_session_id: Some(session_id.clone()),
+                    resume: None,
+                }),
+                new_exit_slot(),
+                Some(abort),
+                move |id| {
+                    *slot_hook.lock().unwrap() = Some(id);
+                    sessions.insert(id, entry_hook);
+                },
+                move || {
+                    let cleanup = cleanup;
+                    async move {
+                        let _ = Delegate::runner_result(&handle, runner_task).await;
+                        finish_child_cleanup(cleanup, &background, &child_for_cleanup).await;
+                        format!("fork session: {session_id_for_output}")
+                    }
+                },
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(session_id)
     }
 
     async fn runner_result(
@@ -1049,24 +1257,27 @@ impl Tool for Delegate {
         } else {
             json!({"type": "string", "enum": roles, "description": format!("specialized role for the subagent; available roles: {}", role_disclosures.join(", "))})
         };
+        let mut properties = json!({
+            "workspace": {"type": "string", "description": "REQUIRED — working directory for the subagent"},
+            "role": role_property,
+            "label": {"type": "string"},
+            "resume": {"type": "string"},
+            "task": {"type": "string", "description": "complete, self-contained instructions for the subagent"}
+        });
+        if self.fork_head.is_some() {
+            properties["fork"] = json!({"type":"boolean", "description":"Continue from the parent's completed-turn prefix so the child reuses the parent's provider-side prompt cache: the child inherits the parent's model, system prompt and tool schemas byte for byte. Mutually exclusive with `role` and `resume`. The current in-flight turn is excluded, so put everything the child needs in `task`."});
+        }
         ToolSpec {
             name: "delegate".into(),
             description,
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "workspace": {"type": "string", "description": "REQUIRED — working directory for the subagent (e.g. /home/user/project or C:\\Users\\user\\project). May be absolute or relative: relative paths are resolved against YOUR workspace root (e.g. `.e-agent/worktrees/wt-x`) and must stay inside it or an authorized external directory."},
-                    "role": role_property,
-                    "label": {"type": "string", "description": "short (≤ 40 chars) human-readable title for the task panel; defaults to the role name or a preview of the task"},
-                    "resume":{"type": "string", "description": "id of a previous subagent session (sub-…) to continue from; its transcript becomes the starting context"},
-                    "task": {"type": "string", "description": "complete, self-contained instructions for the subagent"},
-                },
-                "required": ["workspace", "task"]
-            }),
+            parameters: json!({"type":"object", "properties": properties, "required":["workspace","task"]}),
         }
     }
 
     async fn execute(&self, arguments: Value) -> Result<ToolOutput, String> {
+        if self.fork_child {
+            return Err("a forked subagent cannot delegate further".into());
+        }
         if let Some(args) = arguments.as_object() {
             // Legacy `background` is rejected with a dedicated error, ahead
             // of the generic unknown-key check: `delegate` is background-only
@@ -1078,7 +1289,7 @@ impl Tool for Delegate {
                         .into(),
                 );
             }
-            const KNOWN: &[&str] = &["task", "role", "label", "resume", "workspace"];
+            const KNOWN: &[&str] = &["task", "role", "label", "resume", "workspace", "fork"];
             for key in args.keys() {
                 if !KNOWN.contains(&key.as_str()) {
                     return Err(format!(
@@ -1096,6 +1307,41 @@ impl Tool for Delegate {
             .to_owned();
         if task.trim().is_empty() {
             return Err("`task` must not be empty".into());
+        }
+        let fork = arguments
+            .get("fork")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if fork {
+            if arguments.get("role").is_some() {
+                return Err("`fork` and `role` are mutually exclusive".into());
+            }
+            if arguments.get("resume").is_some() {
+                return Err("`fork` and `resume` are mutually exclusive".into());
+            }
+            let factory = self
+                .fork_head
+                .as_ref()
+                .ok_or("fork is unavailable for this delegate")?;
+            let record = self
+                .record_in
+                .as_ref()
+                .ok_or("fork requires a parent session record")?;
+            let entries = record
+                .store
+                .load(&record.root, &record.session)
+                .await
+                .map_err(|e| format!("cannot load parent history: {e:#}"))?
+                .entries;
+            let prefix = crate::agent::fork_prefix(&entries, None)?;
+            if prefix.is_empty() {
+                return Err("parent session has no completed turn to fork".into());
+            }
+            let head = factory();
+            return self
+                .spawn_fork(task, label_arg(&arguments), record.clone(), prefix, head)
+                .await
+                .map(ToolOutput::text);
         }
         let role = arguments
             .as_object()
