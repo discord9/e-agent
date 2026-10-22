@@ -195,6 +195,33 @@
   .ws-editor input:focus { outline: 1px solid var(--blue); }
   .ws-editor button { padding: 4px 10px; font-size: 12px; }
 
+  .quota-popover {
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 14px;
+    z-index: 20;
+    width: min(680px, calc(100vw - 24px));
+    max-height: min(70vh, 520px);
+    overflow-y: auto;
+    padding: 12px 14px;
+    background: var(--base3);
+    border: 1px solid var(--base1);
+    border-radius: 6px;
+    box-shadow: 0 2px 8px rgba(0,0,0,.15);
+  }
+  .quota-popover-head { display: flex; align-items: center; gap: 10px; }
+  .quota-popover-head .quota-updated { margin-left: auto; }
+  .quota-popover-close { padding: 2px 6px; border: none; font-size: 16px; line-height: 1; }
+  .quota-popover-close:hover { background: var(--base01); }
+  .quota-popover h2 { margin: 0; color: var(--base02); font-size: 14px; }
+  .quota-popover .quota-cards-note { margin: 6px 0 10px; }
+  .quota-popover .quota-cards-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  @media (max-width: 600px) {
+    .quota-popover { left: 8px; right: 8px; width: auto; max-height: 70vh; }
+    .quota-popover-head { flex-wrap: wrap; }
+    .quota-popover .quota-cards-row { grid-template-columns: 1fr; }
+  }
+
   /* ---------- 提示横幅 ---------- */
   .banner {
     display: flex;

@@ -330,18 +330,15 @@ function renderUsageTable(data) {
    placeholder and then vanishes reads as a rendering bug, not as an answer. */
 function renderQuotaNotice(message) {
   $("quotaCardsRow").replaceChildren(el("p", "quota-unavailable", message));
-  $("quotaCards").hidden = false;
 }
 
 function renderQuotaCards(providers) {
-  const section = $("quotaCards");
   const row = $("quotaCardsRow");
   row.replaceChildren();
   if (!providers.length) {
     renderQuotaNotice("当前配置没有可查询额度的 provider");
     return;
   }
-  section.hidden = false;
   for (const provider of providers) {
     const card = el("article", "quota-card");
     const head = el("div", "quota-card-head");
@@ -411,7 +408,6 @@ function resetQuotaView() {
   usageDashboardState.quotaWorkspace = null;
   $("quotaUpdatedAt").textContent = "";
   $("quotaCardsRow").replaceChildren();
-  if (!$("quotaCards").hidden) renderQuotaNotice("额度加载中…");
 }
 
 async function loadProviderQuotas() {
@@ -546,7 +542,39 @@ els.usageCloseBtn.addEventListener("click", closeUsageDashboard);
 els.usageRefreshBtn.addEventListener("click", loadUsageDashboard);
 els.usageResetBtn.addEventListener("click", resetUsageFilters);
 els.usageFilters.addEventListener("submit", (event) => { event.preventDefault(); loadUsageDashboard(); });
-document.addEventListener("keydown", (event) => { if (event.key === "Escape" && usageDashboardState.open) closeUsageDashboard(); });
+
+function openQuotaPopover() {
+  const popover = $("quotaPopover");
+  popover.hidden = false;
+  $("quotaPopoverBtn").setAttribute("aria-expanded", "true");
+  if (!quotaCacheMatchesWorkspace()) startQuotaPolling();
+  if (!$("quotaCardsRow").hasChildNodes()) {
+    if (usageDashboardState.quotaProviders !== null) renderQuotaCards(usageDashboardState.quotaProviders);
+    else renderQuotaNotice("额度加载中…");
+  }
+  $("quotaPopoverClose").focus();
+}
+
+function closeQuotaPopover(restoreFocus = true) {
+  $("quotaPopover").hidden = true;
+  $("quotaPopoverBtn").setAttribute("aria-expanded", "false");
+  if (restoreFocus) $("quotaPopoverBtn").focus();
+}
+
+$("quotaPopoverBtn").addEventListener("click", () => {
+  $("quotaPopover").hidden ? openQuotaPopover() : closeQuotaPopover();
+});
+$("quotaPopoverClose").addEventListener("click", closeQuotaPopover);
+document.addEventListener("click", (event) => {
+  if ($("quotaPopover").hidden) return;
+  if (event.target.closest("#quotaPopover") || event.target.closest("#quotaPopoverBtn")) return;
+  closeQuotaPopover(false);
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape") return;
+  if (!$("quotaPopover").hidden) { closeQuotaPopover(); return; }
+  if (usageDashboardState.open) closeUsageDashboard();
+});
 /* Quota polling is started here, not in sse.js: this file is a separate
    <script> parsed after the app bundle, so its functions do not exist while
    init() runs. A hidden tab stops the timer; regaining visibility only
