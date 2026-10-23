@@ -36,6 +36,31 @@ def sse(response, model):
                    for item in (chunk, end)) + b"data: [DONE]\n\n"
 
 
+def last_message_text(body):
+    """Role and text of the final wire message; content may be a string or parts."""
+    messages = body.get("messages") or []
+    if not messages:
+        return None, ""
+    message = messages[-1]
+    content = message.get("content")
+    if isinstance(content, str):
+        return message.get("role"), content
+    if isinstance(content, list):
+        parts = [part.get("text", "") for part in content
+                 if isinstance(part, dict) and isinstance(part.get("text"), str)]
+        return message.get("role"), "\n".join(parts)
+    return message.get("role"), ""
+
+
+def has_fork_call(body):
+    for message in body.get("messages") or []:
+        for call in message.get("tool_calls") or []:
+            function = call.get("function") or {}
+            if function.get("name") == "delegate" and '"fork"' in (function.get("arguments") or ""):
+                return True
+    return False
+
+
 def main():
     if not BINARY.is_file() or not os.access(BINARY, os.X_OK):
         print(f"SETUP ERROR: executable e-agent binary not found: {BINARY}; build it first", file=sys.stderr)
@@ -67,16 +92,19 @@ def main():
                     requests.append(body)
                     ordinal = len(requests)
                     (root / "provider-requests.json").write_text(json.dumps(requests, indent=2), encoding="utf-8")
-                if ordinal == 1:
-                    response = {"content": "FIRST_TURN_DONE"}
-                elif ordinal == 2:
+                # Decide by content, not arrival order: the parent's
+                # post-tool-result request can race the child's first request.
+                role, text = last_message_text(body)
+                if role == "user" and "FORK_CHILD_TASK" in text:
+                    response = {"content": "CHILD_DONE"}
+                elif text == "SECOND_TURN":
                     response = {"tool_calls": [{"index": 0, "id": "fork-prefix-call-unique", "type": "function",
                                  "function": {"name": "delegate", "arguments": json.dumps({
                                      "workspace": str(workspace), "task": "FORK_CHILD_TASK", "fork": True})}}]}
-                elif ordinal == 3:
-                    response = {"content": "CHILD_DONE"}
+                elif text == "FIRST_TURN":
+                    response = {"content": "FIRST_TURN_DONE"}
                 else:
-                    response = {"content": "EXTRA_REQUEST_OBSERVED"}
+                    response = {"content": "PARENT_CONTINUED"}
                 payload = sse(response, body.get("model", "mock"))
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
@@ -163,7 +191,14 @@ def main():
             return "FIRST_TURN_DONE" in json.dumps(history)
         wait_for(first_turn_done, "completed first parent turn")
         api("POST", "/api/sessions/fork-prefix-parent/prompt", {"prompt": "SECOND_TURN"})
-        wait_for(lambda: len(requests) >= 3, "parent and fork child provider requests")
+        def child_request_seen():
+            # wait_for already holds `lock` around the predicate; taking it
+            # again here would self-deadlock on the non-reentrant Lock.
+            return any(
+                (lambda role_text: role_text[0] == "user" and "FORK_CHILD_TASK" in role_text[1])(last_message_text(request))
+                for request in requests
+            )
+        wait_for(child_request_seen, "fork child provider request")
         # The child can finish its response before the next poll; allow a brief observation window
         # to catch an accidental second child request before fixing the snapshot for assertions.
         time.sleep(.4)
@@ -171,19 +206,35 @@ def main():
             observed = list(requests)
         if mock_errors:
             raise AssertionError("mock provider failed: " + mock_errors[0])
-        if len(observed) != 3:
-            raise AssertionError(f"4a: expected exactly 3 provider requests (parent, parent, child), got {len(observed)}")
-        request1, request2, request3 = observed
-        delegate_tool = next((t for t in request2.get("tools", [])
-                              if t.get("function", {}).get("name") == "delegate"), None)
-        if not delegate_tool or "fork" not in delegate_tool.get("function", {}).get("parameters", {}).get("properties", {}):
-            raise AssertionError("request 2 lacks delegate.parameters.properties.fork")
-        if not any(t.get("function", {}).get("name") == "delegate" for t in request1.get("tools", [])):
-            raise AssertionError("4a: request 1 is not the parent request")
-        if any(t.get("function", {}).get("name") == "delegate" for t in request3.get("tools", [])):
-            raise AssertionError("4a: request 3 is not the child request")
-        if len(observed[2:]) != 1:
-            raise AssertionError(f"4a: expected one child request, got {len(observed[2:])}")
+        # The parent keeps turning after the child's completion notice lands,
+        # so the request count is not fixed. Identify the two requests by
+        # content instead: parent and child now share an identical tool list,
+        # which is exactly what this test exists to prove.
+        def is_user_text(request, wanted):
+            role, text = last_message_text(request)
+            return role == "user" and text == wanted
+
+        matching_fork_call = [request for request in observed if is_user_text(request, "SECOND_TURN")]
+        if len(matching_fork_call) != 1:
+            raise AssertionError(f"4a: expected one parent request ending in the in-flight turn, got {len(matching_fork_call)}")
+        request2 = matching_fork_call[0]
+        if has_fork_call(request2):
+            raise AssertionError("4a: the in-flight parent request already contains the fork call it is about to produce")
+        child_requests = [
+            request for request in observed
+            if (lambda role_text: role_text[0] == "user" and "FORK_CHILD_TASK" in role_text[1])(last_message_text(request))
+        ]
+        if len(child_requests) != 1:
+            raise AssertionError(f"4a: expected one fork child request, got {len(child_requests)} of {len(observed)} provider requests")
+        request3 = child_requests[0]
+        request1 = next((request for request in observed if is_user_text(request, "FIRST_TURN")), None)
+        if request1 is None:
+            raise AssertionError("4a: request with the first parent turn not found")
+        if not any(tool.get("function", {}).get("name") == "delegate" for tool in request2.get("tools", [])):
+            raise AssertionError("4a: the in-flight parent request lost the delegate tool")
+        delegate_tool = next(tool for tool in request2["tools"] if tool.get("function", {}).get("name") == "delegate")
+        if "fork" not in delegate_tool["function"].get("parameters", {}).get("properties", {}):
+            raise AssertionError("4a: the parent delegate tool lacks parameters.properties.fork")
 
         def compare_tools(left, right):
             a, b = left.get("tools", []), right.get("tools", [])
