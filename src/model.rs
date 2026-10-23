@@ -697,19 +697,20 @@ impl WireMessage {
                     if content.is_none() {
                         content = Some(WireContent::Text(String::new()));
                     }
-                    // Thinking-mode tool-call rounds MUST echo the
-                    // assistant's original `reasoning_content` back to the
-                    // API on the next request, or DeepSeek returns the
-                    // "reasoning_content must be passed back" 400. The
-                    // field is echoed verbatim, including an empty string
-                    // (`Some("")` is field presence, which DeepSeek also
-                    // requires to round-trip). Plain assistant reasoning
-                    // (no tool_calls) stays un-replayed.
-                    if thinking
-                        && !message.tool_calls.is_empty()
-                        && let Some(reasoning) = message.reasoning.as_deref()
-                    {
-                        reasoning_content = Some(reasoning.to_owned());
+                    // Verified against the live API: on a thinking-mode
+                    // tool-call turn the field must be PRESENT (an empty
+                    // string is accepted) when that assistant turn
+                    // immediately precedes a trailing `role:"tool"` result,
+                    // or DeepSeek returns the "reasoning_content in the
+                    // thinking mode must be passed back to the API" 400. An
+                    // absent field is a 400 even though `""` is fine. So a
+                    // foreign-model turn with no stored reasoning (e.g. a
+                    // Codex turn carried into a DeepSeek profile mid
+                    // tool-loop, or a compaction `retained` snapshot of it)
+                    // emits `""` rather than omitting the field. Plain
+                    // assistant reasoning (no tool_calls) stays un-replayed.
+                    if thinking && !message.tool_calls.is_empty() {
+                        reasoning_content = Some(message.reasoning.clone().unwrap_or_default());
                     }
                 }
                 Self {
