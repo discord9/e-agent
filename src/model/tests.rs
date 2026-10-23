@@ -837,10 +837,15 @@ fn deepseek_compat_replays_empty_reasoning_on_tool_call_assistant() {
 }
 
 #[test]
-fn deepseek_compat_without_reasoning_field_omits_reasoning_content() {
-    // An assistant tool-call turn whose reasoning is `None` (the stream
-    // never carried a reasoning_content field) sends NO reasoning_content —
-    // the echo is only of what was actually present.
+fn deepseek_compat_emits_empty_reasoning_for_foreign_tool_turn() {
+    // Verified against the live API: the field must be PRESENT (empty
+    // string accepted) on a thinking-mode tool-call assistant turn that
+    // immediately precedes a trailing tool result. An assistant turn whose
+    // reasoning is `None` — e.g. a Codex turn carried into a DeepSeek
+    // profile mid tool-loop, or a compaction `retained` snapshot of it —
+    // therefore emits `""` instead of omitting the field (an absent field
+    // is a hard 400: "The `reasoning_content` in the thinking mode must be
+    // passed back to the API").
     let request = ChatRequest::from_internal(
         "deepseek-chat",
         Some("high"),
@@ -853,6 +858,51 @@ fn deepseek_compat_without_reasoning_field_omits_reasoning_content() {
     let value = serde_json::to_value(request).unwrap();
     let message = &value["messages"][0];
     assert_eq!(message["content"], "");
+    // Field PRESENCE, not just value: `Some("")` is the wire contract.
+    assert_eq!(
+        message.get("reasoning_content").and_then(|v| v.as_str()),
+        Some("")
+    );
+    assert_eq!(value["messages"][0]["reasoning_content"], "");
+    assert_eq!(message["tool_calls"][0]["id"], "call-1");
+}
+
+#[test]
+fn deepseek_compat_foreign_tool_turn_without_thinking_omits_reasoning_content() {
+    // Thinking mode off: the 400 does not exist, so no synthesized field
+    // even for a reasoning-less tool-call turn.
+    let request = ChatRequest::from_internal(
+        "deepseek-chat",
+        Some("high"),
+        false,
+        true,
+        &[tool_call_assistant(None, None)],
+        &[],
+        None,
+    );
+    let value = serde_json::to_value(request).unwrap();
+    let message = &value["messages"][0];
+    assert_eq!(message["content"], "");
+    assert!(message.get("reasoning_content").is_none());
+    assert_eq!(message["tool_calls"][0]["id"], "call-1");
+}
+
+#[test]
+fn non_compat_foreign_tool_turn_omits_reasoning_content() {
+    // Every non-DeepSeek profile stays byte-identical: no synthesized
+    // reasoning_content on a reasoning-less tool-call assistant turn.
+    let request = ChatRequest::from_internal(
+        "kimi-k3",
+        Some("high"),
+        true,
+        false,
+        &[tool_call_assistant(None, None)],
+        &[],
+        None,
+    );
+    let value = serde_json::to_value(request).unwrap();
+    let message = &value["messages"][0];
+    assert!(message.get("content").is_none());
     assert!(message.get("reasoning_content").is_none());
     assert_eq!(message["tool_calls"][0]["id"], "call-1");
 }
