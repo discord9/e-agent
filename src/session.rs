@@ -498,10 +498,10 @@ impl Session {
             .with_context(|| format!("cannot replace session {}", path.display()))?;
         Ok(())
     }
-    /// Record a freshly started background task for later unfinished-task
-    /// recovery. One JSON line per task; `clear_background_task` removes the
-    /// line on completion, so a surviving line is an unfinished/stale
-    /// candidate.
+    /// Test-only seeding: append one background-task record line directly.
+    /// Production writes go through [`Self::rewrite_background_tasks`], which
+    /// rewrites the whole file to the live set. One JSON line per task, so a
+    /// surviving line is an unfinished/stale candidate.
     /// Records are scoped per session: a task started in session A is only
     /// reported back when session A is resumed, never to another session.
     ///
@@ -525,6 +525,9 @@ impl Session {
         Ok(file)
     }
 
+    /// Test-only seeding helper: production writes go through the runner's
+    /// projection ([`Self::rewrite_background_tasks`]).
+    #[cfg(test)]
     pub fn record_background_start(
         root: &Path,
         session: &str,
@@ -565,8 +568,15 @@ impl Session {
 
     fn rewrite_background_file(path: &Path, lines: &[String]) -> anyhow::Result<()> {
         if lines.is_empty() {
-            let _ = std::fs::remove_file(path);
-            return Ok(());
+            // The empty projection means "no live task". A failed unlink must
+            // not be reported as success: the runner would cache the empty
+            // set and never retry, leaving a stale row that a later restart
+            // reports as killed. NotFound is the only benign case.
+            return match std::fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error.into()),
+            };
         }
         let temporary = path.with_extension(format!("jsonl.tmp-{}", std::process::id()));
         let mut file = std::fs::File::create(&temporary)?;
@@ -578,13 +588,15 @@ impl Session {
         Ok(())
     }
 
-    /// Forget one task: its completion arrived while the process was alive.
+    /// Test-only seeding helper (see [`Self::record_background_start`]).
+    #[cfg(test)]
     pub fn clear_background_task(root: &Path, session: &str, id: u64) {
         if let Err(error) = Self::clear_background_task_checked(root, session, id) {
             tracing::warn!("e-agent: cannot clear JSONL background task: {error:#}");
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn clear_background_task_checked(
         root: &Path,
         session: &str,
@@ -609,32 +621,76 @@ impl Session {
         Self::rewrite_background_file(&path, &kept)
     }
 
+    pub(crate) fn rewrite_background_tasks(
+        root: &Path,
+        session: &str,
+        tasks: &[crate::session_store::ProjectedBackgroundTask],
+    ) -> anyhow::Result<()> {
+        let path = background_record_path(root, session)?;
+        let _lock = Self::background_mutation_lock(root, session)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut tasks = tasks.to_vec();
+        tasks.sort_by_key(|task| task.id);
+        let lines = tasks
+            .iter()
+            .map(|task| {
+                let mut row = serde_json::json!({"id": task.id, "label": task.label});
+                if let Some(value) = &task.full_command {
+                    row["full_command"] = serde_json::json!(value);
+                }
+                if let Some(value) = &task.subagent_session_id {
+                    row["session_id"] = serde_json::json!(value);
+                }
+                serde_json::to_string(&row)
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Self::rewrite_background_file(&path, &lines)?;
+        #[cfg(unix)]
+        if !tasks.is_empty() {
+            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+        }
+        Ok(())
+    }
+
     /// Read unfinished records without changing them. Each returned record is
     /// an exact consume token, not merely display text.
-    pub(crate) fn peek_unfinished_background(root: &Path, session: &str) -> Vec<UnfinishedTask> {
-        let Ok(path) = background_record_path(root, session) else {
-            return Vec::new();
-        };
-        let Ok(file) = std::fs::File::open(&path) else {
-            return Vec::new();
+    pub(crate) fn peek_unfinished_background(
+        root: &Path,
+        session: &str,
+    ) -> anyhow::Result<Vec<UnfinishedTask>> {
+        let path = background_record_path(root, session)?;
+        let file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
         };
         let mut tasks = Vec::new();
         for (occurrence, line) in std::io::BufReader::new(file).lines().enumerate() {
-            let Ok(line) = line else { break };
+            let line = line?;
             if line.trim().is_empty() {
                 continue;
             }
-            if let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) {
-                tasks.push(UnfinishedTask {
-                    task_id: record["id"].as_u64().unwrap_or(0),
-                    label: record["label"].as_str().unwrap_or("?").to_owned(),
-                    subagent_session_id: record["session_id"].as_str().map(str::to_owned),
-                    started_at: None,
-                    raw: Some(background_token(session, occurrence, &line)),
-                });
-            }
+            let record: serde_json::Value = serde_json::from_str(&line)?;
+            let task_id = record["id"]
+                .as_u64()
+                .filter(|id| *id != 0)
+                .ok_or_else(|| anyhow!("invalid background task id"))?;
+            let label = record["label"]
+                .as_str()
+                .filter(|label| !label.is_empty())
+                .ok_or_else(|| anyhow!("invalid background task label"))?
+                .to_owned();
+            tasks.push(UnfinishedTask {
+                task_id,
+                label,
+                subagent_session_id: record["session_id"].as_str().map(str::to_owned),
+                started_at: None,
+                raw: Some(background_token(session, occurrence, &line)),
+            });
         }
-        tasks
+        Ok(tasks)
     }
 
     /// Consume only the exact records returned by a preceding peek.
@@ -714,7 +770,7 @@ impl Session {
     }
 
     /// Look up one surviving background-task record's full command by id
-    /// (the "另取" path promised by [`Self::record_background_start`]: the
+    /// (the "另取" path promised by [`Self::rewrite_background_tasks`]: the
     /// consuming peek+consume returns labels unchanged,
     /// this reads the persisted `"full_command"` separately). Old records
     /// written before the field shipped have no `full_command` → `None`
@@ -1133,7 +1189,7 @@ mod tests {
     }
 
     fn take_unfinished_for_test(root: &Path, session: &str) -> Vec<String> {
-        let tasks = Session::peek_unfinished_background(root, session);
+        let tasks = Session::peek_unfinished_background(root, session).unwrap();
         let labels = tasks
             .iter()
             .map(|t| format_unfinished(t.task_id, &t.label, t.subagent_session_id.as_deref()))
@@ -1173,6 +1229,68 @@ mod tests {
         );
     }
 
+    /// `rewrite_background_tasks` is the production writer: it rewrites the
+    /// whole record file to exactly the live set, so removing an id drops its
+    /// line and an empty set removes the file entirely (no append/clear pair
+    /// any more, and no leftover row that a restart would report as killed).
+    #[test]
+    fn project_background_tasks_rewrites_exactly_the_live_set() {
+        use crate::session_store::ProjectedBackgroundTask;
+        let temp = tempfile::tempdir().unwrap();
+        let session = "projected";
+        let file = temp
+            .path()
+            .join(".e-agent/sessions/projected.background.jsonl");
+        let tasks = [
+            ProjectedBackgroundTask {
+                id: 1,
+                label: "cargo build".into(),
+                full_command: Some("cargo build --release".into()),
+                subagent_session_id: None,
+            },
+            ProjectedBackgroundTask {
+                id: 2,
+                label: "btw: side".into(),
+                full_command: None,
+                subagent_session_id: Some("btw-7".into()),
+            },
+        ];
+
+        Session::rewrite_background_tasks(temp.path(), session, &tasks).unwrap();
+        let rows = Session::peek_unfinished_background(temp.path(), session).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].task_id, 1);
+        assert_eq!(rows[0].label, "cargo build");
+        assert_eq!(rows[0].subagent_session_id, None);
+        assert_eq!(rows[1].task_id, 2);
+        assert_eq!(rows[1].label, "btw: side");
+        assert_eq!(rows[1].subagent_session_id.as_deref(), Some("btw-7"));
+        // The full command survives the round-trip for the detail reader.
+        assert_eq!(
+            Session::task_full_command(temp.path(), session, 1).as_deref(),
+            Some("cargo build --release")
+        );
+        assert_eq!(Session::task_full_command(temp.path(), session, 2), None);
+
+        // One task completes: only the remaining id stays on record.
+        Session::rewrite_background_tasks(temp.path(), session, &tasks[1..]).unwrap();
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.contains("\"id\":2"), "remaining row written: {text}");
+        assert!(!text.contains("\"id\":1"), "dropped row removed: {text}");
+        let rows = Session::peek_unfinished_background(temp.path(), session).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].task_id, 2);
+
+        // No live tasks: the file is gone, so a restart reports nothing.
+        Session::rewrite_background_tasks(temp.path(), session, &[]).unwrap();
+        assert!(!file.exists());
+        assert!(
+            Session::peek_unfinished_background(temp.path(), session)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     /// `record_background_start` persists the FULL command (not just the
     /// truncated label) under `"full_command"`; `task_full_command` reads
     /// it back by id. Consuming (peek+consume) still
@@ -1185,7 +1303,7 @@ mod tests {
         let session = "jsonl-recovery-race";
         Session::record_background_start(temp.path(), session, 7, "same label", None, None)
             .unwrap();
-        let old = Session::peek_unfinished_background(temp.path(), session);
+        let old = Session::peek_unfinished_background(temp.path(), session).unwrap();
         assert_eq!(old.len(), 1);
 
         // A restart can re-record the same task key before the old peek is
@@ -1193,10 +1311,14 @@ mod tests {
         Session::record_background_start(temp.path(), session, 7, "same label", None, None)
             .unwrap();
         Session::consume_unfinished_background(temp.path(), session, &old).unwrap();
-        let replacement = Session::peek_unfinished_background(temp.path(), session);
+        let replacement = Session::peek_unfinished_background(temp.path(), session).unwrap();
         assert_eq!(replacement.len(), 1);
         Session::consume_unfinished_background(temp.path(), session, &replacement).unwrap();
-        assert!(Session::peek_unfinished_background(temp.path(), session).is_empty());
+        assert!(
+            Session::peek_unfinished_background(temp.path(), session)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1277,7 +1399,7 @@ mod tests {
     fn jsonl_exact_consume_preserves_identical_appended_record() {
         let temp = tempfile::tempdir().unwrap();
         Session::record_background_start(temp.path(), "same", 1, "x", None, None).unwrap();
-        let tasks = Session::peek_unfinished_background(temp.path(), "same");
+        let tasks = Session::peek_unfinished_background(temp.path(), "same").unwrap();
         Session::record_background_start(temp.path(), "same", 1, "x", None, None).unwrap();
         Session::consume_unfinished_background(temp.path(), "same", &tasks).unwrap();
         let remaining =
@@ -1290,7 +1412,7 @@ mod tests {
     fn jsonl_exact_consume_rejects_changed_or_missing_token() {
         let temp = tempfile::tempdir().unwrap();
         Session::record_background_start(temp.path(), "bad", 1, "x", None, None).unwrap();
-        let mut tasks = Session::peek_unfinished_background(temp.path(), "bad");
+        let mut tasks = Session::peek_unfinished_background(temp.path(), "bad").unwrap();
         std::fs::write(
             temp.path().join(".e-agent/sessions/bad.background.jsonl"),
             "changed\n",

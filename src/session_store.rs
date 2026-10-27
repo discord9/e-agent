@@ -12,10 +12,12 @@
 //!   database file is shared across sessions.
 //!
 //! Background-task state (`*.background.jsonl` files on JSONL, the
-//! `running_tasks` table on Greptime/SQLite) is dispatched through the same
-//! enum: [`SessionStore::record_background_start`] /
-//! [`SessionStore::clear_background_task`] /
-//! [`SessionStore::peek+consume].
+//! `running_tasks` table on Greptime/SQLite) is a projection of the live
+//! in-memory task registry: [`SessionStore::project_background_tasks`]
+//! reconciles a whole live set in one call, and
+//! [`SessionStore::peek_unfinished_background`] /
+//! [`SessionStore::consume_unfinished_background`] report + consume whatever a
+//! previous process left behind.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -713,6 +715,14 @@ pub struct SessionMeta {
     pub label: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProjectedBackgroundTask {
+    pub id: u64,
+    pub label: String,
+    pub full_command: Option<String>,
+    pub subagent_session_id: Option<String>,
+}
+
 #[derive(Clone)]
 pub enum SessionStore {
     /// Default file-based JSONL backend. Stateless — delegates to
@@ -828,11 +838,12 @@ pub struct FinishedTask {
     pub cancellation_source: Option<crate::agent::CancellationSource>,
 }
 
-/// Where a live agent records its in-flight background tasks: the workspace
-/// root, the session name the record belongs to, and the store that owns
-/// the record. Carried by the main agent (`agent.background_record`) and
-/// the delegate tool (`delegate.record_in`) so background bash and delegate
-/// tasks are reported as "killed on exit" when their session is resumed.
+/// Identifies a session's background-task projection target: the workspace
+/// root, the session name the projection belongs to, and the store that owns
+/// it. Carried by the delegate tool (`delegate.record_in`) and `BtwContext`
+/// to name the parent session that spawned a child (the metadata link);
+/// the live task rows themselves come from the runner's projection of the
+/// in-memory registry, and are reported as "killed on exit" on resume.
 #[derive(Clone)]
 pub struct BackgroundRecord {
     pub root: PathBuf,
@@ -1974,8 +1985,7 @@ impl SessionStore {
     /// await it — turn-boundary activity is best-effort and losing the
     /// final touch at process exit is acceptable (the audit table keeps
     /// the last committed snapshot). JSONL writes synchronously (the file
-    /// I/O is small; matching the sync facade of
-    /// `record_background_start`). Never self-creates on any backend
+    /// I/O is small). Never self-creates on any backend
     /// (R3): a session with no metadata row / sidecar is a no-op.
     pub fn touch_meta(&self, root: &Path, session: &str) {
         match self {
@@ -2340,24 +2350,84 @@ impl SessionStore {
         }
     }
 
+    /// Make the durable task rows equal exactly `tasks` (the caller's live
+    /// set), per backend. JSONL rewrites the record file; the DB backends
+    /// diff against the current rows so unchanged sets do no I/O. Errors
+    /// surface to the caller, which logs and retries — never aborts work.
+    pub(crate) async fn project_background_tasks(
+        &self,
+        root: &Path,
+        session: &str,
+        tasks: &[ProjectedBackgroundTask],
+    ) -> Result<()> {
+        match self {
+            SessionStore::Jsonl => Session::rewrite_background_tasks(root, session, tasks),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session: db, .. } => {
+                let current = db.peek_unfinished_tasks(session).await?;
+                let wanted: HashSet<u64> = tasks.iter().map(|t| t.id).collect();
+                let have: HashSet<u64> = current.iter().map(|t| t.task_id).collect();
+                for task in tasks.iter().filter(|t| !have.contains(&t.id)) {
+                    db.record_task_start(
+                        session,
+                        task.id,
+                        &task.label,
+                        task.full_command.as_deref(),
+                        task.subagent_session_id.as_deref(),
+                    )
+                    .await?;
+                }
+                for task in current.iter().filter(|t| !wanted.contains(&t.task_id)) {
+                    db.clear_task(session, task.task_id).await?;
+                }
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite { session: db, .. } => {
+                let db = db.lock().await;
+                let current = db
+                    .peek_unfinished_tasks(session)
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+                let wanted: HashSet<u64> = tasks.iter().map(|t| t.id).collect();
+                let have: HashSet<u64> = current.iter().map(|t| t.task_id).collect();
+                for task in tasks.iter().filter(|t| !have.contains(&t.id)) {
+                    db.record_task_start(
+                        session,
+                        task.id,
+                        &task.label,
+                        task.full_command.as_deref(),
+                        task.subagent_session_id.as_deref(),
+                    )
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+                }
+                for task in current.iter().filter(|t| !wanted.contains(&t.task_id)) {
+                    db.clear_task(session, task.task_id)
+                        .await
+                        .map_err(anyhow::Error::msg)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
     // ------------------------------------------------------------------
     // Background-task state records
     // ------------------------------------------------------------------
     //
-    // Sync facade for the record/clear paths: JSONL writes the record file
-    // synchronously; Greptime/SQLite schedule the write onto the current
-    // tokio runtime (every production call site — tool completion, task
-    // ack, delegate cleanup, TUI cancel — runs inside one). Errors are
-    // reported on stderr: recording must never break the agent loop,
-    // matching the `let _ =` callers of the old
-    // `Session::record_background_start`.
+    // Production writes go exclusively through `project_background_tasks`
+    // (the runner's reconciliation of its live in-memory registry). The
+    // remaining sync `record_background_start` / `clear_background_task`
+    // facades are TEST-ONLY seeding helpers.
 
-    /// Record a freshly started background task so a later launch can tell
-    /// the user what died with the previous process.
+    /// Test-only seeding helper: append one background-task row directly,
+    /// bypassing the projection, so a test can arrange leftover state.
     ///
     /// `label` 是源头截断的 100 字符预览（「被杀」Notice 用）；`full_command`
     /// 是完整命令原文（bash 任务传 `Some`，delegate 无命令传 `None`），
     /// 持久化后供 UI/`task_full_command` 取用。旧记录缺该字段 → 读回 `None`。
+    #[cfg(test)]
     pub fn record_background_start(
         &self,
         root: &Path,
@@ -2449,50 +2519,8 @@ impl SessionStore {
         }
     }
 
-    /// Record a background task and wait until the owner row is durable.
-    /// Callers that must order task execution after ownership use this path;
-    /// the synchronous facade above remains for best-effort UI bookkeeping.
-    pub(crate) async fn record_background_start_durable(
-        &self,
-        root: &Path,
-        session: &str,
-        id: u64,
-        label: &str,
-        full_command: Option<&str>,
-        subagent_session_id: Option<&str>,
-    ) -> Result<()> {
-        match self {
-            SessionStore::Jsonl => Session::record_background_start(
-                root,
-                session,
-                id,
-                label,
-                full_command,
-                subagent_session_id,
-            ),
-            #[cfg(feature = "greptime")]
-            SessionStore::Greptime {
-                session: greptime_session,
-                ..
-            } => {
-                greptime_session
-                    .record_task_start(session, id, label, full_command, subagent_session_id)
-                    .await
-            }
-            #[cfg(feature = "sqlite")]
-            SessionStore::Sqlite {
-                session: sqlite_session,
-                ..
-            } => sqlite_session
-                .lock()
-                .await
-                .record_task_start(session, id, label, full_command, subagent_session_id)
-                .await
-                .map_err(anyhow::Error::msg),
-        }
-    }
-
-    /// Forget one task: its completion arrived while the process was alive.
+    /// Test-only seeding helper: forget one task row directly.
+    #[cfg(test)]
     pub fn clear_background_task(&self, root: &Path, session: &str, id: u64) {
         match self {
             SessionStore::Jsonl => Session::clear_background_task(root, session, id),
@@ -2541,44 +2569,18 @@ impl SessionStore {
         }
     }
 
-    /// Clear a background task and wait until the owner row is gone.
-    pub(crate) async fn clear_background_task_durable(
-        &self,
-        root: &Path,
-        session: &str,
-        id: u64,
-    ) -> Result<()> {
-        match self {
-            SessionStore::Jsonl => Session::clear_background_task_checked(root, session, id),
-            #[cfg(feature = "greptime")]
-            SessionStore::Greptime {
-                session: greptime_session,
-                ..
-            } => greptime_session.clear_task(session, id).await,
-            #[cfg(feature = "sqlite")]
-            SessionStore::Sqlite {
-                session: sqlite_session,
-                ..
-            } => sqlite_session
-                .lock()
-                .await
-                .clear_task(session, id)
-                .await
-                .map_err(anyhow::Error::msg),
-        }
-    }
-
-    /// Tasks recorded by a previous process that died before their
-    /// completion arrived. Consumes the record (file or table rows) and
-    /// returns the labels so the caller can inject the "killed on exit"
-    /// notice. Only this session's own records are returned.
+    /// Live task rows a previous process left behind when it died before
+    /// their completion arrived. Read-only: returns the exact rows so the
+    /// caller can inject the "killed on exit" notice and then
+    /// [`Self::consume_unfinished_background`] them. Only this session's
+    /// own records are returned.
     pub(crate) async fn peek_unfinished_background(
         &self,
         root: &Path,
         session: &str,
     ) -> Result<Vec<UnfinishedTask>> {
         match self {
-            SessionStore::Jsonl => Ok(Session::peek_unfinished_background(root, session)),
+            SessionStore::Jsonl => Session::peek_unfinished_background(root, session),
             #[cfg(feature = "greptime")]
             SessionStore::Greptime {
                 session: greptime_session,
@@ -2683,8 +2685,8 @@ impl SessionStore {
     /// "no live delegate task carries this session" and the frontend falls
     /// back to the session id). JSONL: scans every `<id>.background.jsonl`
     /// record file for a surviving delegate line whose `session_id`
-    /// matches — record lines are removed on task completion
-    /// (`clear_background_task`), mirroring `running_tasks`.
+    /// matches — record lines are a projection of the live task set and
+    /// disappear on task completion (`project_background_tasks`).
     ///
     /// This is persisted task metadata, not runtime liveness: the record
     /// files / `running_tasks` rows have async write and cleanup windows,
@@ -2963,8 +2965,8 @@ fn jsonl_update_meta(
 /// count, or no-op when no sidecar exists (R3 — a sidecar-less session
 /// must not fabricate its own row). The transcript is re-counted on every
 /// call: the store is stateless, and the count is the exact JSONL analogue
-/// of the DB's `next_seq`. Called synchronously at turn boundaries (like
-/// `record_background_start`); the read is a few hundred KB at worst.
+/// of the DB's `next_seq`. Called synchronously at turn boundaries; the
+/// read is a few hundred KB at worst.
 fn jsonl_touch_meta(root: &Path, session: &str) -> anyhow::Result<()> {
     let Some(mut meta) = jsonl_read_meta_snapshot(root, session)? else {
         return Ok(()); // R3: never self-create
@@ -3113,15 +3115,15 @@ fn jsonl_backfill_sessions(root: &Path) -> anyhow::Result<()> {
 }
 
 /// `label_for_subagent` for the JSONL backend: scan every surviving
-/// `<id>.background.jsonl` record file for a delegate line whose
-/// `session_id` matches the subagent, and return the last (newest)
-/// matching label. Record lines are removed when the delegate task
-/// completes (`clear_background_task`), so a surviving line means the
-/// delegate is still live — exactly the `running_tasks` contract. Files
-/// are scanned in sorted name order and lines in append order, so "newest"
-/// is deterministic; a subagent with several live delegates reports the
-/// most recently recorded one. Non-destructive (called from the sessions
-/// list, like the DB lookup).
+/// `<id>.background.jsonl` record file for a line whose `session_id`
+/// matches the subagent, and return the last (newest) matching label.
+/// Record lines are a projection of the live task set, so they disappear
+/// when the delegate task completes (`project_background_tasks`) — the
+/// same contract as a `running_tasks` row. Files are scanned in sorted
+/// name order and lines in sorted-id order, so "newest" is deterministic;
+/// a subagent with several live delegates reports the most recently
+/// projected one. Non-destructive (called from the sessions list, like
+/// the DB lookup).
 fn jsonl_label_for_subagent(root: &Path, subagent_session_id: &str) -> Option<String> {
     let directory = root.join(".e-agent/sessions");
     let Ok(entries) = std::fs::read_dir(&directory) else {
@@ -4187,10 +4189,10 @@ mod tests {
             ]
         }
 
-        /// Wait for the fire-and-forget background-record facade to land:
-        /// `record_background_start` spawns onto the current runtime and is
-        /// never awaited, so poll peek+consume until the row appears or a
-        /// deadline passes.
+        /// Wait for the seeded background row to land: the test-only
+        /// `record_background_start` facade spawns its write onto the current
+        /// runtime and is never awaited, so poll peek+consume until the row
+        /// appears or a deadline passes.
         async fn take_unfinished_with_retry(
             store: &SessionStore,
             root: &Path,
@@ -4435,7 +4437,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn sqlite_background_task_durable_facade_orders_start_and_clear() {
+        async fn sqlite_background_task_projection_orders_insert_and_delete() {
             let (_dir, path) = temp_db();
             let root = std::env::temp_dir();
             let session = format!("test-store-bg-durable-{}", crate::session::new_id());
@@ -4444,16 +4446,18 @@ mod tests {
                 .expect("connect sqlite store");
 
             store
-                .record_background_start_durable(
+                .project_background_tasks(
                     &root,
                     &session,
-                    17,
-                    "cargo test",
-                    Some("cargo test"),
-                    None,
+                    &[ProjectedBackgroundTask {
+                        id: 17,
+                        label: "cargo test".into(),
+                        full_command: Some("cargo test".into()),
+                        subagent_session_id: None,
+                    }],
                 )
                 .await
-                .expect("durable start");
+                .expect("project start");
             let tasks = store
                 .peek_unfinished_background(&root, &session)
                 .await
@@ -4462,9 +4466,9 @@ mod tests {
             assert_eq!(tasks[0].task_id, 17);
 
             store
-                .clear_background_task_durable(&root, &session, 17)
+                .project_background_tasks(&root, &session, &[])
                 .await
-                .expect("durable clear");
+                .expect("project clear");
             assert!(
                 store
                     .peek_unfinished_background(&root, &session)

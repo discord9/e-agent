@@ -479,7 +479,32 @@ pub struct BackgroundTaskInfo {
     pub started_at_ms: Option<u64>,
 }
 
+pub(crate) struct BackgroundTaskMetadata {
+    pub id: u64,
+    pub label: String,
+    pub full_command: Option<String>,
+    pub subagent_session_id: Option<String>,
+}
+
 impl BackgroundTasks {
+    pub(crate) fn metadata(&self) -> Vec<BackgroundTaskMetadata> {
+        self.registry
+            .running
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|task| BackgroundTaskMetadata {
+                id: task.id,
+                label: task.label.clone(),
+                full_command: task.full_command.clone(),
+                subagent_session_id: task
+                    .display_meta
+                    .as_ref()
+                    .and_then(|meta| meta.subagent_session_id.clone()),
+            })
+            .collect()
+    }
+
     pub(super) fn new(timeout: Option<Duration>, sandbox: Option<crate::config::Sandbox>) -> Self {
         Self {
             registry: Arc::new(BackgroundRegistry {

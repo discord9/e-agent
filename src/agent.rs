@@ -1163,10 +1163,6 @@ pub struct Agent {
     /// turns and receive every emitted event. Sinks are dropped once their
     /// session handle is gone.
     running_background: HashSet<u64>,
-    /// Where in-flight background tasks are recorded (workspace root +
-    /// session + the store that owns the record), so resuming the same
-    /// session can report what died. None in tests.
-    background_record: Option<crate::session_store::BackgroundRecord>,
     session_input_tokens: u64,
     session_output_tokens: u64,
     /// Input tokens reported by the most recent successfully completed
@@ -1227,7 +1223,6 @@ impl Agent {
             pending_background: VecDeque::new(),
             subscriber: None,
             running_background: HashSet::new(),
-            background_record: None,
             session_input_tokens: 0,
             session_output_tokens: 0,
             last_context_input: None,
@@ -1262,22 +1257,6 @@ impl Agent {
     /// Not persisted in sessions.
     pub fn set_compaction_reminder(&mut self, text: String) {
         self.compaction_reminder = Some(text);
-    }
-
-    /// Record in-flight background tasks under this workspace root + session
-    /// through the given store, so resuming the same session later can
-    /// report what died with this process.
-    pub fn record_background_tasks_in(
-        &mut self,
-        root: std::path::PathBuf,
-        session: &str,
-        store: crate::session_store::SessionStore,
-    ) {
-        self.background_record = Some(crate::session_store::BackgroundRecord {
-            root,
-            session: session.to_owned(),
-            store,
-        });
     }
 
     /// Cap the number of tool-call rounds per turn. None (the default) means
@@ -1952,9 +1931,8 @@ impl Agent {
         let prepared = self.prepare_compaction().await?;
         let summary = prepared.summary;
         self.apply_entry(prepared.entry);
-        // 直接调用 Agent 的路径（测试/直连 API 使用者）没有 store 访问权
-        // （`background_record` 仅用于后台任务登记，且测试中为 None），这里
-        // 不落盘 usage；生产路径的压缩统一走 runner 的 compact_operation
+        // 直接调用 Agent 的路径（测试/直连 API 使用者）没有 store 访问权，
+        // 这里不落盘 usage；生产路径的压缩统一走 runner 的 compact_operation
         // （runner.rs 的 apply_usage 落盘点，kind="compact"），与该处不是
         // 同一事件，不会重复写入。
         self.apply_usage(prepared.usage, false);
@@ -2134,28 +2112,6 @@ impl Agent {
             )
         {
             self.running_background.insert(id);
-            if let Some(record) = &self.background_record {
-                let command = serde_json::from_str::<Value>(&call.arguments)
-                    .ok()
-                    .and_then(|args| args["command"].as_str().map(str::to_owned))
-                    .unwrap_or_else(|| call.arguments.clone());
-                let label = preview(&command, 100);
-                if let Err(error) = record
-                    .store
-                    .record_background_start_durable(
-                        &record.root,
-                        &record.session,
-                        id,
-                        &label,
-                        Some(&command),
-                        None,
-                    )
-                    .await
-                {
-                    self.running_background.remove(&id);
-                    return Err(format!("cannot record background task owner: {error:#}"));
-                }
-            }
         }
         Ok(())
     }
@@ -2369,9 +2325,7 @@ impl Agent {
         while !self.pending_background.is_empty() {
             let entry = self.peek_background_entry().expect("pending entry");
             self.apply_entry(entry);
-            self.ack_background_entry()
-                .await
-                .map_err(anyhow::Error::msg)?;
+            self.ack_background_entry();
         }
         Ok(())
     }
@@ -2469,28 +2423,15 @@ impl Agent {
         self.pending_background.front().cloned()
     }
 
-    pub(crate) async fn ack_background_entry(&mut self) -> Result<(), String> {
-        let Some(entry) = self.pending_background.front() else {
-            return Ok(());
+    pub(crate) fn ack_background_entry(&mut self) {
+        let Some(_) = self.pending_background.front() else {
+            return;
         };
-        let id = match entry {
-            SessionEntry::BackgroundCompletion { id, .. } => Some(*id),
-            SessionEntry::Notice { .. } => None,
-            _ => unreachable!("pending background queue contains only background entries"),
-        };
-        if let (Some(record), Some(id)) = (&self.background_record, id) {
-            record
-                .store
-                .clear_background_task_durable(&record.root, &record.session, id)
-                .await
-                .map_err(|error| format!("cannot clear background task owner: {error:#}"))?;
-        }
         if let Some(entry) = self.pending_background.pop_front()
             && let SessionEntry::BackgroundCompletion { id, .. } = entry
         {
             self.running_background.remove(&id);
         }
-        Ok(())
     }
 
     pub(crate) fn take_auto_compact_request(&mut self) -> bool {

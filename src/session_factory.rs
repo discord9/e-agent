@@ -986,7 +986,6 @@ impl SessionFactory {
         let loaded = store.load_located(&self.root, &session).await?;
         let legacy = loaded.legacy;
         agent.restore_located(loaded.entries, loaded.locations);
-        agent.record_background_tasks_in(self.root.clone(), &session, store.clone());
         let recovery_labels = if matches!(unfinished, UnfinishedPolicy::Consume) {
             store
                 .peek_unfinished_background(&self.root, &session)
@@ -1035,6 +1034,7 @@ impl SessionFactory {
             bootstrap,
         )
         .await?;
+        let runner = runner.with_background_tasks(background.clone());
         Ok(SessionBuild {
             runner,
             handle,

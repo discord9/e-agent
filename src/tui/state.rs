@@ -213,8 +213,8 @@ pub(crate) struct TuiState {
     /// forks read-only subagents).
     pub(crate) read_only: bool,
     /// Parent session's background record (root + session id + store):
-    /// records the btw task for the killed-on-exit notice and supplies the
-    /// `parent_session_id` metadata link.
+    /// supplies the btw task's `parent_session_id` metadata link (the task
+    /// row itself is projected by the fork's own runner).
     pub(crate) record_in: Option<crate::session_store::BackgroundRecord>,
     /// Live subagent registry btw fork subagents register into (F2 task
     /// panel attach).
@@ -1165,27 +1165,15 @@ impl TuiState {
         }
     }
 
-    /// Cancel a background task by id: registry cancel + session
-    /// bookkeeping + a dim line in the main scrollback.
+    /// Cancel a background task by id: registry cancel + a dim line in the
+    /// main scrollback. The durable projection row is left to the runner,
+    /// which drops it only after the task's real completion is committed.
     pub(crate) fn cancel_task(&mut self, id: u64) {
         if let Some(label) = self
             .background
             .as_ref()
             .and_then(|background| background.cancel_with_source(id, CancellationSource::User))
         {
-            match &self.store {
-                Some(store) => store.clear_background_task(
-                    std::path::Path::new(&self.cwd),
-                    &self.session_id,
-                    id,
-                ),
-                // No store wired (tests): JSONL record file directly.
-                None => crate::session::Session::clear_background_task(
-                    std::path::Path::new(&self.cwd),
-                    &self.session_id,
-                    id,
-                ),
-            }
             self.push_line(format!("cancelled task #{id}: {label}"), LineKind::Dim);
         }
     }

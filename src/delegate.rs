@@ -20,9 +20,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use crate::agent::{
-    Agent, AgentEvent, CancellationSource, CompactionMode, Tool, ToolOutput, ToolSpec, preview,
-};
+use crate::agent::{Agent, AgentEvent, CompactionMode, Tool, ToolOutput, ToolSpec, preview};
 use crate::config::SessionBackend;
 use crate::model::ConfiguredModel;
 use crate::runner::{
@@ -89,24 +87,16 @@ impl Sessions {
 ///
 /// This guard is captured by the scheduler's `FnOnce`, rather than created in
 /// its async body, so aborting the wrapper before its first poll still cleans
-/// up the session and parent recovery record.
+/// up the session registration. Durable task rows are a projection owned by
+/// the child runner, never by this guard.
 struct DelegateCleanup {
     id: Arc<Mutex<Option<u64>>>,
     sessions: Sessions,
-    recovery: Option<crate::session_store::BackgroundRecord>,
 }
 
 impl DelegateCleanup {
-    fn new(
-        id: Arc<Mutex<Option<u64>>>,
-        sessions: Sessions,
-        recovery: Option<crate::session_store::BackgroundRecord>,
-    ) -> Self {
-        Self {
-            id,
-            sessions,
-            recovery,
-        }
+    fn new(id: Arc<Mutex<Option<u64>>>, sessions: Sessions) -> Self {
+        Self { id, sessions }
     }
 
     #[cfg(test)]
@@ -124,11 +114,6 @@ impl DelegateCleanup {
     fn cleanup(&mut self) {
         let Some(id) = self.take_id() else { return };
         self.sessions.remove(id);
-        if let Some(record) = &self.recovery {
-            record
-                .store
-                .clear_background_task(&record.root, &record.session, id);
-        }
     }
 }
 
@@ -144,25 +129,15 @@ async fn finish_child_cleanup(
     child: &crate::session_store::BackgroundRecord,
 ) {
     let Some(id) = cleanup.take_id() else { return };
-    let ids = background.abort_owned_and_join(&child.session).await;
-    for task_id in ids {
-        if let Err(error) = child
-            .store
-            .clear_background_task_durable(&child.root, &child.session, task_id)
-            .await
-        {
-            tracing::warn!("e-agent: cannot clear child background task: {error:#}");
-        }
+    background.abort_owned_and_join(&child.session).await;
+    if let Err(error) = child
+        .store
+        .project_background_tasks(&child.root, &child.session, &[])
+        .await
+    {
+        tracing::warn!("cannot clear child background projection: {error:#}");
     }
     cleanup.sessions.remove(id);
-    if let Some(record) = &cleanup.recovery
-        && let Err(error) = record
-            .store
-            .clear_background_task_durable(&record.root, &record.session, id)
-            .await
-    {
-        tracing::warn!("e-agent: cannot clear delegate background task: {error:#}");
-    }
 }
 
 /// Live default-subagent-model resolver installed by the session factory:
@@ -506,8 +481,10 @@ impl Delegate {
         self.sandbox.as_ref().map(crate::tools::read_only_sandbox)
     }
 
-    /// Record subagent background tasks in the parent session's record so a
-    /// restart can warn about killed subagents alongside killed bash tasks.
+    /// Bind the parent session name used as the delegate/btw session's
+    /// metadata link (`parent_session_id`) and as the parent-side record
+    /// target. Task rows themselves are a projection of the child runner's
+    /// live registry, not written here.
     pub fn record_background_tasks_in(
         mut self,
         root: std::path::PathBuf,
@@ -575,7 +552,7 @@ impl Delegate {
             .filter(|content| !content.trim().is_empty());
         let mut tools = crate::tools::builtins_with_background(
             workspace,
-            background,
+            background.clone(),
             task.sandbox,
             task.read_only,
             task.protect_git,
@@ -652,12 +629,6 @@ impl Delegate {
             legacy: false,
             initial_entries: Vec::new(),
         });
-        // 把 subagent 的后台 bash 任务记到它自己的 session 名下：after_tool_entry
-        // 借此登记 subagent 的 bash 任务（此前 background_record 为 None，subagent
-        // 的 bash 任务既不进 running_tasks 重启后丢失，面板也定位不到发起者）。
-        // store 是 subagent 自己的（persist 绑定 session_id），root 同 workspace；
-        // Resume 只按这个 target session 消费自己的未完成记录。
-        agent.record_background_tasks_in(persist.root.clone(), &persist.session_id, store.clone());
         let (runner, handle) = SessionRunner::new_with_bootstrap(
             agent,
             store,
@@ -668,6 +639,7 @@ impl Delegate {
         )
         .await
         .map_err(|e| format!("subagent bootstrap failed: {e:#}"))?;
+        let runner = runner.with_background_tasks(background.clone());
         let runner_task = runner.start(Some(task.task));
         Ok((handle, runner_task))
     }
@@ -773,8 +745,9 @@ pub struct BtwContext {
     /// Session backend configuration for the subagent's store.
     pub backend: SessionBackend,
     /// Parent session's background record (root + parent session id + the
-    /// parent's store): records the btw task for the killed-on-exit notice
-    /// and supplies the `parent_session_id` metadata link.
+    /// parent's store): supplies the `parent_session_id` metadata link. The
+    /// btw task row itself is projected by the child runner from its live
+    /// registry, not written here.
     pub record_in: Option<crate::session_store::BackgroundRecord>,
     pub local_sessions: crate::session_factory::LocalSessionRegistry,
     /// The source session's live endpoint; the fork may message only here.
@@ -955,18 +928,14 @@ pub async fn spawn_btw_subagent(
         store: meta_store.clone(),
     };
     let child_abort = runner_task.abort_handle();
-    let cleanup = DelegateCleanup::new(slot, sessions.clone(), record_in.clone());
+    let cleanup = DelegateCleanup::new(slot, sessions.clone());
     let child_background = background.clone();
-    let record_label = label.clone();
     let meta_label = label.clone();
-    let record_session_id = session_id.clone();
     let output_session_id = session_id.clone();
     // btw subagent: no structured exit metadata (its task never "completes"
-    // — it stays registered until cancelled). The slot exists only so the
-    // durable-start-record failure below can attribute the abort of a live
-    // child to the system.
+    // — it stays registered until cancelled), so this slot stays empty and
+    // the completion carries no status.
     let exit_slot = new_exit_slot();
-    let work_exit = exit_slot.clone();
     // Live source-session endpoint: registers this btw fork in the source
     // session's Goal-admission set from the `on_id` hook below (before the
     // wrapper's work is released), so a `/btw` fork is the main session's own
@@ -1006,33 +975,10 @@ pub async fn spawn_btw_subagent(
         move || {
             let cleanup = cleanup;
             async move {
-                let id = cleanup.id.lock().unwrap().expect("delegate id");
-                if let Some(record) = &cleanup.recovery
-                    && let Err(error) = record
-                        .store
-                        .record_background_start_durable(
-                            &record.root,
-                            &record.session,
-                            id,
-                            &record_label,
-                            None,
-                            Some(&record_session_id),
-                        )
-                        .await
-                {
-                    tracing::warn!("e-agent: cannot record background task: {error:#}");
-                    // The child cannot outlive its unrecorded spawn: abort a
-                    // live child and mark the abort as a SYSTEM cancellation
-                    // in the exit slot. A child that already finished has
-                    // nothing to abort and stays unsourced; an explicit
-                    // user/agent cancel already latched by the registry
-                    // still wins over this slot mark.
-                    if !child_abort.is_finished() {
-                        work_exit.lock().unwrap().cancellation_source =
-                            Some(CancellationSource::System);
-                        child_abort.abort();
-                    }
-                }
+                // The btw id is allocated by the `on_id` hook above; assert
+                // that contract without holding the guard across
+                // `finish_child_cleanup` (which takes the same lock).
+                assert!(cleanup.id.lock().unwrap().is_some(), "delegate id");
                 let (_, output) =
                     result_output(Delegate::runner_result(&handle, runner_task).await);
                 finish_child_cleanup(cleanup, &child_background, &child_record).await;
@@ -1436,11 +1382,8 @@ impl Tool for Delegate {
             store: meta_store.clone(),
         };
         let child_abort = runner_task.abort_handle();
-        let child_abort_for_cleanup = child_abort.clone();
-        let record = self.record_in.clone();
-        let cleanup = DelegateCleanup::new(slot, self.sessions.clone(), record.clone());
+        let cleanup = DelegateCleanup::new(slot, self.sessions.clone());
         let child_background = self.background.clone();
-        let record_label = label.clone();
         let output_session_id = session_id.clone();
         // The subagent's own exit metadata out-slot: `result_output`'s
         // success bool is kept (instead of being formatted away) and
@@ -1480,40 +1423,15 @@ impl Tool for Delegate {
             move || {
                 let cleanup = cleanup;
                 async move {
-                    let id = cleanup.id.lock().unwrap().expect("delegate id");
-                    if let Some(record) = &cleanup.recovery
-                        && let Err(error) = record
-                            .store
-                            .record_background_start_durable(
-                                &record.root,
-                                &record.session,
-                                id,
-                                &record_label,
-                                None,
-                                Some(&child_record.session),
-                            )
-                            .await
-                    {
-                        tracing::warn!("e-agent: cannot record background task: {error:#}");
-                        // The child cannot outlive its unrecorded spawn:
-                        // abort a live child and mark the abort as a SYSTEM
-                        // cancellation in the exit slot. A child that
-                        // already finished has nothing to abort and stays
-                        // unsourced; an explicit user/agent cancel already
-                        // latched by the registry still wins over this slot
-                        // mark (see `completion_trace`).
-                        if !child_abort_for_cleanup.is_finished() {
-                            work_exit.lock().unwrap().cancellation_source =
-                                Some(CancellationSource::System);
-                            child_abort_for_cleanup.abort();
-                        }
-                    }
+                    let _id = cleanup.id.lock().unwrap().expect("delegate id");
                     let (completed, output) =
                         result_output(Self::runner_result(&handle, runner_task).await);
                     {
+                        // Structured exit metadata only. The wrapper never
+                        // stamps a cancellation source (the registry owns it),
+                        // so a projection failure can never turn a normal
+                        // completion into a SYSTEM kill.
                         let mut exit = work_exit.lock().unwrap();
-                        // Preserve the System mark written above: the regular
-                        // exit metadata assignment must not clobber it.
                         let cancellation_source = exit.cancellation_source;
                         *exit = TaskExit {
                             exit_code: None,

@@ -1683,11 +1683,15 @@ async fn new_keeps_an_already_wired_event_sender() {
 }
 
 #[tokio::test]
-async fn records_and_clears_background_tasks_under_the_workspace() {
-    // A background start is recorded on disk; its completion clears the
-    // record, so only tasks that die WITH the process remain for the
-    // next launch to report.
+async fn background_receipt_tracks_running_ids_without_direct_persistence() {
+    // Semantic change: the durable `running_tasks` row is now a projection
+    // owned by the session runner (it reconciles the live registry), so the
+    // direct `Agent` path writes no record at all. What the Agent still owns
+    // is its in-memory receipt: an id stays in `background_task_ids()` from
+    // the tool boundary until its completion is injected and acknowledged.
     let temp = tempfile::tempdir().unwrap();
+    let completion_gate = Arc::new(tokio::sync::Notify::new());
+    let completion_sent = Arc::new(tokio::sync::Notify::new());
     let model = ScriptedModel {
         replies: vec![
             AssistantMessage {
@@ -1715,22 +1719,37 @@ async fn records_and_clears_background_tasks_under_the_workspace() {
     };
     let mut agent = Agent::new(
         Box::new(model),
-        vec![Box::new(ScriptedBackgroundTool::default())],
-    );
-    agent.record_background_tasks_in(
-        temp.path().to_path_buf(),
-        "test",
-        crate::session_store::SessionStore::Jsonl,
+        vec![Box::new(ScriptedBackgroundTool {
+            sender: None,
+            completion_gate: Some(completion_gate.clone()),
+            completion_sent: Some(completion_sent.clone()),
+        })],
     );
     assert_eq!(agent.run("go".into()).await.unwrap(), "started");
-    // Task recorded while in flight (its completion arrives 10ms after
-    // start; the first run finished before that).
-    let record = temp.path().join(".e-agent/sessions/test.background.jsonl");
-    assert!(record.exists());
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-    // The follow-up run drains the completion and clears the record.
+    // In flight (the completion is still gated): the receipt holds the id,
+    // and the direct Agent path persisted nothing.
+    assert!(
+        agent.background_task_ids().contains(&1),
+        "a started task must stay in the receipt until its completion is acked"
+    );
+    assert!(agent.has_blocking_background());
+    assert!(
+        !temp.path().join(".e-agent").exists(),
+        "the direct Agent path must not write durable task rows"
+    );
+    completion_gate.notify_one();
+    completion_sent.notified().await;
+    // The follow-up run drains the completion and drops the receipt.
     assert_eq!(agent.run("next".into()).await.unwrap(), "reacted");
-    assert!(!record.exists());
+    assert!(
+        !agent.background_task_ids().contains(&1),
+        "an acked completion must leave the receipt"
+    );
+    assert!(!agent.has_blocking_background());
+    assert!(
+        !temp.path().join(".e-agent").exists(),
+        "draining a completion must not write durable task rows either"
+    );
 }
 
 // ── Preview tests (middle-ellipsis) ──────────────────────────────────

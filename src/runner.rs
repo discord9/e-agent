@@ -10,7 +10,7 @@ use crate::{
 };
 
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     path::PathBuf,
     sync::{Arc, Mutex, Weak},
 };
@@ -813,6 +813,8 @@ pub struct SessionRunner {
     root: PathBuf,
     session: String,
     shared: Arc<Mutex<Shared>>,
+    background: Option<crate::tools::BackgroundTasks>,
+    projected_background: Option<Vec<crate::session_store::ProjectedBackgroundTask>>,
     commands: mpsc::UnboundedReceiver<SessionCommand>,
     pending: VecDeque<PendingCommand>,
     pending_web_attaches: Vec<oneshot::Sender<WebAttach>>,
@@ -921,6 +923,56 @@ fn respond_web_attach_locked(shared: &Shared, reply: oneshot::Sender<WebAttach>)
 }
 
 impl SessionRunner {
+    pub(crate) fn with_background_tasks(
+        mut self,
+        background: crate::tools::BackgroundTasks,
+    ) -> Self {
+        self.background = Some(background);
+        self
+    }
+
+    async fn sync_background_projection(&mut self) {
+        let Some(background) = self.background.clone() else {
+            return;
+        };
+        let live: HashSet<u64> = self
+            .agent
+            .background_task_ids()
+            .iter()
+            .copied()
+            .chain(self.shared.lock().unwrap().goal_children.iter().copied())
+            .collect();
+        let metadata = background.metadata();
+        let previous = self.projected_background.clone().unwrap_or_default();
+        let mut rows = live
+            .into_iter()
+            .filter_map(|id| {
+                metadata
+                    .iter()
+                    .find(|task| task.id == id)
+                    .map(|task| crate::session_store::ProjectedBackgroundTask {
+                        id,
+                        label: task.label.clone(),
+                        full_command: task.full_command.clone(),
+                        subagent_session_id: task.subagent_session_id.clone(),
+                    })
+                    .or_else(|| previous.iter().find(|task| task.id == id).cloned())
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by_key(|task| task.id);
+        if self.projected_background.as_ref() == Some(&rows) {
+            return;
+        }
+        match self
+            .store
+            .project_background_tasks(&self.root, &self.session, &rows)
+            .await
+        {
+            Ok(()) => self.projected_background = Some(rows),
+            Err(error) => tracing::warn!("cannot project background tasks: {error:#}"),
+        }
+    }
+
     pub fn new(
         mut agent: Agent,
         store: SessionStore,
@@ -994,6 +1046,8 @@ impl SessionRunner {
                 root,
                 session,
                 shared,
+                background: None,
+                projected_background: None,
                 commands,
                 pending: VecDeque::new(),
                 pending_web_attaches: Vec::new(),
@@ -1921,9 +1975,10 @@ impl SessionRunner {
             let Some(entry) = self.agent.peek_background_entry() else {
                 return Ok(any);
             };
-            // Persist the completion first, but do not apply or publish it
-            // until its owner row is durably clear. Resume may therefore
-            // never observe a live completion paired with a stale owner.
+            // Persist the completion first, then drop the owner from the
+            // live set and re-project, and only then apply/publish. Resume
+            // may therefore never observe a live completion paired with a
+            // stale owner row.
             let child_id = match &entry {
                 SessionEntry::BackgroundCompletion { id, .. } => Some(*id),
                 _ => None,
@@ -1933,15 +1988,11 @@ impl SessionRunner {
                 .append_located(&self.root, &self.session, std::slice::from_ref(&entry))
                 .await?;
             let location = locations.into_iter().next();
-            self.agent
-                .ack_background_entry()
-                .await
-                .map_err(anyhow::Error::msg)?;
+            self.agent.ack_background_entry();
             if let Some(id) = child_id {
-                // Durable now (append + owner ack above): only now may the
-                // child stop suspending fresh automatic Goal turns.
                 self.shared.lock().unwrap().goal_children.remove(&id);
             }
+            self.sync_background_projection().await;
             let event = match &entry {
                 SessionEntry::Notice { text } => AgentEvent::Notice(text.clone()),
                 SessionEntry::BackgroundCompletion {
@@ -2566,7 +2617,13 @@ impl SessionRunner {
                 // FinishWhenIdle waits indefinitely for blocking background
                 // tasks. Their completion is injected as a follow-up turn.
                 self.prepare_web_attach();
+                // One-shot idle projection tick: a fresh `interval` would fire
+                // its first tick immediately and spin this loop. Sleeping a
+                // real second keeps the durable projection fresh while the
+                // session waits for a blocking background completion.
+                let projection_tick = tokio::time::sleep(std::time::Duration::from_secs(1));
                 tokio::select! { biased;
+                    _ = projection_tick, if self.background.is_some() => { self.sync_background_projection().await; continue; },
                     command = self.commands.recv() => match command {
                         Some(command) => {
                             let first = self.queue(command);
@@ -3285,6 +3342,7 @@ impl SessionRunner {
                         self.terminate(SessionResult::Failed(error), pending).await;
                         return;
                     }
+                    self.sync_background_projection().await;
                     self.shared
                         .lock()
                         .unwrap()

@@ -282,9 +282,10 @@ async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
         let task = built.runner.start(None);
         // The btw fork record mirrors the server's /btw endpoint: the
         // parent session's background record (workspace root + effective
-        // session id + its store) so btw tasks are reported as killed on
-        // exit and carry the parent_session_id metadata link. Cloned
-        // before the moved `built.session` / `built.store` args below.
+        // session id + its store) supplies the `parent_session_id` metadata
+        // link (the btw task row itself is projected by the fork's own
+        // runner). Cloned before the moved `built.session` / `built.store`
+        // args below.
         let record_in = Some(e_agent::session_store::BackgroundRecord {
             root: factory.root().to_path_buf(),
             session: built.session.clone(),

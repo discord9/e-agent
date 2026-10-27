@@ -5010,8 +5010,8 @@ mod tests {
             .append(true)
             .open(&record_path)
             .unwrap();
-        // Exactly the JSONL shape `record_background_start` writes for a
-        // delegate task: label + the subagent's session id.
+        // Exactly the JSONL shape a projected delegate row has: label +
+        // the subagent's session id.
         writeln!(
             file,
             r#"{{"id": 3, "label": "delegate work", "session_id": "sub-claimed"}}"#

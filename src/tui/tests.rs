@@ -2501,7 +2501,11 @@ async fn tasks_panel_selection_highlight_shows_on_non_attachable_task() {
 }
 
 #[tokio::test]
-async fn cancelled_task_is_not_reported_as_unfinished_next_start() {
+async fn cancel_selected_task_leaves_projection_to_runner() {
+    // Semantic change: the TUI no longer touches the durable projection.
+    // The runner owns it and drops a task's row only once that task's real
+    // completion is durably committed and acked, so a user cancel from the
+    // panel must leave the row in place for the completion to clear.
     let temp = tempfile::tempdir().unwrap();
     let (_, mut background) = crate::tools::builtins(
         crate::workspace::Workspace::new(temp.path()).unwrap(),
@@ -2523,17 +2527,29 @@ async fn cancelled_task_is_not_reported_as_unfinished_next_start() {
         )
         .unwrap();
     let id = background.running()[0].id;
-    crate::session::Session::record_background_start(
-        temp.path(),
-        "cancel-store",
-        id,
-        "task",
-        None,
-        None,
-    )
-    .unwrap();
+    // Seed the projection the runner would own for this live task.
+    crate::session_store::SessionStore::Jsonl
+        .project_background_tasks(
+            temp.path(),
+            "cancel-store",
+            &[crate::session_store::ProjectedBackgroundTask {
+                id,
+                label: "task".into(),
+                full_command: None,
+                subagent_session_id: None,
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::session::Session::peek_unfinished_background(temp.path(), "cancel-store")
+            .unwrap()
+            .len(),
+        1,
+        "the seeded projection row exists before the cancel"
+    );
     let mut state = TuiState {
-        background: Some(background),
+        background: Some(background.clone()),
         cwd: temp.path().display().to_string(),
         session_id: "cancel-store".into(),
         ..Default::default()
@@ -2541,9 +2557,20 @@ async fn cancelled_task_is_not_reported_as_unfinished_next_start() {
 
     state.cancel_selected_task();
 
+    // The in-memory task is gone, but the projection row is not: only the
+    // runner's post-completion reconciliation may delete it.
     assert!(
-        crate::session::Session::peek_unfinished_background(temp.path(), "cancel-store").is_empty()
+        background.running().is_empty(),
+        "cancel must drop the in-memory task"
     );
+    let rows =
+        crate::session::Session::peek_unfinished_background(temp.path(), "cancel-store").unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "the TUI must not delete the durable projection row"
+    );
+    assert_eq!(rows[0].task_id, id);
 }
 
 #[tokio::test]

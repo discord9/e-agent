@@ -5152,6 +5152,46 @@ impl Tool for MockBackgroundBash {
     }
 }
 
+/// Real-registry background bash: `execute` registers an actual pending task
+/// in the shared [`crate::tools::BackgroundTasks`] registry and returns its
+/// "started background task N: ..." receipt, and the agent's completion
+/// channel is forwarded into that registry — so completions travel the
+/// production path instead of being hand-built by the test.
+struct ProjectingBackgroundBash {
+    background: crate::tools::BackgroundTasks,
+    release: Arc<Notify>,
+}
+
+#[async_trait]
+impl Tool for ProjectingBackgroundBash {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "bash".into(),
+            description: "test only: real registry background task".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+    async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
+        let release = self.release.clone();
+        let started = self.background.spawn_with_id(
+            "slow build".into(),
+            None,
+            None,
+            None,
+            crate::tools::new_exit_slot(),
+            |_| {},
+            move || async move {
+                release.notified().await;
+                "build ok".to_string()
+            },
+        )?;
+        Ok(ToolOutput::text(started))
+    }
+    fn set_event_sender(&mut self, sender: mpsc::UnboundedSender<AgentEvent>) {
+        self.background.set_event_sender(sender);
+    }
+}
+
 /// Scripted model that records every request context and can block one
 /// designated call (1-based) until released — used to deliver a background
 /// completion while the last model round is still in flight.
@@ -8944,7 +8984,20 @@ async fn oracle449_runner_persists_notice_before_completion_and_keeps_owner_unti
     let temp = tempfile::tempdir().unwrap();
     let sender = Arc::new(Mutex::new(None));
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let mut agent = Agent::new(
+    // A real registry: the durable row is projected from the live in-memory
+    // task set, and its label/full command come from this metadata. The
+    // pending work never completes on its own — the test delivers the
+    // completion itself, exactly like a real bash task would.
+    let (_, background) = crate::tools::builtins(
+        crate::workspace::Workspace::new(temp.path()).unwrap(),
+        None,
+        false,
+        None,
+    );
+    let (registry_sender, _registry_events) = tokio::sync::mpsc::unbounded_channel();
+    let mut background = background;
+    background.set_event_sender(registry_sender);
+    let agent = Agent::new(
         Box::new(ScriptedContextCaptureModel {
             replies: vec![
                 (
@@ -8989,7 +9042,20 @@ async fn oracle449_runner_persists_notice_before_completion_and_keeps_owner_unti
             sender: sender.clone(),
         })],
     );
-    agent.record_background_tasks_in(temp.path().to_path_buf(), "oracle449", SessionStore::Jsonl);
+    // The registry id must match the id the mock tool reports (1): the
+    // projection's live set comes from the agent receipt, the row's label
+    // from this registry entry.
+    background
+        .spawn_with_id(
+            "cmd".into(),
+            None,
+            None,
+            None,
+            crate::tools::new_exit_slot(),
+            |_| {},
+            || async { std::future::pending::<String>().await },
+        )
+        .unwrap();
     let (runner, handle) = SessionRunner::new(
         agent,
         SessionStore::Jsonl,
@@ -8997,6 +9063,7 @@ async fn oracle449_runner_persists_notice_before_completion_and_keeps_owner_unti
         "oracle449".into(),
         IdlePolicy::FinishWhenIdle,
     );
+    let runner = runner.with_background_tasks(background.clone());
     let (_, mut live, mut status) = handle.attach();
     let task = runner.start(Some("start".into()));
     loop {
@@ -9014,6 +9081,10 @@ async fn oracle449_runner_persists_notice_before_completion_and_keeps_owner_unti
         .unwrap();
     assert_eq!(owner.len(), 1);
     assert_eq!(owner[0].task_id, 1);
+    assert_eq!(
+        owner[0].label, "cmd",
+        "the row label comes from the live registry metadata"
+    );
 
     let tx = sender.lock().unwrap().as_ref().unwrap().clone();
     tx.send(AgentEvent::Notice("stalled warning".into()))
@@ -9094,6 +9165,144 @@ async fn oracle449_runner_persists_notice_before_completion_and_keeps_owner_unti
                 if content.contains("[background task 1 completed") && content.contains("done")
         )
     }));
+    task.join().await.unwrap();
+}
+
+/// End-to-end projection lifecycle: a real registry task becomes a durable
+/// row when it starts, the row survives while the task runs, and it is
+/// removed only once the real completion was durably committed and the
+/// follow-up turn produced its answer.
+#[tokio::test]
+async fn background_projection_row_follows_the_live_registry_lifecycle() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_, background) = crate::tools::builtins(
+        crate::workspace::Workspace::new(temp.path()).unwrap(),
+        None,
+        false,
+        None,
+    );
+    let release = Arc::new(Notify::new());
+    let agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![background_bash_call("slow build", false)],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("started".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("reacted".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+            ]
+            .into(),
+        }),
+        vec![Box::new(ProjectingBackgroundBash {
+            background: background.clone(),
+            release: release.clone(),
+        })],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "projection-lifecycle".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    // Same registry the tool spawns into: this is the production wiring the
+    // session factory installs.
+    let runner = runner.with_background_tasks(background.clone());
+    let (_, mut live, mut status) = handle.attach();
+    let task = runner.start(Some("go".into()));
+
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::AssistantText(text) if text == "started" => break,
+            AgentEvent::Error(text) => panic!("turn failed: {text}"),
+            _ => {}
+        }
+    }
+    let id = background.running()[0].id;
+
+    // While the task is in flight the projection row exists, with the
+    // registry's label (the projection never invents metadata).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let rows = loop {
+        let rows = crate::session::Session::peek_unfinished_background(
+            temp.path(),
+            "projection-lifecycle",
+        )
+        .unwrap();
+        if !rows.is_empty() {
+            break rows;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the live task was never projected"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].task_id, id);
+    assert_eq!(rows[0].label, "slow build");
+    // Task rows live under the session's own record, not the parent's.
+    assert_eq!(rows[0].subagent_session_id, None);
+    assert_eq!(
+        crate::session::Session::task_full_command(temp.path(), "projection-lifecycle", id),
+        None,
+        "a spawn without a full command projects none"
+    );
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+
+    // The real completion now flows through the registry → agent channel.
+    release.notify_one();
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::AssistantText(text) if text == "reacted" => break,
+            AgentEvent::Error(text) => panic!("follow-up turn failed: {text}"),
+            _ => {}
+        }
+    }
+    // After the committed completion + follow-up turn the row is gone.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let rows = crate::session::Session::peek_unfinished_background(
+            temp.path(),
+            "projection-lifecycle",
+        )
+        .unwrap();
+        if rows.is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the completed task's row was not projected away: {rows:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        background.running().is_empty(),
+        "the completed task left the registry"
+    );
+
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "projection-lifecycle")
+        .await
+        .unwrap();
+    assert!(
+        loaded.entries.iter().any(|entry| matches!(
+            entry,
+            SessionEntry::BackgroundCompletion { id: done, output, .. }
+                if *done == id && output.contains("build ok")
+        )),
+        "the real completion was durably committed"
+    );
     task.join().await.unwrap();
 }
 

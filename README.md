@@ -985,6 +985,15 @@ before finalizing. Each completion is injected and acknowledged, allowing the
 model to continue in a follow-up turn. Detached tasks do not block finalization
 and may outlive the session.
 
+The durable `running_tasks` table is a projection of the live in-memory tasks,
+not an execution ledger: it lists exactly the non-detached background bash and
+delegate/btw tasks that the session currently owns, updated at lifecycle
+boundaries (tool start, task completion, child teardown) and while the session
+idles. Detached tasks are excluded — they may outlive the session. On restart,
+leftover rows are reported as killed with the process and then consumed.
+Projection failures are logged and retried; they never abort a task or end the
+session.
+
 ## Subagents
 
 The `delegate` tool spawns a subagent with a fresh context to work on a
@@ -1551,8 +1560,9 @@ The database keeps three tables:
 - `session_entries` — the append-only transcript log, primary-keyed on
   `(workspace_id, session_id, seq, event_time_us)` with the same entry kinds
   and ordering semantics as the other backends.
-- `running_tasks` — in-flight background bash/delegate bookkeeping; a resumed
-  session finds tasks killed by a previous process.
+- `running_tasks` — a projection of the live in-flight background
+  bash/delegate tasks, not an execution ledger; a resumed session finds the
+  rows a previous process left behind and reports them as killed.
 - `sessions` — a per-session metadata audit log (created_at/model/role/
   title/pinned/archived/writer) backing the web UI's list/rename/pin/archive
   views.
