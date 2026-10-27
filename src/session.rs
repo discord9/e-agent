@@ -579,7 +579,30 @@ impl Session {
             };
         }
         let temporary = path.with_extension(format!("jsonl.tmp-{}", std::process::id()));
+        // Create the temporary file owner-only BEFORE writing task content
+        // and rename it into place. Creating with the ambient umask and
+        // chmod-ing the destination afterwards would expose the full command
+        // (0644 under the common 022 umask), and a crash in that window would
+        // leave it readable permanently.
+        #[cfg(unix)]
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&temporary)?
+        };
+        #[cfg(not(unix))]
         let mut file = std::fs::File::create(&temporary)?;
+        // `mode` only applies when this call creates the file; a temp left by
+        // an earlier crashed writer could still carry wider permissions.
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &temporary,
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )?;
         for line in lines {
             writeln!(file, "{line}")?;
         }
@@ -646,12 +669,9 @@ impl Session {
                 serde_json::to_string(&row)
             })
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        Self::rewrite_background_file(&path, &lines)?;
-        #[cfg(unix)]
-        if !tasks.is_empty() {
-            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
-        }
-        Ok(())
+        // The rename above installs a file that was already created 0600, so
+        // no post-rename permission window exists.
+        Self::rewrite_background_file(&path, &lines)
     }
 
     /// Read unfinished records without changing them. Each returned record is
@@ -1257,6 +1277,14 @@ mod tests {
         ];
 
         Session::rewrite_background_tasks(temp.path(), session, &tasks).unwrap();
+        // Full commands must never be exposed by the ambient umask: the
+        // temporary file is owner-only before the rename installs it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "task rows must stay owner-only");
+        }
         let rows = Session::peek_unfinished_background(temp.path(), session).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].task_id, 1);

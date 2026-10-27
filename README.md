@@ -992,7 +992,10 @@ boundaries (tool start, task completion, child teardown) and while the session
 idles. Detached tasks are excluded — they may outlive the session. On restart,
 leftover rows are reported as killed with the process and then consumed.
 Projection failures are logged and retried; they never abort a task or end the
-session.
+session. The projection is single-writer per session and carries no
+cross-process lease, so running the same session live in two processes at once
+is unsupported: a second resume would read the first process's live rows as
+leftover killed tasks, and the two projections would overwrite each other.
 
 ## Subagents
 

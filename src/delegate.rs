@@ -130,6 +130,14 @@ async fn finish_child_cleanup(
 ) {
     let Some(id) = cleanup.take_id() else { return };
     background.abort_owned_and_join(&child.session).await;
+    // Terminal projection, not a second live writer: the child runner has
+    // already been joined/aborted, so this is the last write for that
+    // session and its in-memory live set is empty by construction. Without
+    // it, explicitly cancelled child work would be reported as "killed with
+    // the process" on the next resume. A failure here has the same observable
+    // as a crash (a leftover row and a killed notice); it cannot lose a
+    // completion, and there is no later tick to retry once this session's
+    // runner is gone.
     if let Err(error) = child
         .store
         .project_background_tasks(&child.root, &child.session, &[])

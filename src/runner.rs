@@ -1975,10 +1975,13 @@ impl SessionRunner {
             let Some(entry) = self.agent.peek_background_entry() else {
                 return Ok(any);
             };
-            // Persist the completion first, then drop the owner from the
-            // live set and re-project, and only then apply/publish. Resume
-            // may therefore never observe a live completion paired with a
-            // stale owner row.
+            // Persist the completion first, then drop the id from the live
+            // set and re-project, and only then apply/publish. Ordering is
+            // what keeps a real completion from being hidden behind a
+            // still-live row. It is NOT atomic: a crash after this append
+            // and before the row delete leaves both a committed completion
+            // and a leftover row, which the next restart reports as killed
+            // with the process (the completion stays in history too).
             let child_id = match &entry {
                 SessionEntry::BackgroundCompletion { id, .. } => Some(*id),
                 _ => None,
