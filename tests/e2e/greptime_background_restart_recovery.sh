@@ -7,7 +7,7 @@ say(){ printf '[e2e] %s\n' "$*"; }
 pass(){ ASSERTIONS=$((ASSERTIONS+1)); say "PASS: $*"; }
 fail(){ FAIL_POINT=$1; printf '[e2e] FAIL: %s\n' "$*" >&2; exit 1; }
 proc_state(){ local p=$1; [ -r "/proc/$p/stat" ] && awk '{print $3}' "/proc/$p/stat" 2>/dev/null || printf gone; }
-marker_pids(){ local m=$1 p cmd; for d in /proc/[0-9]*; do p=${d##*/}; [ -r "$d/cmdline" ] || continue; cmd=$(tr '\0' ' ' <"$d/cmdline" 2>/dev/null || true); [[ "$cmd" == *"$m"* ]] && printf '%s\n' "$p"; done; }
+marker_pids(){ local m=$1 p cmd; for d in /proc/[0-9]*; do p=${d##*/}; [ -r "$d/cmdline" ] || continue; cmd=$(tr '\0' ' ' <"$d/cmdline" 2>/dev/null || true); [[ "$cmd" == *"$m"* ]] && printf '%s\n' "$p"; done; return 0; }
 marker_live(){ local m=$1 p s; while read -r p; do s=$(proc_state "$p"); [ "$s" != Z ] && [ "$s" != gone ] && return 0; done < <(marker_pids "$m"); return 1; }
 marker_snapshot(){ local m=$1 p s cmd; while read -r p; do s=$(proc_state "$p"); cmd=$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null || true); printf '%s:%s:%s ' "$p" "$s" "$cmd"; done < <(marker_pids "$m"); }
 kill_marker(){ local end=$((SECONDS+10)) p; while read -r p; do kill -KILL "$p" 2>/dev/null || true; done < <(marker_pids "$TASK_MARKER"); while ((SECONDS<end)); do marker_live "$TASK_MARKER" || return 0; sleep .1; done; return 1; }
