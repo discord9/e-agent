@@ -992,10 +992,15 @@ boundaries (tool start, task completion, child teardown) and while the session
 idles. Detached tasks are excluded — they may outlive the session. On restart,
 leftover rows are reported as killed with the process and then consumed.
 Projection failures are logged and retried; they never abort a task or end the
-session. The projection is single-writer per session and carries no
-cross-process lease, so running the same session live in two processes at once
-is unsupported: a second resume would read the first process's live rows as
-leftover killed tasks, and the two projections would overwrite each other.
+session. There is one live writer per session plus one terminal write: when a
+child runner has already been joined or aborted, its teardown projects that
+child session empty so an explicit cancellation is not later reported as a
+crash. A failure of that terminal write is logged but cannot be retried once
+the runner is gone; it degrades to exactly the crash observable (a leftover row
+reported as killed). The projection carries no cross-process lease, so running
+the same session live in two processes at once is unsupported: a second resume
+would read the first process's live rows as leftover killed tasks, and the two
+projections would overwrite each other's distinct task rows.
 
 ## Subagents
 
