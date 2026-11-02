@@ -212,9 +212,9 @@ pub(crate) struct TuiState {
     /// Read-only policy inherited by btw fork subagents (a read-only parent
     /// forks read-only subagents).
     pub(crate) read_only: bool,
-    /// Parent session's background record (root + session id + store):
-    /// supplies the btw task's `parent_session_id` metadata link (the task
-    /// row itself is projected by the fork's own runner).
+    /// Parent session identity for the btw task's `parent_session_id` link.
+    /// The parent session's runner projects the btw task row; the child
+    /// session's runner projects tasks started inside that child.
     pub(crate) record_in: Option<crate::session_store::BackgroundRecord>,
     /// Live subagent registry btw fork subagents register into (F2 task
     /// panel attach).

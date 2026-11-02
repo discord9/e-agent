@@ -989,8 +989,9 @@ The durable background-task table is a live view of the tasks this session
 still owns, not an execution history. Detached tasks are excluded. After a
 restart, leftover rows are reported as killed with the process and then cleared.
 Running the same session in two processes at once can cause false killed reports
-and overwrite task records. If cleanup after cancellation fails, that task may
-be reported as killed on the next restart.
+and overwrite task records. Task records can lag behind running work when saving
+fails, and a crash during cleanup can leave a finished task reported as killed
+on the next start.
 
 ## Subagents
 

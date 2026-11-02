@@ -2122,14 +2122,10 @@ async fn background_delegate_completion_carries_status_and_kind() {
     }
 }
 
-/// Projection failure must never abort work. Semantic change: the wrapper
-/// no longer writes a durable start row (the child runner projects its own
-/// live registry), so an unwritable record root — which would have failed
-/// the old durable-start write and killed the live child as a SYSTEM
-/// cancellation — now changes nothing: the subagent runs to a normal
-/// completion.
+/// An unwritable record root no longer triggers the old direct-write abort;
+/// the subagent still runs to a normal completion.
 #[tokio::test]
-async fn delegate_record_write_failure_does_not_abort_live_child() {
+async fn delegate_unwritable_record_root_does_not_abort_live_child() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().to_path_buf();
     let base_url = successful_model("finished answer").await;
@@ -2167,7 +2163,7 @@ async fn delegate_record_write_failure_does_not_abort_live_child() {
             assert_eq!(kind.as_deref(), Some("delegate"));
             assert_eq!(
                 cancellation_source, None,
-                "a projection failure must not kill the live child as SYSTEM"
+                "the old direct-write failure must not kill the live child as SYSTEM"
             );
         }
         other => panic!("expected BackgroundCompleted, got {other:?}"),
@@ -2186,15 +2182,13 @@ async fn delegate_record_write_failure_does_not_abort_live_child() {
     );
 }
 
-/// Same contract for a btw fork: an unwritable record root (which used to
-/// abort the live child as a SYSTEM cancellation from the spawn's `on_id`
-/// hook, milliseconds in — before the child's first model call) leaves the
-/// fork running. A btw task never self-completes (WaitForInput: it stays
+/// An unwritable record root no longer triggers the old direct-write abort
+/// from the spawn hook. A btw task never self-completes (WaitForInput: it stays
 /// registered until closed), so the fork is closed by the test's own USER
 /// cancel and the completion must attribute the stop to that user cancel —
 /// never to SYSTEM — while carrying no status (btw has no exit metadata).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn btw_record_write_failure_does_not_abort_live_child() {
+async fn btw_unwritable_record_root_does_not_abort_live_child() {
     use crate::agent::SessionEntry as AgentEntry;
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().to_path_buf();
@@ -3044,7 +3038,7 @@ async fn subagent_background_bash_recorded_under_its_own_session() {
         crate::session::Session::peek_unfinished_background(&root, "parent")
             .unwrap()
             .is_empty(),
-        "delegate record is cleared on completion"
+        "parent record stays absent in this setup"
     );
     assert!(
         background.running().is_empty(),

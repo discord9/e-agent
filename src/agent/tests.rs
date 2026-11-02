@@ -1735,7 +1735,7 @@ async fn background_receipt_tracks_running_ids_without_direct_persistence() {
     assert!(agent.has_blocking_background());
     assert!(
         !temp.path().join(".e-agent").exists(),
-        "the direct Agent path must not write durable task rows"
+        "this direct Agent path has no store to write durable task rows"
     );
     completion_gate.notify_one();
     completion_sent.notified().await;

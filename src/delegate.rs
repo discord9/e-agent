@@ -752,10 +752,9 @@ pub struct BtwContext {
     pub persist_root: std::path::PathBuf,
     /// Session backend configuration for the subagent's store.
     pub backend: SessionBackend,
-    /// Parent session's background record (root + parent session id + the
-    /// parent's store): supplies the `parent_session_id` metadata link. The
-    /// btw task row itself is projected by the child runner from its live
-    /// registry, not written here.
+    /// Parent session identity for the `parent_session_id` metadata link.
+    /// The parent session's runner projects the btw task row; the child
+    /// session's runner projects tasks started inside that child.
     pub record_in: Option<crate::session_store::BackgroundRecord>,
     pub local_sessions: crate::session_factory::LocalSessionRegistry,
     /// The source session's live endpoint; the fork may message only here.
