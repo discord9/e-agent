@@ -94,6 +94,18 @@ pub fn new_exit_slot() -> ExitSlot {
 /// populated, which would otherwise leave the completion trace with
 /// start/duration/kind but no status. Explicit metadata already written by
 /// the timeout/cancel paths (`killed`/SIGKILL) is preserved.
+pub(super) fn foreground_cancel_result(
+    output: String,
+    trace: &BackgroundTrace,
+    result: Option<Result<String, String>>,
+) -> Result<String, String> {
+    if trace.status.as_deref() == Some("killed") && output.contains("background task cancelled") {
+        Err(output)
+    } else {
+        result.unwrap_or(Err(output))
+    }
+}
+
 pub(super) fn mark_failed_if_empty(exit: &mut TaskExit) {
     if exit.status.is_none() {
         exit.exit_code = None;
@@ -699,12 +711,21 @@ impl BackgroundTasks {
             exit.exit_code = None;
             exit.signal = Some("SIGKILL".into());
             exit.status = Some("killed".into());
+            let trace = BackgroundTrace {
+                started_at_ms: task.started_at_ms,
+                duration_ms: Some(task.started_at.elapsed().as_millis() as u64),
+                exit_code: exit.exit_code,
+                signal: exit.signal.clone(),
+                status: exit.status.clone(),
+                kind: task
+                    .shell_name
+                    .clone()
+                    .map(|name| name.to_ascii_lowercase())
+                    .or_else(|| Some("delegate".to_owned())),
+                cancellation_source: task.cancellation_source.or(exit.cancellation_source),
+            };
             drop(exit);
-            done(
-                id,
-                "background task cancelled".into(),
-                task.completion_trace(),
-            );
+            done(id, "background task cancelled".into(), trace);
         }
         Some(task.label)
     }
@@ -781,17 +802,11 @@ impl BackgroundTasks {
                 ForegroundRoute::Delivered,
             ) {
                 ForegroundRoute::Open(tx) => {
-                    let result = if trace.status.as_deref() == Some("killed")
-                        && output.contains("background task cancelled")
-                    {
-                        Err(output.clone())
-                    } else {
-                        result_done
-                            .lock()
-                            .unwrap()
-                            .take()
-                            .unwrap_or_else(|| Err(output.clone()))
-                    };
+                    let result = foreground_cancel_result(
+                        output.clone(),
+                        &trace,
+                        result_done.lock().unwrap().take(),
+                    );
                     let _ = tx.send(result);
                 }
                 ForegroundRoute::Adopted => {
@@ -1444,6 +1459,20 @@ impl Drop for BackgroundRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn foreground_cancellation_overrides_stored_success() {
+        let trace = BackgroundTrace {
+            status: Some("killed".into()),
+            ..BackgroundTrace::default()
+        };
+        let result = foreground_cancel_result(
+            "background task cancelled".into(),
+            &trace,
+            Some(Ok("command succeeded".into())),
+        );
+        assert_eq!(result, Err("background task cancelled".into()));
+    }
 
     #[tokio::test]
     async fn silent_task_warns_once_and_output_resets_cadence() {

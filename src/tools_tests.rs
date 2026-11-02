@@ -1933,8 +1933,16 @@ fn write_shell_wrapper(path: &Path, body: &str) -> Shell {
 #[tokio::test]
 async fn dropping_foreground_waiter_cancels_registered_command() {
     let temp = tempfile::tempdir().unwrap();
-    let (sender, _events) = tokio::sync::mpsc::unbounded_channel();
+    let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
     let background = BackgroundTasks::new(None, None);
+    let pid_file = temp.path().join("child.pid");
+    let wrapper = write_shell_wrapper(
+        &temp.path().join("pid-shell"),
+        &format!(
+            "/bin/bash \"$@\" & echo $! > '{}' ; wait",
+            pid_file.display()
+        ),
+    );
     let tool = Bash {
         workspace: Workspace::new(temp.path()).unwrap(),
         timeout: None,
@@ -1942,7 +1950,7 @@ async fn dropping_foreground_waiter_cancels_registered_command() {
         background: background.clone(),
         sandbox: None,
         protect_git: false,
-        shell: Shell::detect().unwrap(),
+        shell: wrapper,
         owner_session: None,
     };
     let task = tokio::spawn(async move { tool.execute(json!({"command":"sleep 30"})).await });
@@ -1953,15 +1961,40 @@ async fn dropping_foreground_waiter_cancels_registered_command() {
     })
     .await
     .expect("command was not registered");
+    wait_for_path(&pid_file).await;
     task.abort();
     let _ = task.await;
     tokio::time::timeout(Duration::from_secs(5), async {
-        while !background.running().is_empty() {
+        while !background.all_running_ids().is_empty() {
             tokio::task::yield_now().await;
         }
     })
     .await
     .expect("dropping the foreground waiter left its command running");
+    assert!(
+        events.try_recv().is_err(),
+        "dropped foreground task emitted completion"
+    );
+    let pid: u32 = std::fs::read_to_string(&pid_file)
+        .expect("wrapper did not publish child pid")
+        .trim()
+        .parse()
+        .expect("child pid was not numeric");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = std::process::Command::new("/bin/kill")
+                .arg("-0")
+                .arg(pid.to_string())
+                .status()
+                .expect("failed to check child pid");
+            if !status.success() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("foreground process survived dropped waiter");
 }
 
 #[cfg(unix)]
@@ -2002,7 +2035,7 @@ async fn foreground_cancel_before_threshold_returns_error_without_event() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn foreground_without_sender_waits_for_command_result() {
+async fn foreground_without_threshold_waits_for_command_result() {
     let temp = tempfile::tempdir().unwrap();
     let wrapper = temp.path().join("delayed-shell");
     let shell = write_shell_wrapper(&wrapper, "/bin/sleep 1.1; exec /bin/bash \"$@\"");
