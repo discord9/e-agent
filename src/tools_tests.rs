@@ -1929,6 +1929,39 @@ fn write_shell_wrapper(path: &Path, body: &str) -> Shell {
     shell
 }
 
+#[cfg(target_os = "linux")]
+fn process_stat(pid: u32) -> Option<(u8, u64)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields = stat
+        .rsplit_once(") ")?
+        .1
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    Some((fields[0].as_bytes()[0], fields[19].parse().ok()?))
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_for_original_process_gone(pid: u32, starttime: u64) {
+    while process_stat(pid).is_some_and(|(state, started)| state != b'Z' && starttime == started) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+async fn wait_for_original_process_gone(pid: u32, _starttime: u64) {
+    loop {
+        let status = std::process::Command::new("/bin/kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .status()
+            .expect("failed to check child pid");
+        if !status.success() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn dropping_foreground_waiter_cancels_registered_command() {
@@ -1939,7 +1972,7 @@ async fn dropping_foreground_waiter_cancels_registered_command() {
     let wrapper = write_shell_wrapper(
         &temp.path().join("pid-shell"),
         &format!(
-            "/bin/bash \"$@\" & echo $! > '{}' ; wait",
+            "/bin/bash \"$@\" & echo $! > '{0}.tmp' && mv '{0}.tmp' '{0}' ; wait",
             pid_file.display()
         ),
     );
@@ -1962,6 +1995,17 @@ async fn dropping_foreground_waiter_cancels_registered_command() {
     .await
     .expect("command was not registered");
     wait_for_path(&pid_file).await;
+    let pid: u32 = std::fs::read_to_string(&pid_file)
+        .expect("wrapper did not publish child pid")
+        .trim()
+        .parse()
+        .expect("child pid was not numeric");
+    #[cfg(target_os = "linux")]
+    let starttime = process_stat(pid)
+        .expect("child process stat was not available")
+        .1;
+    #[cfg(all(unix, not(target_os = "linux")))]
+    let starttime = 0;
     task.abort();
     let _ = task.await;
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -1971,30 +2015,19 @@ async fn dropping_foreground_waiter_cancels_registered_command() {
     })
     .await
     .expect("dropping the foreground waiter left its command running");
-    assert!(
-        events.try_recv().is_err(),
-        "dropped foreground task emitted completion"
-    );
-    let pid: u32 = std::fs::read_to_string(&pid_file)
-        .expect("wrapper did not publish child pid")
-        .trim()
-        .parse()
-        .expect("child pid was not numeric");
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let status = std::process::Command::new("/bin/kill")
-                .arg("-0")
-                .arg(pid.to_string())
-                .status()
-                .expect("failed to check child pid");
-            if !status.success() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        wait_for_original_process_gone(pid, starttime),
+    )
     .await
     .expect("foreground process survived dropped waiter");
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("completion channel stayed open after cancellation")
+            .is_none(),
+        "dropped foreground task emitted completion"
+    );
 }
 
 #[cfg(unix)]
