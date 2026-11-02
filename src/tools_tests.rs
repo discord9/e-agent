@@ -1931,6 +1931,41 @@ fn write_shell_wrapper(path: &Path, body: &str) -> Shell {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn dropping_foreground_waiter_cancels_registered_command() {
+    let temp = tempfile::tempdir().unwrap();
+    let (sender, _events) = tokio::sync::mpsc::unbounded_channel();
+    let background = BackgroundTasks::new(None, None);
+    let tool = Bash {
+        workspace: Workspace::new(temp.path()).unwrap(),
+        timeout: None,
+        sender: Some(sender),
+        background: background.clone(),
+        sandbox: None,
+        protect_git: false,
+        shell: Shell::detect().unwrap(),
+        owner_session: None,
+    };
+    let task = tokio::spawn(async move { tool.execute(json!({"command":"sleep 30"})).await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while background.all_running_ids().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("command was not registered");
+    task.abort();
+    let _ = task.await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !background.running().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("dropping the foreground waiter left its command running");
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn foreground_cancel_before_threshold_returns_error_without_event() {
     let temp = tempfile::tempdir().unwrap();
     let shell = Shell::detect().unwrap();
@@ -1967,7 +2002,7 @@ async fn foreground_cancel_before_threshold_returns_error_without_event() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn foreground_without_threshold_waits_for_command_result() {
+async fn foreground_without_sender_waits_for_command_result() {
     let temp = tempfile::tempdir().unwrap();
     let wrapper = temp.path().join("delayed-shell");
     let shell = write_shell_wrapper(&wrapper, "/bin/sleep 1.1; exec /bin/bash \"$@\"");
@@ -1998,7 +2033,7 @@ async fn foreground_without_threshold_waits_for_command_result() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn bash_timeout_kills_its_background_process_group() {
+async fn foreground_adoption_then_cancel_kills_its_process_group() {
     let temp = tempfile::tempdir().unwrap();
     let pid_file = temp.path().join("child.pid");
     // Exercise 300 ms of shell startup latency without host-wide load.
@@ -2046,7 +2081,10 @@ async fn bash_timeout_kills_its_background_process_group() {
         .arg(pid.to_string())
         .status()
         .unwrap();
-    assert!(!status.success(), "background child survived timeout");
+    assert!(
+        !status.success(),
+        "adopted command child survived explicit cancellation"
+    );
 }
 
 #[test]
@@ -2514,7 +2552,7 @@ async fn foreground_or_adopt_fast_command_returns_result_without_completion_even
 }
 
 #[tokio::test]
-async fn foreground_zero_threshold_adopts_immediately_and_delivers_once() {
+async fn foreground_zero_threshold_adopts_immediately_and_delivers_output_once() {
     // Completion wins with a nonzero real threshold in foreground_or_adopt_fast_command_returns_result_without_completion_event;
     // at zero, timeout necessarily beats shell startup, so adoption must win.
     let temp = tempfile::tempdir().unwrap();
@@ -2550,7 +2588,7 @@ async fn foreground_zero_threshold_adopts_immediately_and_delivers_once() {
     else {
         panic!("expected completion")
     };
-    let _ = output;
+    assert!(output.contains("fast"), "{output}");
     assert!(
         tokio::time::timeout(Duration::from_millis(30), events.recv())
             .await
@@ -2581,7 +2619,7 @@ fn gated_command(temp: &tempfile::TempDir) -> String {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn foreground_zero_threshold_parking_command_is_adopted_once() {
+async fn foreground_zero_threshold_parking_command_is_adopted_once_with_output() {
     let temp = tempfile::tempdir().unwrap();
     let shell = write_shell_wrapper(
         &temp.path().join("zero-park-shell"),
@@ -2600,7 +2638,7 @@ async fn foreground_zero_threshold_parking_command_is_adopted_once() {
         owner_session: None,
     };
     let receipt = task
-        .execute(json!({"command":"ignored"}))
+        .execute(json!({"command":"printf after"}))
         .await
         .unwrap()
         .content;
@@ -2614,7 +2652,8 @@ async fn foreground_zero_threshold_parking_command_is_adopted_once() {
     else {
         panic!("expected completion")
     };
-    let _ = output;
+    assert!(output.contains("before"), "{output}");
+    assert!(output.contains("after"), "{output}");
     assert!(
         tokio::time::timeout(Duration::from_millis(30), events.recv())
             .await

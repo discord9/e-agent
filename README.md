@@ -1408,9 +1408,13 @@ Rejected reloads keep the old runtime and emit no success diff.
 
 `[bash] timeout_secs` defaults to 30 seconds and is the foreground residence
 threshold: commands exceeding it continue in the background rather than being
-killed. Set it to `0` to disable automatic adoption. Explicit `background: true`
-and `detached: true` behavior is unchanged. Adopted foreground commands are
-currently not bounded by `[background] timeout_secs`.
+killed. Set it to `0` to disable automatic adoption and run foreground commands
+to completion; explicit `background: true` and `detached: true` behavior is
+unchanged. Automatic adoption is available only when the bash facade has a live
+completion channel; without one, commands stay foreground so their result is not
+lost. Adoption uses the facade's configured shell on supported platforms;
+sandboxed Windows commands retain the foreground fallback. Adopted foreground
+commands are currently not bounded by `[background] timeout_secs`.
 - Existing sessions, startup file capabilities, TUI input mapping, and the
   session backend are unchanged.
 

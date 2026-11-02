@@ -38,6 +38,24 @@ enum ForegroundRoute {
     Delivered,
 }
 
+struct ForegroundWaitGuard {
+    background: BackgroundTasks,
+    id: Arc<AtomicU64>,
+    route: Arc<std::sync::Mutex<ForegroundRoute>>,
+}
+
+impl Drop for ForegroundWaitGuard {
+    fn drop(&mut self) {
+        if matches!(*self.route.lock().unwrap(), ForegroundRoute::Open(_)) {
+            let id = self.id.load(Ordering::Acquire);
+            if id != 0 {
+                self.background
+                    .cancel_with_source(id, CancellationSource::User);
+            }
+        }
+    }
+}
+
 pub(crate) enum ForegroundOutcome {
     Done(Result<String, String>),
     Adopted(String),
@@ -723,6 +741,7 @@ impl BackgroundTasks {
         owner_session: Option<String>,
         title: Option<String>,
         threshold: Option<Duration>,
+        shell: Shell,
     ) -> Result<ForegroundOutcome, String> {
         let sender = sender.filter(|sender| !sender.is_closed());
         // Without a live completion channel, adoption would lose the result, so
@@ -737,11 +756,17 @@ impl BackgroundTasks {
         let route = Arc::new(std::sync::Mutex::new(ForegroundRoute::Open(tx)));
         let registered_id = Arc::new(AtomicU64::new(0));
         let registered_id_for_hook = registered_id.clone();
+        let _wait_guard = ForegroundWaitGuard {
+            background: self.clone(),
+            id: registered_id.clone(),
+            route: route.clone(),
+        };
         let result_slot = Arc::new(std::sync::Mutex::new(None));
         let route_done = route.clone();
         let result_done = result_slot.clone();
         let completion_label = label.clone();
         let receipt = self.spawn_bash_command(
+            Some(shell),
             label,
             workspace,
             command,
@@ -756,11 +781,17 @@ impl BackgroundTasks {
                 ForegroundRoute::Delivered,
             ) {
                 ForegroundRoute::Open(tx) => {
-                    let result = result_done
-                        .lock()
-                        .unwrap()
-                        .take()
-                        .unwrap_or_else(|| Err(output.clone()));
+                    let result = if trace.status.as_deref() == Some("killed")
+                        && output.contains("background task cancelled")
+                    {
+                        Err(output.clone())
+                    } else {
+                        result_done
+                            .lock()
+                            .unwrap()
+                            .take()
+                            .unwrap_or_else(|| Err(output.clone()))
+                    };
                     let _ = tx.send(result);
                 }
                 ForegroundRoute::Adopted => {
@@ -848,6 +879,7 @@ impl BackgroundTasks {
         let label = title.clone().unwrap_or_else(|| preview(&command, 100));
         let completion_label = label.clone();
         self.spawn_bash_command(
+            None,
             label,
             workspace,
             command,
@@ -896,6 +928,7 @@ impl BackgroundTasks {
     ) -> Result<String, String> {
         let label = title.unwrap_or_else(|| preview(&command, 100));
         self.spawn_bash_command(
+            None,
             label,
             workspace,
             command,
@@ -919,6 +952,7 @@ impl BackgroundTasks {
     #[allow(clippy::too_many_arguments)]
     fn spawn_bash_command(
         &self,
+        shell_override: Option<Shell>,
         label: String,
         workspace: Workspace,
         command: String,
@@ -930,7 +964,10 @@ impl BackgroundTasks {
         on_id: impl FnOnce(u64) + Send + 'static,
         on_complete: impl FnOnce(u64, String, BackgroundTrace) + Send + 'static,
     ) -> Result<String, String> {
-        let shell = Shell::detect()?;
+        let shell = match shell_override {
+            Some(shell) => shell,
+            None => Shell::detect()?,
+        };
         let process_group = Arc::new(AtomicI32::new(0));
         let task_started = std::time::Instant::now();
         let task_id = Arc::new(AtomicU64::new(0));
@@ -1257,7 +1294,9 @@ impl BackgroundTasks {
             } else {
                 None
             };
-            if let (Some(trace), Some(done)) = (trace, task_completion.lock().unwrap().take()) {
+            if let Some(trace) = trace
+                && let Some(done) = task_completion.lock().unwrap().take()
+            {
                 done(id, output, trace);
             }
         });

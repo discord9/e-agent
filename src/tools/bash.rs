@@ -246,6 +246,23 @@ impl Tool for Bash {
                 });
         }
         let threshold = self.timeout;
+        #[cfg(windows)]
+        if self.sandbox.is_some() {
+            return run_bash(
+                &self.shell,
+                &self.workspace,
+                command,
+                self.timeout,
+                self.protect_git,
+                None,
+                None,
+                None,
+                self.sandbox.as_ref(),
+                None,
+            )
+            .await
+            .map(ToolOutput::text);
+        }
         match self
             .background
             .run_foreground_or_adopt(
@@ -257,6 +274,7 @@ impl Tool for Bash {
                 self.owner_session.clone(),
                 title,
                 threshold,
+                self.shell.clone(),
             )
             .await?
         {
@@ -1376,7 +1394,7 @@ pub(super) fn wrap_bash_command(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[cfg(test)]
+#[cfg(any(test, windows))]
 pub(super) async fn run_bash(
     shell: &Shell,
     workspace: &Workspace,
