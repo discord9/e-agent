@@ -708,8 +708,12 @@ command set through its slash-command menu):
   the current one, or arm live continuation with an optional token cap.
 - `/help [命令]` — show the command list, or per-command usage detail
   (`/help fork`); an unknown command name prints a hint back to the list.
-- `/model <profile>` — switch the session's model at runtime (not listed by
-  bare `/help`; the profile must be resolvable from the config).
+- `/model <profile> [effort|default|omit]` — switch the session's model at
+  runtime (not listed by bare `/help`; the profile must be resolvable from the
+  config). The optional second token overrides `reasoning_effort` for this
+  session only: a literal value is sent as-is, `default` clears the override,
+  and `omit` leaves the field out of the request entirely. The override is in
+  memory only.
 
 The TUI renders with a truecolor (24-bit) Solarized Light palette; terminals
 without truecolor support may render colors incorrectly.

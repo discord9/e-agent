@@ -959,11 +959,20 @@ fn handle_model(command: ModelCommand, state: &mut TuiState, handle: &RunnerHand
                     state.model_name = name.clone();
                     state.model = Some(configured.clone());
                     state.context_window = context_window;
+                    let clears_effort_override = matches!(
+                        effort,
+                        Some(crate::session_factory::EffortOverride::Default)
+                    );
                     state.effort_override = effort.filter(|value| {
                         !matches!(value, crate::session_factory::EffortOverride::Default)
                     });
                     handle.switch_model(Box::new(configured), context_window);
-                    push_display(state, format!("已切换到 {name}"));
+                    let acknowledgement = if clears_effort_override {
+                        format!("已切换到 {name}（已清除 effort 覆盖，使用配置默认）")
+                    } else {
+                        format!("已切换到 {name}")
+                    };
+                    push_display(state, acknowledgement);
                 }
                 Err(error) => {
                     push_display(state, format!("未知模型 profile：{error:#}"));
@@ -1360,8 +1369,46 @@ mod fork_tests {
 
 #[cfg(test)]
 mod model_tests {
-    use super::{ModelCommand, parse_model};
-    use crate::session_factory::EffortOverride;
+    use super::{ModelCommand, TuiState, handle_model, parse_model};
+    use crate::session_factory::{EffortOverride, SessionFactory};
+    use std::sync::Arc;
+
+    #[test]
+    fn default_effort_switch_acknowledges_clearing_the_override() {
+        let temp = tempfile::tempdir().unwrap();
+        let config: crate::config::Config = toml::from_str(
+            r#"default = "p1/m1"
+[providers.p1]
+base_url = "http://one"
+api_key_env = "PATH"
+[models."p1/m1"]
+model = "m1"
+"#,
+        )
+        .unwrap();
+        let factory = Arc::new(SessionFactory::test_factory_with_config(
+            temp.path().to_path_buf(),
+            Some(config),
+        ));
+        let (handle, _sink, _source) = crate::runner::session_test_channel();
+        let mut state = TuiState {
+            factory: Some(factory),
+            effort_override: Some(EffortOverride::Literal("low".into())),
+            ..TuiState::default()
+        };
+
+        handle_model(
+            ModelCommand::Switch("p1/m1".into(), Some(EffortOverride::Default)),
+            &mut state,
+            &handle,
+        );
+
+        assert_eq!(
+            state.lines.last().unwrap().text,
+            "已切换到 p1/m1（已清除 effort 覆盖，使用配置默认）"
+        );
+        assert_eq!(state.effort_override, None);
+    }
 
     #[test]
     fn parse_model_commands() {
