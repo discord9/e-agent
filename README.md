@@ -712,8 +712,10 @@ command set through its slash-command menu):
   runtime (not listed by bare `/help`; the profile must be resolvable from the
   config). The optional second token overrides `reasoning_effort` for this
   session only: a literal value is sent as-is, `default` clears the override,
-  and `omit` leaves the field out of the request entirely. The override is in
-  memory only.
+  and `omit` leaves the field out of the request entirely (for Codex that
+  removes the whole `reasoning` object, including its explicit summary
+  request). Switching profile without a token uses that profile's configured
+  effort and clears any previous override. The override is in memory only.
 
 The TUI renders with a truecolor (24-bit) Solarized Light palette; terminals
 without truecolor support may render colors incorrectly.
