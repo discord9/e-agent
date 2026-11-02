@@ -303,6 +303,20 @@ fn omits_reasoning_effort_when_unset() {
     let request = ChatRequest::from_internal("test-model", None, false, false, &[], &[], None);
     let value = serde_json::to_value(request).unwrap();
     assert!(value.get("reasoning_effort").is_none());
+    assert!(!value.as_object().unwrap().contains_key("reasoning_effort"));
+}
+
+#[test]
+fn chat_omit_effort_serializes_without_reasoning_effort_key() {
+    // EffortOverride::Omit resolves to None before model construction; the wire
+    // must omit the key, rather than serializing it as JSON null.
+    let request = ChatRequest::from_internal("test-model", None, false, false, &[], &[], None);
+    let value = serde_json::to_value(request).unwrap();
+    assert!(!value.as_object().unwrap().contains_key("reasoning_effort"));
+    assert_ne!(
+        value.get("reasoning_effort"),
+        Some(&serde_json::Value::Null)
+    );
 }
 
 #[test]

@@ -873,8 +873,9 @@ async fn handle_rename(command: RenameCommand, state: &mut TuiState) {
 enum ModelCommand {
     /// Bare `/model` — show the current model and usage.
     Usage,
+    Invalid,
     /// `/model <profile>` — switch the session's model at runtime.
-    Switch(String),
+    Switch(String, Option<crate::session_factory::EffortOverride>),
 }
 
 /// Parse a `/model` command. Returns `None` for any other input so the
@@ -887,10 +888,20 @@ fn parse_model(prompt: &str) -> Option<ModelCommand> {
     let rest = prompt.strip_prefix("/model ")?;
     let rest = rest.trim();
     if rest.is_empty() {
-        Some(ModelCommand::Usage)
-    } else {
-        Some(ModelCommand::Switch(rest.to_string()))
+        return Some(ModelCommand::Usage);
     }
+    let mut tokens = rest.split_whitespace();
+    let profile = tokens.next()?;
+    let effort = match tokens.next() {
+        None => None,
+        Some("default") => Some(crate::session_factory::EffortOverride::Default),
+        Some("omit") => Some(crate::session_factory::EffortOverride::Omit),
+        Some(value) if tokens.next().is_none() => Some(
+            crate::session_factory::EffortOverride::Literal(value.to_string()),
+        ),
+        _ => return Some(ModelCommand::Invalid),
+    };
+    Some(ModelCommand::Switch(profile.to_string(), effort))
 }
 
 /// Run a `/model` command: resolve the profile through the session factory
@@ -905,10 +916,31 @@ fn handle_model(command: ModelCommand, state: &mut TuiState, handle: &RunnerHand
             let current = state.model_name.clone();
             push_display(
                 state,
-                format!("当前模型：{current}。用法：/model <profile>（如 /model deepseek/flash）"),
+                format!(
+                    "当前模型：{current}；effort={}{}。用法：/model <profile> [effort|default|omit]",
+                    state
+                        .model
+                        .as_ref()
+                        .and_then(|model| match &model.kind {
+                            crate::model::ConfiguredModelKind::Chat(m) =>
+                                m.reasoning_effort.as_deref(),
+                            crate::model::ConfiguredModelKind::Codex(m) =>
+                                m.reasoning_effort.as_deref(),
+                        })
+                        .unwrap_or("none"),
+                    if state.effort_override.is_some() {
+                        " (override)"
+                    } else {
+                        " (profile default)"
+                    }
+                ),
             );
         }
-        ModelCommand::Switch(profile) => {
+        ModelCommand::Invalid => push_display(
+            state,
+            "用法：/model <profile> [effort|default|omit]（effort 只能有一个 token）".to_string(),
+        ),
+        ModelCommand::Switch(profile, effort) => {
             let Some(factory) = state.factory.clone() else {
                 push_display(
                     state,
@@ -916,12 +948,13 @@ fn handle_model(command: ModelCommand, state: &mut TuiState, handle: &RunnerHand
                 );
                 return;
             };
-            match factory.resolve_profile(&profile) {
+            match factory.resolve_profile(&profile, effort.clone()) {
                 Ok((configured, context_window)) => {
                     let name = configured.profile_key();
                     state.model_name = name.clone();
                     state.model = Some(configured.clone());
                     state.context_window = context_window;
+                    state.effort_override = effort;
                     handle.switch_model(Box::new(configured), context_window);
                     push_display(state, format!("已切换到 {name}"));
                 }
@@ -1321,6 +1354,7 @@ mod fork_tests {
 #[cfg(test)]
 mod model_tests {
     use super::{ModelCommand, parse_model};
+    use crate::session_factory::EffortOverride;
 
     #[test]
     fn parse_model_commands() {
@@ -1329,12 +1363,44 @@ mod model_tests {
         assert_eq!(parse_model("/model   "), Some(ModelCommand::Usage));
         assert_eq!(
             parse_model("/model chatgpt/sol"),
-            Some(ModelCommand::Switch("chatgpt/sol".to_string()))
+            Some(ModelCommand::Switch("chatgpt/sol".to_string(), None))
         );
         assert_eq!(
             parse_model("/model   deepseek/flash  "),
-            Some(ModelCommand::Switch("deepseek/flash".to_string()))
+            Some(ModelCommand::Switch("deepseek/flash".to_string(), None))
         );
+        assert_eq!(
+            parse_model("/model p medium"),
+            Some(ModelCommand::Switch(
+                "p".into(),
+                Some(EffortOverride::Literal("medium".into()))
+            ))
+        );
+        assert_eq!(
+            parse_model("/model p omit"),
+            Some(ModelCommand::Switch("p".into(), Some(EffortOverride::Omit)))
+        );
+        assert_eq!(
+            parse_model("/model p default"),
+            Some(ModelCommand::Switch(
+                "p".into(),
+                Some(EffortOverride::Default)
+            ))
+        );
+        assert_eq!(
+            parse_model("/model p medium extra"),
+            Some(ModelCommand::Invalid)
+        );
+        let first = parse_model("/model a medium");
+        let second = parse_model("/model b");
+        assert_eq!(
+            first,
+            Some(ModelCommand::Switch(
+                "a".into(),
+                Some(EffortOverride::Literal("medium".into()))
+            ))
+        );
+        assert_eq!(second, Some(ModelCommand::Switch("b".into(), None)));
         // Non-model input falls through to the normal prompt path.
         assert_eq!(parse_model("/modelxxx"), None);
         assert_eq!(parse_model("/modelx gpt"), None);

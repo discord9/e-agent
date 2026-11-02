@@ -110,7 +110,7 @@ pub struct OpenAiModel {
     base_url: String,
     api_key: String,
     model: String,
-    reasoning_effort: Option<String>,
+    pub(crate) reasoning_effort: Option<String>,
     /// Force the OpenAI-compatible `thinking` switch (`thinking:
     /// {"type": "enabled"}`) on chat requests. DeepSeek V4's `max`
     /// reasoning effort needs the explicit switch; `high` enables thinking
@@ -124,10 +124,10 @@ pub struct OpenAiModel {
     /// or DeepSeek 400s; (2) such a content-less assistant turn must carry
     /// `content: ""` instead of an absent/null `content`. Defaults to false;
     /// other providers are byte-identical to the non-compat wire.
-    deepseek_compat: bool,
+    pub(crate) deepseek_compat: bool,
     /// Whether the model accepts image input (chat wire builds image_url
     /// parts only for vision-capable models; see `ensure_vision_supported`).
-    vision: bool,
+    pub(crate) vision: bool,
     /// Global content-addressed image store (see `agent::image_store_dir`).
     /// None when no HOME/XDG_STATE_HOME: image refs then degrade to text
     /// placeholders on the wire.

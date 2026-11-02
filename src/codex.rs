@@ -92,7 +92,7 @@ pub struct CodexModel {
     client: reqwest::Client,
     auth: CodexAuth,
     model: String,
-    reasoning_effort: Option<String>,
+    pub(crate) reasoning_effort: Option<String>,
     endpoint: String,
     /// Whether the model accepts image input (responses wire builds
     /// `input_image` parts only for vision-capable models).
