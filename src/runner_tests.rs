@@ -15892,10 +15892,22 @@ async fn bootstrap_consume_mismatch_does_not_fail_and_projection_clears_rows() {
 
 #[tokio::test]
 async fn bootstrap_does_not_delete_another_sessions_rows() {
-    // Parent projection must not erase an independently persisted child task.
+    // Parent projection consumes its own leftover without erasing the child row.
     let parent_temp = tempfile::tempdir().unwrap();
     let store = SessionStore::Jsonl;
+    store.record_background_start(
+        parent_temp.path(),
+        "parent-session",
+        2,
+        "parent task",
+        None,
+        None,
+    );
     store.record_background_start(parent_temp.path(), "sub-child", 1, "child task", None, None);
+    let recovery_tasks = store
+        .peek_unfinished_background(parent_temp.path(), "parent-session")
+        .await
+        .unwrap();
     let agent = Agent::new(
         Box::new(ScriptedAssistantModel {
             replies: VecDeque::new(),
@@ -15909,13 +15921,18 @@ async fn bootstrap_does_not_delete_another_sessions_rows() {
         "parent-session".into(),
         IdlePolicy::FinishWhenIdle,
         SessionBootstrap {
-            recovery_tasks: vec![],
+            recovery_tasks,
             legacy: false,
             initial_entries: vec![],
         },
     )
     .await
     .unwrap();
+    let parent = store
+        .peek_unfinished_background(parent_temp.path(), "parent-session")
+        .await
+        .unwrap();
+    assert!(parent.is_empty());
     let child = store
         .peek_unfinished_background(parent_temp.path(), "sub-child")
         .await
@@ -16002,12 +16019,40 @@ async fn bootstrap_normal_leftover_gets_one_notice_and_is_consumed() {
     .await
     .unwrap();
     assert_eq!(runner.agent.history().iter().filter(|entry| matches!(entry, SessionEntry::Notice { text } if text.contains("1 background task(s)"))).count(), 1);
-    assert!(
-        store
-            .peek_unfinished_background(temp.path(), "bootstrap-normal")
-            .await
-            .unwrap()
-            .is_empty()
+    let remaining = store
+        .peek_unfinished_background(temp.path(), "bootstrap-normal")
+        .await
+        .unwrap();
+    assert!(remaining.is_empty());
+
+    let agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: VecDeque::new(),
+        }),
+        vec![],
+    );
+    let (second_runner, _) = SessionRunner::new_with_bootstrap(
+        agent,
+        store,
+        temp.path().into(),
+        "bootstrap-normal".into(),
+        IdlePolicy::FinishWhenIdle,
+        SessionBootstrap {
+            recovery_tasks: remaining,
+            legacy: false,
+            initial_entries: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        second_runner
+            .agent
+            .history()
+            .iter()
+            .filter(|entry| matches!(entry, SessionEntry::Notice { text } if text.contains("background task(s)")))
+            .count(),
+        0
     );
 }
 

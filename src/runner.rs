@@ -933,21 +933,28 @@ impl SessionRunner {
         self
     }
 
-    async fn sync_background_projection(&mut self) {
+    async fn sync_background_projection(&mut self) -> bool {
         let Some(background) = self.background.clone() else {
             if self.bootstrap_projection_pending {
                 let rows = Vec::new();
-                match self
+                let succeeded = match self
                     .store
                     .project_background_tasks(&self.root, &self.session, &rows)
                     .await
                 {
-                    Ok(()) => self.projected_background = Some(rows),
-                    Err(error) => tracing::warn!("cannot project background tasks: {error:#}"),
-                }
+                    Ok(()) => {
+                        self.projected_background = Some(rows);
+                        true
+                    }
+                    Err(error) => {
+                        tracing::warn!("cannot project background tasks: {error:#}");
+                        false
+                    }
+                };
                 self.bootstrap_projection_pending = false;
+                return succeeded;
             }
-            return;
+            return false;
         };
         let live: HashSet<u64> = self
             .agent
@@ -975,15 +982,21 @@ impl SessionRunner {
             .collect::<Vec<_>>();
         rows.sort_by_key(|task| task.id);
         if self.projected_background.as_ref() == Some(&rows) {
-            return;
+            return true;
         }
         match self
             .store
             .project_background_tasks(&self.root, &self.session, &rows)
             .await
         {
-            Ok(()) => self.projected_background = Some(rows),
-            Err(error) => tracing::warn!("cannot project background tasks: {error:#}"),
+            Ok(()) => {
+                self.projected_background = Some(rows);
+                true
+            }
+            Err(error) => {
+                tracing::warn!("cannot project background tasks: {error:#}");
+                false
+            }
         }
     }
 
@@ -1134,11 +1147,15 @@ impl SessionRunner {
             // This notice was created during this recovery and is now durable,
             // unlike replayed historical entries. Give it one normal request.
             self.pending_regular_reaction = true;
-            self.sync_background_projection().await;
-            if let Err(error) = self
-                .store
-                .consume_unfinished_background(&self.root, &self.session, &bootstrap.recovery_tasks)
-                .await
+            if !self.sync_background_projection().await
+                && let Err(error) = self
+                    .store
+                    .consume_unfinished_background(
+                        &self.root,
+                        &self.session,
+                        &bootstrap.recovery_tasks,
+                    )
+                    .await
             {
                 tracing::warn!("cannot consume unfinished background tasks: {error:#}");
             }
