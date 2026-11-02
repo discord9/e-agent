@@ -108,14 +108,15 @@ pub const DEFAULT_BACKGROUND_TIMEOUT_SECS: u64 = 30 * 60;
 /// Foreground bash tool policy, from `[bash]`.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 pub struct BashConfig {
-    /// Foreground bash timeout in seconds. `0` disables the timeout
+    /// Foreground residence threshold in seconds: a command still running
+    /// after this long continues in the background. `0` disables adoption
     /// (runs until the command finishes). Absent defaults to
     /// [`DEFAULT_BASH_TIMEOUT_SECS`].
     #[serde(default)]
     pub timeout_secs: Option<u64>,
 }
 
-/// Default foreground bash timeout: 30 seconds.
+/// Default foreground bash residence threshold: 30 seconds.
 pub const DEFAULT_BASH_TIMEOUT_SECS: u64 = 30;
 
 /// User-level `[code_mode]` enabling the experimental `run_rust` tool.
@@ -1250,10 +1251,11 @@ fn project_background(workspace: &Path) -> anyhow::Result<Option<BackgroundConfi
     Ok(parsed.background)
 }
 
-/// Resolve the foreground bash timeout policy for a workspace: workspace
+/// Resolve the foreground bash residence policy for a workspace: workspace
 /// `<workspace>/.e-agent/config.toml` `[bash]` overrides the global config;
-/// `timeout_secs = 0` means no timeout (`None`); absent everywhere returns
-/// the default 30s. Mirrors `resolve_background_timeout`/`project_background`.
+/// `timeout_secs = 0` means no threshold (`None`, so never adopt); absent
+/// everywhere returns the default 30s. Mirrors
+/// `resolve_background_timeout`/`project_background`.
 pub fn resolve_bash_timeout(
     config: Option<&Config>,
     workspace: &Path,

@@ -29,8 +29,10 @@ use super::background::{BackgroundTasks, ExitSlot, OutputSlot, TaskExit, TaskSpo
 /// subagents/fixers. It comes from the role's frontmatter (default true; a
 /// role declares `protect_git = false` to opt out). The Windows write-sandbox
 /// MVP rejects this mode.
-/// `timeout`: foreground command timeout; `None` means no timeout.
-/// Callers resolve it from config (`[bash]`), defaulting to 30s.
+/// `timeout`: foreground residence threshold; a command still running after
+/// it is adopted into the background. `None` means no threshold (run to
+/// completion). Callers resolve it from config (`[bash]`), defaulting to 30s.
+/// Sandboxed Windows retains kill-on-timeout instead of adopting.
 pub fn bash_tool(
     workspace: Workspace,
     background: BackgroundTasks,
@@ -71,7 +73,8 @@ fn optional_background_title(arguments: &Value) -> Result<Option<String>, String
 
 pub(super) struct Bash {
     pub(super) workspace: Workspace,
-    /// Foreground command timeout; `None` = no timeout (runs until done).
+    /// Foreground residence threshold; `None` = no threshold (runs until done).
+    /// Sandboxed Windows ignores adoption and keeps killing at this deadline.
     pub(super) timeout: Option<Duration>,
     pub(super) background: BackgroundTasks,
     /// Completion delivery belongs to this bash facade's Agent, not the
