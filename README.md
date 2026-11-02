@@ -1403,8 +1403,14 @@ Rejected reloads keep the old runtime and emit no success diff.
   immediately available to the web `/model` autocomplete and `POST
   /api/sessions/{id}/model` / TUI `/model` switches, and newly built
   sessions start with the edited default and role routing.
-- `[mcp]`, `[bash]` timeout, `[background]` timeout — winning edits apply to
+- `[mcp]`, `[bash]` foreground residence threshold, `[background]` timeout — winning edits apply to
   sessions built after the reload; existing MCP connections are unchanged.
+
+`[bash] timeout_secs` defaults to 30 seconds and is the foreground residence
+threshold: commands exceeding it continue in the background rather than being
+killed. Set it to `0` to disable automatic adoption. Explicit `background: true`
+and `detached: true` behavior is unchanged. Adopted foreground commands are
+currently not bounded by `[background] timeout_secs`.
 - Existing sessions, startup file capabilities, TUI input mapping, and the
   session backend are unchanged.
 

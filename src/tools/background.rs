@@ -30,6 +30,18 @@ struct BackgroundRegistry {
 
 type Completion =
     Arc<std::sync::Mutex<Option<Box<dyn FnOnce(u64, String, BackgroundTrace) + Send>>>>;
+type ForegroundResult = Arc<std::sync::Mutex<Option<Result<String, String>>>>;
+
+enum ForegroundRoute {
+    Open(tokio::sync::oneshot::Sender<Result<String, String>>),
+    Adopted,
+    Delivered,
+}
+
+pub(crate) enum ForegroundOutcome {
+    Done(Result<String, String>),
+    Adopted(String),
+}
 
 /// Structured exit metadata of a finished background task's underlying run,
 /// written by the task's own work through an out-slot (bash: `run_bash`
@@ -405,6 +417,8 @@ fn truncated_tail_line(bytes: &[u8], start: usize, end: usize, budget: usize) ->
 struct RunningTask {
     id: u64,
     label: String,
+    /// Hidden foreground residence tasks become visible only after adoption.
+    visible: bool,
     /// Full untruncated command for bash tasks (`None` for delegate tasks).
     /// The label is preview-truncated at spawn time, so the detail view
     /// reads this field to show the complete command.
@@ -493,6 +507,7 @@ impl BackgroundTasks {
             .lock()
             .unwrap()
             .iter()
+            .filter(|task| task.visible)
             .map(|task| BackgroundTaskMetadata {
                 id: task.id,
                 label: task.label.clone(),
@@ -535,6 +550,17 @@ impl BackgroundTasks {
             .is_some_and(|sender| !sender.is_closed())
     }
 
+    #[cfg(test)]
+    pub(super) fn all_running_ids(&self) -> Vec<u64> {
+        self.registry
+            .running
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|task| task.id)
+            .collect()
+    }
+
     /// Snapshot of currently running background tasks, for the TUI panel.
     pub fn running(&self) -> Vec<BackgroundTaskInfo> {
         self.registry
@@ -542,6 +568,7 @@ impl BackgroundTasks {
             .lock()
             .unwrap()
             .iter()
+            .filter(|task| task.visible)
             .map(|task| BackgroundTaskInfo {
                 id: task.id,
                 label: task.label.clone(),
@@ -685,6 +712,113 @@ impl BackgroundTasks {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn run_foreground_or_adopt(
+        &self,
+        workspace: Workspace,
+        command: String,
+        protect_git: bool,
+        sender: Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
+        sandbox: Option<crate::config::Sandbox>,
+        owner_session: Option<String>,
+        title: Option<String>,
+        threshold: Option<Duration>,
+    ) -> Result<ForegroundOutcome, String> {
+        let sender = sender.filter(|sender| !sender.is_closed());
+        // Without a live completion channel, adoption would lose the result, so
+        // this invocation remains foreground even when a threshold is set.
+        let threshold = threshold.filter(|_| sender.is_some());
+        let sender = sender.unwrap_or_else(|| {
+            let (fallback, _receiver) = tokio::sync::mpsc::unbounded_channel();
+            fallback
+        });
+        let label = title.unwrap_or_else(|| preview(&command, 100));
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let route = Arc::new(std::sync::Mutex::new(ForegroundRoute::Open(tx)));
+        let registered_id = Arc::new(AtomicU64::new(0));
+        let registered_id_for_hook = registered_id.clone();
+        let result_slot = Arc::new(std::sync::Mutex::new(None));
+        let route_done = route.clone();
+        let result_done = result_slot.clone();
+        let completion_label = label.clone();
+        let receipt = self.spawn_bash_command(
+            label,
+            workspace,
+            command,
+            protect_git,
+            sandbox,
+            owner_session,
+            None,
+            Some(result_slot),
+            move |id| registered_id_for_hook.store(id, Ordering::Release),
+            move |id, output, trace| match std::mem::replace(
+                &mut *route_done.lock().unwrap(),
+                ForegroundRoute::Delivered,
+            ) {
+                ForegroundRoute::Open(tx) => {
+                    let result = result_done
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .unwrap_or_else(|| Err(output.clone()));
+                    let _ = tx.send(result);
+                }
+                ForegroundRoute::Adopted => {
+                    let _ = sender.send(AgentEvent::BackgroundCompleted {
+                        id,
+                        output,
+                        label: Some(completion_label),
+                        started_at_ms: trace.started_at_ms,
+                        duration_ms: trace.duration_ms,
+                        exit_code: trace.exit_code,
+                        signal: trace.signal,
+                        status: trace.status,
+                        kind: trace.kind,
+                        cancellation_source: trace.cancellation_source,
+                    });
+                }
+                ForegroundRoute::Delivered => {}
+            },
+        )?;
+        match threshold {
+            None => Ok(ForegroundOutcome::Done(rx.await.unwrap_or_else(|_| {
+                Err("foreground command was cancelled".into())
+            }))),
+            Some(duration) => match tokio::time::timeout(duration, &mut rx).await {
+                Ok(Ok(result)) => Ok(ForegroundOutcome::Done(result)),
+                Ok(Err(_)) => Err("foreground command result channel closed".into()),
+                Err(_) => {
+                    let adopted = {
+                        let mut route = route.lock().unwrap();
+                        match std::mem::replace(&mut *route, ForegroundRoute::Adopted) {
+                            ForegroundRoute::Open(_tx) => true,
+                            ForegroundRoute::Delivered => false,
+                            ForegroundRoute::Adopted => unreachable!(),
+                        }
+                    };
+                    if adopted {
+                        let id = registered_id.load(Ordering::Acquire);
+                        if let Some(task) = self
+                            .registry
+                            .running
+                            .lock()
+                            .unwrap()
+                            .iter_mut()
+                            .find(|task| task.id == id)
+                        {
+                            task.visible = true;
+                        }
+                        Ok(ForegroundOutcome::Adopted(receipt))
+                    } else {
+                        Ok(ForegroundOutcome::Done(rx.await.unwrap_or_else(|_| {
+                            Err("foreground command result channel closed".into())
+                        })))
+                    }
+                }
+            },
+        }
+    }
+
     /// Start a background bash command with an explicit completion sender and
     /// sandbox policy.
     ///
@@ -721,6 +855,8 @@ impl BackgroundTasks {
             sandbox,
             owner_session.clone(),
             owner_session.as_ref().map(|_| sender.clone()),
+            None,
+            |_| {},
             move |id, output, trace| {
                 let _ = sender.send(AgentEvent::BackgroundCompleted {
                     id,
@@ -767,6 +903,8 @@ impl BackgroundTasks {
             sandbox,
             owner_session,
             None,
+            None,
+            |_| {},
             // Detached: on_complete is a no-op, so no completion entry is
             // ever produced for this task.
             |_, _, _| {},
@@ -788,6 +926,8 @@ impl BackgroundTasks {
         sandbox: Option<crate::config::Sandbox>,
         owner_session: Option<String>,
         stall_sender: Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
+        foreground_result: Option<ForegroundResult>,
+        on_id: impl FnOnce(u64) + Send + 'static,
         on_complete: impl FnOnce(u64, String, BackgroundTrace) + Send + 'static,
     ) -> Result<String, String> {
         let shell = Shell::detect()?;
@@ -806,7 +946,13 @@ impl BackgroundTasks {
         let slot = output.clone();
         let full = spool.clone();
         let command_for_detail = command.clone();
-        let timeout = self.timeout;
+        // Adoption currently does not arm the background timeout retroactively.
+        let timeout = if foreground_result.is_some() {
+            None
+        } else {
+            self.timeout
+        };
+
         let running = self.registry.clone();
         let running_for_id = running.clone();
         let task_id_for_monitor = task_id.clone();
@@ -823,7 +969,9 @@ impl BackgroundTasks {
             owner_session,
             exit_slot.clone(),
             None,
+            foreground_result.is_none(),
             move |id| {
+                on_id(id);
                 task_id.store(id, Ordering::Release);
                 let mut running = running_for_id.running.lock().unwrap();
                 if let Some(task) = running.iter_mut().find(|task| task.id == id) {
@@ -867,6 +1015,9 @@ impl BackgroundTasks {
                 } else {
                     run.await
                 };
+                if let Some(result_slot) = foreground_result {
+                    *result_slot.lock().unwrap() = Some(result.clone());
+                }
                 match result {
                     Ok(output) => output,
                     Err(output) => {
@@ -996,6 +1147,7 @@ impl BackgroundTasks {
             None,
             exit_slot,
             cancel_target,
+            true,
             on_id,
             work,
             move |id, output, trace| {
@@ -1054,6 +1206,7 @@ impl BackgroundTasks {
         owner_session: Option<String>,
         exit_slot: ExitSlot,
         cancel_target: Option<tokio::task::AbortHandle>,
+        visible: bool,
         on_id: impl FnOnce(u64),
         work: F,
         on_complete: impl FnOnce(u64, String, BackgroundTrace) + Send + 'static,
@@ -1111,6 +1264,7 @@ impl BackgroundTasks {
         self.registry.running.lock().unwrap().push(RunningTask {
             id,
             label,
+            visible,
             full_command: None,
             role,
             process_group: process_group.unwrap_or_else(|| Arc::new(AtomicI32::new(0))),

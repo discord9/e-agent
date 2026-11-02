@@ -245,20 +245,29 @@ impl Tool for Bash {
                     ToolOutput::text(format!("{receipt}\n{DO_NOT_WAIT_LINE}"))
                 });
         }
-        run_bash(
-            &self.shell,
-            &self.workspace,
-            command,
-            self.timeout,
-            self.protect_git,
-            None,
-            None,
-            None,
-            self.sandbox.as_ref(),
-            None,
-        )
-        .await
-        .map(ToolOutput::text)
+        let threshold = self.timeout;
+        match self
+            .background
+            .run_foreground_or_adopt(
+                self.workspace.clone(),
+                command.to_owned(),
+                self.protect_git,
+                self.sender.clone(),
+                self.sandbox.clone(),
+                self.owner_session.clone(),
+                title,
+                threshold,
+            )
+            .await?
+        {
+            super::background::ForegroundOutcome::Done(result) => result.map(ToolOutput::text),
+            super::background::ForegroundOutcome::Adopted(receipt) => {
+                let seconds = threshold.map(|value| value.as_secs()).unwrap_or_default();
+                Ok(ToolOutput::text(format!(
+                    "{receipt}\n{DO_NOT_WAIT_LINE}\nThe command exceeded the {seconds}s foreground threshold and is now running in the background."
+                )))
+            }
+        }
     }
 
     fn set_event_sender(&mut self, sender: tokio::sync::mpsc::UnboundedSender<AgentEvent>) {
@@ -1367,6 +1376,7 @@ pub(super) fn wrap_bash_command(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(super) async fn run_bash(
     shell: &Shell,
     workspace: &Workspace,
@@ -1414,6 +1424,8 @@ pub(super) async fn run_bash_with_stall_state(
 ) -> Result<String, String> {
     #[cfg(windows)]
     if let Some(policy) = sandbox {
+        // Sandboxed Windows execution retains kill-on-timeout; auto-adoption is
+        // intentionally deferred there, so the shared threshold is not cross-platform.
         return super::windows_sandbox::run(
             shell,
             workspace,

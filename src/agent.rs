@@ -2102,7 +2102,6 @@ impl Agent {
     ) -> Result<(), String> {
         if result.is_ok()
             && (call.name == "bash" || call.name == "pwsh")
-            && is_background_call(call)
             && !is_detached_background_call(call)
             && let Some(id) = started_task_id(
                 result
@@ -2473,13 +2472,6 @@ impl Agent {
     fn drain_background(&mut self) {
         self.drain_background_ready();
     }
-}
-
-fn is_background_call(call: &ToolCall) -> bool {
-    serde_json::from_str::<Value>(&call.arguments)
-        .ok()
-        .and_then(|value| value.get("background").and_then(Value::as_bool))
-        .unwrap_or(false)
 }
 
 fn is_detached_background_call(call: &ToolCall) -> bool {
