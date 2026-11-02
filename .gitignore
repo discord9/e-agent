@@ -6,3 +6,6 @@ vox_vitae_toolkit
 /.svtmp/
 /.e2e-run/
 /package-lock.json
+
+# Local scratch (agent artifacts); keep ignored like .e-agent/
+/tmp/
