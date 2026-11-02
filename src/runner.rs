@@ -815,6 +815,7 @@ pub struct SessionRunner {
     shared: Arc<Mutex<Shared>>,
     background: Option<crate::tools::BackgroundTasks>,
     projected_background: Option<Vec<crate::session_store::ProjectedBackgroundTask>>,
+    bootstrap_projection_pending: bool,
     commands: mpsc::UnboundedReceiver<SessionCommand>,
     pending: VecDeque<PendingCommand>,
     pending_web_attaches: Vec<oneshot::Sender<WebAttach>>,
@@ -927,12 +928,25 @@ impl SessionRunner {
         mut self,
         background: crate::tools::BackgroundTasks,
     ) -> Self {
+        self.bootstrap_projection_pending = false;
         self.background = Some(background);
         self
     }
 
     async fn sync_background_projection(&mut self) {
         let Some(background) = self.background.clone() else {
+            if self.bootstrap_projection_pending {
+                let rows = Vec::new();
+                match self
+                    .store
+                    .project_background_tasks(&self.root, &self.session, &rows)
+                    .await
+                {
+                    Ok(()) => self.projected_background = Some(rows),
+                    Err(error) => tracing::warn!("cannot project background tasks: {error:#}"),
+                }
+                self.bootstrap_projection_pending = false;
+            }
             return;
         };
         let live: HashSet<u64> = self
@@ -1048,6 +1062,7 @@ impl SessionRunner {
                 shared,
                 background: None,
                 projected_background: None,
+                bootstrap_projection_pending: true,
                 commands,
                 pending: VecDeque::new(),
                 pending_web_attaches: Vec::new(),
@@ -1119,14 +1134,24 @@ impl SessionRunner {
             // This notice was created during this recovery and is now durable,
             // unlike replayed historical entries. Give it one normal request.
             self.pending_regular_reaction = true;
-            self.store
+            self.sync_background_projection().await;
+            if let Err(error) = self
+                .store
                 .consume_unfinished_background(&self.root, &self.session, &bootstrap.recovery_tasks)
-                .await?;
+                .await
+            {
+                tracing::warn!("cannot consume unfinished background tasks: {error:#}");
+            }
         }
         Ok(())
     }
 
     pub fn start(mut self, initial_prompt: Option<String>) -> SessionTask {
+        // A plain `new()` runner has no bootstrap reconciliation to perform.
+        // Keep later projection hooks inert when its background registry is absent.
+        if self.bootstrap.is_none() {
+            self.bootstrap_projection_pending = false;
+        }
         if let Some(prompt) = initial_prompt {
             self.pending.push_back(PendingCommand::Prompt {
                 text: prompt,

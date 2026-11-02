@@ -985,22 +985,12 @@ before finalizing. Each completion is injected and acknowledged, allowing the
 model to continue in a follow-up turn. Detached tasks do not block finalization
 and may outlive the session.
 
-The durable `running_tasks` table is a projection of the live in-memory tasks,
-not an execution ledger: it lists exactly the non-detached background bash and
-delegate/btw tasks that the session currently owns, updated at lifecycle
-boundaries (tool start, task completion, child teardown) and while the session
-idles. Detached tasks are excluded — they may outlive the session. On restart,
-leftover rows are reported as killed with the process and then consumed.
-Projection failures are logged and retried; they never abort a task or end the
-session. There is one live writer per session plus one terminal write: when a
-child runner has already been joined or aborted, its teardown projects that
-child session empty so an explicit cancellation is not later reported as a
-crash. A failure of that terminal write is logged but cannot be retried once
-the runner is gone; it degrades to exactly the crash observable (a leftover row
-reported as killed). The projection carries no cross-process lease, so running
-the same session live in two processes at once is unsupported: a second resume
-would read the first process's live rows as leftover killed tasks, and the two
-projections would overwrite each other's distinct task rows.
+The durable background-task table is a live view of the tasks this session
+still owns, not an execution history. Detached tasks are excluded. After a
+restart, leftover rows are reported as killed with the process and then cleared.
+Running the same session in two processes at once can cause false killed reports
+and overwrite task records. If cleanup after cancellation fails, that task may
+be reported as killed on the next restart.
 
 ## Subagents
 
