@@ -1607,14 +1607,27 @@ async fn session_model(
         ));
     }
     let effort = match body.effort.as_deref() {
-        None | Some("default") => body.effort.as_deref().map(|_| EffortOverride::Default),
-        Some("omit") => Some(EffortOverride::Omit),
-        Some(value) if !value.trim().is_empty() => Some(EffortOverride::Literal(value.to_string())),
-        _ => {
-            return Err(error(
-                StatusCode::BAD_REQUEST,
-                "effort must be a non-empty token",
-            ));
+        None => None,
+        Some(value) => {
+            let trimmed = value.trim();
+            let mut tokens = trimmed.split_whitespace();
+            let Some(token) = tokens.next() else {
+                return Err(error(
+                    StatusCode::BAD_REQUEST,
+                    "effort must be a non-empty token",
+                ));
+            };
+            if tokens.next().is_some() || token != trimmed {
+                return Err(error(
+                    StatusCode::BAD_REQUEST,
+                    "effort must be exactly one whitespace-delimited token",
+                ));
+            }
+            match token {
+                "default" => Some(EffortOverride::Default),
+                "omit" => Some(EffortOverride::Omit),
+                value => Some(EffortOverride::Literal(value.to_string())),
+            }
         }
     };
     let (configured, context_window) =

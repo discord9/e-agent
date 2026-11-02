@@ -892,14 +892,17 @@ fn parse_model(prompt: &str) -> Option<ModelCommand> {
     }
     let mut tokens = rest.split_whitespace();
     let profile = tokens.next()?;
-    let effort = match tokens.next() {
+    let effort_token = tokens.next();
+    if tokens.next().is_some() {
+        return Some(ModelCommand::Invalid);
+    }
+    let effort = match effort_token {
         None => None,
         Some("default") => Some(crate::session_factory::EffortOverride::Default),
         Some("omit") => Some(crate::session_factory::EffortOverride::Omit),
-        Some(value) if tokens.next().is_none() => Some(
-            crate::session_factory::EffortOverride::Literal(value.to_string()),
-        ),
-        _ => return Some(ModelCommand::Invalid),
+        Some(value) => Some(crate::session_factory::EffortOverride::Literal(
+            value.to_string(),
+        )),
     };
     Some(ModelCommand::Switch(profile.to_string(), effort))
 }
@@ -914,25 +917,27 @@ fn handle_model(command: ModelCommand, state: &mut TuiState, handle: &RunnerHand
     match command {
         ModelCommand::Usage => {
             let current = state.model_name.clone();
+            let profile_effort = state.model.as_ref().and_then(|model| match &model.kind {
+                crate::model::ConfiguredModelKind::Chat(m) => m.reasoning_effort.as_deref(),
+                crate::model::ConfiguredModelKind::Codex(m) => m.reasoning_effort.as_deref(),
+            });
+            let effort = match state.effort_override.as_ref() {
+                Some(crate::session_factory::EffortOverride::Omit) => {
+                    "（omit：不发送 effort）".to_string()
+                }
+                Some(crate::session_factory::EffortOverride::Literal(value)) => {
+                    format!("{value}（覆盖）")
+                }
+                Some(crate::session_factory::EffortOverride::Default) | None => profile_effort
+                    .map_or_else(
+                        || "（配置未配置）".to_string(),
+                        |value| format!("{value}（配置默认）"),
+                    ),
+            };
             push_display(
                 state,
                 format!(
-                    "当前模型：{current}；effort={}{}。用法：/model <profile> [effort|default|omit]",
-                    state
-                        .model
-                        .as_ref()
-                        .and_then(|model| match &model.kind {
-                            crate::model::ConfiguredModelKind::Chat(m) =>
-                                m.reasoning_effort.as_deref(),
-                            crate::model::ConfiguredModelKind::Codex(m) =>
-                                m.reasoning_effort.as_deref(),
-                        })
-                        .unwrap_or("none"),
-                    if state.effort_override.is_some() {
-                        " (override)"
-                    } else {
-                        " (profile default)"
-                    }
+                    "当前模型：{current}；effort={effort}。用法：/model <profile> [effort|default|omit]"
                 ),
             );
         }
@@ -954,7 +959,9 @@ fn handle_model(command: ModelCommand, state: &mut TuiState, handle: &RunnerHand
                     state.model_name = name.clone();
                     state.model = Some(configured.clone());
                     state.context_window = context_window;
-                    state.effort_override = effort;
+                    state.effort_override = effort.filter(|value| {
+                        !matches!(value, crate::session_factory::EffortOverride::Default)
+                    });
                     handle.switch_model(Box::new(configured), context_window);
                     push_display(state, format!("已切换到 {name}"));
                 }
@@ -1387,10 +1394,17 @@ mod model_tests {
                 Some(EffortOverride::Default)
             ))
         );
-        assert_eq!(
-            parse_model("/model p medium extra"),
-            Some(ModelCommand::Invalid)
-        );
+        for invalid in [
+            "/model p medium extra",
+            "/model p omit extra",
+            "/model p default extra",
+        ] {
+            assert_eq!(
+                parse_model(invalid),
+                Some(ModelCommand::Invalid),
+                "{invalid}"
+            );
+        }
         let first = parse_model("/model a medium");
         let second = parse_model("/model b");
         assert_eq!(
