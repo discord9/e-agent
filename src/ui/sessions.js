@@ -1134,6 +1134,8 @@ function openSession(id, onReady, epoch, timeoutMs) {
     }
   }
   renderChatSessionId(id);
+  // Show this session's tasks immediately instead of waiting for the next tick.
+  void pollTasks({ liveOnly: true });
   updateComposerMeta();          // 显示当前会话 model · role（缓存/首开/恢复共用）
   els.usageInfo.textContent = "";
   applyStatus("Idle");
@@ -2036,6 +2038,8 @@ function pollRound() {
   // tick independently: per-workspace gates share that peer's request while
   // healthy workspaces make their next refresh on time.
   void runPollRound();
+  // Orbit dots and the task panel read the task snapshot, which has no timer of its own.
+  void pollTasks({ liveOnly: true });
   if (gen === state.pollGen && state.pollTimer === null && shouldPollSessions()) {
     state.pollTimer = setTimeout(pollRound, POLL_INTERVAL_MS);
   }
