@@ -65,10 +65,10 @@ function applyValidation(problems) {
    按失败处理（保留旧列表 stale，标记 workspaceErrors）。 */
 const POLL_TIMEOUT_MS = 30000;
 
-/* 会话列表端点：每个 workspace 身份的第一次请求拉完整列表（分组表头 +
-   展开数据），此后每 2s 的轮询只取侧边栏默认可见子集（服务端过滤归档 +
-   inactive 子会话）；展开「归档」/「历史子会话」/「更早的会话」且缓存缺
-   数据时由 ensureFullSessions 按需补拉完整列表。 */
+/* 会话列表端点：轮询始终请求侧边栏窗口（mode=sidebar），响应自带分组
+   计数，因此首屏不再拉完整列表；展开「归档」/「历史子会话」/「更早的
+   会话」、搜索或显示全部时，才由 ensureFullSessions 按需补拉完整列表。
+   完整列表是权威基线：它会替换可见缓存，而窗口只刷新已有基线。 */
 const SESSIONS_PATH = "/api/sessions";
 const SESSIONS_POLL_PATH = SESSIONS_PATH + "?mode=sidebar";
 
