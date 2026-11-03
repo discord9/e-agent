@@ -1920,8 +1920,186 @@ async fn unsandboxed_background_shell_dies_with_parent() {
 }
 
 #[cfg(unix)]
+fn write_shell_wrapper(path: &Path, body: &str) -> Shell {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut shell = Shell::detect().unwrap();
+    shell.executable = path.to_string_lossy().into_owned();
+    shell
+}
+
+#[cfg(target_os = "linux")]
+fn process_stat(pid: u32) -> Option<(u8, u64)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields = stat
+        .rsplit_once(") ")?
+        .1
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    Some((fields[0].as_bytes()[0], fields[19].parse().ok()?))
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_for_original_process_gone(pid: u32, starttime: u64) {
+    while process_stat(pid).is_some_and(|(state, started)| state != b'Z' && starttime == started) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+async fn wait_for_original_process_gone(pid: u32, _starttime: u64) {
+    loop {
+        let status = std::process::Command::new("/bin/kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .status()
+            .expect("failed to check child pid");
+        if !status.success() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[cfg(unix)]
 #[tokio::test]
-async fn bash_timeout_kills_its_background_process_group() {
+async fn dropping_foreground_waiter_cancels_registered_command() {
+    let temp = tempfile::tempdir().unwrap();
+    let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+    let background = BackgroundTasks::new(None, None);
+    let pid_file = temp.path().join("child.pid");
+    let wrapper = write_shell_wrapper(
+        &temp.path().join("pid-shell"),
+        &format!(
+            "/bin/bash \"$@\" & echo $! > '{0}.tmp' && mv '{0}.tmp' '{0}' ; wait",
+            pid_file.display()
+        ),
+    );
+    let tool = Bash {
+        workspace: Workspace::new(temp.path()).unwrap(),
+        timeout: None,
+        sender: Some(sender),
+        background: background.clone(),
+        sandbox: None,
+        protect_git: false,
+        shell: wrapper,
+        owner_session: None,
+    };
+    let task = tokio::spawn(async move { tool.execute(json!({"command":"sleep 30"})).await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while background.all_running_ids().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("command was not registered");
+    wait_for_path(&pid_file).await;
+    let pid: u32 = std::fs::read_to_string(&pid_file)
+        .expect("wrapper did not publish child pid")
+        .trim()
+        .parse()
+        .expect("child pid was not numeric");
+    #[cfg(target_os = "linux")]
+    let starttime = process_stat(pid)
+        .expect("child process stat was not available")
+        .1;
+    #[cfg(all(unix, not(target_os = "linux")))]
+    let starttime = 0;
+    task.abort();
+    let _ = task.await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !background.all_running_ids().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("dropping the foreground waiter left its command running");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        wait_for_original_process_gone(pid, starttime),
+    )
+    .await
+    .expect("foreground process survived dropped waiter");
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("completion channel stayed open after cancellation")
+            .is_none(),
+        "dropped foreground task emitted completion"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn foreground_cancel_before_threshold_returns_error_without_event() {
+    let temp = tempfile::tempdir().unwrap();
+    let shell = Shell::detect().unwrap();
+    let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+    let background = BackgroundTasks::new(None, None);
+    let tool = Bash {
+        workspace: Workspace::new(temp.path()).unwrap(),
+        timeout: Some(Duration::from_secs(60)),
+        sender: Some(sender),
+        background: background.clone(),
+        sandbox: None,
+        protect_git: false,
+        shell,
+        owner_session: None,
+    };
+    let task = tokio::spawn(async move { tool.execute(json!({"command":"sleep 5"})).await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while background.all_running_ids().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // The fresh registry allocates id 1; cancellation intentionally accepts hidden entries by id.
+    let id = background.all_running_ids()[0];
+    background
+        .cancel_with_source(id, crate::agent::CancellationSource::User)
+        .unwrap();
+    let error = task.await.unwrap().unwrap_err();
+    assert!(error.contains("background task cancelled"), "{error}");
+    assert!(events.try_recv().is_err());
+    assert!(background.running().is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn foreground_without_threshold_waits_for_command_result() {
+    let temp = tempfile::tempdir().unwrap();
+    let wrapper = temp.path().join("delayed-shell");
+    let shell = write_shell_wrapper(&wrapper, "/bin/sleep 1.1; exec /bin/bash \"$@\"");
+    let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+    let background = BackgroundTasks::new(None, None);
+    let tool = Bash {
+        workspace: Workspace::new(temp.path()).unwrap(),
+        timeout: None,
+        sender: Some(sender),
+        background: background.clone(),
+        sandbox: None,
+        protect_git: false,
+        shell,
+        owner_session: None,
+    };
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        tool.execute(json!({"command":"printf finished"})),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(result.content.contains("finished"));
+    assert!(!result.content.contains("foreground threshold"));
+    assert!(events.try_recv().is_err());
+    assert!(background.running().is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn foreground_adoption_then_cancel_kills_its_process_group() {
     let temp = tempfile::tempdir().unwrap();
     let pid_file = temp.path().join("child.pid");
     // Exercise 300 ms of shell startup latency without host-wide load.
@@ -1936,22 +2114,30 @@ async fn bash_timeout_kills_its_background_process_group() {
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
     let mut shell = Shell::detect().unwrap();
     shell.executable = wrapper.to_string_lossy().into_owned();
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     let tool = Bash {
         workspace: Workspace::new(temp.path()).unwrap(),
         timeout: Some(Duration::from_secs(1)),
-        sender: None,
+        sender: Some(sender.clone()),
         background: BackgroundTasks::new(Some(Duration::from_secs(30 * 60)), None),
         sandbox: None,
         protect_git: false,
         shell,
         owner_session: None,
     };
+    let outcome = tool
+        .execute(json!({"command": "sleep 30 & echo $! > child.pid; wait"}))
+        .await
+        .unwrap();
+    assert!(outcome.content.contains("foreground threshold"));
+    let task_id = 1;
     assert!(
-        tool.execute(json!({"command": "sleep 30 & echo $! > child.pid; wait"}))
-            .await
-            .unwrap_err()
-            .contains("timed out")
+        tool.background
+            .cancel_with_source(task_id, crate::agent::CancellationSource::User)
+            .is_some()
     );
+    let event = receiver.recv().await.unwrap();
+    assert!(matches!(event, AgentEvent::BackgroundCompleted { .. }));
     let pid = std::fs::read_to_string(pid_file).unwrap();
     let pid = pid.trim().parse::<u32>().expect("child PID is numeric");
     assert!(pid > 0, "child PID must be nonzero");
@@ -1961,7 +2147,10 @@ async fn bash_timeout_kills_its_background_process_group() {
         .arg(pid.to_string())
         .status()
         .unwrap();
-    assert!(!status.success(), "background child survived timeout");
+    assert!(
+        !status.success(),
+        "adopted command child survived explicit cancellation"
+    );
 }
 
 #[test]
@@ -2413,6 +2602,157 @@ async fn background_bash_uses_the_facade_sandbox_not_the_registry_one() {
         !temp.path().join("escape.txt").exists(),
         "background bash escaped the facade's read-only sandbox; output: {output}"
     );
+}
+
+#[tokio::test]
+async fn foreground_or_adopt_fast_command_returns_result_without_completion_event() {
+    let temp = tempfile::tempdir().unwrap();
+    let (bash, mut receiver) = background_bash(&temp, Duration::from_secs(10));
+    let result = bash
+        .execute(json!({"command": "printf fast"}))
+        .await
+        .unwrap();
+    assert!(result.content.contains("stdout:\nfast\n"));
+    assert!(receiver.try_recv().is_err());
+    assert!(bash.background.running().is_empty());
+}
+
+#[tokio::test]
+async fn foreground_zero_threshold_adopts_immediately_and_delivers_output_once() {
+    // Completion wins with a nonzero real threshold in foreground_or_adopt_fast_command_returns_result_without_completion_event;
+    // at zero, timeout necessarily beats shell startup, so adoption must win.
+    let temp = tempfile::tempdir().unwrap();
+    let wrapper = temp.path().join("zero-threshold-shell");
+    let shell = write_shell_wrapper(
+        &wrapper,
+        "printf fast; /bin/sleep 0.1; exec /bin/bash \"$@\"",
+    );
+    let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+    let background = BackgroundTasks::new(None, None);
+    let task = Bash {
+        workspace: Workspace::new(temp.path()).unwrap(),
+        timeout: Some(Duration::ZERO),
+        sender: Some(sender),
+        background: background.clone(),
+        sandbox: None,
+        protect_git: false,
+        shell,
+        owner_session: None,
+    };
+    let receipt = task
+        .execute(json!({"command":"ignored"}))
+        .await
+        .unwrap()
+        .content;
+    assert!(receipt.contains(DO_NOT_WAIT_LINE));
+    assert!(receipt.contains("foreground threshold"));
+    let AgentEvent::BackgroundCompleted { output, .. } =
+        tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    else {
+        panic!("expected completion")
+    };
+    assert!(output.contains("fast"), "{output}");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), events.recv())
+            .await
+            .is_err()
+    );
+    assert!(background.running().is_empty());
+}
+
+#[cfg(unix)]
+async fn wait_for_path(path: &Path) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !path.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("command did not reach its synchronization point");
+}
+
+#[cfg(unix)]
+fn gated_command(temp: &tempfile::TempDir) -> String {
+    format!(
+        "printf before; touch '{}'; while [ ! -f '{}' ]; do :; done; printf after",
+        temp.path().join("ready").display(),
+        temp.path().join("gate").display()
+    )
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn foreground_zero_threshold_parking_command_is_adopted_once_with_output() {
+    let temp = tempfile::tempdir().unwrap();
+    let shell = write_shell_wrapper(
+        &temp.path().join("zero-park-shell"),
+        "echo before; /bin/sleep 1; printf before; exec /bin/bash \"$@\"",
+    );
+    let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+    let background = BackgroundTasks::new(None, None);
+    let task = Bash {
+        workspace: Workspace::new(temp.path()).unwrap(),
+        timeout: Some(Duration::ZERO),
+        sender: Some(sender),
+        background: background.clone(),
+        sandbox: None,
+        protect_git: false,
+        shell,
+        owner_session: None,
+    };
+    let receipt = task
+        .execute(json!({"command":"printf after"}))
+        .await
+        .unwrap()
+        .content;
+    assert!(receipt.contains(DO_NOT_WAIT_LINE));
+    assert!(receipt.contains("foreground threshold"));
+    let AgentEvent::BackgroundCompleted { output, .. } =
+        tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    else {
+        panic!("expected completion")
+    };
+    assert!(output.contains("before"), "{output}");
+    assert!(output.contains("after"), "{output}");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), events.recv())
+            .await
+            .is_err()
+    );
+    assert!(background.running().is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn foreground_adoption_keeps_process_output_and_exposes_task() {
+    let temp = tempfile::tempdir().unwrap();
+    let (bash, mut receiver) = background_bash(&temp, Duration::from_secs(30));
+    let background = bash.background.clone();
+    let mut bash = bash;
+    bash.timeout = Some(Duration::from_secs(5));
+    let command = gated_command(&temp);
+    let running = tokio::spawn(async move { bash.execute(json!({"command": command})).await });
+    wait_for_path(&temp.path().join("ready")).await;
+    assert!(background.running().is_empty());
+    let receipt = running.await.unwrap().unwrap().content;
+    assert!(receipt.contains(DO_NOT_WAIT_LINE));
+    assert!(receipt.contains("foreground threshold"));
+    let task = background.running();
+    assert_eq!(task.len(), 1);
+    std::fs::write(temp.path().join("gate"), "").unwrap();
+    let event = receiver.recv().await.unwrap();
+    let AgentEvent::BackgroundCompleted { output, .. } = event else {
+        panic!("expected completion")
+    };
+    assert!(output.contains("before"), "{output}");
+    assert!(output.contains("after"), "{output}");
+    assert!(receiver.try_recv().is_err());
 }
 
 fn background_bash(
@@ -4570,7 +4910,7 @@ async fn background_title_labels_task_but_keeps_full_command() {
 }
 
 #[tokio::test]
-async fn background_title_blank_falls_back_and_foreground_is_ignored() {
+async fn background_title_blank_falls_back_and_fast_foreground_is_not_listed() {
     let temp = tempfile::tempdir().unwrap();
     let (bash, mut receiver) = background_bash(&temp, Duration::from_secs(10));
 
@@ -4587,6 +4927,7 @@ async fn background_title_blank_falls_back_and_foreground_is_ignored() {
             .content
             .contains("foreground")
     );
+    assert!(bash.background.running().is_empty());
 
     // An omitted or blank title keeps the legacy command-preview label.
     let started = bash
@@ -4594,16 +4935,41 @@ async fn background_title_blank_falls_back_and_foreground_is_ignored() {
         .await
         .unwrap()
         .content;
-    assert!(started.starts_with("started background task 1: sleep 30\n"));
+    assert!(started.starts_with("started background task 2: sleep 30\n"));
     assert!(started.ends_with(DO_NOT_WAIT_LINE), "{started}");
     assert_eq!(bash.background.running()[0].label, "sleep 30");
     assert_eq!(
         bash.background
-            .cancel_with_source(1, crate::agent::CancellationSource::System)
+            .cancel_with_source(2, crate::agent::CancellationSource::System)
             .as_deref(),
         Some("sleep 30")
     );
     let _ = tokio::time::timeout(Duration::from_secs(5), receiver.recv()).await;
+}
+
+#[tokio::test]
+async fn explicit_background_and_detached_modes_keep_delivery_contracts() {
+    let temp = tempfile::tempdir().unwrap();
+    let (bash, mut events) = background_bash(&temp, Duration::from_secs(30));
+    let receipt = bash
+        .execute(json!({"command":"printf bg", "background":true}))
+        .await
+        .unwrap()
+        .content;
+    assert!(receipt.starts_with("started background task 1:"));
+    assert!(events.recv().await.is_some());
+    assert!(events.try_recv().is_err());
+    let detached = bash
+        .execute(json!({"command":"printf detached", "background":true, "detached":true}))
+        .await
+        .unwrap()
+        .content;
+    assert!(detached.starts_with("started background task 2:"));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), events.recv())
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -5287,6 +5653,7 @@ async fn panicking_on_id_removes_registration_without_work_or_completion() {
             None, // owner_session：测试不关心发起者
             new_exit_slot(),
             None,
+            true,
             |_| panic!("controlled on_id panic"),
             move || async move {
                 work_runs_in_task.fetch_add(1, Ordering::SeqCst);
@@ -5335,6 +5702,7 @@ async fn cancel_during_on_id_suppresses_work_and_completion() {
             None, // owner_session：测试不关心发起者
             crate::tools::new_exit_slot(),
             None,
+            true,
             move |_| {
                 spawn_entered.wait();
                 spawn_release.wait();
@@ -6064,6 +6432,7 @@ async fn first_cancel_source_latches_for_live_wrapper() {
             None,
             exit_slot,
             Some(target.abort_handle()),
+            true,
             |_| {},
             move || async move {
                 let _ = release_rx.await;
@@ -6141,6 +6510,7 @@ async fn cancel_overrides_stale_completed_trace_with_killed() {
             None,
             exit_slot,
             None,
+            true,
             |_| {},
             move || async move {
                 *slot_for_work.lock().unwrap() = TaskExit {

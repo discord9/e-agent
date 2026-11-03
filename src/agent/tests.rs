@@ -30,6 +30,22 @@ impl Model for ScriptedModel {
     }
 }
 
+struct ReceiptTool;
+
+#[async_trait]
+impl Tool for ReceiptTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "bash".into(),
+            description: "receipt test".into(),
+            parameters: json!({"type":"object"}),
+        }
+    }
+    async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
+        Ok(ToolOutput::text("started background task 7: x"))
+    }
+}
+
 struct EchoTool;
 
 #[async_trait]
@@ -310,6 +326,38 @@ fn call(id: &str, name: &str, arguments: &str) -> ToolCall {
         name: name.into(),
         arguments: arguments.into(),
     }
+}
+
+#[tokio::test]
+async fn receipt_without_background_argument_registers_blocking_task_and_detached_is_excluded() {
+    let model = ScriptedModel {
+        replies: vec![AssistantMessage {
+            content: None,
+            tool_calls: vec![call("a", "bash", r#"{"command":"x"}"#)],
+            reasoning: None,
+        }],
+        requests: Arc::new(Mutex::new(Vec::new())),
+        delays: Default::default(),
+    };
+    let mut agent = Agent::new(Box::new(model), vec![Box::new(ReceiptTool)]);
+    // Directly exercise the tool-result hook so no second model reply is needed.
+    let receipt = Ok(ToolOutput::text("started background task 7: x"));
+    agent
+        .after_tool_entry(&call("a", "bash", r#"{"command":"x"}"#), &receipt)
+        .await
+        .unwrap();
+    assert!(agent.background_task_ids().contains(&7));
+    assert!(agent.has_blocking_background());
+    agent
+        .after_tool_entry(
+            &call("b", "bash", r#"{"background":true,"detached":true}"#),
+            &Ok(ToolOutput::text("started background task 8: detached")),
+        )
+        .await
+        .unwrap();
+    assert_eq!(agent.background_task_ids().len(), 1);
+    assert!(agent.background_task_ids().contains(&7));
+    assert!(!agent.background_task_ids().contains(&8));
 }
 
 #[test]

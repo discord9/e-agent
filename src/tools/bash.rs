@@ -29,8 +29,10 @@ use super::background::{BackgroundTasks, ExitSlot, OutputSlot, TaskExit, TaskSpo
 /// subagents/fixers. It comes from the role's frontmatter (default true; a
 /// role declares `protect_git = false` to opt out). The Windows write-sandbox
 /// MVP rejects this mode.
-/// `timeout`: foreground command timeout; `None` means no timeout.
-/// Callers resolve it from config (`[bash]`), defaulting to 30s.
+/// `timeout`: foreground residence threshold; a command still running after
+/// it is adopted into the background. `None` means no threshold (run to
+/// completion). Callers resolve it from config (`[bash]`), defaulting to 30s.
+/// Sandboxed Windows retains kill-on-timeout instead of adopting.
 pub fn bash_tool(
     workspace: Workspace,
     background: BackgroundTasks,
@@ -71,7 +73,8 @@ fn optional_background_title(arguments: &Value) -> Result<Option<String>, String
 
 pub(super) struct Bash {
     pub(super) workspace: Workspace,
-    /// Foreground command timeout; `None` = no timeout (runs until done).
+    /// Foreground residence threshold; `None` = no threshold (runs until done).
+    /// Sandboxed Windows ignores adoption and keeps killing at this deadline.
     pub(super) timeout: Option<Duration>,
     pub(super) background: BackgroundTasks,
     /// Completion delivery belongs to this bash facade's Agent, not the
@@ -245,20 +248,47 @@ impl Tool for Bash {
                     ToolOutput::text(format!("{receipt}\n{DO_NOT_WAIT_LINE}"))
                 });
         }
-        run_bash(
-            &self.shell,
-            &self.workspace,
-            command,
-            self.timeout,
-            self.protect_git,
-            None,
-            None,
-            None,
-            self.sandbox.as_ref(),
-            None,
-        )
-        .await
-        .map(ToolOutput::text)
+        let threshold = self.timeout;
+        #[cfg(windows)]
+        if self.sandbox.is_some() {
+            return run_bash(
+                &self.shell,
+                &self.workspace,
+                command,
+                self.timeout,
+                self.protect_git,
+                None,
+                None,
+                None,
+                self.sandbox.as_ref(),
+                None,
+            )
+            .await
+            .map(ToolOutput::text);
+        }
+        match self
+            .background
+            .run_foreground_or_adopt(
+                self.workspace.clone(),
+                command.to_owned(),
+                self.protect_git,
+                self.sender.clone(),
+                self.sandbox.clone(),
+                self.owner_session.clone(),
+                title,
+                threshold,
+                self.shell.clone(),
+            )
+            .await?
+        {
+            super::background::ForegroundOutcome::Done(result) => result.map(ToolOutput::text),
+            super::background::ForegroundOutcome::Adopted(receipt) => {
+                let seconds = threshold.map(|value| value.as_secs()).unwrap_or_default();
+                Ok(ToolOutput::text(format!(
+                    "{receipt}\n{DO_NOT_WAIT_LINE}\nThe command exceeded the {seconds}s foreground threshold and is now running in the background."
+                )))
+            }
+        }
     }
 
     fn set_event_sender(&mut self, sender: tokio::sync::mpsc::UnboundedSender<AgentEvent>) {
@@ -1367,6 +1397,7 @@ pub(super) fn wrap_bash_command(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(any(test, windows))]
 pub(super) async fn run_bash(
     shell: &Shell,
     workspace: &Workspace,
@@ -1414,6 +1445,8 @@ pub(super) async fn run_bash_with_stall_state(
 ) -> Result<String, String> {
     #[cfg(windows)]
     if let Some(policy) = sandbox {
+        // Sandboxed Windows execution retains kill-on-timeout; auto-adoption is
+        // intentionally deferred there, so the shared threshold is not cross-platform.
         return super::windows_sandbox::run(
             shell,
             workspace,
