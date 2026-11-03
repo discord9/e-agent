@@ -217,13 +217,15 @@ function workspaceSnapshotFor(ws) {
 }
 
 function updateWorkspaceVisibleList(ws) {
+  const key = workspaceIdentityKey(ws, workspaceToken(ws));
   const snapshot = workspaceSnapshotFor(ws);
-  const details = workspaceDetailLists.get(workspaceIdentityKey(ws, workspaceToken(ws))) || [];
+  const baseline = workspaceDetailLists.get(key);
   const windowRows = snapshot ? snapshot.sessions : [];
   const previous = workspaceListFor(ws);
-  const list = snapshot && snapshot.partial
-    ? mergePolledSessions(mergePolledSessions(previous, details), windowRows)
-    : (snapshot ? windowRows : mergePolledSessions(details, windowRows));
+  // An authoritative list replaces; a window only ever refreshes whatever baseline exists, or the observed rows when there is none.
+  const list = baseline !== undefined
+    ? mergePolledSessions(baseline, windowRows)
+    : mergePolledSessions(previous, windowRows);
   state.workspaceLists[ws.id] = list;
   if (ws === state.workspace) state.lastList = list;
 }
@@ -258,7 +260,9 @@ async function pollWorkspaceSessionsNow(ws, identity) {
       };
       workspaceSidebarSnapshots.set(fullKey, snapshot);
       if (snapshot.partial) {
-        list = mergePolledSessions(state.workspaceLists[ws.id] || [], snapshot.sessions);
+        const baseline = workspaceDetailLists.get(fullKey);
+        const observed = baseline !== undefined ? baseline : (state.workspaceLists[ws.id] || []);
+        list = mergePolledSessions(observed, snapshot.sessions);
       } else {
         list = snapshot.sessions;
         workspaceDetailLists.set(fullKey, list);
@@ -386,7 +390,8 @@ async function fetchAllSessionsNow(ws, identity) {
   workspaceDetailErrors.delete(key);
   workspaceDetailLists.set(key, full);
   workspaceDetailsLoaded.add(key);
-  updateWorkspaceVisibleList(ws); // details stay separate; snapshot remains windowed
+  state.workspaceLists[ws.id] = full;
+  if (ws === state.workspace) state.lastList = full;
   renderSidebarTree(true);
   return full;
 }
