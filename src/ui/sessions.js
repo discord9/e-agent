@@ -1056,21 +1056,25 @@ function loadModelProfiles() {
   return modelProfilePromise;
 }
 
-/* 光标前是 "/model <参数>"（/model 后至少一个空格）→ 返回已输入的前缀
-   （可为空串）；否则返回 null（保持命令菜单逻辑）。"/model"（无空格）返回
-   null → 命令菜单（/model 命令项）；"/model " 与 "/model c" 都走 profile 补全。 */
+/* 光标前是 /model 参数时返回补全槽位；否则返回 null（命令菜单逻辑）。 */
 function slashModelArg() {
   const v = els.promptInput.value;
   const caret = (els.promptInput.selectionStart == null)
     ? v.length : els.promptInput.selectionStart;
   const before = v.slice(0, caret);
-  const m = /^\/model[ \t]+(\S*)$/.exec(before);
-  return m ? m[1] : null;
+  const m = /^\/model[ \t]+(\S*)(?:[ \t]+(\S*))?$/.exec(before);
+  if (!m) return null;
+  const profile = m[1];
+  // 第二槽仅在首 token 是已知完整 profile 时启用，避免把尚未完成的 profile
+  // 当作 effort；尾随空格时第二捕获组为空串。
+  if (m[2] !== undefined && modelProfileCache && modelProfileCache.includes(profile)) {
+    return { slot: "effort", profile, filter: m[2] };
+  }
+  return { slot: "profile", filter: profile };
 }
 
-/* /model 参数补全：菜单显示 profile 候选（按已输入前缀过滤）。
-   候选未加载时先关菜单，加载完成后再按当前输入重开。 */
-function updateModelMenu(filter) {
+/* /model 参数补全；候选未加载时先关菜单，加载后按当前输入重开。 */
+function updateModelMenu(arg) {
   if (modelProfileCache === null) {
     closeSlashMenu();
     loadModelProfiles().then(() => {
@@ -1078,9 +1082,12 @@ function updateModelMenu(filter) {
     });
     return;
   }
-  const items = modelProfileCache.filter((p) => p.startsWith(filter));
-  if (!items.length) { closeSlashMenu(); return; }   // 无匹配：关闭
-  slashMenu.mode = "profile";
+  const effortItems = ["default", "omit", "none", "low", "medium", "high", "xhigh", "max"];
+  const items = arg.slot === "effort"
+    ? effortItems.filter((x) => x.startsWith(arg.filter))
+    : modelProfileCache.filter((p) => p.startsWith(arg.filter));
+  if (!items.length) { closeSlashMenu(); return; }
+  slashMenu.mode = arg.slot;
   slashMenu.items = items;
   if (slashMenu.selected >= items.length) slashMenu.selected = 0;
   slashMenu.open = true;
@@ -1100,7 +1107,7 @@ function currentSlashWord() {
 
 /* input 事件驱动：更新菜单（显示/过滤/关闭）。输入、删除都走这里。
    "/model <参数>"（含 "/model " 尾随空格——currentSlashWord 匹配不到）优先
-   走 profile 补全；其余 / 命令走命令候选。 */
+   走 profile / effort 补全；其余 / 命令走命令候选。 */
 function updateSlashMenu() {
   const modelArg = slashModelArg();
   if (modelArg !== null) { updateModelMenu(modelArg); return; }
@@ -1121,8 +1128,8 @@ function renderSlashMenu() {
   menu.innerHTML = "";
   slashMenu.items.forEach((c, i) => {
     const row = el("div", "slash-item" + (i === slashMenu.selected ? " selected" : ""));
-    if (slashMenu.mode === "profile") {
-      row.append(el("span", "slash-name", c));   // profile 候选：只显示 profile 名
+    if (slashMenu.mode === "profile" || slashMenu.mode === "effort") {
+      row.append(el("span", "slash-name", c));   // profile / effort 候选
     } else {
       row.append(el("span", "slash-name", c.name), el("span", "slash-desc", c.desc));
       if (c.args) row.append(el("span", "slash-args", c.args));
@@ -1163,10 +1170,12 @@ function selectSlashItem(i) {
   const c = slashMenu.items[i];
   if (!c) return;
   const inp = els.promptInput;
-  if (slashMenu.mode === "profile") {
-    // /model 参数补全：填入完整 "/model <profile>" 并直接发送（一步到位，
-    // 与命令模式 Enter 执行一致；走 sendPrompt 的 /model 分支 POST）。
-    inp.value = "/model " + c;
+  if (slashMenu.mode === "profile" || slashMenu.mode === "effort") {
+    // 选择任一 /model 补全项后填完整命令并直接发送。
+    const arg = slashModelArg();
+    inp.value = slashMenu.mode === "effort"
+      ? "/model " + arg.profile + " " + c
+      : "/model " + c;
     inp.selectionStart = inp.selectionEnd = inp.value.length;
     closeSlashMenu();
     autosizeInput();
@@ -1427,18 +1436,21 @@ async function sendPrompt() {
     return;   // 保留输入框，方便直接补参数
   }
   if (raw === "/model") {
-    setBanner("用法：/model <profile>（如 /model chatgpt/sol）；切换后当前会话继续用新模型");
+    setBanner("用法：/model <profile> [effort|default|omit]（如 /model chatgpt/sol）");
     return;   // 保留输入框，方便直接补参数
   }
   if (raw.startsWith("/model ")) {
-    const profile = raw.slice("/model ".length).trim();
-    if (!profile) {
-      setBanner("用法：/model <profile>（如 /model chatgpt/sol）");
+    const args = raw.slice("/model ".length).trim().split(/\s+/).filter(Boolean);
+    if (args.length < 1 || args.length > 2) {
+      setBanner("用法：/model <profile> [effort|default|omit]（如 /model chatgpt/sol）");
       return;
     }
+    const profile = args[0];
+    const effort = args.length === 2 ? args[1] : undefined;
     try {
+      const body = effort ? { profile, effort } : { profile };
       const res = await api("/api/sessions/" + encodeURIComponent(state.sessionId) + "/model",
-        { method: "POST", body: JSON.stringify({ profile }) });
+        { method: "POST", body: JSON.stringify(body) });
       if (res.status === 401 || res.status === 403) { setBanner("⚠ 认证失败：请检查 Token。", true); return; }
       if (res.status === 404 || res.status === 405) { setBanner("⚠ 服务器不支持 /model", true); return; }
       if (!res.ok) {
@@ -1452,7 +1464,7 @@ async function sendPrompt() {
       // 成功：清空输入框，刷新列表让侧边栏/输入框元信息显示新模型
       els.promptInput.value = "";
       autosizeInput();
-      setBanner("已切换到 " + model);
+      setBanner("已切换到 " + model + (effort ? "（effort: " + effort + "）" : ""));
       refreshSessionsForSidebar();
     } catch (e) {
       setBanner("⚠ 切换模型失败：" + e.message, true);
