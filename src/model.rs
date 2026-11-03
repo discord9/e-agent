@@ -110,7 +110,7 @@ pub struct OpenAiModel {
     base_url: String,
     api_key: String,
     model: String,
-    reasoning_effort: Option<String>,
+    pub(crate) reasoning_effort: Option<String>,
     /// Force the OpenAI-compatible `thinking` switch (`thinking:
     /// {"type": "enabled"}`) on chat requests. DeepSeek V4's `max`
     /// reasoning effort needs the explicit switch; `high` enables thinking
@@ -124,10 +124,10 @@ pub struct OpenAiModel {
     /// or DeepSeek 400s; (2) such a content-less assistant turn must carry
     /// `content: ""` instead of an absent/null `content`. Defaults to false;
     /// other providers are byte-identical to the non-compat wire.
-    deepseek_compat: bool,
+    pub(crate) deepseek_compat: bool,
     /// Whether the model accepts image input (chat wire builds image_url
     /// parts only for vision-capable models; see `ensure_vision_supported`).
-    vision: bool,
+    pub(crate) vision: bool,
     /// Global content-addressed image store (see `agent::image_store_dir`).
     /// None when no HOME/XDG_STATE_HOME: image refs then degrade to text
     /// placeholders on the wire.
@@ -498,9 +498,7 @@ struct ChatRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<String>,
     /// DeepSeek V4 thinking switch (`thinking: {"type": "enabled"}`), sent
-    /// as a top-level field when the profile sets `thinking = true` AND a
-    /// `reasoning_effort` is present: DeepSeek's `max` mode requires the
-    /// explicit switch (high enables thinking by default). Other
+    /// as a top-level field when the profile sets `thinking = true`.
     /// OpenAI-compatible providers ignore unknown top-level fields.
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<Thinking>,
@@ -544,11 +542,9 @@ impl<'a> ChatRequest<'a> {
         Self {
             model: model.into(),
             reasoning_effort: reasoning_effort.map(str::to_owned),
-            // Only force the switch when the profile opted in
-            // (`thinking = true`) and a reasoning effort is set.
-            thinking: reasoning_effort
-                .filter(|_| thinking)
-                .map(|_| Thinking { r#type: "enabled" }),
+            // The profile flag controls thinking independently of whether
+            // an effort value is present (e.g. an explicit effort omission).
+            thinking: thinking.then_some(Thinking { r#type: "enabled" }),
             messages: Self::wire_messages(messages, image_store, deepseek_compat, thinking),
             tools: tools
                 .iter()

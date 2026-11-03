@@ -62,7 +62,7 @@ use crate::delegate::Sessions;
 use crate::runner::{
     IdlePolicy, PromptSubmission, SessionHandle, SessionStatus, SessionTask, UserInputRequest,
 };
-use crate::session_factory::{SessionBuild, SessionFactory, UnfinishedPolicy};
+use crate::session_factory::{EffortOverride, SessionBuild, SessionFactory, UnfinishedPolicy};
 use crate::session_store::{
     FinishedTask, ListMetaDiagnostics, SessionStore, UsageDashboardMetadata, UsageDashboardRow,
 };
@@ -1486,6 +1486,7 @@ async fn session_compact(
 #[derive(Deserialize)]
 struct ModelBody {
     profile: String,
+    effort: Option<String>,
 }
 
 /// `GET /api/models` — every switchable model profile name (`[models]` keys
@@ -1605,12 +1606,40 @@ async fn session_model(
             "model profile must be provider/model (e.g. chatgpt/sol)",
         ));
     }
-    let (configured, context_window) = state.factory.resolve_profile(profile).map_err(|e| {
-        error(
-            StatusCode::BAD_REQUEST,
-            format!("unknown model profile `{profile}`: {e:#}"),
-        )
-    })?;
+    let effort = match body.effort.as_deref() {
+        None => None,
+        Some(value) => {
+            let trimmed = value.trim();
+            let mut tokens = trimmed.split_whitespace();
+            let Some(token) = tokens.next() else {
+                return Err(error(
+                    StatusCode::BAD_REQUEST,
+                    "effort must be a non-empty token",
+                ));
+            };
+            if tokens.next().is_some() || token != trimmed {
+                return Err(error(
+                    StatusCode::BAD_REQUEST,
+                    "effort must be exactly one whitespace-delimited token",
+                ));
+            }
+            match token {
+                "default" => Some(EffortOverride::Default),
+                "omit" => Some(EffortOverride::Omit),
+                value => Some(EffortOverride::Literal(value.to_string())),
+            }
+        }
+    };
+    let (configured, context_window) =
+        state
+            .factory
+            .resolve_profile(profile, effort)
+            .map_err(|e| {
+                error(
+                    StatusCode::BAD_REQUEST,
+                    format!("unknown model profile `{profile}`: {e:#}"),
+                )
+            })?;
     let name = configured.profile_key();
     session
         .handle()
@@ -5309,6 +5338,15 @@ model = "deepseek-chat"
         assert_eq!(value["model"], "deepseek/flash", "full profile key");
         // The registry metadata mirrors the switch for `GET /api/sessions`.
         assert_eq!(session.model_name(), "deepseek/flash");
+
+        // Explicit omit is accepted by the handler; the factory-level test
+        // separately asserts the constructed model has no effort value.
+        let omitted = request(
+            format!("/api/sessions/{id}/model"),
+            r#"{"profile": "deepseek/flash", "effort": "omit"}"#.to_owned(),
+        )
+        .await;
+        assert_eq!(omitted.status(), StatusCode::OK);
 
         let unknown = request(
             format!("/api/sessions/{id}/model"),

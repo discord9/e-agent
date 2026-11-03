@@ -508,7 +508,11 @@ impl SessionFactory {
     /// after start works without a restart. The context window accompanies
     /// the concrete model so a runtime switch updates both runner
     /// observations together.
-    pub fn resolve_profile(&self, profile: &str) -> anyhow::Result<(ConfiguredModel, Option<u64>)> {
+    pub fn resolve_profile(
+        &self,
+        profile: &str,
+        effort: Option<EffortOverride>,
+    ) -> anyhow::Result<(ConfiguredModel, Option<u64>)> {
         // Clone the config out of the state lock before building the model:
         // the chatgpt branch may take the write half of the same lock to
         // load (and cache) the login that arrived after start.
@@ -519,7 +523,14 @@ impl SessionFactory {
             .config
             .clone()
             .ok_or_else(|| anyhow!("no config file; cannot resolve model profile `{profile}`"))?;
-        let resolved = config.resolve_profile(profile)?;
+        let mut resolved = config.resolve_profile(profile)?;
+        if let Some(effort) = effort {
+            resolved.reasoning_effort = match effort {
+                EffortOverride::Default => resolved.reasoning_effort,
+                EffortOverride::Omit => None,
+                EffortOverride::Literal(value) => Some(value),
+            };
+        }
         // A `--model` override replaces the profile's wire model, so its
         // context-window declaration cannot describe the active model.
         let context_window = self
@@ -1382,6 +1393,14 @@ pub fn read_skills_index(root: &Path, global_dir: Option<&Path>) -> anyhow::Resu
     Ok(Some(format!("## Skills\n\n{lines}")))
 }
 
+/// In-memory reasoning-effort choice for a runtime profile switch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EffortOverride {
+    Default,
+    Omit,
+    Literal(String),
+}
+
 /// Where the ChatGPT credentials for a chatgpt-routed profile come from.
 #[derive(Clone, Copy)]
 enum AuthSource<'a> {
@@ -1699,6 +1718,61 @@ model = "m1"
         toml::from_str(&source).expect("test config parses")
     }
 
+    fn reasoning(model: &ConfiguredModel) -> Option<&str> {
+        match &model.kind {
+            crate::model::ConfiguredModelKind::Chat(model) => model.reasoning_effort.as_deref(),
+            crate::model::ConfiguredModelKind::Codex(model) => model.reasoning_effort.as_deref(),
+        }
+    }
+
+    #[test]
+    fn resolve_profile_effort_override_table_and_preserves_profile_fields() {
+        let temp = tempfile::tempdir().unwrap();
+        let factory = SessionFactory::test_factory_with_config(
+            temp.path().to_path_buf(),
+            Some(test_config(
+                "p1/m1",
+                r#"reasoning_effort = "max"
+context_window = 32768
+vision = true
+thinking = true
+deepseek_compat = true
+"#,
+            )),
+        );
+        let cases = [
+            (None, Some("max")),
+            (Some(EffortOverride::Default), Some("max")),
+            (Some(EffortOverride::Omit), None),
+            (
+                Some(EffortOverride::Literal("medium".into())),
+                Some("medium"),
+            ),
+            (Some(EffortOverride::Literal("none".into())), Some("none")),
+        ];
+        let (base, base_window) = factory.resolve_profile("p1/m1", None).unwrap();
+        assert_eq!(reasoning(&base), Some("max"));
+        let (vision, compat, name) = match &base.kind {
+            crate::model::ConfiguredModelKind::Chat(model) => {
+                (model.vision, model.deepseek_compat, model.name().to_owned())
+            }
+            _ => panic!("expected Chat profile"),
+        };
+        for (override_value, expected_effort) in cases {
+            let (model, window) = factory.resolve_profile("p1/m1", override_value).unwrap();
+            assert_eq!(reasoning(&model), expected_effort);
+            assert_eq!(window, base_window);
+            match &model.kind {
+                crate::model::ConfiguredModelKind::Chat(model) => {
+                    assert_eq!(model.vision, vision);
+                    assert_eq!(model.deepseek_compat, compat);
+                    assert_eq!(model.name(), name);
+                }
+                _ => panic!("expected Chat profile"),
+            }
+        }
+    }
+
     #[derive(Clone, Default)]
     struct ReloadCapture(Arc<std::sync::Mutex<Vec<u8>>>);
 
@@ -1939,11 +2013,15 @@ api_key_env = "PATH"
         // display name is the short form (after the last '/'), per
         // `ConfiguredModel::display_name`.
         assert_eq!(
-            factory.resolve_profile("p2/m2").unwrap().0.display_name(),
+            factory
+                .resolve_profile("p2/m2", None)
+                .unwrap()
+                .0
+                .display_name(),
             "m2"
         );
         assert_eq!(
-            factory.resolve_profile("p2/m2").unwrap().1,
+            factory.resolve_profile("p2/m2", None).unwrap().1,
             None,
             "profiles without context_window carry None to runtime switches"
         );
@@ -1971,8 +2049,11 @@ api_key_env = "PATH"
             )),
         );
 
-        assert_eq!(factory.resolve_profile("p2/m2").unwrap().1, Some(32_768));
-        assert_eq!(factory.resolve_profile("p1/m1").unwrap().1, None);
+        assert_eq!(
+            factory.resolve_profile("p2/m2", None).unwrap().1,
+            Some(32_768)
+        );
+        assert_eq!(factory.resolve_profile("p1/m1", None).unwrap().1, None);
     }
 
     #[test]
@@ -1994,7 +2075,7 @@ api_key_env = "PATH"
         );
         // Previous config stays untouched.
         assert_eq!(factory.model_profiles(), vec!["p1/m1"]);
-        assert!(factory.resolve_profile("p1/m1").is_ok());
+        assert!(factory.resolve_profile("p1/m1", None).is_ok());
     }
 
     #[test]
@@ -2012,7 +2093,7 @@ api_key_env = "PATH"
         assert!(factory.current_config().is_none());
         assert!(factory.model_profiles().is_empty());
         // No config → resolve_profile errors instead of panicking.
-        assert!(factory.resolve_profile("p1/m1").is_err());
+        assert!(factory.resolve_profile("p1/m1", None).is_err());
     }
 
     #[test]
@@ -2063,7 +2144,11 @@ api_key_env = "PATH"
         };
         assert!(matches!(result, ReloadResult::Reloaded), "{result:?}");
         assert_eq!(
-            factory.resolve_profile("p2/m2").unwrap().0.display_name(),
+            factory
+                .resolve_profile("p2/m2", None)
+                .unwrap()
+                .0
+                .display_name(),
             "m2"
         );
     }
@@ -2291,7 +2376,7 @@ model = "m2"
         );
         assert!(matches!(factory.reload_config(), ReloadResult::Reloaded));
         assert_eq!(factory.model_profiles(), vec!["p1/m1", "p2/m2"]);
-        assert!(factory.resolve_profile("p2/m2").is_ok());
+        assert!(factory.resolve_profile("p2/m2", None).is_ok());
 
         // A broken edit is rejected and the previous config stays.
         write_config("default = \"nope/nope\"\n");
@@ -2449,7 +2534,7 @@ model = "m1"
 
     /// The `{:#}` error chain of a failing `resolve_profile`.
     fn resolve_error(factory: &SessionFactory, profile: &str) -> String {
-        match factory.resolve_profile(profile) {
+        match factory.resolve_profile(profile, None) {
             Ok(_) => panic!("expected `{profile}` to fail"),
             Err(error) => format!("{error:#}"),
         }
@@ -2472,7 +2557,7 @@ model = "m1"
         // `e-agent login` in another process writes the file; the next
         // resolution picks it up without a restart or a config reload.
         write_auth_file(&env.xdg);
-        let (model, context_window) = factory.resolve_profile("cg/m1").unwrap();
+        let (model, context_window) = factory.resolve_profile("cg/m1", None).unwrap();
         assert_eq!(model.display_name(), "m1");
         assert_eq!(context_window, None);
         assert!(factory.reloadable.read().unwrap().auth.is_some());
@@ -2498,7 +2583,9 @@ model = "m1"
         for _ in 0..8 {
             let factory = factory.clone();
             tasks.push(tokio::spawn(async move {
-                factory.resolve_profile("cg/m1").map(|(model, _)| model)
+                factory
+                    .resolve_profile("cg/m1", None)
+                    .map(|(model, _)| model)
             }));
         }
         for task in tasks {
@@ -2536,7 +2623,7 @@ model = "m1"
         assert!(factory.reloadable.read().unwrap().auth.is_none());
 
         write_auth_file(&env.xdg);
-        let (model, _) = factory.resolve_profile("cg/m1").unwrap();
+        let (model, _) = factory.resolve_profile("cg/m1", None).unwrap();
         assert_eq!(model.display_name(), "m1");
     }
 
@@ -2550,14 +2637,14 @@ model = "m1"
             temp.path().to_path_buf(),
             Some(chatgpt_config("")),
         );
-        assert!(factory.resolve_profile("cg/m1").is_ok());
+        assert!(factory.resolve_profile("cg/m1", None).is_ok());
 
         // The credentials are cached: later resolutions neither re-read the
         // file (deleted here) nor re-decode it (corrupt here).
         std::fs::remove_file(&auth_file).unwrap();
-        assert!(factory.resolve_profile("cg/m1").is_ok());
+        assert!(factory.resolve_profile("cg/m1", None).is_ok());
         std::fs::write(&auth_file, "{not json").unwrap();
-        assert!(factory.resolve_profile("cg/m1").is_ok());
+        assert!(factory.resolve_profile("cg/m1", None).is_ok());
     }
 
     #[test]

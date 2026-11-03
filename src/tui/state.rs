@@ -144,6 +144,7 @@ pub(crate) struct TuiState {
     /// later with --session).
     pub(crate) session_id: String,
     pub(crate) model_name: String,
+    pub(crate) effort_override: Option<crate::session_factory::EffortOverride>,
     /// Agent role name displayed next to the model name; `None` when no role
     /// template exists.
     pub(crate) role_name: Option<String>,

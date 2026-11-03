@@ -873,8 +873,9 @@ async fn handle_rename(command: RenameCommand, state: &mut TuiState) {
 enum ModelCommand {
     /// Bare `/model` — show the current model and usage.
     Usage,
+    Invalid,
     /// `/model <profile>` — switch the session's model at runtime.
-    Switch(String),
+    Switch(String, Option<crate::session_factory::EffortOverride>),
 }
 
 /// Parse a `/model` command. Returns `None` for any other input so the
@@ -887,10 +888,23 @@ fn parse_model(prompt: &str) -> Option<ModelCommand> {
     let rest = prompt.strip_prefix("/model ")?;
     let rest = rest.trim();
     if rest.is_empty() {
-        Some(ModelCommand::Usage)
-    } else {
-        Some(ModelCommand::Switch(rest.to_string()))
+        return Some(ModelCommand::Usage);
     }
+    let mut tokens = rest.split_whitespace();
+    let profile = tokens.next()?;
+    let effort_token = tokens.next();
+    if tokens.next().is_some() {
+        return Some(ModelCommand::Invalid);
+    }
+    let effort = match effort_token {
+        None => None,
+        Some("default") => Some(crate::session_factory::EffortOverride::Default),
+        Some("omit") => Some(crate::session_factory::EffortOverride::Omit),
+        Some(value) => Some(crate::session_factory::EffortOverride::Literal(
+            value.to_string(),
+        )),
+    };
+    Some(ModelCommand::Switch(profile.to_string(), effort))
 }
 
 /// Run a `/model` command: resolve the profile through the session factory
@@ -903,12 +917,35 @@ fn handle_model(command: ModelCommand, state: &mut TuiState, handle: &RunnerHand
     match command {
         ModelCommand::Usage => {
             let current = state.model_name.clone();
+            let profile_effort = state.model.as_ref().and_then(|model| match &model.kind {
+                crate::model::ConfiguredModelKind::Chat(m) => m.reasoning_effort.as_deref(),
+                crate::model::ConfiguredModelKind::Codex(m) => m.reasoning_effort.as_deref(),
+            });
+            let effort = match state.effort_override.as_ref() {
+                Some(crate::session_factory::EffortOverride::Omit) => {
+                    "（omit：不发送 effort）".to_string()
+                }
+                Some(crate::session_factory::EffortOverride::Literal(value)) => {
+                    format!("{value}（覆盖）")
+                }
+                Some(crate::session_factory::EffortOverride::Default) | None => profile_effort
+                    .map_or_else(
+                        || "（配置未配置）".to_string(),
+                        |value| format!("{value}（配置默认）"),
+                    ),
+            };
             push_display(
                 state,
-                format!("当前模型：{current}。用法：/model <profile>（如 /model deepseek/flash）"),
+                format!(
+                    "当前模型：{current}；effort={effort}。用法：/model <profile> [effort|default|omit]"
+                ),
             );
         }
-        ModelCommand::Switch(profile) => {
+        ModelCommand::Invalid => push_display(
+            state,
+            "用法：/model <profile> [effort|default|omit]（effort 只能有一个 token）".to_string(),
+        ),
+        ModelCommand::Switch(profile, effort) => {
             let Some(factory) = state.factory.clone() else {
                 push_display(
                     state,
@@ -916,14 +953,26 @@ fn handle_model(command: ModelCommand, state: &mut TuiState, handle: &RunnerHand
                 );
                 return;
             };
-            match factory.resolve_profile(&profile) {
+            match factory.resolve_profile(&profile, effort.clone()) {
                 Ok((configured, context_window)) => {
                     let name = configured.profile_key();
                     state.model_name = name.clone();
                     state.model = Some(configured.clone());
                     state.context_window = context_window;
+                    let clears_effort_override = matches!(
+                        effort,
+                        Some(crate::session_factory::EffortOverride::Default)
+                    );
+                    state.effort_override = effort.filter(|value| {
+                        !matches!(value, crate::session_factory::EffortOverride::Default)
+                    });
                     handle.switch_model(Box::new(configured), context_window);
-                    push_display(state, format!("已切换到 {name}"));
+                    let acknowledgement = if clears_effort_override {
+                        format!("已切换到 {name}（已清除 effort 覆盖，使用配置默认）")
+                    } else {
+                        format!("已切换到 {name}")
+                    };
+                    push_display(state, acknowledgement);
                 }
                 Err(error) => {
                     push_display(state, format!("未知模型 profile：{error:#}"));
@@ -1320,7 +1369,46 @@ mod fork_tests {
 
 #[cfg(test)]
 mod model_tests {
-    use super::{ModelCommand, parse_model};
+    use super::{ModelCommand, TuiState, handle_model, parse_model};
+    use crate::session_factory::{EffortOverride, SessionFactory};
+    use std::sync::Arc;
+
+    #[test]
+    fn default_effort_switch_acknowledges_clearing_the_override() {
+        let temp = tempfile::tempdir().unwrap();
+        let config: crate::config::Config = toml::from_str(
+            r#"default = "p1/m1"
+[providers.p1]
+base_url = "http://one"
+api_key_env = "PATH"
+[models."p1/m1"]
+model = "m1"
+"#,
+        )
+        .unwrap();
+        let factory = Arc::new(SessionFactory::test_factory_with_config(
+            temp.path().to_path_buf(),
+            Some(config),
+        ));
+        let (handle, _sink, _source) = crate::runner::session_test_channel();
+        let mut state = TuiState {
+            factory: Some(factory),
+            effort_override: Some(EffortOverride::Literal("low".into())),
+            ..TuiState::default()
+        };
+
+        handle_model(
+            ModelCommand::Switch("p1/m1".into(), Some(EffortOverride::Default)),
+            &mut state,
+            &handle,
+        );
+
+        assert_eq!(
+            state.lines.last().unwrap().text,
+            "已切换到 p1/m1（已清除 effort 覆盖，使用配置默认）"
+        );
+        assert_eq!(state.effort_override, None);
+    }
 
     #[test]
     fn parse_model_commands() {
@@ -1329,12 +1417,51 @@ mod model_tests {
         assert_eq!(parse_model("/model   "), Some(ModelCommand::Usage));
         assert_eq!(
             parse_model("/model chatgpt/sol"),
-            Some(ModelCommand::Switch("chatgpt/sol".to_string()))
+            Some(ModelCommand::Switch("chatgpt/sol".to_string(), None))
         );
         assert_eq!(
             parse_model("/model   deepseek/flash  "),
-            Some(ModelCommand::Switch("deepseek/flash".to_string()))
+            Some(ModelCommand::Switch("deepseek/flash".to_string(), None))
         );
+        assert_eq!(
+            parse_model("/model p medium"),
+            Some(ModelCommand::Switch(
+                "p".into(),
+                Some(EffortOverride::Literal("medium".into()))
+            ))
+        );
+        assert_eq!(
+            parse_model("/model p omit"),
+            Some(ModelCommand::Switch("p".into(), Some(EffortOverride::Omit)))
+        );
+        assert_eq!(
+            parse_model("/model p default"),
+            Some(ModelCommand::Switch(
+                "p".into(),
+                Some(EffortOverride::Default)
+            ))
+        );
+        for invalid in [
+            "/model p medium extra",
+            "/model p omit extra",
+            "/model p default extra",
+        ] {
+            assert_eq!(
+                parse_model(invalid),
+                Some(ModelCommand::Invalid),
+                "{invalid}"
+            );
+        }
+        let first = parse_model("/model a medium");
+        let second = parse_model("/model b");
+        assert_eq!(
+            first,
+            Some(ModelCommand::Switch(
+                "a".into(),
+                Some(EffortOverride::Literal("medium".into()))
+            ))
+        );
+        assert_eq!(second, Some(ModelCommand::Switch("b".into(), None)));
         // Non-model input falls through to the normal prompt path.
         assert_eq!(parse_model("/modelxxx"), None);
         assert_eq!(parse_model("/modelx gpt"), None);

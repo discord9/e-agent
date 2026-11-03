@@ -64,6 +64,7 @@ fn responses_wire_flattens_system_tools_and_tool_results() {
         .collect::<Vec<_>>();
     assert_eq!(keys, ["workspace", "task"]);
     assert_eq!(value["reasoning"]["effort"], "high");
+    assert_eq!(value["reasoning"]["summary"], "auto");
     assert_eq!(value["include"], json!([]));
 }
 

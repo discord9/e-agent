@@ -303,6 +303,61 @@ fn omits_reasoning_effort_when_unset() {
     let request = ChatRequest::from_internal("test-model", None, false, false, &[], &[], None);
     let value = serde_json::to_value(request).unwrap();
     assert!(value.get("reasoning_effort").is_none());
+    assert!(!value.as_object().unwrap().contains_key("reasoning_effort"));
+}
+
+#[test]
+fn chat_omit_effort_serializes_without_reasoning_effort_key() {
+    use crate::session_factory::{EffortOverride, SessionFactory};
+
+    let temp = tempfile::tempdir().unwrap();
+    let config: crate::config::Config = toml::from_str(
+        r#"
+[providers.p]
+base_url = "http://localhost"
+api_key_env = "PATH"
+
+[models."p/m"]
+model = "m"
+reasoning_effort = "high"
+thinking = true
+deepseek_compat = true
+"#,
+    )
+    .unwrap();
+    let factory = SessionFactory::test_factory_with_config(temp.path().to_path_buf(), Some(config));
+
+    let wire = |effort| {
+        let (configured, _) = factory.resolve_profile("p/m", effort).unwrap();
+        let crate::model::ConfiguredModelKind::Chat(model) = configured.kind else {
+            panic!("expected Chat model");
+        };
+        let request = ChatRequest::from_internal(
+            model.name(),
+            model.reasoning_effort.as_deref(),
+            model.thinking,
+            model.deepseek_compat,
+            &[tool_call_assistant(None, Some("need pwd"))],
+            &[],
+            None,
+        );
+        serde_json::to_value(request).unwrap()
+    };
+
+    let with_effort = wire(None);
+    assert_eq!(with_effort["reasoning_effort"], "high");
+    assert_eq!(with_effort["thinking"]["type"], "enabled");
+    assert_eq!(with_effort["messages"][0]["reasoning_content"], "need pwd");
+
+    let omitted = wire(Some(EffortOverride::Omit));
+    assert!(
+        !omitted
+            .as_object()
+            .unwrap()
+            .contains_key("reasoning_effort")
+    );
+    assert_eq!(omitted["thinking"]["type"], "enabled");
+    assert_eq!(omitted["messages"][0]["reasoning_content"], "need pwd");
 }
 
 #[test]
@@ -314,7 +369,7 @@ fn serializes_thinking_switch_when_enabled() {
 }
 
 #[test]
-fn omits_thinking_switch_when_disabled_or_without_effort() {
+fn thinking_switch_follows_profile_flag_even_without_effort() {
     // `thinking = false` must not emit the field even with an effort set.
     let disabled = serde_json::to_value(ChatRequest::from_internal(
         "test-model",
@@ -328,7 +383,7 @@ fn omits_thinking_switch_when_disabled_or_without_effort() {
     .unwrap();
     assert!(disabled.get("thinking").is_none());
 
-    // `thinking = true` alone (no reasoning_effort) must not emit it either.
+    // `thinking = true` emits it independently of reasoning_effort.
     let no_effort = serde_json::to_value(ChatRequest::from_internal(
         "test-model",
         None,
@@ -339,7 +394,7 @@ fn omits_thinking_switch_when_disabled_or_without_effort() {
         None,
     ))
     .unwrap();
-    assert!(no_effort.get("thinking").is_none());
+    assert_eq!(no_effort["thinking"]["type"], "enabled");
 }
 
 /// Read one HTTP request, returning the raw header block (request line plus
