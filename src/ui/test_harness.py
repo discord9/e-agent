@@ -231,6 +231,10 @@ class El {
     const i=p._children.indexOf(this); if(i>=0) p._children.splice(i,1);
     this._parent=null; } }
   insertAdjacentText(pos, t){ if(pos==="beforeend") this._children.push({text:t}); }
+  /* 额度面板使用的新 DOM API：整体替换子节点 / 是否有子节点。 */
+  replaceChildren(...nodes){ for(const c of this._children){ if(c instanceof El) c._parent=null; }
+    this._children=[]; this._innerHTML=""; this._text=""; this.append(...nodes); }
+  hasChildNodes(){ return this._children.length > 0; }
   addEventListener(type, fn){ (this._listeners[type] || (this._listeners[type]=[])).push(fn); }
   querySelectorAll(sel){ const out=[];
     const walk=(e)=>{ for(const c of e._children){ if(c instanceof El){
@@ -254,6 +258,7 @@ for(const id of ["topActions","backParentBtn","connState","banner","bannerText",
   "workspaceSelect","workspaceAddBtn","workspaceRemoveBtn","workspaceEditor",
   "wsNameInput","wsUrlInput","wsTokenInput","wsSaveBtn","wsCancelBtn",
   "usageDashboardBtn","usageDashboard","usageTitle","usageScopeNote","usageUpdatedAt",
+  "quotaRefreshBtn","quotaPopover","quotaPopoverBtn","quotaPopoverClose","quotaUpdatedAt","quotaCardsRow",
   "usageRefreshBtn","usageCloseBtn","usageFilters","usageFrom","usageTo","usageRootSession",
   "usageModel","usageRole","usageKind","usageBucket","usageResetBtn","usageStatus","usageContent","usageKpis",
   "usageTrendChart","usageModelChart","usageCompositionChart","usageTable","usageTableNote"]) elsById[id]=new El(id);
@@ -8741,6 +8746,27 @@ async function main(){
       label: "done-build", status: "Finished", exit_code: 0, duration_ms: 1234,
       output: "completed output" }];
     state.tasks.composerOpen = true; state.tasks.finishedCollapsed = true; lastTasksSig = ""; lastTasksRenderedSig = "";   // 刷新后的初始值
+    await pollTasks(); await flush();
+    {
+      state.tasks.finishedCollapsed = false;
+      taskRequests.clear();
+      const liveOnlyFreshnessPoll = pollTasks({ liveOnly: true });
+      chk("live-only poll requests live, not finished",
+          taskRequests.has(taskRequestKey(state.workspace, "live"))
+          && !taskRequests.has(taskRequestKey(state.workspace, "finished")),
+          "keys=" + JSON.stringify([...taskRequests.keys()]));
+      await liveOnlyFreshnessPoll;
+      await Promise.allSettled([...taskRequests.values()].map((entry) => entry.promise));
+      taskRequests.clear();
+      const defaultFreshnessPoll = pollTasks();
+      chk("default poll refreshes expanded finished",
+          taskRequests.has(taskRequestKey(state.workspace, "finished")),
+          "keys=" + JSON.stringify([...taskRequests.keys()]));
+      await defaultFreshnessPoll;
+      await Promise.allSettled([...taskRequests.values()].map((entry) => entry.promise));
+      await flush();
+      state.tasks.finishedCollapsed = true;
+    }
     await pollTasks(); await flush();
     let fhdr = elsById["composerTasks"].querySelector(".tasks-finished-header");
     let fbody = elsById["composerTasks"].querySelector(".tasks-finished-body");
