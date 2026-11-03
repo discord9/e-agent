@@ -834,8 +834,11 @@ pub(super) fn build_bwrap_plan(
     // is MS_NODEV and cannot open devices); `-try` skips nodes the host lacks.
     // AMD/ROCm enumeration additionally reads sysfs: `/sys/devices` (KFD
     // topology + DRM devices), `/sys/dev/char` (the device-number links HIP
-    // uses to match KFD nodes to render nodes) and `/sys/module/amdgpu`
-    // (rocminfo's module gate) — all read-only.
+    // uses to match KFD nodes to render nodes), `/sys/class/drm` (the DRM
+    // class entries used for render-node enumeration), and `/sys/module/amdgpu`
+    // (rocminfo's module gate) — all read-only. The profiler opens
+    // `/sys/class/kfd/...`; bind that specific class subtree because the
+    // literal path is a symlink whose target resolves through `/sys/class`.
     // Installed after every configured mount so the `--dev-bind-try` devices
     // win over any overlapping configured bind (last mount wins in bwrap).
     if sandbox.gpu {
@@ -855,7 +858,13 @@ pub(super) fn build_bwrap_plan(
                 args.extend(["--dev-bind-try".into(), path.clone().into(), path.into()]);
             }
         }
-        for path in ["/sys/devices", "/sys/dev/char", "/sys/module/amdgpu"] {
+        for path in [
+            "/sys/devices",
+            "/sys/dev/char",
+            "/sys/class/kfd",
+            "/sys/class/drm",
+            "/sys/module/amdgpu",
+        ] {
             args.extend(["--ro-bind-try".into(), path.into(), path.into()]);
         }
     }
