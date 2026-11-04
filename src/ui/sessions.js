@@ -160,7 +160,15 @@ function afterPollRound() {
       updateCurrentSessionBusy();
       syncDocumentTitle();   // 服务端后台生成的标题在轮询后同步到标签页
       const cur = (state.lastList || []).find((s) => s.id === state.sessionId);
-      if (cur) els.backParentBtn.hidden = !cur.parent_session_id;
+      if (cur) {
+        els.backParentBtn.hidden = !cur.parent_session_id;
+        // 轮询已给出可用父信息：撤掉 installBackParentRetry 的临时处理器，
+        // 否则一次点击既导航又发起一次重试请求。父信息仍缺失则保留处理器。
+        if (cur.parent_session_id) {
+          els.backParentBtn.onclick = null;
+          els.backParentBtn.title = "返回主会话";
+        }
+      }
       else if (!workspaceDetailsLoaded.has(workspaceIdentityKey(state.workspace, workspaceToken(state.workspace)))) {
         els.backParentBtn.hidden = true;
       }
@@ -247,6 +255,11 @@ async function pollWorkspaceSessionsNow(ws, identity) {
         partial: true, sessions: data.sessions,
         totals: data.totals || {}, child_counts: data.child_counts || {},
       };
+      // 摘要变化 → 已加载的完整列表缓存失效，下次用户按需动作重拉一次。
+      // 错误标记保持粘性（真正失败仍需用户显式重试，不被轮询自动清除）。
+      if (sidebarTotalsChanged((workspaceSidebarSnapshots.get(fullKey) || {}).totals, snapshot.totals)) {
+        workspaceDetailsLoaded.delete(fullKey);
+      }
       workspaceSidebarSnapshots.set(fullKey, snapshot);
       if (snapshot.partial) {
         const baseline = workspaceDetailLists.get(fullKey);
@@ -289,6 +302,14 @@ const workspaceFullRequests = new Map();
 
 function workspaceIdentityKey(ws, token) {
   return ws.id + "\u0000" + (ws.url || "") + "\u0000" + token;
+}
+
+/* 服务器摘要变化 = 底层会话集合变了（新建/归档/删除/子会话增减）。只用于
+   失效已加载的完整列表缓存，让下一次用户按需动作重拉一次；不触发请求。 */
+function sidebarTotalsChanged(prev, next) {
+  if (!prev || !next) return false;   // 旧服务器裸数组无 totals：永不失效
+  return prev.roots !== next.roots || prev.archived !== next.archived
+    || prev.historical_children !== next.historical_children || prev.all !== next.all;
 }
 
 /* 完整列表按需补拉（展开「归档」/「历史子会话」/「更早的会话」时）：
