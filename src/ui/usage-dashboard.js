@@ -197,15 +197,71 @@ function fillUsageSelect(select, values, allLabel, labelForValue) {
   if (values.includes(current)) select.value = current;
 }
 
-function updateUsageFilterOptions(data) {
+const USAGE_ROOT_RETRY_VALUE = "__retry_full_sessions__";
+let usageRootRetryBound = false;
+let usageRootRetryInFlight = false;
+
+function updateUsageRootOptions() {
   const localSessions = Array.isArray(state.lastList) ? state.lastList : [];
   const currentRoot = els.usageRootSession.value;
+  const ws = state.workspace;
+  const key = ws && workspaceToken(ws) ? workspaceIdentityKey(ws, workspaceToken(ws)) : null;
+  const loaded = key && workspaceDetailsLoaded.has(key);
+  const failed = key && workspaceDetailErrors.has(key);
   els.usageRootSession.innerHTML = "";
   const all = el("option", "", "全部会话"); all.value = ""; els.usageRootSession.append(all);
   for (const session of localSessions.filter((item) => !item.parent_session_id)) {
     const option = el("option", "", session.title || shortId(session.id)); option.value = session.id; els.usageRootSession.append(option);
   }
-  if (localSessions.some((item) => item.id === currentRoot)) els.usageRootSession.value = currentRoot;
+  if (currentRoot && !localSessions.some((item) => item.id === currentRoot)) {
+    const retained = el("option", "", currentRoot); retained.value = currentRoot; els.usageRootSession.append(retained);
+  }
+  if (key && !loaded) {
+    const status = el("option", "", failed ? "完整会话加载失败（选择此项重试）" : "正在加载完整会话…");
+    status.value = USAGE_ROOT_RETRY_VALUE;
+    els.usageRootSession.append(status);
+    if (!failed && !usageRootRetryInFlight) {
+      usageRootRetryInFlight = true;
+      workspaceDetailRequestsPending.add(key);
+      ensureFullSessions(ws.id).then((rows) => {
+        if (rows) workspaceDetailErrors.delete(key);
+        else workspaceDetailErrors.add(key);
+      }).finally(() => {
+        workspaceDetailRequestsPending.delete(key);
+        usageRootRetryInFlight = false;
+        updateUsageRootOptions();
+      });
+    }
+  }
+  els.usageRootSession.value = currentRoot === USAGE_ROOT_RETRY_VALUE ? "" : currentRoot;
+  if (!usageRootRetryBound) {
+    usageRootRetryBound = true;
+    els.usageRootSession.addEventListener("change", () => {
+      if (els.usageRootSession.value !== USAGE_ROOT_RETRY_VALUE) return;
+      const selected = els.usageRootSession.dataset.previousValue || "";
+      els.usageRootSession.value = selected;
+      const ws = state.workspace;
+      const key = workspaceIdentityKey(ws, workspaceToken(ws));
+      workspaceDetailErrors.delete(key);
+      usageRootRetryInFlight = true;
+      workspaceDetailRequestsPending.add(key);
+      ensureFullSessions(ws.id).then((rows) => {
+        if (rows) workspaceDetailErrors.delete(key);
+        else workspaceDetailErrors.add(key);
+      }).finally(() => {
+        workspaceDetailRequestsPending.delete(key);
+        usageRootRetryInFlight = false;
+        updateUsageRootOptions();
+      });
+    });
+    els.usageRootSession.addEventListener("focus", () => {
+      els.usageRootSession.dataset.previousValue = els.usageRootSession.value;
+    });
+  }
+}
+
+function updateUsageFilterOptions(data) {
+  updateUsageRootOptions();
   fillUsageSelect(els.usageModel, data.byModel.map((row) => row.key), "全部模型");
   fillUsageSelect(els.usageRole, data.byRole.map((row) => row.key), "全部角色", (value) => value === "unknown" ? "未知角色" : value);
   fillUsageSelect(els.usageKind, data.byKind.map((row) => row.key), "全部类型");

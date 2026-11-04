@@ -161,6 +161,9 @@ function afterPollRound() {
       syncDocumentTitle();   // 服务端后台生成的标题在轮询后同步到标签页
       const cur = (state.lastList || []).find((s) => s.id === state.sessionId);
       if (cur) els.backParentBtn.hidden = !cur.parent_session_id;
+      else if (!workspaceDetailsLoaded.has(workspaceIdentityKey(state.workspace, workspaceToken(state.workspace)))) {
+        els.backParentBtn.hidden = true;
+      }
     }
     if (!els.sidebar.hidden) renderSidebarTree();
   });
@@ -214,20 +217,6 @@ function mergePolledSessions(detailRows, windowRows) {
 
 function workspaceSnapshotFor(ws) {
   return workspaceSidebarSnapshots.get(workspaceIdentityKey(ws, workspaceToken(ws))) || null;
-}
-
-function updateWorkspaceVisibleList(ws) {
-  const key = workspaceIdentityKey(ws, workspaceToken(ws));
-  const snapshot = workspaceSnapshotFor(ws);
-  const baseline = workspaceDetailLists.get(key);
-  const windowRows = snapshot ? snapshot.sessions : [];
-  const previous = workspaceListFor(ws);
-  // An authoritative list replaces; a window only ever refreshes whatever baseline exists, or the observed rows when there is none.
-  const list = baseline !== undefined
-    ? mergePolledSessions(baseline, windowRows)
-    : mergePolledSessions(previous, windowRows);
-  state.workspaceLists[ws.id] = list;
-  if (ws === state.workspace) state.lastList = list;
 }
 
 async function pollWorkspaceSessionsNow(ws, identity) {
@@ -1032,7 +1021,57 @@ function openSession(id, onReady, epoch, timeoutMs) {
   // cur 不存在则不动按钮（保持现状），等 refreshSessionsForSidebar 拉到
   // 列表后由它判定，避免把返回按钮误藏。
   const cur = (state.lastList || []).find((s) => s.id === id);
-  if (cur) els.backParentBtn.hidden = !cur.parent_session_id;
+  els.backParentBtn.onclick = null;
+  if (cur) {
+    els.backParentBtn.hidden = !cur.parent_session_id;
+  } else {
+    els.backParentBtn.hidden = true;
+    const detailKey = workspaceIdentityKey(state.workspace, workspaceToken(state.workspace));
+    if (!workspaceDetailsLoaded.has(detailKey) && !workspaceDetailErrors.has(detailKey)) {
+      workspaceDetailRequestsPending.add(detailKey);
+      ensureFullSessions(state.workspace.id).then((rows) => {
+        if (!rows) {
+          workspaceDetailErrors.add(detailKey);
+          if (state.workspace.id === wsId && state.sessionId === id) {
+            els.backParentBtn.hidden = false;
+            els.backParentBtn.title = "加载父会话信息失败，点击重试";
+            els.backParentBtn.onclick = () => {
+              workspaceDetailErrors.delete(detailKey);
+              workspaceDetailRequestsPending.add(detailKey);
+              ensureFullSessions(wsId).then((retryRows) => {
+                if (!retryRows || state.workspace.id !== wsId || state.sessionId !== id) {
+                  workspaceDetailErrors.add(detailKey);
+                  return;
+                }
+                const retrySession = (state.lastList || []).find((s) => s.id === id);
+                els.backParentBtn.hidden = !retrySession || !retrySession.parent_session_id;
+                els.backParentBtn.title = "返回主会话";
+              }).finally(() => workspaceDetailRequestsPending.delete(detailKey));
+            };
+          }
+          return;
+        }
+        workspaceDetailErrors.delete(detailKey);
+        if (state.workspace.id !== wsId || state.sessionId !== id) return;
+        const loaded = (state.lastList || []).find((s) => s.id === id);
+        els.backParentBtn.hidden = !loaded || !loaded.parent_session_id;
+      }).finally(() => workspaceDetailRequestsPending.delete(detailKey));
+    } else if (workspaceDetailErrors.has(detailKey)) {
+      els.backParentBtn.hidden = false;
+      els.backParentBtn.onclick = () => {
+        workspaceDetailErrors.delete(detailKey);
+        workspaceDetailRequestsPending.add(detailKey);
+        ensureFullSessions(wsId).then((rows) => {
+          if (!rows || state.workspace.id !== wsId || state.sessionId !== id) {
+            workspaceDetailErrors.add(detailKey);
+            return;
+          }
+          const retrySession = (state.lastList || []).find((s) => s.id === id);
+          els.backParentBtn.hidden = !retrySession || !retrySession.parent_session_id;
+        }).finally(() => workspaceDetailRequestsPending.delete(detailKey));
+      };
+    }
+  }
   renderChatSessionId(id);
   updateComposerMeta();          // 显示当前会话 model · role（缓存/首开/恢复共用）
   els.usageInfo.textContent = "";
@@ -2019,6 +2058,32 @@ async function refreshSessionsForSidebar() {
  * 列表未变化时跳过重绘，保留展开状态与滚动位置。
  * ===================================================================*/
 const MAX_TREE_ROOTS = 8;   // 每个 workspace 分组内默认只显示最近 8 个主会话（少滑即见）
+function resolveSessionParentFromKnownRow(sessionId, parentId, wsId) {
+  const currentWsId = state.workspace.id;
+  const known = (state.lastList || []).find((s) => s.id === sessionId);
+  const parent = parentId || (known && known.parent_session_id);
+  if (!parent) return;
+  const parentRow = (state.lastList || []).find((s) => s.id === parent);
+  if (parentRow && !isSessionLive(parentRow)) resumeSessionIn(wsId, parentRow.id);
+  else if (parentRow) openSessionIn(wsId, parent);
+  else {
+    const key = workspaceIdentityKey(state.workspace, workspaceToken(state.workspace));
+    if (workspaceDetailsLoaded.has(key) || workspaceDetailErrors.has(key)) {
+      openSessionIn(wsId, parent);
+      return;
+    }
+    if (workspaceDetailRequestsPending.has(key)) return;
+    workspaceDetailRequestsPending.add(key);
+    ensureFullSessions(wsId).then((rows) => {
+      if (!rows) { workspaceDetailErrors.add(key); return; }
+      if (state.workspace.id !== currentWsId) return;
+      const row = (state.lastList || []).find((s) => s.id === parent);
+      if (row && !isSessionLive(row)) resumeSessionIn(wsId, parent);
+      else openSessionIn(wsId, parent);
+    }).finally(() => workspaceDetailRequestsPending.delete(key));
+  }
+}
+
 const PIN_ORDER_KEY = "eagent.pinOrder";
 let lastTreeSig = "";
 
@@ -2563,7 +2628,8 @@ function renderTreeForList(container, list, wsId) {
       const slots = sorted.filter((s) => isMainSession(s) && !inPinnedSubtree(s))
         .slice(0, MAX_TREE_ROOTS);
       shown = slots.filter((s) => !inArchive(s));
-      const more = Math.max(0, totalRootSlots - shown.length);
+      const pinnedRoots = allPinnedSessions().filter(({ ws: pinnedWs }) => pinnedWs.id === wsId).length;
+      const more = Math.max(0, totalRootSlots - pinnedRoots - shown.length);
       moreBtn = el("button", "tree-more", "+" + more + " 个更早的会话");
       moreBtn.type = "button";
       moreBtn.title = "显示全部主会话";
