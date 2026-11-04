@@ -65,12 +65,24 @@ function applyValidation(problems) {
    按失败处理（保留旧列表 stale，标记 workspaceErrors）。 */
 const POLL_TIMEOUT_MS = 30000;
 
-/* 会话列表端点：每个 workspace 身份的第一次请求拉完整列表（分组表头 +
-   展开数据），此后每 2s 的轮询只取侧边栏默认可见子集（服务端过滤归档 +
-   inactive 子会话）；展开「归档」/「历史子会话」/「更早的会话」且缓存缺
-   数据时由 ensureFullSessions 按需补拉完整列表。 */
+/* 会话列表端点：轮询始终请求侧边栏窗口（mode=sidebar），响应自带分组
+   计数，因此首屏不再拉完整列表；展开「归档」/「历史子会话」/「更早的
+   会话」、搜索或显示全部时，才由 ensureFullSessions 按需补拉完整列表。
+   完整列表是权威基线：它会替换可见缓存，而窗口只刷新已有基线。 */
 const SESSIONS_PATH = "/api/sessions";
-const SESSIONS_POLL_PATH = SESSIONS_PATH + "?exclude=archived_children";
+const SESSIONS_POLL_PATH = SESSIONS_PATH + "?mode=sidebar";
+
+/* Sidebar snapshots are deliberately separate from on-demand full detail rows. */
+const workspaceSidebarSnapshots = new Map();
+const workspaceDetailLists = new Map();
+const workspaceDetailsLoaded = new Set();
+/* 摘要在轮询中变化 → 已加载的完整列表可能过期。只打标记、保留 loaded：自动
+   渲染路径见到 stale 一律不请求（只显示「数据已变化，点击刷新」），只有用户
+   显式动作才清除标记并重拉一次。 */
+const workspaceDetailsStale = new Set();
+const workspaceDetailRequestsPending = new Set();
+const workspaceDetailErrors = new Set();
+const workspaceListIdentities = new Map();
 
 /* 深链 history 有界超时：恶劣网络下深链直接按 id probe history，同样挂
    10s 上限（复用 fetchWithTimeout）——只作用于深链路径（maybeHandleDeepLink
@@ -108,6 +120,7 @@ async function fetchPollJson(ws, path, opts = {}) {
 }
 
 async function pollAllWorkspaces() {
+  pruneWorkspaceSessionCaches();
   const wss = (state.workspaces || []).slice();
   await Promise.allSettled(wss.map((ws) => pollWorkspaceSessions(ws)));
 }
@@ -118,6 +131,23 @@ function workspaceRequestCurrent(ws, identity) {
 }
 
 const workspaceSessionRequests = new Map();
+
+function pruneWorkspaceSessionCaches() {
+  const identities = new Map((state.workspaces || []).map((ws) => [ws.id, workspaceIdentityKey(ws, workspaceToken(ws))]));
+  const live = new Set(identities.values());
+  for (const wsId of Object.keys(state.workspaceLists || {})) {
+    const current = identities.get(wsId);
+    const previous = workspaceListIdentities.get(wsId);
+    if (previous && previous !== current) delete state.workspaceLists[wsId];
+    if (current) workspaceListIdentities.set(wsId, current);
+  }
+  for (const key of workspaceSidebarSnapshots.keys()) if (!live.has(key)) workspaceSidebarSnapshots.delete(key);
+  for (const key of workspaceDetailLists.keys()) if (!live.has(key)) workspaceDetailLists.delete(key);
+  for (const key of workspaceDetailsLoaded) if (!live.has(key)) workspaceDetailsLoaded.delete(key);
+  for (const key of workspaceDetailsStale) if (!live.has(key)) workspaceDetailsStale.delete(key);
+  for (const key of workspaceDetailRequestsPending) if (!live.has(key)) workspaceDetailRequestsPending.delete(key);
+  for (const key of workspaceDetailErrors) if (!live.has(key)) workspaceDetailErrors.delete(key);
+}
 
 /* 聚合轮询整轮收尾：深链、字段校验、当前会话元信息与侧边栏同步。
    侧边栏是唯一导航，因此即使抽屉关闭也持续刷新数据缓存；打开时强制
@@ -135,7 +165,22 @@ function afterPollRound() {
       updateCurrentSessionBusy();
       syncDocumentTitle();   // 服务端后台生成的标题在轮询后同步到标签页
       const cur = (state.lastList || []).find((s) => s.id === state.sessionId);
-      if (cur) els.backParentBtn.hidden = !cur.parent_session_id;
+      // 临时重试已安装（onclick 非空）：无论当前行是否存在/是否有父，都必须
+      // 保持可用——否则一次轮询就会把重试控件藏掉。只在恢复父信息或导航时清。
+      const retryHandler = els.backParentBtn.onclick;
+      if (cur && cur.parent_session_id) {
+        els.backParentBtn.hidden = false;
+        els.backParentBtn.onclick = null;
+        els.backParentBtn.title = "返回主会话";
+      } else if (retryHandler) {
+        els.backParentBtn.hidden = false;
+        els.backParentBtn.title = "加载父会话信息失败，点击重试";
+      } else if (cur) {
+        els.backParentBtn.hidden = true;
+      }
+      else if (!workspaceDetailsLoaded.has(workspaceIdentityKey(state.workspace, workspaceToken(state.workspace)))) {
+        els.backParentBtn.hidden = true;
+      }
     }
     if (!els.sidebar.hidden) renderSidebarTree();
   });
@@ -178,21 +223,17 @@ function pollWorkspaceSessions(ws) {
   return request;
 }
 
-/* 服务端 `?exclude=archived_children` 的同款判定：归档（非置顶）会话与
-   inactive 子会话。轮询结果里没有这些条目，本地归档/子会话结束后用同一
-   规则把它们留在缓存里（展开分组仍可见），其余消失的条目按已删除丢弃。 */
-function sidebarHiddenSession(s) {
-  return (s.archived === true && s.pinned !== true)
-    || (!!s.parent_session_id && s.active === false);
+/* Full detail rows are durable cache entries; window rows are a replaceable
+   snapshot. Fresh window data wins, while absence from the window never deletes
+   a detail row. A snapshot row absent from both sets is no longer current. */
+function mergePolledSessions(detailRows, windowRows) {
+  const byId = new Map((detailRows || []).map((s) => [s.id, s]));
+  for (const s of windowRows) byId.set(s.id, Object.assign({}, byId.get(s.id) || {}, s));
+  return Array.from(byId.values());
 }
 
-/* 小轮询结果合并进缓存：同 id 用新数据替换；轮询结果里没有的条目仅当
-   属于轮询过滤掉的类别时保留（展开过的归档/历史分组不闪没）。 */
-function mergePolledSessions(prev, polled) {
-  if (!Array.isArray(prev) || !prev.length) return polled;
-  const seen = new Set(polled.map((s) => s.id));
-  const kept = prev.filter((s) => !seen.has(s.id) && sidebarHiddenSession(s));
-  return kept.length ? polled.concat(kept) : polled;
+function workspaceSnapshotFor(ws) {
+  return workspaceSidebarSnapshots.get(workspaceIdentityKey(ws, workspaceToken(ws))) || null;
 }
 
 async function pollWorkspaceSessionsNow(ws, identity) {
@@ -200,31 +241,46 @@ async function pollWorkspaceSessionsNow(ws, identity) {
   state.workspaceListPending[ws.id] = true;
   let list = null;
   let err = null;
-  // 每个 workspace 身份的第一次请求拉完整列表（无过滤）：侧边栏的
-  // 「归档 (N)」「历史子会话 (N)」分组表头也来自这份数据，刷新页面后必须
-  // 仍可发现（分组收起 ≠ 分组可以不存在）。此后每 2s 的轮询一律带
-  // exclude 只拉默认可见子集；成功一次后即切换（失败则下轮重试完整列表，
-  // 不影响正确性）。展开分组 /「更早的会话」时另有 ensureFullSessions 兜底。
   const fullKey = workspaceIdentityKey(ws, identity.token);
-  const firstFetch = !workspaceFullAttempted.has(fullKey);
   try {
-    // 侧边栏默认只画 pinned / 未归档主会话 / live 子会话：轮询带 exclude
-    // 只拉默认可见子集（5000 会话不再每 2s 传整份归档）。
-    const response = await fetchPollJson(ws, firstFetch ? SESSIONS_PATH : SESSIONS_POLL_PATH);
+    // Summary-bearing sidebar window is used from the first request and every
+    // 2s poll; full rows are fetched only on explicit demand.
+    const response = await fetchPollJson(ws, SESSIONS_POLL_PATH);
     const res = response.res;
     if (res.status === 401 || res.status === 403) {
       err = "auth";
     } else if (!res.ok) {
       err = "http" + res.status;
-    } else if (response.formatError || !Array.isArray(response.json)) {
+    } else if (response.formatError || !(Array.isArray(response.json)
+      || (response.json && response.json.partial === true && Array.isArray(response.json.sessions)))) {
       err = "format";
-    } else if (firstFetch) {
-      workspaceFullAttempted.add(fullKey);   // 首份完整列表就是全量，无需合并
-      list = response.json;
+    } else if (!workspaceRequestCurrent(ws, identity)) {
+      return;
     } else {
-      // 小轮询结果里没有归档 / inactive 子会话：把它们从缓存里保留下来
-      // （分组内容与计数不闪没），其余缺失条目按已删除丢弃。
-      list = mergePolledSessions(state.workspaceLists[ws.id], response.json);
+      const data = response.json;
+      const snapshot = Array.isArray(data) ? {
+        partial: false, sessions: data, totals: null, child_counts: null,
+      } : {
+        partial: true, sessions: data.sessions,
+        totals: data.totals || null, child_counts: data.child_counts || {},
+      };
+      // 摘要变化 → 标记已加载的完整列表过期（保留 loaded）。只打标记、不发
+      // 请求：自动渲染见到 stale 只显示刷新控件，重拉必须由用户显式触发。
+      // 错误标记保持粘性（真正失败仍需用户显式重试，不被轮询自动清除）。
+      if (sidebarTotalsChanged((workspaceSidebarSnapshots.get(fullKey) || {}).totals, snapshot.totals)) {
+        workspaceDetailsStale.add(fullKey);
+      }
+      workspaceSidebarSnapshots.set(fullKey, snapshot);
+      if (snapshot.partial) {
+        const baseline = workspaceDetailLists.get(fullKey);
+        const observed = baseline !== undefined ? baseline : (state.workspaceLists[ws.id] || []);
+        list = mergePolledSessions(observed, snapshot.sessions);
+      } else {
+        list = snapshot.sessions;
+        workspaceDetailLists.set(fullKey, list);
+        workspaceDetailsLoaded.add(fullKey);
+        workspaceDetailsStale.delete(fullKey);   // 权威全量：最新，非过期
+      }
     }
   } catch (e) {
     // 超时（AbortError）和网络失败只在 workspace 侧边栏标记：保留旧列表
@@ -242,7 +298,7 @@ async function pollWorkspaceSessionsNow(ws, identity) {
     setBanner("⚠ 服务器返回异常格式（非数组 JSON）。", true);
   }
   if (list) {
-    state.workspaceLists[ws.id] = list;   // 上面已按 id 合并（本轮结果 + 保留的隐藏条目）
+    state.workspaceLists[ws.id] = list;
     state.workspaceErrors[ws.id] = null;
   } else {
     if (state.workspaceLists[ws.id] === undefined) state.workspaceLists[ws.id] = [];
@@ -254,13 +310,17 @@ async function pollWorkspaceSessionsNow(ws, identity) {
 }
 
 const workspaceFullRequests = new Map();
-/* 已成功拉到过「完整列表」的 workspace 身份键集合（wsId + url + token）：
-   每个身份只在第一次请求时拉全量，之后每 2s 的轮询只拉默认可见子集。
-   展开分组 /「更早的会话」且缓存缺数据时按需再补（ensureFullSessions）。 */
-const workspaceFullAttempted = new Set();
 
 function workspaceIdentityKey(ws, token) {
   return ws.id + "\u0000" + (ws.url || "") + "\u0000" + token;
+}
+
+/* 服务器摘要变化 = 底层会话集合变了（新建/归档/删除/子会话增减）。只用于
+   失效已加载的完整列表缓存，让下一次用户按需动作重拉一次；不触发请求。 */
+function sidebarTotalsChanged(prev, next) {
+  if (!prev || !next) return false;   // 旧服务器裸数组无 totals：永不失效
+  return prev.roots !== next.roots || prev.archived !== next.archived
+    || prev.historical_children !== next.historical_children || prev.all !== next.all;
 }
 
 /* 完整列表按需补拉（展开「归档」/「历史子会话」/「更早的会话」时）：
@@ -269,10 +329,73 @@ function workspaceIdentityKey(ws, token) {
 function ensureFullSessions(wsId) {
   const ws = (state.workspaces || []).find((w) => w.id === wsId);
   if (!ws || !workspaceToken(ws)) return Promise.resolve(null);
-  // 缓存里已有归档 / inactive 子会话（首次完整列表或此前展开补拉过）：
-  // 无需再请求，分组数据已在本地。
-  if (workspaceListFor(ws).some(sidebarHiddenSession)) return Promise.resolve(null);
-  return fetchAllSessions(ws);
+  const key = workspaceIdentityKey(ws, workspaceToken(ws));
+  // 已成功拉到过完整列表、且既没有失败标记也没有过期标记：直接复用缓存基线，
+  // 绝不再发请求——展开/收起反复切换不得产生网络流量（此前只有 in-flight 去重）。
+  // 过期身份走真正的重拉；本函数只被显式用户动作或已通过 stale 门禁的路径调用。
+  if (workspaceDetailsLoaded.has(key) && !workspaceDetailErrors.has(key)
+      && !workspaceDetailsStale.has(key)) {
+    return Promise.resolve(workspaceDetailLists.get(key) || []);
+  }
+  return fetchAllSessions(ws).catch(() => {
+    workspaceDetailErrors.add(key);
+    return null;
+  });
+}
+
+/* Render-time detail requests are single-flight and failure-sticky. The visible
+   retry control clears the workspace identity's error before trying again. */
+function requestFullSessionsForSidebar(wsId, container, loadingText, onSuccess = null) {
+  const ws = (state.workspaces || []).find((w) => w.id === wsId);
+  if (!ws || !workspaceToken(ws)) return;
+  const key = workspaceIdentityKey(ws, workspaceToken(ws));
+  const showState = () => {
+    container.innerHTML = "";
+    if (workspaceDetailErrors.has(key)) {
+      const retry = el("button", "tree-empty", "加载失败，点击重试");
+      retry.type = "button";
+      retry.addEventListener("click", () => {
+        workspaceDetailErrors.delete(key);
+        workspaceDetailsStale.delete(key);
+        workspaceDetailsLoaded.delete(key);
+        requestFullSessionsForSidebar(wsId, container, loadingText, onSuccess);
+      });
+      container.appendChild(retry);
+    } else if (workspaceDetailsStale.has(key)) {
+      // 概要是轮询发现的过期：自动渲染绝不请求，只提供显式刷新控件。
+      const refresh = el("button", "tree-empty", "数据已变化，点击刷新");
+      refresh.type = "button";
+      refresh.addEventListener("click", () => {
+        workspaceDetailsStale.delete(key);
+        workspaceDetailsLoaded.delete(key);
+        requestFullSessionsForSidebar(wsId, container, loadingText, onSuccess);
+      });
+      container.appendChild(refresh);
+    } else container.appendChild(el("div", "tree-empty", loadingText));
+  };
+  if (container.hidden) return; // collapsed history/archive groups do not fetch
+  if (workspaceDetailsLoaded.has(key) && !workspaceDetailsStale.has(key)) {
+    container.innerHTML = "";
+    container.appendChild(el("div", "tree-empty", "已加载；当前摘要中的会话行不可用。"));
+    return;
+  }
+  showState();
+  // 自动渲染路径到此为止：失败粘性 + 过期（且无在途请求）都不得自动请求。
+  if (workspaceDetailRequestsPending.has(key) || workspaceDetailErrors.has(key)) return;
+  if (workspaceDetailsStale.has(key)) return;
+  workspaceDetailRequestsPending.add(key);
+  ensureFullSessions(wsId).then((rows) => {
+    if (rows) {
+      workspaceDetailErrors.delete(key);
+      if (onSuccess) onSuccess();
+      renderSidebarTree(true);
+    } else {
+      workspaceDetailErrors.add(key);
+      showState();
+    }
+  }).finally(() => {
+    workspaceDetailRequestsPending.delete(key);
+  });
 }
 
 function fetchAllSessions(ws) {
@@ -297,18 +420,21 @@ function fetchAllSessions(ws) {
 }
 
 async function fetchAllSessionsNow(ws, identity) {
+  const key = workspaceIdentityKey(ws, identity.token);
   const response = await fetchPollJson(ws, SESSIONS_PATH);
   const res = response.res;
-  if (!res || !res.ok || response.formatError || !Array.isArray(response.json)) return null;
+  if (!res || !res.ok || response.formatError || !Array.isArray(response.json)) {
+    workspaceDetailErrors.add(key);
+    return null;
+  }
   if (!workspaceRequestCurrent(ws, identity)) return null;
-  // 完整列表（含归档 / inactive 子会话）替换缓存：被小轮询过滤掉的条目
-  // 重新可渲染；缓存里不在完整列表、但属于轮询过滤类别的条目保留（与
-  // 轮询合并同一规则，防删除竞态导致刚归档的行闪没）。
   const full = response.json;
-  const ids = new Set(full.map((s) => s.id));
-  const kept = workspaceListFor(ws).filter((s) => !ids.has(s.id) && sidebarHiddenSession(s));
-  state.workspaceLists[ws.id] = kept.length ? full.concat(kept) : full;
-  if (ws === state.workspace) state.lastList = state.workspaceLists[ws.id];
+  workspaceDetailErrors.delete(key);
+  workspaceDetailsStale.delete(key);   // 刚拉到的权威全量：不再过期
+  workspaceDetailLists.set(key, full);
+  workspaceDetailsLoaded.add(key);
+  state.workspaceLists[ws.id] = full;
+  if (ws === state.workspace) state.lastList = full;
   renderSidebarTree(true);
   return full;
 }
@@ -915,6 +1041,38 @@ function saveSessionState() {
   };
 }
 
+/* 「← 主会话」的临时重试：详情加载失败时安装（内联 onclick，与 sse.js 的
+   常驻监听并存）。失败态下常驻监听找不到当前行 → 不导航，所以一次点击只
+   触发一次重试；重试成功/再次失败时内联处理器立即自清，恢复后剩余的点击
+   只走常驻监听（一次导航、零额外请求）。 */
+function installBackParentRetry(wsId, id) {
+  const detailKey = workspaceIdentityKey(state.workspace, workspaceToken(state.workspace));
+  els.backParentBtn.hidden = false;
+  els.backParentBtn.title = "加载父会话信息失败，点击重试";
+  els.backParentBtn.onclick = () => {
+    els.backParentBtn.onclick = null;      // 一次性：先清，避免重入/残留
+    els.backParentBtn.title = "返回主会话";
+    workspaceDetailErrors.delete(detailKey);
+    if (workspaceDetailRequestsPending.has(detailKey)) {
+      installBackParentRetry(wsId, id);    // 在途：保留可用重试，不重复请求
+      return;
+    }
+    els.backParentBtn.hidden = true;
+    workspaceDetailRequestsPending.add(detailKey);
+    ensureFullSessions(wsId).then((rows) => {
+      if (state.workspace.id !== wsId || state.sessionId !== id) return;
+      if (!rows) {
+        workspaceDetailErrors.add(detailKey);
+        installBackParentRetry(wsId, id);  // 仍失败：保留可用重试
+        return;
+      }
+      const row = (state.lastList || []).find((s) => s.id === id);
+      els.backParentBtn.hidden = !row || !row.parent_session_id;
+      els.backParentBtn.title = "返回主会话";
+    }).finally(() => workspaceDetailRequestsPending.delete(detailKey));
+  };
+}
+
 function openSession(id, onReady, epoch, timeoutMs) {
   // 打开即声明新代次（入口调用）；嵌套调用（openSessionIn/resumeSession 等
   // 已声明过）传入共享的代次，不再递增——一次用户动作只有一个 action epoch。
@@ -949,7 +1107,32 @@ function openSession(id, onReady, epoch, timeoutMs) {
   // cur 不存在则不动按钮（保持现状），等 refreshSessionsForSidebar 拉到
   // 列表后由它判定，避免把返回按钮误藏。
   const cur = (state.lastList || []).find((s) => s.id === id);
-  if (cur) els.backParentBtn.hidden = !cur.parent_session_id;
+  els.backParentBtn.onclick = null;          // 每次打开都从无临时处理器开始
+  els.backParentBtn.title = "返回主会话";
+  if (cur) {
+    els.backParentBtn.hidden = !cur.parent_session_id;
+  } else {
+    els.backParentBtn.hidden = true;
+    const detailKey = workspaceIdentityKey(state.workspace, workspaceToken(state.workspace));
+    if (!workspaceDetailsLoaded.has(detailKey) && !workspaceDetailErrors.has(detailKey)) {
+      workspaceDetailRequestsPending.add(detailKey);
+      ensureFullSessions(state.workspace.id).then((rows) => {
+        if (!rows) {
+          workspaceDetailErrors.add(detailKey);
+          if (state.workspace.id === wsId && state.sessionId === id) installBackParentRetry(wsId, id);
+          return;
+        }
+        workspaceDetailErrors.delete(detailKey);
+        if (state.workspace.id !== wsId || state.sessionId !== id) return;
+        const loaded = (state.lastList || []).find((s) => s.id === id);
+        els.backParentBtn.hidden = !loaded || !loaded.parent_session_id;
+        els.backParentBtn.title = "返回主会话";
+        els.backParentBtn.onclick = null;    // 恢复成功：清除临时处理器
+      }).finally(() => workspaceDetailRequestsPending.delete(detailKey));
+    } else if (workspaceDetailErrors.has(detailKey)) {
+      installBackParentRetry(wsId, id);
+    }
+  }
   renderChatSessionId(id);
   updateComposerMeta();          // 显示当前会话 model · role（缓存/首开/恢复共用）
   els.usageInfo.textContent = "";
@@ -1936,6 +2119,32 @@ async function refreshSessionsForSidebar() {
  * 列表未变化时跳过重绘，保留展开状态与滚动位置。
  * ===================================================================*/
 const MAX_TREE_ROOTS = 8;   // 每个 workspace 分组内默认只显示最近 8 个主会话（少滑即见）
+function resolveSessionParentFromKnownRow(sessionId, parentId, wsId) {
+  const currentWsId = state.workspace.id;
+  const known = (state.lastList || []).find((s) => s.id === sessionId);
+  const parent = parentId || (known && known.parent_session_id);
+  if (!parent) return;
+  const parentRow = (state.lastList || []).find((s) => s.id === parent);
+  if (parentRow && !isSessionLive(parentRow)) resumeSessionIn(wsId, parentRow.id);
+  else if (parentRow) openSessionIn(wsId, parent);
+  else {
+    const key = workspaceIdentityKey(state.workspace, workspaceToken(state.workspace));
+    if (workspaceDetailsLoaded.has(key) || workspaceDetailErrors.has(key)) {
+      openSessionIn(wsId, parent);
+      return;
+    }
+    if (workspaceDetailRequestsPending.has(key)) return;
+    workspaceDetailRequestsPending.add(key);
+    ensureFullSessions(wsId).then((rows) => {
+      if (!rows) { workspaceDetailErrors.add(key); return; }
+      if (state.workspace.id !== currentWsId) return;
+      const row = (state.lastList || []).find((s) => s.id === parent);
+      if (row && !isSessionLive(row)) resumeSessionIn(wsId, parent);
+      else openSessionIn(wsId, parent);
+    }).finally(() => workspaceDetailRequestsPending.delete(key));
+  }
+}
+
 const PIN_ORDER_KEY = "eagent.pinOrder";
 let lastTreeSig = "";
 
@@ -2169,6 +2378,8 @@ function sidebarTreeSig() {
     parts.push(ws.id + ":" + (ws === state.workspace ? 1 : 0) + ":"
       + (state.workspaceErrors[ws.id] || "") + ":"
       + (state.sidebar.showAllWs.has(ws.id) ? 1 : 0) + ":"
+      + JSON.stringify((workspaceSnapshotFor(ws) || {}).totals || {}) + ":"
+      + JSON.stringify((workspaceSnapshotFor(ws) || {}).child_counts || {}) + ":"
       + JSON.stringify(list.map((s) => [
         s.id, s.title || "", s.label || "", s.status, s.busy ? 1 : 0, s.active === false ? 0 : 1,
         s.entry_count ?? null, s.parent_session_id || "", s.pinned === true ? 1 : 0,
@@ -2300,7 +2511,11 @@ function renderSidebarTree(force) {
     sec.appendChild(header);
     // ---- 组体：既有树逻辑（per-workspace） ----
     const body = el("div", "tree-ws-body");
-    if (!list.length) {
+    const snapshot = workspaceSnapshotFor(ws);
+    const detailsKey = workspaceIdentityKey(ws, workspaceToken(ws));
+    if (state.sidebar.filter && (!workspaceDetailsLoaded.has(detailsKey) || workspaceDetailsStale.has(detailsKey))) {
+      requestFullSessionsForSidebar(ws.id, body, "正在加载完整会话以搜索…");
+    } else if (!list.length && !snapshot) {
       const emptyText = (err === "network" || err === "timeout")
         ? "正在连接，重试中…"
         : err === "auth" ? "认证失败，请检查 Token。"
@@ -2403,7 +2618,9 @@ function taskDotTitle(t, n, total) {
    expanded 键限定（wsId:sid）与 .current 高亮（只高亮激活 workspace 内
    当前会话）。 */
 function renderTreeForList(container, list, wsId) {
-  if (!list.length) {
+  const wsForSummary = (state.workspaces || []).find((w) => w.id === wsId) || state.workspace;
+  const summary = workspaceSnapshotFor(wsForSummary);
+  if (!list.length && !(summary && summary.totals)) {
     container.appendChild(el("div", "tree-empty", "暂无会话"));
     return;
   }
@@ -2452,12 +2669,19 @@ function renderTreeForList(container, list, wsId) {
     } else {
       for (const s of matchedRoots) container.appendChild(buildTreeRoot(s, kidsFor(s), wsId));
       if (matchedOrphans.length) container.appendChild(buildTreeGroup("未关联", matchedOrphans, wsId));
-      if (matchedArchived.length) container.appendChild(buildArchiveGroup(matchedArchived, wsId, childrenByParent));
+      const archiveCount = summary && summary.totals && Number.isFinite(summary.totals.archived)
+        ? summary.totals.archived : archivedSessions.length;
+      if (matchedArchived.length || archiveCount > 0) {
+        container.appendChild(buildArchiveGroup(matchedArchived, wsId, childrenByParent, archiveCount));
+      }
     }
   } else {
     let shown = roots;
     let moreBtn = null;
-    const totalRootSlots = sorted.filter((s) => isMainSession(s) && !inPinnedSubtree(s)).length;
+    const ws = (state.workspaces || []).find((w) => w.id === wsId) || state.workspace;
+    const summary = workspaceSnapshotFor(ws);
+    const totalRootSlots = summary && summary.totals && Number.isFinite(summary.totals.roots)
+      ? summary.totals.roots : sorted.filter((s) => isMainSession(s) && !inPinnedSubtree(s)).length;
     if (!state.sidebar.showAllWs.has(wsId) && totalRootSlots > MAX_TREE_ROOTS) {
       // 槽位法窗口：取最近 MAX_TREE_ROOTS 个主会话槽位（含归档，sorted
       // 已按时间重排），归档会话的槽位空着、不顶替——归档后侧边栏真实
@@ -2465,22 +2689,41 @@ function renderTreeForList(container, list, wsId) {
       const slots = sorted.filter((s) => isMainSession(s) && !inPinnedSubtree(s))
         .slice(0, MAX_TREE_ROOTS);
       shown = slots.filter((s) => !inArchive(s));
-      const more = roots.length - shown.length;
+      const pinnedRoots = allPinnedSessions().filter(({ ws: pinnedWs }) => pinnedWs.id === wsId).length;
+      const more = Math.max(0, totalRootSlots - pinnedRoots - shown.length);
       moreBtn = el("button", "tree-more", "+" + more + " 个更早的会话");
       moreBtn.type = "button";
       moreBtn.title = "显示全部主会话";
       moreBtn.addEventListener("click", () => {
-        state.sidebar.showAllWs.add(wsId);   // 只展开本 workspace 分组
-        // 「更早的会话」展开是用户首次要完整视图的信号：按需补拉全量列表
-        // （归档槽位与分组数据补回缓存；已有隐藏条目则复用不请求）。
-        ensureFullSessions(wsId);
-        renderSidebarTree(true);
+        const ws = (state.workspaces || []).find((w) => w.id === wsId) || state.workspace;
+        const key = workspaceIdentityKey(ws, workspaceToken(ws));
+        // 「显示全部」是显式用户动作：过期身份先失效再重拉一次。
+        if (workspaceDetailsStale.has(key)) {
+          workspaceDetailsStale.delete(key);
+          workspaceDetailsLoaded.delete(key);
+        }
+        const full = workspaceDetailsLoaded.has(key);
+        if (full) {
+          state.sidebar.showAllWs.add(wsId);
+          renderSidebarTree(true);
+          return;
+        }
+        const status = el("div", "tree-empty", "");
+        moreBtn.after(status);
+        moreBtn.textContent = "加载全部会话中…";
+        moreBtn.disabled = true;
+        requestFullSessionsForSidebar(wsId, status, "正在加载完整会话…", () => {
+          state.sidebar.showAllWs.add(wsId);
+          renderSidebarTree(true);
+        });
       });
     }
     for (const s of shown) container.appendChild(buildTreeRoot(s, kidsFor(s), wsId));
     if (moreBtn) container.appendChild(moreBtn);
     if (orphans.length) container.appendChild(buildTreeGroup("未关联", orphans, wsId));
-    if (archivedSessions.length) container.appendChild(buildArchiveGroup(archivedSessions, wsId, childrenByParent));
+    const archiveCount = summary && summary.totals && Number.isFinite(summary.totals.archived)
+      ? summary.totals.archived : archivedSessions.length;
+    if (archiveCount > 0) container.appendChild(buildArchiveGroup(archivedSessions, wsId, childrenByParent, archiveCount));
   }
 }
 
@@ -2584,14 +2827,16 @@ function buildTreeRoot(s, kids, wsId) {
     + (state.workspace.id === wsId && state.sessionId === s.id ? " current" : "")
     + (s.pinned === true ? " pinned" : "")
     + (s.archived === true ? " archived" : ""));
-  const hasKids = kids.length > 0;
+  const snapshot = workspaceSnapshotFor((state.workspaces || []).find((w) => w.id === wsId) || state.workspace);
+  const childCount = snapshot && snapshot.child_counts ? Number(snapshot.child_counts[s.id] || 0) : 0;
+  const hasKids = kids.length > 0 || childCount > 0;
   const toggle = el("button", "tree-toggle");
   toggle.type = "button";
-  toggle.disabled = !hasKids;      // 无子会话时留位（占 24px，不响应）
+  toggle.disabled = !hasKids;
   if (hasKids) {
     toggle.title = "展开 / 收起子会话";
     toggle.addEventListener("click", (ev) => {
-      ev.stopPropagation();          // 点击箭头只展开/收起，不切换会话
+      ev.stopPropagation();
       toggleSidebarNode(wsId + ":" + s.id, toggle, kids, wsId, s.id);
     });
   }
@@ -2664,7 +2909,9 @@ function buildTreeRoot(s, kids, wsId) {
     if (showKids) {
       children.hidden = false;
       toggle.classList.add("open");
-      renderTreeChildren(children, kids, wsId, s.id);
+      if (!kids.length && childCount > 0) {
+        if (showKids) requestFullSessionsForSidebar(wsId, children, "正在加载历史子会话…");
+      } else renderTreeChildren(children, kids, wsId, s.id);
     }
     node.appendChild(children);
   }
@@ -2677,7 +2924,16 @@ function toggleSidebarNode(key, toggle, kids, wsId, parentSid) {
   if (children.hidden) {
     children.hidden = false;
     toggle.classList.add("open");
-    renderTreeChildren(children, kids, wsId, parentSid);   // 展开时才渲染子节点（400+ 会话不拖慢树）
+    if (!kids.length) {
+      // 展开点击 = 显式动作：过期身份在这里失效，允许本次重拉一次。
+      const wsExp = (state.workspaces || []).find((w) => w.id === wsId);
+      const keyExp = wsExp && workspaceToken(wsExp) ? workspaceIdentityKey(wsExp, workspaceToken(wsExp)) : null;
+      if (keyExp && workspaceDetailsStale.has(keyExp)) {
+        workspaceDetailsStale.delete(keyExp);
+        workspaceDetailsLoaded.delete(keyExp);
+      }
+      requestFullSessionsForSidebar(wsId, children, "正在加载子会话…");
+    } else renderTreeChildren(children, kids, wsId, parentSid);
     state.sidebar.expanded.add(key);
   } else {
     children.hidden = true;
@@ -2696,7 +2952,13 @@ function renderTreeChildren(container, kids, wsId, parentSid) {
   const live = [], hist = [];
   for (const k of kids) (isSessionLive(k) ? live : hist).push(k);
   renderSubagentRows(container, live, false, wsId);
-  if (hist.length) container.appendChild(buildHistGroup(hist, wsId, parentSid));
+  const ws = (state.workspaces || []).find((w) => w.id === wsId) || state.workspace;
+  const snapshot = workspaceSnapshotFor(ws);
+  const totalHist = Math.max(
+    hist.length,
+    Number((parentSid && snapshot && snapshot.child_counts && snapshot.child_counts[parentSid]) || 0),
+  );
+  if (hist.length || totalHist > 0) container.appendChild(buildHistGroup(hist, wsId, parentSid, totalHist));
 }
 
 /* 渲染 subagent 行（不做活跃/历史分组）；hist=true 时行灰显小字 */
@@ -2756,7 +3018,7 @@ const EAGER_GROUP_MAX = 50;
    （live 直显组之外），默认收起，点击展开；展开状态与主会话 expanded 同
    Set 持久（内存态，不落盘）——键按宿主区分：主树内 = wsId:hist:parentSid，
    未关联组内（parentSid 为 null）= wsId:hist:__orphans__。 */
-function buildHistGroup(kids, wsId, parentSid) {
+function buildHistGroup(kids, wsId, parentSid, totalCount = kids.length) {
   const key = wsId + ":hist:" + (parentSid || "__orphans__");
   const node = el("div", "tree-node");
   const row = el("div", "tree-row tree-hist-row");
@@ -2764,14 +3026,18 @@ function buildHistGroup(kids, wsId, parentSid) {
   toggle.type = "button";
   toggle.title = "展开 / 收起";
   toggle.addEventListener("click", (ev) => toggleTreeGroup(ev, toggle, key, wsId));
-  const idEl = el("span", "tree-id tree-group tree-hist-label", "历史子会话 (" + kids.length + ")");
+  const idEl = el("span", "tree-id tree-group tree-hist-label", "历史子会话 (" + totalCount + ")");
   row.append(toggle, idEl);
   node.appendChild(row);
   const children = el("div", "tree-children");
   const expanded = state.sidebar.expanded.has(key);
   children.hidden = !expanded;
   if (expanded) toggle.classList.add("open");
-  children._lazyRender = () => renderSubagentRows(children, kids, true, wsId);
+  children._lazyRender = () => {
+    if (!kids.length && totalCount > 0) {
+      if (!children.hidden) requestFullSessionsForSidebar(wsId, children, "正在加载历史子会话…");
+    } else renderSubagentRows(children, kids, true, wsId);
+  };
   if (expanded || kids.length <= EAGER_GROUP_MAX) children._lazyRender();
   node.appendChild(children);
   return node;
@@ -2805,7 +3071,7 @@ function buildTreeGroup(label, kids, wsId) {
    可直接恢复），孤儿子会话用 renderSubagentRows 渲染。点击分组内会话
    行可正常打开（与普通树行一致）。展开状态持久（键 wsId:group:archive，
    与主会话 expanded 同 Set，内存态）。 */
-function buildArchiveGroup(archivedSessions, wsId, childrenByParent) {
+function buildArchiveGroup(archivedSessions, wsId, childrenByParent, totalCount = archivedSessions.length) {
   const archivedIds = new Set(archivedSessions.map((s) => s.id));
   const isMain = (s) => !s.parent_session_id && !/^(sub|btw)-/i.test(String(s.id || ""));
   // 根：无 parent 或 parent 不在归档集合内（归档孤儿）。主会话根用
@@ -2825,7 +3091,7 @@ function buildArchiveGroup(archivedSessions, wsId, childrenByParent) {
   toggle.title = "展开 / 收起";
   toggle.addEventListener("click", (ev) => toggleTreeGroup(ev, toggle, key, wsId));
   const idEl = el("span", "tree-id tree-group tree-archive-label",
-    "归档 (" + archivedSessions.length + ")");
+    "归档 (" + totalCount + ")");
   row.append(toggle, idEl);
   node.appendChild(row);
   const children = el("div", "tree-children");
@@ -2833,6 +3099,10 @@ function buildArchiveGroup(archivedSessions, wsId, childrenByParent) {
   children.hidden = !expanded;
   if (expanded) toggle.classList.add("open");
   children._lazyRender = () => {
+    if (!archivedSessions.length && totalCount > 0) {
+      if (expanded) requestFullSessionsForSidebar(wsId, children, "正在加载归档会话…");
+      return;
+    }
     for (const s of roots) {
       if (!isMain(s)) { renderSubagentRows(children, [s], true, wsId); continue; }
       children.appendChild(buildTreeRoot(s, childrenByParent.get(s.id) || [], wsId));
@@ -2854,11 +3124,20 @@ function toggleTreeGroup(ev, toggle, key, wsId) {
   if (children.hidden) {
     children.hidden = false;
     toggle.classList.add("open");
+    const ws = (state.workspaces || []).find((w) => w.id === wsId);
+    const detailKey = ws && workspaceToken(ws) ? workspaceIdentityKey(ws, workspaceToken(ws)) : null;
+    const retrying = detailKey && workspaceDetailErrors.has(detailKey);
+    if (retrying) workspaceDetailErrors.delete(detailKey);
     // 懒渲染：折叠期间不建子行 DOM，首次展开时才渲染（小分组已在构建时
     // 渲染过，firstChild 非空即跳过）；收起保留 DOM，再展开不重建。
-    if (children._lazyRender && !children.firstChild) children._lazyRender();
+    if (children._lazyRender && (!children.firstChild || retrying)) {
+      if (retrying) children.innerHTML = "";
+      children._lazyRender();
+    }
     state.sidebar.expanded.add(key);
-    ensureFullSessions(wsId);   // 展开 = 用户要完整视图：按需补拉全量
+    if (retrying && detailKey && !workspaceDetailRequestsPending.has(detailKey)) {
+      requestFullSessionsForSidebar(wsId, children, "正在加载完整会话…");
+    } else ensureFullSessions(wsId);   // 展开 = 用户要完整视图：按需补拉全量
   } else {
     children.hidden = true;
     toggle.classList.remove("open");

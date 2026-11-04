@@ -726,7 +726,7 @@ function stopSSE() {
 // 「← 主会话」：从 subagent 会话快速返回其父会话（无父则不显示按钮）
 els.backParentBtn.addEventListener("click", () => {
   const cur = (state.lastList || []).find((s) => s.id === state.sessionId);
-  if (cur && cur.parent_session_id) openSession(cur.parent_session_id);
+  if (cur && cur.parent_session_id) resolveSessionParentFromKnownRow(cur.id, cur.parent_session_id, state.workspace.id);
 });
 els.sidebarBtn.addEventListener("click", () => {
   if (state.sidebar.open) closeSidebar();
