@@ -13,9 +13,10 @@
  *      面板内每行一张任务卡片：bash 点击就地展开/收起 .task-output 并
  *      500ms 流式轮询 output 端点；delegate 点击切到 subagent 会话
  *      （解析不到时回退就地展开 .task-stream 内嵌 SSE）。
- * 按需拉取：pollTasks()（初始化 / SSE 工具事件 / 页面重新可见时调用）一次
- * GET /api/tasks 更新面板；live tasks 也在侧边栏 2s tick 刷新（仅 live；finished
- * history 仍按需）；「已完成」小节只在展开时
+ * 拉取：pollTasks()（初始化 / SSE 工具事件 / 页面重新可见时调用）一次
+ * GET /api/tasks 更新面板；live tasks 另有一条独立的 2s 链（只受页面可见性
+ * 约束，侧栏开关无关；仅 live；finished history 仍按需）。页面隐藏时本函数
+ * 直接返回，所有触发点共用这一处守卫。「已完成」小节只在展开时
  * GET /api/tasks/finished（loadFinishedTasks），不预加载。
  * ===================================================================*/
 /* GET /api/tasks → 任务数组；失败/无 token 返回 null（调用方决定如何处理）。
