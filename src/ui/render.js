@@ -1523,9 +1523,17 @@ function isFoldableBlock(k) {
     || k.classList.contains("tool-card");
 }
 
+/* 选择保护：移动/重建已渲染节点会打断进行中的文本选择，所以移动节点前先检查
+   选择是否落在消息区（移动包含选择锚点/焦点的块会打断选择）。已知缺口：
+   renderHistory 非前置插入、resync、缓存快照恢复仍会整体重建，仍可能打断选择；
+   这些故意不推迟——推迟同步渲染事务的一部分会丢失数据。 */
 function pruneMessages() {
   if (suppressScroll) return;   // 批量渲染期间不折叠（loadOlder 前置插入 / 初始渲染）
   const m = els.messages;
+  // 移入占位会移动已渲染的块，可能打断进行中的选择：有选择时跳过本轮折叠。
+  const selection = window.getSelection && window.getSelection();
+  if (selection && !selection.isCollapsed
+      && m.contains(selection.anchorNode) && m.contains(selection.focusNode)) return;
   const kids = [...m.children];
   if (kids.length <= MAX_MESSAGE_BLOCKS) return;
   let holder = null;
