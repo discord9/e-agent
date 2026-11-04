@@ -2001,6 +2001,36 @@ function restartTransport() {
   maybeHandleDeepLink();   // token 从空变有效：立即重试 pending 深链（不再等 poll round）
 }
 
+/* 运行中任务（环绕点 / 任务面板 / 侧边栏任务分组）与侧边栏是否打开无关：
+   自己的 2s setTimeout 链，只受页面可见性约束（sidebar 关闭不能停任务刷新；
+   否则别的会话新起的任务可能永久不显示）。与会话列表轮询共用 pollTasks 的
+   每 workspace 单飞，两条节奏互不重复触发。 */
+let taskPollTimer = null;
+let taskPollGeneration = 0;
+
+function shouldPollTasks() {
+  return !document.hidden;
+}
+
+function startTaskPolling() {
+  stopTaskPolling();
+  if (shouldPollTasks()) taskPollTimer = setTimeout(taskPollRound, POLL_INTERVAL_MS);
+}
+
+function stopTaskPolling() {
+  taskPollGeneration++;   // 使在途一轮的续调度失效
+  if (taskPollTimer) { clearTimeout(taskPollTimer); taskPollTimer = null; }
+}
+
+function taskPollRound() {
+  const gen = taskPollGeneration;
+  taskPollTimer = null;
+  void pollTasks({ liveOnly: true });
+  if (gen === taskPollGeneration && shouldPollTasks()) {
+    taskPollTimer = setTimeout(taskPollRound, POLL_INTERVAL_MS);
+  }
+}
+
 /* 聚合轮询：setTimeout 链（2s）驱动所有 workspace——一轮（并行拉取全部 +
    Promise.allSettled）完成才调度下一轮，天然防重入：慢响应不叠加、不并发
    轰炸。stopPolling 或条件不满足（聊天视图 + 侧边栏关闭）时不再续调度。
@@ -2038,8 +2068,6 @@ function pollRound() {
   // tick independently: per-workspace gates share that peer's request while
   // healthy workspaces make their next refresh on time.
   void runPollRound();
-  // Orbit dots and the task panel read the task snapshot, which has no timer of its own.
-  void pollTasks({ liveOnly: true });
   if (gen === state.pollGen && state.pollTimer === null && shouldPollSessions()) {
     state.pollTimer = setTimeout(pollRound, POLL_INTERVAL_MS);
   }
