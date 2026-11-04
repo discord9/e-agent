@@ -622,7 +622,7 @@ fn status_json(status: &SessionStatus) -> serde_json::Value {
 }
 
 /// Session metadata for `GET /api/sessions` and `POST /api/sessions`.
-#[derive(Serialize)]
+#[derive(Clone, Serialize, serde::Deserialize)]
 pub struct SessionMeta {
     pub id: String,
     pub model: String,
@@ -920,13 +920,36 @@ struct ListSessionsTiming {
     merge_ms: u128,
     connect_ms: u128,
     total_ms: u128,
+    response_bytes: u128,
+    serialization_ms: u128,
+    returned_rows: usize,
+    returned_live_rows: usize,
+    returned_historical_root_rows: usize,
+    returned_historical_child_rows: usize,
     list_meta_diagnostics: Option<ListMetaDiagnostics>,
 }
 
 /// Whether the request should emit a structured warning. Pure so the
 /// threshold/degraded predicate is unit-testable.
+const LIST_SESSIONS_OVERSIZED_BYTES: u128 = 131_072;
+
+fn record_returned_rows(timing: &mut ListSessionsTiming, rows: &[SessionMeta]) {
+    timing.returned_rows = rows.len();
+    for row in rows {
+        if row.active {
+            timing.returned_live_rows += 1;
+        } else if row.parent_session_id.is_some() {
+            timing.returned_historical_child_rows += 1;
+        } else {
+            timing.returned_historical_root_rows += 1;
+        }
+    }
+}
+
 fn list_sessions_is_slow(timing: ListSessionsTiming, degraded: bool) -> bool {
-    degraded || timing.total_ms >= LIST_SESSIONS_SLOW_THRESHOLD.as_millis()
+    degraded
+        || timing.total_ms >= LIST_SESSIONS_SLOW_THRESHOLD.as_millis()
+        || timing.response_bytes > LIST_SESSIONS_OVERSIZED_BYTES
 }
 
 /// The one `?exclude=` value `GET /api/sessions` understands: the sidebar
@@ -938,6 +961,109 @@ const EXCLUDE_ARCHIVED_CHILDREN: &str = "archived_children";
 #[derive(Deserialize, Default)]
 struct ListSessionsQuery {
     exclude: Option<String>,
+    mode: Option<String>,
+}
+
+const SIDEBAR_WINDOW_ROOTS: usize = 16;
+
+#[derive(Serialize, Deserialize)]
+struct SidebarTotals {
+    roots: i64,
+    archived: i64,
+    historical_children: i64,
+    all: i64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SidebarSnapshot {
+    partial: bool,
+    window_roots: usize,
+    sessions: Vec<SessionMeta>,
+    totals: SidebarTotals,
+    child_counts: HashMap<String, i64>,
+}
+
+fn sidebar_mode(mode: Option<&str>) -> bool {
+    mode == Some("sidebar")
+}
+
+fn compact_sidebar(merged: Vec<SessionMeta>) -> SidebarSnapshot {
+    let totals = SidebarTotals {
+        roots: merged
+            .iter()
+            .filter(|m| m.parent_session_id.is_none() && m.archived != Some(true))
+            .count() as i64,
+        archived: merged.iter().filter(|m| m.archived == Some(true)).count() as i64,
+        historical_children: merged
+            .iter()
+            .filter(|m| m.parent_session_id.is_some() && !m.active)
+            .count() as i64,
+        all: merged.len() as i64,
+    };
+    fn add(
+        index: usize,
+        merged: &[SessionMeta],
+        ids: &mut HashSet<String>,
+        selected: &mut Vec<usize>,
+    ) {
+        if ids.insert(merged[index].id.clone()) {
+            selected.push(index);
+        }
+    }
+    let mut selected = Vec::new();
+    let mut ids = HashSet::new();
+    for (i, meta) in merged.iter().enumerate() {
+        if meta.pinned == Some(true) {
+            add(i, &merged, &mut ids, &mut selected);
+        }
+    }
+    let mut root_count = 0;
+    for (i, meta) in merged.iter().enumerate() {
+        if meta.parent_session_id.is_none()
+            && meta.archived != Some(true)
+            && meta.pinned != Some(true)
+        {
+            if root_count < SIDEBAR_WINDOW_ROOTS {
+                add(i, &merged, &mut ids, &mut selected);
+            }
+            root_count += 1;
+        }
+    }
+    // Delegated sessions are leaf sessions here (nested `delegate` is unavailable to subagents).
+    let window_ids: HashSet<String> = ids.clone();
+    let live_children: Vec<usize> = merged
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| {
+            (m.active
+                && m.parent_session_id
+                    .as_ref()
+                    .is_some_and(|p| window_ids.contains(p)))
+            .then_some(i)
+        })
+        .collect();
+    for i in &live_children {
+        add(*i, &merged, &mut ids, &mut selected);
+    }
+    let rendered_ids: HashSet<&str> = selected.iter().map(|i| merged[*i].id.as_str()).collect();
+    let child_counts = merged
+        .iter()
+        .filter_map(|m| {
+            let parent = m.parent_session_id.as_ref()?;
+            (rendered_ids.contains(parent.as_str()) && !m.active).then_some((parent.clone(), 1i64))
+        })
+        .fold(HashMap::new(), |mut counts, (parent, n)| {
+            *counts.entry(parent).or_insert(0) += n;
+            counts
+        });
+    let sessions = selected.into_iter().map(|i| merged[i].clone()).collect();
+    SidebarSnapshot {
+        partial: true,
+        window_roots: SIDEBAR_WINDOW_ROOTS,
+        sessions,
+        totals,
+        child_counts,
+    }
 }
 
 /// Whether `?exclude=archived_children` drops this entry: archived sessions
@@ -965,7 +1091,7 @@ fn apply_list_sessions_exclude(merged: &mut Vec<SessionMeta>, exclude: Option<&s
 async fn list_sessions(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListSessionsQuery>,
-) -> Json<Vec<SessionMeta>> {
+) -> Response {
     let request_start = std::time::Instant::now();
     let mut timing = ListSessionsTiming::default();
     let mut degraded = false;
@@ -1020,8 +1146,11 @@ async fn list_sessions(
     // backend so only the rows the sidebar needs leave the database (the
     // in-memory filter below stays as a safety net). Unknown/absent
     // `exclude` values keep the full list.
-    let sidebar_filter =
-        (query.exclude.as_deref() == Some(EXCLUDE_ARCHIVED_CHILDREN)).then_some(&live_session_ids);
+    let sidebar_filter = if sidebar_mode(query.mode.as_deref()) {
+        None
+    } else {
+        (query.exclude.as_deref() == Some(EXCLUDE_ARCHIVED_CHILDREN)).then_some(&live_session_ids)
+    };
     let phase_start = std::time::Instant::now();
     // Historical sessions from the metadata table (Greptime/SQLite audit
     // table; JSONL `.meta.jsonl` sidecars).
@@ -1186,9 +1315,34 @@ async fn list_sessions(
     // status is merged in, and must survive the filter. The backend already
     // dropped the rows this request must hide (the live-id filter is pushed
     // into SQL / the sidecar scan), so this is a defense-in-depth safety
-    // net over the merged list.
-    apply_list_sessions_exclude(&mut merged, query.exclude.as_deref());
+    // net over the merged list. Compact summaries intentionally use the
+    // unfiltered merged list so totals and child counts include hidden rows.
+    let sidebar = sidebar_mode(query.mode.as_deref());
+    if !sidebar {
+        apply_list_sessions_exclude(&mut merged, query.exclude.as_deref());
+    }
     timing.merge_ms = phase_start.elapsed().as_millis();
+    let serialization_start = std::time::Instant::now();
+    let body = if sidebar {
+        let snapshot = compact_sidebar(merged);
+        record_returned_rows(&mut timing, &snapshot.sessions);
+        serde_json::to_vec(&snapshot)
+    } else {
+        record_returned_rows(&mut timing, &merged);
+        serde_json::to_vec(&merged)
+    };
+    let body = match body {
+        Ok(body) => body,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to serialize sessions response: {error}"),
+            )
+                .into_response();
+        }
+    };
+    timing.serialization_ms = serialization_start.elapsed().as_millis();
+    timing.response_bytes = body.len() as u128;
     timing.total_ms = request_start.elapsed().as_millis();
     if list_sessions_is_slow(timing, degraded) {
         list_sessions_slow_event(
@@ -1196,18 +1350,24 @@ async fn list_sessions(
             degraded,
             live_count,
             historical_count,
-            merged.len(),
+            timing.returned_rows,
             subagent_label_count,
             query.exclude.as_deref(),
+            sidebar,
         );
     }
-    Json(merged)
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap()
 }
 
 /// Emit the structured slow/degraded event. The caller gates on
 /// [`list_sessions_is_slow`] so this never runs for fast, clean requests.
 /// Fields stay free of session ids/titles/workspace paths; the focused
 /// capture test calls this same helper so it cannot drift from production.
+#[allow(clippy::too_many_arguments)]
 fn list_sessions_slow_event(
     timing: ListSessionsTiming,
     degraded: bool,
@@ -1216,6 +1376,7 @@ fn list_sessions_slow_event(
     merged_count: usize,
     subagent_label_count: usize,
     exclude: Option<&str>,
+    sidebar: bool,
 ) {
     let diagnostics = timing.list_meta_diagnostics;
     tracing::warn!(
@@ -1231,6 +1392,14 @@ fn list_sessions_slow_event(
         live_count,
         historical_count,
         merged_count,
+        response_bytes = timing.response_bytes,
+        serialization_ms = timing.serialization_ms,
+        returned_rows = timing.returned_rows,
+        returned_live_rows = timing.returned_live_rows,
+        returned_historical_root_rows = timing.returned_historical_root_rows,
+        returned_historical_child_rows = timing.returned_historical_child_rows,
+        oversized = timing.response_bytes > LIST_SESSIONS_OVERSIZED_BYTES,
+        response_mode = if sidebar { "sidebar" } else { "full" },
         subagent_labels_count = subagent_label_count,
         backend = diagnostics.map(|d| d.backend),
         facade_lock_wait_ms = diagnostics.map(|d| d.facade_lock_wait_ms),
@@ -3876,6 +4045,158 @@ mod tests {
         dir
     }
 
+    fn sample_meta(
+        id: &str,
+        parent: Option<&str>,
+        active: bool,
+        pinned: bool,
+        archived: bool,
+    ) -> SessionMeta {
+        SessionMeta {
+            id: id.to_owned(),
+            model: "m".to_owned(),
+            role: None,
+            created_at: chrono::Utc::now(),
+            last_active_at: chrono::Utc::now(),
+            status: "Idle".to_owned(),
+            entry_count: 0,
+            busy: false,
+            active,
+            parent_session_id: parent.map(str::to_owned),
+            title: None,
+            pinned: Some(pinned),
+            archived: Some(archived),
+            label: None,
+        }
+    }
+
+    #[test]
+    fn sidebar_window_keeps_pinned_roots_live_children_and_parent() {
+        let mut rows = vec![sample_meta("pin-archived", None, false, true, true)];
+        for i in 0..18 {
+            rows.push(sample_meta(&format!("root-{i}"), None, false, false, false));
+        }
+        rows.push(sample_meta(
+            "child-live",
+            Some("root-0"),
+            true,
+            false,
+            false,
+        ));
+        rows.push(sample_meta(
+            "orphan-live",
+            Some("absent"),
+            true,
+            false,
+            false,
+        ));
+        let snapshot = compact_sidebar(rows);
+        let ids: HashSet<String> = snapshot.sessions.iter().map(|m| m.id.clone()).collect();
+        let expected: HashSet<String> = std::iter::once("pin-archived".to_owned())
+            .chain((0..16).map(|i| format!("root-{i}")))
+            .chain(["child-live".to_owned()])
+            .collect();
+        assert_eq!(ids, expected);
+    }
+
+    #[test]
+    fn sidebar_recency_window_skips_roots_already_included_as_pinned() {
+        let mut rows = (0..=SIDEBAR_WINDOW_ROOTS)
+            .map(|i| sample_meta(&format!("pinned-{i}"), None, false, true, false))
+            .collect::<Vec<_>>();
+        rows.extend((0..3).map(|i| sample_meta(&format!("recent-{i}"), None, false, false, false)));
+
+        let snapshot = compact_sidebar(rows);
+        let ids: HashSet<String> = snapshot.sessions.iter().map(|m| m.id.clone()).collect();
+        for i in 0..=SIDEBAR_WINDOW_ROOTS {
+            assert!(ids.contains(&format!("pinned-{i}")));
+        }
+        for i in 0..3 {
+            assert!(ids.contains(&format!("recent-{i}")));
+        }
+    }
+
+    #[test]
+    fn sidebar_child_counts_cover_historical_children_not_rows() {
+        let snapshot = compact_sidebar(vec![
+            sample_meta("root", None, false, false, false),
+            sample_meta("old-1", Some("root"), false, false, false),
+            sample_meta("old-2", Some("root"), false, false, false),
+        ]);
+        assert_eq!(snapshot.child_counts.get("root"), Some(&2));
+        assert_eq!(
+            snapshot
+                .sessions
+                .iter()
+                .filter(|m| m.parent_session_id.is_some())
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn sidebar_totals_count_full_input() {
+        let mut rows = (0..20)
+            .map(|i| sample_meta(&format!("root-{i}"), None, false, false, false))
+            .collect::<Vec<_>>();
+        rows.push(sample_meta("archived", None, false, false, true));
+        rows.push(sample_meta(
+            "old-child",
+            Some("root-0"),
+            false,
+            false,
+            false,
+        ));
+        let snapshot = compact_sidebar(rows);
+        assert_eq!(snapshot.totals.roots, 20);
+        assert_eq!(snapshot.totals.archived, 1);
+        assert_eq!(snapshot.totals.historical_children, 1);
+        assert_eq!(snapshot.totals.all, 22);
+    }
+
+    #[test]
+    fn only_exact_sidebar_mode_changes_full_array_shape() {
+        assert!(!sidebar_mode(None));
+        assert!(!sidebar_mode(Some("")));
+        assert!(!sidebar_mode(Some("unknown")));
+        assert!(sidebar_mode(Some("sidebar")));
+        let actual =
+            serde_json::to_vec(&vec![sample_meta("one", None, false, false, false)]).unwrap();
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&actual)
+                .unwrap()
+                .is_array()
+        );
+    }
+
+    #[test]
+    fn oversized_predicate_uses_bytes_and_not_fast_sidebar_timing() {
+        assert!(list_sessions_is_slow(
+            ListSessionsTiming {
+                response_bytes: 131_073,
+                total_ms: 1,
+                ..Default::default()
+            },
+            false
+        ));
+        assert!(!list_sessions_is_slow(
+            ListSessionsTiming {
+                response_bytes: 131_072,
+                total_ms: 1,
+                ..Default::default()
+            },
+            false
+        ));
+        assert!(!list_sessions_is_slow(
+            ListSessionsTiming {
+                response_bytes: 1000,
+                total_ms: 1,
+                ..Default::default()
+            },
+            false
+        ));
+    }
+
     #[test]
     fn list_sessions_slow_predicate_is_silent_below_threshold_and_clean() {
         let timing = ListSessionsTiming {
@@ -3986,6 +4307,7 @@ mod tests {
                 36,
                 0,
                 Some(EXCLUDE_ARCHIVED_CHILDREN),
+                false,
             );
         });
 
@@ -7353,10 +7675,18 @@ model = "deepseek-chat"
 
         let listed = list_sessions(
             State(state.clone()),
-            Query(ListSessionsQuery { exclude: None }),
+            Query(ListSessionsQuery {
+                exclude: None,
+                mode: None,
+            }),
         )
-        .await
-        .0;
+        .await;
+        let listed: Vec<SessionMeta> = serde_json::from_slice(
+            &axum::body::to_bytes(listed.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         let by_id: HashMap<&str, &SessionMeta> =
             listed.iter().map(|m| (m.id.as_str(), m)).collect();
 
@@ -7413,10 +7743,16 @@ model = "deepseek-chat"
             State(state.clone()),
             Query(ListSessionsQuery {
                 exclude: Some(EXCLUDE_ARCHIVED_CHILDREN.to_owned()),
+                mode: None,
             }),
         )
-        .await
-        .0;
+        .await;
+        let filtered: Vec<SessionMeta> = serde_json::from_slice(
+            &axum::body::to_bytes(filtered.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         let kept: HashSet<&str> = filtered.iter().map(|m| m.id.as_str()).collect();
         assert!(
             !kept.contains("sub-stale"),
@@ -7568,6 +7904,168 @@ model = "deepseek-chat"
             4,
             "unknown exclude values keep the full list"
         );
+    }
+
+    #[tokio::test]
+    async fn sidebar_summary_counts_excluded_rows_from_full_merged_list() {
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let store = SessionStore::Jsonl;
+        store
+            .create_meta(&root, "parent", Some("test-model"), None, None, None, None)
+            .await
+            .unwrap();
+        store
+            .create_meta(
+                &root,
+                "historical-child",
+                Some("test-model"),
+                None,
+                Some("parent"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .create_meta(
+                &root,
+                "archived-root",
+                Some("test-model"),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .set_archived(&root, "archived-root", true)
+            .await
+            .unwrap();
+
+        let state = Arc::new(AppState {
+            factory: crate::session_factory::SessionFactory::test_factory(root),
+            registry: Arc::new(SessionRegistry::default()),
+            token: "sekrit".to_owned(),
+            meta_store: SessionStore::Jsonl,
+            summaries: Arc::new(Mutex::new(HashMap::new())),
+            summary_pending: Arc::new(SummaryPending(Mutex::new(HashSet::new()))),
+            shutdown: watch::channel(()).0,
+        });
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions?exclude=archived_children&mode=sidebar")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let snapshot: SidebarSnapshot = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            snapshot.sessions.iter().all(|m| m.id != "historical-child"),
+            "inactive historical child should not be rendered as a row"
+        );
+        assert_eq!(snapshot.child_counts.get("parent"), Some(&1));
+        assert_eq!(snapshot.totals.historical_children, 1);
+        assert_eq!(snapshot.totals.archived, 1);
+    }
+
+    #[tokio::test]
+    async fn full_mode_absent_and_unknown_mode_have_identical_filtered_wire_response() {
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let store = SessionStore::Jsonl;
+        for id in ["keep", "archived", "pinned-archived"] {
+            store
+                .create_meta(&root, id, Some("test-model"), None, None, None, None)
+                .await
+                .unwrap();
+        }
+        store.set_archived(&root, "archived", true).await.unwrap();
+        store
+            .set_archived(&root, "pinned-archived", true)
+            .await
+            .unwrap();
+        store
+            .set_pinned(&root, "pinned-archived", true)
+            .await
+            .unwrap();
+
+        let state = Arc::new(AppState {
+            factory: crate::session_factory::SessionFactory::test_factory(root),
+            registry: Arc::new(SessionRegistry::default()),
+            token: "sekrit".to_owned(),
+            meta_store: SessionStore::Jsonl,
+            summaries: Arc::new(Mutex::new(HashMap::new())),
+            summary_pending: Arc::new(SummaryPending(Mutex::new(HashSet::new()))),
+            shutdown: watch::channel(()).0,
+        });
+        let app = router(state);
+        async fn get(app: &axum::Router, uri: &str) -> (StatusCode, String, Vec<u8>) {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header(header::AUTHORIZATION, "Bearer sekrit")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let content_type = response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec();
+            (status, content_type, body)
+        }
+
+        let (status_absent, content_type_absent, absent_body) =
+            get(&app, "/api/sessions?exclude=archived_children").await;
+        let (status_unknown, content_type_unknown, unknown_body) =
+            get(&app, "/api/sessions?exclude=archived_children&mode=unknown").await;
+        assert_eq!(status_absent, StatusCode::OK);
+        assert_eq!(status_unknown, StatusCode::OK);
+        assert_eq!(content_type_absent, "application/json");
+        assert_eq!(content_type_unknown, "application/json");
+        let absent: serde_json::Value = serde_json::from_slice(&absent_body).unwrap();
+        let unknown: serde_json::Value = serde_json::from_slice(&unknown_body).unwrap();
+        assert!(absent.is_array());
+        assert!(unknown.is_array());
+        for body in [&absent, &unknown] {
+            let ids: HashSet<&str> = body
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["id"].as_str().unwrap())
+                .collect();
+            assert!(!ids.contains("archived"));
+            assert!(ids.contains("pinned-archived"));
+        }
+        assert_eq!(absent_body, unknown_body);
     }
 
     /// The web addresses a subagent by session id exactly like the TUI:
