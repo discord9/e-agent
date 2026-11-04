@@ -148,6 +148,11 @@ function pollTaskWorkspace(ws, kind, fetcher, refresh) {
    never holds healthy results or their next polling cycle, and its eventual
    success is still applied unless that workspace changed or was removed. */
 async function pollTasks(options) {
+  // 隐藏页面零任务流量：2s 节奏已在 visibilitychange 停止，而 SSE 工具事件、
+  // init/openSession/openSidebar 等触发点都汇集到本函数，所以只在这一处拦截。
+  // 恢复可见时 sse.js 先 pollTasks()（此时 hidden 已为 false）再重启节奏，
+  // 顺序保证立即刷新不被吞掉。
+  if (document.hidden) return;
   const liveOnly = !!(options && options.liveOnly);
   const wss = (state.workspaces || []).slice();
   if (!wss.length && state.workspace) wss.push(state.workspace);
