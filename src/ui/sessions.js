@@ -298,6 +298,12 @@ function ensureFullSessions(wsId) {
   const ws = (state.workspaces || []).find((w) => w.id === wsId);
   if (!ws || !workspaceToken(ws)) return Promise.resolve(null);
   const key = workspaceIdentityKey(ws, workspaceToken(ws));
+  // 已成功拉到过完整列表、且没有待重试的失败标记：直接复用缓存基线，绝不再发
+  // 请求——展开/收起反复切换不得产生网络流量（此前只有 in-flight 去重）。
+  // 失败身份（workspaceDetailErrors 有键，重试路径会先清除它）仍会真正重拉。
+  if (workspaceDetailsLoaded.has(key) && !workspaceDetailErrors.has(key)) {
+    return Promise.resolve(workspaceDetailLists.get(key) || []);
+  }
   return fetchAllSessions(ws).catch(() => {
     workspaceDetailErrors.add(key);
     return null;
@@ -987,6 +993,38 @@ function saveSessionState() {
   };
 }
 
+/* 「← 主会话」的临时重试：详情加载失败时安装（内联 onclick，与 sse.js 的
+   常驻监听并存）。失败态下常驻监听找不到当前行 → 不导航，所以一次点击只
+   触发一次重试；重试成功/再次失败时内联处理器立即自清，恢复后剩余的点击
+   只走常驻监听（一次导航、零额外请求）。 */
+function installBackParentRetry(wsId, id) {
+  const detailKey = workspaceIdentityKey(state.workspace, workspaceToken(state.workspace));
+  els.backParentBtn.hidden = false;
+  els.backParentBtn.title = "加载父会话信息失败，点击重试";
+  els.backParentBtn.onclick = () => {
+    els.backParentBtn.onclick = null;      // 一次性：先清，避免重入/残留
+    els.backParentBtn.title = "返回主会话";
+    workspaceDetailErrors.delete(detailKey);
+    if (workspaceDetailRequestsPending.has(detailKey)) {
+      installBackParentRetry(wsId, id);    // 在途：保留可用重试，不重复请求
+      return;
+    }
+    els.backParentBtn.hidden = true;
+    workspaceDetailRequestsPending.add(detailKey);
+    ensureFullSessions(wsId).then((rows) => {
+      if (state.workspace.id !== wsId || state.sessionId !== id) return;
+      if (!rows) {
+        workspaceDetailErrors.add(detailKey);
+        installBackParentRetry(wsId, id);  // 仍失败：保留可用重试
+        return;
+      }
+      const row = (state.lastList || []).find((s) => s.id === id);
+      els.backParentBtn.hidden = !row || !row.parent_session_id;
+      els.backParentBtn.title = "返回主会话";
+    }).finally(() => workspaceDetailRequestsPending.delete(detailKey));
+  };
+}
+
 function openSession(id, onReady, epoch, timeoutMs) {
   // 打开即声明新代次（入口调用）；嵌套调用（openSessionIn/resumeSession 等
   // 已声明过）传入共享的代次，不再递增——一次用户动作只有一个 action epoch。
@@ -1021,7 +1059,8 @@ function openSession(id, onReady, epoch, timeoutMs) {
   // cur 不存在则不动按钮（保持现状），等 refreshSessionsForSidebar 拉到
   // 列表后由它判定，避免把返回按钮误藏。
   const cur = (state.lastList || []).find((s) => s.id === id);
-  els.backParentBtn.onclick = null;
+  els.backParentBtn.onclick = null;          // 每次打开都从无临时处理器开始
+  els.backParentBtn.title = "返回主会话";
   if (cur) {
     els.backParentBtn.hidden = !cur.parent_session_id;
   } else {
@@ -1032,44 +1071,18 @@ function openSession(id, onReady, epoch, timeoutMs) {
       ensureFullSessions(state.workspace.id).then((rows) => {
         if (!rows) {
           workspaceDetailErrors.add(detailKey);
-          if (state.workspace.id === wsId && state.sessionId === id) {
-            els.backParentBtn.hidden = false;
-            els.backParentBtn.title = "加载父会话信息失败，点击重试";
-            els.backParentBtn.onclick = () => {
-              workspaceDetailErrors.delete(detailKey);
-              workspaceDetailRequestsPending.add(detailKey);
-              ensureFullSessions(wsId).then((retryRows) => {
-                if (!retryRows || state.workspace.id !== wsId || state.sessionId !== id) {
-                  workspaceDetailErrors.add(detailKey);
-                  return;
-                }
-                const retrySession = (state.lastList || []).find((s) => s.id === id);
-                els.backParentBtn.hidden = !retrySession || !retrySession.parent_session_id;
-                els.backParentBtn.title = "返回主会话";
-              }).finally(() => workspaceDetailRequestsPending.delete(detailKey));
-            };
-          }
+          if (state.workspace.id === wsId && state.sessionId === id) installBackParentRetry(wsId, id);
           return;
         }
         workspaceDetailErrors.delete(detailKey);
         if (state.workspace.id !== wsId || state.sessionId !== id) return;
         const loaded = (state.lastList || []).find((s) => s.id === id);
         els.backParentBtn.hidden = !loaded || !loaded.parent_session_id;
+        els.backParentBtn.title = "返回主会话";
+        els.backParentBtn.onclick = null;    // 恢复成功：清除临时处理器
       }).finally(() => workspaceDetailRequestsPending.delete(detailKey));
     } else if (workspaceDetailErrors.has(detailKey)) {
-      els.backParentBtn.hidden = false;
-      els.backParentBtn.onclick = () => {
-        workspaceDetailErrors.delete(detailKey);
-        workspaceDetailRequestsPending.add(detailKey);
-        ensureFullSessions(wsId).then((rows) => {
-          if (!rows || state.workspace.id !== wsId || state.sessionId !== id) {
-            workspaceDetailErrors.add(detailKey);
-            return;
-          }
-          const retrySession = (state.lastList || []).find((s) => s.id === id);
-          els.backParentBtn.hidden = !retrySession || !retrySession.parent_session_id;
-        }).finally(() => workspaceDetailRequestsPending.delete(detailKey));
-      };
+      installBackParentRetry(wsId, id);
     }
   }
   renderChatSessionId(id);
