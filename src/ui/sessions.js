@@ -1134,6 +1134,8 @@ function openSession(id, onReady, epoch, timeoutMs) {
     }
   }
   renderChatSessionId(id);
+  // Show this session's tasks immediately instead of waiting for the next tick.
+  void pollTasks({ liveOnly: true });
   updateComposerMeta();          // 显示当前会话 model · role（缓存/首开/恢复共用）
   els.usageInfo.textContent = "";
   applyStatus("Idle");
@@ -1997,6 +1999,36 @@ function restartTransport() {
     openWith(id, true, undefined, state.workspace.id, claimed);
   }
   maybeHandleDeepLink();   // token 从空变有效：立即重试 pending 深链（不再等 poll round）
+}
+
+/* 运行中任务（环绕点 / 任务面板 / 侧边栏任务分组）与侧边栏是否打开无关：
+   自己的 2s setTimeout 链，只受页面可见性约束（sidebar 关闭不能停任务刷新；
+   否则别的会话新起的任务可能永久不显示）。与会话列表轮询共用 pollTasks 的
+   每 workspace 单飞，两条节奏互不重复触发。 */
+let taskPollTimer = null;
+let taskPollGeneration = 0;
+
+function shouldPollTasks() {
+  return !document.hidden;
+}
+
+function startTaskPolling() {
+  stopTaskPolling();
+  if (shouldPollTasks()) taskPollTimer = setTimeout(taskPollRound, POLL_INTERVAL_MS);
+}
+
+function stopTaskPolling() {
+  taskPollGeneration++;   // 使在途一轮的续调度失效
+  if (taskPollTimer) { clearTimeout(taskPollTimer); taskPollTimer = null; }
+}
+
+function taskPollRound() {
+  const gen = taskPollGeneration;
+  taskPollTimer = null;
+  void pollTasks({ liveOnly: true });
+  if (gen === taskPollGeneration && shouldPollTasks()) {
+    taskPollTimer = setTimeout(taskPollRound, POLL_INTERVAL_MS);
+  }
 }
 
 /* 聚合轮询：setTimeout 链（2s）驱动所有 workspace——一轮（并行拉取全部 +

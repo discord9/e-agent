@@ -916,16 +916,18 @@ function init() {
     if (localStorage.getItem("e-agent.sidebar.open") === "1") openSidebar();
   } catch (e) { /* 静默 */ }
   // 运行中任务：初始化拉一次更新侧边栏树分组 + composer 折叠条/面板
-  //（无 token 时 fetchTasks 静默跳过；之后由 SSE 工具事件与页面重新可见
-  // 触发，无常驻定时器——空闲时不打 /api/tasks）
+  //（无 token 时 fetchTasks 静默跳过）。之后由 SSE 工具事件、页面重新可见
+  // 与独立的 2s 任务节奏刷新——任务面板与侧边栏无关，sidebar 关闭时仍继续。
   pollTasks();
+  startTaskPolling();
   // 页面隐藏（切标签页/最小化）时暂停会话 2s 轮询：后台标签页无需拉取，
   // 避免 5 workspace × 多条轮询持续打服务器；重新可见时立即补一轮会话 +
-  // 任务（pollTasks 单次；任务侧已无定时器，隐藏时无需额外处理）。
+  // 任务。任务节奏只受可见性约束（与侧边栏开关无关）。
   // 只挂一次：init 是唯一启动入口。
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) {
       stopPolling();
+      stopTaskPolling();
     } else {
       if (shouldPollSessions()) {
         startPolling();
@@ -934,6 +936,7 @@ function init() {
         stopPolling();
       }
       pollTasks();
+      startTaskPolling();
     }
   });
 }

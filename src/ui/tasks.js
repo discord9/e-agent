@@ -13,8 +13,10 @@
  *      面板内每行一张任务卡片：bash 点击就地展开/收起 .task-output 并
  *      500ms 流式轮询 output 端点；delegate 点击切到 subagent 会话
  *      （解析不到时回退就地展开 .task-stream 内嵌 SSE）。
- * 按需拉取：pollTasks()（初始化 / SSE 工具事件 / 页面重新可见时调用，无
- * 定时器）一次 GET /api/tasks 更新面板；「已完成」小节只在展开时
+ * 拉取：pollTasks()（初始化 / SSE 工具事件 / 页面重新可见时调用）一次
+ * GET /api/tasks 更新面板；live tasks 另有一条独立的 2s 链（只受页面可见性
+ * 约束，侧栏开关无关；仅 live；finished history 仍按需）。页面隐藏时本函数
+ * 直接返回，所有触发点共用这一处守卫。「已完成」小节只在展开时
  * GET /api/tasks/finished（loadFinishedTasks），不预加载。
  * ===================================================================*/
 /* GET /api/tasks → 任务数组；失败/无 token 返回 null（调用方决定如何处理）。
@@ -146,14 +148,20 @@ function pollTaskWorkspace(ws, kind, fetcher, refresh) {
 /* Each workspace/endpoint is independently single-flight. A slow workspace
    never holds healthy results or their next polling cycle, and its eventual
    success is still applied unless that workspace changed or was removed. */
-async function pollTasks() {
+async function pollTasks(options) {
+  // 隐藏页面零任务流量：2s 节奏已在 visibilitychange 停止，而 SSE 工具事件、
+  // init/openSession/openSidebar 等触发点都汇集到本函数，所以只在这一处拦截。
+  // 恢复可见时 sse.js 先 pollTasks()（此时 hidden 已为 false）再重启节奏，
+  // 顺序保证立即刷新不被吞掉。
+  if (document.hidden) return;
+  const liveOnly = !!(options && options.liveOnly);
   const wss = (state.workspaces || []).slice();
   if (!wss.length && state.workspace) wss.push(state.workspace);
   const live = wss.map((ws) => pollTaskWorkspace(ws, "live", fetchTasks));
   // 「已完成」小节只在用户展开着时才顺带刷新：折叠（默认）时一次都不拉，因此
   // 默认状态零 finished 流量；首次数据由展开动作触发（loadFinishedTasks）。
   // live 与 finished 分别应用：慢的持久化查询不会阻塞运行中任务面板。
-  if (finishedSectionExpanded()) {
+  if (!liveOnly && finishedSectionExpanded()) {
     void Promise.allSettled(wss.map((ws) => pollTaskWorkspace(ws, "finished", fetchFinishedTasks)));
   }
   await Promise.allSettled(live);
@@ -894,7 +902,8 @@ function buildTaskRow(t, key, restoreExpanded, depth, connector) {
   // 当前会话发起的任务（bash 的 session_id / delegate 的父 session_id 等于
   // 正在查看的会话）→ 行加 current 标记：左侧 cyan accent bar + 「本会话」
   // 标签，任务面板里一眼可辨哪些属于当前会话。
-  const isCurrentSession = t.session_id != null && t.session_id === state.sessionId;
+  // owner_session is the true initiator; a subagent's bash task lives in its parent's registry.
+  const isCurrentSession = t.session_id != null && (t.session_id === state.sessionId || t.owner_session === state.sessionId);
   const row = el("div", "task-row" + (isCurrentSession ? " task-row-current" : ""));
   row.setAttribute("data-task", key);
   row.setAttribute("data-key-sig", taskKeySig(t));
