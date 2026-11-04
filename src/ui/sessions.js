@@ -76,6 +76,10 @@ const SESSIONS_POLL_PATH = SESSIONS_PATH + "?mode=sidebar";
 const workspaceSidebarSnapshots = new Map();
 const workspaceDetailLists = new Map();
 const workspaceDetailsLoaded = new Set();
+/* 摘要在轮询中变化 → 已加载的完整列表可能过期。只打标记、保留 loaded：自动
+   渲染路径见到 stale 一律不请求（只显示「数据已变化，点击刷新」），只有用户
+   显式动作才清除标记并重拉一次。 */
+const workspaceDetailsStale = new Set();
 const workspaceDetailRequestsPending = new Set();
 const workspaceDetailErrors = new Set();
 const workspaceListIdentities = new Map();
@@ -140,6 +144,7 @@ function pruneWorkspaceSessionCaches() {
   for (const key of workspaceSidebarSnapshots.keys()) if (!live.has(key)) workspaceSidebarSnapshots.delete(key);
   for (const key of workspaceDetailLists.keys()) if (!live.has(key)) workspaceDetailLists.delete(key);
   for (const key of workspaceDetailsLoaded) if (!live.has(key)) workspaceDetailsLoaded.delete(key);
+  for (const key of workspaceDetailsStale) if (!live.has(key)) workspaceDetailsStale.delete(key);
   for (const key of workspaceDetailRequestsPending) if (!live.has(key)) workspaceDetailRequestsPending.delete(key);
   for (const key of workspaceDetailErrors) if (!live.has(key)) workspaceDetailErrors.delete(key);
 }
@@ -160,14 +165,18 @@ function afterPollRound() {
       updateCurrentSessionBusy();
       syncDocumentTitle();   // 服务端后台生成的标题在轮询后同步到标签页
       const cur = (state.lastList || []).find((s) => s.id === state.sessionId);
-      if (cur) {
-        els.backParentBtn.hidden = !cur.parent_session_id;
-        // 轮询已给出可用父信息：撤掉 installBackParentRetry 的临时处理器，
-        // 否则一次点击既导航又发起一次重试请求。父信息仍缺失则保留处理器。
-        if (cur.parent_session_id) {
-          els.backParentBtn.onclick = null;
-          els.backParentBtn.title = "返回主会话";
-        }
+      // 临时重试已安装（onclick 非空）：无论当前行是否存在/是否有父，都必须
+      // 保持可用——否则一次轮询就会把重试控件藏掉。只在恢复父信息或导航时清。
+      const retryHandler = els.backParentBtn.onclick;
+      if (cur && cur.parent_session_id) {
+        els.backParentBtn.hidden = false;
+        els.backParentBtn.onclick = null;
+        els.backParentBtn.title = "返回主会话";
+      } else if (retryHandler) {
+        els.backParentBtn.hidden = false;
+        els.backParentBtn.title = "加载父会话信息失败，点击重试";
+      } else if (cur) {
+        els.backParentBtn.hidden = true;
       }
       else if (!workspaceDetailsLoaded.has(workspaceIdentityKey(state.workspace, workspaceToken(state.workspace)))) {
         els.backParentBtn.hidden = true;
@@ -253,12 +262,13 @@ async function pollWorkspaceSessionsNow(ws, identity) {
         partial: false, sessions: data, totals: null, child_counts: null,
       } : {
         partial: true, sessions: data.sessions,
-        totals: data.totals || {}, child_counts: data.child_counts || {},
+        totals: data.totals || null, child_counts: data.child_counts || {},
       };
-      // 摘要变化 → 已加载的完整列表缓存失效，下次用户按需动作重拉一次。
+      // 摘要变化 → 标记已加载的完整列表过期（保留 loaded）。只打标记、不发
+      // 请求：自动渲染见到 stale 只显示刷新控件，重拉必须由用户显式触发。
       // 错误标记保持粘性（真正失败仍需用户显式重试，不被轮询自动清除）。
       if (sidebarTotalsChanged((workspaceSidebarSnapshots.get(fullKey) || {}).totals, snapshot.totals)) {
-        workspaceDetailsLoaded.delete(fullKey);
+        workspaceDetailsStale.add(fullKey);
       }
       workspaceSidebarSnapshots.set(fullKey, snapshot);
       if (snapshot.partial) {
@@ -269,6 +279,7 @@ async function pollWorkspaceSessionsNow(ws, identity) {
         list = snapshot.sessions;
         workspaceDetailLists.set(fullKey, list);
         workspaceDetailsLoaded.add(fullKey);
+        workspaceDetailsStale.delete(fullKey);   // 权威全量：最新，非过期
       }
     }
   } catch (e) {
@@ -319,10 +330,11 @@ function ensureFullSessions(wsId) {
   const ws = (state.workspaces || []).find((w) => w.id === wsId);
   if (!ws || !workspaceToken(ws)) return Promise.resolve(null);
   const key = workspaceIdentityKey(ws, workspaceToken(ws));
-  // 已成功拉到过完整列表、且没有待重试的失败标记：直接复用缓存基线，绝不再发
-  // 请求——展开/收起反复切换不得产生网络流量（此前只有 in-flight 去重）。
-  // 失败身份（workspaceDetailErrors 有键，重试路径会先清除它）仍会真正重拉。
-  if (workspaceDetailsLoaded.has(key) && !workspaceDetailErrors.has(key)) {
+  // 已成功拉到过完整列表、且既没有失败标记也没有过期标记：直接复用缓存基线，
+  // 绝不再发请求——展开/收起反复切换不得产生网络流量（此前只有 in-flight 去重）。
+  // 过期身份走真正的重拉；本函数只被显式用户动作或已通过 stale 门禁的路径调用。
+  if (workspaceDetailsLoaded.has(key) && !workspaceDetailErrors.has(key)
+      && !workspaceDetailsStale.has(key)) {
     return Promise.resolve(workspaceDetailLists.get(key) || []);
   }
   return fetchAllSessions(ws).catch(() => {
@@ -344,19 +356,33 @@ function requestFullSessionsForSidebar(wsId, container, loadingText, onSuccess =
       retry.type = "button";
       retry.addEventListener("click", () => {
         workspaceDetailErrors.delete(key);
+        workspaceDetailsStale.delete(key);
+        workspaceDetailsLoaded.delete(key);
         requestFullSessionsForSidebar(wsId, container, loadingText, onSuccess);
       });
       container.appendChild(retry);
+    } else if (workspaceDetailsStale.has(key)) {
+      // 概要是轮询发现的过期：自动渲染绝不请求，只提供显式刷新控件。
+      const refresh = el("button", "tree-empty", "数据已变化，点击刷新");
+      refresh.type = "button";
+      refresh.addEventListener("click", () => {
+        workspaceDetailsStale.delete(key);
+        workspaceDetailsLoaded.delete(key);
+        requestFullSessionsForSidebar(wsId, container, loadingText, onSuccess);
+      });
+      container.appendChild(refresh);
     } else container.appendChild(el("div", "tree-empty", loadingText));
   };
   if (container.hidden) return; // collapsed history/archive groups do not fetch
-  if (workspaceDetailsLoaded.has(key)) {
+  if (workspaceDetailsLoaded.has(key) && !workspaceDetailsStale.has(key)) {
     container.innerHTML = "";
     container.appendChild(el("div", "tree-empty", "已加载；当前摘要中的会话行不可用。"));
     return;
   }
   showState();
+  // 自动渲染路径到此为止：失败粘性 + 过期（且无在途请求）都不得自动请求。
   if (workspaceDetailRequestsPending.has(key) || workspaceDetailErrors.has(key)) return;
+  if (workspaceDetailsStale.has(key)) return;
   workspaceDetailRequestsPending.add(key);
   ensureFullSessions(wsId).then((rows) => {
     if (rows) {
@@ -404,6 +430,7 @@ async function fetchAllSessionsNow(ws, identity) {
   if (!workspaceRequestCurrent(ws, identity)) return null;
   const full = response.json;
   workspaceDetailErrors.delete(key);
+  workspaceDetailsStale.delete(key);   // 刚拉到的权威全量：不再过期
   workspaceDetailLists.set(key, full);
   workspaceDetailsLoaded.add(key);
   state.workspaceLists[ws.id] = full;
@@ -2486,7 +2513,7 @@ function renderSidebarTree(force) {
     const body = el("div", "tree-ws-body");
     const snapshot = workspaceSnapshotFor(ws);
     const detailsKey = workspaceIdentityKey(ws, workspaceToken(ws));
-    if (state.sidebar.filter && !workspaceDetailsLoaded.has(detailsKey)) {
+    if (state.sidebar.filter && (!workspaceDetailsLoaded.has(detailsKey) || workspaceDetailsStale.has(detailsKey))) {
       requestFullSessionsForSidebar(ws.id, body, "正在加载完整会话以搜索…");
     } else if (!list.length && !snapshot) {
       const emptyText = (err === "network" || err === "timeout")
@@ -2670,6 +2697,11 @@ function renderTreeForList(container, list, wsId) {
       moreBtn.addEventListener("click", () => {
         const ws = (state.workspaces || []).find((w) => w.id === wsId) || state.workspace;
         const key = workspaceIdentityKey(ws, workspaceToken(ws));
+        // 「显示全部」是显式用户动作：过期身份先失效再重拉一次。
+        if (workspaceDetailsStale.has(key)) {
+          workspaceDetailsStale.delete(key);
+          workspaceDetailsLoaded.delete(key);
+        }
         const full = workspaceDetailsLoaded.has(key);
         if (full) {
           state.sidebar.showAllWs.add(wsId);
@@ -2893,6 +2925,13 @@ function toggleSidebarNode(key, toggle, kids, wsId, parentSid) {
     children.hidden = false;
     toggle.classList.add("open");
     if (!kids.length) {
+      // 展开点击 = 显式动作：过期身份在这里失效，允许本次重拉一次。
+      const wsExp = (state.workspaces || []).find((w) => w.id === wsId);
+      const keyExp = wsExp && workspaceToken(wsExp) ? workspaceIdentityKey(wsExp, workspaceToken(wsExp)) : null;
+      if (keyExp && workspaceDetailsStale.has(keyExp)) {
+        workspaceDetailsStale.delete(keyExp);
+        workspaceDetailsLoaded.delete(keyExp);
+      }
       requestFullSessionsForSidebar(wsId, children, "正在加载子会话…");
     } else renderTreeChildren(children, kids, wsId, parentSid);
     state.sidebar.expanded.add(key);
