@@ -7317,11 +7317,11 @@ fn gpu_binds_plan_ordering_and_opt_in() {
             "{node} must be bound after --dev /dev, not shadowed by it: {args:?}"
         );
     }
-    // The AMD runtime needs these sysfs subtrees read-only. KFD class is
-    // the profiler's literal path (and symlink resolution requires /sys/class);
-    // DRM class entries support render-node enumeration. The host running
-    // this plan test has no KFD device, so this verifies plan construction,
-    // not real ROCm enumeration.
+    // The AMD runtime needs these sysfs subtrees read-only. `/sys/class/kfd`
+    // is the class pathname the profiler opens; its device link resolves into
+    // `/sys/devices`. `/sys/class/drm` supports render-node enumeration. The
+    // host running this plan test has no KFD device, so this verifies plan
+    // construction, not real ROCm enumeration.
     for path in [
         "/sys/devices",
         "/sys/dev/char",
@@ -7374,6 +7374,24 @@ fn gpu_binds_plan_ordering_and_opt_in() {
         generic < kfd,
         "the GPU device bind must win over a configured /dev mount: {configured:?}"
     );
+    // The sysfs grants need the same precedence: a configured read-only
+    // `/sys` mounts the whole tree BEFORE the GPU loop, so the class subtrees
+    // must be re-bound after it or the generic mount would shadow them.
+    let configured_sys = configure("/sys");
+    let generic_sys = configured_sys
+        .windows(3)
+        .position(|w| w[0] == "--ro-bind-try" && w[1] == "/sys" && w[2] == "/sys")
+        .expect("the configured /sys mount must be present");
+    for path in ["/sys/class/kfd", "/sys/class/drm"] {
+        let grant = configured_sys
+            .windows(3)
+            .position(|w| w[0] == "--ro-bind-try" && w[1] == path && w[2] == path)
+            .unwrap_or_else(|| panic!("missing GPU sysfs grant {path}: {configured_sys:?}"));
+        assert!(
+            generic_sys < grant,
+            "{path} must win over a configured /sys mount: {configured_sys:?}"
+        );
+    }
     // Off by default: the same workspace without gpu carries no device binds
     // and no sysfs grants.
     let plain = crate::config::Sandbox::default();

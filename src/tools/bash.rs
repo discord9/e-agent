@@ -837,8 +837,9 @@ pub(super) fn build_bwrap_plan(
     // uses to match KFD nodes to render nodes), `/sys/class/drm` (the DRM
     // class entries used for render-node enumeration), and `/sys/module/amdgpu`
     // (rocminfo's module gate) — all read-only. The profiler opens
-    // `/sys/class/kfd/...`; bind that specific class subtree because the
-    // literal path is a symlink whose target resolves through `/sys/class`.
+    // `/sys/class/kfd/...`, so that class pathname itself must exist inside
+    // the sandbox; its KFD device link resolves into the `/sys/devices`
+    // subtree bound above.
     // Installed after every configured mount so the `--dev-bind-try` devices
     // win over any overlapping configured bind (last mount wins in bwrap).
     if sandbox.gpu {
