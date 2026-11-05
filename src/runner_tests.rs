@@ -16098,3 +16098,163 @@ async fn runner_without_background_registry_does_not_clear_durable_rows_on_notic
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].task_id, 41);
 }
+
+// ----------------------------------------------------------------------
+// Turn-boundary status publication (`SessionRunner::status`)
+//
+// The idle loop re-enters the turn-end block on every one-second projection
+// tick, so it calls `status(Idle)` repeatedly while nothing changed. Status
+// NOTIFICATION stays unconditional — every publish wakes subscribers exactly
+// as it always did, and the summary listener relies on that — but the
+// sessions audit write (R4) is gated on a real transition, so an idle session
+// appends one metadata row per actual return to Idle instead of one per tick.
+// These tests pin the store-write invariant only.
+// ----------------------------------------------------------------------
+
+/// Lines in a session's JSONL metadata sidecar (`<id>.meta.jsonl`): every
+/// `touch_meta` appends exactly one full snapshot line, so the line count is
+/// an observable proxy for "the store write happened" that needs no
+/// production test seam.
+fn meta_sidecar_lines(root: &std::path::Path, session: &str) -> usize {
+    std::fs::read_to_string(
+        root.join(".e-agent/sessions")
+            .join(format!("{session}.meta.jsonl")),
+    )
+    .map(|raw| raw.lines().filter(|line| !line.trim().is_empty()).count())
+    .unwrap_or(0)
+}
+
+/// One unstarted runner rooted in a temp workspace: enough to drive
+/// `SessionRunner::status` directly (the store / watch are real).
+fn idle_status_runner(
+    temp: &tempfile::TempDir,
+    session: &str,
+) -> (SessionRunner, SessionHandle, SessionStore) {
+    let store = SessionStore::Jsonl;
+    let (agent, _, _) = controlled(vec![], false);
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        store.clone(),
+        temp.path().into(),
+        session.into(),
+        IdlePolicy::WaitForInput,
+    );
+    (runner, handle, store)
+}
+
+/// The kept invariant: one `touch_meta` per ACTUAL return to Idle. Repeated
+/// same-value Idle publishes still notify subscribers (unchanged behaviour);
+/// they only stop writing to the sessions audit table.
+#[tokio::test]
+async fn repeated_idle_status_touches_session_meta_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let session = "status-touch";
+    let (runner, handle, store) = idle_status_runner(&temp, session);
+    store
+        .create_meta(temp.path(), session, Some("gpt-x"), None, None, None, None)
+        .await
+        .unwrap();
+    let before = meta_sidecar_lines(temp.path(), session);
+    assert_eq!(before, 1, "create_meta writes exactly one snapshot line");
+
+    // Busy is not a return to Idle: no metadata write.
+    runner.status(SessionStatus::Busy);
+    assert_eq!(meta_sidecar_lines(temp.path(), session), before);
+
+    // The one real return to Idle uses the turn-boundary touch (R4).
+    runner.status(SessionStatus::Idle);
+    assert_eq!(meta_sidecar_lines(temp.path(), session), before + 1);
+
+    // Every later idle tick is an idempotent repeat: no second write.
+    runner.status(SessionStatus::Idle);
+    runner.status(SessionStatus::Idle);
+    assert_eq!(
+        meta_sidecar_lines(temp.path(), session),
+        before + 1,
+        "a repeated Idle must not touch session metadata"
+    );
+
+    // A fresh Busy -> Idle round trip touches exactly once more.
+    runner.status(SessionStatus::Busy);
+    runner.status(SessionStatus::Idle);
+    assert_eq!(meta_sidecar_lines(temp.path(), session), before + 2);
+    drop(handle);
+}
+
+/// P2 regression: a turn parked in `WaitingInput` that is then cancelled must
+/// still perform the turn-boundary metadata touch on its way back to Idle.
+/// `clear_waiting_input` used to publish Idle with a direct `send_replace`,
+/// skipping the touch; the idle loop's later `status(Idle)` then saw an
+/// unchanged value and skipped it too, so `last_active_at` / `entry_count`
+/// stayed stale. Observable through the JSONL sidecar line count (one line per
+/// `touch_meta`, no production test seam).
+#[tokio::test]
+async fn cancelled_waiting_input_turn_touches_session_meta_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let session = "cancel-touch";
+    let store = SessionStore::Jsonl;
+    store
+        .create_meta(temp.path(), session, Some("gpt-x"), None, None, None, None)
+        .await
+        .unwrap();
+    let before = meta_sidecar_lines(temp.path(), session);
+    assert_eq!(before, 1, "create_meta writes exactly one snapshot line");
+
+    let agent = Agent::new(
+        Box::new(InputRecordingModel {
+            calls: 0,
+            saw_result: Arc::new(Mutex::new(false)),
+        }),
+        vec![
+            Box::new(crate::tools::user_input::RequestUserInput),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        store.clone(),
+        temp.path().into(),
+        session.into(),
+        IdlePolicy::WaitForInput,
+    );
+    let task = runner.start(Some("start".into()));
+    let mut status = handle.status();
+    loop {
+        if matches!(&*status.borrow(), SessionStatus::WaitingInput(_)) {
+            break;
+        }
+        status.changed().await.unwrap();
+    }
+    // Parking in WaitingInput is not a return to Idle: no metadata write yet.
+    assert_eq!(meta_sidecar_lines(temp.path(), session), before);
+
+    handle.cancel();
+    // The notification is published before `touch_meta` runs, so wait for the
+    // write itself rather than for the status value.
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while meta_sidecar_lines(temp.path(), session) < before + 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "a cancelled WaitingInput turn must touch session metadata: status={:?}",
+            *status.borrow()
+        )
+    });
+    loop {
+        if matches!(&*status.borrow(), SessionStatus::Idle) {
+            break;
+        }
+        status.changed().await.unwrap();
+    }
+    // Idle now re-enters the turn-end block; the guard must not touch again.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(
+        meta_sidecar_lines(temp.path(), session),
+        before + 1,
+        "exactly one metadata touch for the cancelled turn"
+    );
+    drop(task);
+}

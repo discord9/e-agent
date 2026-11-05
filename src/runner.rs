@@ -1749,10 +1749,20 @@ impl SessionRunner {
     }
 
     fn clear_waiting_input(&mut self, status: SessionStatus) {
-        let mut shared = self.shared.lock().unwrap();
-        shared.waiting_input = None;
-        shared.input_claimed = false;
-        shared.status.send_replace(status);
+        {
+            let mut shared = self.shared.lock().unwrap();
+            shared.waiting_input = None;
+            shared.input_claimed = false;
+        }
+        // Leaving WaitingInput is a REAL status transition, so publish it
+        // through the guarded helper: that notifies subscribers AND, when it
+        // lands on Idle, performs the turn-boundary metadata touch. The old
+        // direct `send_replace` skipped the touch, and the idle loop's later
+        // `status(Idle)` then saw an unchanged value and skipped it too, so a
+        // cancelled `request_user_input` turn left `last_active_at` /
+        // `entry_count` stale. The waiting-input fields above are cleared
+        // unconditionally, independently of the status value.
+        self.status(status);
     }
 
     async fn await_input_answer(
@@ -1819,15 +1829,29 @@ impl SessionRunner {
     }
 
     fn status(&self, status: SessionStatus) {
-        // Turn-boundary metadata touch (R4): the sessions audit table is
-        // appended once per return to Idle — not per event (double-write
-        // amplification). Fire-and-forget: the write is spawned and never
-        // awaited, so losing the final touch at process exit is acceptable
-        // (the audit table keeps the last committed snapshot).
-        if matches!(status, SessionStatus::Idle) {
-            self.store.touch_meta(&self.root, &self.session);
+        // Notification is UNCONDITIONAL: `send_replace` always publishes, even
+        // for a value the watch already holds, so every subscriber observes
+        // exactly what it observed before the metadata gate existed (the
+        // idle loop re-enters the turn-end block on every projection tick, and
+        // the summary listener relies on seeing those publishes).
+        // The store write is never made under the shared mutex.
+        let changed = {
+            let shared = self.shared.lock().unwrap();
+            let previous = shared.status.borrow().clone();
+            shared.status.send_replace(status.clone());
+            previous != status
+        };
+        if !(changed && matches!(status, SessionStatus::Idle)) {
+            return;
         }
-        self.shared.lock().unwrap().status.send_replace(status);
+        // Turn-boundary metadata touch (R4): the sessions audit table is
+        // appended once per actual return to Idle — not per event, and not
+        // per repeated idle tick (double-write amplification), so an idle
+        // session writes one row per turn instead of one per second.
+        // Fire-and-forget: the write is spawned and never awaited, so losing
+        // the final touch at process exit is acceptable (the audit table keeps
+        // the last committed snapshot).
+        self.store.touch_meta(&self.root, &self.session);
     }
     fn publish_finished(shared: &mut Shared, result: SessionResult) {
         shared.commands_open = false;
