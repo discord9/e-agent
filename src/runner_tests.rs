@@ -1380,7 +1380,26 @@ impl Model for CompletingWithCancelModel {
 }
 
 fn history_for_compaction(agent: &mut Agent) {
-    agent.restore_history(vec![
+    // Long enough to be compactable: compaction replaces everything before
+    // the last 20 messages, so the replaced prefix needs its own
+    // assistant activity. 12 filler exchanges + the old/current pair keep
+    // the tail's shape (a completed turn plus a current prompt).
+    let mut history: Vec<SessionEntry> = (0..12)
+        .flat_map(|i| {
+            [
+                SessionEntry::from(Message::User {
+                    content: format!("filler task {i}"),
+                    images: vec![],
+                }),
+                SessionEntry::from(Message::Assistant(AssistantMessage {
+                    content: Some(format!("filler answer {i}")),
+                    tool_calls: Vec::new(),
+                    reasoning: None,
+                })),
+            ]
+        })
+        .collect();
+    history.extend([
         Message::User {
             content: "old question".into(),
             images: vec![],
@@ -1398,6 +1417,7 @@ fn history_for_compaction(agent: &mut Agent) {
         }
         .into(),
     ]);
+    agent.restore_history(history);
 }
 
 async fn wait_for_status(
@@ -2328,11 +2348,15 @@ async fn web_attach_replays_only_transients_in_the_head_history_range() {
 #[tokio::test]
 async fn compaction_usage_marker_waits_for_a_fresh_regular_usage() {
     let temp = tempfile::tempdir().unwrap();
+    let mut agent = Agent::new(
+        Box::new(UsageSequenceModel { calls: 0 }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    // A compactable transcript up front: the two regular turns below are
+    // about the usage marker, not about reaching a compactable length.
+    history_for_compaction(&mut agent);
     let (runner, handle) = SessionRunner::new(
-        Agent::new(
-            Box::new(UsageSequenceModel { calls: 0 }),
-            vec![Box::new(KeepAliveTool { sender: None })],
-        ),
+        agent,
         SessionStore::Jsonl,
         temp.path().into(),
         "usage-marker".into(),
@@ -3767,30 +3791,23 @@ async fn mid_turn_auto_compact_before_tool_result_pairs_real_result() {
     ];
     // Keep enough completed activity before the current prompt that the
     // second high-usage round has genuinely replaceable context after the
-    // first compaction. The test still exercises the latch, not a no-op.
+    // first compaction. Plain exchanges (no tool results) keep the retained
+    // tail tool-free, so the only Tool message in the final context is the
+    // real result of this turn's pending call.
     for index in 0..15 {
-        let id = format!("prior-{index}");
         prior_history.push(
-            Message::Assistant(AssistantMessage {
-                content: None,
-                tool_calls: vec![ToolCall {
-                    id: id.clone(),
-                    name: "keep_alive".into(),
-                    arguments: "{}".into(),
-                }],
-                reasoning: None,
-            })
+            Message::User {
+                content: format!("prior question {index}"),
+                images: vec![],
+            }
             .into(),
         );
         prior_history.push(
-            Message::Tool {
-                call_id: id,
-                name: "keep_alive".into(),
-                content: "ok".into(),
-                images: vec![],
-                is_error: false,
-                synthetic: false,
-            }
+            Message::Assistant(AssistantMessage {
+                content: Some(format!("prior answer {index}")),
+                tool_calls: vec![],
+                reasoning: None,
+            })
             .into(),
         );
     }
@@ -4001,10 +4018,25 @@ async fn successful_auto_compact_resets_latch_and_fires_again_on_next_big_round(
         vec![Box::new(KeepAliveTool { sender: None })],
     );
     agent.set_context_window(1000);
-    // Prior conversation so there is something before the current turn to
-    // compact (prepare_compaction requires an assistant/tool message before
-    // the retained user turn).
-    agent.restore_history(vec![
+    // Prior conversation so there is something before the bounded retained
+    // tail to compact: compaction replaces everything before the last 20
+    // messages, so the replaced prefix needs its own assistant activity.
+    let mut prior_history: Vec<SessionEntry> = (0..15)
+        .flat_map(|index| {
+            [
+                SessionEntry::from(Message::User {
+                    content: format!("prior question {index}"),
+                    images: vec![],
+                }),
+                SessionEntry::from(Message::Assistant(AssistantMessage {
+                    content: Some(format!("prior answer {index}")),
+                    tool_calls: vec![],
+                    reasoning: None,
+                })),
+            ]
+        })
+        .collect();
+    prior_history.extend([
         Message::User {
             content: "old question".into(),
             images: vec![],
@@ -4017,6 +4049,7 @@ async fn successful_auto_compact_resets_latch_and_fires_again_on_next_big_round(
         })
         .into(),
     ]);
+    agent.restore_history(prior_history);
     let (runner, handle) = SessionRunner::new(
         agent,
         SessionStore::Jsonl,
