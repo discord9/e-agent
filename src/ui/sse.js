@@ -802,7 +802,13 @@ els.messages.addEventListener("scroll", (ev) => {
   // 离开底部时显示「回到底部」按钮；在底部则隐藏
   els.jumpBottomBtn.hidden = atBottom;
   // 滚到接近顶部时加载更早历史（分页；防重入 / 已全部加载 / 未开会话时跳过）
-  if (state.loadingOlder || state.olderDone || !state.sessionId) return;
+  // A reconnect bootstrap can retain already-loaded pages under a newer bounded
+  // head, leaving a disjoint interval (state.webGapCursor) above them while the
+  // true oldest page is already exhausted (olderDone). loadOlder() drains that
+  // gap before following the normal cursor, so olderDone only skips the call
+  // when no gap is pending.
+  if (state.loadingOlder || !state.sessionId) return;
+  if (state.olderDone && state.webGapCursor === null) return;
   if (m.scrollTop < 30) loadOlder();
 });
 /* 长文本「展开全文/收起」+ 占位「加载更早历史」：事件委托在消息容器上。
