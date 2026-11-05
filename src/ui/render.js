@@ -775,6 +775,9 @@ function newAccumulator() {
     thinkDot: null,      // 当前 thinking 的圆点元素（缓存：delta 追加不再 querySelector）
     toolStack: [],       // 未配对结果的工具卡片（live 事件按顺序配对）
     pendingByCall: new Map(), // call_id -> 卡片元素（history 渲染按 id 配对）
+    compactionStreaming: false, // 压缩流中：delta 只进脚手架气泡，绝不续写压缩前的助手块
+    compactionEl: null,  // 压缩流脚手架气泡（durable 投影到达时原地换成边界节点）
+    compactionBody: null,
   };
 }
 
@@ -937,6 +940,13 @@ function assistantBubble(acc, reason) {
 }
 
 function appendAssistantDelta(text, acc) {
+  if (acc && acc.compactionStreaming) {
+    // 压缩摘要的 delta 没有 tag（server 压缩期间只广播、不落 log）：绝不续写
+    // 进压缩前的助手气泡（否则 live 是 "BEFORESUMMARY"，refresh 后是两块）。
+    compactionBubble(acc).insertAdjacentText("beforeend", text);
+    scheduleScrollBottom();
+    return;
+  }
   const body = assistantBubble(acc, true);
   acc.assistantText += text;
   // 新 delta：正文已不同于上次 markdown 渲染，下次 idle 必须重算一次
@@ -948,6 +958,13 @@ function appendAssistantDelta(text, acc) {
 
 /* 非流式回合结束时整段落文本 */
 function setAssistantText(text, acc) {
+  if (acc && acc.compactionStreaming) {
+    // 同 appendAssistantDelta：压缩流的整段文本也留在脚手架里，等 durable
+    // 投影到达时整体换成边界节点。
+    compactionBubble(acc).innerHTML = renderMarkdown(text);
+    scrollBottom(false);
+    return;
+  }
   const body = assistantBubble(acc, true);
   if (acc.assistantText) {
     // 已累积过 delta：整段覆盖（TUI 语义：同回合的最终完整文本）
@@ -982,6 +999,10 @@ function thinkingBlock(acc) {
 }
 
 function appendReasoningDelta(text, acc) {
+  // 压缩流期间不渲染压缩模型自己的思考：history 的 Compaction 条目只有摘要
+  // （没有 reasoning），渲染它既制造 live/refresh 差异，也会把思考续写进压缩
+  // 前的 thinking 块。
+  if (acc && acc.compactionStreaming) return;
   const body = thinkingBlock(acc);
   body.insertAdjacentText("beforeend", text);
   // 思考进行中：折叠栏的圆点转圈（dot 引用在 thinkingBlock 创建时缓存）
@@ -1141,7 +1162,14 @@ function reattachInFlight(acc) {
   //    未 markdown 化，无元素子节点）→ 进行中，绑定并把 textContent 取回
   const as = [...els.messages.querySelectorAll(".msg-assistant")];
   const a = as[as.length - 1];
-  if (a) {
+  if (a && a.classList.contains("compaction-stream")) {
+    // 切回一个仍在压缩中的会话：缓存里的脚手架气泡继续接收压缩摘要 delta。
+    // 把它绑成 assistantEl 就会让摘要续写进压缩前的助手块（本 bug 的另一条
+    // 入口），所以这里恢复压缩流状态而不是助手累积状态。
+    acc.compactionStreaming = true;
+    acc.compactionEl = a;
+    acc.compactionBody = a.querySelector(".msg-body");
+  } else if (a) {
     const body = a.querySelector(".msg-body");
     if (body && !body.querySelector("*")) {   // 无子元素 = 纯文本 = 流式中
       acc.assistantEl = a;
@@ -1283,14 +1311,96 @@ function appendError(text) {
   pruneMessages();
 }
 
-/* 压缩分界线 */
+/* 压缩边界节点：分界线 + 摘要 notice。history（Compaction 条目）与 live
+   （durable 的 Display "compacted: …"）共用这一份形状——两边必须完全同形。 */
+function compactionBoundaryNodes(summary) {
+  const nodes = [el("div", "compaction", "—— 上下文已压缩 ——")];
+  if (summary) nodes.push(el("div", "notice", "摘要: " + summary));
+  return nodes;
+}
+
+/* 压缩分界线（history 渲染入口） */
 function appendCompaction(summary) {
   freezeAssistant(state.acc);
-  els.messages.appendChild(el("div", "compaction", "—— 上下文已压缩 ——"));
-  if (summary) {
-    const n = el("div", "notice", "摘要: " + summary);
-    els.messages.appendChild(n);
+  for (const node of compactionBoundaryNodes(summary)) els.messages.appendChild(node);
+  scrollBottom(false);
+  pruneMessages();
+}
+
+/* 压缩流的脚手架气泡：压缩摘要是内部维护输出，history 里它只以「分界线 +
+   摘要」出现（appendCompaction），从不是助手气泡。流式期间先写进这个专用
+   气泡，durable 投影到达时整体换成边界节点（见 commitCompactionBoundary）。 */
+function compactionBubble(acc) {
+  if (!acc.compactionEl) {
+    const msg = el("div", "msg msg-assistant compaction-stream");
+    const body = el("div", "msg-body");
+    msg.append(el("span", "who", "ai>"), body);
+    els.messages.appendChild(msg);
+    acc.compactionEl = msg;
+    acc.compactionBody = body;
+    scrollBottom(false);
+    pruneMessages();
   }
+  return acc.compactionBody;
+}
+
+/* 进入 Compacting：封口当前累积器。压缩摘要的 AssistantDelta/ReasoningDelta
+   没有 tag（server 压缩期间只广播不落 log），不封口就会续写进压缩前的助手
+   气泡，live 变成 "BEFORESUMMARY" 而 refresh 后是两块分开的消息。 */
+function beginCompactionStream(acc) {
+  if (!acc) return;
+  freezeAssistant(acc);
+  // 切回一个仍在线压缩的会话时，reattachInFlight 已经绑好了缓存里的脚手架气泡
+  // ——继续用它。这里再清空会另起一个气泡，durable 投影只换掉新的那个，旧的
+  // 流式前缀就留在 DOM 里（重复摘要）。新一次压缩的脚手架已由上一轮的
+  // commitCompactionBoundary / endCompactionStream 清掉。
+  if (!acc.compactionEl) acc.compactionBody = null;
+  acc.compactionStreaming = true;
+}
+
+/* 离开 Compacting：压缩流结束。成功路径已在 commitCompactionBoundary 里把
+   脚手架换成边界节点；失败/取消路径没有 durable 对应物（history 里根本不
+   存在这段摘要），脚手架直接丢弃。随后再封口一次，避免后续轮次的 delta 续写
+   进压缩流的残留气泡。 */
+function endCompactionStream(acc) {
+  if (!acc) return;
+  if (acc.compactionStreaming) dropCompactionBubble(acc);
+  acc.compactionStreaming = false;
+  freezeAssistant(acc);
+}
+
+function dropCompactionBubble(acc) {
+  const node = acc && acc.compactionEl;
+  if (node) node.remove();
+  if (acc) {
+    acc.compactionEl = null;
+    acc.compactionBody = null;
+  }
+}
+
+/* durable 压缩投影（Display "compacted: …"）到达：live 边界必须与 refresh
+   渲染的边界同形。脚手架气泡原地换成「分界线 + 摘要」，摘要文本只取自
+   durable 投影——流式的脚手架随之移除，不会重复。 */
+function commitCompactionBoundary(summary, acc) {
+  // 缓存恢复 / 切换会话后累积器是新的：按 class 找回残留的脚手架气泡。
+  const anchor = (acc && acc.compactionEl)
+    || els.messages.querySelector(".compaction-stream");
+  const parent = anchor ? anchor.parentNode : null;
+  if (acc) {
+    acc.compactionEl = null;
+    acc.compactionBody = null;
+  }
+  freezeAssistant(acc);
+  const nodes = compactionBoundaryNodes(summary);
+  if (parent && anchor) {
+    // 原地替换：边界节点插在脚手架气泡原来的位置（流式期间它可能已被后续
+    // notice 超过），再移除脚手架。
+    for (const node of nodes) parent.insertBefore(node, anchor);
+    anchor.remove();
+  } else {
+    for (const node of nodes) els.messages.appendChild(node);
+  }
+  if (acc) acc.compactionStreaming = false;
   scrollBottom(false);
   pruneMessages();
 }
@@ -1518,7 +1628,8 @@ function renderEntries(entries, prepend, locations, before, presentationAt) {
  * 代价是长会话 DOM 总量不下降（上限约束的是「直接子块数」）。
  * ===================================================================*/
 function isInflightBlock(k) {
-  if (state.acc && (state.acc.assistantEl === k || state.acc.thinkingEl === k)) return true;
+  if (state.acc && (state.acc.assistantEl === k || state.acc.thinkingEl === k
+      || state.acc.compactionEl === k)) return true;
   if (k.classList.contains("tool-card")) {
     const st = k.querySelector(".tool-state");
     return st && st.textContent === "执行中…";
@@ -1661,7 +1772,16 @@ function clearWaitingInput(restoreDraft = true) {
 function applyStatus(statusPayload) {
   const payload = statusPayload && typeof statusPayload === "object"
     ? statusPayload : { status: statusPayload };
+  const previousStatus = state.status;
   state.status = payload.status || "Idle";
+  // 压缩边界：进入 Compacting 封口（压缩摘要的 delta 绝不续写压缩前的助手
+  // 气泡），离开 Compacting 收尾（丢弃没有 durable 对应物的脚手架气泡）。
+  // 手动 /compact 没有 Display 前置通知，所以信号取状态而不是通知文本。
+  if (state.status === "Compacting" && previousStatus !== "Compacting") {
+    beginCompactionStream(state.acc);
+  } else if (previousStatus === "Compacting" && state.status !== "Compacting") {
+    endCompactionStream(state.acc);
+  }
   if (state.status === "WaitingInput") renderWaitingInput(payload);
   else clearWaitingInput();
   els.chatStatus.textContent = statusLabel(state.status);

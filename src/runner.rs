@@ -3008,6 +3008,23 @@ impl SessionRunner {
                         .unwrap()
                         .emit_durable(AgentEvent::AssistantText(text));
                 }
+                // Publish this committed assistant message's tool calls BEFORE
+                // any auto-compaction projection. History renders `tool_calls`
+                // as part of the assistant entry, so its cards belong on the
+                // pre-compaction side of the boundary; publishing them later
+                // (during execution, i.e. after the compaction) put the live
+                // cards after the divider. Projection only — no execution is
+                // reordered and the ToolResult pairing contract is unchanged.
+                if !calls.is_empty() {
+                    let mut shared = self.shared.lock().unwrap();
+                    for call in &calls {
+                        shared.emit_durable(AgentEvent::ToolCall {
+                            name: call.name.clone(),
+                            arguments: call.arguments.clone(),
+                            call_id: Some(call.id.clone()),
+                        });
+                    }
+                }
                 let steering = self.intake_after_operation(waited.pending);
                 self.publish_web_attaches();
                 if steering != Steering::None && calls.is_empty() {
@@ -3103,16 +3120,12 @@ impl SessionRunner {
                 let mut poll_terminate = false;
                 let mut requested_compaction = false;
                 for call in calls {
-                    self.shared
-                        .lock()
-                        .unwrap()
-                        .emit_durable(AgentEvent::ToolCall {
-                            name: call.name.clone(),
-                            arguments: call.arguments.clone(),
-                            call_id: Some(call.id.clone()),
-                        });
-                    // Root-only marker: persist the assistant ToolCall first,
-                    // then pause this same model/tool turn for the Web answer.
+                    // The ToolCall projection was already published with the
+                    // assistant commit above (before any compaction), so this
+                    // loop only executes. Publishing again here would duplicate
+                    // the card in every live view.
+                    // Root-only marker: pause this same model/tool turn for the
+                    // Web answer.
                     if call.name == "request_user_input" {
                         let questions = match crate::tools::parse_questions(&call.arguments) {
                             Ok(questions) => questions,

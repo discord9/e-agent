@@ -3828,6 +3828,39 @@ async fn mid_turn_auto_compact_before_tool_result_pairs_real_result() {
     );
     task.join().await.unwrap();
 
+    // Live projection order must match what a refresh renders: history renders
+    // `tool_calls` as part of the assistant entry, i.e. BEFORE the Compaction
+    // entry, so the ToolCall projection is published with the assistant commit
+    // and not (as before) during execution, where it landed after the
+    // compaction divider. Published exactly once: a second publication in the
+    // execution loop would duplicate the card in every live view.
+    let log = handle.snapshot();
+    let tool_call_at = log
+        .iter()
+        .position(|event| {
+            matches!(event, AgentEvent::ToolCall { call_id: Some(id), .. } if id == "call-1")
+        })
+        .expect("the committed assistant's tool call is published");
+    let compacted_at = log
+        .iter()
+        .position(
+            |event| matches!(event, AgentEvent::Display(text) if text.starts_with("compacted: ")),
+        )
+        .expect("auto-compaction publishes its durable projection");
+    assert!(
+        tool_call_at < compacted_at,
+        "tool call must be published before the compaction boundary: {log:?}"
+    );
+    assert_eq!(
+        log.iter()
+            .filter(|event| {
+                matches!(event, AgentEvent::ToolCall { call_id: Some(id), .. } if id == "call-1")
+            })
+            .count(),
+        1,
+        "the tool call projection is published exactly once: {log:?}"
+    );
+
     // Model calls: [0] first round, [1] compaction summary, [2] round after
     // the real result landed. The last context must be well-formed. The
     // guard is scoped so it is dropped before the awaited reload below.
