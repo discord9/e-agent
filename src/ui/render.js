@@ -769,6 +769,7 @@ function newAccumulator() {
     assistantEl: null,   // 当前助手消息容器（流式累积）
     assistantBody: null,
     assistantText: "",   // 已累积的文本（用于替换/查重）
+    renderedMarkdownText: "",  // assistantBody 最近一次由 renderMarkdown 写入的文本（幂等守卫）
     thinkingEl: null,    // 当前 thinking 折叠块
     thinkBody: null,
     thinkDot: null,      // 当前 thinking 的圆点元素（缓存：delta 追加不再 querySelector）
@@ -783,8 +784,10 @@ function freezeAssistant(acc) {
   // 流式期间是纯文本（快）；冻结时用完整文本重算一次 markdown，
   // 让表格/代码块/公式在回合结束时正确渲染。
   if (!acc) return;   // 累积器未就绪（切工作区等）时直接返回，尾段赋值不能解引用 null
-  if (acc && acc.assistantBody && acc.assistantText) {
+  if (acc && acc.assistantBody && acc.assistantText
+      && acc.assistantText !== acc.renderedMarkdownText) {
     acc.assistantBody.innerHTML = renderMarkdown(acc.assistantText);
+    acc.renderedMarkdownText = acc.assistantText;
   }
   // 思考结束：转圈 → 勾号（表示该轮思考完成）
   if (acc && acc.thinkingEl) {
@@ -797,6 +800,7 @@ function freezeAssistant(acc) {
   acc.assistantEl = null;
   acc.assistantBody = null;
   acc.assistantText = "";
+  acc.renderedMarkdownText = "";
   acc.thinkingEl = null;
   acc.thinkBody = null;
 }
@@ -924,7 +928,8 @@ function assistantBubble(acc, reason) {
     msg.append(who, body);
     els.messages.appendChild(msg);
     acc.assistantEl = msg;      // 先绑定再 prune：进行中的助手块绝不折叠
-    acc.assistantBody = body;
+    acc.assistantBody = body;   // 新 body：尚无 markdown 渲染
+    acc.renderedMarkdownText = "";
     if (reason) scrollBottom(false);
     pruneMessages();
   }
@@ -934,6 +939,8 @@ function assistantBubble(acc, reason) {
 function appendAssistantDelta(text, acc) {
   const body = assistantBubble(acc, true);
   acc.assistantText += text;
+  // 新 delta：正文已不同于上次 markdown 渲染，下次 idle 必须重算一次
+  acc.renderedMarkdownText = "";
   // 流式渲染：直接追加（markdown 不重算，保持简单、快）
   body.insertAdjacentText("beforeend", text);
   scheduleScrollBottom();   // rAF 批处理：帧内多个 delta 合并为一次滚动
@@ -949,6 +956,7 @@ function setAssistantText(text, acc) {
   }
   body.innerHTML = renderMarkdown(text);
   acc.assistantText = text;
+  acc.renderedMarkdownText = text;   // 已是 markdown：idle 不再重复写
   scrollBottom(false);
 }
 
@@ -1139,6 +1147,7 @@ function reattachInFlight(acc) {
       acc.assistantEl = a;
       acc.assistantBody = body;
       acc.assistantText = body.textContent;
+      acc.renderedMarkdownText = "";          // body 是流式纯文本，尚未 markdown 化
     }
   }
   // 3. 工具卡片：所有 .tool-state 文本为 "执行中…" 的 details.tool-card →
@@ -1345,6 +1354,7 @@ function renderMessage(m, acc, pendingCards) {
       const body = assistantBubble(acc, true);
       body.innerHTML = renderMarkdown(a.content);
       acc.assistantText = a.content;
+      acc.renderedMarkdownText = a.content;
     } else if (!a.tool_calls || !a.tool_calls.length) {
       // 空内容助手消息：占位，避免空白
       const body = assistantBubble(acc, true);
@@ -1679,8 +1689,12 @@ function applyStatus(statusPayload) {
   // 回合结束（回到 Idle）：流式 delta 期间是纯文本（快），此刻用完整
   // 文本重算一次 markdown，让表格/代码块/公式正确渲染；同时停思考动画。
   if (!busy && state.acc) {
-    if (state.acc.assistantBody && state.acc.assistantText) {
+    // 幂等：文本没变（含重复收到同一个 Idle）就不写 innerHTML——无谓的
+    // 整体重写会打断用户正在进行的文本选择。空文本同样跳过。
+    if (state.acc.assistantBody && state.acc.assistantText
+        && state.acc.assistantText !== state.acc.renderedMarkdownText) {
       state.acc.assistantBody.innerHTML = renderMarkdown(state.acc.assistantText);
+      state.acc.renderedMarkdownText = state.acc.assistantText;
     }
     if (state.acc.thinkingEl) {
       const dot = state.acc.thinkDot || state.acc.thinkingEl.querySelector(".think-dot");
