@@ -1047,9 +1047,15 @@ be attached.
 ## Compaction
 
 Use `/compact` in the TUI or `--repl` to manually summarize earlier history.
-The agent summarizes everything before the current turn and appends a
-compaction entry (summary plus the retained turn) to the append-only session
-log; earlier messages stay persisted and visible in the TUI. Subsequent model
+The agent summarizes everything before a bounded tail of the most recent
+messages and appends a compaction entry (summary plus that retained tail) to
+the append-only session log; earlier messages stay persisted and visible in the
+TUI. The tail is sized by message count (`RETAIN_TAIL`); a context no longer
+than that keeps half of itself so it stays compactable. The cut is aligned to
+an assistant boundary so a tool batch is never split, which can extend the tail
+past that count when user-shaped notices follow the last assistant. The current
+user prompt gets no special treatment: it is projected like any other field,
+and its full text remains retrievable from the durable session. Subsequent model
 calls use the latest summary plus everything after it. When a configured model
 profile provides a context window, the agent also compacts automatically at
 80% usage.
