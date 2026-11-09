@@ -641,14 +641,19 @@ function applyLiveEvent(name, payload) {
     case "Display":
     case "Notice": {
       const text = pickText(payload, ["text", "message"]);
-      appendNotice(text);
-      // 压缩成功投影（"compacted: …"）之后紧跟着一条携带压缩前基线的 Usage。
-      // Display 是当前投影，Notice 保持旧服务端兼容。
-      // 置“（压缩前）”标注并挂起下一次 Usage 的清除动作——那条正是压缩自己
-      // 发出的旧基线，不是普通轮的新值。
+      // 压缩成功投影（"compacted: …"）：Display 是当前投影，Notice 保持旧
+      // 服务端兼容。这是 durable 的 Compaction 条目在 live 侧的对应事件，
+      // 所以渲染成 history 同一套边界（分界线 + 摘要），并收掉流式脚手架
+      // 气泡（摘要文本只取自这里，不重复）。
       if (typeof text === "string" && text.startsWith("compacted: ")) {
+        commitCompactionBoundary(text.slice("compacted: ".length), acc);
+        // 之后紧跟着一条携带压缩前基线的 Usage：置“（压缩前）”标注并挂起
+        // 下一次 Usage 的清除动作——那条正是压缩自己发出的旧基线，不是
+        // 普通轮的新值。
         state.usagePreCompaction = true;
         state.compactionUsagePending = true;
+      } else {
+        appendNotice(text);
       }
       break;
     }
