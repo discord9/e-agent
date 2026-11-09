@@ -4720,7 +4720,8 @@ impl<'a> SnapshotRow<'a> {
 /// Pins the latest-snapshot query shape: one full row per session chosen by
 /// the indexed correlated `MAX(last_active_at)`, with the sidebar predicate
 /// applied to that latest row. Raw rows make it deterministic — multiple
-/// history versions, two workspaces, every metadata column, a four-session
+/// history versions (one inserted newest-first), two workspaces sharing a
+/// session id with different maxima, every metadata column, a four-session
 /// timestamp tie, and stale archived/parent states that must not resurface.
 #[tokio::test]
 async fn list_meta_correlated_max_keeps_latest_full_snapshot_per_tied_session() {
@@ -4776,12 +4777,30 @@ async fn list_meta_correlated_max_keeps_latest_full_snapshot_per_tied_session() 
         writer: Some("writer-other"),
         ..SnapshotRow::new(&other_wid, "other-root", 400)
     };
+    // Same session id in both workspaces, different maxima: the correlated
+    // MAX must be scoped to the outer row's workspace. Without
+    // `m.workspace_id = s.workspace_id` the wid probe would see 400 and drop
+    // "shared" from the wid list entirely.
+    let shared_latest = SnapshotRow {
+        created_at: 70,
+        title: Some("shared-title"),
+        writer: Some("writer-shared"),
+        ..SnapshotRow::new(&wid, "shared", 300)
+    };
+    let other_shared = SnapshotRow {
+        created_at: 80,
+        model: Some("other-shared-model"),
+        writer: Some("writer-other-shared"),
+        ..SnapshotRow::new(&other_wid, "shared", 400)
+    };
 
     let rows = [
-        // root-a: three complete snapshots; t=300 wins over the later row id.
+        // root-a: newest snapshot written FIRST, then two older versions —
+        // picking the largest rowid instead of MAX(last_active_at) would
+        // select t=200 and fail the field/timestamp assertions.
+        root_latest.clone(),
         SnapshotRow::new(&wid, "root-a", 100),
         SnapshotRow::new(&wid, "root-a", 200),
-        root_latest.clone(),
         // arch-child: the old row is an unarchived root, the latest is an
         // archived child; the filter must read only the latest state.
         SnapshotRow::new(&wid, "arch-child", 100),
@@ -4792,9 +4811,13 @@ async fn list_meta_correlated_max_keeps_latest_full_snapshot_per_tied_session() 
         idle_latest.clone(),
         SnapshotRow::new(&wid, "pin-arch", 140),
         pin_latest.clone(),
+        // Wid's "shared" ties root-a at t=300; the other workspace's
+        // "shared" snapshot is newer (400) but must not leak into wid.
+        shared_latest.clone(),
         // Other workspace: t=400 must never leak into the ws1 list.
         SnapshotRow::new(&other_wid, "other-root", 150),
         other_latest.clone(),
+        other_shared.clone(),
     ];
     let conn = session.conn.lock().await.clone();
     for row in &rows {
@@ -4808,6 +4831,7 @@ async fn list_meta_correlated_max_keeps_latest_full_snapshot_per_tied_session() 
         live_latest.meta(),
         pin_latest.meta(),
         root_latest.meta(),
+        shared_latest.meta(),
     ];
     expected.sort_by(|a, b| a.session_id.cmp(&b.session_id));
     let pick = |ids: &[&str]| {
@@ -4832,26 +4856,40 @@ async fn list_meta_correlated_max_keeps_latest_full_snapshot_per_tied_session() 
     );
 
     // Sidebar filter on the LIVE set: root-a/pin-arch are pinned,
-    // live-child is live, while the archived and idle children drop out.
+    // live-child is live, shared is an unarchived root, while the archived
+    // and idle children drop out.
     let live: HashSet<String> = ["live-child".to_owned()].into_iter().collect();
     let (mut filtered, diagnostic) = session.list_meta_diagnostic(Some(&live)).await.unwrap();
     filtered.sort_by(|a, b| a.session_id.cmp(&b.session_id));
-    assert_eq!(filtered, pick(&["live-child", "pin-arch", "root-a"]));
-    assert_eq!(diagnostic.logical_rows, 3);
+    assert_eq!(
+        filtered,
+        pick(&["live-child", "pin-arch", "root-a", "shared"])
+    );
+    assert_eq!(diagnostic.logical_rows, 4);
 
     // A live archived child is still live: liveness overrides the latest
     // archived/parent state, never the older unarchived root row.
     let live: HashSet<String> = ["arch-child".to_owned()].into_iter().collect();
     let (mut filtered, _) = session.list_meta_diagnostic(Some(&live)).await.unwrap();
     filtered.sort_by(|a, b| a.session_id.cmp(&b.session_id));
-    assert_eq!(filtered, pick(&["arch-child", "pin-arch", "root-a"]));
+    assert_eq!(
+        filtered,
+        pick(&["arch-child", "pin-arch", "root-a", "shared"])
+    );
 
-    // Workspace scoping: the other workspace sees only its own latest row.
+    // Workspace scoping: the other workspace sees only its own latest rows.
     let other_bound = format!("test-sql-correlated-other-{}", crate::session::new_id());
     let other = SqliteSession::connect(p, &other_wid, &other_bound)
         .await
         .unwrap();
-    assert_eq!(other.list_meta().await.unwrap(), vec![other_latest.meta()]);
+    let mut other_actual = other.list_meta().await.unwrap();
+    other_actual.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+    let mut other_expected = vec![other_latest.meta(), other_shared.meta()];
+    other_expected.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+    assert_eq!(
+        other_actual, other_expected,
+        "the other workspace's own 400 max wins; wid's 300 shared row is invisible there"
+    );
 }
 
 #[tokio::test]
