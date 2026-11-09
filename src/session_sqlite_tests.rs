@@ -4633,6 +4633,265 @@ async fn sessions_meta_list_same_last_active_tie_keeps_both_rows() {
     );
 }
 
+/// One synthetic full metadata snapshot for the deterministic latest-row
+/// regression below.
+#[derive(Clone)]
+struct SnapshotRow<'a> {
+    workspace_id: &'a str,
+    session_id: &'a str,
+    created_at: i64,
+    last_active_at: i64,
+    model: Option<&'a str>,
+    role: Option<&'a str>,
+    entry_count: i64,
+    parent_session_id: Option<&'a str>,
+    parent_task_id: Option<i64>,
+    title: Option<&'a str>,
+    pinned: Option<i64>,
+    archived: Option<i64>,
+    writer: Option<&'a str>,
+}
+
+impl<'a> SnapshotRow<'a> {
+    fn new(workspace_id: &'a str, session_id: &'a str, last_active_at: i64) -> Self {
+        Self {
+            workspace_id,
+            session_id,
+            created_at: 0,
+            last_active_at,
+            model: None,
+            role: None,
+            entry_count: 0,
+            parent_session_id: None,
+            parent_task_id: None,
+            title: None,
+            pinned: None,
+            archived: None,
+            writer: None,
+        }
+    }
+
+    /// The expected `SessionMeta` if this row is the latest for its session.
+    fn meta(&self) -> SessionMeta {
+        SessionMeta {
+            session_id: self.session_id.to_owned(),
+            created_at: us_to_datetime(self.created_at),
+            last_active_at: us_to_datetime(self.last_active_at),
+            model: self.model.map(str::to_owned),
+            role: self.role.map(str::to_owned),
+            entry_count: self.entry_count,
+            parent_session_id: self.parent_session_id.map(str::to_owned),
+            parent_task_id: self.parent_task_id,
+            title: self.title.map(str::to_owned),
+            pinned: self.pinned.map(|flag| flag == 1),
+            archived: self.archived.map(|flag| flag == 1),
+            writer: self.writer.map(str::to_owned),
+            label: None,
+        }
+    }
+
+    async fn insert(&self, conn: &turso::Connection) {
+        conn.execute(
+            "INSERT INTO sessions \
+             (workspace_id, session_id, created_at, last_active_at, model, \"role\", \
+              entry_count, parent_session_id, parent_task_id, title, pinned, archived, writer) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            (
+                self.workspace_id,
+                self.session_id,
+                self.created_at,
+                self.last_active_at,
+                self.model,
+                self.role,
+                self.entry_count,
+                self.parent_session_id,
+                self.parent_task_id,
+                self.title,
+                self.pinned,
+                self.archived,
+                self.writer,
+            ),
+        )
+        .await
+        .expect("insert synthetic metadata snapshot");
+    }
+}
+
+/// Pins the latest-snapshot query shape: one full row per session chosen by
+/// the indexed correlated `MAX(last_active_at)`, with the sidebar predicate
+/// applied to that latest row. Raw rows make it deterministic — multiple
+/// history versions (one inserted newest-first), two workspaces sharing a
+/// session id with different maxima, every metadata column, a four-session
+/// timestamp tie, and stale archived/parent states that must not resurface.
+#[tokio::test]
+async fn list_meta_correlated_max_keeps_latest_full_snapshot_per_tied_session() {
+    let (_dir, path) = temp_db();
+    let wid = workspace_id();
+    let other_wid = format!("{wid}-other");
+    let p = path.to_str().unwrap();
+    let bound = format!("test-sql-correlated-{}", crate::session::new_id());
+    let session = SqliteSession::connect(p, &wid, &bound).await.unwrap();
+
+    let root_latest = SnapshotRow {
+        created_at: 10,
+        model: Some("a-model"),
+        role: Some("main"),
+        entry_count: 7,
+        parent_task_id: Some(7),
+        title: Some("a-title"),
+        pinned: Some(1),
+        archived: Some(0),
+        writer: Some("writer-a"),
+        ..SnapshotRow::new(&wid, "root-a", 300)
+    };
+    let arch_latest = SnapshotRow {
+        created_at: 20,
+        parent_session_id: Some("root-a"),
+        archived: Some(1),
+        writer: Some("writer-arch"),
+        ..SnapshotRow::new(&wid, "arch-child", 250)
+    };
+    let live_latest = SnapshotRow {
+        created_at: 30,
+        parent_session_id: Some("root-a"),
+        archived: Some(1),
+        writer: Some("writer-live"),
+        ..SnapshotRow::new(&wid, "live-child", 250)
+    };
+    let idle_latest = SnapshotRow {
+        created_at: 40,
+        parent_session_id: Some("root-a"),
+        writer: Some("writer-idle"),
+        ..SnapshotRow::new(&wid, "idle-child", 250)
+    };
+    let pin_latest = SnapshotRow {
+        created_at: 50,
+        pinned: Some(1),
+        archived: Some(1),
+        writer: Some("writer-pin"),
+        ..SnapshotRow::new(&wid, "pin-arch", 250)
+    };
+    let other_latest = SnapshotRow {
+        created_at: 60,
+        model: Some("other-model"),
+        writer: Some("writer-other"),
+        ..SnapshotRow::new(&other_wid, "other-root", 400)
+    };
+    // Same session id in both workspaces, different maxima: the correlated
+    // MAX must be scoped to the outer row's workspace. Without
+    // `m.workspace_id = s.workspace_id` the wid probe would see 400 and drop
+    // "shared" from the wid list entirely.
+    let shared_latest = SnapshotRow {
+        created_at: 70,
+        title: Some("shared-title"),
+        writer: Some("writer-shared"),
+        ..SnapshotRow::new(&wid, "shared", 300)
+    };
+    let other_shared = SnapshotRow {
+        created_at: 80,
+        model: Some("other-shared-model"),
+        writer: Some("writer-other-shared"),
+        ..SnapshotRow::new(&other_wid, "shared", 400)
+    };
+
+    let rows = [
+        // root-a: newest snapshot written FIRST, then two older versions —
+        // picking the largest rowid instead of MAX(last_active_at) would
+        // select t=200 and fail the field/timestamp assertions.
+        root_latest.clone(),
+        SnapshotRow::new(&wid, "root-a", 100),
+        SnapshotRow::new(&wid, "root-a", 200),
+        // arch-child: the old row is an unarchived root, the latest is an
+        // archived child; the filter must read only the latest state.
+        SnapshotRow::new(&wid, "arch-child", 100),
+        arch_latest.clone(),
+        // arch-child, live-child, idle-child and pin-arch tie at t=250.
+        live_latest.clone(),
+        SnapshotRow::new(&wid, "idle-child", 150),
+        idle_latest.clone(),
+        SnapshotRow::new(&wid, "pin-arch", 140),
+        pin_latest.clone(),
+        // Wid's "shared" ties root-a at t=300; the other workspace's
+        // "shared" snapshot is newer (400) but must not leak into wid.
+        shared_latest.clone(),
+        // Other workspace: t=400 must never leak into the ws1 list.
+        SnapshotRow::new(&other_wid, "other-root", 150),
+        other_latest.clone(),
+        other_shared.clone(),
+    ];
+    let conn = session.conn.lock().await.clone();
+    for row in &rows {
+        row.insert(&conn).await;
+    }
+    drop(conn);
+
+    let mut expected = vec![
+        arch_latest.meta(),
+        idle_latest.meta(),
+        live_latest.meta(),
+        pin_latest.meta(),
+        root_latest.meta(),
+        shared_latest.meta(),
+    ];
+    expected.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+    let pick = |ids: &[&str]| {
+        expected
+            .iter()
+            .filter(|meta| ids.contains(&meta.session_id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+
+    let mut actual = session.list_meta().await.unwrap();
+    assert!(
+        actual
+            .windows(2)
+            .all(|w| w[0].last_active_at >= w[1].last_active_at),
+        "ORDER BY last_active_at DESC holds across the four-session tie"
+    );
+    actual.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+    assert_eq!(
+        actual, expected,
+        "every latest snapshot keeps all 12 metadata fields, one row per session"
+    );
+
+    // Sidebar filter on the LIVE set: root-a/pin-arch are pinned,
+    // live-child is live, shared is an unarchived root, while the archived
+    // and idle children drop out.
+    let live: HashSet<String> = ["live-child".to_owned()].into_iter().collect();
+    let (mut filtered, diagnostic) = session.list_meta_diagnostic(Some(&live)).await.unwrap();
+    filtered.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+    assert_eq!(
+        filtered,
+        pick(&["live-child", "pin-arch", "root-a", "shared"])
+    );
+    assert_eq!(diagnostic.logical_rows, 4);
+
+    // A live archived child is still live: liveness overrides the latest
+    // archived/parent state, never the older unarchived root row.
+    let live: HashSet<String> = ["arch-child".to_owned()].into_iter().collect();
+    let (mut filtered, _) = session.list_meta_diagnostic(Some(&live)).await.unwrap();
+    filtered.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+    assert_eq!(
+        filtered,
+        pick(&["arch-child", "pin-arch", "root-a", "shared"])
+    );
+
+    // Workspace scoping: the other workspace sees only its own latest rows.
+    let other_bound = format!("test-sql-correlated-other-{}", crate::session::new_id());
+    let other = SqliteSession::connect(p, &other_wid, &other_bound)
+        .await
+        .unwrap();
+    let mut other_actual = other.list_meta().await.unwrap();
+    other_actual.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+    let mut other_expected = vec![other_latest.meta(), other_shared.meta()];
+    other_expected.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+    assert_eq!(
+        other_actual, other_expected,
+        "the other workspace's own 400 max wins; wid's 300 shared row is invisible there"
+    );
+}
+
 #[tokio::test]
 async fn sessions_meta_same_microsecond_insert_collides_loudly() {
     // The SQLite PK carries last_active_at: two snapshots of the SAME

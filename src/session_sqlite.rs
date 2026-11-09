@@ -89,10 +89,9 @@ CREATE TABLE IF NOT EXISTS running_tasks (
 /// upsert table. Every create/touch appends a COMPLETE snapshot row
 /// (created_at/model/role/parent/entry_count/title/pinned/archived/writer
 /// all carried on every row) at a fresh `last_active_at`; the list view
-/// deduplicates per session taking the latest `last_active_at` (explicitly
-/// in SQL — the query is correct whether or not the engine auto-dedups
-/// same-PK rows). Because each row is a full snapshot, a touch can never
-/// wipe immutable columns: there is no partial-row rewrite at all.
+/// keeps the newest `last_active_at` per session. Because each row is a
+/// full snapshot, a touch can never wipe immutable columns: there is no
+/// partial-row rewrite at all.
 ///
 /// `title` is the user-assigned session name (manual, never auto-generated;
 /// `NULL` = unnamed, the frontend shows the id). `pinned` is the user pin
@@ -2491,9 +2490,9 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
     /// Latest metadata snapshot per session, newest activity first.
     ///
     /// The table is append-only, so one session has many rows; the list
-    /// deduplicates by primary key keeping the row with the maximum
-    /// `last_active_at` per session (explicit GROUP BY + JOIN — correct
-    /// whether or not the engine auto-dedups same-PK rows at read time).
+    /// keeps the row with the maximum `last_active_at` per session via an
+    /// indexed correlated `MAX` (the primary key prefixes workspace and
+    /// session, so each probe is an index lookup).
     pub async fn list_meta(&self) -> Result<Vec<SessionMeta>, String> {
         Ok(self.list_meta_diagnostic(None).await?.0)
     }
@@ -2505,8 +2504,8 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
     /// only the sidebar's default set — pinned sessions, unarchived roots,
     /// and live sessions (main or child) — so the database returns only the
     /// rows the sidebar needs. The predicate is applied to the CURRENT
-    /// (deduplicated) snapshot row, never to raw audit rows: the table is
-    /// an append-only log, so filtering before dedup would resurrect the
+    /// latest snapshot row, never to raw audit rows: the table is an
+    /// append-only log, so filtering before dedup would resurrect the
     /// older unarchived/parent state of a session archived or adopted
     /// after it was first written.
     pub async fn list_meta_diagnostic(
@@ -2523,12 +2522,12 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
                     s.entry_count, s.parent_session_id, s.parent_task_id, s.title, s.pinned, \
                     s.archived, s.writer \
              FROM sessions s \
-             INNER JOIN ( \
-                 SELECT session_id, MAX(last_active_at) AS max_ts \
-                 FROM sessions WHERE workspace_id = ?1 GROUP BY session_id \
-             ) latest \
-               ON latest.session_id = s.session_id AND latest.max_ts = s.last_active_at \
-             WHERE s.workspace_id = ?1{filter_clause} \
+             WHERE s.workspace_id = ?1 \
+               AND s.last_active_at = ( \
+                   SELECT MAX(m.last_active_at) FROM sessions m \
+                   WHERE m.workspace_id = s.workspace_id \
+                     AND m.session_id = s.session_id \
+               ){filter_clause} \
              ORDER BY s.last_active_at DESC"
         );
         let mut params: Vec<turso::Value> = vec![turso::Value::Text(self.workspace_id.clone())];
@@ -3044,8 +3043,8 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
 /// [`SqliteSession::list_meta_diagnostic`], appended after
 /// `WHERE s.workspace_id = ?1`. `Some` keeps pinned sessions, unarchived
 /// roots, and live sessions (main or child) — evaluated on the CURRENT
-/// deduplicated snapshot row, because the table is an append-only audit
-/// log and a raw-row filter would resurrect older archived/parent state.
+/// latest snapshot row, because the table is an append-only audit log and
+/// a raw-row filter would resurrect older archived/parent state.
 /// Returns the fragment plus the ids to bind in placeholder order (empty
 /// when the filter is off); an empty live set emits the non-live disjuncts
 /// only. `pinned`/`archived` are 0/1 INTEGERs and may be NULL (`= 1` and
