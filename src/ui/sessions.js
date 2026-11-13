@@ -1667,6 +1667,8 @@ async function sendPrompt() {
       // 成功：清空输入框；空 title 即清除标题（saveTitle 内部落 null）
       els.promptInput.value = "";
       autosizeInput();
+      // 侧边栏靠轮询刷新；聊天标题只在这里重绘，否则 /rename 后一直显示旧名
+      renderChatSessionId(state.sessionId);
     }
     // 失败：saveTitle 内部已提示，保留输入框可重试
     return;
