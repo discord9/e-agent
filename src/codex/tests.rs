@@ -578,6 +578,67 @@ async fn transient_connect_error_retries_and_recovers() {
 }
 
 #[tokio::test]
+async fn image_rejection_is_typed_and_bypasses_the_retryable_403_path() {
+    // The codex wire shares the typed rejection: a 403 naming images with
+    // image references submitted is classified after exactly one request
+    // (403 is otherwise retried), carrying the full diagnostic.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/responses", listener.local_addr().unwrap());
+    let body = r#"{"error":{"message":"image input is not supported"}}"#;
+    let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let server_attempts = attempts.clone();
+    tokio::spawn(async move {
+        for _ in 0..HTTP_RETRY_ATTEMPTS {
+            let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(std::time::Duration::from_millis(150), listener.accept())
+                    .await
+            else {
+                break;
+            };
+            server_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut request = [0; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+    });
+    let temp = tempfile::tempdir().unwrap();
+    let mut model = CodexModel::with_endpoint(
+        crate::codex_auth::CodexAuth::test_auth(temp.path().join("auth.json")),
+        endpoint,
+    )
+    .with_vision(true);
+    let error = model
+        .complete(
+            &[Message::User {
+                content: "what is this?".into(),
+                images: vec![crate::agent::ImagePart {
+                    hash: "hash-a".into(),
+                    mime: "image/png".into(),
+                }],
+            }],
+            &[],
+            None,
+        )
+        .await
+        .unwrap_err();
+    let rejection = crate::model::image_rejection(&error).expect("typed image rejection");
+    assert_eq!(rejection.status, reqwest::StatusCode::FORBIDDEN);
+    assert_eq!(rejection.diagnostic, body);
+    assert_eq!(rejection.hashes, vec!["hash-a".to_string()]);
+    assert!(format!("{error:#}").contains(body));
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn http_5xx_is_retried_then_succeeds() {
     // Two 503s (server overloaded), then a completed stream: the codex wire
     // retries transient HTTP errors (same whole-request loop as the chat

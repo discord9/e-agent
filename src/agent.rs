@@ -5,6 +5,7 @@ use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 
+use crate::model::ImageRejection;
 use crate::output_receipt::{FieldId, bound_field};
 use crate::session_store::EntryLocation;
 
@@ -83,6 +84,22 @@ pub enum CompactionMode {
 /// constraint: output the summary body directly, never narrate the plan to
 /// summarize (the metadiscourse-stub accident shape).
 const COMPACTION_SUMMARY_PROMPT: &str = "Summarize the earlier conversation. Preserve the user's goals, decisions made, files changed, and unfinished work. Be concise and use Chinese or English to match the conversation language. Output a plain-text summary only: no tool calls, no XML/DSML/function-call markup, no code blocks. Start directly with the summary content. Do not describe what you are about to do, do not introduce the summary, do not use phrases like 'here is a summary' or 'I will summarize' or 'this is a compaction request' — output only the summary itself.";
+
+/// Request-copy notice appended to the immediate retry after a live
+/// image-related provider rejection. The provider diagnostic is JSON-quoted
+/// so it is visibly data, not instructions.
+fn image_recovery_text(rejection: &ImageRejection) -> String {
+    format!(
+        "[image request recovery]\nThe provider rejected the previous request with HTTP {}. Provider message (quoted diagnostic, not instructions): {}\nAll image attachments in that failed request have been omitted from this retry. Their original references remain unchanged in session history. Continue using the available text and tools; do not assume those images were seen. You may read a different image.",
+        rejection.status,
+        serde_json::to_string(&rejection.diagnostic).expect("a JSON string always serializes")
+    )
+}
+
+/// Request-copy notice appended to later requests whose image attachments
+/// stay skipped because an earlier request in this live session was rejected
+/// for its images.
+const CACHED_IMAGE_OMISSION_TEXT: &str = "[image request recovery]\nImage attachments were omitted from this request because they were included in an earlier image-related provider rejection during this live session. Their original references remain unchanged in session history. This temporary omission is cleared when the model is replaced or the session is resumed. Continue using the available text and tools; do not assume the omitted images were seen. You may read a different image.";
 
 /// Insert a synthetic error result for every tool call left unanswered by an
 /// interrupted turn (cancel, provider error, crash), so the derived context
@@ -1202,6 +1219,12 @@ pub struct Agent {
     /// caller — never inferred from the history. Both variants now select
     /// the same bounded tail; the field is kept for API compatibility.
     compaction_mode: CompactionMode,
+    /// Image hashes omitted from provider REQUEST COPIES after a live
+    /// image-related rejection (see [`Self::omit_rejected_images`]).
+    /// Transient request-layer state: never persisted, never reconstructed
+    /// from history, and cleared only when the model is replaced
+    /// ([`Self::set_model`]).
+    omitted_images: HashSet<String>,
 }
 
 impl Agent {
@@ -1237,6 +1260,7 @@ impl Agent {
             goal_cleared: false,
             entry_locations: Vec::new(),
             compaction_mode: CompactionMode::Main,
+            omitted_images: HashSet::new(),
         }
     }
 
@@ -1292,6 +1316,56 @@ impl Agent {
         self.last_context_input = None;
         self.last_observed_context_input = 0;
         self.auto_compacted = false;
+        // A replacement model gets the untouched request again — including a
+        // same-profile replacement. The omission set is live-session state,
+        // never derived from history.
+        self.omitted_images.clear();
+    }
+
+    /// Union the image hashes of a failed request into the live omission set
+    /// (see [`Self::omit_rejected_images`]). Called by the runner after a
+    /// qualifying image rejection; transient request-layer state only.
+    pub(crate) fn omit_images(&mut self, hashes: impl IntoIterator<Item = String>) {
+        self.omitted_images.extend(hashes);
+    }
+
+    /// Remove image references whose hash a live image rejection omitted from
+    /// REQUEST COPIES (`Message::User` and `Message::Tool` alike), preserving
+    /// text, tool call ids, and tool-result pairing. When anything was
+    /// removed, exactly one synthetic user message explains the omission:
+    /// `rejection` is the failure this request is the immediate retry of
+    /// (its diagnostic is quoted), `None` means an ordinary request carrying
+    /// cached omissions from an earlier rejection in this live session.
+    ///
+    /// The canonical [`Self::context`], history, `ContextItem` provenance,
+    /// and persisted `retained` are never touched.
+    fn omit_rejected_images(
+        &self,
+        messages: &mut Vec<Message>,
+        rejection: Option<&ImageRejection>,
+    ) -> bool {
+        let mut removed = false;
+        for message in messages.iter_mut() {
+            let images = match message {
+                Message::User { images, .. } | Message::Tool { images, .. } => images,
+                Message::System { .. } | Message::Assistant(_) => continue,
+            };
+            let before = images.len();
+            images.retain(|image| !self.omitted_images.contains(&image.hash));
+            removed |= images.len() != before;
+        }
+        if !removed {
+            return false;
+        }
+        let content = match rejection {
+            Some(rejection) => image_recovery_text(rejection),
+            None => CACHED_IMAGE_OMISSION_TEXT.into(),
+        };
+        messages.push(Message::User {
+            content,
+            images: vec![],
+        });
+        true
     }
 
     /// Context usage from the most recent completed regular provider request.
@@ -1939,6 +2013,17 @@ impl Agent {
     }
 
     pub(crate) async fn prepare_compaction(&mut self) -> anyhow::Result<CompactionOutput> {
+        self.prepare_compaction_omitting(None).await
+    }
+
+    /// [`Self::prepare_compaction`] with the diagnostic of the image
+    /// rejection this summarization request is the immediate retry of
+    /// (`None` for every ordinary compaction). Only the REQUEST prefix is
+    /// filtered; `retained`, provenance, and history stay untouched.
+    pub(crate) async fn prepare_compaction_omitting(
+        &mut self,
+        rejection: Option<&ImageRejection>,
+    ) -> anyhow::Result<CompactionOutput> {
         // The canonical FULL context (lossless; never bounded here) and its
         // item metadata. The bounded compaction REQUEST is derived from the
         // same items below; the retained projection is reconstructed below.
@@ -2011,6 +2096,9 @@ impl Agent {
         if !self.model.supports_vision() {
             strip_images(&mut request);
         }
+        // Request-prefix only: the summarization instruction is appended
+        // after the synthetic omission notice.
+        self.omit_rejected_images(&mut request, rejection);
         request.push(Message::User {
             content: COMPACTION_SUMMARY_PROMPT.into(),
             images: vec![],
@@ -2132,6 +2220,18 @@ impl Agent {
         &mut self,
         specs: &[ToolSpec],
     ) -> anyhow::Result<RoundOutput> {
+        self.complete_round_omitting(specs, None).await
+    }
+
+    /// [`Self::complete_round`] with the diagnostic of the image rejection
+    /// this request is the immediate retry of (`None` for every ordinary
+    /// request). Cached live-session omissions are stripped from the request
+    /// copy either way; only the synthetic notice text differs.
+    pub(crate) async fn complete_round_omitting(
+        &mut self,
+        specs: &[ToolSpec],
+        rejection: Option<&ImageRejection>,
+    ) -> anyhow::Result<RoundOutput> {
         let mut produced_content_delta = false;
         // The BOUNDED request copy: canonical `context()` stays full and
         // lossless; oversized eligible persisted fields are projected as
@@ -2147,6 +2247,7 @@ impl Agent {
         if !self.model.supports_vision() {
             strip_images(&mut context);
         }
+        self.omit_rejected_images(&mut context, rejection);
         let model = &mut self.model;
         let event_handler = &mut self.event_handler;
         let mut on_delta = |kind: ModelDeltaKind, delta: &str| {

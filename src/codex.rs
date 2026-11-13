@@ -11,6 +11,7 @@ use crate::agent::{
     AssistantMessage, Message, Model, ModelDeltaKind, ToolCall, ToolSpec, Usage, preview,
 };
 use crate::codex_auth::CodexAuth;
+use crate::model::ImageRejection;
 
 const RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 
@@ -238,6 +239,29 @@ impl Model for CodexModel {
                 response = self.send(&request, false).await?.0;
             }
             let status = response.status();
+            // Only a 4xx can be an image rejection: read its body here so a
+            // qualifying rejection bypasses the transient 403/5xx retry loop
+            // (and reaches the runner's one-shot recovery). The 401 refresh
+            // above keeps its established order; every other status keeps
+            // the existing retry-before-body path.
+            if status.is_client_error() {
+                let body = response.text().await.unwrap_or_default();
+                if let Some(rejection) = ImageRejection::classify(status, &body, messages) {
+                    return Err(anyhow::Error::new(rejection));
+                }
+                if is_retryable_http_status(status) && attempt < HTTP_RETRY_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_millis(retry_backoff_ms(
+                        HTTP_RETRY_BASE_BACKOFF_MS,
+                        attempt,
+                    )))
+                    .await;
+                    continue;
+                }
+                bail!(
+                    "ChatGPT Responses returned HTTP {status}: {}",
+                    preview(&body, 500)
+                );
+            }
             if is_retryable_http_status(status) && attempt < HTTP_RETRY_ATTEMPTS {
                 tokio::time::sleep(Duration::from_millis(retry_backoff_ms(
                     HTTP_RETRY_BASE_BACKOFF_MS,

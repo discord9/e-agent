@@ -104,6 +104,88 @@ impl Model for ConfiguredModel {
     }
 }
 
+/// A provider 4xx response that rejected the image attachments submitted
+/// with the request. Shared by both model wires (chat here, codex in
+/// `src/codex.rs`).
+///
+/// Classification is deliberately narrow: an actual HTTP 4xx response, a
+/// request that submitted image references, and a provider message/body
+/// that names `image` case-insensitively. The match runs on the FULL body
+/// (never the 500-char display preview), and the full diagnostic is carried
+/// so the recovery notice can quote it verbatim instead of the truncated
+/// display text. Retrying the identical request cannot help (the image is
+/// still attached), so a qualifying rejection bypasses the adapters'
+/// transient HTTP retry loop and reaches the runner's one-shot recovery.
+#[derive(Clone, Debug)]
+pub(crate) struct ImageRejection {
+    /// HTTP status of the rejected request.
+    pub(crate) status: reqwest::StatusCode,
+    /// Full, untruncated provider diagnostic (response body / message).
+    pub(crate) diagnostic: String,
+    /// Distinct image hashes carried by the failed request, in first-seen
+    /// order.
+    pub(crate) hashes: Vec<String>,
+}
+
+impl ImageRejection {
+    /// Classify a failed provider response as an image rejection. Returns
+    /// `None` for every other failure, leaving the existing status/retry/
+    /// auth behavior untouched.
+    pub(crate) fn classify(
+        status: reqwest::StatusCode,
+        body: &str,
+        messages: &[Message],
+    ) -> Option<Self> {
+        if !status.is_client_error() || !body.to_ascii_lowercase().contains("image") {
+            return None;
+        }
+        let hashes = submitted_image_hashes(messages);
+        (!hashes.is_empty()).then(|| Self {
+            status,
+            diagnostic: body.to_owned(),
+            hashes,
+        })
+    }
+}
+
+impl std::fmt::Display for ImageRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "provider returned HTTP {}: {}",
+            self.status, self.diagnostic
+        )
+    }
+}
+
+impl std::error::Error for ImageRejection {}
+
+/// Distinct image hashes carried by a request's messages (user and tool
+/// references alike), in first-seen order.
+fn submitted_image_hashes(messages: &[Message]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut hashes = Vec::new();
+    for message in messages {
+        let images = match message {
+            Message::User { images, .. } | Message::Tool { images, .. } => images,
+            Message::System { .. } | Message::Assistant(_) => continue,
+        };
+        for image in images {
+            if seen.insert(image.hash.as_str()) {
+                hashes.push(image.hash.clone());
+            }
+        }
+    }
+    hashes
+}
+
+/// The typed image rejection carried by a failed model request, if any.
+pub(crate) fn image_rejection(error: &anyhow::Error) -> Option<&ImageRejection> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ImageRejection>())
+}
+
 #[derive(Clone)]
 pub struct OpenAiModel {
     client: reqwest::Client,
@@ -277,6 +359,31 @@ impl Model for OpenAiModel {
             attempt += 1;
             let response = self.send_chat(&request).await?;
             let status = response.status();
+            // Only a 4xx can be an image rejection: read its body here so a
+            // qualifying rejection bypasses the transient 403/5xx retry loop.
+            // Every other status keeps the existing retry-before-body path.
+            if status.is_client_error() {
+                let body = response.text().await.unwrap_or_default();
+                if let Some(rejection) = ImageRejection::classify(status, &body, messages) {
+                    return Err(anyhow::Error::new(rejection));
+                }
+                if is_retryable_http_status(status) && attempt < HTTP_RETRY_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_millis(retry_backoff_ms(
+                        HTTP_RETRY_BASE_BACKOFF_MS,
+                        attempt,
+                    )))
+                    .await;
+                    continue;
+                }
+                anyhow::bail!(
+                    "provider returned HTTP {status} (model={} effort={:?} msgs={} tools={}): {}",
+                    self.model,
+                    self.reasoning_effort,
+                    messages.len(),
+                    tools.len(),
+                    preview(&body, 500)
+                );
+            }
             if is_retryable_http_status(status) && attempt < HTTP_RETRY_ATTEMPTS {
                 tokio::time::sleep(Duration::from_millis(retry_backoff_ms(
                     HTTP_RETRY_BASE_BACKOFF_MS,

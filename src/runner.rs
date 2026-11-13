@@ -6,6 +6,7 @@ use crate::{
         POLL_GUARD_TERMINATION_NOTICE, RoundOutput, SessionEntry, ToolCall, ToolOutput, ToolSpec,
         is_poll_guard_terminate, tool_error_content,
     },
+    model::{ImageRejection, image_rejection},
     session_store::{LocatedKey, SessionStore},
 };
 
@@ -50,6 +51,10 @@ const EVENT_CAPACITY: usize = 256;
 /// itself arms/wakes nothing.
 const GOAL_TURN_NOTICE: &str = "[goal continuation] Check the current goal with the `get_goal` tool, assess its status, remaining work, and evidence, then continue the relevant work — or update the goal with `update_goal` so it stays truthful.";
 
+/// Transient display notice published when a qualifying image rejection is
+/// recovered by one image-free retry.
+const IMAGE_RETRY_NOTICE: &str = "Retrying once without image attachments. Their references remain in history; matching attachments will be skipped until the model is replaced or this session is resumed.";
+
 /// Outcome of polling an in-flight operation against the command channel.
 /// A `Cancel` command is a *release*: the in-flight future is dropped
 /// (preempted) so queued messages are processed immediately — it never
@@ -65,6 +70,10 @@ struct WaitResult<T> {
     pending: Vec<SessionCommand>,
 }
 
+/// Run one model round, with the single conditional image-rejection retry.
+/// Steering, cancel, and queued-command semantics are the existing
+/// `wait_for_operation` ones: commands collected while the rejected request
+/// was in flight are carried into the retry and returned with its outcome.
 async fn await_round(
     agent: &mut Agent,
     specs: &[ToolSpec],
@@ -72,16 +81,86 @@ async fn await_round(
     shared: &Arc<Mutex<Shared>>,
 ) -> WaitResult<anyhow::Result<RoundOutput>> {
     let mut operation = Box::pin(agent.complete_round(specs));
-    wait_for_operation(&mut operation, commands, shared).await
+    let first = wait_for_operation(&mut operation, commands, shared).await;
+    // The future holds the agent borrow; release it before retrying.
+    drop(operation);
+    let Some(rejection) = completed_rejection(&first.outcome) else {
+        return first;
+    };
+    recover_image_rejection(agent, rejection, shared);
+    let mut pending = first.pending;
+    let mut retry = Box::pin(agent.complete_round_omitting(specs, Some(rejection)));
+    let retried = wait_for_operation(&mut retry, commands, shared).await;
+    pending.extend(retried.pending);
+    WaitResult {
+        outcome: label_retry_failure(retried.outcome),
+        pending,
+    }
 }
 
+/// Run one compaction request, with the same single conditional
+/// image-rejection retry (the request prefix is filtered; `retained` and
+/// provenance are untouched).
 async fn await_compaction(
     agent: &mut Agent,
     commands: &mut mpsc::UnboundedReceiver<SessionCommand>,
     shared: &Arc<Mutex<Shared>>,
 ) -> WaitResult<anyhow::Result<CompactionOutput>> {
     let mut operation = Box::pin(agent.prepare_compaction());
-    wait_for_operation(&mut operation, commands, shared).await
+    let first = wait_for_operation(&mut operation, commands, shared).await;
+    // The future holds the agent borrow; release it before retrying.
+    drop(operation);
+    let Some(rejection) = completed_rejection(&first.outcome) else {
+        return first;
+    };
+    recover_image_rejection(agent, rejection, shared);
+    let mut pending = first.pending;
+    let mut retry = Box::pin(agent.prepare_compaction_omitting(Some(rejection)));
+    let retried = wait_for_operation(&mut retry, commands, shared).await;
+    pending.extend(retried.pending);
+    WaitResult {
+        outcome: label_retry_failure(retried.outcome),
+        pending,
+    }
+}
+
+/// The typed image rejection of a completed-and-failed operation, if any.
+fn completed_rejection<T>(outcome: &WaitOutcome<anyhow::Result<T>>) -> Option<&ImageRejection> {
+    match outcome {
+        WaitOutcome::Completed(Err(error)) => image_rejection(error),
+        _ => None,
+    }
+}
+
+/// Apply a qualifying image rejection: publish the provider diagnostic and
+/// the retry notice as TRANSIENT presentation events (never a durable
+/// `SessionEntry`, never provider context), then make the failed request's
+/// image hashes sticky for the rest of this live session so later request
+/// copies skip them too.
+fn recover_image_rejection(
+    agent: &mut Agent,
+    rejection: &ImageRejection,
+    shared: &Arc<Mutex<Shared>>,
+) {
+    {
+        let mut shared = shared.lock().unwrap();
+        shared.emit_presentation(AgentEvent::Error(rejection.to_string()));
+        shared.emit_presentation(AgentEvent::Display(IMAGE_RETRY_NOTICE.into()));
+    }
+    agent.omit_images(rejection.hashes.iter().cloned());
+}
+
+/// The one-shot image-free retry's own failure is labelled; a successful
+/// retry keeps the operation's normal outcome (no third attempt).
+fn label_retry_failure<T>(
+    outcome: WaitOutcome<anyhow::Result<T>>,
+) -> WaitOutcome<anyhow::Result<T>> {
+    match outcome {
+        WaitOutcome::Completed(Err(error)) => {
+            WaitOutcome::Completed(Err(anyhow::anyhow!("image-free retry failed: {error:#}")))
+        }
+        outcome => outcome,
+    }
 }
 
 async fn await_tool(
