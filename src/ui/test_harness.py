@@ -538,6 +538,25 @@ let sessionsPostCustom = null;
 let sessionDeleteStatus = 204;
 let historyOverrides = new Map();
 let sseOkIds = new Set();
+/* Web attach（/events?view=web）bootstrap 固定桩：id → {status?, netfail?,
+   hang?, entries, locations?, replay?, next_before_seq?}。live 会话的历史由
+   runner-owned bootstrap 一次性送达（一个 SSE 事件同时带 transcript 与呈现
+   桥），深链对未列出的 id 也走这条路——它不再 probe /history。因此每个深链
+   用例必须按 id 给出自己的 bootstrap；旧的「history 覆盖 + 空 /events」
+   组合在新流程里等价于「没有 transcript」，会让页面停在空消息区。 */
+let attachById = new Map();
+function bootstrapStream(fix) {
+  const payload = JSON.stringify({
+    entries: fix.entries || [],
+    locations: fix.locations || [],
+    replay: fix.replay || [],
+    next_before_seq: fix.next_before_seq !== undefined ? fix.next_before_seq : null,
+  });
+  const chunks = ["event: bootstrap\ndata: " + payload + "\n\n"];
+  let i = 0;
+  return { getReader(){ return { read: async()=> i < chunks.length
+    ? { done:false, value: chunks[i++] } : { done:true } }; } };
+}
 let historyResolve = null;
 let a1StreamManualNotice = false;
 // fork 面板测试用：/fork-candidates 候选与 /fork POST 响应（测试中可变）
@@ -599,6 +618,17 @@ globalThis.fetch=(url,opts={})=>{
           "x-spool-total": String(total),
           "x-spool-truncated": taskOutputTruncated ? "true" : "false",
         });
+      }
+      // Web attach / events 显式固定桩（含 bootstrap）：按 id 给出与真实 wire
+      // 一致的响应（200 = bootstrap 流，或 401/404 等错误状态、网络失败、
+      // 永久挂起）。优先级最高，避免落到下方「未知 id → 404」兜底。
+      const _mAttach = /^\/api\/sessions\/([^/]+)\/events(\?view=web)?$/.exec(url);
+      if (_mAttach && attachById.has(_mAttach[1])) {
+        const fix = attachById.get(_mAttach[1]);
+        if (fix.netfail) return Promise.reject(new TypeError("network error"));
+        if (fix.hang) return abortable(new Promise(() => {}), signal);
+        if (fix.status && fix.status !== 200) return resp(fix.status, fix.body || {}, signal);
+        return resp(200, bootstrapStream(fix), signal);
       }
       // SSE 404 语义测试：命中这些 id 的 /events 返回 404（优先于下方具体会话路由）
       const _m404 = /^\/api\/sessions\/([^/]+)\/events$/.exec(url);
@@ -2576,13 +2606,22 @@ async function main(){
     await flush(); await flush();
     const msgs3 = elsById["messages"];
     const last3 = msgs3.children[msgs3.children.length - 1];
+    // 累积器不变式（比旧的 length===0 更准确）：fresh 尾部由 renderEntries 用
+    // 新累积器渲染，它自己那张 bash 卡片以 filled:true 留在 toolStack 里
+    // （appendToolCall push → appendToolResult 标记 filled），所以 length 不再
+    // 为 0。回归真正要防的是「缓存里那张执行中卡片还挂在累积器上」：每个槽
+    // 必须已填充、且节点仍连在消息区（未填充 = 后续 ToolResult 会填进它；
+    // 脱离文档 = 结果写进一个不再显示的节点）。
+    const stack3 = (state.acc && state.acc.toolStack) || [];
+    const unfilled3 = stack3.filter((e) => !e.filled).length;
+    const detached3 = stack3.filter((e) => !(e.el && e.el.isConnected && msgs3.contains(e.el))).length;
     chk("restored does not re-append cached in-flight tool card to bottom",
         !msgs3.textContent.includes("执行中…")
         && !!last3 && last3.className.includes("forked")
-        && !(state.acc && state.acc.toolStack && state.acc.toolStack.length),
+        && unfilled3 === 0 && detached3 === 0,
         "last=" + (last3 ? last3.className : "none")
         + " inflight=" + msgs3.textContent.includes("执行中…")
-        + " stack=" + (state.acc && state.acc.toolStack ? state.acc.toolStack.length : "-"));
+        + " stack=" + stack3.length + " unfilled=" + unfilled3 + " detached=" + detached3);
 
     // ---- restored streaming tail reconciliation ----
     // Cache A after ABC, leave it while B is active, then return. The initial
@@ -6155,6 +6194,18 @@ async function main(){
     state.workspaceErrors = {};
     state.lastList = [];
     state.sessionId = null;
+    // 真正的「首次加载」：上一段已成功轮询过 wsTransient，侧边栏快照/详情
+    // 缓存仍在（键 = wsId+url+token）。production 的首次加载没有任何快照，
+    // 组体走的是「无快照 + 无行 + 瞬时错误」分支（「正在连接，重试中…」）；
+    // 留着旧快照会走 renderTreeForList 的空列表分支（「暂无会话」），那就
+    // 不是首次加载了。只清该身份的缓存，不碰其它 workspace 的已加载详情。
+    {
+      const _trKey = workspaceIdentityKey(state.workspace, workspaceToken(state.workspace));
+      workspaceSidebarSnapshots.delete(_trKey);
+      workspaceDetailLists.delete(_trKey);
+      workspaceDetailsLoaded.delete(_trKey);
+      workspaceDetailErrors.delete(_trKey);
+    }
     // 上面「stale 行点击仍在 timeout 列表下」会顺手发起一次新的列表轮询：
     // 桩里的 timeout 分支是永久挂起（只有捕获到的 abort 句柄能打断，此处
     // 拿不到），它登记进 workspaceSessionRequests 后永不 settle。若不清理，
@@ -7043,8 +7094,12 @@ async function main(){
     chk("poll list URL carries exclude filter",
         FETCHES.includes("/api/sessions?mode=sidebar"),
         "n=" + FETCHES.filter((u) => u === "/api/sessions?mode=sidebar").length);
-    // 小轮询结果里没有归档 / inactive 子会话：合并必须把它们留在缓存里
-    // （否则展开过的「归档 (N)」分组会随下一次 2s 轮询闪没）。
+    // 轮询结果只带窗口内的行（?mode=sidebar 的 partial 快照）：合并规则已从
+    // 「只保留被服务端过滤掉的归档/inactive 行、其余缺失即删除」改为
+    // 「详情缓存是持久的，窗口行是快照」——窗口里没有的 id 一律保留（它只是
+    // 落在窗口外，不能当作已删除），窗口行覆盖同名详情行。真正的删除只能由
+    // 权威全量（裸数组快照）表达。这里同时锁住旧不变式（归档/inactive 子会话
+    // 不因一次小轮询闪没）与新不变式（窗口缺席 ≠ 删除，且同 id 不重复）。
     const _polledSubset = [
       { id: "s1", parent_session_id: null, model: "kimi", role: "main",
         status: "Idle", entry_count: 8, active: true },
@@ -7054,15 +7109,16 @@ async function main(){
       { id: "arch-1", parent_session_id: null, status: "Idle", active: true, archived: true },
       { id: "sub-arch", parent_session_id: "s1", status: "Idle", active: true, archived: true },
       { id: "x-hist", parent_session_id: "s1", status: "Idle", active: false },
-      { id: "gone", parent_session_id: null, status: "Idle", active: true },
+      { id: "out-of-window", parent_session_id: null, status: "Idle", active: true },
     ];
     const _mergedCache = mergePolledSessions(_prevCache, _polledSubset);
-    chk("archive: filtered poll merge retains archived and inactive children",
+    chk("archive: filtered poll merge retains archived, inactive, and out-of-window rows",
         _mergedCache.some((x) => x.id === "arch-1")
         && _mergedCache.some((x) => x.id === "sub-arch")
         && _mergedCache.some((x) => x.id === "x-hist")
         && _mergedCache.some((x) => x.id === "s1" && x.entry_count === 8)
-        && !_mergedCache.some((x) => x.id === "gone")
+        && _mergedCache.some((x) => x.id === "out-of-window")
+        && _mergedCache.length === _prevCache.length
         && _mergedCache.filter((x) => x.id === "s1").length === 1,
         "ids=" + _mergedCache.map((x) => x.id).join(","));
     // 展开分组 → 归档行可见（buildTreeRoot 保留，点击可打开）
@@ -7085,8 +7141,17 @@ async function main(){
     // 服务端把 archived 沉底排序（server.rs），旧窗口 slice(0,8) 会让归档
     // 腾出的位被更早会话顶上（「归档后侧边栏不变短、冒出别的会话」）。
     // 前端按 last_active_at 重排（含归档恢复原槽位），窗口取槽位、归档
-    // 的空着：9 个总根中近期 1 个归档，虽然非归档 roots 恰好只有 8，
-    // 仍须按总根数进入窗口；主树显示 7 个，不显示最旧 w0，more = 1。
+    // 的空着：9 个总根中近期 1 个归档 → 槽位窗口仍然生效，主树显示 7 个，
+    // 不显示最旧 w0（本段的核心不变式，未变）。
+    // more 计数的口径变了（a6ff73c）：旧式 = 非归档 roots - 已显示 = 1；
+    // 现在 = max(0, totalRootSlots - pinnedRoots - shown)。本用例走的是
+    // 「列表桩返回裸数组（权威全量）、无 sidebar 汇总 totals」的路径：
+    // totalRootSlots 回退为「主会话槽位数」，**含归档槽位** → 9 - 0 - 7 = 2
+    // （= 归档槽位 + 窗口外的 w0）。对照：服务端 totals.roots 只数非归档根
+    // （server.rs compact_sidebar），带真实 sidebar 快照时同一 9 行列表只有
+    // 8 个非归档根 → 8 > 8 不成立，根本不进窗口（8 根全显示、无 more 按钮）。
+    // 也就是说「more 是否把归档槽位算进去」只在无汇总的兼容路径可见（已作为
+    // 报告项记录）。本断言锁定这条路径的实际规则：more = 未进入主树的根槽位数。
     const _winSessions = [];
     for (let i = 0; i < 9; i++) {
       _winSessions.push({ id: "w" + i, parent_session_id: null, status: "Idle",
@@ -7115,10 +7180,11 @@ async function main(){
         !_winTexts.some((t) => t.includes("w0")),
         "texts=" + _winTexts.join("|"));
     const _winMore = elsById["sidebarTree"].querySelector(".tree-more");
-    chk("archive window: 9→8 boundary keeps more count 1",
-        _winMore !== null && _winMore.textContent.includes("1"),
+    chk("archive window: 9→8 boundary counts every root slot outside the main tree (2)",
+        _winMore !== null && _winMore.textContent.includes("2"),
         "more=" + (_winMore && _winMore.textContent));
-    // 对照组：同一 9 根列表恢复近期归档 → 窗口满 8 根 + more 计数 1。
+    // 对照组：同一 9 根列表恢复近期归档 → 窗口满 8 根 + more 计数 1
+    // （全部根槽位都在主树内，只剩最旧 w0 未显示）。
     _winSessions[7].archived = false;
     renderSidebarTree(true);
     const _winRoots2 = [...elsById["sidebarTree"].querySelectorAll(".tree-row")]
@@ -8275,12 +8341,16 @@ async function main(){
         && scheduledTimeouts.length === _to404a,
         "stopped=" + state.sse.stopped + " timeouts=" + scheduledTimeouts.length);
     sse404Ids.delete("s1");
-    // (b) 真 live（刷新后仍 active）：live 的 404 先刷新列表再分类——
-    //     刷新（立即返回的 sessionsData 仍 active:true）后重分类仍为 live
-    //     → 保持「不存在」报错，但不重连
+    // (b) 真 live（刷新后仍 active）且 transcript 也读不到：handleLive404Refresh
+    //     会先刷新列表，再 **probe 一次 history 确认会话是否真的没了**
+    //     （"Confirm its transcript before declaring terminal or retrying"）：
+    //     列表仍 active + history 仍 404 → 会话确实不存在 → 保持「不存在」
+    //     报错，但不重连。history 可读的分支见 (b2)：那时产品判定「会话已
+    //     结束」并渲染 transcript，不再报不存在（新规则）。
     sessionsData = [{ id: "s1", status: "Idle", entry_count: 8, busy: false, active: true }];
     _open404("s1", [{ id: "s1", status: "Idle", entry_count: 8, busy: false, active: true }]);
     sse404Ids.add("s1");
+    historyOverrides.set("s1", { status: 404, body: {} });   // transcript 不可读
     const _to404b = scheduledTimeouts.length;
     connectSSE("s1", state.workspace.id, sessionOpenEpoch);
     await flush();
@@ -8294,6 +8364,31 @@ async function main(){
         && scheduledTimeouts.length === _to404b + 2,   // +2 = banner 自动消失计时器 + 刷新 fetch 的
         // abort 定时器槽（fetchWithTimeout 10s 超时；完成后 finally clear 置 null，
         // 但 scheduledTimeouts.length 只增不减——HEAD perf 合并后新增的槽位）
+        "stopped=" + state.sse.stopped + " timeouts=" + scheduledTimeouts.length);
+    sse404Ids.delete("s1");
+    historyOverrides.delete("s1");
+    // (b2) 缓存标 live、404，但 transcript 可读：会话在 poll 与 SSE 之间结束
+    //      （runner 已退出，历史仍在库里）。产品确认 transcript 后判定「会话
+    //      已结束」：渲染可读的 transcript + ended 轻提示，不报「不存在」、
+    //      不重连——不能把「没有实时流」当成「会话不存在」。
+    _open404("s1", [{ id: "s1", status: "Idle", entry_count: 8, busy: false, active: true }]);
+    sse404Ids.add("s1");
+    const _to404b2 = scheduledTimeouts.length;
+    connectSSE("s1", state.workspace.id, sessionOpenEpoch);
+    await flush();
+    await flush();
+    chk("sse404 live + readable transcript: ended hint, transcript kept",
+        elsById["banner"].hidden === true
+        && elsById["connState"].textContent === "会话已结束"
+        && elsById["connState"].className === "conn-state ended"
+        && elsById["messages"].textContent.includes("完成。")
+        && state.initSource === "history",
+        "banner=" + JSON.stringify(elsById["bannerText"].textContent)
+        + " conn=" + JSON.stringify(elsById["connState"].textContent)
+        + " src=" + state.initSource);
+    chk("sse404 live + readable transcript: stopped, no reconnect",
+        state.sse.stopped === true && state.sse.retryTimer === null
+        && scheduledTimeouts.length === _to404b2 + 1,   // +1 = 刷新 fetch 的 abort 定时器槽
         "stopped=" + state.sse.stopped + " timeouts=" + scheduledTimeouts.length);
     sse404Ids.delete("s1");
     // (c) 未知（不在任何列表）：任务面板直连刚结束的子会话 → 完全静默
@@ -8377,13 +8472,19 @@ async function main(){
     // 16) 深链平滑降级（?session=<id> 不依赖列表轮询）：
     //     - URL/token 就绪后立即尝试（与轮询并行），不再等 poll round
     //     - fresh 列表命中 → 既有 active/resume 分支；列表缺失/失败/超时/
-    //       过期 → 直接对激活 workspace probe history（列表缺失不是权威
-    //       不存在）
+    //       过期 → 直接对激活 workspace 打开会话（列表缺失不是权威不存在）
+    //     - **live/未知会话的历史走 runner-owned Web attach bootstrap**
+    //       （GET /events?view=web，一个 bootstrap 事件带 transcript + 呈现
+    //       桥），不再先 probe /history：只有列表已判定 active===false 的
+    //       历史会话才走 /history + /events 404 的旧路径。因此每个深链用例
+    //       按 id 提供 attachById 的 bootstrap 固定桩（见顶部桩注释），
+    //       「history 覆盖 + 空 /events」在新流程里等于没有 transcript。
     //     - token 从空变有效 → 立即重试 pending 深链（不只 pollSessions）
-    //     - history 加有界超时；"fail"（网络/超时）→ SSE snapshot 兜底
+    //     - history 加有界超时（历史会话路径）；attach 失败（401/404/网络/
+    //       timeout）→ 新重试 banner「无法读取会话历史，且该会话暂无实时流；
+    //       将自动重试」+ 3s 自动重连；401 仍是明确的认证 banner
     //     - 深链专属 SSE 404 恢复：history 已成功 + historical/unknown →
     //       resumeSession；任务面板路径（无深链标记）保持三态分类不变
-    //     - history 与 SSE 都失败 → 持久错误提示 + 自动重试，不白屏
     //     - 竞态：深链 history 迟到 + 用户切走 → 旧响应不渲染不起流
     //     - 无 workspace 参数 → 只用当前激活 workspace；背景 poll 卡住
     //       不延迟目标 workspace 深链
@@ -8395,7 +8496,7 @@ async function main(){
       sidebarOpen: state.sidebar.open, search: location.search,
       sessionsData: sessionsData, sessionsDataB: sessionsDataB, sessionsDelayed: sessionsDelayed,
       sessionsBFail: sessionsBFail, bGetDelayed: bGetDelayed, sse404Ids: new Set(sse404Ids),
-      historyOverrides: new Map(historyOverrides),
+      historyOverrides: new Map(historyOverrides), attachById: new Map(attachById),
     };
     const _postedIds = () => FETCH_BODIES.map((b) => {
       try { return b ? JSON.parse(b).id : null; } catch (e) { return null; }
@@ -8414,12 +8515,16 @@ async function main(){
       elsById["banner"].hidden = true; elsById["bannerText"].textContent = "";
     };
     const _hist = (text) => ({ entries: [{ type: "message", message: { User: { content: text, images: [] } } }], next_before_seq: null });
+    // Web attach bootstrap 固定桩（live / 未列出会话的深链主路径）：一个
+    // bootstrap 事件带 transcript（entries）+ 呈现桥（replay）。
+    const _bootstrap = (text) => ({ entries: _hist(text).entries, replay: [], next_before_seq: null });
 
-    // (1) 列表永久 pending + history/SSE 成功 → 不等待列表即进入 chat
+    // (1) 列表永久 pending + attach bootstrap 成功 → 不等待列表即进入 chat
+    //     （未列出的 id 在 openWith 里归类 unknown → Web attach；transcript
+    //      由 bootstrap 事件送达，不需要 /history）
     _dlReset(null, "t");
     sessionsDelayed = true; sessionsResolve = null;
-    historyOverrides.set("dl1", { status: 200, body: _hist("深链1内容") });
-    sseOkIds.add("dl1");
+    attachById.set("dl1", _bootstrap("深链1内容"));
     location.search = "?session=dl1";
     init();                                   // 重新走启动：URL 解析 → 立即深链（与轮询并行）
     await flush(); await flush();
@@ -8433,7 +8538,7 @@ async function main(){
     sessionsResolve(resp(200, sessionsData));   // 放行列表轮询
     await flush(); await flush();
     sessionsDelayed = false;
-    historyOverrides.delete("dl1"); sseOkIds.delete("dl1");
+    attachById.delete("dl1");
 
     // (2) token 初始为空：URL 解析记录 pending；输入 token 后立即处理（不等 poll round）
     _dlReset(null, "");
@@ -8448,8 +8553,7 @@ async function main(){
     chk("deeplink: list poll pending while token empty",
         sessionsResolve !== null,
         "listPending=" + (sessionsResolve !== null));
-    historyOverrides.set("dl2", { status: 200, body: _hist("token后深链") });
-    sseOkIds.add("dl2");
+    attachById.set("dl2", _bootstrap("token后深链"));
     sessionsDelayed = false;                  // 后续轮询正常完成（不再二次挂起）
     state.token = "test-token";               // 模拟 token input 后的派生值
     restartTransport();                       // token 变化 → 立即重试深链
@@ -8461,7 +8565,7 @@ async function main(){
         "sid=" + state.sessionId + " listPending=" + (sessionsResolve !== null));
     sessionsResolve(resp(200, sessionsData)); // 放行挂起的列表轮询
     await flush(); await flush();
-    historyOverrides.delete("dl2"); sseOkIds.delete("dl2");
+    attachById.delete("dl2");
 
     // (3) fresh 列表命中 inactive → 仍调用 resume，不退化成只读 history
     _dlReset("dl-hist", "t");
@@ -8476,9 +8580,16 @@ async function main(){
         "sid=" + state.sessionId + " posted=" + JSON.stringify(_postedIds()));
     sessionsPostCustom = null;
 
-    // (4) 列表失败 + history 200 + SSE 404 → 深链专属恢复（resume 被调用）
+    // (4) 列表失败 + 缓存判定历史 + history 200 + SSE 404 → 深链专属恢复
+    //     （resume 被调用）。Web attach 流程下，深链只在「已知历史」时读
+    //     /history（openWith: known==="historical" → loadHistory，否则
+    //     ?view=web bootstrap），所以这条恢复路径的现实前提是：轮询失败、
+    //     缓存里该会话仍是 active:false 的历史行（列表失败保留 stale 缓存，
+    //     不是权威不存在）。unknown 的 404 不再 probe history，见 (5a)。
     _dlReset("dl-404", "t");
     sessionsAFail = true;
+    state.lastList = [{ id: "dl-404", status: "Idle", entry_count: 2, busy: false, active: false }];
+    state.workspaceLists["ws1"] = state.lastList;   // 轮询失败 → 保留的 stale 缓存
     historyOverrides.set("dl-404", { status: 200, body: _hist("404恢复历史") });
     sse404Ids.add("dl-404");
     sessionsPostCustom = { id: "dl-404", status: "Idle", active: true };
@@ -8486,7 +8597,8 @@ async function main(){
     await flush(); await flush(); await flush();
     chk("deeplink: list-fail + history 200 + SSE 404 resumes",
         _postedIds().includes("dl-404")
-        && state.sessionId === "dl-404",
+        && state.sessionId === "dl-404"
+        && elsById["messages"].textContent.includes("404恢复历史"),
         "sid=" + state.sessionId + " posted=" + JSON.stringify(_postedIds()));
     const _promptBefore4 = FETCHES.filter((u) => u === "/api/sessions/dl-404/prompt").length;
     els.promptInput.value = "列表失败时仍可发送";
@@ -8512,46 +8624,76 @@ async function main(){
     historyOverrides.delete("dl-404");
     sessionsAFail = false; sessionsPostCustom = null;
 
-    // (5) history 失败形态：404/401 → 停流提示；网络失败/timeout → SSE snapshot 兜底
-    // (5a) 404 → gone banner，不起 SSE
+    // (5) attach 失败形态。Web attach 流程下深链不再先 probe /history，所以
+    //     未列出 id 的失败全部由 /events?view=web 的状态决定：
+    //     404 / 网络失败 / 悬挂 → 新重试 banner「…暂无实时流；将自动重试」
+    //     + 3s 自动重连（深链标记保留，重试仍按深链处理）；401 → 认证 banner
+    //     并停流。404 不再等同于「会话不存在」：列表未给出该 id 时，缺失
+    //     不是权威不存在（旧断言「404 → 不存在 banner」按旧 probe 语义写，
+    //     在新流程里已不成立）。
+    // (5a) 未列出 id + attach 404 → 重试 banner（不是「不存在」），继续重试
     _dlReset("dl-gone", "t");
-    historyOverrides.set("dl-gone", { status: 404, body: {} });
+    attachById.set("dl-gone", { status: 404 });
+    const _postsBefore5a = _postedIds().length;
     maybeHandleDeepLink();
     await flush(); await flush();
-    chk("deeplink: history 404 shows gone banner, no SSE",
-        elsById["bannerText"].textContent.includes("不存在")
-        && !FETCHES.some((u) => u === "/api/sessions/dl-gone/events"),
-        "banner=" + JSON.stringify(elsById["bannerText"].textContent));
-    historyOverrides.delete("dl-gone");
-    // (5b) 401 → auth banner，不起 SSE
+    chk("deeplink: unknown target 404 → retry banner, no false 不存在",
+        FETCHES.includes("/api/sessions/dl-gone/events?view=web")   // 走 Web attach
+        && !FETCHES.some((u) => u.includes("dl-gone/history"))       // 不再 probe history
+        && elsById["bannerText"].textContent.includes("自动重试")
+        && !elsById["bannerText"].textContent.includes("不存在")
+        && elsById["banner"].hidden === false
+        && _postedIds().length === _postsBefore5a                // 未伪造恢复
+        && state.sse.stopped === false && state.sse.retryTimer !== null,
+        "banner=" + JSON.stringify(elsById["bannerText"].textContent)
+        + " web=" + FETCHES.includes("/api/sessions/dl-gone/events?view=web")
+        + " retry=" + (state.sse.retryTimer !== null));
+    attachById.delete("dl-gone");
+    // (5b) attach 401 → 认证 banner，停流（不重连到 401 循环），不读 transcript
     _dlReset("dl-auth", "t");
-    historyOverrides.set("dl-auth", { status: 401, body: {} });
+    attachById.set("dl-auth", { status: 401 });
     maybeHandleDeepLink();
     await flush(); await flush();
-    chk("deeplink: history 401 shows auth banner, no SSE",
-        elsById["bannerText"].textContent.includes("认证失败")
-        && !FETCHES.some((u) => u === "/api/sessions/dl-auth/events"),
-        "banner=" + JSON.stringify(elsById["bannerText"].textContent));
-    historyOverrides.delete("dl-auth");
-    // (5c) 网络失败 → SSE snapshot 兜底 + 持久错误提示（自动重试）
+    chk("deeplink: attach 401 shows auth banner, stops stream",
+        FETCHES.includes("/api/sessions/dl-auth/events?view=web")
+        && !FETCHES.some((u) => u.includes("dl-auth/history"))
+        && elsById["bannerText"].textContent.includes("认证失败")
+        && state.sse.stopped === true && state.sse.retryTimer === null,
+        "banner=" + JSON.stringify(elsById["bannerText"].textContent)
+        + " stopped=" + state.sse.stopped);
+    attachById.delete("dl-auth");
+    // (5c) attach 网络失败 → 排程 3s 自动重连（连接状态可见）、深链标记保留
+    //      （重试仍带深链有界 history 超时语义）、不误报「不存在」
     _dlReset("dl-net", "t");
-    historyOverrides.set("dl-net", { netfail: true });
+    attachById.set("dl-net", { netfail: true });
     maybeHandleDeepLink();
     await flush(); await flush();
-    chk("deeplink: history network fail → SSE snapshot + persistent error",
-        FETCHES.some((u) => u === "/api/sessions/dl-net/events")
-        && elsById["bannerText"].textContent.includes("自动重试"),
-        "banner=" + JSON.stringify(elsById["bannerText"].textContent));
-    historyOverrides.delete("dl-net");
-    // (5d) timeout（10s abort）→ SSE snapshot 兜底 + 持久错误提示
+    chk("deeplink: attach network fail schedules retry, no false classification",
+        FETCHES.includes("/api/sessions/dl-net/events?view=web")
+        && elsById["banner"].hidden === true
+        && elsById["connState"].textContent.includes("重连")
+        && state.sse.stopped === false && state.sse.retryTimer !== null
+        && state.deepLink.probing === true,
+        "conn=" + JSON.stringify(elsById["connState"].textContent)
+        + " retry=" + (state.sse.retryTimer !== null)
+        + " probing=" + state.deepLink.probing);
+    attachById.delete("dl-net");
+    // (5d) 已知历史深链 + /history 悬挂：深链有界超时（10s abort）兜底，
+    //      超时后仍起 attach 并给出重试 banner——绝不永久挂起白屏
     _dlReset("dl-timeout", "t");
+    state.lastList = [{ id: "dl-timeout", status: "Idle", entry_count: 2, busy: false, active: false }];
+    state.workspaceLists["ws1"] = state.lastList;
     historyOverrides.set("dl-timeout", { hang: true });
     maybeHandleDeepLink();
-    const _abortIdx5d = scheduledTimeouts.length - 1;   // fetchWithTimeout 的 10s abort 定时器（同步 arm，最后一个槽）
-    scheduledTimeouts[_abortIdx5d]();                    // 触发超时 → AbortError → "fail"
+    // fetchWithTimeout 的 10s abort 定时器同步 arm（同步调用点就在 openWith →
+    // loadHistory 里），是本次调用新增的最后一个槽。
+    const _abort5d = scheduledTimeouts[scheduledTimeouts.length - 1] || null;
+    chk("deeplink: known-history history timeout arms bounded abort",
+        _abort5d !== null, "abortTimer=" + (_abort5d !== null));
+    if (_abort5d) _abort5d();                            // 触发超时 → AbortError → "fail"
     await flush(); await flush();
-    chk("deeplink: history timeout → SSE snapshot + persistent error",
-        FETCHES.some((u) => u === "/api/sessions/dl-timeout/events")
+    chk("deeplink: history timeout → attach attempted + retry banner",
+        FETCHES.some((u) => isEventsAttach(u, "/api/sessions/dl-timeout/events"))
         && elsById["bannerText"].textContent.includes("自动重试"),
         "banner=" + JSON.stringify(elsById["bannerText"].textContent));
     historyOverrides.delete("dl-timeout");
@@ -8626,8 +8768,7 @@ async function main(){
     state.deepLink = { pending: "dl8", handled: false, probing: false, attemptEpoch: -1 };
     state.sessionId = null;
     state.sidebar.open = false;
-    historyOverrides.set("dl8", { status: 200, body: _hist("深链8") });
-    sseOkIds.add("dl8");
+    attachById.set("dl8", _bootstrap("深链8"));
     bGetDelayed = true; bGetResolve = null;
     pollSessions();                               // 启动聚合轮询：B 卡住
     await flush();
@@ -8643,7 +8784,7 @@ async function main(){
     bGetResolve(resp(200, sessionsDataB));        // 放行 B
     await flush(); await flush();
     bGetDelayed = false;
-    historyOverrides.delete("dl8"); sseOkIds.delete("dl8");
+    attachById.delete("dl8");
 
     // =====================================================================
     // 9) 缺口 1（oracle 复审）：fresh inactive 深链经 resumeSession 后，
@@ -8684,6 +8825,11 @@ async function main(){
     // =====================================================================
     _dlReset("dl-retry-t", "t");
     sessionsAFail = true;                         // 列表失败 → probe 路径
+    // Web attach 流程下只有「已知历史」的深链才读 /history（openWith:
+    // known==="historical"），所以这条重试链的前提是缓存里该会话仍是
+    // active:false 的历史行（轮询失败保留 stale 缓存，不是权威不存在）。
+    state.lastList = [{ id: "dl-retry-t", status: "Idle", entry_count: 2, busy: false, active: false }];
+    state.workspaceLists["ws1"] = state.lastList;
     historyOverrides.set("dl-retry-t", { netfail: true });
     sse404Ids.add("dl-retry-t");
     const _base10 = scheduledTimeouts.length;
@@ -8736,6 +8882,7 @@ async function main(){
     sessionsAFail = false; sessionsPostCustom = null;
     sse404Ids = new Set(_dlSave.sse404Ids); sseOkIds = new Set();
     historyOverrides = new Map(_dlSave.historyOverrides);
+    attachById = new Map(_dlSave.attachById);
     stopSSE();
 
     // =====================================================================
