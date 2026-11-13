@@ -52,6 +52,17 @@ def last_message_text(body):
     return message.get("role"), ""
 
 
+def is_fork_child_request(body):
+    """The fork child's OWN first request: its prompt starts with the task text.
+
+    The parent keeps turning after the child's completion arrives, and the
+    injected notice carries the task label, so a substring match would count
+    the parent's continuation as a second child request.
+    """
+    role, text = last_message_text(body)
+    return role == "user" and text.startswith("FORK_CHILD_TASK")
+
+
 def has_fork_call(body):
     for message in body.get("messages") or []:
         for call in message.get("tool_calls") or []:
@@ -194,10 +205,7 @@ def main():
         def child_request_seen():
             # wait_for already holds `lock` around the predicate; taking it
             # again here would self-deadlock on the non-reentrant Lock.
-            return any(
-                (lambda role_text: role_text[0] == "user" and "FORK_CHILD_TASK" in role_text[1])(last_message_text(request))
-                for request in requests
-            )
+            return any(is_fork_child_request(request) for request in requests)
         wait_for(child_request_seen, "fork child provider request")
         # The child can finish its response before the next poll; allow a brief observation window
         # to catch an accidental second child request before fixing the snapshot for assertions.
@@ -220,10 +228,7 @@ def main():
         request2 = matching_fork_call[0]
         if has_fork_call(request2):
             raise AssertionError("4a: the in-flight parent request already contains the fork call it is about to produce")
-        child_requests = [
-            request for request in observed
-            if (lambda role_text: role_text[0] == "user" and "FORK_CHILD_TASK" in role_text[1])(last_message_text(request))
-        ]
+        child_requests = [request for request in observed if is_fork_child_request(request)]
         if len(child_requests) != 1:
             raise AssertionError(f"4a: expected one fork child request, got {len(child_requests)} of {len(observed)} provider requests")
         request3 = child_requests[0]

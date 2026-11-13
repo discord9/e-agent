@@ -3711,3 +3711,460 @@ fn fork_child_delegate_spec_matches_parent() {
     let child = parent.fork_child_delegate();
     assert_eq!(parent.spec(), child.spec());
 }
+
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// fork lifecycle: sender ownership, completion, admission,
+// parent registration, sessions metadata, live model
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+/// Seed a parent session with one completed turn: `fork_prefix` needs a turn
+/// boundary to cut the child's prefix at.
+fn seed_fork_parent(root: &std::path::Path, session: &str) {
+    use crate::agent::SessionEntry as AgentEntry;
+    let entries = vec![
+        AgentEntry::Message {
+            message: Message::User {
+                content: "parent question".into(),
+                images: vec![],
+            },
+        },
+        AgentEntry::Message {
+            message: Message::Assistant(AssistantMessage {
+                content: Some("parent answer".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            }),
+        },
+    ];
+    Session::append(root, session, &entries).unwrap();
+}
+
+fn chat_model(base_url: String, wire: &str) -> ConfiguredModel {
+    ConfiguredModel::chat(
+        crate::model::OpenAiModel::new(base_url, "test-key".into(), wire.to_string(), None)
+            .unwrap(),
+    )
+}
+
+fn fork_record(root: &std::path::Path, session: &str) -> crate::session_store::BackgroundRecord {
+    crate::session_store::BackgroundRecord {
+        root: root.to_path_buf(),
+        session: session.to_owned(),
+        store: SessionStore::Jsonl,
+    }
+}
+
+/// A fork-capable Delegate rooted at `root`, bound to the parent session
+/// `record` (its store is the fork source) with a request head on
+/// `head_model` — the model captured when the parent session was built.
+fn forking_delegate(
+    root: &std::path::Path,
+    record: &crate::session_store::BackgroundRecord,
+    head_model: ConfiguredModel,
+) -> Delegate {
+    let workspace = Workspace::new(root).unwrap();
+    let (_, background) = builtins(workspace.clone(), None, false, None);
+    let model = head_model.clone();
+    Delegate::new(model, workspace, background)
+        .with_persist_store(SessionBackend::Jsonl)
+        .persist_sessions(root.to_path_buf())
+        .record_background_tasks_in(record.root.clone(), &record.session, record.store.clone())
+        .with_fork_head(Arc::new(move || crate::session_factory::RequestHead {
+            model: head_model.clone(),
+            context_window: None,
+            context_prefix: None,
+            compaction_reminder: None,
+            sandbox: None,
+            read_only: false,
+            protect_git: false,
+            code_mode: false,
+            mcp_servers: std::collections::HashMap::new(),
+        }))
+}
+
+/// A base URL on a port nothing listens on: the child's model call fails
+/// (connect retries are 10 ms apart under `cfg(test)`).
+async fn refusing_model() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    format!("http://{address}")
+}
+
+async fn await_background_status(
+    receiver: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
+) -> (Option<String>, String) {
+    let event = tokio::time::timeout(std::time::Duration::from_secs(10), receiver.recv())
+        .await
+        .expect("timed out waiting for background completion")
+        .unwrap();
+    match event {
+        AgentEvent::BackgroundCompleted { output, status, .. } => (status, output),
+        other => panic!("expected BackgroundCompleted, got {other:?}"),
+    }
+}
+
+/// A parent endpoint whose runner is alive (so the non-owning handle upgrades)
+/// and idles on `WaitForInput`; the returned task is aborted when dropped.
+fn parent_endpoint(
+    root: &std::path::Path,
+    session: &str,
+) -> (SessionHandle, crate::runner::SessionTask) {
+    let agent = Agent::new(
+        Box::new(chat_model("http://127.0.0.1:1".into(), "parent-model")),
+        vec![],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        root.to_path_buf(),
+        session.to_owned(),
+        IdlePolicy::WaitForInput,
+    );
+    let task = runner.start(None);
+    (handle, task)
+}
+
+/// A live parent session endpoint without a runner: the fork spawn requires
+/// one (child `send_message`, Goal registration), and a test channel's Shared
+/// is enough. The returned handle must outlive the fork.
+fn live_parent_endpoint() -> SessionHandle {
+    let (handle, _emitter, _commands) = crate::runner::session_test_channel();
+    handle
+}
+
+#[tokio::test]
+async fn fork_spawn_keeps_parent_delivery_available_for_a_later_delegate() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    seed_fork_parent(&root, "parent");
+    let head = chat_model(successful_model_n("model answer", 2).await, "stale-model");
+    let mut delegate = forking_delegate(&root, &fork_record(&root, "parent"), head);
+    let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
+    delegate.set_event_sender(sender);
+    let parent_handle = live_parent_endpoint();
+    delegate.set_session_handle("parent", parent_handle.clone());
+    assert!(
+        delegate.background.completion_delivery_available(),
+        "the parent Delegate publishes the registry slot the /btw path spawns from"
+    );
+
+    delegate
+        .execute(json!({
+            "task": "forked work",
+            "fork": true,
+            "workspace": root.display().to_string()
+        }))
+        .await
+        .expect("the fork spawns");
+    let (_, fork_output) = await_background_status(&mut completions).await;
+    assert!(
+        fork_output.contains("model answer"),
+        "the fork's completion carries the child's answer, got: {fork_output}"
+    );
+    // The fork's child delegate shares the registry; it must not replace the
+    // parent's sender with its own (which dies with the child).
+    assert!(
+        delegate.background.completion_delivery_available(),
+        "a fork must never replace the parent's registered sender"
+    );
+
+    delegate
+        .execute(json!({
+            "task": "plain work",
+            "workspace": root.display().to_string()
+        }))
+        .await
+        .expect("a plain delegate still spawns after a fork");
+    let (status, output) = await_background_status(&mut completions).await;
+    assert_eq!(status.as_deref(), Some("completed"));
+    assert!(
+        output.contains("subagent session:"),
+        "the later delegate's completion must be delivered, got: {output}"
+    );
+}
+
+#[tokio::test]
+async fn fork_completion_carries_the_child_answer_with_completed_status() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    seed_fork_parent(&root, "parent");
+    let head = chat_model(successful_model("fork child answer").await, "stale-model");
+    let mut delegate = forking_delegate(&root, &fork_record(&root, "parent"), head);
+    let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
+    delegate.set_event_sender(sender);
+    let parent_handle = live_parent_endpoint();
+    delegate.set_session_handle("parent", parent_handle.clone());
+
+    delegate
+        .execute(json!({
+            "task": "answer this",
+            "fork": true,
+            "workspace": root.display().to_string()
+        }))
+        .await
+        .expect("the fork spawns");
+    let (status, output) = await_background_status(&mut completions).await;
+    assert_eq!(status.as_deref(), Some("completed"));
+    assert!(
+        output.contains("fork child answer"),
+        "the child's answer must reach the parent, got: {output}"
+    );
+    assert!(
+        output.contains(DELEGATE_COMPLETION_REMINDER),
+        "the fork keeps the delegate's evidence framing, got: {output}"
+    );
+    assert!(
+        output.starts_with("fork session: "),
+        "the fork reports its session id, got: {output}"
+    );
+}
+
+#[tokio::test]
+async fn fork_completion_reports_failure_instead_of_success() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    seed_fork_parent(&root, "parent");
+    let head = chat_model(refusing_model().await, "stale-model");
+    let mut delegate = forking_delegate(&root, &fork_record(&root, "parent"), head);
+    let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
+    delegate.set_event_sender(sender);
+    let parent_handle = live_parent_endpoint();
+    delegate.set_session_handle("parent", parent_handle.clone());
+
+    delegate
+        .execute(json!({
+            "task": "fail",
+            "fork": true,
+            "workspace": root.display().to_string()
+        }))
+        .await
+        .expect("the fork spawns");
+    let (status, output) = await_background_status(&mut completions).await;
+    assert_eq!(
+        status.as_deref(),
+        Some("failed"),
+        "a failed fork must never be reported as a normal completion, got: {output}"
+    );
+    assert!(
+        output.contains("subagent failed"),
+        "the failure must be the completion body, got: {output}"
+    );
+}
+
+#[tokio::test]
+async fn fork_delivery_preflight_rejects_a_closed_channel_without_orphans() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    seed_fork_parent(&root, "parent");
+    let head = chat_model(successful_model("never used").await, "stale-model");
+    let mut delegate = forking_delegate(&root, &fork_record(&root, "parent"), head);
+    // No live receiver: delivery is unavailable from the start.
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    drop(receiver);
+    delegate.set_event_sender(sender);
+    let parent_handle = live_parent_endpoint();
+    delegate.set_session_handle("parent", parent_handle);
+
+    let error = delegate
+        .execute(json!({
+            "task": "orphan",
+            "fork": true,
+            "workspace": root.display().to_string()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(error, "background task delivery is unavailable");
+    assert!(
+        delegate.sessions().list().is_empty(),
+        "a rejected fork registers no child session"
+    );
+    assert!(
+        delegate.background.running().is_empty(),
+        "a rejected fork starts no child runner"
+    );
+    let metas = SessionStore::Jsonl.list_meta(&root).await.unwrap();
+    assert!(
+        !metas
+            .iter()
+            .any(|meta| meta.parent_session_id.as_deref() == Some("parent")),
+        "a rejected fork writes no sessions metadata row: {metas:?}"
+    );
+}
+
+#[tokio::test]
+async fn fork_registers_the_child_with_the_parent_goal_admission_set() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    seed_fork_parent(&root, "parent");
+    let head = chat_model(successful_model("fork answer").await, "stale-model");
+    let mut delegate = forking_delegate(&root, &fork_record(&root, "parent"), head);
+    let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
+    delegate.set_event_sender(sender);
+    let (handle, parent_task) = parent_endpoint(&root, "parent");
+    delegate.set_session_handle("parent", handle.clone());
+
+    delegate
+        .execute(json!({
+            "task": "goal gated work",
+            "fork": true,
+            "workspace": root.display().to_string()
+        }))
+        .await
+        .expect("the fork spawns");
+    let fork_id = delegate
+        .background
+        .running()
+        .first()
+        .expect("the fork is a live background task")
+        .id;
+    assert!(
+        handle.downgrade().goal_children().contains(&fork_id),
+        "the fork must be the parent's own outstanding child from spawn time"
+    );
+    await_background_status(&mut completions).await;
+    drop(parent_task);
+}
+
+#[tokio::test]
+async fn fork_writes_a_sessions_metadata_row_linked_to_the_parent() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    seed_fork_parent(&root, "parent");
+    let head = chat_model(successful_model("fork answer").await, "stale-model");
+    let mut delegate = forking_delegate(&root, &fork_record(&root, "parent"), head);
+    let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
+    delegate.set_event_sender(sender);
+    let parent_handle = live_parent_endpoint();
+    delegate.set_session_handle("parent", parent_handle.clone());
+
+    delegate
+        .execute(json!({
+            "task": "metadata work",
+            "label": "fork label",
+            "fork": true,
+            "workspace": root.display().to_string()
+        }))
+        .await
+        .expect("the fork spawns");
+    // The row is created from the spawn's `on_id` hook onto the runtime.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let row = loop {
+        let metas = SessionStore::Jsonl.list_meta(&root).await.unwrap();
+        if let Some(row) = metas
+            .iter()
+            .find(|meta| meta.parent_session_id.as_deref() == Some("parent"))
+            .cloned()
+        {
+            break row;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the fork never wrote a sessions metadata row: {metas:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    assert_eq!(row.title.as_deref(), Some("fork label"));
+    assert_eq!(row.model.as_deref(), Some("stale-model"));
+    assert_eq!(row.role, None);
+    await_background_status(&mut completions).await;
+}
+
+#[tokio::test]
+async fn fork_runs_on_the_parents_live_model_after_a_switch() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    seed_fork_parent(&root, "parent");
+    // The head keeps the model captured at build time; the parent switches to
+    // a different profile afterwards, exactly like `/model` does.
+    let head = chat_model("http://127.0.0.1:1".into(), "stale-model");
+    let (live_url, captured) = capturing_model().await;
+    let live_model = chat_model(live_url, "test-model-2");
+    let resolved = live_model.clone();
+    let mut delegate = forking_delegate(&root, &fork_record(&root, "parent"), head)
+        .with_fork_model_source(Arc::new(move |profile: &str| {
+            (profile == "live-profile").then(|| (resolved.clone(), Some(64_000)))
+        }));
+    let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
+    delegate.set_event_sender(sender);
+    let (handle, parent_task) = parent_endpoint(&root, "parent");
+    delegate.set_session_handle("parent", handle.clone());
+    handle.switch_model("live-profile", Box::new(live_model), Some(64_000));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while handle.downgrade().live_model().is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the parent runner never installed the live model"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    delegate
+        .execute(json!({
+            "task": "live model work",
+            "fork": true,
+            "workspace": root.display().to_string()
+        }))
+        .await
+        .expect("the fork spawns");
+    let (status, output) = await_background_status(&mut completions).await;
+    assert_eq!(status.as_deref(), Some("completed"));
+    assert!(output.contains("done"), "child answered, got: {output}");
+    let request = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+    let body = request
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_owned())
+        .unwrap_or_else(|| request.clone());
+    assert!(
+        body.contains("\"model\":\"test-model-2\""),
+        "the fork must run on the parent's CURRENT model, got: {body}"
+    );
+    assert!(
+        !body.contains("\"model\":\"stale-model\""),
+        "the fork must not run on the build-time model, got: {body}"
+    );
+    assert!(
+        delegate.sessions().list().is_empty(),
+        "the finished fork leaves no registry entry"
+    );
+    drop(parent_task);
+}
+
+#[tokio::test]
+async fn fork_fails_closed_when_the_live_model_cannot_be_represented() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    seed_fork_parent(&root, "parent");
+    let head = chat_model("http://127.0.0.1:1".into(), "stale-model");
+    let mut delegate = forking_delegate(&root, &fork_record(&root, "parent"), head);
+    let (sender, _completions) = tokio::sync::mpsc::unbounded_channel();
+    delegate.set_event_sender(sender);
+    let (handle, parent_task) = parent_endpoint(&root, "parent");
+    delegate.set_session_handle("parent", handle.clone());
+    handle.switch_model(
+        "unresolvable-profile",
+        Box::new(chat_model("http://127.0.0.1:1".into(), "other-model")),
+        None,
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while handle.downgrade().live_model().is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the parent runner never installed the live model"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let error = delegate
+        .execute(json!({
+            "task": "stale model work",
+            "fork": true,
+            "workspace": root.display().to_string()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(error, "fork requires the parent's current model");
+    assert!(delegate.sessions().list().is_empty());
+    assert!(delegate.background.running().is_empty());
+    drop(parent_task);
+}

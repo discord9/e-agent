@@ -260,6 +260,49 @@ pub struct SessionBuild {
     pub local_permit: LocalSessionPermit,
 }
 
+/// Shared body of [`SessionFactory::resolve_profile`] and the live fork-model
+/// resolver: resolve one profile against the CURRENT config, honoring the
+/// startup `--base-url`/`--model` overrides. Split out of the method so a
+/// `'static` closure can resolve a profile without capturing the factory.
+fn resolve_profile_from(
+    reloadable: &Arc<RwLock<ReloadableState>>,
+    base_url: Option<String>,
+    model_override: Option<String>,
+    profile: &str,
+    effort: Option<EffortOverride>,
+) -> anyhow::Result<(ConfiguredModel, Option<u64>)> {
+    // Clone the config out of the state lock before building the model:
+    // the chatgpt branch may take the write half of the same lock to
+    // load (and cache) the login that arrived after start.
+    let config = reloadable
+        .read()
+        .unwrap()
+        .config
+        .clone()
+        .ok_or_else(|| anyhow!("no config file; cannot resolve model profile `{profile}`"))?;
+    let mut resolved = config.resolve_profile(profile)?;
+    if let Some(effort) = effort {
+        resolved.reasoning_effort = match effort {
+            EffortOverride::Default => resolved.reasoning_effort,
+            EffortOverride::Omit => None,
+            EffortOverride::Literal(value) => Some(value),
+        };
+    }
+    // A `--model` override replaces the profile's wire model, so its
+    // context-window declaration cannot describe the active model.
+    let context_window = model_override
+        .as_ref()
+        .map(|_| None)
+        .unwrap_or(resolved.context_window);
+    let model = configured_model(
+        resolved,
+        AuthSource::Lazy(reloadable),
+        base_url,
+        model_override,
+    )?;
+    Ok((model, context_window))
+}
+
 impl SessionFactory {
     /// Resolve all process-global startup state: workspace + external roots,
     /// config, models (main/subagent/roles), sandbox policy, workspace
@@ -527,38 +570,29 @@ impl SessionFactory {
         profile: &str,
         effort: Option<EffortOverride>,
     ) -> anyhow::Result<(ConfiguredModel, Option<u64>)> {
-        // Clone the config out of the state lock before building the model:
-        // the chatgpt branch may take the write half of the same lock to
-        // load (and cache) the login that arrived after start.
-        let config = self
-            .reloadable
-            .read()
-            .unwrap()
-            .config
-            .clone()
-            .ok_or_else(|| anyhow!("no config file; cannot resolve model profile `{profile}`"))?;
-        let mut resolved = config.resolve_profile(profile)?;
-        if let Some(effort) = effort {
-            resolved.reasoning_effort = match effort {
-                EffortOverride::Default => resolved.reasoning_effort,
-                EffortOverride::Omit => None,
-                EffortOverride::Literal(value) => Some(value),
-            };
-        }
-        // A `--model` override replaces the profile's wire model, so its
-        // context-window declaration cannot describe the active model.
-        let context_window = self
-            .model
-            .as_ref()
-            .map(|_| None)
-            .unwrap_or(resolved.context_window);
-        let model = configured_model(
-            resolved,
-            AuthSource::Lazy(&self.reloadable),
+        resolve_profile_from(
+            &self.reloadable,
             self.base_url.clone(),
             self.model.clone(),
-        )?;
-        Ok((model, context_window))
+            profile,
+            effort,
+        )
+    }
+
+    /// Resolve a model profile by name at FORK time — the `fork` delegate's
+    /// child runs on the parent's current model, so a parent `/model <profile>`
+    /// switch (which only updates the live agent) must not leave the child on
+    /// the build-time model. `None` when the profile cannot be resolved (no
+    /// config, unknown profile); the fork then fails closed instead of
+    /// silently using the stale model. The effort level is the profile's own
+    /// configured default: the live identity carries the profile name only.
+    pub fn fork_model_resolver(&self) -> crate::delegate::ForkModelSource {
+        let reloadable = self.reloadable.clone();
+        let base_url = self.base_url.clone();
+        let model = self.model.clone();
+        Arc::new(move |profile: &str| {
+            resolve_profile_from(&reloadable, base_url.clone(), model.clone(), profile, None).ok()
+        })
     }
 
     /// Every switchable model profile name (`[models]` keys + `[roles]`
@@ -986,6 +1020,10 @@ impl SessionFactory {
                 .expect("main request head initialized")
                 .clone()
         }));
+        // A forked child runs on the parent's CURRENT model: after a runtime
+        // `/model` switch the request head above is stale, so the fork asks
+        // the runner for its live identity and re-resolves that profile here.
+        delegate = delegate.with_fork_model_source(self.fork_model_resolver());
         let subagent_sessions = delegate.sessions();
         tools.push(Box::new(crate::delegate::SendMessage::parent(
             subagent_sessions.clone(),
