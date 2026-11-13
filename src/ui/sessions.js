@@ -1112,7 +1112,8 @@ function openSession(id, onReady, epoch, timeoutMs) {
   if (cur) {
     els.backParentBtn.hidden = !cur.parent_session_id;
   } else {
-    els.backParentBtn.hidden = true;
+    // 列表尚未包含该会话（窗口/任务面板直连）：保持现状，别把返回按钮误藏；
+    // 等 refreshSessionsForSidebar 拉到行后再判定。
     const detailKey = workspaceIdentityKey(state.workspace, workspaceToken(state.workspace));
     if (!workspaceDetailsLoaded.has(detailKey) && !workspaceDetailErrors.has(detailKey)) {
       workspaceDetailRequestsPending.add(detailKey);
