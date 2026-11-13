@@ -1232,6 +1232,102 @@ impl Model for FailOnceContextCaptureModel {
     }
 }
 
+/// Vision model that rejects the first `rejections` requests with the typed
+/// provider image rejection (carrying the hashes actually submitted), then
+/// answers from the scripted replies. Captures every request context.
+struct ImageRejectingModel {
+    calls: Arc<Mutex<Vec<Vec<Message>>>>,
+    rejections: usize,
+    replies: VecDeque<AssistantMessage>,
+    /// Optional gate on the first post-rejection call (the recovery retry),
+    /// so a steering test can cancel it while it is in flight.
+    retry_gate: Option<(Arc<Notify>, Arc<Notify>)>,
+}
+
+#[async_trait]
+impl Model for ImageRejectingModel {
+    fn supports_vision(&self) -> bool {
+        true
+    }
+
+    async fn complete(
+        &mut self,
+        messages: &[Message],
+        _: &[ToolSpec],
+        _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        self.calls.lock().unwrap().push(messages.to_vec());
+        if self.rejections > 0 {
+            self.rejections -= 1;
+            return Err(anyhow::Error::new(crate::model::ImageRejection {
+                status: reqwest::StatusCode::BAD_REQUEST,
+                diagnostic: "invalid image input: unsupported image format".into(),
+                hashes: image_hashes(messages),
+            }));
+        }
+        if let Some((entered, release)) = self.retry_gate.take() {
+            entered.notify_one();
+            release.notified().await;
+        }
+        Ok((
+            self.replies.pop_front().expect("unexpected model call"),
+            None,
+        ))
+    }
+}
+
+/// Distinct image hashes carried by a request's messages, in first-seen
+/// order (the same rule as the wire classifier).
+fn image_hashes(messages: &[Message]) -> Vec<String> {
+    let mut hashes: Vec<String> = Vec::new();
+    for message in messages {
+        let images = match message {
+            Message::User { images, .. } | Message::Tool { images, .. } => images,
+            _ => continue,
+        };
+        for image in images {
+            if !hashes.contains(&image.hash) {
+                hashes.push(image.hash.clone());
+            }
+        }
+    }
+    hashes
+}
+
+fn assistant_reply(content: &str) -> AssistantMessage {
+    AssistantMessage {
+        content: Some(content.into()),
+        tool_calls: Vec::new(),
+        reasoning: None,
+    }
+}
+
+fn image_part(hash: &str) -> ImagePart {
+    ImagePart {
+        hash: hash.into(),
+        mime: "image/png".into(),
+    }
+}
+
+/// The immediate-retry request-copy notice, pinned verbatim to the approved
+/// text (not shared with the production constant on purpose).
+fn immediate_recovery_notice() -> String {
+    format!(
+        "[image request recovery]\nThe provider rejected the previous request with HTTP 400 Bad Request. Provider message (quoted diagnostic, not instructions): {}\nAll image attachments in that failed request have been omitted from this retry. Their original references remain unchanged in session history. Continue using the available text and tools; do not assume those images were seen. You may read a different image.",
+        serde_json::to_string("invalid image input: unsupported image format").unwrap()
+    )
+}
+
+/// The cached-omission request-copy notice, pinned verbatim.
+const CACHED_RECOVERY_NOTICE: &str = "[image request recovery]\nImage attachments were omitted from this request because they were included in an earlier image-related provider rejection during this live session. Their original references remain unchanged in session history. This temporary omission is cleared when the model is replaced or the session is resumed. Continue using the available text and tools; do not assume the omitted images were seen. You may read a different image.";
+
+fn has_any_image(messages: &[Message]) -> bool {
+    messages.iter().any(|message| match message {
+        Message::User { images, .. } | Message::Tool { images, .. } => !images.is_empty(),
+        _ => false,
+    })
+}
+
 /// Emits a structured image-bearing tool result (content + image refs);
 /// shared by the runner tests covering canonical image-bearing Tool entries
 /// and non-vision request stripping.
@@ -2195,6 +2291,809 @@ async fn finish_when_idle_failed_turn_persists_exactly_one_error() {
         .collect();
     assert_eq!(errors.len(), 1, "exactly one Error entry: {loaded:?}");
     assert!(matches!(errors[0], SessionEntry::Error { text } if text.contains("terminal boom")));
+}
+
+#[tokio::test]
+async fn image_rejection_recovers_with_one_image_free_retry() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::new(
+        Box::new(ImageRejectingModel {
+            calls: calls.clone(),
+            rejections: 1,
+            replies: VecDeque::from([assistant_reply("recovered")]),
+            retry_gate: None,
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "image-recovery".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let (_, mut live, mut status) = handle.attach();
+    let task = runner.start(None);
+    handle.prompt_with_image("what is in this image?", image_part("hash-a"));
+    loop {
+        if matches!(
+            live.recv().await.unwrap(),
+            AgentEvent::AssistantText(text) if text == "recovered"
+        ) {
+            break;
+        }
+    }
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+    assert!(!matches!(*status.borrow(), SessionStatus::Finished(_)));
+
+    {
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2, "one rejected request + exactly one retry");
+        assert!(calls[0].iter().any(|message| matches!(
+            message,
+            Message::User { content, images }
+                if content == "what is in this image?"
+                    && images.iter().any(|image| image.hash == "hash-a")
+        )));
+        assert!(!has_any_image(&calls[1]), "the retry omits the image");
+        assert!(
+            calls[1].iter().any(|message| matches!(
+                message,
+                Message::User { content, .. } if content == "what is in this image?"
+            )),
+            "the original user text is preserved"
+        );
+        assert_eq!(
+            calls[1].last(),
+            Some(&Message::User {
+                content: immediate_recovery_notice(),
+                images: vec![],
+            }),
+            "exactly one immediate-recovery notice in the approved text"
+        );
+    }
+
+    // The rejection and retry notice are transient projections.
+    let snapshot = handle.snapshot();
+    assert_eq!(
+        snapshot
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Error(_)))
+            .count(),
+        1,
+        "the recovered failure surfaces as exactly one transient Error"
+    );
+    assert!(snapshot.iter().any(|event| matches!(
+        event,
+        AgentEvent::Error(text) if text.contains("invalid image input: unsupported image format")
+    )));
+    assert!(snapshot.iter().any(|event| matches!(
+        event,
+        AgentEvent::Display(text) if text == IMAGE_RETRY_NOTICE
+    )));
+
+    // Nothing about the recovered failure is durable: no Error entry, no
+    // recovery notice, and the image-bearing prompt is unchanged.
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "image-recovery")
+        .await
+        .unwrap();
+    assert!(
+        !loaded
+            .entries
+            .iter()
+            .any(|entry| matches!(entry, SessionEntry::Error { .. })),
+        "a recovered first failure must not be committed: {loaded:?}"
+    );
+    assert!(loaded.entries.iter().any(|entry| matches!(
+        entry,
+        SessionEntry::Message {
+            message: Message::User { content, images }
+        } if content == "what is in this image?" && images.len() == 1
+    )));
+    assert!(
+        !serde_json::to_string(&loaded.entries)
+            .unwrap()
+            .contains("[image request recovery]")
+    );
+    drop(handle);
+    drop(task);
+}
+
+#[tokio::test]
+async fn image_rejection_omissions_stay_cached_for_the_tool_loop_and_later_turns() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::new(
+        Box::new(ImageRejectingModel {
+            calls: calls.clone(),
+            rejections: 1,
+            replies: VecDeque::from([
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![crate::agent::ToolCall {
+                        id: "call-keep".into(),
+                        name: "keep_alive".into(),
+                        arguments: "{}".into(),
+                    }],
+                    reasoning: None,
+                },
+                assistant_reply("first turn done"),
+                assistant_reply("second turn done"),
+            ]),
+            retry_gate: None,
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "image-tool-loop".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let (_, mut live, mut status) = handle.attach();
+    let task = runner.start(None);
+    handle.prompt_with_image("look and keep going", image_part("hash-loop"));
+    loop {
+        if matches!(
+            live.recv().await.unwrap(),
+            AgentEvent::AssistantText(text) if text == "first turn done"
+        ) {
+            break;
+        }
+    }
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+    // A later user turn keeps the cached omission.
+    handle.prompt("later turn");
+    loop {
+        if matches!(
+            live.recv().await.unwrap(),
+            AgentEvent::AssistantText(text) if text == "second turn done"
+        ) {
+            break;
+        }
+    }
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+
+    {
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 4, "reject, retry, tool loop, later turn");
+        // The retry's tool call and the following tool-coupled request keep
+        // their pairing while the image is omitted.
+        assert!(calls[2].iter().any(|message| matches!(
+            message,
+            Message::Tool { call_id, .. } if call_id == "call-keep"
+        )));
+        assert_eq!(
+            calls[1].last(),
+            Some(&Message::User {
+                content: immediate_recovery_notice(),
+                images: vec![],
+            }),
+            "the immediate retry carries the rejection diagnostic"
+        );
+        for call in &calls[2..] {
+            assert!(!has_any_image(call), "cached omissions filter images");
+            assert_eq!(
+                call.last(),
+                Some(&Message::User {
+                    content: CACHED_RECOVERY_NOTICE.into(),
+                    images: vec![],
+                }),
+                "later requests carry the cached-omission text"
+            );
+        }
+        assert!(calls[3].iter().any(|message| matches!(
+            message,
+            Message::User { content, .. } if content == "later turn"
+        )));
+    }
+    // Only the first rejection produced a transient Error: the cached
+    // omission is never re-rejected.
+    let snapshot = handle.snapshot();
+    assert_eq!(
+        snapshot
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Error(_)))
+            .count(),
+        1
+    );
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "image-tool-loop")
+        .await
+        .unwrap();
+    assert!(loaded.entries.iter().any(|entry| matches!(
+        entry,
+        SessionEntry::Message {
+            message: Message::User { images, .. }
+        } if images.len() == 1
+    )));
+    assert!(
+        !loaded
+            .entries
+            .iter()
+            .any(|entry| matches!(entry, SessionEntry::Error { .. }))
+    );
+    drop(handle);
+    drop(task);
+}
+
+#[tokio::test]
+async fn resumed_session_retries_its_images_once_before_omitting_them() {
+    // First life: recover from one rejection and commit a clean turn.
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::new(
+        Box::new(ImageRejectingModel {
+            calls: calls.clone(),
+            rejections: 1,
+            replies: VecDeque::from([assistant_reply("first life")]),
+            retry_gate: None,
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "image-resume".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let (_, mut live, mut status) = handle.attach();
+    let task = runner.start(None);
+    handle.prompt_with_image("resume me", image_part("hash-resume"));
+    loop {
+        if matches!(
+            live.recv().await.unwrap(),
+            AgentEvent::AssistantText(text) if text == "first life"
+        ) {
+            break;
+        }
+    }
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+    drop(handle);
+    drop(task);
+
+    // Resume: a fresh Agent is built from durable history. The omission
+    // cache is not reconstructed, so the image goes out once, is rejected
+    // once, and the retry recovers; nothing recovery-related is persisted.
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "image-resume")
+        .await
+        .unwrap();
+    assert!(
+        !loaded
+            .entries
+            .iter()
+            .any(|entry| matches!(entry, SessionEntry::Error { .. }))
+    );
+    let resumed_calls = Arc::new(Mutex::new(Vec::new()));
+    let mut resumed = Agent::new(
+        Box::new(ImageRejectingModel {
+            calls: resumed_calls.clone(),
+            rejections: 1,
+            replies: VecDeque::from([assistant_reply("resumed ok")]),
+            retry_gate: None,
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    resumed.restore_history(loaded.entries.clone());
+    let (runner, handle) = SessionRunner::new(
+        resumed,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "image-resume".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let (_, mut live, mut status) = handle.attach();
+    let task = runner.start(Some("continue".into()));
+    loop {
+        if matches!(
+            live.recv().await.unwrap(),
+            AgentEvent::AssistantText(text) if text == "resumed ok"
+        ) {
+            break;
+        }
+    }
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+    {
+        let calls = resumed_calls.lock().unwrap();
+        assert_eq!(calls.len(), 2, "resume retries once, then recovers");
+        assert!(
+            has_any_image(&calls[0]),
+            "a resumed session must re-send the image once"
+        );
+        assert!(!has_any_image(&calls[1]));
+        assert_eq!(
+            calls[1].last(),
+            Some(&Message::User {
+                content: immediate_recovery_notice(),
+                images: vec![],
+            })
+        );
+    }
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "image-resume")
+        .await
+        .unwrap();
+    assert!(
+        !loaded
+            .entries
+            .iter()
+            .any(|entry| matches!(entry, SessionEntry::Error { .. })),
+        "no recovery entry may be persisted: {loaded:?}"
+    );
+    assert!(
+        !serde_json::to_string(&loaded.entries)
+            .unwrap()
+            .contains("[image request recovery]")
+    );
+    assert!(loaded.entries.iter().any(|entry| matches!(
+        entry,
+        SessionEntry::Message {
+            message: Message::User { content, images }
+        } if content == "resume me" && images.len() == 1
+    )));
+    drop(handle);
+    drop(task);
+}
+
+#[tokio::test]
+async fn image_rejection_retry_is_bounded_and_labels_a_second_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = Agent::new(
+        Box::new(ImageRejectingModel {
+            calls: calls.clone(),
+            // Both the first request and the image-free retry are rejected:
+            // there must be no third attempt.
+            rejections: 2,
+            replies: VecDeque::new(),
+            retry_gate: None,
+        }),
+        vec![],
+    );
+    agent.restore_history(vec![
+        Message::User {
+            content: "look".into(),
+            images: vec![image_part("hash-bounded")],
+        }
+        .into(),
+    ]);
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "image-bounded".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let task = runner.start(Some("follow-up".into()));
+    let mut status = handle.status();
+    let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
+    assert!(
+        matches!(
+            &result,
+            SessionStatus::Finished(SessionResult::Failed(text))
+                if text.starts_with("image-free retry failed: ")
+                    && text.contains("invalid image input")
+        ),
+        "second failure must be labelled: {result:?}"
+    );
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        2,
+        "exactly two attempts: the original request and one retry"
+    );
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "image-bounded")
+        .await
+        .unwrap();
+    assert_eq!(
+        loaded
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry, SessionEntry::Error { .. }))
+            .count(),
+        1,
+        "the final failure keeps the ordinary durable-error policy: {loaded:?}"
+    );
+    task.join().await.unwrap();
+}
+
+struct PlainFailureModel {
+    calls: Arc<Mutex<Vec<Vec<Message>>>>,
+    error: String,
+}
+
+#[async_trait]
+impl Model for PlainFailureModel {
+    fn supports_vision(&self) -> bool {
+        true
+    }
+
+    async fn complete(
+        &mut self,
+        messages: &[Message],
+        _: &[ToolSpec],
+        _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        self.calls.lock().unwrap().push(messages.to_vec());
+        anyhow::bail!(self.error.clone())
+    }
+}
+
+#[tokio::test]
+async fn non_image_errors_do_not_degrade_the_request() {
+    // A plain 4xx with image wording (not a typed rejection), a non-HTTP
+    // transport failure, and a typed rejection with no submitted image refs
+    // all keep the ordinary single-attempt failure policy.
+    for (session, error, with_images) in [
+        (
+            "image-wording",
+            "provider returned HTTP 400: invalid image reference in payload",
+            true,
+        ),
+        ("non-http", "connection reset by peer", true),
+        (
+            "image-no-refs",
+            "provider returned HTTP 400: image input is not supported",
+            false,
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut agent = Agent::new(
+            Box::new(PlainFailureModel {
+                calls: calls.clone(),
+                error: error.into(),
+            }),
+            vec![],
+        );
+        agent.restore_history(vec![
+            Message::User {
+                content: "look".into(),
+                images: if with_images {
+                    vec![image_part("hash-plain")]
+                } else {
+                    vec![]
+                },
+            }
+            .into(),
+        ]);
+        let (runner, handle) = SessionRunner::new(
+            agent,
+            SessionStore::Jsonl,
+            temp.path().into(),
+            session.into(),
+            IdlePolicy::FinishWhenIdle,
+        );
+        let task = runner.start(Some("follow-up".into()));
+        let mut status = handle.status();
+        let result =
+            wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
+        assert!(
+            matches!(
+                &result,
+                SessionStatus::Finished(SessionResult::Failed(text))
+                    if !text.contains("image-free retry failed")
+            ),
+            "{session}: no degradation retry may run: {result:?}"
+        );
+        assert_eq!(calls.lock().unwrap().len(), 1, "{session}");
+        task.join().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn subagent_image_rejection_recovery_does_not_finish_failed() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = Agent::new(
+        Box::new(ImageRejectingModel {
+            calls: calls.clone(),
+            rejections: 1,
+            replies: VecDeque::from([assistant_reply("subagent recovered")]),
+            retry_gate: None,
+        }),
+        vec![],
+    );
+    agent.restore_history(vec![
+        Message::User {
+            content: "single task with an image".into(),
+            images: vec![image_part("hash-subagent")],
+        }
+        .into(),
+    ]);
+    // Subagents run FinishWhenIdle: a successful recovery must end the
+    // session Completed, never Finished(Failed).
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "image-subagent".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let task = runner.start(Some("go".into()));
+    let mut status = handle.status();
+    let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
+    assert_eq!(
+        result,
+        SessionStatus::Finished(SessionResult::Completed(Some("subagent recovered".into())))
+    );
+    assert_eq!(calls.lock().unwrap().len(), 2);
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "image-subagent")
+        .await
+        .unwrap();
+    assert!(
+        !loaded
+            .entries
+            .iter()
+            .any(|entry| matches!(entry, SessionEntry::Error { .. }))
+    );
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn compaction_image_rejection_recovers_with_retained_provenance_intact() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = Agent::new(
+        Box::new(ImageRejectingModel {
+            calls: calls.clone(),
+            rejections: 1,
+            replies: VecDeque::from([
+                assistant_reply("summary of the earlier conversation"),
+                assistant_reply("after compaction done"),
+            ]),
+            retry_gate: None,
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    // The replaced prefix and the retained tail both reference the SAME
+    // image hash, so the cached omission applies to the retained copy on
+    // later regular calls while the persisted `retained` stays untouched.
+    let mut history: Vec<SessionEntry> = (0..12)
+        .flat_map(|i| {
+            [
+                SessionEntry::from(Message::User {
+                    content: format!("filler task {i}"),
+                    images: if i == 0 {
+                        vec![image_part("hash-retained")]
+                    } else {
+                        vec![]
+                    },
+                }),
+                SessionEntry::from(Message::Assistant(AssistantMessage {
+                    content: Some(format!("filler answer {i}")),
+                    tool_calls: Vec::new(),
+                    reasoning: None,
+                })),
+            ]
+        })
+        .collect();
+    history.extend([
+        Message::User {
+            content: "old question".into(),
+            images: vec![],
+        }
+        .into(),
+        Message::Assistant(AssistantMessage {
+            content: Some("old answer".into()),
+            tool_calls: Vec::new(),
+            reasoning: None,
+        })
+        .into(),
+        Message::User {
+            content: "current question".into(),
+            images: vec![image_part("hash-retained")],
+        }
+        .into(),
+    ]);
+    agent.restore_history(history);
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "image-compaction".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let (_, mut live, mut status) = handle.attach();
+    handle.compact();
+    let task = runner.start(None);
+    loop {
+        if matches!(
+            live.recv().await.unwrap(),
+            AgentEvent::Display(text) if text.starts_with("compacted:")
+        ) {
+            break;
+        }
+    }
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+
+    {
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2, "rejected compaction + one retry");
+        assert!(
+            has_any_image(&calls[0]),
+            "the rejected summarization request carried the image"
+        );
+        assert!(!has_any_image(&calls[1]));
+        let retry = &calls[1];
+        assert!(
+            matches!(
+                retry.last(),
+                Some(Message::User { content, .. })
+                    if content.starts_with("Summarize the earlier conversation.")
+            ),
+            "the summarization instruction stays last"
+        );
+        assert_eq!(
+            retry.get(retry.len() - 2),
+            Some(&Message::User {
+                content: immediate_recovery_notice(),
+                images: vec![],
+            }),
+            "the recovery notice precedes the summarization instruction"
+        );
+    }
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "image-compaction")
+        .await
+        .unwrap();
+    let compaction = loaded
+        .entries
+        .iter()
+        .find_map(|entry| match entry {
+            SessionEntry::Compaction {
+                retained,
+                current_prompt_at,
+                no_current_prompt,
+                ..
+            } => Some((retained, current_prompt_at, no_current_prompt)),
+            _ => None,
+        })
+        .expect("compaction committed");
+    let (retained, current_prompt_at, no_current_prompt) = compaction;
+    assert!(
+        retained.iter().any(|message| matches!(
+            message,
+            Message::User { images, .. } if images.iter().any(|image| image.hash == "hash-retained")
+        )),
+        "retained keeps its image references: {retained:?}"
+    );
+    assert_eq!(
+        *current_prompt_at,
+        Some(19),
+        "the retained-tail provenance is unchanged"
+    );
+    assert!(!no_current_prompt);
+    assert!(
+        !loaded
+            .entries
+            .iter()
+            .any(|entry| matches!(entry, SessionEntry::Error { .. })),
+        "a recovered compaction failure is not durable"
+    );
+
+    // The later regular request filters the retained image via the cached
+    // omission set (same hash) and carries the cached notice.
+    handle.prompt("after compaction");
+    loop {
+        if matches!(
+            live.recv().await.unwrap(),
+            AgentEvent::AssistantText(text) if text == "after compaction done"
+        ) {
+            break;
+        }
+    }
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 3);
+    assert!(!has_any_image(&calls[2]));
+    assert!(
+        calls[2].iter().any(|message| matches!(
+            message,
+            Message::User { content, .. }
+                if content.starts_with("[compacted summary of earlier conversation]")
+        )),
+        "the compaction summary is part of the resumed context"
+    );
+    assert_eq!(
+        calls[2].last(),
+        Some(&Message::User {
+            content: CACHED_RECOVERY_NOTICE.into(),
+            images: vec![],
+        })
+    );
+    drop(calls);
+    drop(handle);
+    drop(task);
+}
+
+#[tokio::test]
+async fn cancel_during_the_image_free_retry_preserves_queued_work() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let agent = Agent::new(
+        Box::new(ImageRejectingModel {
+            calls: calls.clone(),
+            rejections: 1,
+            replies: VecDeque::from([
+                assistant_reply("after cancel"),
+                assistant_reply("reaction done"),
+            ]),
+            retry_gate: Some((entered.clone(), release.clone())),
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "image-cancel".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let (_, mut live, mut status) = handle.attach();
+    let task = runner.start(None);
+    handle.prompt_with_image("look", image_part("hash-cancel"));
+    tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+        .await
+        .expect("the image-free retry starts");
+    // Queue a prompt and an agent message, then cancel the in-flight retry.
+    // The Cancel releases the blocked retry (its model future is dropped),
+    // so both queued commands must survive into the following turns.
+    handle.prompt("queued after cancel");
+    handle
+        .send_agent_message("test".into(), "notice body".into())
+        .unwrap();
+    handle.cancel();
+    loop {
+        if matches!(
+            live.recv().await.unwrap(),
+            AgentEvent::AssistantText(text) if text == "reaction done"
+        ) {
+            break;
+        }
+    }
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+    assert!(!matches!(*status.borrow(), SessionStatus::Finished(_)));
+    {
+        let calls = calls.lock().unwrap();
+        // reject, cancelled retry, queued-prompt turn, one reaction request
+        // for the committed agent message (the flag was armed once).
+        assert_eq!(
+            calls.len(),
+            4,
+            "queued commands survive the cancelled retry: {calls:?}"
+        );
+        assert!(!has_any_image(&calls[1]));
+        assert_eq!(
+            calls[1].last(),
+            Some(&Message::User {
+                content: immediate_recovery_notice(),
+                images: vec![],
+            })
+        );
+        assert!(calls[2].iter().any(|message| matches!(
+            message,
+            Message::User { content, .. } if content == "queued after cancel"
+        )));
+        assert!(calls[3].iter().any(|message| matches!(
+            message,
+            Message::User { content, .. } if content.contains("notice body")
+        )));
+    }
+    assert!(handle.snapshot().iter().any(|event| matches!(
+        event,
+        AgentEvent::UserPrompt(text) if text == "queued after cancel"
+    )));
+    drop(handle);
+    drop(task);
 }
 
 #[tokio::test]

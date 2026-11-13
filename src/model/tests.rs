@@ -1,3 +1,7 @@
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::Duration;
 
 use serde_json::json;
@@ -1494,6 +1498,171 @@ async fn http_403_is_retried_then_succeeds() {
         .await
         .unwrap();
     assert_eq!(message.content.as_deref(), Some("rate limit lifted"));
+}
+
+/// Serve a fixed status/body for every accepted request until 150ms pass
+/// without a new connection, counting attempts. A wire that (incorrectly)
+/// retries shows up in the counter instead of a connect error.
+async fn serve_error_responses(
+    status_line: &'static str,
+    body: String,
+    attempts: Arc<AtomicUsize>,
+) -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let accepted =
+                tokio::time::timeout(Duration::from_millis(150), listener.accept()).await;
+            let Ok(Ok((mut stream, _))) = accepted else {
+                break;
+            };
+            attempts.fetch_add(1, Ordering::SeqCst);
+            let _ = read_request(&mut stream).await;
+            let _ = stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await;
+        }
+    });
+    address
+}
+
+fn image_request() -> Vec<Message> {
+    vec![Message::User {
+        content: "what is in this image?".into(),
+        images: vec![ImagePart {
+            hash: "hash-a".into(),
+            mime: "image/png".into(),
+        }],
+    }]
+}
+
+#[tokio::test]
+async fn image_rejection_is_typed_with_the_full_untruncated_diagnostic() {
+    // "image" appears PAST the 500-char display preview: classification must
+    // match the full body and carry it verbatim, not the truncated preview.
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let body = format!(
+        "{{\"error\":{{\"message\":\"{} image input is not supported\"}}}}",
+        "x".repeat(600)
+    );
+    let address = serve_error_responses("400 Bad Request", body.clone(), attempts.clone()).await;
+    let temp = tempfile::tempdir().unwrap();
+    let mut model = OpenAiModel::with_timeout(
+        format!("http://{address}/v1"),
+        "test-key".into(),
+        "vision-model".into(),
+        None,
+        true,
+        Duration::from_secs(1),
+    )
+    .unwrap()
+    .with_image_store(temp.path().to_path_buf());
+    let error = model
+        .complete(&image_request(), &[], None)
+        .await
+        .unwrap_err();
+    let rejection = image_rejection(&error).expect("typed image rejection");
+    assert_eq!(rejection.status, reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(rejection.diagnostic, body);
+    assert_eq!(rejection.hashes, vec!["hash-a".to_string()]);
+    assert!(
+        format!("{error:#}").contains(&body),
+        "the full diagnostic must be carried verbatim"
+    );
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "a 400 image rejection must not be retried"
+    );
+}
+
+#[tokio::test]
+async fn image_rejection_bypasses_the_retryable_403_path() {
+    // 403 is normally retried; an image rejection must reach recovery after
+    // exactly one request.
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let body = r#"{"error":{"message":"image input is not supported"}}"#;
+    let address = serve_error_responses("403 Forbidden", body.into(), attempts.clone()).await;
+    let mut model = OpenAiModel::with_timeout(
+        format!("http://{address}/v1"),
+        "test-key".into(),
+        "vision-model".into(),
+        None,
+        true,
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    let error = model
+        .complete(&image_request(), &[], None)
+        .await
+        .unwrap_err();
+    assert!(image_rejection(&error).is_some(), "{error:#}");
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn image_wording_without_submitted_images_is_not_a_rejection() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let body = r#"{"error":{"message":"image input is not supported"}}"#;
+    let address = serve_error_responses("400 Bad Request", body.into(), attempts.clone()).await;
+    let mut model = OpenAiModel::with_timeout(
+        format!("http://{address}/v1"),
+        "test-key".into(),
+        "vision-model".into(),
+        None,
+        true,
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    let error = model
+        .complete(
+            &[Message::User {
+                content: "hello".into(),
+                images: vec![],
+            }],
+            &[],
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(image_rejection(&error).is_none());
+    assert!(format!("{error:#}").contains("HTTP 400"), "{error:#}");
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn image_wording_on_a_server_error_keeps_the_existing_retry_path() {
+    // A 5xx is not a 4xx: no image rejection, and 5xx retries are unchanged.
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let body = r#"{"error":{"message":"image backend unavailable"}}"#;
+    let address =
+        serve_error_responses("500 Internal Server Error", body.into(), attempts.clone()).await;
+    let mut model = OpenAiModel::with_timeout(
+        format!("http://{address}/v1"),
+        "test-key".into(),
+        "vision-model".into(),
+        None,
+        true,
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    let error = model
+        .complete(&image_request(), &[], None)
+        .await
+        .unwrap_err();
+    assert!(image_rejection(&error).is_none());
+    assert!(format!("{error:#}").contains("HTTP 500"), "{error:#}");
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        HTTP_RETRY_ATTEMPTS as usize
+    );
 }
 
 #[tokio::test]

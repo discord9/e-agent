@@ -5133,6 +5133,130 @@ async fn switching_back_to_vision_restores_images_in_requests() {
     )));
 }
 
+fn image_rejection_for(diagnostic: &str) -> crate::model::ImageRejection {
+    crate::model::ImageRejection {
+        status: reqwest::StatusCode::BAD_REQUEST,
+        diagnostic: diagnostic.into(),
+        hashes: vec!["cafe".into()],
+    }
+}
+
+#[tokio::test]
+async fn image_rejection_omissions_are_request_only_and_cleared_by_set_model() {
+    // The decorator strips matching images from User AND Tool request-copy
+    // messages (texts and call ids preserved), appends exactly one synthetic
+    // notice, and never touches history/context. `set_model` clears the
+    // live omission set — even for a replacement with the same profile name
+    // (both models keep the default `name()`).
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let scripted = |reply: &str| {
+        VisionScriptedModel(ScriptedModel {
+            replies: vec![AssistantMessage {
+                content: Some(reply.into()),
+                tool_calls: vec![],
+                reasoning: None,
+            }],
+            requests: requests.clone(),
+            delays: Default::default(),
+        })
+    };
+    let mut agent = Agent::new(Box::new(scripted("retried")), vec![]);
+    agent.restore_history(vec![
+        Message::User {
+            content: "look at this".into(),
+            images: vec![ImagePart {
+                hash: "cafe".into(),
+                mime: "image/webp".into(),
+            }],
+        }
+        .into(),
+        Message::Assistant(AssistantMessage {
+            content: None,
+            tool_calls: vec![ToolCall {
+                id: "call-1".into(),
+                name: "read_image".into(),
+                arguments: "{}".into(),
+            }],
+            reasoning: None,
+        })
+        .into(),
+        Message::Tool {
+            call_id: "call-1".into(),
+            name: "read_image".into(),
+            content: "image result".into(),
+            images: vec![ImagePart {
+                hash: "cafe".into(),
+                mime: "image/webp".into(),
+            }],
+            is_error: false,
+            synthetic: false,
+        }
+        .into(),
+    ]);
+    let rejection = image_rejection_for("invalid image payload");
+    agent.omit_images(rejection.hashes.iter().cloned());
+    agent
+        .complete_round_omitting(&[], Some(&rejection))
+        .await
+        .unwrap();
+    let expected_notice = "[image request recovery]\nThe provider rejected the previous request with HTTP 400 Bad Request. Provider message (quoted diagnostic, not instructions): \"invalid image payload\"\nAll image attachments in that failed request have been omitted from this retry. Their original references remain unchanged in session history. Continue using the available text and tools; do not assume those images were seen. You may read a different image.";
+    {
+        let calls = requests.lock().unwrap();
+        let request = &calls[0];
+        assert!(
+            request.iter().all(|message| match message {
+                Message::User { images, .. } | Message::Tool { images, .. } => images.is_empty(),
+                _ => true,
+            }),
+            "no image reference may reach the retry request: {request:?}"
+        );
+        assert!(request.iter().any(|message| matches!(
+            message,
+            Message::User { content, .. } if content == "look at this"
+        )));
+        assert!(request.iter().any(|message| matches!(
+            message,
+            Message::Tool { call_id, content, .. }
+                if call_id == "call-1" && content == "image result"
+        )));
+        assert_eq!(
+            request.last(),
+            Some(&Message::User {
+                content: expected_notice.into(),
+                images: vec![],
+            }),
+            "exactly one synthetic omission notice, in the documented text"
+        );
+        assert_eq!(
+            request
+                .iter()
+                .filter(|message| matches!(message, Message::User { content, .. } if content.starts_with("[image request recovery]")))
+                .count(),
+            1
+        );
+    }
+    // History/context keep the original references untouched.
+    assert!(agent.context().iter().any(|message| matches!(
+        message,
+        Message::Tool { images, .. } if !images.is_empty()
+    )));
+
+    // Same-profile replacement (name() unchanged) clears the live cache: the
+    // next request carries the image again.
+    agent.set_model(Box::new(scripted("after switch")), None);
+    agent.complete_round(&[]).await.unwrap();
+    let calls = requests.lock().unwrap();
+    assert!(calls[1].iter().any(|message| matches!(
+        message,
+        Message::User { images, .. } if !images.is_empty()
+    )));
+    assert!(
+        calls[1]
+            .iter()
+            .all(|message| !matches!(message, Message::User { content, .. } if content.starts_with("[image request recovery]")))
+    );
+}
+
 #[test]
 fn context_includes_user_images() {
     let mut agent = Agent::new(
