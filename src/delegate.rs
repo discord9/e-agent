@@ -792,7 +792,6 @@ impl Delegate {
         let store = SessionStore::connect(&persist.backend, &persist.root, &session_id)
             .await
             .map_err(|e| format!("fork failed: {e:#}"))?;
-        agent.record_background_tasks_in(persist.root.clone(), &session_id, store.clone());
         let (runner, handle) = SessionRunner::new_with_bootstrap(
             agent,
             store.clone(),
@@ -803,6 +802,11 @@ impl Delegate {
         )
         .await
         .map_err(|e| format!("fork failed: {e:#}"))?;
+        // The fork child's own background bash tasks are projected onto its
+        // session by its runner (main's single writer), exactly like
+        // `start_runner`/btw: the registry lives in the shared parent
+        // `BackgroundTasks`, but only this child's tasks belong to this row set.
+        let runner = runner.with_background_tasks(self.background.clone());
         let runner_task = runner.start(Some(format!("{task}\n\n[You are a forked subagent continuing the parent session's completed history. You run on the parent's model with the parent's tools. You cannot delegate further and cannot ask the user questions; work autonomously and return a concise final answer.]")));
         let id_slot = Arc::new(Mutex::new(None::<u64>));
         let slot_hook = id_slot.clone();
@@ -825,7 +829,7 @@ impl Delegate {
         };
         let abort = runner_task.abort_handle();
         let title = task_label(label.as_deref(), None, &task);
-        let cleanup = DelegateCleanup::new(id_slot, self.sessions.clone(), Some(record.clone()));
+        let cleanup = DelegateCleanup::new(id_slot, self.sessions.clone());
         let background = self.background.clone();
         let child_for_cleanup = child_record.clone();
         let session_id_for_output = session_id.clone();
