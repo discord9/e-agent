@@ -735,6 +735,7 @@ globalThis.fetch=(url,opts={})=>{
   if(url.startsWith("/api/sessions/")&&url.endsWith("/cancel")) return resp(202,{},signal);
   if(url.startsWith("/api/sessions/")&&url.endsWith("/compact")) return resp(202,{},signal);
   if(url.startsWith("/api/sessions/")&&url.endsWith("/pin")&&m==="PUT") return resp(204,null,signal);
+  if(url.startsWith("/api/sessions/")&&url.endsWith("/title")&&m==="PUT") return resp(204,null,signal);
   if(url.startsWith("/api/sessions/")&&url.endsWith("/archive")&&m==="PUT") return resp(204,null,signal);
   if(url.startsWith("/api/sessions/")&&m==="DELETE") return resp(sessionDeleteStatus,null,signal);
   return resp(404,{},signal);
@@ -1604,6 +1605,27 @@ async function main(){
     chk("slash compact executes via sendPrompt",
         pin.value === "" && FETCHES.some(u => u.endsWith("/compact")),
         "cleared=" + (pin.value === ""));
+    // /rename 成功后聊天标题必须立即重绘（侧边栏靠轮询，聊天标题没有轮询）
+    {
+      const savedId = state.sessionId;
+      const savedList = state.lastList;
+      state.sessionId = "rename-title-test";
+      state.lastList = [{ id: "rename-title-test", title: "旧标题", status: "Idle" }];
+      renderChatSessionId(state.sessionId);
+      chk("rename test starts with old chat title",
+          elsById["chatSessionId"].textContent.includes("旧标题"),
+          "=" + elsById["chatSessionId"].textContent);
+      pin.value = "/rename 新标题";
+      await sendPrompt();
+      await flush();
+      chk("rename repaints chat header immediately",
+          elsById["chatSessionId"].textContent.includes("新标题")
+            && !elsById["chatSessionId"].textContent.includes("旧标题"),
+          "=" + elsById["chatSessionId"].textContent);
+      state.sessionId = savedId;
+      state.lastList = savedList;
+      renderChatSessionId(savedId);
+    }
     // /help：Enter 执行 → scrollback 出现多行命令列表 Notice，输入框清空
     pin.value = "/help";
     pin.selectionStart = pin.selectionEnd = 5;
