@@ -4632,3 +4632,147 @@ async fn fork_fails_when_the_mcp_tool_set_differs_from_the_parent() {
         "a mismatched MCP fork starts no child runner"
     );
 }
+
+#[test]
+fn fork_mcp_set_requires_an_identical_non_empty_list() {
+    let spec = |name: &str, description: &str| crate::agent::ToolSpec {
+        name: name.into(),
+        description: description.into(),
+        parameters: json!({"type": "object", "properties": {}}),
+    };
+    let parent = vec![
+        spec("engram_search", "search"),
+        spec("engram_write", "write"),
+    ];
+    // The happy path the fork depends on: the re-connected servers produce the
+    // very same tool list, so the fork is accepted.
+    assert!(
+        fork_mcp_set_matches(&parent, &parent.clone()),
+        "an identical non-empty MCP tool set must be accepted"
+    );
+    // One changed field is enough to fork a different provider tool set.
+    let mut changed = parent.clone();
+    changed[1].description = "write (changed)".into();
+    assert!(
+        !fork_mcp_set_matches(&parent, &changed),
+        "a changed tool description must be rejected"
+    );
+    let mut schema = parent.clone();
+    schema[0].parameters = json!({"type": "object", "properties": {"q": {"type": "string"}}});
+    assert!(
+        !fork_mcp_set_matches(&parent, &schema),
+        "a changed tool schema must be rejected"
+    );
+    // Order and membership are part of the provider tool set too.
+    let mut reversed = parent.clone();
+    reversed.reverse();
+    assert!(
+        !fork_mcp_set_matches(&parent, &reversed),
+        "a reordered MCP tool list must be rejected"
+    );
+    assert!(
+        !fork_mcp_set_matches(&parent, &parent[..1]),
+        "a missing MCP tool must be rejected"
+    );
+    assert!(
+        !fork_mcp_set_matches(&parent, &[]),
+        "an empty re-connected list must not match a non-empty parent list"
+    );
+}
+
+/// The depth cap is the `fork_child` guard at the top of `execute`: a fork's
+/// child delegate rejects every delegation attempt, so a fork can never spawn
+/// a grandchild.
+#[tokio::test]
+async fn fork_child_delegate_cannot_delegate_further() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    seed_fork_parent(&root, "parent");
+    let head = chat_model("http://127.0.0.1:1".into(), "stale-model");
+    let mut delegate = forking_delegate(&root, &fork_record(&root, "parent"), head);
+    let (sender, _completions) = tokio::sync::mpsc::unbounded_channel();
+    delegate.set_event_sender(sender);
+    delegate.set_session_handle("parent", live_parent_endpoint());
+    let child = delegate.fork_child_delegate();
+
+    let error = child
+        .execute(json!({
+            "task": "nested work",
+            "workspace": root.display().to_string()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(error, "a forked subagent cannot delegate further");
+    assert!(
+        child.sessions().list().is_empty(),
+        "a rejected nested delegation registers no grandchild session"
+    );
+    assert!(
+        child.background.running().is_empty(),
+        "a rejected nested delegation starts no grandchild runner"
+    );
+}
+
+/// `execute` checks delivery before the awaited parent-history load;
+/// `spawn_fork` must re-check it, because the channel can close in between and
+/// a fork must never leave an orphan runner/session behind.
+#[tokio::test]
+async fn spawn_fork_rechecks_delivery_before_creating_anything() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    seed_fork_parent(&root, "parent");
+    let head_model = chat_model("http://127.0.0.1:1".into(), "stale-model");
+    let mut delegate = forking_delegate(&root, &fork_record(&root, "parent"), head_model.clone());
+    // Everything else a fork needs is in place (persistence, a live parent
+    // endpoint, a matching MCP set): only the completion channel is gone.
+    delegate.set_session_handle("parent", live_parent_endpoint());
+    let entries = SessionStore::Jsonl
+        .load(&root, "parent")
+        .await
+        .unwrap()
+        .entries;
+    let prefix = crate::agent::fork_prefix_complete(&entries, None).unwrap();
+    let head = fork_head(head_model, None, None, false, Vec::new());
+
+    let error = delegate
+        .spawn_fork(
+            "orphaned work".into(),
+            None,
+            fork_record(&root, "parent"),
+            prefix,
+            head,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error, "background task delivery is unavailable");
+    assert!(
+        delegate.sessions().list().is_empty(),
+        "a rejected fork registers no child session"
+    );
+    assert!(
+        delegate.background.running().is_empty(),
+        "a rejected fork starts no child runner"
+    );
+    let metas = SessionStore::Jsonl.list_meta(&root).await.unwrap();
+    assert!(
+        !metas
+            .iter()
+            .any(|meta| meta.parent_session_id.as_deref() == Some("parent")),
+        "a rejected fork writes no sessions metadata row: {metas:?}"
+    );
+    // No child session file either (a child session id is always `sub-…`).
+    let sessions_dir = root.join(".e-agent/sessions");
+    let child_files = std::fs::read_dir(&sessions_dir)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with("sub-"))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    assert!(
+        child_files.is_empty(),
+        "a rejected fork creates no child session file, found: {child_files:?}"
+    );
+}

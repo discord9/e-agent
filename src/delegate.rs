@@ -402,6 +402,18 @@ struct DisabledTool {
 fn label_arg(args: &Value) -> Option<String> {
     args.get("label").and_then(Value::as_str).map(str::to_owned)
 }
+
+/// The fork re-connects MCP with the parent's workspace, so its final MCP tool
+/// list must equal the parent's captured list exactly: a missing, extra,
+/// reordered, or changed tool would silently fork a different provider tool
+/// set, and the child's request would no longer be a byte-identical prefix.
+fn fork_mcp_set_matches(
+    parent: &[crate::agent::ToolSpec],
+    reconnected: &[crate::agent::ToolSpec],
+) -> bool {
+    reconnected == parent
+}
+
 #[async_trait]
 impl Tool for DisabledTool {
     fn spec(&self) -> ToolSpec {
@@ -846,12 +858,11 @@ impl Delegate {
         // Deterministic order is required for prefix-cache parity.
         mcp_tools.sort_by_key(|tool| tool.spec().name);
         // The fork re-connects MCP with the parent's workspace; its final MCP
-        // tool list must equal the parent's captured list exactly. A missing,
-        // extra, reordered, or changed tool would silently fork a different
-        // provider tool set, so fail closed instead.
+        // tool list must equal the parent's captured list exactly (see
+        // `fork_mcp_set_matches`).
         let fork_mcp_specs: Vec<crate::agent::ToolSpec> =
             mcp_tools.iter().map(|tool| tool.spec()).collect();
-        if fork_mcp_specs != head.mcp_specs {
+        if !fork_mcp_set_matches(&head.mcp_specs, &fork_mcp_specs) {
             return Err("fork MCP tool set differs from the parent".into());
         }
         tools.extend(mcp_tools);

@@ -1076,6 +1076,13 @@ impl SessionRunner {
         self
     }
 
+    /// Test-only view of the user-input gate above, so a test can assert which
+    /// session classes may park in `WaitingInput` without driving the tool.
+    #[cfg(test)]
+    pub(crate) fn user_input_allowed_for_test(&self) -> bool {
+        self.user_input_allowed
+    }
+
     async fn sync_background_projection(&mut self) -> bool {
         let Some(background) = self.background.clone() else {
             if self.bootstrap_projection_pending {

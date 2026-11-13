@@ -2918,3 +2918,71 @@ context_window = 3000
         assert_eq!(context_window, Some(1000));
     }
 }
+
+#[cfg(test)]
+mod user_input_gate_tests {
+    use super::*;
+
+    /// Only the root/main session may suspend on `request_user_input`: the
+    /// factory installs the gate for `build`, while the delegate/btw/fork spawn
+    /// paths construct their runner without it, so their model gets a tool
+    /// error instead of parking a turn nobody can answer.
+    #[tokio::test]
+    async fn only_the_root_session_may_park_for_user_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let factory = SessionFactory::test_factory(temp.path().to_path_buf());
+        let build = factory
+            .build(
+                "web-main",
+                None,
+                None,
+                IdlePolicy::WaitForInput,
+                UnfinishedPolicy::Preserve,
+            )
+            .await
+            .expect("the root session builds");
+        assert!(
+            build.runner.user_input_allowed_for_test(),
+            "a root session built by the factory must answer request_user_input"
+        );
+
+        // The child shape: `Delegate::spawn`/`spawn_fork` and
+        // `spawn_btw_subagent` build exactly this runner (same constructor,
+        // same `FinishWhenIdle` policy) and never enable the gate.
+        let model = ConfiguredModel::chat(
+            OpenAiModel::new(
+                "http://localhost".into(),
+                "test-key".into(),
+                "child-model".into(),
+                None,
+            )
+            .expect("test child model"),
+        );
+        let store = SessionStore::connect(
+            &crate::config::SessionBackend::Jsonl,
+            temp.path(),
+            "sub-test",
+        )
+        .await
+        .expect("the child store connects");
+        let (child, child_handle) = SessionRunner::new_with_bootstrap(
+            Agent::new(Box::new(model), Vec::new()),
+            store,
+            temp.path().to_path_buf(),
+            "sub-test".to_owned(),
+            IdlePolicy::FinishWhenIdle,
+            SessionBootstrap {
+                recovery_tasks: Vec::new(),
+                legacy: false,
+                initial_entries: Vec::new(),
+            },
+        )
+        .await
+        .expect("the child session builds");
+        assert!(
+            !child.user_input_allowed_for_test(),
+            "a delegate/btw/fork runner must never park for user input"
+        );
+        drop(child_handle);
+    }
+}
