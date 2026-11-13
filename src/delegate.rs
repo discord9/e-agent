@@ -845,6 +845,15 @@ impl Delegate {
         };
         // Deterministic order is required for prefix-cache parity.
         mcp_tools.sort_by_key(|tool| tool.spec().name);
+        // The fork re-connects MCP with the parent's workspace; its final MCP
+        // tool list must equal the parent's captured list exactly. A missing,
+        // extra, reordered, or changed tool would silently fork a different
+        // provider tool set, so fail closed instead.
+        let fork_mcp_specs: Vec<crate::agent::ToolSpec> =
+            mcp_tools.iter().map(|tool| tool.spec()).collect();
+        if fork_mcp_specs != head.mcp_specs {
+            return Err("fork MCP tool set differs from the parent".into());
+        }
         tools.extend(mcp_tools);
         let child_delegate = self.fork_child_delegate();
         tools.push(Box::new(SendMessage::child(
@@ -865,6 +874,15 @@ impl Delegate {
         }
         let at = prefix.len();
         let mut initial_entries = prefix;
+        // Freeze the goal projection via the existing append-only goal path:
+        // the newest GoalUpdated entry wins on resume, so the child's request
+        // carries the parent's exact `[session goal]` system message even when
+        // its cut prefix ends before that update.
+        if let Some(goal) = head.goal.clone() {
+            initial_entries.push(crate::agent::SessionEntry::GoalUpdated { goal: Some(goal) });
+        } else if head.goal_cleared {
+            initial_entries.push(crate::agent::SessionEntry::GoalUpdated { goal: None });
+        }
         initial_entries.push(crate::agent::SessionEntry::ForkedFrom {
             source: record.session.clone(),
             at,
@@ -1476,17 +1494,70 @@ impl Tool for Delegate {
                 .record_in
                 .as_ref()
                 .ok_or("fork requires a parent session record")?;
+            // The fork always runs in the parent's own workspace. Resolve the
+            // argument exactly like the delegate path (join relative paths
+            // with the parent root, then reroot/canonicalize) and REQUIRE it
+            // to resolve to that same root: never silently substitute it for
+            // a caller that named a different directory.
+            let workspace_arg: Option<String> = arguments
+                .as_object()
+                .and_then(|args| args.get("workspace"))
+                .and_then(Value::as_str)
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty());
+            let workspace_path = match &workspace_arg {
+                Some(path) if std::path::Path::new(path).is_absolute() => {
+                    std::path::PathBuf::from(path)
+                }
+                Some(path) => self.workspace.root().join(path),
+                None => self.workspace.root().to_path_buf(),
+            };
+            let workspace_display = workspace_arg
+                .clone()
+                .unwrap_or_else(|| self.workspace.root().display().to_string());
+            let resolved = self
+                .workspace
+                .reroot(&workspace_path)
+                .map_err(|error| {
+                    format!("invalid `workspace` path `{workspace_display}`: {error}")
+                })?
+                .derive_child_linked_metadata(&self.workspace)
+                .map_err(|error| {
+                    format!("invalid `workspace` path `{workspace_display}`: {error}")
+                })?;
+            if resolved.root() != self.workspace.root() {
+                return Err(
+                    "`fork` runs in the parent's workspace; omit `workspace` or pass the parent root"
+                        .into(),
+                );
+            }
             let entries = record
                 .store
                 .load(&record.root, &record.session)
                 .await
                 .map_err(|e| format!("cannot load parent history: {e:#}"))?
                 .entries;
-            let prefix = crate::agent::fork_prefix(&entries, None)?;
+            // A delegate fork must cut at a COMPLETED turn: a bare
+            // `fork_prefix` also accepts a mid-turn compaction, whose retained
+            // tail can end with an unanswered tool call (the child would then
+            // see a fabricated `[turn interrupted …]` result the parent never
+            // had).
+            let prefix = crate::agent::fork_prefix_complete(&entries, None)?;
             if prefix.is_empty() {
                 return Err("parent session has no completed turn to fork".into());
             }
-            let head = factory();
+            let mut head = factory();
+            // Freeze the parent's LIVE goal projection. The full history is
+            // the newest durable goal state; the fork prefix drops any
+            // GoalUpdated entry committed after its cut boundary, and the
+            // build-time head can predate a later human `/goal` command.
+            // Fall back to the head only when the history carries no goal
+            // update at all.
+            let (history_goal, history_cleared) = crate::agent::Agent::fold_goal(&entries);
+            if history_goal.is_some() || history_cleared {
+                head.goal = history_goal;
+                head.goal_cleared = history_cleared;
+            }
             return self
                 .spawn_fork(task, label_arg(&arguments), record.clone(), prefix, head)
                 .await

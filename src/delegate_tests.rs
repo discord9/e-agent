@@ -3707,6 +3707,9 @@ fn fork_child_delegate_spec_matches_parent() {
             protect_git: true,
             code_mode: false,
             mcp_servers: std::collections::HashMap::new(),
+            goal: None,
+            goal_cleared: false,
+            mcp_specs: Vec::new(),
         }));
     let child = parent.fork_child_delegate();
     assert_eq!(parent.spec(), child.spec());
@@ -3779,6 +3782,9 @@ fn forking_delegate(
             protect_git: false,
             code_mode: false,
             mcp_servers: std::collections::HashMap::new(),
+            goal: None,
+            goal_cleared: false,
+            mcp_specs: Vec::new(),
         }))
 }
 
@@ -4167,4 +4173,380 @@ async fn fork_fails_closed_when_the_live_model_cannot_be_represented() {
     assert!(delegate.sessions().list().is_empty());
     assert!(delegate.background.running().is_empty());
     drop(parent_task);
+}
+
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// fork boundary + workspace + frozen goal/MCP head
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+/// A captured request head with the fork-relevant fields explicit.
+fn fork_head(
+    model: ConfiguredModel,
+    context_prefix: Option<&str>,
+    goal: Option<crate::agent::GoalSnapshot>,
+    goal_cleared: bool,
+    mcp_specs: Vec<crate::agent::ToolSpec>,
+) -> crate::session_factory::RequestHead {
+    crate::session_factory::RequestHead {
+        model,
+        context_window: None,
+        context_prefix: context_prefix.map(str::to_owned),
+        compaction_reminder: None,
+        sandbox: None,
+        read_only: false,
+        protect_git: false,
+        code_mode: false,
+        mcp_servers: std::collections::HashMap::new(),
+        goal,
+        goal_cleared,
+        mcp_specs,
+    }
+}
+
+/// Parse the JSON body out of the captured raw HTTP request.
+fn captured_request_body(captured: &Arc<Mutex<Vec<u8>>>) -> serde_json::Value {
+    let bytes = captured.lock().unwrap().clone();
+    let split = bytes
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("captured request has a header terminator")
+        + 4;
+    serde_json::from_slice(&bytes[split..]).expect("captured request body is JSON")
+}
+
+/// Seed the parent session with an arbitrary history (the fork source).
+fn seed_parent_entries(
+    root: &std::path::Path,
+    session: &str,
+    entries: &[crate::agent::SessionEntry],
+) {
+    Session::append(root, session, entries).unwrap();
+}
+
+fn parent_user() -> crate::agent::SessionEntry {
+    crate::agent::SessionEntry::Message {
+        message: Message::User {
+            content: "parent question".into(),
+            images: vec![],
+        },
+    }
+}
+
+fn parent_answer() -> crate::agent::SessionEntry {
+    crate::agent::SessionEntry::Message {
+        message: Message::Assistant(AssistantMessage {
+            content: Some("parent answer".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        }),
+    }
+}
+
+#[tokio::test]
+async fn fork_rejects_a_mid_turn_compaction_with_an_unanswered_tool_call() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    let call = crate::agent::ToolCall {
+        id: "call-mid-turn".into(),
+        name: "bash".into(),
+        arguments: "{}".into(),
+    };
+    let pending = Message::Assistant(AssistantMessage {
+        content: None,
+        tool_calls: vec![call],
+        reasoning: None,
+    });
+    seed_parent_entries(
+        &root,
+        "parent",
+        &[
+            parent_user(),
+            crate::agent::SessionEntry::Message {
+                message: pending.clone(),
+            },
+            crate::agent::SessionEntry::Compaction {
+                summary: "mid-turn summary".into(),
+                retained: vec![pending],
+                current_prompt_at: None,
+                no_current_prompt: true,
+            },
+        ],
+    );
+    let head = chat_model("http://127.0.0.1:1".into(), "stale-model");
+    let mut delegate = forking_delegate(&root, &fork_record(&root, "parent"), head);
+    let (sender, _completions) = tokio::sync::mpsc::unbounded_channel();
+    delegate.set_event_sender(sender);
+    delegate.set_session_handle("parent", live_parent_endpoint());
+
+    let error = delegate
+        .execute(json!({
+            "task": "must not fork mid-turn",
+            "fork": true,
+            "workspace": root.display().to_string()
+        }))
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("cannot fork mid-turn"),
+        "a mid-turn compaction must be rejected, got {error:?}"
+    );
+    assert!(
+        delegate.sessions().list().is_empty(),
+        "a rejected fork registers no child session"
+    );
+    assert!(
+        delegate.background.running().is_empty(),
+        "a rejected fork starts no child runner"
+    );
+    let metas = SessionStore::Jsonl.list_meta(&root).await.unwrap();
+    assert!(
+        !metas
+            .iter()
+            .any(|meta| meta.parent_session_id.as_deref() == Some("parent")),
+        "a rejected fork writes no sessions metadata row: {metas:?}"
+    );
+    // The parent's history is untouched: no synthetic interrupted result was
+    // appended to make the bad boundary legal.
+    let history = SessionStore::Jsonl
+        .load(&root, "parent")
+        .await
+        .unwrap()
+        .entries;
+    assert!(!history.iter().any(|entry| matches!(
+        entry,
+        crate::agent::SessionEntry::Message {
+            message: Message::Tool { content, .. }
+        } if content == "[turn interrupted before a tool result was produced]"
+    )));
+}
+
+#[tokio::test]
+async fn fork_rejects_a_workspace_other_than_the_parent_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    seed_fork_parent(&root, "parent");
+    let other = root.join("other-dir");
+    std::fs::create_dir(&other).unwrap();
+    let head = chat_model("http://127.0.0.1:1".into(), "stale-model");
+    let mut delegate = forking_delegate(&root, &fork_record(&root, "parent"), head);
+    let (sender, _completions) = tokio::sync::mpsc::unbounded_channel();
+    delegate.set_event_sender(sender);
+    delegate.set_session_handle("parent", live_parent_endpoint());
+
+    let error = delegate
+        .execute(json!({
+            "task": "wrong workspace",
+            "fork": true,
+            "workspace": other.display().to_string()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        "`fork` runs in the parent's workspace; omit `workspace` or pass the parent root"
+    );
+    assert!(delegate.sessions().list().is_empty());
+    assert!(delegate.background.running().is_empty());
+}
+
+#[tokio::test]
+async fn fork_accepts_an_omitted_workspace_and_uses_the_parent_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    seed_fork_parent(&root, "parent");
+    let head = chat_model(
+        successful_model("omitted workspace answer").await,
+        "live-model",
+    );
+    let mut delegate = forking_delegate(&root, &fork_record(&root, "parent"), head);
+    let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
+    delegate.set_event_sender(sender);
+    delegate.set_session_handle("parent", live_parent_endpoint());
+
+    delegate
+        .execute(json!({
+            "task": "no workspace argument",
+            "fork": true
+        }))
+        .await
+        .expect("an omitted workspace forks in the parent root");
+    let (status, output) = await_background_status(&mut completions).await;
+    assert_eq!(status.as_deref(), Some("completed"));
+    assert!(
+        output.contains("omitted workspace answer"),
+        "the fork must run in the parent workspace, got: {output}"
+    );
+}
+
+#[tokio::test]
+async fn fork_request_carries_the_parent_goal_system_message() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    let goal = crate::agent::create_goal(
+        None,
+        "ship the fork".into(),
+        vec!["prefix equality holds".into()],
+    )
+    .unwrap();
+    // The goal update lands AFTER the completed turn: the fork's cut prefix
+    // drops it, so only the full parent history (not the prefix and not the
+    // stale head) can freeze the live goal.
+    seed_parent_entries(
+        &root,
+        "parent",
+        &[
+            parent_user(),
+            parent_answer(),
+            crate::agent::SessionEntry::GoalUpdated {
+                goal: Some(goal.clone()),
+            },
+        ],
+    );
+    let (url, captured) = capturing_model().await;
+    let model = chat_model(url, "fork-goal-model");
+    let head_model = model.clone();
+    let mut delegate = forking_delegate(&root, &fork_record(&root, "parent"), model)
+        .with_fork_head(Arc::new(move || {
+            fork_head(
+                head_model.clone(),
+                Some("parent system"),
+                None,
+                false,
+                Vec::new(),
+            )
+        }));
+    let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
+    delegate.set_event_sender(sender);
+    delegate.set_session_handle("parent", live_parent_endpoint());
+
+    delegate
+        .execute(json!({
+            "task": "goal-bearing fork",
+            "fork": true,
+            "workspace": root.display().to_string()
+        }))
+        .await
+        .expect("the goal-bearing fork spawns");
+    let (status, _output) = await_background_status(&mut completions).await;
+    assert_eq!(status.as_deref(), Some("completed"));
+
+    let body = captured_request_body(&captured);
+    let messages = body["messages"].as_array().expect("messages array");
+    assert_eq!(
+        messages[0],
+        json!({"role": "system", "content": "parent system"}),
+        "the parent context prefix leads the request"
+    );
+    assert_eq!(
+        messages[1],
+        json!({
+            "role": "system",
+            "content": format!(
+                "[session goal]\n{}",
+                crate::agent::goal_projection_text(&goal)
+            )
+        }),
+        "the fork's first request must carry the identical goal system message"
+    );
+    // Prefix equality: the parent's completed history follows the head, and
+    // the child's own task prompt is the only appended user message.
+    assert_eq!(
+        messages[2],
+        json!({"role": "user", "content": "parent question"})
+    );
+    assert_eq!(
+        messages[3],
+        json!({"role": "assistant", "content": "parent answer"})
+    );
+}
+
+#[tokio::test]
+async fn fork_request_carries_the_cleared_goal_marker_from_the_head() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    seed_fork_parent(&root, "parent");
+    let (url, captured) = capturing_model().await;
+    let model = chat_model(url, "fork-cleared-model");
+    let head_model = model.clone();
+    let mut delegate = forking_delegate(&root, &fork_record(&root, "parent"), model)
+        .with_fork_head(Arc::new(move || {
+            fork_head(
+                head_model.clone(),
+                Some("parent system"),
+                None,
+                true,
+                Vec::new(),
+            )
+        }));
+    let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
+    delegate.set_event_sender(sender);
+    delegate.set_session_handle("parent", live_parent_endpoint());
+
+    delegate
+        .execute(json!({
+            "task": "cleared-goal fork",
+            "fork": true,
+            "workspace": root.display().to_string()
+        }))
+        .await
+        .expect("the cleared-goal fork spawns");
+    let (status, _output) = await_background_status(&mut completions).await;
+    assert_eq!(status.as_deref(), Some("completed"));
+
+    let body = captured_request_body(&captured);
+    let messages = body["messages"].as_array().expect("messages array");
+    assert_eq!(
+        messages[0],
+        json!({"role": "system", "content": "parent system"})
+    );
+    assert_eq!(
+        messages[1],
+        json!({"role": "system", "content": "[session goal]\nnone (cleared)"}),
+        "a cleared parent goal must project the identical cleared marker"
+    );
+}
+
+#[tokio::test]
+async fn fork_fails_when_the_mcp_tool_set_differs_from_the_parent() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    seed_fork_parent(&root, "parent");
+    let head = chat_model("http://127.0.0.1:1".into(), "stale-model");
+    let mut delegate = forking_delegate(&root, &fork_record(&root, "parent"), head);
+    let (sender, _completions) = tokio::sync::mpsc::unbounded_channel();
+    delegate.set_event_sender(sender);
+    delegate.set_session_handle("parent", live_parent_endpoint());
+    // The parent's captured MCP list has a tool the re-connected fork (no
+    // configured MCP server here) cannot reproduce.
+    delegate = delegate.with_fork_head(Arc::new(|| {
+        fork_head(
+            chat_model("http://127.0.0.1:1".into(), "stale-model"),
+            None,
+            None,
+            false,
+            vec![crate::agent::ToolSpec {
+                name: "mcp_parent_only".into(),
+                description: "parent-only MCP tool".into(),
+                parameters: json!({"type": "object", "properties": {}}),
+            }],
+        )
+    }));
+
+    let error = delegate
+        .execute(json!({
+            "task": "different tool set",
+            "fork": true,
+            "workspace": root.display().to_string()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(error, "fork MCP tool set differs from the parent");
+    assert!(
+        delegate.sessions().list().is_empty(),
+        "a mismatched MCP fork registers no child session"
+    );
+    assert!(
+        delegate.background.running().is_empty(),
+        "a mismatched MCP fork starts no child runner"
+    );
 }

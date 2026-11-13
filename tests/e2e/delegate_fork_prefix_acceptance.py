@@ -201,6 +201,18 @@ def main():
             history = api("GET", "/api/sessions/fork-prefix-parent/history")
             return "FIRST_TURN_DONE" in json.dumps(history)
         wait_for(first_turn_done, "completed first parent turn")
+        # Goal-bearing case: the parent commits a live goal AFTER its turn
+        # boundary, so the fork's cut prefix drops that update and only the
+        # frozen parent goal can reproduce the identical system message.
+        api("POST", "/api/sessions/fork-prefix-parent/goal", {
+            "action": "set",
+            "objective": "keep the fork prefix identical",
+            "success_criteria": ["goal system message matches"],
+        })
+        def goal_committed():
+            goal = api("GET", "/api/sessions/fork-prefix-parent/goal").get("goal")
+            return isinstance(goal, dict) and goal.get("objective") == "keep the fork prefix identical"
+        wait_for(goal_committed, "committed parent goal")
         api("POST", "/api/sessions/fork-prefix-parent/prompt", {"prompt": "SECOND_TURN"})
         def child_request_seen():
             # wait_for already holds `lock` around the predicate; taking it
@@ -232,6 +244,15 @@ def main():
         if len(child_requests) != 1:
             raise AssertionError(f"4a: expected one fork child request, got {len(child_requests)} of {len(observed)} provider requests")
         request3 = child_requests[0]
+        def goal_messages(request):
+            return [message for message in request.get("messages") or []
+                    if message.get("role") == "system"
+                    and "[session goal]" in str(message.get("content") or "")]
+        parent_goals = goal_messages(request2)
+        if len(parent_goals) != 1 or "keep the fork prefix identical" not in str(parent_goals[0].get("content")):
+            raise AssertionError(f"goal case: parent request lacks its committed goal message: {parent_goals!r}")
+        if len(goal_messages(request3)) != 1:
+            raise AssertionError("goal case: the fork child request is missing the goal system message")
         request1 = next((request for request in observed if is_user_text(request, "FIRST_TURN")), None)
         if request1 is None:
             raise AssertionError("4a: request with the first parent turn not found")

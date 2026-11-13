@@ -17,7 +17,7 @@ use std::time::SystemTime;
 
 use anyhow::{Context, anyhow};
 
-use crate::agent::{Agent, SessionEntry};
+use crate::agent::{Agent, GoalSnapshot, SessionEntry, ToolSpec};
 use crate::codex::CodexModel;
 use crate::codex_auth::CodexAuth;
 use crate::config::{
@@ -47,6 +47,17 @@ pub(crate) struct RequestHead {
     pub protect_git: bool,
     pub code_mode: bool,
     pub mcp_servers: HashMap<String, crate::mcp::McpServerConfig>,
+    /// The parent's goal projection at build time (folded from the restored
+    /// history). A fork applies it so its request carries the identical
+    /// `[session goal]` system message; `goal_cleared` distinguishes an
+    /// explicit clear tombstone from "never set".
+    pub goal: Option<GoalSnapshot>,
+    pub goal_cleared: bool,
+    /// The parent's final MCP tool list (name/description/parameters), sorted
+    /// by name. A fork re-connects MCP with the parent's workspace and must
+    /// match this snapshot exactly instead of silently running a different
+    /// tool set.
+    pub mcp_specs: Vec<ToolSpec>,
 }
 
 /// What to do with background-task records left behind by a previous run
@@ -983,6 +994,10 @@ impl SessionFactory {
         };
         // Deterministic order is required for prefix-cache parity.
         mcp_tools.sort_by_key(|tool| tool.spec().name);
+        // Snapshot the final MCP tool list for the fork request head before
+        // the tools move into the agent: a fork must re-connect exactly this
+        // tool set, never a silently different one.
+        let head_mcp_specs: Vec<ToolSpec> = mcp_tools.iter().map(|tool| tool.spec()).collect();
         tools.extend(mcp_tools);
         let mut delegate = Delegate::new(
             main_model.clone(),
@@ -1054,32 +1069,36 @@ impl SessionFactory {
         if !context.is_empty() {
             agent.set_context_prefix(context.join("\n\n"));
         }
-        let head_prefix = agent.context_prefix().map(str::to_owned);
-        let head_reminder = agent.compaction_reminder_text().map(str::to_owned);
-        let head_model = main_model.clone();
-        let head_window = main_context_window;
-        let head_sandbox = self.sandbox.clone();
-        let head_read_only = self.read_only;
-        let head_code_mode = self.code_mode;
-        let head_value = RequestHead {
-            model: head_model.clone(),
-            context_window: head_window,
-            context_prefix: head_prefix.clone(),
-            compaction_reminder: head_reminder.clone(),
-            sandbox: head_sandbox.clone(),
-            read_only: head_read_only,
-            protect_git: false,
-            code_mode: head_code_mode,
-
-            mcp_servers: mcp_servers_for_fork.clone(),
-        };
-        *head_cell.lock().unwrap() = Some(head_value);
         if let Some(rounds) = max_rounds {
             agent = agent.max_tool_rounds(rounds);
         }
         let loaded = store.load_located(&self.root, &session).await?;
         let legacy = loaded.legacy;
         agent.restore_located(loaded.entries, loaded.locations);
+        // Capture the request head AFTER the history restore: its goal fields
+        // must carry the session's live folded goal (not the pre-restore
+        // "never set" state) so a fork's first request projects the exact
+        // same `[session goal]` system message as its parent.
+        let head_prefix = agent.context_prefix().map(str::to_owned);
+        let head_reminder = agent.compaction_reminder_text().map(str::to_owned);
+        let head_goal = agent.goal();
+        let head_goal_cleared = agent.goal_cleared();
+        let head_model = main_model.clone();
+        let head_value = RequestHead {
+            model: head_model,
+            context_window: main_context_window,
+            context_prefix: head_prefix,
+            compaction_reminder: head_reminder,
+            sandbox: self.sandbox.clone(),
+            read_only: self.read_only,
+            protect_git: false,
+            code_mode: self.code_mode,
+            mcp_servers: mcp_servers_for_fork.clone(),
+            goal: head_goal,
+            goal_cleared: head_goal_cleared,
+            mcp_specs: head_mcp_specs,
+        };
+        *head_cell.lock().unwrap() = Some(head_value);
         let recovery_labels = if matches!(unfinished, UnfinishedPolicy::Consume) {
             store
                 .peek_unfinished_background(&self.root, &session)

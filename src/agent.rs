@@ -1053,6 +1053,63 @@ pub fn fork_prefix(
     Ok(entries[..=boundary].to_vec())
 }
 
+/// [`fork_prefix`] plus the completed-turn proof a delegate fork requires:
+/// the prefix's provider projection must end with an assistant message that
+/// has no pending tool calls, and repairing its tool-call pairing must not
+/// introduce a synthetic `[turn interrupted …]` result the parent never had.
+/// A compaction is only accepted as the cut when its retained projection
+/// proves the same thing.
+pub(crate) fn fork_prefix_complete(
+    entries: &[SessionEntry],
+    at: Option<usize>,
+) -> Result<Vec<SessionEntry>, String> {
+    const MID_TURN: &str = "cannot fork mid-turn; wait for the current turn to finish";
+    let prefix = fork_prefix(entries, at)?;
+    let locations = vec![None; prefix.len()];
+    let items = Agent::history_items(&prefix, &locations, None);
+    let messages: Vec<Message> = items.iter().map(|item| item.message.clone()).collect();
+    let repaired: Vec<Message> = repair_item_pairs(items)
+        .into_iter()
+        .map(|item| item.message)
+        .collect();
+    // Repairing must never INTRODUCE a synthetic `[turn interrupted …]`
+    // result the parent never had. A synthetic placeholder already present in
+    // the prefix may be dropped when its real result landed later (the
+    // compaction race `repair_item_pairs` documents); that is not a fabricated
+    // result and keeps the child's request identical to the parent's.
+    let synthetic = |message: &Message| {
+        matches!(
+            message,
+            Message::Tool {
+                synthetic: true,
+                ..
+            }
+        )
+    };
+    let mut original_synthetic: Vec<&Message> = messages
+        .iter()
+        .filter(|message| synthetic(message))
+        .collect();
+    for message in repaired.iter().filter(|message| synthetic(message)) {
+        match original_synthetic
+            .iter()
+            .position(|candidate| *candidate == message)
+        {
+            Some(index) => {
+                original_synthetic.remove(index);
+            }
+            None => return Err(MID_TURN.into()),
+        }
+    }
+    if !matches!(
+        messages.last(),
+        Some(Message::Assistant(assistant)) if assistant.tool_calls.is_empty()
+    ) {
+        return Err(MID_TURN.into());
+    }
+    Ok(prefix)
+}
+
 /// Token accounting for one provider call, if the provider reports it.
 
 #[async_trait]
@@ -1525,7 +1582,6 @@ impl Agent {
 
     /// Whether the newest goal update was a clear tombstone — distinct from
     /// never having set a goal. Drives the provider-context override.
-    #[cfg(test)]
     pub(crate) fn goal_cleared(&self) -> bool {
         self.goal_cleared
     }
@@ -1534,7 +1590,7 @@ impl Agent {
     /// tombstone (`goal: None`) wins like any other update; the returned
     /// bool is true exactly when the newest update is a tombstone (so a
     /// "cleared" goal is distinguishable from "never set").
-    fn fold_goal(history: &[SessionEntry]) -> (Option<GoalSnapshot>, bool) {
+    pub(crate) fn fold_goal(history: &[SessionEntry]) -> (Option<GoalSnapshot>, bool) {
         match history
             .iter()
             .rev()
@@ -1683,9 +1739,35 @@ impl Agent {
                 content: "[session goal]\nnone (cleared)".into(),
             }));
         }
+        items.extend(Self::history_items(
+            &self.history,
+            &self.entry_locations,
+            self.compaction_reminder.as_deref(),
+        ));
+        // The newest pager result must be complete in the next provider
+        // request: it is precisely the page the model asked to inspect.
+        if let Some(last) = items.iter().rposition(
+            |item| matches!(&item.message, Message::Tool { name, .. } if name == "read_output"),
+        ) {
+            items[last].keep_full = true;
+        }
+        items
+    }
+
+    /// The provider-message projection of a persisted history slice: the
+    /// latest compaction summary plus its retained tail, then every entry
+    /// after it. This is the pairing-relevant part of [`Self::context_items`]
+    /// (no context prefix, goal, or receipt-field metadata), shared by the
+    /// live agent and the fork-boundary check so both see the exact same
+    /// messages.
+    fn history_items(
+        history: &[SessionEntry],
+        entry_locations: &[Option<EntryLocation>],
+        compaction_reminder: Option<&str>,
+    ) -> Vec<ContextItem> {
+        let mut items = Vec::new();
         let mut start = 0;
-        if let Some(index) = self
-            .history
+        if let Some(index) = history
             .iter()
             .rposition(|entry| matches!(entry, SessionEntry::Compaction { .. }))
         {
@@ -1694,16 +1776,15 @@ impl Agent {
                 retained,
                 current_prompt_at,
                 no_current_prompt,
-            } = &self.history[index]
+            } = &history[index]
             else {
                 unreachable!()
             };
-            let location = self
-                .entry_locations
+            let location = entry_locations
                 .get(index)
                 .and_then(|location| location.clone());
             let header = "[compacted summary of earlier conversation]\n";
-            let prefix = match &self.compaction_reminder {
+            let prefix = match compaction_reminder {
                 Some(reminder) => format!("{header}\n[standing directive: {reminder}]\n\n"),
                 None => header.to_owned(),
             };
@@ -1758,12 +1839,9 @@ impl Agent {
             }
             start = index + 1;
         }
-        for (i, entry) in self.history[start..].iter().enumerate() {
+        for (i, entry) in history[start..].iter().enumerate() {
             let i = start + i;
-            let location = self
-                .entry_locations
-                .get(i)
-                .and_then(|location| location.clone());
+            let location = entry_locations.get(i).and_then(|location| location.clone());
             match entry {
                 SessionEntry::Message { message } => items.push(ContextItem {
                     message: message.clone(),
@@ -1828,13 +1906,6 @@ impl Agent {
                 // replaying them here would duplicate the projection.
                 SessionEntry::GoalUpdated { .. } => {}
             }
-        }
-        // The newest pager result must be complete in the next provider
-        // request: it is precisely the page the model asked to inspect.
-        if let Some(last) = items.iter().rposition(
-            |item| matches!(&item.message, Message::Tool { name, .. } if name == "read_output"),
-        ) {
-            items[last].keep_full = true;
         }
         items
     }
