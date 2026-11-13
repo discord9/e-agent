@@ -1147,7 +1147,12 @@ impl SessionFactory {
             bootstrap,
         )
         .await?;
-        let runner = runner.with_background_tasks(background.clone());
+        // The root/main session is the only one with a user-facing
+        // `WaitingInput` frontend (Web/TUI), so it is the only session
+        // allowed to suspend on `request_user_input` for an answer.
+        let runner = runner
+            .with_background_tasks(background.clone())
+            .with_user_input_allowed();
         Ok(SessionBuild {
             runner,
             handle,

@@ -209,7 +209,7 @@ impl Tool for SendMessage {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "send_message".into(),
-            description: "Send a direct message to a live session. From the main agent, `target` must be the exact registered child subagent session id. From a subagent, `target` must be `parent`. Delivery is queued; it is not a human instruction.".into(),
+            description: "Send a direct message to a live session. From the main agent, `target` must be the exact registered child subagent session id. From a subagent, `target` must be `parent`. Delivery is queued; it is not a human instruction. A finished child is not live: continue it with the `delegate` tool (`resume` its session id, with a fresh `task` and the original `role`/`workspace` if the task used them).".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -956,6 +956,11 @@ impl Delegate {
         let goal_registration = self.parent_endpoint.clone();
         let exit_slot = new_exit_slot();
         let work_exit = exit_slot.clone();
+        // The fork has no user-provided workspace argument (its workspace is
+        // always the parent's, which the fork head already validated); pass
+        // that resolved parent workspace in the same string form the delegate
+        // path passes, so the task panel shows where this child is running.
+        let display_workspace = workspace.root().display().to_string();
         self.background
             .spawn_with_id_target(
                 self.sender.clone(),
@@ -964,7 +969,7 @@ impl Delegate {
                 None,
                 Some(crate::tools::TaskDisplayMeta {
                     background: true,
-                    workspace: None,
+                    workspace: Some(display_workspace),
                     subagent_session_id: Some(session_id.clone()),
                     resume: None,
                 }),
@@ -1419,10 +1424,10 @@ impl Tool for Delegate {
             json!({"type": "string", "enum": roles, "description": format!("specialized role for the subagent; available roles: {}", role_disclosures.join(", "))})
         };
         let mut properties = json!({
-            "workspace": {"type": "string", "description": "REQUIRED — working directory for the subagent"},
+            "workspace": {"type": "string", "description": "REQUIRED — working directory for the subagent (e.g. /home/user/project or C:\\Users\\user\\project). May be absolute or relative: relative paths are resolved against YOUR workspace root (e.g. `.e-agent/worktrees/wt-x`) and must stay inside it or an authorized external directory."},
             "role": role_property,
-            "label": {"type": "string"},
-            "resume": {"type": "string"},
+            "label": {"type": "string", "description": "short (≤ 40 chars) human-readable title for the task panel; defaults to the role name or a preview of the task"},
+            "resume": {"type": "string", "description": "id of a previous subagent session (sub-…) to continue from; its transcript becomes the starting context"},
             "task": {"type": "string", "description": "complete, self-contained instructions for the subagent"}
         });
         if self.fork_head.is_some() {

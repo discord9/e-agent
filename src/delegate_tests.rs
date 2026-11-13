@@ -2738,6 +2738,20 @@ fn bash_tool_call_delta(arguments: &str) -> Value {
     })
 }
 
+/// SSE delta for a one-question `request_user_input` tool call.
+fn user_input_tool_call_delta(arguments: &str) -> Value {
+    json!({
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [{
+            "index": 0,
+            "id": "call-1",
+            "type": "function",
+            "function": {"name": "request_user_input", "arguments": arguments}
+        }]
+    })
+}
+
 #[tokio::test]
 async fn background_delegate_cancel_aborts_child_before_wrapper_completion() {
     // The public cancel path targets the child runner, not the wrapper. The
@@ -3923,6 +3937,74 @@ async fn fork_completion_carries_the_child_answer_with_completed_status() {
     assert!(
         output.starts_with("fork session: "),
         "the fork reports its session id, got: {output}"
+    );
+}
+
+#[tokio::test]
+async fn fork_child_cannot_ask_the_user_questions() {
+    // A fork has no frontend that could answer a WaitingInput request: the
+    // runner must fail `request_user_input` back to the child's model as a
+    // plain tool error and keep the child's turn going. Suspending instead
+    // would leave the child (and its parent task) parked forever.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    seed_fork_parent(&root, "parent");
+    let base_url = scripted_chat(vec![
+        (
+            user_input_tool_call_delta(
+                r#"{"questions":[{"id":"branch","prompt":"Which branch?"}]}"#,
+            ),
+            "tool_calls",
+        ),
+        (json!({"content":"worked alone"}), "stop"),
+    ])
+    .await;
+    let head = chat_model(base_url, "stale-model");
+    let mut delegate = forking_delegate(&root, &fork_record(&root, "parent"), head);
+    let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
+    delegate.set_event_sender(sender);
+    let parent_handle = live_parent_endpoint();
+    delegate.set_session_handle("parent", parent_handle.clone());
+
+    delegate
+        .execute(json!({
+            "task": "do the work",
+            "fork": true,
+            "workspace": root.display().to_string()
+        }))
+        .await
+        .expect("the fork spawns");
+    // `await_background_status` times out if the child parked in
+    // WaitingInput instead of continuing its turn.
+    let (status, output) = await_background_status(&mut completions).await;
+    assert_eq!(
+        status.as_deref(),
+        Some("completed"),
+        "a forked child must never park in WaitingInput, got: {output}"
+    );
+    assert!(
+        output.contains("worked alone"),
+        "the child's own answer must reach the parent, got: {output}"
+    );
+    let session_id = output
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("fork session: "))
+        .expect("the completion reports the fork session id")
+        .to_owned();
+    let entries = SessionStore::Jsonl
+        .load(&root, &session_id)
+        .await
+        .unwrap()
+        .entries;
+    assert!(
+        entries.iter().any(|entry| matches!(
+            entry,
+            crate::agent::SessionEntry::Message {
+                message: Message::Tool { call_id, content, is_error: true, synthetic: false, .. }
+            } if call_id == "call-1" && content.contains("cannot ask the user questions")
+        )),
+        "the child's question must be a committed tool error, got: {entries:?}"
     );
 }
 

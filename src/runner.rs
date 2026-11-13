@@ -46,6 +46,11 @@ pub enum PromptSubmission {
 
 const EVENT_CAPACITY: usize = 256;
 
+/// Model-facing error committed when a session without a user-facing
+/// frontend (delegate, btw, fork) calls `request_user_input`: the tool stays
+/// advertised for schema parity, but it must never suspend such a session.
+const USER_INPUT_UNAVAILABLE: &str = "this session cannot ask the user questions: no frontend can answer, so continue with the information you already have and report anything still needed in your final answer";
+
 /// Model-facing notice committed once per genuinely new automatic Goal turn
 /// (never on a same-turn maintenance resume); replay is audit-only and by
 /// itself arms/wakes nothing.
@@ -942,6 +947,12 @@ pub struct SessionRunner {
     pending: VecDeque<PendingCommand>,
     pending_web_attaches: Vec<oneshot::Sender<WebAttach>>,
     policy: IdlePolicy,
+    /// Whether this session may suspend on `request_user_input` and wait for
+    /// a human answer. Only the root/main session has a frontend that can
+    /// answer, so `false` (the default) makes the interception fail that call
+    /// back to the model instead of parking the turn in `WaitingInput` with
+    /// nobody to answer — a delegate, btw or fork child has no such frontend.
+    user_input_allowed: bool,
     last_answer: Option<String>,
     /// Internal trigger for the next turn; Goal is the in-memory driver mount.
     armed_trigger: Option<RunnerTrigger>,
@@ -1052,6 +1063,16 @@ impl SessionRunner {
     ) -> Self {
         self.bootstrap_projection_pending = false;
         self.background = Some(background);
+        self
+    }
+
+    /// Let this session suspend on `request_user_input` until a human answers.
+    /// Only the root/main session installs this: it owns the single
+    /// `WaitingInput`/answer frontend. Delegate, btw and fork runners keep the
+    /// `false` default, so the tool fails back to their model instead of
+    /// waiting for an answer nobody can give.
+    pub(crate) fn with_user_input_allowed(mut self) -> Self {
+        self.user_input_allowed = true;
         self
     }
 
@@ -1203,6 +1224,7 @@ impl SessionRunner {
                 pending: VecDeque::new(),
                 pending_web_attaches: Vec::new(),
                 policy,
+                user_input_allowed: false,
                 last_answer: None,
                 armed_trigger: None,
                 turn_just_ended: false,
@@ -3262,6 +3284,32 @@ impl SessionRunner {
                     // Root-only marker: pause this same model/tool turn for the
                     // Web answer.
                     if call.name == "request_user_input" {
+                        // Only the root session has a frontend that can answer
+                        // (the Web/TUI WaitingInput prompt). A delegate, btw or
+                        // fork session has none: suspending there would park the
+                        // turn forever, so the call fails back to the model as a
+                        // normal tool error and the loop continues.
+                        if !self.user_input_allowed {
+                            let result = Err(USER_INPUT_UNAVAILABLE.to_owned());
+                            match self.finish_intercepted_tool(&call, result).await {
+                                Ok(Steering::None) => {}
+                                Ok(steering) => {
+                                    if self.release_after_preempt(steering) {
+                                        return;
+                                    }
+                                    break 'turn;
+                                }
+                                Err(error) => {
+                                    self.terminate(
+                                        SessionResult::Failed(format!("{error:#}")),
+                                        Vec::new(),
+                                    )
+                                    .await;
+                                    return;
+                                }
+                            }
+                            continue;
+                        }
                         let questions = match crate::tools::parse_questions(&call.arguments) {
                             Ok(questions) => questions,
                             Err(error) => {
