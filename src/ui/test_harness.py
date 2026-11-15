@@ -340,14 +340,19 @@ const FETCHES=[];
 const FETCH_HEADERS=[];   // 每个请求的 {url, method, headers}（全局 token 回退测试断言 Authorization）
 const FETCH_BODIES=[];    // 每个请求的 body（深链 resume 断言 POST {"id":...}）
 const FETCH_OPTS=[];      // 每个请求的 {url, method, cache}（apiFor cache:no-store 断言）
-// 侧边栏轮询 URL（带 exclude）：每个 workspace 身份的第一次列表请求是无过滤
-// 的完整列表（分组表头需要），此后都是带 exclude 的小轮询。计数断言把两者
-// 都算作「一次列表请求」，展开分组的按需补拉只在缓存缺隐藏条目时发生。
-const POLL_LIST_URL = "/api/sessions?exclude=archived_children";
+// 侧边栏轮询 URL：产品侧固定为 SESSIONS_POLL_PATH = /api/sessions?mode=sidebar
+// （服务端返回窗口化 partial 快照 + totals；旧的 ?exclude=archived_children
+// 形态已不再是客户端的轮询路径）。每个 workspace 身份的第一次列表请求与轮询
+// 用同一 URL；计数断言把它算作「一次列表请求」，展开分组的按需补拉才走无参数
+// 的完整列表。
+const POLL_LIST_URL = "/api/sessions?mode=sidebar";
 const POLL_LIST_URL_B = "http://b.local" + POLL_LIST_URL;
 const isListPollFetchA = (u) => u === POLL_LIST_URL || u === "/api/sessions";
 const isListPollFetchB = (u) => u === POLL_LIST_URL_B || u === "http://b.local/api/sessions";
 const isListPollFetch = (u) => isListPollFetchA(u) || isListPollFetchB(u);   // 两侧
+// SSE attach URL：live 会话经 Web attach 带 ?view=web（sse.js connectSSE 的
+// webAttach 参数），历史会话才是裸 /events。断言两侧都认。
+const isEventsAttach = (u, path) => u === path || u === path + "?view=web";
 const sseChunks = [
   "event: snapshot\ndata: [{\"type\":\"notice\",\"text\":\"SNAPSHOT-SHOULD-BE-SKIPPED\"}]\n\n",
   "event: status\ndata: {\"status\":\"Busy\"}\n\n",
@@ -533,6 +538,25 @@ let sessionsPostCustom = null;
 let sessionDeleteStatus = 204;
 let historyOverrides = new Map();
 let sseOkIds = new Set();
+/* Web attach（/events?view=web）bootstrap 固定桩：id → {status?, netfail?,
+   hang?, entries, locations?, replay?, next_before_seq?}。live 会话的历史由
+   runner-owned bootstrap 一次性送达（一个 SSE 事件同时带 transcript 与呈现
+   桥），深链对未列出的 id 也走这条路——它不再 probe /history。因此每个深链
+   用例必须按 id 给出自己的 bootstrap；旧的「history 覆盖 + 空 /events」
+   组合在新流程里等价于「没有 transcript」，会让页面停在空消息区。 */
+let attachById = new Map();
+function bootstrapStream(fix) {
+  const payload = JSON.stringify({
+    entries: fix.entries || [],
+    locations: fix.locations || [],
+    replay: fix.replay || [],
+    next_before_seq: fix.next_before_seq !== undefined ? fix.next_before_seq : null,
+  });
+  const chunks = ["event: bootstrap\ndata: " + payload + "\n\n"];
+  let i = 0;
+  return { getReader(){ return { read: async()=> i < chunks.length
+    ? { done:false, value: chunks[i++] } : { done:true } }; } };
+}
 let historyResolve = null;
 let a1StreamManualNotice = false;
 // fork 面板测试用：/fork-candidates 候选与 /fork POST 响应（测试中可变）
@@ -594,6 +618,17 @@ globalThis.fetch=(url,opts={})=>{
           "x-spool-total": String(total),
           "x-spool-truncated": taskOutputTruncated ? "true" : "false",
         });
+      }
+      // Web attach / events 显式固定桩（含 bootstrap）：按 id 给出与真实 wire
+      // 一致的响应（200 = bootstrap 流，或 401/404 等错误状态、网络失败、
+      // 永久挂起）。优先级最高，避免落到下方「未知 id → 404」兜底。
+      const _mAttach = /^\/api\/sessions\/([^/]+)\/events(\?view=web)?$/.exec(url);
+      if (_mAttach && attachById.has(_mAttach[1])) {
+        const fix = attachById.get(_mAttach[1]);
+        if (fix.netfail) return Promise.reject(new TypeError("network error"));
+        if (fix.hang) return abortable(new Promise(() => {}), signal);
+        if (fix.status && fix.status !== 200) return resp(fix.status, fix.body || {}, signal);
+        return resp(200, bootstrapStream(fix), signal);
       }
       // SSE 404 语义测试：命中这些 id 的 /events 返回 404（优先于下方具体会话路由）
       const _m404 = /^\/api\/sessions\/([^/]+)\/events$/.exec(url);
@@ -672,6 +707,11 @@ globalThis.fetch=(url,opts={})=>{
   if(url==="/api/sessions/a1/events")
     return resp(200, a1StreamManualNotice ? streamManualNotice()
       : (a1StreamManual ? streamManual() : streamEmpty()), signal);
+  /* live 会话经 Web attach（?view=web）起流——手动挂起流的两套 URL 都要覆盖，
+     否则桩不匹配（无 SSE）→ read 从未挂起 → 依赖 a1StreamReadResolve 的
+     断言（create-no-kill / agg sse lifetime）失败并抛错。 */
+  if(url==="/api/sessions/a1/events?view=web" && (a1StreamManual || a1StreamManualNotice))
+    return resp(200, a1StreamManualNotice ? streamManualNotice() : streamManual(), signal);
   if(url.startsWith("http://b.local/api/sessions/b1/history"))
     return resp(200,{entries:[{type:"message",message:{Assistant:{content:"B 会话内容"}}}], next_before_seq:null},signal);
   if(url==="http://b.local/api/sessions/b1/events") return resp(200, streamEmpty(), signal);
@@ -2208,6 +2248,32 @@ async function main(){
     //     bash 行有同款行尾「取消」按钮（展开区 task-cancel-inside 已移除）。
     state.lastList = [];   // 不依赖 label 匹配：subagent_session_id 直连
     state.tasks.composerOpen = true;   // openSession 会强制收起面板：重开以渲染行
+    // 本段有两个反调试陷阱：
+    // 1) openSession 内部会 void pollTasks({liveOnly})，cancelTask 成功后也会
+    //    局部刷新；这类请求在 fetch 发起瞬间就捕获了「那一刻」的 tasksData。
+    //    pollTaskWorkspace 按 workspace/端点单飞 → 随后的 await pollTasks()
+    //    只会并流到在飞的旧请求，新写入的 tasksData 永远发不出去（面板停在
+    //    旧 7/8 两行）。注入新数据前先让在飞请求（含 refresh 递归）全部落地。
+    // 2) 行一律按 data-task key（session_id:id）选取，不用数组下标：缺行时下标
+    //    得到 undefined，随后 .querySelector 抛错会中止整个 harness；key 选取
+    //    返回 null，只让对应断言 FAIL（可诊断，不掩盖失败）。
+    const settleTaskRequests = async () => {
+      for (let i = 0; i < 8 && taskRequests.size; i++) {
+        await Promise.allSettled([...taskRequests.values()].map((entry) => entry.promise));
+        await flush();
+      }
+      taskRequests.clear();
+      await flush();
+    };
+    const taskPanel = elsById["composerTasks"];
+    const taskRowOf = (key) => [...taskPanel.querySelectorAll(".task-row")]
+      .find((row) => row.getAttribute("data-task") === key) || null;
+    const clickNode = (node, ev) => {
+      const fn = node && node._listeners["click"] && node._listeners["click"][0];
+      if (fn) fn(ev);
+      return !!fn;
+    };
+    await settleTaskRequests();
     tasksData = [
       { session_id: "s1", id: 20, kind: "delegate", label: "子任务X", role: "explore",
         subagent_session_id: "sub-20" },
@@ -2218,11 +2284,12 @@ async function main(){
     ];
     await pollTasks();
     await flush();
-    const drows = elsById["composerTasks"].querySelectorAll(".task-row");
-    chk("delegate+btw+bash rows rendered", drows.length === 3, "n=" + drows.length);
-    const drow20 = drows[0], drow21 = drows[1], drow22 = drows[2];
-    const dbtn20 = drow20.querySelector(".task-cancel-inline");
-    const dbtn21 = drow21.querySelector(".task-cancel-inline");
+    const drows = [...taskPanel.querySelectorAll(".task-row")];
+    const drow20 = taskRowOf("s1:20"), drow21 = taskRowOf("s1:21"), drow22 = taskRowOf("s1:22");
+    chk("delegate+btw+bash rows rendered", drows.length === 3,
+        "n=" + drows.length + " keys=" + drows.map((r) => r.getAttribute("data-task")).join(","));
+    const dbtnOf = (row) => (row ? row.querySelector(".task-cancel-inline") : null);
+    const dbtn20 = dbtnOf(drow20), dbtn21 = dbtnOf(drow21), dbtn22 = dbtnOf(drow22);
     chk("delegate row has visible inline end button",
         dbtn20 !== null && dbtn20.hidden === false && dbtn20.textContent === "结束",
         "btn=" + String(dbtn20 !== null) + " hidden=" + (dbtn20 && dbtn20.hidden)
@@ -2231,11 +2298,9 @@ async function main(){
         dbtn21 !== null && dbtn21.hidden === false && dbtn21.textContent === "结束",
         "btn=" + String(dbtn21 !== null) + " hidden=" + (dbtn21 && dbtn21.hidden));
     chk("bash row has visible trailing cancel button",
-        drow22.querySelector(".task-cancel-inline") !== null
-        && drow22.querySelector(".task-cancel-inline").hidden === false
-        && drow22.querySelector(".task-cancel-inline").textContent === "取消",
-        "btn=" + String(drow22.querySelector(".task-cancel-inline") !== null)
-        + " text=" + (drow22.querySelector(".task-cancel-inline") || {}).textContent);
+        dbtn22 !== null && dbtn22.hidden === false && dbtn22.textContent === "取消",
+        "btn=" + String(dbtn22 !== null) + " hidden=" + (dbtn22 && dbtn22.hidden)
+        + " text=" + (dbtn22 && dbtn22.textContent));
     // 按钮在行尾、状态点之后（task-line 内）
     chk("inline end button inside task-line",
         dbtn20 !== null && dbtn20.parentNode !== null
@@ -2247,7 +2312,7 @@ async function main(){
     const delFetchBefore = FETCH_HEADERS.filter((f) => f.method === "DELETE"
         && f.url.indexOf("/tasks/") !== -1).length;
     const evInline = { _stopped: false, stopPropagation() { this._stopped = true; } };
-    dbtn20._listeners["click"][0](evInline);   // async：flush 后断言 DELETE
+    clickNode(dbtn20, evInline);   // async：flush 后断言 DELETE
     chk("inline end button stops propagation", evInline._stopped === true,
         "stopped=" + evInline._stopped);
     await flush();
@@ -2261,23 +2326,25 @@ async function main(){
     chk("inline end click did not navigate (session unchanged)",
         state.sessionId === "s1", "sid=" + state.sessionId);
     // btw 按钮同样发 DELETE（结束 btw 对话 = cancel task）
-    dbtn21._listeners["click"][0]({ _stopped: false, stopPropagation() { this._stopped = true; } });
+    clickNode(dbtn21, { _stopped: false, stopPropagation() { this._stopped = true; } });
     await flush();
     chk("btw inline end issues DELETE task cancel",
         FETCH_HEADERS.some((f) => f.method === "DELETE" && f.url === "/api/sessions/s1/tasks/21"),
         "urls=" + JSON.stringify(FETCH_HEADERS.filter((f) => f.method === "DELETE").map((f) => f.url)));
     // 后端取消成功 → 任务从轮询列表消失（模拟后端 registry 已清理）
+    await settleTaskRequests();   // cancelTask 成功后的 refresh 递归先落地
     tasksData = [{ session_id: "s1", id: 22, kind: "bash", label: "cargo check",
       full_command: "cargo check", output: "", role: null }];
     await pollTasks();
     await flush();
     // (c) 防回归：delegate 行点击仍是跳转会话（subagent_session_id 直连）
+    await settleTaskRequests();
     tasksData = [{ session_id: "s1", id: 23, kind: "delegate", label: "子任务Y", role: "explore",
       subagent_session_id: "sub-23" }];
     await pollTasks();
     await flush();
-    const drow23 = elsById["composerTasks"].querySelector(".task-row");
-    drow23._listeners["click"][0]();
+    const drow23 = taskRowOf("s1:23");
+    clickNode(drow23);
     await flush();
     chk("delegate row click still navigates to subagent session",
         state.sessionId === "sub-23", "sid=" + state.sessionId);
@@ -2288,13 +2355,14 @@ async function main(){
     // 展开）+ confirm + DELETE；展开区不再有第二个取消按钮
     // （task-cancel-inside 已移除，行尾按钮统一替代）。
     state.tasks.composerOpen = true;   // openSession 强制收起面板：重开渲染行
+    await settleTaskRequests();        // openSession 自发的那轮轮询先落地
     tasksData = [{ session_id: "s1", id: 24, kind: "bash", label: "cargo test",
       full_command: "cargo test", output: "running", role: null }];
     taskOutputText = "running";
     await pollTasks();
     await flush();
-    const brow24 = elsById["composerTasks"].querySelector(".task-row");
-    const tbtn24 = brow24.querySelector(".task-cancel-inline");
+    const brow24 = taskRowOf("s1:24");
+    const tbtn24 = brow24 ? brow24.querySelector(".task-cancel-inline") : null;
     chk("bash trailing cancel visible without expand",
         tbtn24 !== null && tbtn24.hidden === false && tbtn24.textContent === "取消",
         "btn=" + String(tbtn24 !== null) + " hidden=" + (tbtn24 && tbtn24.hidden)
@@ -2303,15 +2371,16 @@ async function main(){
         tbtn24 !== null && tbtn24.title === "取消任务 24",
         "title=" + (tbtn24 && tbtn24.title));
     chk("bash row has no inside cancel button",
-        brow24.querySelector(".task-cancel-inside") === null
+        brow24 !== null && brow24.querySelector(".task-cancel-inside") === null
         && brow24.querySelectorAll(".task-cancel-inline").length === 1,
-        "inside=" + String(brow24.querySelector(".task-cancel-inside") !== null)
-        + " inline n=" + brow24.querySelectorAll(".task-cancel-inline").length);
-    const bpre24 = brow24.querySelector(".task-output");
+        "row=" + String(brow24 !== null)
+        + " inside=" + String(brow24 !== null && brow24.querySelector(".task-cancel-inside") !== null)
+        + " inline n=" + (brow24 ? brow24.querySelectorAll(".task-cancel-inline").length : -1));
+    const bpre24 = brow24 ? brow24.querySelector(".task-output") : null;
     const delBefore24 = FETCH_HEADERS.filter((f) => f.method === "DELETE"
         && f.url.indexOf("/tasks/") !== -1).length;
     const evTrail24 = { _stopped: false, stopPropagation() { this._stopped = true; } };
-    tbtn24._listeners["click"][0](evTrail24);   // async：flush 后断言 DELETE
+    clickNode(tbtn24, evTrail24);   // async：flush 后断言 DELETE
     chk("bash trailing cancel stops propagation", evTrail24._stopped === true,
         "stopped=" + evTrail24._stopped);
     await flush();
@@ -2323,18 +2392,19 @@ async function main(){
         "delta=" + (delFetches24.length - delBefore24)
         + " urls=" + JSON.stringify(delFetches24.map((f) => f.url)));
     chk("bash trailing cancel click did not expand row",
-        bpre24.hidden === true && !state.tasks.pollers.has("s1:24"),
-        "hidden=" + bpre24.hidden
+        bpre24 !== null && bpre24.hidden === true && !state.tasks.pollers.has("s1:24"),
+        "hidden=" + (bpre24 && bpre24.hidden)
         + " pollers=" + JSON.stringify([...state.tasks.pollers.keys()]));
     // 行点击展开输出后也不会出现第二个取消按钮（展开区按钮已移除）
-    brow24._listeners["click"][0]();
+    clickNode(brow24);
     chk("bash row click still expands after trailing cancel",
-        bpre24.hidden === false, "hidden=" + bpre24.hidden);
+        bpre24 !== null && bpre24.hidden === false, "hidden=" + (bpre24 && bpre24.hidden));
     chk("no second cancel button after expand",
-        brow24.querySelector(".task-cancel-inside") === null
+        brow24 !== null && brow24.querySelector(".task-cancel-inside") === null
         && brow24.querySelectorAll(".task-cancel-inline").length === 1,
-        "inside=" + String(brow24.querySelector(".task-cancel-inside") !== null)
-        + " inline n=" + brow24.querySelectorAll(".task-cancel-inline").length);
+        "row=" + String(brow24 !== null)
+        + " inside=" + String(brow24 !== null && brow24.querySelector(".task-cancel-inside") !== null)
+        + " inline n=" + (brow24 ? brow24.querySelectorAll(".task-cancel-inline").length : -1));
     // 还原：面板清空（后续 Bug C 等测试从空任务面板继续）
     tasksData = [];
     await pollTasks();
@@ -2440,7 +2510,12 @@ async function main(){
         elsById["promptInput"].value === "",
         "draft=" + JSON.stringify(elsById["promptInput"].value));
     openSession("s1");          // 真实切回：cached 分支恢复草稿 + openWith 恢复快照
-    await flush();
+    // 以下三条按「快照恢复」的确定时机取值：排队快照由 openWith 同步恢复
+    // （先清后恢复）；随后 Web attach 的 bootstrap 会按服务端 replay 重新
+    // 投影队列——先清空 state.queue 与快照，再折叠 after_head 的
+    // prompt_queued。本桩的 bootstrap replay 为 []（没有队列投影），
+    // flush 后队列必为空；因此断言必须在 bootstrap 落地前同步执行，
+    // 而不是在 flush 之后比一个桩里不存在的数据。
     chk("draft restored on switch-back",
         elsById["promptInput"].value === "未保存草稿",
         "draft=" + JSON.stringify(elsById["promptInput"].value));
@@ -2458,12 +2533,27 @@ async function main(){
         "q=" + state.queue.length + " snap=" + JSON.stringify(state.queues[state.workspace.id + ":s1"]));
     chk("queue bar hidden when empty", elsById["queueBar"].hidden === true,
         "hidden=" + elsById["queueBar"].hidden);
+    await flush();             // 让 attach 的 bootstrap 落地，后续段落从干净状态开始
 
     // ---- restored 替换回归：切走期间的会话更新必须可见 ----
     // 场景：用户切走会话（缓存旧快照）→ 会话继续产出新消息 → 切回。
     // 旧实现恢复缓存 + 跳过 snapshot → 新消息永不显示。现在 restored
     // 会拉最新 history 替换过期缓存。
+    // 这几个场景的会话要验证的是「历史会话」路径（openWith 拉 /history 替换
+    // 过期缓存；桩里 /history 有数据、/events 是空流）。sessionKnownState 只
+    // 认列表里的会话：列表里没有 → unknown → openWith 走 Web attach
+    // (?view=web bootstrap)，桩里没有对应 bootstrap，缓存就永不替换。故先把
+    // 这些 id 以 active:false（历史会话）登记进当前 workspace 列表。
+    const markHistorical = (id) => {
+      const into = (list) => (list || []).filter((s) => s.id !== id)
+        .concat([{ id, active: false, parent_session_id: null }]);
+      state.lastList = into(state.lastList);
+      if (state.workspaceLists && state.workspaceLists[state.workspace.id]) {
+        state.workspaceLists[state.workspace.id] = into(state.workspaceLists[state.workspace.id]);
+      }
+    };
     state.sessionId = null;
+    markHistorical("restored-test");
     state.sessionStates[state.workspace.id + ":restored-test"] = {
       html: "<div class='notice'>旧缓存消息</div>", scrollTop: 0,
       nextBeforeSeq: 8, olderDone: false, draft: "",
@@ -2479,6 +2569,7 @@ async function main(){
     // 以前的卡片会出现在最新位置、与尾部历史重复、且永不折叠）。live 续写
     // 靠重新连接的 SSE 新建块。
     state.sessionId = null;
+    markHistorical("restored-test2");
     state.sessionStates[state.workspace.id + ":restored-test2"] = {
       html: "<div class='msg msg-assistant'><div class='msg-body'>正在流式</div></div>",
       scrollTop: 0, nextBeforeSeq: 8, olderDone: false, draft: "",
@@ -2503,6 +2594,7 @@ async function main(){
     // 整体替换后，消息区最后一个子节点是尾部最新条目（forked 行），而不是
     // 切走瞬间还在执行的旧 bash 卡片（否则它出现在最新位置、永不折叠）。
     state.sessionId = null;
+    markHistorical("restored-test3");
     state.sessionStates[state.workspace.id + ":restored-test3"] = {
       html: "<div class='msg msg-user'><span class='who'>you&gt;</span>"
         + "<div class='msg-body'>旧消息</div></div>"
@@ -2514,18 +2606,28 @@ async function main(){
     await flush(); await flush();
     const msgs3 = elsById["messages"];
     const last3 = msgs3.children[msgs3.children.length - 1];
+    // 累积器不变式（比旧的 length===0 更准确）：fresh 尾部由 renderEntries 用
+    // 新累积器渲染，它自己那张 bash 卡片以 filled:true 留在 toolStack 里
+    // （appendToolCall push → appendToolResult 标记 filled），所以 length 不再
+    // 为 0。回归真正要防的是「缓存里那张执行中卡片还挂在累积器上」：每个槽
+    // 必须已填充、且节点仍连在消息区（未填充 = 后续 ToolResult 会填进它；
+    // 脱离文档 = 结果写进一个不再显示的节点）。
+    const stack3 = (state.acc && state.acc.toolStack) || [];
+    const unfilled3 = stack3.filter((e) => !e.filled).length;
+    const detached3 = stack3.filter((e) => !(e.el && e.el.isConnected && msgs3.contains(e.el))).length;
     chk("restored does not re-append cached in-flight tool card to bottom",
         !msgs3.textContent.includes("执行中…")
         && !!last3 && last3.className.includes("forked")
-        && !(state.acc && state.acc.toolStack && state.acc.toolStack.length),
+        && unfilled3 === 0 && detached3 === 0,
         "last=" + (last3 ? last3.className : "none")
         + " inflight=" + msgs3.textContent.includes("执行中…")
-        + " stack=" + (state.acc && state.acc.toolStack ? state.acc.toolStack.length : "-"));
+        + " stack=" + stack3.length + " unfilled=" + unfilled3 + " detached=" + detached3);
 
     // ---- restored streaming tail reconciliation ----
     // Cache A after ABC, leave it while B is active, then return. The initial
     // snapshot repeats ABC and adds DEF; only that in-flight tail is restored,
     // while persisted history stays in the DOM and live GHI uses one block.
+    markHistorical("stream-switch-a");
     state.sessionId = "stream-switch-a";
     state.initSource = "history";
     state.acc = newAccumulator();
@@ -5232,14 +5334,14 @@ async function main(){
     chk("agg sse lifetime: current reconnect schedules",
         scheduledTimeouts.length === tBefore14 + 1 && state.sse.retryTimer !== null,
         "n=" + scheduledTimeouts.length);
-    const bEventsBefore14 = FETCHES.filter(u => u === "http://b.local/api/sessions/b1/events").length;
+    const bEventsBefore14 = FETCHES.filter(u => isEventsAttach(u, "http://b.local/api/sessions/b1/events")).length;
     scheduledTimeouts[tBefore14]();   // 触发重连定时器
     await flush();
     await flush();
     chk("agg sse lifetime: current reconnect re-opens b1",
         state.sessionId === "b1"
-        && FETCHES.filter(u => u === "http://b.local/api/sessions/b1/events").length === bEventsBefore14 + 1,
-        "events=" + FETCHES.filter(u => u === "http://b.local/api/sessions/b1/events").length);
+        && FETCHES.filter(u => isEventsAttach(u, "http://b.local/api/sessions/b1/events")).length === bEventsBefore14 + 1,
+        "events=" + FETCHES.filter(u => isEventsAttach(u, "http://b.local/api/sessions/b1/events")).length);
     a1StreamManual = false;
 
     // =====================================================================
@@ -6092,6 +6194,26 @@ async function main(){
     state.workspaceErrors = {};
     state.lastList = [];
     state.sessionId = null;
+    // 真正的「首次加载」：上一段已成功轮询过 wsTransient，侧边栏快照/详情
+    // 缓存仍在（键 = wsId+url+token）。production 的首次加载没有任何快照，
+    // 组体走的是「无快照 + 无行 + 瞬时错误」分支（「正在连接，重试中…」）；
+    // 留着旧快照会走 renderTreeForList 的空列表分支（「暂无会话」），那就
+    // 不是首次加载了。只清该身份的缓存，不碰其它 workspace 的已加载详情。
+    {
+      const _trKey = workspaceIdentityKey(state.workspace, workspaceToken(state.workspace));
+      workspaceSidebarSnapshots.delete(_trKey);
+      workspaceDetailLists.delete(_trKey);
+      workspaceDetailsLoaded.delete(_trKey);
+      workspaceDetailErrors.delete(_trKey);
+    }
+    // 上面「stale 行点击仍在 timeout 列表下」会顺手发起一次新的列表轮询：
+    // 桩里的 timeout 分支是永久挂起（只有捕获到的 abort 句柄能打断，此处
+    // 拿不到），它登记进 workspaceSessionRequests 后永不 settle。若不清理，
+    // 下一次 pollAllWorkspaces 会并流到它 → 永久挂起（gjs 无定时器，进程静默
+    // 退出、后面所有断言消失）。解除失败开关并丢掉这条废弃在飞请求。
+    sessionsAListFailure = null;
+    workspaceSessionRequests.clear();
+    state.workspaceListPending = {};
     sessionsAListFailure = "network";
     elsById["banner"].hidden = true; elsById["bannerText"].textContent = "";
     await pollAllWorkspaces();
@@ -6518,7 +6640,7 @@ async function main(){
             .filter((f) => f.url.includes("b1/history")).map((f) => f.headers["Authorization"])));
     chk("B SSE uses global token",
         FETCH_HEADERS.slice(hMarkOpen).some((f) =>
-            f.url === "http://b.local/api/sessions/b1/events"
+            isEventsAttach(f.url, "http://b.local/api/sessions/b1/events")
             && f.headers["Authorization"] === "Bearer tok-g"),
         "sse=" + JSON.stringify(FETCH_HEADERS.slice(hMarkOpen)
             .filter((f) => f.url.includes("b1/events")).map((f) => f.headers["Authorization"])));
@@ -6966,12 +7088,18 @@ async function main(){
     const kidsBox = groupNode && groupNode.querySelector(".tree-children");
     chk("archive: 分组默认折叠",
         !!kidsBox && kidsBox.hidden === true, "hidden=" + (kidsBox && kidsBox.hidden));
-    // 侧边栏轮询带 exclude=archived_children（只拉默认可见子集）
+    // 侧边栏轮询请求侧边栏投影：产品固定用 /api/sessions?mode=sidebar（服务端
+    // 返回窗口化快照 + totals；旧的 ?exclude=archived_children 不再是客户端
+    // 的轮询路径，服务端仍兼容但不发）。
     chk("poll list URL carries exclude filter",
-        FETCHES.includes("/api/sessions?exclude=archived_children"),
-        "n=" + FETCHES.filter((u) => u === "/api/sessions?exclude=archived_children").length);
-    // 小轮询结果里没有归档 / inactive 子会话：合并必须把它们留在缓存里
-    // （否则展开过的「归档 (N)」分组会随下一次 2s 轮询闪没）。
+        FETCHES.includes("/api/sessions?mode=sidebar"),
+        "n=" + FETCHES.filter((u) => u === "/api/sessions?mode=sidebar").length);
+    // 轮询结果只带窗口内的行（?mode=sidebar 的 partial 快照）：合并规则已从
+    // 「只保留被服务端过滤掉的归档/inactive 行、其余缺失即删除」改为
+    // 「详情缓存是持久的，窗口行是快照」——窗口里没有的 id 一律保留（它只是
+    // 落在窗口外，不能当作已删除），窗口行覆盖同名详情行。真正的删除只能由
+    // 权威全量（裸数组快照）表达。这里同时锁住旧不变式（归档/inactive 子会话
+    // 不因一次小轮询闪没）与新不变式（窗口缺席 ≠ 删除，且同 id 不重复）。
     const _polledSubset = [
       { id: "s1", parent_session_id: null, model: "kimi", role: "main",
         status: "Idle", entry_count: 8, active: true },
@@ -6981,15 +7109,16 @@ async function main(){
       { id: "arch-1", parent_session_id: null, status: "Idle", active: true, archived: true },
       { id: "sub-arch", parent_session_id: "s1", status: "Idle", active: true, archived: true },
       { id: "x-hist", parent_session_id: "s1", status: "Idle", active: false },
-      { id: "gone", parent_session_id: null, status: "Idle", active: true },
+      { id: "out-of-window", parent_session_id: null, status: "Idle", active: true },
     ];
     const _mergedCache = mergePolledSessions(_prevCache, _polledSubset);
-    chk("archive: filtered poll merge retains archived and inactive children",
+    chk("archive: filtered poll merge retains archived, inactive, and out-of-window rows",
         _mergedCache.some((x) => x.id === "arch-1")
         && _mergedCache.some((x) => x.id === "sub-arch")
         && _mergedCache.some((x) => x.id === "x-hist")
         && _mergedCache.some((x) => x.id === "s1" && x.entry_count === 8)
-        && !_mergedCache.some((x) => x.id === "gone")
+        && _mergedCache.some((x) => x.id === "out-of-window")
+        && _mergedCache.length === _prevCache.length
         && _mergedCache.filter((x) => x.id === "s1").length === 1,
         "ids=" + _mergedCache.map((x) => x.id).join(","));
     // 展开分组 → 归档行可见（buildTreeRoot 保留，点击可打开）
@@ -7012,8 +7141,17 @@ async function main(){
     // 服务端把 archived 沉底排序（server.rs），旧窗口 slice(0,8) 会让归档
     // 腾出的位被更早会话顶上（「归档后侧边栏不变短、冒出别的会话」）。
     // 前端按 last_active_at 重排（含归档恢复原槽位），窗口取槽位、归档
-    // 的空着：9 个总根中近期 1 个归档，虽然非归档 roots 恰好只有 8，
-    // 仍须按总根数进入窗口；主树显示 7 个，不显示最旧 w0，more = 1。
+    // 的空着：9 个总根中近期 1 个归档 → 槽位窗口仍然生效，主树显示 7 个，
+    // 不显示最旧 w0（本段的核心不变式，未变）。
+    // more 计数的口径变了（a6ff73c）：旧式 = 非归档 roots - 已显示 = 1；
+    // 现在 = max(0, totalRootSlots - pinnedRoots - shown)。本用例走的是
+    // 「列表桩返回裸数组（权威全量）、无 sidebar 汇总 totals」的路径：
+    // totalRootSlots 回退为「主会话槽位数」，**含归档槽位** → 9 - 0 - 7 = 2
+    // （= 归档槽位 + 窗口外的 w0）。对照：服务端 totals.roots 只数非归档根
+    // （server.rs compact_sidebar），带真实 sidebar 快照时同一 9 行列表只有
+    // 8 个非归档根 → 8 > 8 不成立，根本不进窗口（8 根全显示、无 more 按钮）。
+    // 也就是说「more 是否把归档槽位算进去」只在无汇总的兼容路径可见（已作为
+    // 报告项记录）。本断言锁定这条路径的实际规则：more = 未进入主树的根槽位数。
     const _winSessions = [];
     for (let i = 0; i < 9; i++) {
       _winSessions.push({ id: "w" + i, parent_session_id: null, status: "Idle",
@@ -7042,10 +7180,11 @@ async function main(){
         !_winTexts.some((t) => t.includes("w0")),
         "texts=" + _winTexts.join("|"));
     const _winMore = elsById["sidebarTree"].querySelector(".tree-more");
-    chk("archive window: 9→8 boundary keeps more count 1",
-        _winMore !== null && _winMore.textContent.includes("1"),
+    chk("archive window: 9→8 boundary counts every root slot outside the main tree (2)",
+        _winMore !== null && _winMore.textContent.includes("2"),
         "more=" + (_winMore && _winMore.textContent));
-    // 对照组：同一 9 根列表恢复近期归档 → 窗口满 8 根 + more 计数 1。
+    // 对照组：同一 9 根列表恢复近期归档 → 窗口满 8 根 + more 计数 1
+    // （全部根槽位都在主树内，只剩最旧 w0 未显示）。
     _winSessions[7].archived = false;
     renderSidebarTree(true);
     const _winRoots2 = [...elsById["sidebarTree"].querySelectorAll(".tree-row")]
@@ -8202,12 +8341,16 @@ async function main(){
         && scheduledTimeouts.length === _to404a,
         "stopped=" + state.sse.stopped + " timeouts=" + scheduledTimeouts.length);
     sse404Ids.delete("s1");
-    // (b) 真 live（刷新后仍 active）：live 的 404 先刷新列表再分类——
-    //     刷新（立即返回的 sessionsData 仍 active:true）后重分类仍为 live
-    //     → 保持「不存在」报错，但不重连
+    // (b) 真 live（刷新后仍 active）且 transcript 也读不到：handleLive404Refresh
+    //     会先刷新列表，再 **probe 一次 history 确认会话是否真的没了**
+    //     （"Confirm its transcript before declaring terminal or retrying"）：
+    //     列表仍 active + history 仍 404 → 会话确实不存在 → 保持「不存在」
+    //     报错，但不重连。history 可读的分支见 (b2)：那时产品判定「会话已
+    //     结束」并渲染 transcript，不再报不存在（新规则）。
     sessionsData = [{ id: "s1", status: "Idle", entry_count: 8, busy: false, active: true }];
     _open404("s1", [{ id: "s1", status: "Idle", entry_count: 8, busy: false, active: true }]);
     sse404Ids.add("s1");
+    historyOverrides.set("s1", { status: 404, body: {} });   // transcript 不可读
     const _to404b = scheduledTimeouts.length;
     connectSSE("s1", state.workspace.id, sessionOpenEpoch);
     await flush();
@@ -8221,6 +8364,31 @@ async function main(){
         && scheduledTimeouts.length === _to404b + 2,   // +2 = banner 自动消失计时器 + 刷新 fetch 的
         // abort 定时器槽（fetchWithTimeout 10s 超时；完成后 finally clear 置 null，
         // 但 scheduledTimeouts.length 只增不减——HEAD perf 合并后新增的槽位）
+        "stopped=" + state.sse.stopped + " timeouts=" + scheduledTimeouts.length);
+    sse404Ids.delete("s1");
+    historyOverrides.delete("s1");
+    // (b2) 缓存标 live、404，但 transcript 可读：会话在 poll 与 SSE 之间结束
+    //      （runner 已退出，历史仍在库里）。产品确认 transcript 后判定「会话
+    //      已结束」：渲染可读的 transcript + ended 轻提示，不报「不存在」、
+    //      不重连——不能把「没有实时流」当成「会话不存在」。
+    _open404("s1", [{ id: "s1", status: "Idle", entry_count: 8, busy: false, active: true }]);
+    sse404Ids.add("s1");
+    const _to404b2 = scheduledTimeouts.length;
+    connectSSE("s1", state.workspace.id, sessionOpenEpoch);
+    await flush();
+    await flush();
+    chk("sse404 live + readable transcript: ended hint, transcript kept",
+        elsById["banner"].hidden === true
+        && elsById["connState"].textContent === "会话已结束"
+        && elsById["connState"].className === "conn-state ended"
+        && elsById["messages"].textContent.includes("完成。")
+        && state.initSource === "history",
+        "banner=" + JSON.stringify(elsById["bannerText"].textContent)
+        + " conn=" + JSON.stringify(elsById["connState"].textContent)
+        + " src=" + state.initSource);
+    chk("sse404 live + readable transcript: stopped, no reconnect",
+        state.sse.stopped === true && state.sse.retryTimer === null
+        && scheduledTimeouts.length === _to404b2 + 1,   // +1 = 刷新 fetch 的 abort 定时器槽
         "stopped=" + state.sse.stopped + " timeouts=" + scheduledTimeouts.length);
     sse404Ids.delete("s1");
     // (c) 未知（不在任何列表）：任务面板直连刚结束的子会话 → 完全静默
@@ -8283,15 +8451,15 @@ async function main(){
     // (e) 404 后同会话重开：openSession → connectSSE 重置 stopped（stopSSE
     //     清旧流 → stopped=false → 新 /events fetch）——确认既有实现，能
     //     重新连接
-    const _s1EventsBeforeE = FETCHES.filter((u) => u === "/api/sessions/s1/events").length;
+    const _s1EventsBeforeE = FETCHES.filter((u) => isEventsAttach(u, "/api/sessions/s1/events")).length;
     openSession("s1");
     await flush();
     await flush();
     chk("sse404 reopen: stopped reset + events stream re-fetched",
         state.sse.stopped === false
-        && FETCHES.filter((u) => u === "/api/sessions/s1/events").length === _s1EventsBeforeE + 1,
+        && FETCHES.filter((u) => isEventsAttach(u, "/api/sessions/s1/events")).length === _s1EventsBeforeE + 1,
         "stopped=" + state.sse.stopped
-        + " events=" + FETCHES.filter((u) => u === "/api/sessions/s1/events").length);
+        + " events=" + FETCHES.filter((u) => isEventsAttach(u, "/api/sessions/s1/events")).length);
     // 还原（本段之后无其它测试，仍保持整洁）
     state.lastList = _savedList404;
     state.workspaceLists = _savedWsLists404;
@@ -8304,13 +8472,19 @@ async function main(){
     // 16) 深链平滑降级（?session=<id> 不依赖列表轮询）：
     //     - URL/token 就绪后立即尝试（与轮询并行），不再等 poll round
     //     - fresh 列表命中 → 既有 active/resume 分支；列表缺失/失败/超时/
-    //       过期 → 直接对激活 workspace probe history（列表缺失不是权威
-    //       不存在）
+    //       过期 → 直接对激活 workspace 打开会话（列表缺失不是权威不存在）
+    //     - **live/未知会话的历史走 runner-owned Web attach bootstrap**
+    //       （GET /events?view=web，一个 bootstrap 事件带 transcript + 呈现
+    //       桥），不再先 probe /history：只有列表已判定 active===false 的
+    //       历史会话才走 /history + /events 404 的旧路径。因此每个深链用例
+    //       按 id 提供 attachById 的 bootstrap 固定桩（见顶部桩注释），
+    //       「history 覆盖 + 空 /events」在新流程里等于没有 transcript。
     //     - token 从空变有效 → 立即重试 pending 深链（不只 pollSessions）
-    //     - history 加有界超时；"fail"（网络/超时）→ SSE snapshot 兜底
+    //     - history 加有界超时（历史会话路径）；attach 失败（401/404/网络/
+    //       timeout）→ 新重试 banner「无法读取会话历史，且该会话暂无实时流；
+    //       将自动重试」+ 3s 自动重连；401 仍是明确的认证 banner
     //     - 深链专属 SSE 404 恢复：history 已成功 + historical/unknown →
     //       resumeSession；任务面板路径（无深链标记）保持三态分类不变
-    //     - history 与 SSE 都失败 → 持久错误提示 + 自动重试，不白屏
     //     - 竞态：深链 history 迟到 + 用户切走 → 旧响应不渲染不起流
     //     - 无 workspace 参数 → 只用当前激活 workspace；背景 poll 卡住
     //       不延迟目标 workspace 深链
@@ -8322,7 +8496,7 @@ async function main(){
       sidebarOpen: state.sidebar.open, search: location.search,
       sessionsData: sessionsData, sessionsDataB: sessionsDataB, sessionsDelayed: sessionsDelayed,
       sessionsBFail: sessionsBFail, bGetDelayed: bGetDelayed, sse404Ids: new Set(sse404Ids),
-      historyOverrides: new Map(historyOverrides),
+      historyOverrides: new Map(historyOverrides), attachById: new Map(attachById),
     };
     const _postedIds = () => FETCH_BODIES.map((b) => {
       try { return b ? JSON.parse(b).id : null; } catch (e) { return null; }
@@ -8341,12 +8515,16 @@ async function main(){
       elsById["banner"].hidden = true; elsById["bannerText"].textContent = "";
     };
     const _hist = (text) => ({ entries: [{ type: "message", message: { User: { content: text, images: [] } } }], next_before_seq: null });
+    // Web attach bootstrap 固定桩（live / 未列出会话的深链主路径）：一个
+    // bootstrap 事件带 transcript（entries）+ 呈现桥（replay）。
+    const _bootstrap = (text) => ({ entries: _hist(text).entries, replay: [], next_before_seq: null });
 
-    // (1) 列表永久 pending + history/SSE 成功 → 不等待列表即进入 chat
+    // (1) 列表永久 pending + attach bootstrap 成功 → 不等待列表即进入 chat
+    //     （未列出的 id 在 openWith 里归类 unknown → Web attach；transcript
+    //      由 bootstrap 事件送达，不需要 /history）
     _dlReset(null, "t");
     sessionsDelayed = true; sessionsResolve = null;
-    historyOverrides.set("dl1", { status: 200, body: _hist("深链1内容") });
-    sseOkIds.add("dl1");
+    attachById.set("dl1", _bootstrap("深链1内容"));
     location.search = "?session=dl1";
     init();                                   // 重新走启动：URL 解析 → 立即深链（与轮询并行）
     await flush(); await flush();
@@ -8360,7 +8538,7 @@ async function main(){
     sessionsResolve(resp(200, sessionsData));   // 放行列表轮询
     await flush(); await flush();
     sessionsDelayed = false;
-    historyOverrides.delete("dl1"); sseOkIds.delete("dl1");
+    attachById.delete("dl1");
 
     // (2) token 初始为空：URL 解析记录 pending；输入 token 后立即处理（不等 poll round）
     _dlReset(null, "");
@@ -8375,8 +8553,7 @@ async function main(){
     chk("deeplink: list poll pending while token empty",
         sessionsResolve !== null,
         "listPending=" + (sessionsResolve !== null));
-    historyOverrides.set("dl2", { status: 200, body: _hist("token后深链") });
-    sseOkIds.add("dl2");
+    attachById.set("dl2", _bootstrap("token后深链"));
     sessionsDelayed = false;                  // 后续轮询正常完成（不再二次挂起）
     state.token = "test-token";               // 模拟 token input 后的派生值
     restartTransport();                       // token 变化 → 立即重试深链
@@ -8388,7 +8565,7 @@ async function main(){
         "sid=" + state.sessionId + " listPending=" + (sessionsResolve !== null));
     sessionsResolve(resp(200, sessionsData)); // 放行挂起的列表轮询
     await flush(); await flush();
-    historyOverrides.delete("dl2"); sseOkIds.delete("dl2");
+    attachById.delete("dl2");
 
     // (3) fresh 列表命中 inactive → 仍调用 resume，不退化成只读 history
     _dlReset("dl-hist", "t");
@@ -8403,9 +8580,16 @@ async function main(){
         "sid=" + state.sessionId + " posted=" + JSON.stringify(_postedIds()));
     sessionsPostCustom = null;
 
-    // (4) 列表失败 + history 200 + SSE 404 → 深链专属恢复（resume 被调用）
+    // (4) 列表失败 + 缓存判定历史 + history 200 + SSE 404 → 深链专属恢复
+    //     （resume 被调用）。Web attach 流程下，深链只在「已知历史」时读
+    //     /history（openWith: known==="historical" → loadHistory，否则
+    //     ?view=web bootstrap），所以这条恢复路径的现实前提是：轮询失败、
+    //     缓存里该会话仍是 active:false 的历史行（列表失败保留 stale 缓存，
+    //     不是权威不存在）。unknown 的 404 不再 probe history，见 (5a)。
     _dlReset("dl-404", "t");
     sessionsAFail = true;
+    state.lastList = [{ id: "dl-404", status: "Idle", entry_count: 2, busy: false, active: false }];
+    state.workspaceLists["ws1"] = state.lastList;   // 轮询失败 → 保留的 stale 缓存
     historyOverrides.set("dl-404", { status: 200, body: _hist("404恢复历史") });
     sse404Ids.add("dl-404");
     sessionsPostCustom = { id: "dl-404", status: "Idle", active: true };
@@ -8413,7 +8597,8 @@ async function main(){
     await flush(); await flush(); await flush();
     chk("deeplink: list-fail + history 200 + SSE 404 resumes",
         _postedIds().includes("dl-404")
-        && state.sessionId === "dl-404",
+        && state.sessionId === "dl-404"
+        && elsById["messages"].textContent.includes("404恢复历史"),
         "sid=" + state.sessionId + " posted=" + JSON.stringify(_postedIds()));
     const _promptBefore4 = FETCHES.filter((u) => u === "/api/sessions/dl-404/prompt").length;
     els.promptInput.value = "列表失败时仍可发送";
@@ -8439,46 +8624,76 @@ async function main(){
     historyOverrides.delete("dl-404");
     sessionsAFail = false; sessionsPostCustom = null;
 
-    // (5) history 失败形态：404/401 → 停流提示；网络失败/timeout → SSE snapshot 兜底
-    // (5a) 404 → gone banner，不起 SSE
+    // (5) attach 失败形态。Web attach 流程下深链不再先 probe /history，所以
+    //     未列出 id 的失败全部由 /events?view=web 的状态决定：
+    //     404 / 网络失败 / 悬挂 → 新重试 banner「…暂无实时流；将自动重试」
+    //     + 3s 自动重连（深链标记保留，重试仍按深链处理）；401 → 认证 banner
+    //     并停流。404 不再等同于「会话不存在」：列表未给出该 id 时，缺失
+    //     不是权威不存在（旧断言「404 → 不存在 banner」按旧 probe 语义写，
+    //     在新流程里已不成立）。
+    // (5a) 未列出 id + attach 404 → 重试 banner（不是「不存在」），继续重试
     _dlReset("dl-gone", "t");
-    historyOverrides.set("dl-gone", { status: 404, body: {} });
+    attachById.set("dl-gone", { status: 404 });
+    const _postsBefore5a = _postedIds().length;
     maybeHandleDeepLink();
     await flush(); await flush();
-    chk("deeplink: history 404 shows gone banner, no SSE",
-        elsById["bannerText"].textContent.includes("不存在")
-        && !FETCHES.some((u) => u === "/api/sessions/dl-gone/events"),
-        "banner=" + JSON.stringify(elsById["bannerText"].textContent));
-    historyOverrides.delete("dl-gone");
-    // (5b) 401 → auth banner，不起 SSE
+    chk("deeplink: unknown target 404 → retry banner, no false 不存在",
+        FETCHES.includes("/api/sessions/dl-gone/events?view=web")   // 走 Web attach
+        && !FETCHES.some((u) => u.includes("dl-gone/history"))       // 不再 probe history
+        && elsById["bannerText"].textContent.includes("自动重试")
+        && !elsById["bannerText"].textContent.includes("不存在")
+        && elsById["banner"].hidden === false
+        && _postedIds().length === _postsBefore5a                // 未伪造恢复
+        && state.sse.stopped === false && state.sse.retryTimer !== null,
+        "banner=" + JSON.stringify(elsById["bannerText"].textContent)
+        + " web=" + FETCHES.includes("/api/sessions/dl-gone/events?view=web")
+        + " retry=" + (state.sse.retryTimer !== null));
+    attachById.delete("dl-gone");
+    // (5b) attach 401 → 认证 banner，停流（不重连到 401 循环），不读 transcript
     _dlReset("dl-auth", "t");
-    historyOverrides.set("dl-auth", { status: 401, body: {} });
+    attachById.set("dl-auth", { status: 401 });
     maybeHandleDeepLink();
     await flush(); await flush();
-    chk("deeplink: history 401 shows auth banner, no SSE",
-        elsById["bannerText"].textContent.includes("认证失败")
-        && !FETCHES.some((u) => u === "/api/sessions/dl-auth/events"),
-        "banner=" + JSON.stringify(elsById["bannerText"].textContent));
-    historyOverrides.delete("dl-auth");
-    // (5c) 网络失败 → SSE snapshot 兜底 + 持久错误提示（自动重试）
+    chk("deeplink: attach 401 shows auth banner, stops stream",
+        FETCHES.includes("/api/sessions/dl-auth/events?view=web")
+        && !FETCHES.some((u) => u.includes("dl-auth/history"))
+        && elsById["bannerText"].textContent.includes("认证失败")
+        && state.sse.stopped === true && state.sse.retryTimer === null,
+        "banner=" + JSON.stringify(elsById["bannerText"].textContent)
+        + " stopped=" + state.sse.stopped);
+    attachById.delete("dl-auth");
+    // (5c) attach 网络失败 → 排程 3s 自动重连（连接状态可见）、深链标记保留
+    //      （重试仍带深链有界 history 超时语义）、不误报「不存在」
     _dlReset("dl-net", "t");
-    historyOverrides.set("dl-net", { netfail: true });
+    attachById.set("dl-net", { netfail: true });
     maybeHandleDeepLink();
     await flush(); await flush();
-    chk("deeplink: history network fail → SSE snapshot + persistent error",
-        FETCHES.some((u) => u === "/api/sessions/dl-net/events")
-        && elsById["bannerText"].textContent.includes("自动重试"),
-        "banner=" + JSON.stringify(elsById["bannerText"].textContent));
-    historyOverrides.delete("dl-net");
-    // (5d) timeout（10s abort）→ SSE snapshot 兜底 + 持久错误提示
+    chk("deeplink: attach network fail schedules retry, no false classification",
+        FETCHES.includes("/api/sessions/dl-net/events?view=web")
+        && elsById["banner"].hidden === true
+        && elsById["connState"].textContent.includes("重连")
+        && state.sse.stopped === false && state.sse.retryTimer !== null
+        && state.deepLink.probing === true,
+        "conn=" + JSON.stringify(elsById["connState"].textContent)
+        + " retry=" + (state.sse.retryTimer !== null)
+        + " probing=" + state.deepLink.probing);
+    attachById.delete("dl-net");
+    // (5d) 已知历史深链 + /history 悬挂：深链有界超时（10s abort）兜底，
+    //      超时后仍起 attach 并给出重试 banner——绝不永久挂起白屏
     _dlReset("dl-timeout", "t");
+    state.lastList = [{ id: "dl-timeout", status: "Idle", entry_count: 2, busy: false, active: false }];
+    state.workspaceLists["ws1"] = state.lastList;
     historyOverrides.set("dl-timeout", { hang: true });
     maybeHandleDeepLink();
-    const _abortIdx5d = scheduledTimeouts.length - 1;   // fetchWithTimeout 的 10s abort 定时器（同步 arm，最后一个槽）
-    scheduledTimeouts[_abortIdx5d]();                    // 触发超时 → AbortError → "fail"
+    // fetchWithTimeout 的 10s abort 定时器同步 arm（同步调用点就在 openWith →
+    // loadHistory 里），是本次调用新增的最后一个槽。
+    const _abort5d = scheduledTimeouts[scheduledTimeouts.length - 1] || null;
+    chk("deeplink: known-history history timeout arms bounded abort",
+        _abort5d !== null, "abortTimer=" + (_abort5d !== null));
+    if (_abort5d) _abort5d();                            // 触发超时 → AbortError → "fail"
     await flush(); await flush();
-    chk("deeplink: history timeout → SSE snapshot + persistent error",
-        FETCHES.some((u) => u === "/api/sessions/dl-timeout/events")
+    chk("deeplink: history timeout → attach attempted + retry banner",
+        FETCHES.some((u) => isEventsAttach(u, "/api/sessions/dl-timeout/events"))
         && elsById["bannerText"].textContent.includes("自动重试"),
         "banner=" + JSON.stringify(elsById["bannerText"].textContent));
     historyOverrides.delete("dl-timeout");
@@ -8553,8 +8768,7 @@ async function main(){
     state.deepLink = { pending: "dl8", handled: false, probing: false, attemptEpoch: -1 };
     state.sessionId = null;
     state.sidebar.open = false;
-    historyOverrides.set("dl8", { status: 200, body: _hist("深链8") });
-    sseOkIds.add("dl8");
+    attachById.set("dl8", _bootstrap("深链8"));
     bGetDelayed = true; bGetResolve = null;
     pollSessions();                               // 启动聚合轮询：B 卡住
     await flush();
@@ -8570,7 +8784,7 @@ async function main(){
     bGetResolve(resp(200, sessionsDataB));        // 放行 B
     await flush(); await flush();
     bGetDelayed = false;
-    historyOverrides.delete("dl8"); sseOkIds.delete("dl8");
+    attachById.delete("dl8");
 
     // =====================================================================
     // 9) 缺口 1（oracle 复审）：fresh inactive 深链经 resumeSession 后，
@@ -8611,6 +8825,11 @@ async function main(){
     // =====================================================================
     _dlReset("dl-retry-t", "t");
     sessionsAFail = true;                         // 列表失败 → probe 路径
+    // Web attach 流程下只有「已知历史」的深链才读 /history（openWith:
+    // known==="historical"），所以这条重试链的前提是缓存里该会话仍是
+    // active:false 的历史行（轮询失败保留 stale 缓存，不是权威不存在）。
+    state.lastList = [{ id: "dl-retry-t", status: "Idle", entry_count: 2, busy: false, active: false }];
+    state.workspaceLists["ws1"] = state.lastList;
     historyOverrides.set("dl-retry-t", { netfail: true });
     sse404Ids.add("dl-retry-t");
     const _base10 = scheduledTimeouts.length;
@@ -8663,6 +8882,7 @@ async function main(){
     sessionsAFail = false; sessionsPostCustom = null;
     sse404Ids = new Set(_dlSave.sse404Ids); sseOkIds = new Set();
     historyOverrides = new Map(_dlSave.historyOverrides);
+    attachById = new Map(_dlSave.attachById);
     stopSSE();
 
     // =====================================================================
@@ -8787,7 +9007,11 @@ async function main(){
       await defaultFreshnessPoll;
       await Promise.allSettled([...taskRequests.values()].map((entry) => entry.promise));
       await flush();
-      state.tasks.finishedCollapsed = true;
+      // 直接写 state 不会重绘 finished 小节的 body（它只在数据签名变化时
+      // 重建，签名未变 → 面板仍停在上一次的展开态）。收起要走产品契约里的
+      // header 点击：同一处理器同时更新 state、body.hidden 与 aria-expanded。
+      const collapseHeader = elsById["composerTasks"].querySelector(".tasks-finished-header");
+      if (collapseHeader) collapseHeader._listeners["click"][0]();
     }
     await pollTasks(); await flush();
     let fhdr = elsById["composerTasks"].querySelector(".tasks-finished-header");
