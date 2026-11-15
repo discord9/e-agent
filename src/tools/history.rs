@@ -427,6 +427,15 @@ pub(crate) fn searchable_content(entry: &SessionEntry) -> Option<String> {
     }
 }
 
+/// Accept a JSON integer or a numeric string. Models routinely stringify
+/// integers (`"limit": "40"`); the schema still declares an integer, but a
+/// value that parses cleanly should not turn the call into a tool error.
+fn integer_arg(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|s| s.trim().parse().ok()))
+}
+
 fn parse_arguments(arguments: &Value) -> Result<Args, String> {
     let object = arguments
         .as_object()
@@ -483,11 +492,10 @@ fn parse_arguments(arguments: &Value) -> Result<Args, String> {
     };
     let limit = match object.get("limit") {
         None => HISTORY_DEFAULT_LIMIT,
-        Some(v) => usize::try_from(
-            v.as_u64()
-                .ok_or("history `limit` must be a non-negative integer")?,
-        )
-        .map_err(|_| "history `limit` must be a non-negative integer")?,
+        Some(v) => {
+            usize::try_from(integer_arg(v).ok_or("history `limit` must be a non-negative integer")?)
+                .map_err(|_| "history `limit` must be a non-negative integer")?
+        }
     };
     if !(1..=HISTORY_MAX_LIMIT).contains(&limit) {
         return Err(format!(
@@ -496,7 +504,11 @@ fn parse_arguments(arguments: &Value) -> Result<Args, String> {
     }
     let seq = object
         .get("seq")
-        .map(|v| v.as_i64().ok_or("history `seq` must be an integer"))
+        .map(|v| {
+            v.as_i64()
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+                .ok_or("history `seq` must be an integer")
+        })
         .transpose()?;
     let query = object
         .get("query")
@@ -1419,6 +1431,15 @@ mod tests {
             first["entries"][0]["session_id"],
             second["entries"][0]["session_id"]
         );
+    }
+    #[test]
+    fn numeric_strings_are_accepted_for_limit_and_seq() {
+        let args = parse_arguments(&json!({"action":"search","query":"x","limit":"40"})).unwrap();
+        assert_eq!(args.limit, 40);
+        let args = parse_arguments(&json!({"action":"read","seq":"7"})).unwrap();
+        assert_eq!(args.seq, Some(7));
+        assert!(parse_arguments(&json!({"action":"search","query":"x","limit":"nope"})).is_err());
+        assert!(parse_arguments(&json!({"action":"read","seq":"1.5"})).is_err());
     }
     #[test]
     fn ids_without_scope_are_accepted_and_scope_restrictions_stay() {
