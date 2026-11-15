@@ -1812,7 +1812,7 @@ async fn session_model(
     let name = configured.profile_key();
     session
         .handle()
-        .switch_model(Box::new(configured), context_window);
+        .switch_model(&name, Box::new(configured), context_window);
     // Mirror the new model into the registry metadata so `GET /api/sessions`
     // (sidebar / composer meta) reflects the switch immediately. Subagent
     // sessions keep their spawn-time display name (the delegate entry is

@@ -17,7 +17,7 @@ use std::time::SystemTime;
 
 use anyhow::{Context, anyhow};
 
-use crate::agent::{Agent, SessionEntry};
+use crate::agent::{Agent, GoalSnapshot, SessionEntry, ToolSpec};
 use crate::codex::CodexModel;
 use crate::codex_auth::CodexAuth;
 use crate::config::{
@@ -34,6 +34,31 @@ use crate::tools::{
     builtins_with_bash_timeout,
 };
 use crate::workspace::Workspace;
+
+/// Everything before a main session's history, participating in prefix-cache matching.
+#[derive(Clone)]
+pub(crate) struct RequestHead {
+    pub model: ConfiguredModel,
+    pub context_window: Option<u64>,
+    pub context_prefix: Option<String>,
+    pub compaction_reminder: Option<String>,
+    pub sandbox: Option<crate::config::Sandbox>,
+    pub read_only: bool,
+    pub protect_git: bool,
+    pub code_mode: bool,
+    pub mcp_servers: HashMap<String, crate::mcp::McpServerConfig>,
+    /// The parent's goal projection at build time (folded from the restored
+    /// history). A fork applies it so its request carries the identical
+    /// `[session goal]` system message; `goal_cleared` distinguishes an
+    /// explicit clear tombstone from "never set".
+    pub goal: Option<GoalSnapshot>,
+    pub goal_cleared: bool,
+    /// The parent's final MCP tool list (name/description/parameters), sorted
+    /// by name. A fork re-connects MCP with the parent's workspace and must
+    /// match this snapshot exactly instead of silently running a different
+    /// tool set.
+    pub mcp_specs: Vec<ToolSpec>,
+}
 
 /// What to do with background-task records left behind by a previous run
 /// when building a session.
@@ -244,6 +269,49 @@ pub struct SessionBuild {
     pub model_name: String,
     pub role_name: Option<String>,
     pub local_permit: LocalSessionPermit,
+}
+
+/// Shared body of [`SessionFactory::resolve_profile`] and the live fork-model
+/// resolver: resolve one profile against the CURRENT config, honoring the
+/// startup `--base-url`/`--model` overrides. Split out of the method so a
+/// `'static` closure can resolve a profile without capturing the factory.
+fn resolve_profile_from(
+    reloadable: &Arc<RwLock<ReloadableState>>,
+    base_url: Option<String>,
+    model_override: Option<String>,
+    profile: &str,
+    effort: Option<EffortOverride>,
+) -> anyhow::Result<(ConfiguredModel, Option<u64>)> {
+    // Clone the config out of the state lock before building the model:
+    // the chatgpt branch may take the write half of the same lock to
+    // load (and cache) the login that arrived after start.
+    let config = reloadable
+        .read()
+        .unwrap()
+        .config
+        .clone()
+        .ok_or_else(|| anyhow!("no config file; cannot resolve model profile `{profile}`"))?;
+    let mut resolved = config.resolve_profile(profile)?;
+    if let Some(effort) = effort {
+        resolved.reasoning_effort = match effort {
+            EffortOverride::Default => resolved.reasoning_effort,
+            EffortOverride::Omit => None,
+            EffortOverride::Literal(value) => Some(value),
+        };
+    }
+    // A `--model` override replaces the profile's wire model, so its
+    // context-window declaration cannot describe the active model.
+    let context_window = model_override
+        .as_ref()
+        .map(|_| None)
+        .unwrap_or(resolved.context_window);
+    let model = configured_model(
+        resolved,
+        AuthSource::Lazy(reloadable),
+        base_url,
+        model_override,
+    )?;
+    Ok((model, context_window))
 }
 
 impl SessionFactory {
@@ -513,38 +581,29 @@ impl SessionFactory {
         profile: &str,
         effort: Option<EffortOverride>,
     ) -> anyhow::Result<(ConfiguredModel, Option<u64>)> {
-        // Clone the config out of the state lock before building the model:
-        // the chatgpt branch may take the write half of the same lock to
-        // load (and cache) the login that arrived after start.
-        let config = self
-            .reloadable
-            .read()
-            .unwrap()
-            .config
-            .clone()
-            .ok_or_else(|| anyhow!("no config file; cannot resolve model profile `{profile}`"))?;
-        let mut resolved = config.resolve_profile(profile)?;
-        if let Some(effort) = effort {
-            resolved.reasoning_effort = match effort {
-                EffortOverride::Default => resolved.reasoning_effort,
-                EffortOverride::Omit => None,
-                EffortOverride::Literal(value) => Some(value),
-            };
-        }
-        // A `--model` override replaces the profile's wire model, so its
-        // context-window declaration cannot describe the active model.
-        let context_window = self
-            .model
-            .as_ref()
-            .map(|_| None)
-            .unwrap_or(resolved.context_window);
-        let model = configured_model(
-            resolved,
-            AuthSource::Lazy(&self.reloadable),
+        resolve_profile_from(
+            &self.reloadable,
             self.base_url.clone(),
             self.model.clone(),
-        )?;
-        Ok((model, context_window))
+            profile,
+            effort,
+        )
+    }
+
+    /// Resolve a model profile by name at FORK time — the `fork` delegate's
+    /// child runs on the parent's current model, so a parent `/model <profile>`
+    /// switch (which only updates the live agent) must not leave the child on
+    /// the build-time model. `None` when the profile cannot be resolved (no
+    /// config, unknown profile); the fork then fails closed instead of
+    /// silently using the stale model. The effort level is the profile's own
+    /// configured default: the live identity carries the profile name only.
+    pub fn fork_model_resolver(&self) -> crate::delegate::ForkModelSource {
+        let reloadable = self.reloadable.clone();
+        let base_url = self.base_url.clone();
+        let model = self.model.clone();
+        Arc::new(move |profile: &str| {
+            resolve_profile_from(&reloadable, base_url.clone(), model.clone(), profile, None).ok()
+        })
     }
 
     /// Every switchable model profile name (`[models]` keys + `[roles]`
@@ -927,12 +986,18 @@ impl SessionFactory {
         // marker, so exposing them would defeat the policy. Delegation stays —
         // spawning a subagent does not mutate this session's host state, and
         // each subagent resolves its own role template (read-only or not).
-        let (mcp_tools, mcp_instructions) = if self.read_only {
+        let mcp_servers_for_fork = config.as_ref().map(|c| c.mcp.clone()).unwrap_or_default();
+        let (mut mcp_tools, mcp_instructions) = if self.read_only {
             (Vec::new(), Vec::new())
         } else {
-            let mcp_servers = config.as_ref().map(|c| c.mcp.clone()).unwrap_or_default();
-            mcp::connect_all(mcp_servers, &self.root).await
+            mcp::connect_all(mcp_servers_for_fork.clone(), &self.root).await
         };
+        // Deterministic order is required for prefix-cache parity.
+        mcp_tools.sort_by_key(|tool| tool.spec().name);
+        // Snapshot the final MCP tool list for the fork request head before
+        // the tools move into the agent: a fork must re-connect exactly this
+        // tool set, never a silently different one.
+        let head_mcp_specs: Vec<ToolSpec> = mcp_tools.iter().map(|tool| tool.spec()).collect();
         tools.extend(mcp_tools);
         let mut delegate = Delegate::new(
             main_model.clone(),
@@ -961,6 +1026,19 @@ impl SessionFactory {
         // spawn time, exactly like the routed-role path above reads `[roles]
         // <role>` — both survive config hot reloads without a restart.
         delegate = delegate.with_subagent_model_source(self.subagent_model_resolver());
+        let head_cell = Arc::new(std::sync::Mutex::new(None::<RequestHead>));
+        let cell = head_cell.clone();
+        delegate = delegate.with_fork_head(Arc::new(move || {
+            cell.lock()
+                .unwrap()
+                .as_ref()
+                .expect("main request head initialized")
+                .clone()
+        }));
+        // A forked child runs on the parent's CURRENT model: after a runtime
+        // `/model` switch the request head above is stale, so the fork asks
+        // the runner for its live identity and re-resolves that profile here.
+        delegate = delegate.with_fork_model_source(self.fork_model_resolver());
         let subagent_sessions = delegate.sessions();
         tools.push(Box::new(crate::delegate::SendMessage::parent(
             subagent_sessions.clone(),
@@ -997,6 +1075,30 @@ impl SessionFactory {
         let loaded = store.load_located(&self.root, &session).await?;
         let legacy = loaded.legacy;
         agent.restore_located(loaded.entries, loaded.locations);
+        // Capture the request head AFTER the history restore: its goal fields
+        // must carry the session's live folded goal (not the pre-restore
+        // "never set" state) so a fork's first request projects the exact
+        // same `[session goal]` system message as its parent.
+        let head_prefix = agent.context_prefix().map(str::to_owned);
+        let head_reminder = agent.compaction_reminder_text().map(str::to_owned);
+        let head_goal = agent.goal();
+        let head_goal_cleared = agent.goal_cleared();
+        let head_model = main_model.clone();
+        let head_value = RequestHead {
+            model: head_model,
+            context_window: main_context_window,
+            context_prefix: head_prefix,
+            compaction_reminder: head_reminder,
+            sandbox: self.sandbox.clone(),
+            read_only: self.read_only,
+            protect_git: false,
+            code_mode: self.code_mode,
+            mcp_servers: mcp_servers_for_fork.clone(),
+            goal: head_goal,
+            goal_cleared: head_goal_cleared,
+            mcp_specs: head_mcp_specs,
+        };
+        *head_cell.lock().unwrap() = Some(head_value);
         let recovery_labels = if matches!(unfinished, UnfinishedPolicy::Consume) {
             store
                 .peek_unfinished_background(&self.root, &session)
@@ -1045,7 +1147,12 @@ impl SessionFactory {
             bootstrap,
         )
         .await?;
-        let runner = runner.with_background_tasks(background.clone());
+        // The root/main session is the only one with a user-facing
+        // `WaitingInput` frontend (Web/TUI), so it is the only session
+        // allowed to suspend on `request_user_input` for an answer.
+        let runner = runner
+            .with_background_tasks(background.clone())
+            .with_user_input_allowed();
         Ok(SessionBuild {
             runner,
             handle,
@@ -2809,5 +2916,73 @@ context_window = 3000
         let (model, context_window) = resolver().expect("main fallback");
         assert_eq!(model.display_name(), "m1");
         assert_eq!(context_window, Some(1000));
+    }
+}
+
+#[cfg(test)]
+mod user_input_gate_tests {
+    use super::*;
+
+    /// Only the root/main session may suspend on `request_user_input`: the
+    /// factory installs the gate for `build`, while the delegate/btw/fork spawn
+    /// paths construct their runner without it, so their model gets a tool
+    /// error instead of parking a turn nobody can answer.
+    #[tokio::test]
+    async fn only_the_root_session_may_park_for_user_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let factory = SessionFactory::test_factory(temp.path().to_path_buf());
+        let build = factory
+            .build(
+                "web-main",
+                None,
+                None,
+                IdlePolicy::WaitForInput,
+                UnfinishedPolicy::Preserve,
+            )
+            .await
+            .expect("the root session builds");
+        assert!(
+            build.runner.user_input_allowed_for_test(),
+            "a root session built by the factory must answer request_user_input"
+        );
+
+        // The child shape: `Delegate::spawn`/`spawn_fork` and
+        // `spawn_btw_subagent` build exactly this runner (same constructor,
+        // same `FinishWhenIdle` policy) and never enable the gate.
+        let model = ConfiguredModel::chat(
+            OpenAiModel::new(
+                "http://localhost".into(),
+                "test-key".into(),
+                "child-model".into(),
+                None,
+            )
+            .expect("test child model"),
+        );
+        let store = SessionStore::connect(
+            &crate::config::SessionBackend::Jsonl,
+            temp.path(),
+            "sub-test",
+        )
+        .await
+        .expect("the child store connects");
+        let (child, child_handle) = SessionRunner::new_with_bootstrap(
+            Agent::new(Box::new(model), Vec::new()),
+            store,
+            temp.path().to_path_buf(),
+            "sub-test".to_owned(),
+            IdlePolicy::FinishWhenIdle,
+            SessionBootstrap {
+                recovery_tasks: Vec::new(),
+                legacy: false,
+                initial_entries: Vec::new(),
+            },
+        )
+        .await
+        .expect("the child session builds");
+        assert!(
+            !child.user_input_allowed_for_test(),
+            "a delegate/btw/fork runner must never park for user input"
+        );
+        drop(child_handle);
     }
 }

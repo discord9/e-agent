@@ -46,6 +46,11 @@ pub enum PromptSubmission {
 
 const EVENT_CAPACITY: usize = 256;
 
+/// Model-facing error committed when a session without a user-facing
+/// frontend (delegate, btw, fork) calls `request_user_input`: the tool stays
+/// advertised for schema parity, but it must never suspend such a session.
+const USER_INPUT_UNAVAILABLE: &str = "this session cannot ask the user questions: no frontend can answer, so continue with the information you already have and report anything still needed in your final answer";
+
 /// Model-facing notice committed once per genuinely new automatic Goal turn
 /// (never on a same-turn maintenance resume); replay is audit-only and by
 /// itself arms/wakes nothing.
@@ -229,8 +234,13 @@ pub enum SessionCommand {
     Compact,
     /// Runtime model switch (web/TUI `/model <profile>`): the caller
     /// resolves the profile to a concrete model and its context window;
-    /// the runner installs both on the agent together.
-    SwitchModel(Box<dyn Model>, Option<u64>),
+    /// the runner installs both on the agent together and remembers the
+    /// profile as the session's live routing identity.
+    SwitchModel {
+        profile: String,
+        model: Box<dyn Model>,
+        context_window: Option<u64>,
+    },
     /// Human-issued goal mutation (`/goal` commands, web API). The model
     /// never creates goals; its `update_goal` tool is intercepted by the
     /// runner with the same transition rules under an id + revision CAS.
@@ -351,6 +361,11 @@ struct Shared {
     /// Latest goal snapshot, mirrored from the runner for UI reads
     /// (REPL `/goal`, TUI GoalBar, web `GET /api/sessions/{id}/goal`).
     goal: Option<crate::agent::GoalSnapshot>,
+    /// The session's live routing identity — `(profile key, context window)`
+    /// installed by a runtime `/model` switch — or `None` while the startup
+    /// model still applies. Fork admission reads it so a forked child never
+    /// inherits the model captured when the parent was built.
+    live_model: Option<(String, Option<u64>)>,
     /// Goal-admission state only: ids of this session's own live
     /// `delegate`/btw children whose completion is not durably committed yet.
     /// Registered at spawn (before the wrapper's work runs) and released only
@@ -458,6 +473,34 @@ impl WeakSessionHandle {
         }
         shared.goal_children.insert(id);
         true
+    }
+
+    /// The session's live model identity — `(profile key, context window)`
+    /// installed by the last runtime `/model` switch — or `None` while the
+    /// startup model still applies. A `fork` delegate reads it so the child
+    /// runs and reports the parent's CURRENT model, never the one captured
+    /// when the parent was built.
+    pub fn live_model(&self) -> Option<(String, Option<u64>)> {
+        self.shared.upgrade()?.lock().unwrap().live_model.clone()
+    }
+
+    /// Test-only: this session's registered Goal children, so spawn-path
+    /// tests can assert the `on_id` registration without driving a full
+    /// automatic Goal turn.
+    #[cfg(test)]
+    pub(crate) fn goal_children(&self) -> Vec<u64> {
+        let Some(shared) = self.shared.upgrade() else {
+            return Vec::new();
+        };
+        let mut ids: Vec<u64> = shared
+            .lock()
+            .unwrap()
+            .goal_children
+            .iter()
+            .copied()
+            .collect();
+        ids.sort_unstable();
+        ids
     }
 }
 
@@ -613,13 +656,17 @@ impl SessionHandle {
     /// Switch the session's model and context window at runtime. The caller
     /// resolves the profile (web/TUI `/model`); the runner installs both from
     /// its next call on.
-    pub fn switch_model(&self, model: Box<dyn Model>, context_window: Option<u64>) {
+    pub fn switch_model(&self, profile: &str, model: Box<dyn Model>, context_window: Option<u64>) {
         let mut shared = self.shared.lock().unwrap();
         if shared.commands_open
             && !self.commands.is_closed()
             && self
                 .commands
-                .send(SessionCommand::SwitchModel(model, context_window))
+                .send(SessionCommand::SwitchModel {
+                    profile: profile.to_owned(),
+                    model,
+                    context_window,
+                })
                 .is_err()
         {
             shared.commands_open = false;
@@ -755,6 +802,7 @@ pub(crate) fn session_test_channel() -> (
         waiting_input: None,
         input_claimed: false,
         goal: None,
+        live_model: None,
         goal_children: std::collections::HashSet::new(),
     }));
     let (commands, receiver) = mpsc::unbounded_channel();
@@ -899,6 +947,12 @@ pub struct SessionRunner {
     pending: VecDeque<PendingCommand>,
     pending_web_attaches: Vec<oneshot::Sender<WebAttach>>,
     policy: IdlePolicy,
+    /// Whether this session may suspend on `request_user_input` and wait for
+    /// a human answer. Only the root/main session has a frontend that can
+    /// answer, so `false` (the default) makes the interception fail that call
+    /// back to the model instead of parking the turn in `WaitingInput` with
+    /// nobody to answer — a delegate, btw or fork child has no such frontend.
+    user_input_allowed: bool,
     last_answer: Option<String>,
     /// Internal trigger for the next turn; Goal is the in-memory driver mount.
     armed_trigger: Option<RunnerTrigger>,
@@ -1010,6 +1064,23 @@ impl SessionRunner {
         self.bootstrap_projection_pending = false;
         self.background = Some(background);
         self
+    }
+
+    /// Let this session suspend on `request_user_input` until a human answers.
+    /// Only the root/main session installs this: it owns the single
+    /// `WaitingInput`/answer frontend. Delegate, btw and fork runners keep the
+    /// `false` default, so the tool fails back to their model instead of
+    /// waiting for an answer nobody can give.
+    pub(crate) fn with_user_input_allowed(mut self) -> Self {
+        self.user_input_allowed = true;
+        self
+    }
+
+    /// Test-only view of the user-input gate above, so a test can assert which
+    /// session classes may park in `WaitingInput` without driving the tool.
+    #[cfg(test)]
+    pub(crate) fn user_input_allowed_for_test(&self) -> bool {
+        self.user_input_allowed
     }
 
     async fn sync_background_projection(&mut self) -> bool {
@@ -1133,6 +1204,7 @@ impl SessionRunner {
             waiting_input: None,
             input_claimed: false,
             goal,
+            live_model: None,
             goal_children: std::collections::HashSet::new(),
         }));
         let handler_shared = shared.clone();
@@ -1159,6 +1231,7 @@ impl SessionRunner {
                 pending: VecDeque::new(),
                 pending_web_attaches: Vec::new(),
                 policy,
+                user_input_allowed: false,
                 last_answer: None,
                 armed_trigger: None,
                 turn_just_ended: false,
@@ -2068,10 +2141,17 @@ impl SessionRunner {
                 self.pending.push_back(PendingCommand::Continue(budget));
                 Steering::None
             }
-            SessionCommand::SwitchModel(model, context_window) => {
+            SessionCommand::SwitchModel {
+                profile,
+                model,
+                context_window,
+            } => {
                 // Instant, not queued: the new model applies to the next
                 // model call (a call already in flight keeps its model).
                 self.agent.set_model(model, context_window);
+                // The live routing identity a fork child must inherit; the
+                // request head captured at build time is stale from here on.
+                self.shared.lock().unwrap().live_model = Some((profile, context_window));
                 Steering::None
             }
             SessionCommand::Cancel => {
@@ -2271,8 +2351,13 @@ impl SessionRunner {
         let mut deferred = Vec::with_capacity(pending.len());
         for command in pending {
             match command {
-                SessionCommand::SwitchModel(model, context_window) => {
-                    self.agent.set_model(model, context_window)
+                SessionCommand::SwitchModel {
+                    profile,
+                    model,
+                    context_window,
+                } => {
+                    self.agent.set_model(model, context_window);
+                    self.shared.lock().unwrap().live_model = Some((profile, context_window));
                 }
                 other => deferred.push(other),
             }
@@ -3206,6 +3291,32 @@ impl SessionRunner {
                     // Root-only marker: pause this same model/tool turn for the
                     // Web answer.
                     if call.name == "request_user_input" {
+                        // Only the root session has a frontend that can answer
+                        // (the Web/TUI WaitingInput prompt). A delegate, btw or
+                        // fork session has none: suspending there would park the
+                        // turn forever, so the call fails back to the model as a
+                        // normal tool error and the loop continues.
+                        if !self.user_input_allowed {
+                            let result = Err(USER_INPUT_UNAVAILABLE.to_owned());
+                            match self.finish_intercepted_tool(&call, result).await {
+                                Ok(Steering::None) => {}
+                                Ok(steering) => {
+                                    if self.release_after_preempt(steering) {
+                                        return;
+                                    }
+                                    break 'turn;
+                                }
+                                Err(error) => {
+                                    self.terminate(
+                                        SessionResult::Failed(format!("{error:#}")),
+                                        Vec::new(),
+                                    )
+                                    .await;
+                                    return;
+                                }
+                            }
+                            continue;
+                        }
                         let questions = match crate::tools::parse_questions(&call.arguments) {
                             Ok(questions) => questions,
                             Err(error) => {

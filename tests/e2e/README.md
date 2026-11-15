@@ -24,6 +24,18 @@ tests/e2e/
 └── README.md
 ```
 
+## Delegate fork prefix acceptance
+
+`delegate_fork_prefix_acceptance.py` runs an isolated real `--serve` server and stdlib mock provider,
+then checks fork-child model, tools (including order/schema), and completed-turn message prefix equality.
+Build the binary explicitly; the test never builds it itself:
+
+```sh
+cd tests/e2e
+CARGO_TARGET_DIR=/mnt/nvme_rust/rust-targets-2/e-agent-delegate-fork-v2 cargo build --manifest-path ../../Cargo.toml --bin e-agent
+EAGENT_BIN=/mnt/nvme_rust/rust-targets-2/e-agent-delegate-fork-v2/debug/e-agent python3 delegate_fork_prefix_acceptance.py
+```
+
 ## GreptimeDB background restart recovery
 
 `greptime_background_restart_recovery.sh` is a real process-boundary E2E for

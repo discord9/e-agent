@@ -522,6 +522,7 @@ async fn request_user_input_waits_answers_and_resumes_same_turn() {
         "input".into(),
         IdlePolicy::WaitForInput,
     );
+    let runner = runner.with_user_input_allowed();
     let (_, mut events, mut status) = handle.attach();
     let task = runner.start(Some("start".into()));
     loop {
@@ -580,6 +581,109 @@ async fn request_user_input_waits_answers_and_resumes_same_turn() {
         entry,
         SessionEntry::Message { message: Message::User { content, .. } } if content == "Ada"
     )));
+    drop(task);
+}
+
+/// A delegate/btw/fork session has no frontend that could answer a
+/// `request_user_input` question, so the interception must fail that call
+/// back to the model as an ordinary tool error and keep the SAME turn going
+/// instead of parking the session in `WaitingInput` forever.
+#[tokio::test]
+async fn request_user_input_without_a_frontend_errors_and_never_waits() {
+    let temp = tempfile::tempdir().unwrap();
+    let agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: VecDeque::from(vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call-input".into(),
+                        name: "request_user_input".into(),
+                        arguments: r#"{"questions":[{"id":"name","prompt":"Your name?"}]}"#.into(),
+                    }],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("worked alone".into()),
+                    tool_calls: Vec::new(),
+                    reasoning: None,
+                },
+            ]),
+        }),
+        vec![
+            Box::new(crate::tools::user_input::RequestUserInput),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "input-without-frontend".into(),
+        IdlePolicy::WaitForInput,
+    );
+    // Deliberately NOT `with_user_input_allowed()`: a subagent-like runner.
+    let (_, _events, mut status) = handle.attach();
+    let task = runner.start(Some("start".into()));
+    // The turn must continue on its own: the error result is the only thing
+    // the model gets back, and it answers again without any human input. A
+    // suspension would hang here (the wait helper times out and panics).
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "worked alone"),
+    )
+    .await;
+    assert!(
+        handle.snapshot().iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolResult { is_error: true, content, call_id: Some(call_id), .. }
+                if call_id == "call-input" && content == USER_INPUT_UNAVAILABLE
+        )),
+        "the question must come back as a plain tool error: {:?}",
+        handle.snapshot()
+    );
+    wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)).await;
+    assert!(
+        !matches!(&*status.borrow(), SessionStatus::WaitingInput(_)),
+        "a session without a frontend must never enter WaitingInput: {:?}",
+        *status.borrow()
+    );
+    // No WaitingInput claim was ever registered for that call id, so an
+    // "answer" is rejected instead of being consumed by a parked turn.
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("call-input".into()), "Ada".into()),
+        PromptSubmission::Conflict
+    );
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "input-without-frontend")
+        .await
+        .unwrap()
+        .entries;
+    let tools = tool_entries(&entries);
+    assert_eq!(tools.len(), 1, "{tools:?}");
+    match tools[0] {
+        Message::Tool {
+            call_id,
+            content,
+            is_error,
+            synthetic,
+            ..
+        } => {
+            assert_eq!(call_id, "call-input");
+            assert_eq!(content, USER_INPUT_UNAVAILABLE);
+            assert!(is_error);
+            assert!(!synthetic);
+        }
+        other => panic!("expected the tool error result, got {other:?}"),
+    }
+    assert!(
+        entries.iter().any(|entry| matches!(
+            entry,
+            SessionEntry::Message { message: Message::Assistant(reply) }
+                if reply.content.as_deref() == Some("worked alone")
+        )),
+        "the same turn must reach its final answer: {entries:?}"
+    );
     drop(task);
 }
 
@@ -695,6 +799,7 @@ async fn web_attach_while_waiting_input_returns_before_answer() {
         "web-input".into(),
         IdlePolicy::WaitForInput,
     );
+    let runner = runner.with_user_input_allowed();
     let task = runner.start(Some("start".into()));
     let mut status = handle.status();
     loop {
@@ -734,6 +839,7 @@ async fn request_user_input_twice_rejects_stale_first_call_id() {
         "two-waits".into(),
         IdlePolicy::WaitForInput,
     );
+    let runner = runner.with_user_input_allowed();
     let task = runner.start(Some("start".into()));
     let mut status = handle.status();
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -851,6 +957,7 @@ async fn request_user_input_answer_claim_wins_then_cancel_commits_once() {
         "answer-first".into(),
         IdlePolicy::WaitForInput,
     );
+    let runner = runner.with_user_input_allowed();
     let task = runner.start(Some("start".into()));
     let mut status = handle.status();
     loop {
@@ -899,6 +1006,7 @@ async fn request_user_input_cancel_claim_wins_then_answer_conflicts() {
         "cancel-first".into(),
         IdlePolicy::WaitForInput,
     );
+    let runner = runner.with_user_input_allowed();
     let task = runner.start(Some("start".into()));
     let mut status = handle.status();
     loop {
@@ -958,6 +1066,7 @@ async fn request_user_input_cancel_discards_goal_continue_until_fresh_continue()
     )
     .await
     .unwrap();
+    let runner = runner.with_user_input_allowed();
     let task = runner.start(None);
     let mut status = handle.status();
     handle.continue_goal(None);
@@ -1015,6 +1124,7 @@ async fn request_user_input_channel_close_exits_without_answer() {
         "close-input".into(),
         IdlePolicy::WaitForInput,
     );
+    let runner = runner.with_user_input_allowed();
     let task = runner.start(Some("start".into()));
     let mut status = handle.status();
     loop {
@@ -1836,6 +1946,7 @@ async fn switch_model_applies_to_the_next_turn() {
 
     // Runtime switch, then turn 2 must run on the new model.
     handle.switch_model(
+        "model-b",
         Box::new(NamedRecordingModel {
             name: "model-b".into(),
             calls: calls.clone(),
@@ -5706,7 +5817,7 @@ async fn switch_to_non_vision_during_read_image_strips_request() {
     );
     let task = runner.start(Some("look".into()));
     entered.notified().await;
-    handle.switch_model(Box::new(non_vision), None);
+    handle.switch_model("non-vision", Box::new(non_vision), None);
     release.notify_one();
     let mut status = handle.status();
     let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
@@ -5819,7 +5930,7 @@ async fn switch_to_vision_during_read_image_keeps_history_image_and_serves_it() 
     );
     let task = runner.start(Some("look".into()));
     entered.notified().await;
-    handle.switch_model(Box::new(vision), None);
+    handle.switch_model("vision", Box::new(vision), None);
     release.notify_one();
     let mut status = handle.status();
     let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
@@ -10367,6 +10478,7 @@ async fn oracle449_runner_notice_is_visible_once_to_attached_and_late_views() {
 fn switch_model_command_carries_context_window() {
     let (handle, _emitter, mut commands) = session_test_channel();
     handle.switch_model(
+        "model-b",
         Box::new(NamedRecordingModel {
             name: "model-b".into(),
             calls: Arc::new(Mutex::new(Vec::new())),
@@ -10375,7 +10487,11 @@ fn switch_model_command_carries_context_window() {
     );
     assert!(matches!(
         commands.try_recv(),
-        Ok(SessionCommand::SwitchModel(_, Some(32_000)))
+        Ok(SessionCommand::SwitchModel {
+            context_window: Some(32_000),
+            profile,
+            ..
+        }) if profile == "model-b"
     ));
 }
 
@@ -12646,6 +12762,7 @@ async fn exhausted_goal_input_answer_continues(usage: Option<Usage>, session: &s
     )
     .await
     .unwrap();
+    let runner = runner.with_user_input_allowed();
     let task = runner.start(None);
     let mut status = handle.status();
     handle.continue_goal(Some(10));
@@ -12929,6 +13046,7 @@ async fn oracle677_answer_requested_compaction_is_budget_exempt() {
     )
     .await
     .unwrap();
+    let runner = runner.with_user_input_allowed();
     let task = runner.start(None);
     let mut status = handle.status();
     handle.continue_goal(Some(10));
@@ -13048,6 +13166,7 @@ async fn oracle677_answer_manual_compact_preserves_resume_after_cap() {
     )
     .await
     .unwrap();
+    let runner = runner.with_user_input_allowed();
     let task = runner.start(None);
     let mut status = handle.status();
     handle.continue_goal(Some(10));
@@ -13139,6 +13258,7 @@ async fn oracle677_answer_manual_compact_missing_usage_preserves_resume() {
     )
     .await
     .unwrap();
+    let runner = runner.with_user_input_allowed();
     let task = runner.start(None);
     let mut status = handle.status();
     handle.continue_goal(Some(10));
@@ -13236,6 +13356,7 @@ async fn oracle677_answer_auto_compaction_is_budget_exempt() {
     )
     .await
     .unwrap();
+    let runner = runner.with_user_input_allowed();
     let task = runner.start(None);
     let mut status = handle.status();
     handle.continue_goal(Some(10));
@@ -13323,6 +13444,7 @@ async fn oracle677_answer_queued_goal_mutation_keeps_resume(
     )
     .await
     .unwrap();
+    let runner = runner.with_user_input_allowed();
     let task = runner.start(None);
     let mut status = handle.status();
     handle.continue_goal(None);
@@ -13421,6 +13543,7 @@ async fn oracle677_answer_update_goal_sibling_keeps_resume() {
     )
     .await
     .unwrap();
+    let runner = runner.with_user_input_allowed();
     let task = runner.start(None);
     let mut status = handle.status();
     handle.continue_goal(None);
@@ -13739,6 +13862,7 @@ async fn oracle677_positive_answer_compaction_keeps_goal_budget(
     )
     .await
     .unwrap();
+    let runner = runner.with_user_input_allowed();
     let task = runner.start(None);
     let mut status = handle.status();
     handle.continue_goal(Some(10));
@@ -13854,6 +13978,7 @@ async fn oracle718_answer_pause_compact_resume_does_not_rearm_driver() {
     )
     .await
     .unwrap();
+    let runner = runner.with_user_input_allowed();
     let task = runner.start(None);
     let mut status = handle.status();
     handle.continue_goal(Some(10));
@@ -14049,6 +14174,7 @@ async fn oracle718_background_during_answer_compact_keeps_resume(
     )
     .await
     .unwrap();
+    let runner = runner.with_user_input_allowed();
     let task = runner.start(None);
     let mut status = handle.status();
     handle.continue_goal(None);
@@ -14189,6 +14315,7 @@ async fn oracle739_notice_during_answer_compact_active_continue_zero_keeps_resum
     )
     .await
     .unwrap();
+    let runner = runner.with_user_input_allowed();
     let task = runner.start(None);
     let mut status = handle.status();
     assert!(handle.continue_goal(None));
@@ -14330,6 +14457,7 @@ async fn oracle731_resumed_answer_pause_queued_resume_disarms_driver() {
     )
     .await
     .unwrap();
+    let runner = runner.with_user_input_allowed();
     let task = runner.start(None);
     let mut status = handle.status();
     handle.continue_goal(Some(10));
@@ -14460,6 +14588,7 @@ async fn oracle120_continue_preserves_accepted_input_resume() {
     )
     .await
     .unwrap();
+    let runner = runner.with_user_input_allowed();
     let task = runner.start(None);
     let mut status = handle.status();
     handle.continue_goal(Some(10));
@@ -14991,6 +15120,7 @@ async fn agent_message_and_compaction_while_waiting_input_preserve_answer_turn()
         "message-wait".into(),
         IdlePolicy::WaitForInput,
     );
+    let runner = runner.with_user_input_allowed();
     let task = runner.start(Some("start".into()));
     let mut status = handle.status();
     wait_for_status(&mut status, |status| {
@@ -17182,6 +17312,7 @@ async fn cancelled_waiting_input_turn_touches_session_meta_once() {
         session.into(),
         IdlePolicy::WaitForInput,
     );
+    let runner = runner.with_user_input_allowed();
     let task = runner.start(Some("start".into()));
     let mut status = handle.status();
     loop {

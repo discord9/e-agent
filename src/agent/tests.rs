@@ -3494,6 +3494,213 @@ fn fork_prefix_accepts_compaction_as_boundary() {
 }
 
 #[test]
+fn fork_prefix_complete_accepts_a_completed_turn() {
+    let entries = forked_history();
+    assert_eq!(fork_prefix_complete(&entries, None).unwrap(), entries);
+    // The explicit 1-based at on the last completed assistant also passes.
+    assert_eq!(fork_prefix_complete(&entries, Some(6)).unwrap(), entries);
+}
+
+#[test]
+fn fork_prefix_complete_accepts_a_clean_compaction_boundary() {
+    let mut entries = completed_turn("q1", "a1");
+    entries.push(SessionEntry::Compaction {
+        summary: "summary".into(),
+        retained: vec![
+            Message::User {
+                content: "q2".into(),
+                images: vec![],
+            },
+            Message::Assistant(AssistantMessage {
+                content: Some("a2".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            }),
+        ],
+        current_prompt_at: None,
+        no_current_prompt: false,
+    });
+    let prefix = fork_prefix_complete(&entries, None).unwrap();
+    assert_eq!(prefix.len(), 3);
+    assert!(matches!(
+        prefix.last(),
+        Some(SessionEntry::Compaction { .. })
+    ));
+}
+
+#[test]
+fn fork_prefix_complete_rejects_a_mid_turn_compaction_with_an_unanswered_tool_call() {
+    let call = ToolCall {
+        id: "call-mid-turn".into(),
+        name: "bash".into(),
+        arguments: "{}".into(),
+    };
+    let pending = Message::Assistant(AssistantMessage {
+        content: None,
+        tool_calls: vec![call],
+        reasoning: None,
+    });
+    let entries = vec![
+        Message::User {
+            content: "q1".into(),
+            images: vec![],
+        }
+        .into(),
+        pending.clone().into(),
+        SessionEntry::Compaction {
+            summary: "mid-turn summary".into(),
+            retained: vec![pending],
+            current_prompt_at: None,
+            no_current_prompt: true,
+        },
+    ];
+    // The raw prefix cut still accepts the compaction ...
+    let prefix = fork_prefix(&entries, None).unwrap();
+    assert!(matches!(
+        prefix.last(),
+        Some(SessionEntry::Compaction { .. })
+    ));
+    // ... but repairing its projection would fabricate a synthetic result for
+    // the unanswered call — the exact thing a fork must never inherit.
+    let locations = vec![None; prefix.len()];
+    let items = Agent::history_items(&prefix, &locations, None);
+    let messages: Vec<Message> = items.iter().map(|item| item.message.clone()).collect();
+    let repaired: Vec<Message> = repair_item_pairs(items)
+        .into_iter()
+        .map(|item| item.message)
+        .collect();
+    assert_ne!(repaired, messages, "repair must detect the dangling call");
+    assert!(
+        repaired.iter().any(|message| matches!(
+            message,
+            Message::Tool {
+                content,
+                synthetic: true,
+                ..
+            } if content == INTERRUPTED
+        )),
+        "the unguarded cut would fabricate an interrupted tool result"
+    );
+    // The validated cut rejects it instead of forking a fabricated result.
+    let error = fork_prefix_complete(&entries, None).unwrap_err();
+    assert!(
+        error.contains("cannot fork mid-turn"),
+        "mid-turn compaction must be rejected, got {error:?}"
+    );
+}
+
+#[test]
+fn fork_prefix_complete_accepts_a_superseded_synthetic_placeholder() {
+    // A cancelled turn's placeholder, then the real result landed later:
+    // repair drops the placeholder but introduces nothing new, so the
+    // completed turn is still a valid fork boundary.
+    let call = ToolCall {
+        id: "call-raced".into(),
+        name: "bash".into(),
+        arguments: "{}".into(),
+    };
+    let entries = vec![
+        Message::User {
+            content: "q1".into(),
+            images: vec![],
+        }
+        .into(),
+        Message::Assistant(AssistantMessage {
+            content: None,
+            tool_calls: vec![call.clone()],
+            reasoning: None,
+        })
+        .into(),
+        Message::Tool {
+            call_id: call.id.clone(),
+            name: call.name.clone(),
+            content: INTERRUPTED.into(),
+            images: vec![],
+            is_error: true,
+            synthetic: true,
+        }
+        .into(),
+        Message::Tool {
+            call_id: call.id,
+            name: call.name,
+            content: "real result".into(),
+            images: vec![],
+            is_error: false,
+            synthetic: false,
+        }
+        .into(),
+        Message::User {
+            content: "q2".into(),
+            images: vec![],
+        }
+        .into(),
+        Message::Assistant(AssistantMessage {
+            content: Some("a2".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        })
+        .into(),
+    ];
+    assert_eq!(fork_prefix_complete(&entries, None).unwrap(), entries);
+}
+
+#[test]
+fn fork_prefix_complete_rejects_a_dangling_call_before_a_later_answer() {
+    // A cut that is not the direct end of the batch: the next assistant
+    // would force repair to fabricate the missing result, so it is rejected
+    // even though the LAST message has no tool calls.
+    let entries = vec![
+        Message::User {
+            content: "q1".into(),
+            images: vec![],
+        }
+        .into(),
+        Message::Assistant(AssistantMessage {
+            content: None,
+            tool_calls: vec![ToolCall {
+                id: "call-dangling".into(),
+                name: "bash".into(),
+                arguments: "{}".into(),
+            }],
+            reasoning: None,
+        })
+        .into(),
+        Message::Assistant(AssistantMessage {
+            content: Some("a1".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        })
+        .into(),
+    ];
+    let error = fork_prefix_complete(&entries, Some(3)).unwrap_err();
+    assert!(error.contains("cannot fork mid-turn"), "{error}");
+}
+
+#[test]
+fn fork_prefix_complete_rejects_an_unpaired_trailing_tool_call() {
+    // A prefix that ends directly on a tool-call assistant is mid-turn even
+    // when an earlier completed turn exists; the default cut must not pick
+    // that assistant as its boundary (it never does) and the explicit cut
+    // refuses it.
+    let mut entries = completed_turn("q1", "a1");
+    entries.push(
+        Message::Assistant(AssistantMessage {
+            content: None,
+            tool_calls: vec![ToolCall {
+                id: "call-open".into(),
+                name: "bash".into(),
+                arguments: "{}".into(),
+            }],
+            reasoning: None,
+        })
+        .into(),
+    );
+    // The uncut history keeps the in-flight turn out of the prefix.
+    assert_eq!(fork_prefix_complete(&entries, None).unwrap().len(), 2);
+    assert!(fork_prefix_complete(&entries, Some(3)).is_err());
+}
+
+#[test]
 fn forked_from_marker_serde_roundtrip_and_context_skip() {
     // Serialization: provenance None fields are skipped, at/source kept.
     let marker = SessionEntry::ForkedFrom {

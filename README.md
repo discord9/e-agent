@@ -1014,6 +1014,20 @@ tools and, when
 configured, `web_search`; no MCP tools and no `delegate` itself, so delegation
 depth is capped at 1 by construction. Tool rounds are unlimited.
 
+`fork: true` is the one explicit exception to that empty history. The child
+starts from the parent's **completed-turn prefix** (the in-flight turn is
+excluded, so put everything the child needs in `task`) and runs on the parent's
+**current** model and workspace, inheriting the parent's system prompt, tool
+schemas and MCP tool set so its request is a byte-identical prefix and reuses
+the parent's provider-side prompt cache. The parent's goal is frozen into the
+request head. A fork still cannot delegate further or ask the user questions.
+Constraints: `fork` is mutually exclusive with `role` and `resume`; the parent
+must have a completed turn (a mid-turn compaction is rejected); `workspace`
+must resolve to the parent root; and the reconnected MCP tool set must equal the
+parent's captured list exactly — a missing, extra, reordered or changed tool
+fails closed instead of forking a different provider tool set (this is the only
+case where a subagent gets MCP tools).
+
 Subagents always run in the background without blocking the main agent; there
 is no foreground mode. The immediate tool result includes both the background
 task number and subagent session ID, and its completion includes that same
@@ -1470,8 +1484,9 @@ executes the commands its `.e-agent/config.toml` declares. A global
 `[mcp."<name>"] enabled = false` is a kill switch a project file cannot
 re-enable: the merged config keeps the disabled global entry, so a
 same-named project server is skipped (`connect_all` skips disabled servers).
-Project MCP servers apply to subagents too — tools are built from the unified
-effective config, and subagents inherit the workspace's MCP toolset.
+Project MCP servers apply to the main session and to explicit `fork: true`
+delegates, which reconnect the parent's tool set and fail closed if it differs.
+Ordinary subagents do not connect MCP.
 
 Each entry spawns `command` with the workspace as its current directory
 (override with `cwd`), plus optional `env`. Servers are connected one at a
@@ -1479,7 +1494,10 @@ time at startup; a server that fails to start is skipped with a warning and
 does not abort the session. Server-provided instructions (from the MCP
 `initialize` response) are prepended to the model context as a system
 message on every call, but are not persisted in sessions. Only tools are
-supported — no resources, prompts, or server-initiated notifications.
+supported — no resources, prompts, or server-initiated notifications. MCP
+tools are sorted by name for deterministic provider requests, so the tool
+array a provider sees is stable across runs and a forked child can reuse the
+parent's prompt cache.
 
 ## Environment
 
