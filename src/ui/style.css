@@ -1343,6 +1343,84 @@
     font-weight: 600;
     margin-top: 5px;
   }
+  /* 异步 pending_questions：沿用 waiting-input 的视觉语言（青色左粗边、
+     base2 底），但独立于阻塞式等待面板——它不接管 composer，普通输入框
+     照常可用；每张卡片自带输入与「回答」按钮。 */
+  .pending-questions {
+    border: 1px solid var(--cyan);
+    border-left-width: 4px;
+    border-radius: 4px;
+    background: var(--base2);
+    padding: 9px 11px;
+    color: var(--base02);
+    overflow-wrap: anywhere;
+  }
+  .pending-questions-head {
+    color: var(--status-cyan);
+    font-size: 12px;
+    font-weight: 700;
+    margin-bottom: 5px;
+  }
+  .pending-questions-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-height: 30vh; /* fallback when --app-height is unavailable */
+    max-height: min(30vh, calc(var(--app-height, 100dvh) * 0.3));
+    overflow-y: auto;
+  }
+  .pending-question-card {
+    border: 1px solid var(--base1);
+    border-radius: 4px;
+    background: var(--base3);
+    padding: 7px 8px;
+    min-width: 0;   /* flex 项默认 min-width:auto：长问题会横向撑破面板 */
+  }
+  .pending-question-card.submitted { border-color: var(--cyan); }
+  .pending-question-prompt {
+    margin: 0;
+    font-size: 14px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  .pending-question-row {
+    display: flex;
+    align-items: stretch;
+    gap: 6px;
+    margin-top: 6px;
+    min-width: 0;
+  }
+  .pending-question-field {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+  }
+  .pending-question-input {
+    width: 100%;
+    min-width: 0;   /* 390px：输入框可收缩，按钮不被挤出面板 */
+    background: var(--base3);
+    border: 1px solid var(--base1);
+    border-radius: 4px;
+    padding: 6px 8px;
+    color: var(--base02);
+    font-family: inherit;
+    font-size: 13px;
+    line-height: 1.4;
+  }
+  .pending-question-input:focus { outline: 1px solid var(--blue); }
+  .pending-question-submit {
+    flex: 0 0 auto;
+    white-space: nowrap;
+    padding: 6px 10px;
+  }
+  .pending-question-submit:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
+  .pending-question-status { margin: 5px 0 0; color: var(--base01); font-size: 12px; }
+  .pending-question-status:empty { display: none; }
+  .pending-question-card.submitted .pending-question-status {
+    color: var(--status-cyan);
+    font-weight: 600;
+  }
   .tree-status {
     flex: 0 0 auto;
     padding: 1px 5px;
@@ -2258,6 +2336,12 @@
     .compact-head { font-size: 10px; padding: 0 6px; }
     .waiting-input { padding: 8px 9px; }
     .waiting-input-question { font-size: 13px; }
+    /* 390px：异步问题面板收紧内边距/字号；输入框 flex 收缩 + 按钮不换行，
+       保证卡片内无横向溢出 */
+    .pending-questions { padding: 8px 9px; }
+    .pending-question-card { padding: 6px 7px; }
+    .pending-question-prompt { font-size: 13px; }
+    .pending-question-submit { padding: 6px 8px; }
     .composer-foot { align-items: flex-end; }
     .composer-actions { flex: 0 0 auto; }
   }
