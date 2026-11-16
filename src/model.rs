@@ -104,6 +104,21 @@ impl Model for ConfiguredModel {
     }
 }
 
+/// A provider stream that ended with a tool call missing its id or name.
+/// This is a truncation signature (proxy/network cut, or a provider bug), not
+/// a semantic failure: it is safe to retry the whole idempotent request once
+/// instead of poisoning the session with an unusable turn.
+#[derive(Debug)]
+pub(crate) struct IncompleteToolCall;
+
+impl std::fmt::Display for IncompleteToolCall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("provider stream returned an incomplete tool call")
+    }
+}
+
+impl std::error::Error for IncompleteToolCall {}
+
 /// A provider 4xx response that rejected the image attachments submitted
 /// with the request. Shared by both model wires (chat here, codex in
 /// `src/codex.rs`).
@@ -942,7 +957,7 @@ fn build_assistant(
         .into_iter()
         .map(|call| {
             if call.id.is_empty() || call.name.is_empty() {
-                anyhow::bail!("provider stream returned an incomplete tool call");
+                return Err(anyhow::Error::new(IncompleteToolCall));
             }
             Ok(ToolCall {
                 id: call.id,

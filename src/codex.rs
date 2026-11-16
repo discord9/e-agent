@@ -85,6 +85,7 @@ pub(crate) fn is_stream_decode_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause.is::<eventsource_stream::EventStreamError<reqwest::Error>>()
             || cause.is::<serde_json::Error>()
+            || cause.is::<crate::model::IncompleteToolCall>()
     })
 }
 

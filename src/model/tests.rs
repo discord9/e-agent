@@ -1500,6 +1500,56 @@ async fn http_403_is_retried_then_succeeds() {
     assert_eq!(message.content.as_deref(), Some("rate limit lifted"));
 }
 
+#[tokio::test]
+async fn incomplete_tool_call_stream_is_retried_then_succeeds() {
+    // A truncated stream can end with a tool call whose id/name never
+    // arrived. That is a transport truncation signature, not a semantic
+    // failure: the whole idempotent request must be retried once instead of
+    // poisoning the session with an unusable turn.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let _ = read_request(&mut stream).await;
+        reply_sse(
+            &mut stream,
+            &[json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"","arguments":"{}"}}]},"finish_reason":null}]})],
+        )
+        .await;
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let _ = read_request(&mut stream).await;
+        reply_sse(
+            &mut stream,
+            &[
+                json!({"choices":[{"delta":{"content":"recovered"},"finish_reason":null}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+            ],
+        )
+        .await;
+    });
+    let mut model = OpenAiModel::with_timeout(
+        format!("http://{address}/v1"),
+        "test-key".into(),
+        "test-model".into(),
+        None,
+        false,
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    let (message, _) = model
+        .complete(
+            &[Message::User {
+                content: "hello".into(),
+                images: vec![],
+            }],
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(message.content.as_deref(), Some("recovered"));
+}
+
 /// Serve a fixed status/body for every accepted request until 150ms pass
 /// without a new connection, counting attempts. A wire that (incorrectly)
 /// retries shows up in the counter instead of a connect error.
