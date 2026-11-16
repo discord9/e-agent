@@ -48,7 +48,6 @@ const state = {
   waitingSubmit: null,       // 在途回答的捕获快照；用于禁用/去重与 stale 防护
   waitingDrafts: {},         // wsId:sessionId:callId -> draft；新问题绝不继承旧问题草稿
   pendingQuestions: null,    // 异步待回答问题 [{callId, questions}]（不阻塞会话；每卡独立 call_id）
-  pendingQuestionsKey: "",   // 问题集/顺序签名：相同状态帧不重建卡片（保留输入/焦点）
   pendingCards: new Map(),   // callId -> {root,input,button,status,pending,submitted}
   lastStatusPayload: {},     // wsId:sessionId -> latest SSE status payload，切回缓存时重建等待面板
   initSource: null,          // "history" | "snapshot" | null —— 初始渲染来源

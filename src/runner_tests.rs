@@ -1764,6 +1764,121 @@ async fn async_questions_are_memory_only_across_restart() {
     );
 }
 
+/// Gates the compaction model call so a test can deliver an asynchronous
+/// answer while the requested compaction is in flight.
+struct GatedCompactionModel {
+    replies: VecDeque<AssistantMessage>,
+    calls: Arc<Mutex<Vec<Vec<Message>>>>,
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait]
+impl Model for GatedCompactionModel {
+    async fn complete(
+        &mut self,
+        messages: &[Message],
+        _: &[ToolSpec],
+        _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        self.calls.lock().unwrap().push(messages.to_vec());
+        let is_compaction = matches!(
+            messages.last(),
+            Some(Message::User { content, .. })
+                if content.contains("Summarize the earlier conversation")
+        );
+        if is_compaction {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        Ok((
+            self.replies.pop_front().expect("unexpected model call"),
+            None,
+        ))
+    }
+}
+
+/// An answer that arrives while a model-requested compaction is in flight
+/// must be committed at the compaction's completed safe point, before the
+/// next regular provider request (that path does not pass through the
+/// sibling-batch safe point).
+#[tokio::test]
+async fn async_answer_during_requested_compaction_lands_in_the_next_request() {
+    let temp = tempfile::tempdir().unwrap();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = Agent::new(
+        Box::new(GatedCompactionModel {
+            replies: VecDeque::from(vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![
+                        ToolCall {
+                            id: "ask1".into(),
+                            name: "request_user_input".into(),
+                            arguments: r#"{"async":true,"questions":[{"id":"q","prompt":"Q?"}]}"#
+                                .into(),
+                        },
+                        ToolCall {
+                            id: "compact".into(),
+                            name: "request_compaction".into(),
+                            arguments: "{}".into(),
+                        },
+                    ],
+                    reasoning: None,
+                },
+                assistant_reply("summary"),
+                assistant_reply("done"),
+            ]),
+            calls: calls.clone(),
+            entered: entered.clone(),
+            release: release.clone(),
+        }),
+        vec![
+            Box::new(crate::tools::user_input::RequestUserInput),
+            Box::new(crate::tools::RequestCompaction),
+        ],
+    );
+    history_for_compaction(&mut agent);
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "async-during-compaction".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let runner = runner.with_user_input_allowed();
+    let task = runner.start(Some("start".into()));
+    entered.notified().await;
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("ask1".into()), "A".into()),
+        PromptSubmission::Answered
+    );
+    release.notify_one();
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "done"),
+    )
+    .await;
+    {
+        let calls = calls.lock().unwrap();
+        // [0] initial round, [1] requested compaction, [2] next regular request.
+        assert!(calls.len() >= 3, "model calls: {}", calls.len());
+        assert!(
+            calls[2].iter().any(|message| matches!(
+                message,
+                Message::User { content, .. }
+                    if content.contains("[question ask1]") && content.contains("[answer]\nA")
+            )),
+            "the answer Notice must precede the next regular request: {:?}",
+            calls[2]
+        );
+    }
+    drop(handle);
+    task.join().await.unwrap();
+}
+
 #[test]
 fn persisted_request_user_input_call_is_repaired_on_resume_not_waiting() {
     let call = ToolCall {

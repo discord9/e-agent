@@ -4125,8 +4125,20 @@ impl SessionRunner {
                             if !committed && goal_turn && !human_required_continuation {
                                 break 'turn;
                             }
-                            // Completion may arrive while compaction was in
-                            // flight; commit it before the next provider call.
+                            // Completion and asynchronous-question answers may
+                            // arrive while compaction was in flight; commit
+                            // both before the next provider call. The manual
+                            // requested-compaction path goes straight back to
+                            // await_round, so this is its only safe point
+                            // between the compaction and that request.
+                            if let Err(error) = self.commit_answers().await {
+                                self.terminate(
+                                    SessionResult::Failed(format!("{error:#}")),
+                                    Vec::new(),
+                                )
+                                .await;
+                                return;
+                            }
                             if let Err(error) = self.commit_backgrounds().await {
                                 self.terminate(
                                     SessionResult::Failed(format!("{error:#}")),

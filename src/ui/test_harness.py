@@ -1514,6 +1514,20 @@ async function main(){
         pqButton(0).textContent === "回答" && pqInput(0).disabled === false
         && pqInput(1).value === "乙");
 
+    // 增量对账：新增/删除一张卡不重建其他卡——草稿、节点身份、已提交/在途
+    // 状态都必须留在原卡片上。
+    const keepCard = pqCards()[0];
+    pqInput(0).value = "草稿保留";
+    applyStatus(pqFrame([
+      {call_id: "c1", questions: [{id: "q1", prompt: "第一个？"}]},
+      {call_id: "c3", questions: [{id: "q3", prompt: "第三个？"}]},
+    ]));
+    chk("adding/removing a question preserves the other card's draft and node",
+        pqCards().length === 2 && pqCards()[0] === keepCard
+        && pqInput(0).value === "草稿保留"
+        && pqList.textContent.includes("第三个？")
+        && !pqList.textContent.includes("第二个？"));
+
     // 失败：既有 banner + 保留文本 + 重新可编辑。
     applyStatus(pqFrame([{call_id: "c3", questions: [{id: "q3", prompt: "第三个？"}]}]));
     const pqBeforeEmpty = pqPosts().length;

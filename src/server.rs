@@ -3628,10 +3628,12 @@ async fn forward_events(
     if !send(Ok(initial)) {
         return;
     }
-    if !send(status_event(
-        &status.borrow().clone(),
-        &pending.pending_questions(),
-    )) {
+    // Clone the watch value into its own statement: holding the `Ref` across
+    // `pending.pending_questions()` (which locks `Shared`) would invert the
+    // lock order used by register/resolve (`Shared` then `status.send_replace`).
+    let current_status = status.borrow().clone();
+    let current_pending = pending.pending_questions();
+    if !send(status_event(&current_status, &current_pending)) {
         return;
     }
     let mut tick = tokio::time::interval(HEARTBEAT);
@@ -3645,10 +3647,9 @@ async fn forward_events(
             _ = shutdown.changed() => return,
             changed = status.changed() => match changed {
                 Ok(_) => {
-                    if !send(status_event(
-                        &status.borrow().clone(),
-                        &pending.pending_questions(),
-                    )) {
+                    let current_status = status.borrow().clone();
+                    let current_pending = pending.pending_questions();
+                    if !send(status_event(&current_status, &current_pending)) {
                         return;
                     }
                 }
@@ -3681,10 +3682,9 @@ async fn forward_events(
                     if !send(resync_event(&tail_snapshot(snapshot))) {
                         return;
                     }
-                    if !send(status_event(
-                        &new_status.borrow().clone(),
-                        &pending.pending_questions(),
-                    )) {
+                    let current_status = new_status.borrow().clone();
+                    let current_pending = pending.pending_questions();
+                    if !send(status_event(&current_status, &current_pending)) {
                         return;
                     }
                     events = new_events;

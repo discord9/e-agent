@@ -1786,13 +1786,6 @@ function normalizePendingQuestions(payload) {
   return out;
 }
 
-/* 问题集/顺序签名：相同帧（含重复的 Idle/Busy）不重建卡片，半途输入与
-   焦点都保留；只有集合、顺序或文案变化才重建。 */
-function pendingQuestionsSignature(items) {
-  return JSON.stringify(items.map((item) => [item.callId,
-    item.questions.map((q) => [typeof q.id === "string" ? q.id : "", q.prompt])]));
-}
-
 function buildPendingQuestionCard(item) {
   const promptText = item.questions.map((q) => q.prompt).join("\n");
   const root = el("article", "pending-question-card");
@@ -1849,7 +1842,6 @@ function syncPendingQuestionCards() {
 
 function clearPendingQuestions() {
   state.pendingQuestions = null;
-  state.pendingQuestionsKey = "";
   state.pendingCards = new Map();
   if (els.pendingQuestionsList) els.pendingQuestionsList.textContent = "";
   if (els.pendingQuestionsPanel) els.pendingQuestionsPanel.hidden = true;
@@ -1861,15 +1853,41 @@ function renderPendingQuestions(payload) {
     clearPendingQuestions();
     return;
   }
-  const signature = pendingQuestionsSignature(items);
-  if (signature !== state.pendingQuestionsKey) {
-    state.pendingQuestionsKey = signature;
-    state.pendingCards = new Map();
-    els.pendingQuestionsList.textContent = "";
-    for (const item of items) {
-      const entry = buildPendingQuestionCard(item);
+  const incoming = new Set(items.map((item) => item.callId));
+  // Reconcile by call_id, never rebuild the whole list: a new/removed question
+  // must not wipe another card's half-typed answer, focus, in-flight submit or
+  // submitted state.
+  for (const [callId, entry] of state.pendingCards) {
+    if (!incoming.has(callId)) {
+      entry.root.remove();
+      state.pendingCards.delete(callId);
+    }
+  }
+  // Reorder only when the next expected node differs. Unconditionally
+  // appendChild-ing an already-positioned card detaches/reinserts it, which
+  // drops focus in a real DOM and needlessly rewrites the panel every frame.
+  let cursor = els.pendingQuestionsList.firstChild;
+  for (const item of items) {
+    const promptText = item.questions.map((q) => q.prompt).join("\n");
+    let entry = state.pendingCards.get(item.callId);
+    if (!entry) {
+      entry = buildPendingQuestionCard(item);
+      entry.promptText = promptText;
       state.pendingCards.set(item.callId, entry);
-      els.pendingQuestionsList.appendChild(entry.root);
+    } else if (entry.promptText !== promptText) {
+      // Same call id, changed prompt text: update labels in place; keep the
+      // input value and submission state.
+      const prompt = entry.root.querySelector(".pending-question-prompt");
+      if (prompt) prompt.textContent = promptText;
+      const label = entry.root.querySelector(".pending-question-field .sr-only");
+      if (label) label.textContent = "回答：" + promptText;
+      entry.input.setAttribute("aria-label", "回答：" + promptText);
+      entry.promptText = promptText;
+    }
+    if (entry.root === cursor) {
+      cursor = cursor.nextSibling;   // already in place: do not touch the node
+    } else {
+      els.pendingQuestionsList.insertBefore(entry.root, cursor);
     }
   }
   state.pendingQuestions = items;
