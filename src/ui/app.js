@@ -47,6 +47,8 @@ const state = {
   waitingInput: null,        // 当前展示的 {callId, questions}；回答严格绑定此 call_id
   waitingSubmit: null,       // 在途回答的捕获快照；用于禁用/去重与 stale 防护
   waitingDrafts: {},         // wsId:sessionId:callId -> draft；新问题绝不继承旧问题草稿
+  pendingQuestions: null,    // 异步待回答问题 [{callId, questions}]（不阻塞会话；每卡独立 call_id）
+  pendingCards: new Map(),   // callId -> {root,input,button,status,pending,submitted}
   lastStatusPayload: {},     // wsId:sessionId -> latest SSE status payload，切回缓存时重建等待面板
   initSource: null,          // "history" | "snapshot" | null —— 初始渲染来源
   pollTimer: null,
@@ -131,6 +133,7 @@ const els = {
   goalBar: $("goalBar"),
   waitingInputPanel: $("waitingInputPanel"), waitingInputQuestions: $("waitingInputQuestions"),
   waitingInputStatus: $("waitingInputStatus"), waitingInputError: $("waitingInputError"),
+  pendingQuestionsPanel: $("pendingQuestionsPanel"), pendingQuestionsList: $("pendingQuestionsList"),
   promptLabel: $("promptLabel"),
   slashMenu: $("slashMenu"), forkMenu: $("forkMenu"),
   composerMeta: $("composerMeta"),

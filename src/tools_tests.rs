@@ -91,6 +91,7 @@ fn request_user_input_schema_and_validation_are_strict() {
     assert_eq!(spec.name, "request_user_input");
     assert_eq!(spec.parameters["properties"]["questions"]["type"], "array");
     assert_eq!(spec.parameters["properties"]["questions"]["maxItems"], 1);
+    assert_eq!(spec.parameters["properties"]["async"]["type"], "boolean");
     for args in [
         "{}",
         r#"{"questions":[]}"#,
@@ -98,16 +99,29 @@ fn request_user_input_schema_and_validation_are_strict() {
         r#"{"questions":[{"id":"a/b","prompt":"ok"}]}"#,
         r#"{"questions":[{"id":"a","prompt":""}]}"#,
         r#"{"questions":[{"id":"a","prompt":"ok"},{"id":"b","prompt":"no"}]}"#,
+        // `async` is optional and strictly boolean; unknown keys stay fatal.
+        r#"{"async":"yes","questions":[{"id":"a","prompt":"ok"}]}"#,
+        r#"{"async":null,"questions":[{"id":"a","prompt":"ok"}]}"#,
+        r#"{"mode":true,"questions":[{"id":"a","prompt":"ok"}]}"#,
     ] {
         assert!(
             parse_questions(args).is_err(),
             "accepted invalid arguments: {args}"
         );
     }
-    let questions =
-        parse_questions(r#"{"questions":[{"id":"ask_1","prompt":"Need it?"}]}"#).unwrap();
-    assert_eq!(questions[0].id, "ask_1");
-    assert_eq!(questions[0].prompt, "Need it?");
+    let parsed = parse_questions(r#"{"questions":[{"id":"ask_1","prompt":"Need it?"}]}"#).unwrap();
+    assert_eq!(parsed.question.id, "ask_1");
+    assert_eq!(parsed.question.prompt, "Need it?");
+    assert!(!parsed.is_async);
+    let parsed =
+        parse_questions(r#"{"async":true,"questions":[{"id":"ask_1","prompt":"Need it?"}]}"#)
+            .unwrap();
+    assert_eq!(parsed.question.id, "ask_1");
+    assert!(parsed.is_async);
+    let parsed =
+        parse_questions(r#"{"async":false,"questions":[{"id":"ask_1","prompt":"Need it?"}]}"#)
+            .unwrap();
+    assert!(!parsed.is_async);
 }
 
 #[test]

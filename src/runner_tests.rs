@@ -1143,6 +1143,742 @@ async fn request_user_input_channel_close_exits_without_answer() {
     assert!(tool_entries(&entries).is_empty());
 }
 
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// Asynchronous `request_user_input` (`async: true`)
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+/// The pinned receipt text an asynchronous call returns immediately (the
+/// production string is intentionally not shared with this assertion).
+fn async_receipt(call_id: &str) -> String {
+    format!(
+        "question {call_id} asked; you may continue. The answer will arrive later as a user \
+         message with the original question."
+    )
+}
+
+/// The pinned user-shaped Notice one accepted answer commits.
+fn answer_notice(call_id: &str, prompt: &str, answer: &str) -> String {
+    format!("[question {call_id}]\nQuestion: {prompt}\n[answer]\n{answer}")
+}
+
+fn async_question_call(call_id: &str, question_id: &str, prompt: &str) -> AssistantMessage {
+    AssistantMessage {
+        content: None,
+        tool_calls: vec![ToolCall {
+            id: call_id.into(),
+            name: "request_user_input".into(),
+            arguments: format!(
+                r#"{{"async":true,"questions":[{{"id":"{question_id}","prompt":"{prompt}"}}]}}"#
+            ),
+        }],
+        reasoning: None,
+    }
+}
+
+fn blocking_tool_call(call_id: &str, name: &str) -> AssistantMessage {
+    AssistantMessage {
+        content: None,
+        tool_calls: vec![ToolCall {
+            id: call_id.into(),
+            name: name.into(),
+            arguments: "{}".into(),
+        }],
+        reasoning: None,
+    }
+}
+
+fn notice_texts(entries: &[SessionEntry]) -> Vec<String> {
+    entries
+        .iter()
+        .filter_map(|entry| match entry {
+            SessionEntry::Notice { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Records every provider request context and serves the scripted replies;
+/// afterwards it answers `final_answer` forever, so a test never depends on
+/// how many turns the human's answers open.
+struct AsyncQuestionModel {
+    replies: VecDeque<AssistantMessage>,
+    calls: Arc<Mutex<Vec<Vec<Message>>>>,
+    final_answer: &'static str,
+}
+
+#[async_trait]
+impl Model for AsyncQuestionModel {
+    async fn complete(
+        &mut self,
+        messages: &[Message],
+        _: &[ToolSpec],
+        _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        self.calls.lock().unwrap().push(messages.to_vec());
+        let reply = self
+            .replies
+            .pop_front()
+            .unwrap_or_else(|| assistant_reply(self.final_answer));
+        Ok((reply, None))
+    }
+}
+
+/// The async call returns a receipt at once: no `WaitingInput`, no durable
+/// pending entry, and the same turn goes on to its final answer.
+#[tokio::test]
+async fn async_request_user_input_receipts_and_keeps_the_turn_going() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::new(
+        Box::new(AsyncQuestionModel {
+            replies: VecDeque::from(vec![async_question_call(
+                "call-async",
+                "name",
+                "Your name?",
+            )]),
+            calls: calls.clone(),
+            final_answer: "continued without waiting",
+        }),
+        vec![
+            Box::new(crate::tools::user_input::RequestUserInput),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "async-input".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let runner = runner.with_user_input_allowed();
+    let mut status = handle.status();
+    let task = runner.start(Some("start".into()));
+    wait_for_log_event(&handle, |event| {
+        matches!(event, AgentEvent::AssistantText(text) if text == "continued without waiting")
+    })
+    .await;
+    assert!(
+        handle.snapshot().iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolResult { is_error: false, content, call_id: Some(call_id), .. }
+                if call_id == "call-async" && content == &async_receipt("call-async")
+        )),
+        "the async call must return its receipt: {:?}",
+        handle.snapshot()
+    );
+    assert!(
+        !matches!(&*status.borrow(), SessionStatus::WaitingInput(_)),
+        "an async question never parks the turn: {:?}",
+        *status.borrow()
+    );
+    assert_eq!(
+        handle.pending_questions(),
+        vec![UserInputRequest {
+            call_id: "call-async".into(),
+            questions: vec![UserQuestion {
+                id: "name".into(),
+                prompt: "Your name?".into(),
+            }],
+        }]
+    );
+    wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)).await;
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "async-input")
+        .await
+        .unwrap()
+        .entries;
+    assert_eq!(
+        tool_entries(&entries).len(),
+        1,
+        "only the receipt is durable: {entries:?}"
+    );
+    assert!(
+        notice_texts(&entries).is_empty(),
+        "an unanswered question is pure memory: {entries:?}"
+    );
+    drop(task);
+}
+
+/// Answering while the turn runs: the Notice is committed at the batch safe
+/// point, so THIS turn's next provider request already carries it, exactly
+/// once.
+#[tokio::test]
+async fn async_answer_while_the_turn_runs_lands_in_the_next_request() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let agent = Agent::new(
+        Box::new(AsyncQuestionModel {
+            replies: VecDeque::from(vec![
+                async_question_call("call-async", "name", "Your name?"),
+                blocking_tool_call("call-block", "blocker"),
+            ]),
+            calls: calls.clone(),
+            final_answer: "done after the answer",
+        }),
+        vec![
+            Box::new(crate::tools::user_input::RequestUserInput),
+            Box::new(BlockingNoopTool {
+                entered: entered.clone(),
+                release: release.clone(),
+            }),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "async-running".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let runner = runner.with_user_input_allowed();
+    let mut status = handle.status();
+    let task = runner.start(Some("start".into()));
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+        .await
+        .expect("the blocking tool must run");
+    // The turn is in flight (its tool batch is executing) when the answer
+    // arrives, so this is the running-session path, not an idle new turn.
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("call-async".into()), "Ada".into()),
+        PromptSubmission::Answered
+    );
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("call-async".into()), "Ada".into()),
+        PromptSubmission::Conflict
+    );
+    release.notify_one();
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "done after the answer"),
+    )
+    .await;
+    let notice = answer_notice("call-async", "Your name?", "Ada");
+    // Snapshot the captured requests before awaiting again: no MutexGuard may
+    // be held across an await point.
+    let captured = calls.lock().unwrap().clone();
+    assert_eq!(
+        captured.len(),
+        3,
+        "one receipt round, one tool round, one answer round"
+    );
+    assert!(
+        !captured[1].iter().any(|message| matches!(
+            message,
+            Message::User { content, .. } if content == &notice
+        )),
+        "the answer had not arrived for the tool round: {:?}",
+        captured[1]
+    );
+    assert_eq!(
+        captured[2]
+            .iter()
+            .filter(|message| matches!(
+                message,
+                Message::User { content, .. } if content == &notice
+            ))
+            .count(),
+        1,
+        "next provider request must carry the Notice exactly once: {:?}",
+        captured[2]
+    );
+    wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)).await;
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "async-running")
+        .await
+        .unwrap()
+        .entries;
+    assert_eq!(notice_texts(&entries), vec![notice]);
+    assert!(handle.pending_questions().is_empty());
+    drop(task);
+}
+
+/// Answering an idle session opens a regular turn whose user-shaped message
+/// is the Notice (and a repeated answer never writes a second one).
+#[tokio::test]
+async fn async_answer_while_idle_opens_a_turn_with_the_notice() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::new(
+        Box::new(AsyncQuestionModel {
+            replies: VecDeque::from(vec![async_question_call(
+                "call-async",
+                "name",
+                "Your name?",
+            )]),
+            calls: calls.clone(),
+            final_answer: "answered later",
+        }),
+        vec![
+            Box::new(crate::tools::user_input::RequestUserInput),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "async-idle".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let runner = runner.with_user_input_allowed();
+    let mut status = handle.status();
+    let task = runner.start(Some("start".into()));
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "answered later"),
+    )
+    .await;
+    wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)).await;
+    assert_eq!(handle.pending_questions().len(), 1);
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("call-async".into()), "Ada".into()),
+        PromptSubmission::Answered
+    );
+    // The start turn already used two provider calls (question + final
+    // answer); the idle answer opens the third, whose user-shaped message is
+    // the Notice.
+    wait_for_calls(&calls, 3).await;
+    let notice = answer_notice("call-async", "Your name?", "Ada");
+    assert_eq!(
+        calls.lock().unwrap()[2].last(),
+        Some(&Message::User {
+            content: notice.clone(),
+            images: vec![],
+        }),
+        "the new turn's user-shaped message is the Notice"
+    );
+    // The claim is one-shot: answering twice cannot commit a second Notice.
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("call-async".into()), "Ada".into()),
+        PromptSubmission::Conflict
+    );
+    wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)).await;
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "async-idle")
+        .await
+        .unwrap()
+        .entries;
+    assert_eq!(notice_texts(&entries), vec![notice]);
+    assert!(handle.pending_questions().is_empty());
+    drop(task);
+}
+
+/// Two questions answered out of order: each removes its own entry and each
+/// Notice carries its own question/answer text.
+#[tokio::test]
+async fn async_answers_arrive_out_of_order_without_cross_talk() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::new(
+        Box::new(AsyncQuestionModel {
+            replies: VecDeque::from(vec![
+                async_question_call("call-a", "a", "question a"),
+                async_question_call("call-b", "b", "question b"),
+            ]),
+            calls: calls.clone(),
+            final_answer: "both settled",
+        }),
+        vec![
+            Box::new(crate::tools::user_input::RequestUserInput),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "async-many".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let runner = runner.with_user_input_allowed();
+    let mut status = handle.status();
+    let task = runner.start(Some("start".into()));
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "both settled"),
+    )
+    .await;
+    wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)).await;
+    assert_eq!(
+        handle
+            .pending_questions()
+            .iter()
+            .map(|request| request.call_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["call-a", "call-b"]
+    );
+    // Out of order: the second question is answered first. Each answer
+    // commits its own Notice (the durable event is the sync point).
+    let notice_b = answer_notice("call-b", "question b", "answer-b");
+    let notice_a = answer_notice("call-a", "question a", "answer-a");
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("call-b".into()), "answer-b".into()),
+        PromptSubmission::Answered
+    );
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::Notice(text) if text == &notice_b),
+    )
+    .await;
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("call-a".into()), "answer-a".into()),
+        PromptSubmission::Answered
+    );
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::Notice(text) if text == &notice_a),
+    )
+    .await;
+    wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)).await;
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "async-many")
+        .await
+        .unwrap()
+        .entries;
+    assert_eq!(
+        notice_texts(&entries),
+        vec![notice_b, notice_a],
+        "commit order follows the answers, with no cross-talk"
+    );
+    assert!(handle.pending_questions().is_empty());
+    drop(task);
+}
+
+/// A provided call id must name the open asynchronous question: an unknown
+/// id, an empty answer, or a repeated answer never commits a Notice, while an
+/// absent id stays an ordinary prompt (it can never infer which late answer
+/// is meant).
+#[tokio::test]
+async fn async_answer_requires_the_open_call_id_and_commits_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::new(
+        Box::new(AsyncQuestionModel {
+            replies: VecDeque::from(vec![async_question_call(
+                "call-async",
+                "name",
+                "Your name?",
+            )]),
+            calls: calls.clone(),
+            final_answer: "waiting",
+        }),
+        vec![
+            Box::new(crate::tools::user_input::RequestUserInput),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "async-ids".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let runner = runner.with_user_input_allowed();
+    let mut status = handle.status();
+    let task = runner.start(Some("start".into()));
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "waiting"),
+    )
+    .await;
+    wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)).await;
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("not-a-call".into()), "Ada".into()),
+        PromptSubmission::Conflict
+    );
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("call-async".into()), "  ".into()),
+        PromptSubmission::Conflict,
+        "an empty answer leaves the question answerable"
+    );
+    assert_eq!(handle.pending_questions().len(), 1);
+    assert_eq!(
+        handle.submit_prompt("plain prompt".into()),
+        PromptSubmission::Queued,
+        "an absent call id is never an asynchronous answer"
+    );
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("call-async".into()), "Ada".into()),
+        PromptSubmission::Answered
+    );
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("call-async".into()), "Ada".into()),
+        PromptSubmission::Conflict
+    );
+    wait_for_log_event(&handle, |event| {
+        matches!(event, AgentEvent::Notice(text)
+            if text == &answer_notice("call-async", "Your name?", "Ada"))
+    })
+    .await;
+    wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)).await;
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "async-ids")
+        .await
+        .unwrap()
+        .entries;
+    assert_eq!(
+        notice_texts(&entries),
+        vec![answer_notice("call-async", "Your name?", "Ada")]
+    );
+    drop(task);
+}
+
+/// The root-only gate covers async too: a delegate/btw/fork session gets the
+/// existing "cannot ask" tool error and registers nothing.
+#[tokio::test]
+async fn async_request_user_input_without_a_frontend_registers_nothing() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::new(
+        Box::new(AsyncQuestionModel {
+            replies: VecDeque::from(vec![async_question_call(
+                "call-async",
+                "name",
+                "Your name?",
+            )]),
+            calls: calls.clone(),
+            final_answer: "worked alone",
+        }),
+        vec![
+            Box::new(crate::tools::user_input::RequestUserInput),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "async-no-frontend".into(),
+        IdlePolicy::WaitForInput,
+    );
+    // Deliberately NOT `with_user_input_allowed()`: a subagent-like runner.
+    let mut status = handle.status();
+    let task = runner.start(Some("start".into()));
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "worked alone"),
+    )
+    .await;
+    assert!(
+        handle.snapshot().iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolResult { is_error: true, content, call_id: Some(call_id), .. }
+                if call_id == "call-async" && content == USER_INPUT_UNAVAILABLE
+        )),
+        "the async call must fail back as the existing tool error: {:?}",
+        handle.snapshot()
+    );
+    assert!(
+        handle.pending_questions().is_empty(),
+        "no frontend may register a question nobody can answer"
+    );
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("call-async".into()), "Ada".into()),
+        PromptSubmission::Conflict
+    );
+    wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)).await;
+    drop(task);
+}
+
+/// The pending map is pure memory: a resumed session starts empty and the
+/// only durable trace of the call is the model's receipt.
+#[tokio::test]
+async fn async_questions_are_memory_only_across_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::new(
+        Box::new(AsyncQuestionModel {
+            replies: VecDeque::from(vec![async_question_call(
+                "call-async",
+                "name",
+                "Your name?",
+            )]),
+            calls: calls.clone(),
+            final_answer: "for now",
+        }),
+        vec![
+            Box::new(crate::tools::user_input::RequestUserInput),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "async-restart".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let runner = runner.with_user_input_allowed();
+    let mut status = handle.status();
+    let mut task = runner.start(Some("start".into()));
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "for now"),
+    )
+    .await;
+    wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)).await;
+    assert_eq!(handle.pending_questions().len(), 1);
+    task.abort();
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "async-restart")
+        .await
+        .unwrap()
+        .entries;
+    assert!(
+        notice_texts(&entries).is_empty(),
+        "no durable pending entry may exist: {entries:?}"
+    );
+    assert!(matches!(
+        tool_entries(&entries)[0],
+        Message::Tool { content, .. } if content == &async_receipt("call-async")
+    ));
+    // Resume the same session: the question is gone, the receipt remains.
+    let mut agent = Agent::new(
+        Box::new(AsyncQuestionModel {
+            replies: VecDeque::new(),
+            calls: Arc::new(Mutex::new(Vec::new())),
+            final_answer: "resumed",
+        }),
+        vec![
+            Box::new(crate::tools::user_input::RequestUserInput),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    agent.restore_history(entries);
+    let (_runner, resumed) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "async-restart".into(),
+        IdlePolicy::WaitForInput,
+    );
+    assert!(resumed.pending_questions().is_empty());
+    assert_eq!(
+        resumed.submit_prompt_with_call_id(Some("call-async".into()), "Ada".into()),
+        PromptSubmission::Conflict
+    );
+}
+
+/// Gates the compaction model call so a test can deliver an asynchronous
+/// answer while the requested compaction is in flight.
+struct GatedCompactionModel {
+    replies: VecDeque<AssistantMessage>,
+    calls: Arc<Mutex<Vec<Vec<Message>>>>,
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait]
+impl Model for GatedCompactionModel {
+    async fn complete(
+        &mut self,
+        messages: &[Message],
+        _: &[ToolSpec],
+        _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        self.calls.lock().unwrap().push(messages.to_vec());
+        let is_compaction = matches!(
+            messages.last(),
+            Some(Message::User { content, .. })
+                if content.contains("Summarize the earlier conversation")
+        );
+        if is_compaction {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        Ok((
+            self.replies.pop_front().expect("unexpected model call"),
+            None,
+        ))
+    }
+}
+
+/// An answer that arrives while a model-requested compaction is in flight
+/// must be committed at the compaction's completed safe point, before the
+/// next regular provider request (that path does not pass through the
+/// sibling-batch safe point).
+#[tokio::test]
+async fn async_answer_during_requested_compaction_lands_in_the_next_request() {
+    let temp = tempfile::tempdir().unwrap();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = Agent::new(
+        Box::new(GatedCompactionModel {
+            replies: VecDeque::from(vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![
+                        ToolCall {
+                            id: "ask1".into(),
+                            name: "request_user_input".into(),
+                            arguments: r#"{"async":true,"questions":[{"id":"q","prompt":"Q?"}]}"#
+                                .into(),
+                        },
+                        ToolCall {
+                            id: "compact".into(),
+                            name: "request_compaction".into(),
+                            arguments: "{}".into(),
+                        },
+                    ],
+                    reasoning: None,
+                },
+                assistant_reply("summary"),
+                assistant_reply("done"),
+            ]),
+            calls: calls.clone(),
+            entered: entered.clone(),
+            release: release.clone(),
+        }),
+        vec![
+            Box::new(crate::tools::user_input::RequestUserInput),
+            Box::new(crate::tools::RequestCompaction),
+        ],
+    );
+    history_for_compaction(&mut agent);
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "async-during-compaction".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let runner = runner.with_user_input_allowed();
+    let task = runner.start(Some("start".into()));
+    entered.notified().await;
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("ask1".into()), "A".into()),
+        PromptSubmission::Answered
+    );
+    release.notify_one();
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "done"),
+    )
+    .await;
+    {
+        let calls = calls.lock().unwrap();
+        // [0] initial round, [1] requested compaction, [2] next regular request.
+        assert!(calls.len() >= 3, "model calls: {}", calls.len());
+        assert!(
+            calls[2].iter().any(|message| matches!(
+                message,
+                Message::User { content, .. }
+                    if content.contains("[question ask1]") && content.contains("[answer]\nA")
+            )),
+            "the answer Notice must precede the next regular request: {:?}",
+            calls[2]
+        );
+    }
+    drop(handle);
+    task.join().await.unwrap();
+}
+
 #[test]
 fn persisted_request_user_input_call_is_repaired_on_resume_not_waiting() {
     let call = ToolCall {

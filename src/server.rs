@@ -61,6 +61,7 @@ use crate::agent::{AgentEvent, CancellationSource, Message, Model, SessionEntry,
 use crate::delegate::Sessions;
 use crate::runner::{
     IdlePolicy, PromptSubmission, SessionHandle, SessionStatus, SessionTask, UserInputRequest,
+    WeakSessionHandle,
 };
 use crate::session_factory::{EffortOverride, SessionBuild, SessionFactory, UnfinishedPolicy};
 use crate::session_store::{
@@ -612,13 +613,24 @@ fn status_string(status: &SessionStatus) -> &'static str {
 /// Wire payload of `event: status` SSE frames. The frontend does
 /// `applyStatus(JSON.parse(data).status)`, so the frame must be an object
 /// with a `status` key carrying the CamelCase string (not a bare string).
-fn status_json(status: &SessionStatus) -> serde_json::Value {
-    match status {
+///
+/// `pending_questions` mirrors the session's process-local asynchronous
+/// questions (`request_user_input` with `async: true`) in `call_id` order, so
+/// a client can answer them through `POST /api/sessions/{id}/prompt` with the
+/// corresponding `call_id`. The `WaitingInput` fields keep their existing
+/// shape (that is the blocking request, not an asynchronous one).
+fn status_json(
+    status: &SessionStatus,
+    pending_questions: &[UserInputRequest],
+) -> serde_json::Value {
+    let mut frame = match status {
         SessionStatus::WaitingInput(UserInputRequest { call_id, questions }) => {
             serde_json::json!({"status": "WaitingInput", "call_id": call_id, "questions": questions})
         }
         _ => serde_json::json!({ "status": status_string(status) }),
-    }
+    };
+    frame["pending_questions"] = serde_json::json!(pending_questions);
+    frame
 }
 
 /// Session metadata for `GET /api/sessions` and `POST /api/sessions`.
@@ -3569,10 +3581,14 @@ async fn session_events(
         (snapshot_event(&tail_snapshot(snapshot)), live, status)
     };
     let initial = initial.map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // Status frames carry the session's process-local asynchronous questions.
+    // A WEAK endpoint is enough: it never keeps command intake open and it
+    // yields an empty list once the runner state is gone.
+    let pending = session.handle().downgrade();
     let (tx, rx) = mpsc::channel::<Result<Event, Error>>(SSE_CHANNEL_CAPACITY);
     let shutdown = state.shutdown.subscribe();
     tokio::spawn(forward_events(
-        state, id, initial, live, status, shutdown, tx, web,
+        state, id, initial, live, status, pending, shutdown, tx, web,
     ));
     let mut response = Sse::new(SseReceiver(rx)).into_response();
     response.headers_mut().insert(
@@ -3600,6 +3616,7 @@ async fn forward_events(
     initial: Event,
     mut events: broadcast::Receiver<AgentEvent>,
     mut status: watch::Receiver<SessionStatus>,
+    pending: WeakSessionHandle,
     mut shutdown: watch::Receiver<()>,
     tx: mpsc::Sender<Result<Event, Error>>,
     web: bool,
@@ -3611,7 +3628,12 @@ async fn forward_events(
     if !send(Ok(initial)) {
         return;
     }
-    if !send(status_event(&status.borrow().clone())) {
+    // Clone the watch value into its own statement: holding the `Ref` across
+    // `pending.pending_questions()` (which locks `Shared`) would invert the
+    // lock order used by register/resolve (`Shared` then `status.send_replace`).
+    let current_status = status.borrow().clone();
+    let current_pending = pending.pending_questions();
+    if !send(status_event(&current_status, &current_pending)) {
         return;
     }
     let mut tick = tokio::time::interval(HEARTBEAT);
@@ -3625,7 +3647,9 @@ async fn forward_events(
             _ = shutdown.changed() => return,
             changed = status.changed() => match changed {
                 Ok(_) => {
-                    if !send(status_event(&status.borrow().clone())) {
+                    let current_status = status.borrow().clone();
+                    let current_pending = pending.pending_questions();
+                    if !send(status_event(&current_status, &current_pending)) {
                         return;
                     }
                 }
@@ -3658,7 +3682,9 @@ async fn forward_events(
                     if !send(resync_event(&tail_snapshot(snapshot))) {
                         return;
                     }
-                    if !send(status_event(&new_status.borrow().clone())) {
+                    let current_status = new_status.borrow().clone();
+                    let current_pending = pending.pending_questions();
+                    if !send(status_event(&current_status, &current_pending)) {
                         return;
                     }
                     events = new_events;
@@ -3694,10 +3720,13 @@ fn live_event(event: &AgentEvent) -> Result<Event, Error> {
         .json_data(event_payload(event))
 }
 
-fn status_event(status: &SessionStatus) -> Result<Event, Error> {
+fn status_event(
+    status: &SessionStatus,
+    pending_questions: &[UserInputRequest],
+) -> Result<Event, Error> {
     Event::default()
         .event("status")
-        .json_data(status_json(status))
+        .json_data(status_json(status, pending_questions))
 }
 
 /// SSE event name for a live [`AgentEvent`]: the Rust variant name in
@@ -4594,18 +4623,26 @@ mod tests {
     fn status_json_is_object_with_camel_case_status() {
         use serde_json::json;
         // The frontend does `applyStatus(JSON.parse(data).status)`: the frame
-        // must be an object carrying the CamelCase string.
-        assert_eq!(status_json(&SessionStatus::Idle), json!({"status": "Idle"}));
-        assert_eq!(status_json(&SessionStatus::Busy), json!({"status": "Busy"}));
+        // must be an object carrying the CamelCase string. `pending_questions`
+        // is always present (empty when nothing is unanswered).
         assert_eq!(
-            status_json(&SessionStatus::Compacting),
-            json!({"status": "Compacting"})
+            status_json(&SessionStatus::Idle, &[]),
+            json!({"status": "Idle", "pending_questions": []})
         );
         assert_eq!(
-            status_json(&SessionStatus::Finished(
-                crate::runner::SessionResult::Cancelled
-            )),
-            json!({"status": "Finished"})
+            status_json(&SessionStatus::Busy, &[]),
+            json!({"status": "Busy", "pending_questions": []})
+        );
+        assert_eq!(
+            status_json(&SessionStatus::Compacting, &[]),
+            json!({"status": "Compacting", "pending_questions": []})
+        );
+        assert_eq!(
+            status_json(
+                &SessionStatus::Finished(crate::runner::SessionResult::Cancelled),
+                &[]
+            ),
+            json!({"status": "Finished", "pending_questions": []})
         );
         let waiting = UserInputRequest {
             call_id: "call-7".into(),
@@ -4615,9 +4652,53 @@ mod tests {
             }],
         };
         assert_eq!(
-            status_json(&SessionStatus::WaitingInput(waiting)),
+            status_json(&SessionStatus::WaitingInput(waiting), &[]),
             json!({"status": "WaitingInput", "call_id": "call-7",
-                   "questions": [{"id": "confirm", "prompt": "Continue?"}]})
+                   "questions": [{"id": "confirm", "prompt": "Continue?"}],
+                   "pending_questions": []})
+        );
+    }
+
+    /// A status frame carries the session's process-local asynchronous
+    /// questions and drops them once the answer committed. Both halves go
+    /// through the real `Shared` map (`SessionHandle::pending_questions`).
+    #[test]
+    fn status_json_carries_pending_questions_until_answered() {
+        use serde_json::json;
+        let (handle, emitter, _receiver) = crate::runner::session_test_channel();
+        let request = UserInputRequest {
+            call_id: "call-async".into(),
+            questions: vec![crate::runner::UserQuestion {
+                id: "name".into(),
+                prompt: "Your name?".into(),
+            }],
+        };
+        assert!(handle.pending_questions().is_empty());
+        emitter.register_pending_question(request.clone());
+        assert_eq!(
+            status_json(&SessionStatus::Idle, &handle.pending_questions()),
+            json!({"status": "Idle", "pending_questions": [
+                {"call_id": "call-async",
+                 "questions": [{"id": "name", "prompt": "Your name?"}]}
+            ]})
+        );
+        // The prompt endpoint routes through `submit_prompt_with_call_id`,
+        // which claims the asynchronous question instead of queueing a
+        // prompt.
+        assert_eq!(
+            handle.submit_prompt_with_call_id(Some("call-async".into()), "Ada".into()),
+            PromptSubmission::Answered
+        );
+        assert_eq!(
+            handle.submit_prompt_with_call_id(Some("call-async".into()), "Ada".into()),
+            PromptSubmission::Conflict
+        );
+        // The runner removes the registration only after the durable Notice
+        // commit; the status frame then no longer advertises it.
+        emitter.resolve_pending_question("call-async");
+        assert_eq!(
+            status_json(&SessionStatus::Idle, &handle.pending_questions()),
+            json!({"status": "Idle", "pending_questions": []})
         );
     }
 
@@ -7187,7 +7268,7 @@ model = "deepseek-chat"
             })
             .is_ok()
         );
-        assert!(status_event(&SessionStatus::Busy).is_ok());
+        assert!(status_event(&SessionStatus::Busy, &[]).is_ok());
     }
 
     /// Frontend contract: `GET /api/sessions` items carry `status` as a
@@ -9273,6 +9354,7 @@ model = "deepseek-chat"
             snapshot_event(&tail_snapshot(snapshot)).unwrap(),
             live,
             status,
+            handle.downgrade(),
             state.shutdown.subscribe(),
             tx,
             false,
@@ -9332,6 +9414,7 @@ model = "deepseek-chat"
             snapshot_event(&tail_snapshot(snapshot)).unwrap(),
             live,
             status,
+            handle.downgrade(),
             shutdown,
             tx,
             false,
@@ -9362,6 +9445,7 @@ model = "deepseek-chat"
             snapshot_event(&tail_snapshot(snapshot)).unwrap(),
             live,
             status,
+            handle.downgrade(),
             shutdown_rx,
             tx,
             false,
@@ -9485,9 +9569,12 @@ model = "deepseek-chat"
             );
         }
         // Status frames: the frontend reads `JSON.parse(data).status`.
-        let text = event_to_text(status_event(&SessionStatus::Busy).unwrap()).await;
+        let text = event_to_text(status_event(&SessionStatus::Busy, &[]).unwrap()).await;
         assert!(text.contains("event: status"), "{text}");
-        assert!(text.contains(r#"{"status":"Busy"}"#), "{text}");
+        assert!(
+            text.contains(r#"{"status":"Busy","pending_questions":[]}"#),
+            "{text}"
+        );
     }
 
     /// The `task_meta` field mapping: bash output becomes lossy UTF-8

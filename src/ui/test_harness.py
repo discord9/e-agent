@@ -253,7 +253,8 @@ const elsById={};
 for(const id of ["topActions","backParentBtn","connState","banner","bannerText","bannerClose","tokenInput","tokenToggle","chatView","chatEmpty",
   "chatBusy","chatSessionId","chatStatus",
   "usageInfo","messages","promptInput","sendBtn","cancelBtn","compactBtn",
-  "queueBar","goalBar","waitingInputPanel","waitingInputQuestions","waitingInputStatus","waitingInputError","promptLabel","slashMenu","jumpBottomBtn","composerMeta","sidebarBtn","sidebarOverlay","sidebar",
+  "queueBar","goalBar","waitingInputPanel","waitingInputQuestions","waitingInputStatus","waitingInputError",
+  "pendingQuestionsPanel","pendingQuestionsList","promptLabel","slashMenu","jumpBottomBtn","composerMeta","sidebarBtn","sidebarOverlay","sidebar",
   "sidebarCloseBtn","sidebarFilter","sidebarTree","tasksToggleBar","composerTasks","forkMenu",
   "workspaceSelect","workspaceAddBtn","workspaceRemoveBtn","workspaceEditor",
   "wsNameInput","wsUrlInput","wsTokenInput","wsSaveBtn","wsCancelBtn",
@@ -265,6 +266,9 @@ for(const id of ["topActions","backParentBtn","connState","banner","bannerText",
 elsById["waitingInputPanel"].setAttribute("role", "status");
 elsById["waitingInputPanel"].setAttribute("aria-live", "polite");
 elsById["waitingInputError"].setAttribute("role", "alert");
+// 异步待回答问题面板（index.html 的静态属性；stub 不解析 HTML，须手动补）
+elsById["pendingQuestionsPanel"].setAttribute("role", "region");
+elsById["pendingQuestionsPanel"].setAttribute("aria-label", "待回答的问题");
 // 任务折叠条的计数徽标 span（index.html 里的 .tasks-toggle-label）——
 // 面板计数断言需要它；其余 stub 元素都是裸 El，不建子树。
 const _togLabel = new El("span");
@@ -1408,6 +1412,158 @@ async function main(){
     chk("snapshot skipped", !t.includes("SNAPSHOT-SHOULD-BE-SKIPPED"));
     chk("status Busy", elsById["chatStatus"].textContent==="处理中", "="+elsById["chatStatus"].textContent);
     chk("cancel enabled when busy", elsById["cancelBtn"].disabled===false);
+
+    // ---- 异步 request_user_input（status 帧 pending_questions）：独立面板，
+    //      每张卡片按自己的 call_id 回答；会话不被阻塞，普通 composer 照常
+    //      可用。与阻塞式 WaitingInput 并存时两者都可见。 ----
+    state.sessionId = "s1";
+    const pqPanel = elsById["pendingQuestionsPanel"];
+    const pqList = elsById["pendingQuestionsList"];
+    const pqCards = () => pqList.querySelectorAll(".pending-question-card");
+    const pqInput = (i) => pqCards()[i].querySelector(".pending-question-input");
+    const pqButton = (i) => pqCards()[i].querySelector(".pending-question-submit");
+    const pqPosts = () => FETCH_HEADERS.map((x, i) => ({...x, body: FETCH_BODIES[i]}))
+      .filter((x) => x.method === "POST" && x.url.endsWith("/prompt"));
+    const pqFrame = (list) => ({status: "Idle", pending_questions: list});
+    const q1 = pqFrame([{call_id: "c1", questions: [{id: "q1", prompt: "Which?"}]}]);
+
+    applyStatus(q1);
+    chk("pending questions panel renders one card with prompt and answer control",
+        pqPanel.hidden === false && pqList.textContent.includes("Which?")
+        && pqCards().length === 1 && pqButton(0).textContent === "回答"
+        && pqInput(0).getAttribute("aria-label") === "回答：Which?"
+        && pqPanel.getAttribute("role") === "region"
+        && pqPanel.getAttribute("aria-label") === "待回答的问题");
+    chk("pending questions do not take over the composer",
+        elsById["promptInput"].disabled === false && elsById["sendBtn"].disabled === false
+        && elsById["promptLabel"].textContent === "消息" && elsById["sendBtn"].textContent === "发送"
+        && elsById["waitingInputPanel"].hidden === true);
+
+    // 阻塞式 WaitingInput 与异步卡片并存：阻塞面板接管 composer，卡片仍可回答。
+    applyStatus({status: "WaitingInput", call_id: "blocking",
+      questions: [{id: "answer", prompt: "阻塞问题？"}], pending_questions: q1.pending_questions});
+    chk("blocking wait and async cards stay independently visible",
+        elsById["waitingInputPanel"].hidden === false && pqPanel.hidden === false
+        && elsById["promptLabel"].textContent === "回答当前问题"
+        && pqInput(0).disabled === false);
+    applyStatus(q1);
+    chk("leaving blocking wait keeps async card intact",
+        elsById["waitingInputPanel"].hidden === true && pqCards().length === 1
+        && elsById["promptLabel"].textContent === "消息");
+
+    // 幂等：重复相同状态帧不重建 DOM，半途输入与焦点（节点身份）都保留。
+    const pqCardNode = pqCards()[0];
+    pqInput(0).value = "B";
+    applyStatus(q1);
+    chk("identical status frames preserve typed answer and card node",
+        pqCards().length === 1 && pqCards()[0] === pqCardNode
+        && pqInput(0).value === "B" && pqInput(0).disabled === false);
+
+    // Enter 提交：POST 绑定该卡片的 call_id；在途禁用，成功后标记已提交。
+    promptPostDeferred = true;
+    const pqBefore = pqPosts().length;
+    let pqEnterPrevented = false;
+    for (const fn of pqInput(0)._listeners.keydown || []) {
+      fn({key: "Enter", isComposing: false, preventDefault(){ pqEnterPrevented = true; }});
+    }
+    await flush();
+    const pqPosted = pqPosts().slice(pqBefore);
+    chk("pending answer posts exact text and its own call id",
+        pqEnterPrevented && pqPosted.length === 1
+        && pqPosted[0].body === JSON.stringify({text: "B", call_id: "c1"}),
+        "posts=" + JSON.stringify(pqPosted.map((x) => x.body)));
+    chk("card is disabled while its answer is in flight",
+        pqInput(0).disabled === true && pqButton(0).disabled === true
+        && pqButton(0).textContent === "提交中…");
+    promptPostResolve(resp(202, {}));
+    await flush();
+    chk("accepted answer keeps text and marks the card submitted",
+        pqInput(0).value === "B" && pqCardNode.classList.contains("submitted")
+        && pqButton(0).textContent === "已提交" && pqInput(0).disabled === true
+        && elsById["promptInput"].disabled === false,
+        "btn=" + pqButton(0).textContent);
+    promptPostDeferred = false;
+    applyStatus(q1);
+    chk("submitted card stays marked until a status frame removes it",
+        pqCards().length === 1 && pqButton(0).textContent === "已提交"
+        && pqInput(0).disabled === true && pqInput(0).value === "B");
+
+    // 下一次 status 帧不再包含该问题 → 面板隐藏、卡片移除。
+    applyStatus(pqFrame([]));
+    chk("empty pending questions hide the panel and remove cards",
+        pqPanel.hidden === true && pqCards().length === 0 && state.pendingQuestions === null);
+
+    // 多个问题 → 多张卡片；各自携带自己的 call_id，可任意顺序回答。
+    applyStatus(pqFrame([
+      {call_id: "c1", questions: [{id: "q1", prompt: "第一个？"}]},
+      {call_id: "c2", questions: [{id: "q2", prompt: "第二个？"}]},
+    ]));
+    chk("two pending questions render two independent cards",
+        pqCards().length === 2 && pqList.textContent.includes("第一个？")
+        && pqList.textContent.includes("第二个？"));
+    pqInput(1).value = "乙";
+    const pqBefore2 = pqPosts().length;
+    const pqClick = (i) => { for (const fn of pqButton(i)._listeners.click || []) fn(); };
+    pqClick(1);
+    await flush();
+    chk("answering the second card sends the second call id",
+        pqPosts().length === pqBefore2 + 1
+        && pqPosts()[pqBefore2].body === JSON.stringify({text: "乙", call_id: "c2"})
+        && pqButton(1).textContent === "已提交");
+    chk("first card remains untouched and answerable",
+        pqButton(0).textContent === "回答" && pqInput(0).disabled === false
+        && pqInput(1).value === "乙");
+
+    // 增量对账：新增/删除一张卡不重建其他卡——草稿、节点身份、已提交/在途
+    // 状态都必须留在原卡片上。
+    const keepCard = pqCards()[0];
+    pqInput(0).value = "草稿保留";
+    applyStatus(pqFrame([
+      {call_id: "c1", questions: [{id: "q1", prompt: "第一个？"}]},
+      {call_id: "c3", questions: [{id: "q3", prompt: "第三个？"}]},
+    ]));
+    chk("adding/removing a question preserves the other card's draft and node",
+        pqCards().length === 2 && pqCards()[0] === keepCard
+        && pqInput(0).value === "草稿保留"
+        && pqList.textContent.includes("第三个？")
+        && !pqList.textContent.includes("第二个？"));
+
+    // 失败：既有 banner + 保留文本 + 重新可编辑。
+    applyStatus(pqFrame([{call_id: "c3", questions: [{id: "q3", prompt: "第三个？"}]}]));
+    const pqBeforeEmpty = pqPosts().length;
+    for (const fn of pqInput(0)._listeners.keydown || []) {
+      fn({key: "Enter", isComposing: false, preventDefault(){}});
+    }
+    await flush();
+    chk("empty pending answer is rejected without a request",
+        pqPosts().length === pqBeforeEmpty
+        && pqCards()[0].textContent.includes("请输入回答后再提交"));
+    pqInput(0).value = "丙";
+    promptPostStatus = 409;
+    pqClick(0);
+    await flush();
+    chk("failed pending answer re-enables card and keeps text",
+        pqInput(0).value === "丙" && pqInput(0).disabled === false
+        && pqButton(0).textContent === "回答"
+        && elsById["bannerText"].textContent.includes("HTTP 409"),
+        "banner=" + elsById["bannerText"].textContent);
+    promptPostStatus = 202;
+
+    // Finished：保留的卡片输入被禁用。
+    applyStatus({status: "Finished",
+      pending_questions: [{call_id: "c3", questions: [{id: "q3", prompt: "第三个？"}]}]});
+    chk("Finished disables pending question inputs", pqCards().length === 1
+        && pqInput(0).disabled === true && pqButton(0).disabled === true);
+
+    // openSession 清空面板（与 clearWaitingInput 同一会话切换路径）。
+    applyStatus(pqFrame([{call_id: "c4", questions: [{id: "q4", prompt: "切走前？"}]}]));
+    chk("pending card visible before session switch", pqPanel.hidden === false && pqCards().length === 1);
+    openSession("s2");
+    await flush(); await flush();
+    chk("openSession clears pending questions panel",
+        pqPanel.hidden === true && pqCards().length === 0 && state.pendingQuestions === null);
+    openSession("s1");
+    await flush(); await flush();
 
     // 会话行删除按钮已移除（用户决策：pin + archive 已覆盖整理需求，删除
     // 按钮冗余且不可恢复）：当前树行没有 delete 按钮，DELETE 路径无 UI 入口。
@@ -9295,6 +9451,17 @@ print(("PASS" if _task_connector_ok else "FAIL") + " task child dashed trunk/elb
 _m = re.search(r'\.composer-actions\s*\{([^}]*)\}', _css)
 _css_ok = bool(_m and re.search(r'margin-left:\s*auto', _m.group(1)))
 print(("PASS" if _css_ok else "FAIL") + " composer-actions margin-left:auto in style.css")
+# 异步问题卡片在 390px 下不横向溢出：行 flex + 输入框 min-width:0 可收缩，
+# 按钮不收缩不换行；列表超高时自身纵向滚动。
+_pq_input_rule = re.search(r'\.pending-question-input\s*\{([^}]*)\}', _css)
+_pq_row_rule = re.search(r'\.pending-question-row\s*\{([^}]*)\}', _css)
+_pq_list_rule = re.search(r'\.pending-questions-list\s*\{([^}]*)\}', _css)
+_pq_css_ok = bool(
+    _pq_input_rule and re.search(r'min-width:\s*0', _pq_input_rule.group(1))
+    and _pq_row_rule and re.search(r'display:\s*flex', _pq_row_rule.group(1))
+    and re.search(r'\.pending-question-submit\s*\{[^}]*flex:\s*0 0 auto', _css)
+    and _pq_list_rule and re.search(r'overflow-y:\s*auto', _pq_list_rule.group(1)))
+print(("PASS" if _pq_css_ok else "FAIL") + " pending questions cards cannot overflow at 390px")
 # 状态 spinner（纯 CSS 伪元素）：busy/compacting 前置转圈，动画 + reduced-motion 降级
 _spin_ok = bool(re.search(r'\.composer-status\.busy::before[^{]*\{[^}]*animation:[^;}]*composer-status-spin', _css)
                 and re.search(r'@keyframes\s+composer-status-spin', _css)

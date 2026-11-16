@@ -1769,6 +1769,177 @@ function clearWaitingInput(restoreDraft = true) {
   els.sendBtn.textContent = "发送";
 }
 
+/* =====================================================================
+ * 异步 request_user_input（status 帧的 pending_questions）：
+ * 独立于阻塞式 WaitingInput 的回答面板。会话不被阻塞——普通 composer
+ * 保持可用；每张卡片只绑定自己的 call_id，可任意顺序回答。
+ * ===================================================================*/
+function normalizePendingQuestions(payload) {
+  const raw = payload && Array.isArray(payload.pending_questions) ? payload.pending_questions : [];
+  const out = [];
+  for (const item of raw) {
+    if (!item || typeof item.call_id !== "string" || !item.call_id) continue;
+    const questions = (Array.isArray(item.questions) ? item.questions : [])
+      .filter((q) => q && typeof q.prompt === "string");
+    if (questions.length) out.push({ callId: item.call_id, questions });
+  }
+  return out;
+}
+
+function buildPendingQuestionCard(item) {
+  const promptText = item.questions.map((q) => q.prompt).join("\n");
+  const root = el("article", "pending-question-card");
+  root.setAttribute("data-call-id", item.callId);
+  root.appendChild(el("p", "pending-question-prompt", promptText));
+  const row = el("div", "pending-question-row");
+  const field = el("label", "pending-question-field");
+  field.appendChild(el("span", "sr-only", "回答：" + promptText));
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "pending-question-input";
+  input.placeholder = "输入回答…";
+  input.autocomplete = "off";
+  input.spellcheck = "false";
+  input.setAttribute("aria-label", "回答：" + promptText);
+  field.appendChild(input);
+  row.appendChild(field);
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "pending-question-submit primary";
+  button.textContent = "回答";
+  row.appendChild(button);
+  root.appendChild(row);
+  const status = el("p", "pending-question-status");
+  status.setAttribute("role", "status");
+  root.appendChild(status);
+  const entry = { root, input, button, status, pending: false, submitted: false };
+  // 键盘可达：Enter 提交本卡片（单行 input，无需 Shift+Enter 换行）。
+  button.addEventListener("click", () => submitPendingAnswer(item.callId));
+  input.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Enter" || ev.isComposing || ev.keyCode === 229) return;
+    ev.preventDefault();
+    submitPendingAnswer(item.callId);
+  });
+  input.addEventListener("input", () => {
+    if (!entry.pending && !entry.submitted) status.textContent = "";
+  });
+  return entry;
+}
+
+function syncPendingQuestionCards() {
+  const finished = !!state.status && state.status.startsWith("Finished");
+  for (const entry of state.pendingCards.values()) {
+    const busy = !!entry.pending;
+    // 已提交的卡片保持只读，直到下一次 status 帧把它移除（避免重复回答）。
+    const locked = finished || busy || !!entry.submitted;
+    entry.input.disabled = locked;
+    entry.button.disabled = locked;
+    entry.root.classList.toggle("submitted", !!entry.submitted);
+    entry.root.classList.toggle("sending", busy);
+    entry.button.textContent = entry.submitted ? "已提交" : (busy ? "提交中…" : "回答");
+  }
+}
+
+function clearPendingQuestions() {
+  state.pendingQuestions = null;
+  state.pendingCards = new Map();
+  if (els.pendingQuestionsList) els.pendingQuestionsList.textContent = "";
+  if (els.pendingQuestionsPanel) els.pendingQuestionsPanel.hidden = true;
+}
+
+function renderPendingQuestions(payload) {
+  const items = normalizePendingQuestions(payload);
+  if (!items.length) {
+    clearPendingQuestions();
+    return;
+  }
+  const incoming = new Set(items.map((item) => item.callId));
+  // Reconcile by call_id, never rebuild the whole list: a new/removed question
+  // must not wipe another card's half-typed answer, focus, in-flight submit or
+  // submitted state.
+  for (const [callId, entry] of state.pendingCards) {
+    if (!incoming.has(callId)) {
+      entry.root.remove();
+      state.pendingCards.delete(callId);
+    }
+  }
+  // Reorder only when the next expected node differs. Unconditionally
+  // appendChild-ing an already-positioned card detaches/reinserts it, which
+  // drops focus in a real DOM and needlessly rewrites the panel every frame.
+  let cursor = els.pendingQuestionsList.firstChild;
+  for (const item of items) {
+    const promptText = item.questions.map((q) => q.prompt).join("\n");
+    let entry = state.pendingCards.get(item.callId);
+    if (!entry) {
+      entry = buildPendingQuestionCard(item);
+      entry.promptText = promptText;
+      state.pendingCards.set(item.callId, entry);
+    } else if (entry.promptText !== promptText) {
+      // Same call id, changed prompt text: update labels in place; keep the
+      // input value and submission state.
+      const prompt = entry.root.querySelector(".pending-question-prompt");
+      if (prompt) prompt.textContent = promptText;
+      const label = entry.root.querySelector(".pending-question-field .sr-only");
+      if (label) label.textContent = "回答：" + promptText;
+      entry.input.setAttribute("aria-label", "回答：" + promptText);
+      entry.promptText = promptText;
+    }
+    if (entry.root === cursor) {
+      cursor = cursor.nextSibling;   // already in place: do not touch the node
+    } else {
+      els.pendingQuestionsList.insertBefore(entry.root, cursor);
+    }
+  }
+  state.pendingQuestions = items;
+  els.pendingQuestionsPanel.hidden = false;
+  syncPendingQuestionCards();
+}
+
+/* 回答一张卡片：POST 现有 /prompt，携带该卡片自己的 call_id。失败时保留
+   文本并显示既有 banner；成功后卡片标记「已提交」，等下一次 status 帧移除。 */
+async function submitPendingAnswer(callId) {
+  const entry = state.pendingCards.get(callId);
+  if (!entry || entry.pending || entry.submitted || !state.sessionId) return;
+  const text = entry.input.value.trim();
+  if (!text) {
+    entry.status.textContent = "请输入回答后再提交。";
+    entry.input.focus();
+    return;
+  }
+  const captured = {
+    sid: state.sessionId,
+    wid: state.workspace ? state.workspace.id : "",
+    entry,
+  };
+  const current = () => state.sessionId === captured.sid
+    && !!state.workspace && state.workspace.id === captured.wid
+    && state.pendingCards.get(callId) === entry;
+  entry.pending = true;
+  syncPendingQuestionCards();
+  entry.status.textContent = "正在提交…";
+  try {
+    const res = await api("/api/sessions/" + encodeURIComponent(captured.sid) + "/prompt",
+      { method: "POST", body: JSON.stringify({ text, call_id: callId }) });
+    if (!current()) return;   // 切走/面板已重建：迟到结果绝不作用于新卡片
+    if (res.status !== 202) {
+      const detail = await res.text().catch(() => "");
+      if (!current()) return;
+      throw new Error("HTTP " + res.status + (detail ? "：" + detail : ""));
+    }
+    entry.submitted = true;
+    entry.status.textContent = "已提交";
+  } catch (e) {
+    if (!current()) return;
+    setBanner("⚠ 回答未发送：" + e.message, true);
+    entry.status.textContent = "未发送，请重试";
+  } finally {
+    if (state.pendingCards.get(callId) === entry) {
+      entry.pending = false;
+      syncPendingQuestionCards();
+    }
+  }
+}
+
 function applyStatus(statusPayload) {
   const payload = statusPayload && typeof statusPayload === "object"
     ? statusPayload : { status: statusPayload };
@@ -1784,6 +1955,10 @@ function applyStatus(statusPayload) {
   }
   if (state.status === "WaitingInput") renderWaitingInput(payload);
   else clearWaitingInput();
+  // 异步问题与阻塞式 WaitingInput 相互独立：两者可同时可见，普通 composer
+  // 始终可用。空/缺失 pending_questions（含 openSession 的 applyStatus("Idle")）
+  // 会移除面板；相同集合只同步状态，不重建输入框。
+  renderPendingQuestions(payload);
   els.chatStatus.textContent = statusLabel(state.status);
   els.chatStatus.className = "status-chip " + statusChipClass(state.status);
   els.chatStatus.setAttribute("role", "status");

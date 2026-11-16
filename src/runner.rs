@@ -36,6 +36,28 @@ pub struct UserInputRequest {
     pub questions: Vec<UserQuestion>,
 }
 
+/// A process-local question registered by `request_user_input` with
+/// `async: true`. Pure memory: it is never persisted, so a restart drops every
+/// unanswered question (the model's receipt stays in history). `claimed` is
+/// set by the first `submit_prompt_with_call_id` that answers it, under the
+/// same mutex as command admission, so exactly one answer wins.
+struct PendingQuestion {
+    request: UserInputRequest,
+    claimed: bool,
+}
+
+/// The process-local asynchronous questions this session still awaits, in
+/// call-id order (deterministic for status payloads).
+fn pending_questions(shared: &Shared) -> Vec<UserInputRequest> {
+    let mut requests: Vec<UserInputRequest> = shared
+        .pending_questions
+        .values()
+        .map(|pending| pending.request.clone())
+        .collect();
+    requests.sort_by(|a, b| a.call_id.cmp(&b.call_id));
+    requests
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PromptSubmission {
     Answered,
@@ -245,7 +267,9 @@ pub enum SessionCommand {
     /// never creates goals; its `update_goal` tool is intercepted by the
     /// runner with the same transition rules under an id + revision CAS.
     Goal(GoalCommand),
-    /// Structured answer to the currently waiting root input request.
+    /// Structured answer to a root input request: a blocking
+    /// (`WaitingInput`) question is consumed by `await_input_answer`, while an
+    /// asynchronous question is committed as one durable user-shaped Notice.
     Answer {
         call_id: String,
         answers: Vec<(String, String)>,
@@ -352,6 +376,10 @@ struct Shared {
     /// into two winners.
     waiting_input: Option<UserInputRequest>,
     input_claimed: bool,
+    /// Process-local asynchronous questions (`request_user_input` with
+    /// `async: true`), keyed by the tool call id. Nothing here is durable: a
+    /// restart drops unanswered questions.
+    pending_questions: std::collections::HashMap<String, PendingQuestion>,
     compaction_streaming: bool,
     // Producer-owned web projection state. It is updated where usage is
     // emitted, rather than reconstructed from presentation text on attach.
@@ -420,6 +448,54 @@ impl Shared {
             self.emit_presentation(event);
         }
     }
+
+    /// Re-publish the CURRENT status so an `event: status` frame that carries
+    /// the pending-question array (process-local state outside `SessionStatus`)
+    /// is never stale. The value is unchanged, so no metadata touch happens.
+    fn republish_status(&mut self) {
+        let current = self.status.borrow().clone();
+        self.status.send_replace(current);
+    }
+
+    /// Register one asynchronous question (`async: true`). Pure memory: the
+    /// model already got its receipt, nothing here is persisted.
+    fn register_pending_question(&mut self, request: UserInputRequest) {
+        self.pending_questions.insert(
+            request.call_id.clone(),
+            PendingQuestion {
+                request,
+                claimed: false,
+            },
+        );
+        self.republish_status();
+    }
+
+    /// The user-shaped Notice an accepted answer commits. `None` means the id
+    /// is unknown, already answered, not claimed, or carries an empty answer:
+    /// such a command is ignored, never turned into a second Notice.
+    fn answer_notice(&self, call_id: &str, answers: &[(String, String)]) -> Option<String> {
+        let pending = self
+            .pending_questions
+            .get(call_id)
+            .filter(|pending| pending.claimed)?;
+        let question = pending.request.questions.first()?;
+        let (id, value) = answers.first()?;
+        if id != &question.id || value.trim().is_empty() {
+            return None;
+        }
+        Some(format!(
+            "[question {}]\nQuestion: {}\n[answer]\n{}",
+            pending.request.call_id, question.prompt, value
+        ))
+    }
+
+    /// Drop a committed answer's registration (one Notice per question) and
+    /// refresh the status frame so the question disappears from it.
+    fn resolve_pending_question(&mut self, call_id: &str) {
+        if self.pending_questions.remove(call_id).is_some() {
+            self.republish_status();
+        }
+    }
 }
 
 /// Cloneable frontend end. Dropping every handle closes the runner command channel.
@@ -437,6 +513,15 @@ pub struct WeakSessionHandle {
 }
 
 impl WeakSessionHandle {
+    /// The process-local asynchronous questions this session still awaits
+    /// (`call_id` order). Losing the runner state yields an empty list.
+    pub fn pending_questions(&self) -> Vec<UserInputRequest> {
+        match self.shared.upgrade() {
+            Some(shared) => pending_questions(&shared.lock().unwrap()),
+            None => Vec::new(),
+        }
+    }
+
     /// Queue an agent message only while both the runner state and command
     /// channel still exist. Losing either is a normal live-endpoint failure.
     pub fn send_agent_message(&self, source: String, body: String) -> Result<(), String> {
@@ -538,8 +623,9 @@ impl SessionHandle {
         self.submit_prompt_with_call_id(None, prompt)
     }
 
-    /// Submit text with an optional call-id binding. A provided id must match
-    /// the currently open request; absence is never allowed to infer a wait.
+    /// Submit text with an optional call-id binding. A provided id must name
+    /// the currently open blocking request or an unanswered asynchronous
+    /// question; absence is never allowed to infer a wait.
     pub fn submit_prompt_with_call_id(
         &self,
         call_id: Option<String>,
@@ -550,26 +636,41 @@ impl SessionHandle {
             return PromptSubmission::Closed;
         }
         if let Some(request) = shared.waiting_input.as_ref() {
-            if call_id.as_deref() != Some(request.call_id.as_str()) || shared.input_claimed {
-                return PromptSubmission::Conflict;
+            if call_id.as_deref() == Some(request.call_id.as_str()) {
+                if shared.input_claimed {
+                    return PromptSubmission::Conflict;
+                }
+                let id = request.questions[0].id.clone();
+                if self
+                    .commands
+                    .send(SessionCommand::Answer {
+                        call_id: request.call_id.clone(),
+                        answers: vec![(id, prompt)],
+                    })
+                    .is_err()
+                {
+                    shared.commands_open = false;
+                    return PromptSubmission::Closed;
+                }
+                shared.input_claimed = true;
+                return PromptSubmission::Answered;
             }
-            let id = request.questions[0].id.clone();
-            if self
-                .commands
-                .send(SessionCommand::Answer {
-                    call_id: request.call_id.clone(),
-                    answers: vec![(id, prompt)],
-                })
-                .is_err()
+            // A blocking question is open, but this id names an asynchronous
+            // one: answer that (any order, any time) or reject.
+            if let Some(id) = call_id.as_deref()
+                && let Some(submission) = self.claim_async_answer(&mut shared, id, prompt)
             {
-                shared.commands_open = false;
-                return PromptSubmission::Closed;
+                return submission;
             }
-            shared.input_claimed = true;
-            return PromptSubmission::Answered;
-        }
-        if call_id.is_some() {
             return PromptSubmission::Conflict;
+        }
+        if let Some(id) = call_id {
+            // Asynchronous questions are answerable while a turn runs and
+            // from an idle session alike; an unknown or already answered id
+            // is a conflict, never a prompt.
+            return self
+                .claim_async_answer(&mut shared, &id, prompt)
+                .unwrap_or(PromptSubmission::Conflict);
         }
         let command = SessionCommand::Prompt(prompt.clone());
         if self.commands.send(command).is_err() {
@@ -583,6 +684,41 @@ impl SessionHandle {
             shared.emit_presentation(AgentEvent::PromptQueued(prompt));
         }
         PromptSubmission::Queued
+    }
+
+    /// Claim one process-local asynchronous question and send its answer
+    /// command. `None` means no such unclaimed question (unknown id, already
+    /// answered, or an empty answer that must leave the question answerable).
+    fn claim_async_answer(
+        &self,
+        shared: &mut Shared,
+        call_id: &str,
+        prompt: String,
+    ) -> Option<PromptSubmission> {
+        if prompt.trim().is_empty() {
+            return None;
+        }
+        let question = shared
+            .pending_questions
+            .get(call_id)
+            .filter(|pending| !pending.claimed)
+            .and_then(|pending| pending.request.questions.first())
+            .map(|question| question.id.clone())?;
+        if self
+            .commands
+            .send(SessionCommand::Answer {
+                call_id: call_id.to_owned(),
+                answers: vec![(question, prompt)],
+            })
+            .is_err()
+        {
+            shared.commands_open = false;
+            return Some(PromptSubmission::Closed);
+        }
+        if let Some(pending) = shared.pending_questions.get_mut(call_id) {
+            pending.claimed = true;
+        }
+        Some(PromptSubmission::Answered)
     }
 
     /// Queue a prompt with an image attached; the image rides along as a
@@ -730,6 +866,12 @@ impl SessionHandle {
             .map_err(|_| anyhow::anyhow!("session attach reply channel is closed"))
     }
 
+    /// The process-local asynchronous questions this session still awaits
+    /// (`call_id` order); source of the `pending_questions` status field.
+    pub fn pending_questions(&self) -> Vec<UserInputRequest> {
+        pending_questions(&self.shared.lock().unwrap())
+    }
+
     pub fn snapshot(&self) -> Vec<AgentEvent> {
         self.shared
             .lock()
@@ -780,6 +922,24 @@ impl TestSessionEmitter {
         shared.input_claimed = false;
         shared.status.send_replace(status);
     }
+    /// Test-only: register one process-local asynchronous question exactly as
+    /// the runner does, so status/answer tests can exercise the map without
+    /// driving a full turn.
+    pub(crate) fn register_pending_question(&self, request: UserInputRequest) {
+        self.shared
+            .lock()
+            .unwrap()
+            .register_pending_question(request);
+    }
+    /// Test-only: mirror the runner's post-commit removal of an answered
+    /// asynchronous question (the runner only removes it after the Notice is
+    /// durably appended).
+    pub(crate) fn resolve_pending_question(&self, call_id: &str) {
+        self.shared
+            .lock()
+            .unwrap()
+            .resolve_pending_question(call_id);
+    }
 }
 #[cfg(test)]
 pub(crate) fn session_test_channel() -> (
@@ -801,6 +961,7 @@ pub(crate) fn session_test_channel() -> (
         commands_open: true,
         waiting_input: None,
         input_claimed: false,
+        pending_questions: std::collections::HashMap::new(),
         goal: None,
         live_model: None,
         goal_children: std::collections::HashSet::new(),
@@ -918,6 +1079,13 @@ enum PendingCommand {
     Compact,
     Goal(GoalCommand),
     Continue(Option<u64>),
+    /// A human answer to a process-local asynchronous question. It becomes
+    /// one durable user-shaped Notice at the next safe point; it is never a
+    /// prompt and never resumes a waiting turn (that is the blocking path).
+    Answer {
+        call_id: String,
+        answers: Vec<(String, String)>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1203,6 +1371,7 @@ impl SessionRunner {
             commands_open: true,
             waiting_input: None,
             input_claimed: false,
+            pending_questions: std::collections::HashMap::new(),
             goal,
             live_model: None,
             goal_children: std::collections::HashSet::new(),
@@ -1917,6 +2086,66 @@ impl SessionRunner {
         self.status(status);
     }
 
+    /// Register an asynchronous question (`request_user_input` with
+    /// `async: true`) and keep the turn going. Pure memory: a restart drops
+    /// every unanswered question, while the model's receipt stays in history.
+    fn register_pending_question(&mut self, request: UserInputRequest) {
+        self.shared
+            .lock()
+            .unwrap()
+            .register_pending_question(request);
+    }
+
+    /// Commit every queued asynchronous answer as exactly one durable,
+    /// user-shaped Notice each:
+    ///
+    /// ```text
+    /// [question {call_id}]
+    /// Question: {prompt}
+    /// [answer]
+    /// {answer}
+    /// ```
+    ///
+    /// The command is only consumed when `Shared` still holds the claimed
+    /// question, so an unknown, stale, or repeated answer never writes a
+    /// second Notice. A committed answer arms one ordinary provider request
+    /// (`pending_regular_reaction`): an idle session starts a new turn, while
+    /// a running turn consumes it at its next request boundary with the
+    /// Notice already in context.
+    async fn commit_answers(&mut self) -> anyhow::Result<bool> {
+        let mut committed = false;
+        while let Some(index) = self
+            .pending
+            .iter()
+            .position(|command| matches!(command, PendingCommand::Answer { .. }))
+        {
+            let Some(PendingCommand::Answer { call_id, answers }) = self.pending.remove(index)
+            else {
+                unreachable!("matched a queued answer")
+            };
+            let notice = self
+                .shared
+                .lock()
+                .unwrap()
+                .answer_notice(&call_id, &answers);
+            let Some(text) = notice else {
+                // Unknown, already answered, or unclaimed: ignore, do not
+                // panic and do not duplicate.
+                continue;
+            };
+            self.commit(SessionEntry::Notice { text }).await?;
+            self.shared
+                .lock()
+                .unwrap()
+                .resolve_pending_question(&call_id);
+            committed = true;
+        }
+        if committed {
+            self.pending_regular_reaction = true;
+        }
+        Ok(committed)
+    }
+
     async fn await_input_answer(
         &mut self,
         call: &ToolCall,
@@ -2088,8 +2317,12 @@ impl SessionRunner {
                     }
                     // Goal mutations and continuation resets are dropped
                     // while terminating: the session is ending, nothing will
-                    // apply them.
-                    Some(PendingCommand::Goal(_)) | Some(PendingCommand::Continue(_)) => {
+                    // apply them. An asynchronous answer is dropped for the
+                    // same reason: its Notice needs a provider request that
+                    // will never come, and nothing was promised durably.
+                    Some(PendingCommand::Goal(_))
+                    | Some(PendingCommand::Continue(_))
+                    | Some(PendingCommand::Answer { .. }) => {
                         self.pending.pop_front();
                     }
                     None => unreachable!(),
@@ -2163,7 +2396,15 @@ impl SessionRunner {
                 self.invalidate_trigger_for_cancel();
                 self.release_steering()
             }
-            SessionCommand::Answer { .. } => Steering::None,
+            SessionCommand::Answer { call_id, answers } => {
+                // A blocking answer never reaches here (`await_input_answer`
+                // consumes the matching command); this is an asynchronous
+                // answer, committed as a durable Notice at the next safe
+                // point instead of becoming a prompt.
+                self.pending
+                    .push_back(PendingCommand::Answer { call_id, answers });
+                Steering::None
+            }
             SessionCommand::WebAttach(reply) => {
                 self.pending_web_attaches.push(reply);
                 Steering::None
@@ -2716,6 +2957,23 @@ impl SessionRunner {
                     unreachable!()
                 };
                 self.arm_goal_continuation(budget);
+                continue;
+            }
+            // A human answer to an asynchronous question is durable ingress,
+            // never a prompt: commit it as one user-shaped Notice before any
+            // turn decision. The `pending_regular_reaction` it arms below
+            // gives an idle session its provider request.
+            if self
+                .pending
+                .iter()
+                .any(|command| matches!(command, PendingCommand::Answer { .. }))
+            {
+                if let Err(error) = self.commit_answers().await {
+                    self.terminate(SessionResult::Failed(format!("{error:#}")), Vec::new())
+                        .await;
+                    return;
+                }
+                self.publish_web_attaches();
                 continue;
             }
             // A fresh durable ingress is independent of Goal maintenance.
@@ -3317,8 +3575,8 @@ impl SessionRunner {
                             }
                             continue;
                         }
-                        let questions = match crate::tools::parse_questions(&call.arguments) {
-                            Ok(questions) => questions,
+                        let parsed = match crate::tools::parse_questions(&call.arguments) {
+                            Ok(parsed) => parsed,
                             Err(error) => {
                                 let entry = Message::Tool {
                                     call_id: call.id.clone(),
@@ -3349,10 +3607,45 @@ impl SessionRunner {
                                 continue;
                             }
                         };
-                        self.begin_waiting_input(UserInputRequest {
+                        let questions = vec![parsed.question];
+                        let request = UserInputRequest {
                             call_id: call.id.clone(),
                             questions: questions.clone(),
-                        });
+                        };
+                        if parsed.is_async {
+                            // Async: register the process-local question and
+                            // finish the call with a receipt. No WaitingInput,
+                            // no suspension — the answer arrives later as a
+                            // user-shaped Notice, and this turn keeps going.
+                            self.register_pending_question(request);
+                            let receipt = format!(
+                                "question {} asked; you may continue. The answer will arrive \
+                                 later as a user message with the original question.",
+                                call.id
+                            );
+                            match self
+                                .finish_intercepted_tool(&call, Ok(ToolOutput::text(receipt)))
+                                .await
+                            {
+                                Ok(Steering::None) => {}
+                                Ok(steering) => {
+                                    if self.release_after_preempt(steering) {
+                                        return;
+                                    }
+                                    break 'turn;
+                                }
+                                Err(error) => {
+                                    self.terminate(
+                                        SessionResult::Failed(format!("{error:#}")),
+                                        Vec::new(),
+                                    )
+                                    .await;
+                                    return;
+                                }
+                            }
+                            continue;
+                        }
+                        self.begin_waiting_input(request);
                         let waited = self.await_input_answer(&call).await;
                         match waited.outcome {
                             WaitOutcome::Completed(Ok(answers)) => {
@@ -3660,6 +3953,14 @@ impl SessionRunner {
                         return;
                     }
                 }
+                // An answer that arrived while this batch was in flight is
+                // committed here too, so the NEXT provider call of this same
+                // turn already sees it in context.
+                if let Err(error) = self.commit_answers().await {
+                    self.terminate(SessionResult::Failed(format!("{error:#}")), Vec::new())
+                        .await;
+                    return;
+                }
                 // This full sibling-batch safe point is also the last
                 // chance for steering before another automatic Goal call.
                 // Defer queued Prompt/Goal/Compact work to the outer FIFO
@@ -3824,8 +4125,20 @@ impl SessionRunner {
                             if !committed && goal_turn && !human_required_continuation {
                                 break 'turn;
                             }
-                            // Completion may arrive while compaction was in
-                            // flight; commit it before the next provider call.
+                            // Completion and asynchronous-question answers may
+                            // arrive while compaction was in flight; commit
+                            // both before the next provider call. The manual
+                            // requested-compaction path goes straight back to
+                            // await_round, so this is its only safe point
+                            // between the compaction and that request.
+                            if let Err(error) = self.commit_answers().await {
+                                self.terminate(
+                                    SessionResult::Failed(format!("{error:#}")),
+                                    Vec::new(),
+                                )
+                                .await;
+                                return;
+                            }
                             if let Err(error) = self.commit_backgrounds().await {
                                 self.terminate(
                                     SessionResult::Failed(format!("{error:#}")),
