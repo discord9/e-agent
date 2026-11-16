@@ -79,8 +79,11 @@ pub(crate) fn is_retryable_http_status(status: reqwest::StatusCode) -> bool {
 /// connection dies mid-stream) or a data frame that is not valid JSON. The
 /// request never completed, so re-running the whole idempotent request is
 /// safe. Well-formed provider-level errors (response.failed /
-/// response.incomplete / response.error, chat stream error chunks, incomplete
-/// tool calls) are NOT classified as decode errors and are not retried.
+/// response.incomplete / response.error and chat stream error chunks) are NOT
+/// classified as decode errors and are not retried. The chat wire's typed
+/// IncompleteToolCall is included because it is a truncated tool call, not a
+/// well-formed provider error; Codex's own incomplete-function-call path stays
+/// non-retryable.
 pub(crate) fn is_stream_decode_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause.is::<eventsource_stream::EventStreamError<reqwest::Error>>()
