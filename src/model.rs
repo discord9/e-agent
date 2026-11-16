@@ -106,8 +106,9 @@ impl Model for ConfiguredModel {
 
 /// A provider stream that ended with a tool call missing its id or name.
 /// This is a truncation signature (proxy/network cut, or a provider bug), not
-/// a semantic failure: it is safe to retry the whole idempotent request once
-/// instead of poisoning the session with an unusable turn.
+/// a semantic failure: it is safe to retry the whole idempotent request
+/// within the existing bounded HTTP retry budget instead of poisoning the
+/// session with an unusable turn.
 #[derive(Debug)]
 pub(crate) struct IncompleteToolCall;
 
