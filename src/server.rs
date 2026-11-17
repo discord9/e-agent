@@ -998,8 +998,10 @@ struct SidebarSnapshot {
     child_counts: HashMap<String, i64>,
     /// Main-session id → the cached two-line summary from the desktop-pet
     /// summarizer (`short` = sidebar phrase, `full` = pet text/hover title).
-    /// Reused verbatim; polling never generates one, so a cold cache simply
-    /// omits the key (and the sidebar omits the activity line).
+    /// Covers every cached main session in the merged list, including rows the
+    /// compact window dropped (the full list can render them). Reused
+    /// verbatim; polling never generates one, so a cold cache simply omits the
+    /// key (and the sidebar omits the activity line).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     summaries: HashMap<String, SidebarSummary>,
 }
@@ -1097,12 +1099,18 @@ fn compact_sidebar(merged: Vec<SessionMeta>) -> SidebarSnapshot {
     }
 }
 
-/// Attach the cached summaries to the sidebar snapshot. Main sessions only
+/// Collect the cached summaries for EVERY main session in the merged list,
+/// not just the compact window `compact_sidebar` selects: the full list can
+/// render a row the 16-root window dropped (17th root, archived live root),
+/// and this map is what lets its activity line appear. Main sessions only
 /// (subagent rows stay bare in this pass) and cache-only: the desktop pet
 /// already writes these at turn end, so a poll never triggers a model call.
-fn attach_sidebar_summaries(snapshot: &mut SidebarSnapshot, state: &AppState) {
-    for meta in snapshot
-        .sessions
+fn collect_sidebar_summaries(
+    merged: &[SessionMeta],
+    state: &AppState,
+) -> HashMap<String, SidebarSummary> {
+    let mut summaries = HashMap::new();
+    for meta in merged
         .iter()
         .filter(|meta| meta.parent_session_id.is_none())
     {
@@ -1114,7 +1122,7 @@ fn attach_sidebar_summaries(snapshot: &mut SidebarSnapshot, state: &AppState) {
             continue;
         }
         let full = entry.text.trim();
-        snapshot.summaries.insert(
+        summaries.insert(
             meta.id.clone(),
             SidebarSummary {
                 short: short.to_owned(),
@@ -1126,6 +1134,7 @@ fn attach_sidebar_summaries(snapshot: &mut SidebarSnapshot, state: &AppState) {
             },
         );
     }
+    summaries
 }
 
 /// Whether `?exclude=archived_children` drops this entry: archived sessions
@@ -1386,8 +1395,13 @@ async fn list_sessions(
     timing.merge_ms = phase_start.elapsed().as_millis();
     let serialization_start = std::time::Instant::now();
     let body = if sidebar {
+        // Read the summary cache BEFORE `compact_sidebar` consumes the merged
+        // list: the map covers every cached main session, so a row outside the
+        // compact window still gets its activity line when the full list
+        // renders it.
+        let summaries = collect_sidebar_summaries(&merged, &state);
         let mut snapshot = compact_sidebar(merged);
-        attach_sidebar_summaries(&mut snapshot, &state);
+        snapshot.summaries = summaries;
         record_returned_rows(&mut timing, &snapshot.sessions);
         serde_json::to_vec(&snapshot)
     } else {
@@ -8271,6 +8285,137 @@ model = "deepseek-chat"
             rows.as_array()
                 .is_some_and(|rows| rows.iter().all(|row| row.get("summaries").is_none())),
             "full-list rows gain no summaries field"
+        );
+    }
+
+    /// Regression: the summary map covers EVERY cached main session, not just
+    /// the compact window. With more than `SIDEBAR_WINDOW_ROOTS` live main
+    /// sessions the 17th+ root is dropped from `sessions`, and an archived
+    /// live main is never a window root — both must still ship their cached
+    /// summary (the full list renders those rows on demand). A cached
+    /// subagent summary stays out.
+    #[tokio::test]
+    async fn sidebar_summaries_cover_main_sessions_outside_the_compact_window() {
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let store = SessionStore::Jsonl;
+        let state = Arc::new(AppState {
+            factory: crate::session_factory::SessionFactory::test_factory(root.clone()),
+            registry: Arc::new(SessionRegistry::default()),
+            token: "sekrit".to_owned(),
+            meta_store: SessionStore::Jsonl,
+            summaries: Arc::new(Mutex::new(HashMap::new())),
+            summary_pending: Arc::new(SummaryPending(Mutex::new(HashSet::new()))),
+            shutdown: watch::channel(()).0,
+        });
+        // More live main roots than the compact window keeps.
+        let mut roots = Vec::new();
+        for i in 0..(SIDEBAR_WINDOW_ROOTS + 2) {
+            let id = format!("main-{i:02}");
+            store
+                .create_meta(&root, &id, Some("test-model"), None, None, None, None)
+                .await
+                .unwrap();
+            let (live_id, session) = live_session(&id);
+            state.registry.insert(live_id, session);
+            summary_put(&state, &id, format!("短语{i}"), format!("摘要{i}"));
+            roots.push(id);
+        }
+        // Archived but live main root: never a compact-window root.
+        store
+            .create_meta(
+                &root,
+                "main-archived",
+                Some("test-model"),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let (live_id, session) = live_session("main-archived");
+        state.registry.insert(live_id, session);
+        store
+            .set_archived(&root, "main-archived", true)
+            .await
+            .unwrap();
+        summary_put(
+            &state,
+            "main-archived",
+            "归档短语".to_owned(),
+            "归档摘要".to_owned(),
+        );
+        // Cached subagent: main-only map.
+        store
+            .create_meta(
+                &root,
+                "sub-cached",
+                Some("test-model"),
+                None,
+                Some("main-00"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        store.set_pinned(&root, "sub-cached", true).await.unwrap();
+        summary_put(
+            &state,
+            "sub-cached",
+            "子短语".to_owned(),
+            "子摘要".to_owned(),
+        );
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions?mode=sidebar")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let snapshot: SidebarSnapshot = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        let outside: Vec<&String> = roots
+            .iter()
+            .filter(|id| !snapshot.sessions.iter().any(|m| &m.id == *id))
+            .collect();
+        assert!(
+            !outside.is_empty(),
+            "the compact window must overflow for this regression to mean anything"
+        );
+        for id in &outside {
+            assert!(
+                snapshot.summaries.contains_key(*id),
+                "summary for a main root outside the compact window must still ship"
+            );
+        }
+        assert!(
+            snapshot.sessions.iter().all(|m| m.id != "main-archived"),
+            "an archived unpinned root is never a compact-window row"
+        );
+        assert!(snapshot.summaries.contains_key("main-archived"));
+        assert!(snapshot.sessions.iter().any(|m| m.id == "sub-cached"));
+        assert!(
+            !snapshot.summaries.contains_key("sub-cached"),
+            "subagent summaries stay out of the map"
+        );
+        assert_eq!(
+            snapshot.summaries.len(),
+            SIDEBAR_WINDOW_ROOTS + 3,
+            "every cached main session ships, window or not"
         );
     }
 
