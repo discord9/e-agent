@@ -1039,16 +1039,18 @@ starts from the parent's **completed-turn prefix** (the in-flight turn is
 excluded, so put everything the child needs in `task`). It stores only a
 `ForkedFrom` marker — the prefix is read back from the parent session — so
 spawning a fork writes O(1) entries, never the parent history. It runs on the
-parent's **current** model and workspace, inheriting the parent's system
-prompt, tool schemas and MCP tool set so its request is a byte-identical prefix
-and reuses the parent's provider-side prompt cache. The parent's goal is frozen into the
-request head. A fork still cannot delegate further or ask the user questions.
-Constraints: `fork` is mutually exclusive with `role` and `resume`; the parent
-must have a completed turn (a mid-turn compaction is rejected); `workspace`
-must resolve to the parent root; and the reconnected MCP tool set must equal the
-parent's captured list exactly — a missing, extra, reordered or changed tool
-fails closed instead of forking a different provider tool set (this is the only
-case where a subagent gets MCP tools).
+parent's **current** model, inheriting the parent's system prompt, tool schemas
+and MCP tool set, and the parent's goal is frozen into the request head.
+`workspace` is optional and defaults to the parent root: with that default the
+child's request is a byte-identical prefix and reuses the parent's
+provider-side prompt cache. An explicit different `workspace` is allowed and
+only moves the child's file/bash tools and MCP connections there — the model,
+history prefix and goal still come from the parent — so such a request is no
+longer guaranteed to be a byte-identical prefix or a cache hit. A fork still
+cannot delegate further or ask the user questions. Constraints: `fork` is
+mutually exclusive with `role` and `resume`; the parent must have a completed
+turn (a mid-turn compaction is rejected). This is the only case where a
+subagent gets MCP tools.
 
 Subagents always run in the background without blocking the main agent; there
 is no foreground mode. The immediate tool result includes both the background
@@ -1507,8 +1509,9 @@ executes the commands its `.e-agent/config.toml` declares. A global
 re-enable: the merged config keeps the disabled global entry, so a
 same-named project server is skipped (`connect_all` skips disabled servers).
 Project MCP servers apply to the main session and to explicit `fork: true`
-delegates, which reconnect the parent's tool set and fail closed if it differs.
-Ordinary subagents do not connect MCP.
+delegates, which reconnect the parent's project servers in the child's own
+workspace (a server that fails to start is skipped, exactly as for a main
+session). Ordinary subagents do not connect MCP.
 
 Each entry spawns `command` with the workspace as its current directory
 (override with `cwd`), plus optional `env`. Servers are connected one at a

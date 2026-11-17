@@ -403,17 +403,6 @@ fn label_arg(args: &Value) -> Option<String> {
     args.get("label").and_then(Value::as_str).map(str::to_owned)
 }
 
-/// The fork re-connects MCP with the parent's workspace, so its final MCP tool
-/// list must equal the parent's captured list exactly: a missing, extra,
-/// reordered, or changed tool would silently fork a different provider tool
-/// set, and the child's request would no longer be a byte-identical prefix.
-fn fork_mcp_set_matches(
-    parent: &[crate::agent::ToolSpec],
-    reconnected: &[crate::agent::ToolSpec],
-) -> bool {
-    reconnected == parent
-}
-
 #[async_trait]
 impl Tool for DisabledTool {
     fn spec(&self) -> ToolSpec {
@@ -793,6 +782,12 @@ impl Delegate {
     /// entries — the goal freeze and the `ForkedFrom` marker — so spawning
     /// never performs O(N) durable writes and the parent rows are never
     /// copied.
+    ///
+    /// `workspace` is the child's own resolved workspace (the parent root by
+    /// default, or an explicitly requested directory): tools, MCP connections
+    /// and the task-panel row all belong to it. Model, history prefix and goal
+    /// stay the parent's.
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_fork(
         &self,
         task: String,
@@ -801,6 +796,7 @@ impl Delegate {
         parent: crate::session_store::LoadedLocated,
         at: usize,
         head: crate::session_factory::RequestHead,
+        workspace: Workspace,
     ) -> Result<String, String> {
         // Admission preflight: `execute` checked delivery before the awaited
         // parent-history load, so re-check here — nothing has been spawned
@@ -811,14 +807,16 @@ impl Delegate {
         // The parent's current model, never the head captured at build time.
         let (model, context_window) = self.fork_model(&head)?;
         let session_id = crate::session::new_id_prefixed("sub-");
-        let workspace = self.workspace.clone();
         let persist_root = self
             .persist_root
             .clone()
             .ok_or("fork requires subagent persistence")?;
         // Reserve this fork's live session key before the runner starts
         // (mirrors `spawn_btw_subagent`): the permit lives with the session
-        // entry, so the same session can never be live twice.
+        // entry, so the same session can never be live twice. The key keeps
+        // the PARENT's root — that is what a later `delegate`/`resume` from
+        // this parent computes for the same session id — even when the fork
+        // runs in another workspace.
         let local_permit = self
             .local_sessions
             .reserve(crate::session_factory::LocalSessionRegistry::key(
@@ -861,16 +859,14 @@ impl Delegate {
                 .await
                 .0
         };
-        // Deterministic order is required for prefix-cache parity.
+        // Deterministic order keeps the provider tool array stable across
+        // runs (and is what the parent's own request used).
         mcp_tools.sort_by_key(|tool| tool.spec().name);
-        // The fork re-connects MCP with the parent's workspace; its final MCP
-        // tool list must equal the parent's captured list exactly (see
-        // `fork_mcp_set_matches`).
-        let fork_mcp_specs: Vec<crate::agent::ToolSpec> =
-            mcp_tools.iter().map(|tool| tool.spec()).collect();
-        if !fork_mcp_set_matches(&head.mcp_specs, &fork_mcp_specs) {
-            return Err("fork MCP tool set differs from the parent".into());
-        }
+        // The fork re-connects MCP in ITS OWN workspace, so its tool list may
+        // legitimately differ from the parent's capture (another workspace
+        // declares other servers, or one fails to connect and is skipped).
+        // No exact-match rule: a same-workspace fork is byte-identical by
+        // construction, a different-workspace fork simply is not.
         tools.extend(mcp_tools);
         let child_delegate = self.fork_child_delegate();
         tools.push(Box::new(SendMessage::child(
@@ -989,10 +985,10 @@ impl Delegate {
         let goal_registration = self.parent_endpoint.clone();
         let exit_slot = new_exit_slot();
         let work_exit = exit_slot.clone();
-        // The fork has no user-provided workspace argument (its workspace is
-        // always the parent's, which the fork head already validated); pass
-        // that resolved parent workspace in the same string form the delegate
-        // path passes, so the task panel shows where this child is running.
+        // The fork has no implicit workspace argument any more: the child runs
+        // wherever its caller asked (the parent root by default). Show that
+        // resolved child workspace in the same string form the delegate path
+        // passes, so the task panel says where this child is running.
         let display_workspace = workspace.root().display().to_string();
         self.background
             .spawn_with_id_target(
@@ -1472,7 +1468,7 @@ impl Tool for Delegate {
             "task": {"type": "string", "description": "complete, self-contained instructions for the subagent"}
         });
         if self.fork_head.is_some() {
-            properties["fork"] = json!({"type":"boolean", "description":"Continue from the parent's completed-turn prefix so the child reuses the parent's provider-side prompt cache: the child inherits the parent's model, system prompt and tool schemas byte for byte. Mutually exclusive with `role` and `resume`. The current in-flight turn is excluded, so put everything the child needs in `task`."});
+            properties["fork"] = json!({"type":"boolean", "description":"Continue from the parent's completed-turn prefix: the child inherits the parent's current model, system prompt, goal and tool schemas. `workspace` defaults to the parent's root; with that default (and the same MCP tool set) the child's request is a byte-identical provider prefix and reuses the parent's prompt cache, while an explicit different `workspace` runs the child's tools/MCP elsewhere and loses that guarantee. Mutually exclusive with `role` and `resume`. The current in-flight turn is excluded, so put everything the child needs in `task`."});
         }
         ToolSpec {
             name: "delegate".into(),
@@ -1540,11 +1536,13 @@ impl Tool for Delegate {
                 .record_in
                 .as_ref()
                 .ok_or("fork requires a parent session record")?;
-            // The fork always runs in the parent's own workspace. Resolve the
-            // argument exactly like the delegate path (join relative paths
-            // with the parent root, then reroot/canonicalize) and REQUIRE it
-            // to resolve to that same root: never silently substitute it for
-            // a caller that named a different directory.
+            // The fork defaults to the parent's own workspace but accepts an
+            // explicit one: resolve the argument exactly like the delegate
+            // path (join relative paths with the parent root, then
+            // reroot/canonicalize). A different workspace changes only where
+            // the child's tools and MCP servers run — model, inherited
+            // history and goal stay the parent's — so such a request is no
+            // longer guaranteed to be a byte-identical provider prefix.
             let workspace_arg: Option<String> = arguments
                 .as_object()
                 .and_then(|args| args.get("workspace"))
@@ -1561,7 +1559,7 @@ impl Tool for Delegate {
             let workspace_display = workspace_arg
                 .clone()
                 .unwrap_or_else(|| self.workspace.root().display().to_string());
-            let resolved = self
+            let workspace = self
                 .workspace
                 .reroot(&workspace_path)
                 .map_err(|error| {
@@ -1571,12 +1569,6 @@ impl Tool for Delegate {
                 .map_err(|error| {
                     format!("invalid `workspace` path `{workspace_display}`: {error}")
                 })?;
-            if resolved.root() != self.workspace.root() {
-                return Err(
-                    "`fork` runs in the parent's workspace; omit `workspace` or pass the parent root"
-                        .into(),
-                );
-            }
             // Marker-aware: a parent that is itself a zero-copy fork child
             // resolves its inherited prefix here, so `at` always indexes the
             // same resolved transcript the child re-loads.
@@ -1617,6 +1609,7 @@ impl Tool for Delegate {
                     parent,
                     at,
                     head,
+                    workspace,
                 )
                 .await
                 .map(ToolOutput::text);

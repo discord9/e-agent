@@ -3727,7 +3727,6 @@ fn fork_child_delegate_spec_matches_parent() {
             mcp_servers: std::collections::HashMap::new(),
             goal: None,
             goal_cleared: false,
-            mcp_specs: Vec::new(),
         }));
     let child = parent.fork_child_delegate();
     assert_eq!(parent.spec(), child.spec());
@@ -3802,7 +3801,6 @@ fn forking_delegate(
             mcp_servers: std::collections::HashMap::new(),
             goal: None,
             goal_cleared: false,
-            mcp_specs: Vec::new(),
         }))
 }
 
@@ -4392,7 +4390,6 @@ fn fork_head(
     context_prefix: Option<&str>,
     goal: Option<crate::agent::GoalSnapshot>,
     goal_cleared: bool,
-    mcp_specs: Vec<crate::agent::ToolSpec>,
 ) -> crate::session_factory::RequestHead {
     crate::session_factory::RequestHead {
         model,
@@ -4406,7 +4403,6 @@ fn fork_head(
         mcp_servers: std::collections::HashMap::new(),
         goal,
         goal_cleared,
-        mcp_specs,
     }
 }
 
@@ -4527,33 +4523,61 @@ async fn fork_rejects_a_mid_turn_compaction_with_an_unanswered_tool_call() {
     )));
 }
 
+/// A fork may run in a workspace other than the parent root: only the model,
+/// the inherited history prefix and the goal come from the parent, while the
+/// child's tools, MCP connections and task-panel row use the requested
+/// directory.
 #[tokio::test]
-async fn fork_rejects_a_workspace_other_than_the_parent_root() {
+async fn fork_accepts_a_workspace_other_than_the_parent_root() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().to_path_buf();
     seed_fork_parent(&root, "parent");
     let other = root.join("other-dir");
     std::fs::create_dir(&other).unwrap();
-    let head = chat_model("http://127.0.0.1:1".into(), "stale-model");
+    // `reroot` canonicalizes, so compare against the canonical path.
+    let other_root = other.canonicalize().unwrap();
+    let head = chat_model(
+        successful_model("other workspace answer").await,
+        "live-model",
+    );
     let mut delegate = forking_delegate(&root, &fork_record(&root, "parent"), head);
-    let (sender, _completions) = tokio::sync::mpsc::unbounded_channel();
+    let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
     delegate.set_event_sender(sender);
     delegate.set_session_handle("parent", live_parent_endpoint());
 
-    let error = delegate
+    delegate
         .execute(json!({
-            "task": "wrong workspace",
+            "task": "run in another workspace",
             "fork": true,
             "workspace": other.display().to_string()
         }))
         .await
-        .unwrap_err();
+        .expect("a fork in a non-parent workspace is accepted");
+
+    let running = delegate.background.running();
+    assert_eq!(running.len(), 1, "exactly one forked task: {running:?}");
     assert_eq!(
-        error,
-        "`fork` runs in the parent's workspace; omit `workspace` or pass the parent root"
+        running[0]
+            .display_meta
+            .as_ref()
+            .and_then(|meta| meta.workspace.as_deref()),
+        Some(other_root.to_str().unwrap()),
+        "the task panel shows the child's own workspace, not the parent root"
     );
-    assert!(delegate.sessions().list().is_empty());
-    assert!(delegate.background.running().is_empty());
+    let sessions = delegate.sessions().list();
+    assert_eq!(sessions.len(), 1, "the fork registers one child session");
+    assert_eq!(
+        sessions[0].1.cwd,
+        other_root.display().to_string(),
+        "the child session runs in the requested workspace"
+    );
+
+    let (status, output) = await_background_status(&mut completions).await;
+    assert_eq!(status.as_deref(), Some("completed"));
+    assert!(
+        output.contains("other workspace answer"),
+        "the fork answers from the requested workspace: {output}"
+    );
 }
 
 #[tokio::test]
@@ -4614,13 +4638,7 @@ async fn fork_request_carries_the_parent_goal_system_message() {
     let head_model = model.clone();
     let mut delegate = forking_delegate(&root, &fork_record(&root, "parent"), model)
         .with_fork_head(Arc::new(move || {
-            fork_head(
-                head_model.clone(),
-                Some("parent system"),
-                None,
-                false,
-                Vec::new(),
-            )
+            fork_head(head_model.clone(), Some("parent system"), None, false)
         }));
     let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
     delegate.set_event_sender(sender);
@@ -4677,13 +4695,7 @@ async fn fork_request_carries_the_cleared_goal_marker_from_the_head() {
     let head_model = model.clone();
     let mut delegate = forking_delegate(&root, &fork_record(&root, "parent"), model)
         .with_fork_head(Arc::new(move || {
-            fork_head(
-                head_model.clone(),
-                Some("parent system"),
-                None,
-                true,
-                Vec::new(),
-            )
+            fork_head(head_model.clone(), Some("parent system"), None, true)
         }));
     let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
     delegate.set_event_sender(sender);
@@ -4713,95 +4725,48 @@ async fn fork_request_carries_the_cleared_goal_marker_from_the_head() {
     );
 }
 
+/// The fork reconnects MCP in ITS OWN workspace, so its tool list may differ
+/// from the parent's — no exact-match rule fails it closed. A server that
+/// cannot start is skipped exactly like at main-session build time.
 #[tokio::test]
-async fn fork_fails_when_the_mcp_tool_set_differs_from_the_parent() {
+async fn fork_spawns_even_when_an_mcp_server_cannot_connect() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().to_path_buf();
     seed_fork_parent(&root, "parent");
-    let head = chat_model("http://127.0.0.1:1".into(), "stale-model");
-    let mut delegate = forking_delegate(&root, &fork_record(&root, "parent"), head);
-    let (sender, _completions) = tokio::sync::mpsc::unbounded_channel();
+    let head = chat_model(successful_model("mcp-less fork answer").await, "live-model");
+    let head_model = head.clone();
+    let missing = root.join("no-such-mcp-server").display().to_string();
+    let mut delegate = forking_delegate(&root, &fork_record(&root, "parent"), head).with_fork_head(
+        Arc::new(move || {
+            let mut head = fork_head(head_model.clone(), None, None, false);
+            head.mcp_servers.insert(
+                "broken".into(),
+                crate::mcp::McpServerConfig {
+                    command: vec![missing.clone()],
+                    env: std::collections::HashMap::new(),
+                    cwd: None,
+                    enabled: true,
+                },
+            );
+            head
+        }),
+    );
+    let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
     delegate.set_event_sender(sender);
     delegate.set_session_handle("parent", live_parent_endpoint());
-    // The parent's captured MCP list has a tool the re-connected fork (no
-    // configured MCP server here) cannot reproduce.
-    delegate = delegate.with_fork_head(Arc::new(|| {
-        fork_head(
-            chat_model("http://127.0.0.1:1".into(), "stale-model"),
-            None,
-            None,
-            false,
-            vec![crate::agent::ToolSpec {
-                name: "mcp_parent_only".into(),
-                description: "parent-only MCP tool".into(),
-                parameters: json!({"type": "object", "properties": {}}),
-            }],
-        )
-    }));
 
-    let error = delegate
+    delegate
         .execute(json!({
-            "task": "different tool set",
-            "fork": true,
-            "workspace": root.display().to_string()
+            "task": "different MCP set",
+            "fork": true
         }))
         .await
-        .unwrap_err();
-    assert_eq!(error, "fork MCP tool set differs from the parent");
+        .expect("a fork whose MCP server cannot connect still spawns");
+    let (status, output) = await_background_status(&mut completions).await;
+    assert_eq!(status.as_deref(), Some("completed"));
     assert!(
-        delegate.sessions().list().is_empty(),
-        "a mismatched MCP fork registers no child session"
-    );
-    assert!(
-        delegate.background.running().is_empty(),
-        "a mismatched MCP fork starts no child runner"
-    );
-}
-
-#[test]
-fn fork_mcp_set_requires_an_identical_non_empty_list() {
-    let spec = |name: &str, description: &str| crate::agent::ToolSpec {
-        name: name.into(),
-        description: description.into(),
-        parameters: json!({"type": "object", "properties": {}}),
-    };
-    let parent = vec![
-        spec("engram_search", "search"),
-        spec("engram_write", "write"),
-    ];
-    // The happy path the fork depends on: the re-connected servers produce the
-    // very same tool list, so the fork is accepted.
-    assert!(
-        fork_mcp_set_matches(&parent, &parent.clone()),
-        "an identical non-empty MCP tool set must be accepted"
-    );
-    // One changed field is enough to fork a different provider tool set.
-    let mut changed = parent.clone();
-    changed[1].description = "write (changed)".into();
-    assert!(
-        !fork_mcp_set_matches(&parent, &changed),
-        "a changed tool description must be rejected"
-    );
-    let mut schema = parent.clone();
-    schema[0].parameters = json!({"type": "object", "properties": {"q": {"type": "string"}}});
-    assert!(
-        !fork_mcp_set_matches(&parent, &schema),
-        "a changed tool schema must be rejected"
-    );
-    // Order and membership are part of the provider tool set too.
-    let mut reversed = parent.clone();
-    reversed.reverse();
-    assert!(
-        !fork_mcp_set_matches(&parent, &reversed),
-        "a reordered MCP tool list must be rejected"
-    );
-    assert!(
-        !fork_mcp_set_matches(&parent, &parent[..1]),
-        "a missing MCP tool must be rejected"
-    );
-    assert!(
-        !fork_mcp_set_matches(&parent, &[]),
-        "an empty re-connected list must not match a non-empty parent list"
+        output.contains("mcp-less fork answer"),
+        "the fork runs without the unreachable MCP server: {output}"
     );
 }
 
@@ -4849,7 +4814,8 @@ async fn spawn_fork_rechecks_delivery_before_creating_anything() {
     let head_model = chat_model("http://127.0.0.1:1".into(), "stale-model");
     let mut delegate = forking_delegate(&root, &fork_record(&root, "parent"), head_model.clone());
     // Everything else a fork needs is in place (persistence, a live parent
-    // endpoint, a matching MCP set): only the completion channel is gone.
+    // endpoint, a resolved child workspace): only the completion channel is
+    // gone.
     delegate.set_session_handle("parent", live_parent_endpoint());
     let prefix = SessionStore::Jsonl
         .load_fork_located(&root, "parent")
@@ -4858,7 +4824,7 @@ async fn spawn_fork_rechecks_delivery_before_creating_anything() {
     let at = crate::agent::fork_prefix_complete(&prefix.entries, None)
         .unwrap()
         .len();
-    let head = fork_head(head_model, None, None, false, Vec::new());
+    let head = fork_head(head_model, None, None, false);
 
     let error = delegate
         .spawn_fork(
@@ -4868,6 +4834,7 @@ async fn spawn_fork_rechecks_delivery_before_creating_anything() {
             prefix,
             at,
             head,
+            Workspace::new(&root).unwrap(),
         )
         .await
         .unwrap_err();

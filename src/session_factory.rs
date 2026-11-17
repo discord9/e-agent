@@ -17,7 +17,7 @@ use std::time::SystemTime;
 
 use anyhow::{Context, anyhow};
 
-use crate::agent::{Agent, GoalSnapshot, SessionEntry, ToolSpec};
+use crate::agent::{Agent, GoalSnapshot, SessionEntry};
 use crate::codex::CodexModel;
 use crate::codex_auth::CodexAuth;
 use crate::config::{
@@ -53,11 +53,6 @@ pub(crate) struct RequestHead {
     /// explicit clear tombstone from "never set".
     pub goal: Option<GoalSnapshot>,
     pub goal_cleared: bool,
-    /// The parent's final MCP tool list (name/description/parameters), sorted
-    /// by name. A fork re-connects MCP with the parent's workspace and must
-    /// match this snapshot exactly instead of silently running a different
-    /// tool set.
-    pub mcp_specs: Vec<ToolSpec>,
 }
 
 /// What to do with background-task records left behind by a previous run
@@ -996,10 +991,6 @@ impl SessionFactory {
         };
         // Deterministic order is required for prefix-cache parity.
         mcp_tools.sort_by_key(|tool| tool.spec().name);
-        // Snapshot the final MCP tool list for the fork request head before
-        // the tools move into the agent: a fork must re-connect exactly this
-        // tool set, never a silently different one.
-        let head_mcp_specs: Vec<ToolSpec> = mcp_tools.iter().map(|tool| tool.spec()).collect();
         tools.extend(mcp_tools);
         let mut delegate = Delegate::new(
             main_model.clone(),
@@ -1102,7 +1093,6 @@ impl SessionFactory {
             mcp_servers: mcp_servers_for_fork.clone(),
             goal: head_goal,
             goal_cleared: head_goal_cleared,
-            mcp_specs: head_mcp_specs,
         };
         *head_cell.lock().unwrap() = Some(head_value);
         let recovery_labels = if matches!(unfinished, UnfinishedPolicy::Consume) {
