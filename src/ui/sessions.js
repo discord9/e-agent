@@ -2923,7 +2923,22 @@ function buildTreeRoot(s, kids, wsId) {
     const ws = state.workspaces.find((w) => w.id === wsId);
     toggleArchived(s, () => renderSidebarTree(true), ws);
   });
-  row.append(toggle, dot, titleEl);
+  // 主会话摘要行：桌宠总结器同一次调用产出的两行摘要——short（≤16 字）是侧边栏
+  // 的一句「正在做什么」，full（≤30 字）留给 title。不再截断字符：窄视口只靠
+  // CSS 单行省略。无缓存 → 不占行高；subagent 行本 pass 不加。摘要在 .tree-main
+  // 标题列内（不再是行外兄弟节点），点击/hover 与标题同属一行。
+  const summary = isMainSession(s) && snapshot && snapshot.summaries
+    ? snapshot.summaries[s.id] : null;
+  const activityShort = summary && typeof summary === "object"
+    ? String(summary.short || "").trim() : "";
+  const main = el("div", "tree-main");
+  main.append(titleEl);
+  if (activityShort) {
+    const activity = el("div", "tree-activity", activityShort);
+    activity.title = String(summary.full || activityShort);   // 完整 30 字摘要留给 hover
+    main.append(activity);
+  }
+  row.append(toggle, dot, main);
   if (statusBadge) row.append(statusBadge);
   row.append(pin, archive);
   row.title = (s.title || s.id) + " · " + countHint + (s.model ? " · " + s.model : "")
@@ -2938,18 +2953,6 @@ function buildTreeRoot(s, kids, wsId) {
     openSessionIn(wsId, s.id);
   });
   node.appendChild(row);
-  // 主会话行下一行：复用桌宠总结器同一次调用产出的两行摘要——short（≤16 字）
-  // 是侧边栏的一句「正在做什么」，full（≤30 字）留给 title。不再截断字符：
-  // 窄视口只靠 CSS 单行省略。无缓存 → 不占行高；subagent 行本 pass 不加。
-  const summary = isMainSession(s) && snapshot && snapshot.summaries
-    ? snapshot.summaries[s.id] : null;
-  const activityShort = summary && typeof summary === "object"
-    ? String(summary.short || "").trim() : "";
-  if (activityShort) {
-    const activity = el("div", "tree-activity", activityShort);
-    activity.title = String(summary.full || activityShort);   // 完整 30 字摘要留给 hover
-    node.appendChild(activity);
-  }
   if (hasKids) {
     const children = el("div", "tree-children");
     children.hidden = true;

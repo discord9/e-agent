@@ -1840,6 +1840,21 @@
      与 Ø4 环绕点相差 2px 足以读作「中心」，同时在 24px 画布内给正圆环
      让出间隙；子行单点同行高对齐。 */
   .tree-row .busy-dot { width: 6px; height: 6px; flex: 0 0 auto; }
+  /* 标题列：标题/id + 可选摘要行同属一列，占据行的剩余宽度（行内
+     flex 子项：flex:1 + min-width:0 让单行省略真正生效）。 */
+  .tree-main {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+  }
+  /* 列内标题不再自己抢占主轴（纵向 flex 里 flex:1 无意义），只占满列宽。 */
+  .tree-main > .tree-id {
+    flex: 0 0 auto;
+    width: 100%;
+    min-width: 0;
+  }
   .tree-id {
     flex: 1;
     min-width: 0;
@@ -1873,21 +1888,22 @@
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  /* 主会话行下一行：桌宠总结器同一次调用产出的侧边栏短语（≤16 字）。不按
-     字符截断，只有真正窄的视口才靠单行省略。左缩进对齐标题文字：3px 左边条
-     + 8px 行内 padding + 24px 折叠按钮 + 2×4px gap + 6px 状态点 = 49px。 */
+  /* 主会话行的摘要行：桌宠总结器同一次调用产出的侧边栏短语（≤16 字），
+     作为 .tree-main 列内的第二行（行内，hover/点击区与标题一致）。不按
+     字符截断，只有真正窄的视口才靠单行省略。 */
   .tree-activity {
-    margin: 1px 8px 4px 49px;
+    margin: 1px 0 0;
+    padding: 0;
     font-size: 11px;
-    line-height: 1.4;
+    line-height: 1.35;
     color: var(--base01);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
   }
   /* hover / 当前会话：活动行跟着提亮，不在 muted 灰里失去可读性 */
-  .tree-row:hover ~ .tree-activity,
-  .tree-row.current ~ .tree-activity,
+  .tree-row:hover .tree-activity,
+  .tree-row.current .tree-activity,
   .tree-activity:hover { color: var(--base02); }
   .tree-group { color: var(--base01); }
   /* 「+N 个更早的会话」按钮 */
