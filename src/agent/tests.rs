@@ -3381,7 +3381,7 @@ fn fork_prefix_default_cuts_at_last_completed_turn_and_drops_tail() {
     });
     entries.push(SessionEntry::ForkedFrom {
         source: "other".into(),
-        at: 1,
+        at: Some(1),
         event_time: None,
         seq: None,
     });
@@ -3705,7 +3705,7 @@ fn forked_from_marker_serde_roundtrip_and_context_skip() {
     // Serialization: provenance None fields are skipped, at/source kept.
     let marker = SessionEntry::ForkedFrom {
         source: "src-123".into(),
-        at: 4,
+        at: Some(4),
         event_time: Some(1_700_000_000_000_000),
         seq: Some(3),
     };
@@ -3718,7 +3718,7 @@ fn forked_from_marker_serde_roundtrip_and_context_skip() {
     assert_eq!(serde_json::from_str::<SessionEntry>(&json).unwrap(), marker);
     let marker_none = SessionEntry::ForkedFrom {
         source: "src-123".into(),
-        at: 4,
+        at: Some(4),
         event_time: None,
         seq: None,
     };
@@ -3729,6 +3729,32 @@ fn forked_from_marker_serde_roundtrip_and_context_skip() {
         serde_json::from_str::<SessionEntry>(&json_none).unwrap(),
         marker_none
     );
+
+    // A NEW-generation marker omits `at` entirely (pinned by owner+key) and
+    // round-trips; a legacy row that still carries `at` keeps decoding.
+    let pinned = SessionEntry::ForkedFrom {
+        source: "src-123".into(),
+        at: None,
+        event_time: Some(1_700_000_000_000_000),
+        seq: Some(3),
+    };
+    let json_pinned = serde_json::to_string(&pinned).unwrap();
+    assert!(!json_pinned.contains(r#""at""#), "{json_pinned}");
+    assert!(json_pinned.contains(r#""seq":3"#), "{json_pinned}");
+    assert_eq!(
+        serde_json::from_str::<SessionEntry>(&json_pinned).unwrap(),
+        pinned
+    );
+    let legacy_row: SessionEntry =
+        serde_json::from_str(r#"{"type":"forked_from","source":"old","at":7,"seq":6}"#).unwrap();
+    assert!(matches!(
+        legacy_row,
+        SessionEntry::ForkedFrom {
+            at: Some(7),
+            seq: Some(6),
+            ..
+        }
+    ));
 
     // context(): the marker must never reach the model wire.
     let mut agent = Agent::new(
@@ -4452,7 +4478,7 @@ async fn compaction_of_a_zero_copy_fork_fails_closed_when_the_tail_reaches_the_p
     let mut history = inherited;
     history.push(SessionEntry::ForkedFrom {
         source: "source-session".into(),
-        at: 4,
+        at: Some(4),
         event_time: None,
         seq: Some(3),
     });
@@ -4513,7 +4539,7 @@ async fn compaction_guard_counts_the_non_history_prefix_messages() {
         .into(),
         SessionEntry::ForkedFrom {
             source: "source-session".into(),
-            at: 4,
+            at: Some(4),
             event_time: None,
             seq: Some(3),
         },
@@ -4603,7 +4629,7 @@ async fn compaction_guard_is_not_shifted_by_a_dropped_own_tool_result() {
         .into(),
         SessionEntry::ForkedFrom {
             source: "source-session".into(),
-            at: 4,
+            at: Some(4),
             event_time: None,
             seq: Some(3),
         },
@@ -4672,7 +4698,7 @@ fn web_head_of_a_zero_copy_fork_is_the_whole_resolved_history() {
         .collect();
     history.push(SessionEntry::ForkedFrom {
         source: "source-session".into(),
-        at: 300,
+        at: Some(300),
         event_time: None,
         seq: Some(299),
     });
@@ -4687,11 +4713,29 @@ fn web_head_of_a_zero_copy_fork_is_the_whole_resolved_history() {
     );
     fork.restore_history(history.clone());
     fork.set_inherited_prefix(300);
-    let (entries, locations, cursor, start, end, _) = fork.web_head_page(200, true);
+    let (entries, locations, cursor, _cursor_session, start, end, _) =
+        fork.web_head_page(200, true);
     assert_eq!((start, end), (0, 301), "the inherited prefix is not cut");
     assert_eq!(entries.len(), 301);
     assert_eq!(locations.len(), 301);
     assert!(cursor.is_none(), "no child physical cursor exists");
+
+    // With a recorded older route, the inherited context pages into the
+    // session that stores its older rows — never a child seq.
+    let mut routed = Agent::new(
+        Box::new(ScriptedModel {
+            replies: vec![],
+            requests: Arc::new(Mutex::new(Vec::new())),
+            delays: Default::default(),
+        }),
+        vec![],
+    );
+    routed.restore_history(history.clone());
+    routed.set_inherited_prefix(300);
+    routed.set_older_route(Some(("source-session".into(), 7)));
+    let (_, _, cursor, cursor_session, _, _, _) = routed.web_head_page(200, true);
+    assert_eq!(cursor, Some(7));
+    assert_eq!(cursor_session.as_deref(), Some("source-session"));
 
     // Control: the same history without inheritance keeps the bounded tail.
     let mut plain = Agent::new(
@@ -4703,9 +4747,45 @@ fn web_head_of_a_zero_copy_fork_is_the_whole_resolved_history() {
         vec![],
     );
     plain.restore_history(history);
-    let (entries, _, _, start, end, _) = plain.web_head_page(200, true);
+    let (entries, _, _, _, start, end, _) = plain.web_head_page(200, true);
     assert_eq!((start, end), (101, 301));
     assert_eq!(entries.len(), 200);
+}
+
+/// A head-only live session (the whole loaded history IS the head) still hands
+/// out its recorded older route: the head begins at local index zero, which
+/// must not suppress the cursor of the rows below it.
+#[test]
+fn web_head_of_a_head_only_session_uses_its_recorded_older_route() {
+    let mut agent = Agent::new(
+        Box::new(ScriptedModel {
+            replies: vec![],
+            requests: Arc::new(Mutex::new(Vec::new())),
+            delays: Default::default(),
+        }),
+        vec![],
+    );
+    agent.restore_located(
+        vec![
+            SessionEntry::Compaction {
+                summary: "head summary".into(),
+                retained: vec![],
+                current_prompt_at: None,
+                no_current_prompt: false,
+            },
+            SessionEntry::from(Message::User {
+                content: "own q".into(),
+                images: vec![],
+            }),
+        ],
+        vec![None, None],
+    );
+    agent.set_older_route(Some(("own-session".into(), 0)));
+    let (entries, _, cursor, cursor_session, start, end, _) = agent.web_head_page(200, false);
+    assert_eq!((start, end), (0, 2), "the whole loaded head is shown");
+    assert_eq!(entries.len(), 2);
+    assert_eq!(cursor, Some(0), "older rows exist below the head");
+    assert_eq!(cursor_session.as_deref(), Some("own-session"));
 }
 
 /// The child's own messages still compact normally: once the newest
@@ -4741,7 +4821,7 @@ async fn compaction_of_a_zero_copy_fork_compacts_the_childs_own_messages() {
         .into(),
         SessionEntry::ForkedFrom {
             source: "source-session".into(),
-            at: 2,
+            at: Some(2),
             event_time: None,
             seq: Some(1),
         },

@@ -955,12 +955,21 @@ pub enum SessionEntry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cancellation_source: Option<CancellationSource>,
     },
-    /// A new session forked from an existing one: source session id, the
-    /// 1-based entry index it was forked at, and the source's event_time +
-    /// seq of that entry (provenance; never sent to the provider).
+    /// A new session forked from an existing one (provenance only; never
+    /// sent to the provider). Two marker generations share this shape:
+    ///
+    /// - **Legacy** (`at: Some(n)`): `source` is the logical parent session
+    ///   and `n` is the 1-based count of its RESOLVED entries the child
+    ///   inherits positionally. Kept for old rows and for decoding; the
+    ///   loader selects it by the presence of `at`.
+    /// - **Pinned** (`at: None`): `source` is the session that PHYSICALLY
+    ///   stores the cut entry (an ancestor when the cut lies in an inherited
+    ///   prefix) and `seq`/`event_time` pin that exact row. The loader
+    ///   selects it by the absence of `at`; a missing `seq` fails closed.
     ForkedFrom {
         source: String,
-        at: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at: Option<usize>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         event_time: Option<i64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -985,6 +994,25 @@ pub enum SessionEntry {
 impl From<Message> for SessionEntry {
     fn from(message: Message) -> Self {
         Self::Message { message }
+    }
+}
+
+impl SessionEntry {
+    /// The dim provenance line a `ForkedFrom` marker replays as (TUI
+    /// scrollback and the replayed `AgentEvent::Display`), so the two
+    /// projections can never drift. `None` for every other variant.
+    pub(crate) fn forked_from_text(&self) -> Option<String> {
+        let Self::ForkedFrom {
+            source, at, seq, ..
+        } = self
+        else {
+            return None;
+        };
+        Some(match (at, seq) {
+            (Some(at), _) => format!("forked from {source} at entry {at}"),
+            (None, Some(seq)) => format!("forked from {source} at seq {seq}"),
+            (None, None) => format!("forked from {source}"),
+        })
     }
 }
 
@@ -1216,10 +1244,15 @@ impl ContextItem {
     }
 }
 
+/// `(entries, locations, next_before_seq, next_older_session, history_start,
+/// history_end, returned_boundaries)`: `next_older_session` names the session
+/// that owns the cursor when the older AUDIT rows live in a fork ANCESTOR
+/// (`None` = this session).
 type WebHeadPage = (
     Vec<SessionEntry>,
     Vec<Option<EntryLocation>>,
     Option<i64>,
+    Option<String>,
     usize,
     usize,
     Vec<usize>,
@@ -1279,6 +1312,11 @@ pub struct Agent {
     /// [`Self::set_inherited_prefix`]). Zero for every ordinary session and
     /// for the copy-based forks written by older builds.
     inherited: usize,
+    /// Where the OLDER audit rows of that inherited prefix live
+    /// ([`Self::set_older_route`]): the owning session and its paging
+    /// position. Kept separate from the model context, which never replays
+    /// them alongside their compaction summary.
+    older_route: Option<(String, i64)>,
     /// The session kind for compaction (see [`CompactionMode`]). Set by the
     /// caller — never inferred from the history. Both variants now select
     /// the same bounded tail; the field is kept for API compatibility.
@@ -1324,6 +1362,7 @@ impl Agent {
             goal_cleared: false,
             entry_locations: Vec::new(),
             inherited: 0,
+            older_route: None,
             compaction_mode: CompactionMode::Main,
             omitted_images: HashSet::new(),
         }
@@ -1515,17 +1554,33 @@ impl Agent {
             self.history.len().saturating_sub(limit).max(segment_start)
         };
         let history_end = self.history.len();
-        // The pagination boundary is the first physical row in the logical
-        // head interval. An unlocated fallback Error must not move it.
-        let cursor = self.entry_locations[history_start..history_end]
-            .iter()
-            .find_map(|location| location.as_ref())
-            .map(|location| match &location.key {
-                crate::session_store::LocatedKey::Jsonl { ordinal } => *ordinal,
-                crate::session_store::LocatedKey::Sqlite { seq, .. }
-                | crate::session_store::LocatedKey::Greptime { seq, .. } => *seq,
-            })
-            .filter(|_| history_start > 0);
+        // A fork context has no child physical row below its first entry: its
+        // older AUDIT rows live in the session that stores them, so the cursor
+        // is that owner's position (never a child seq). An ordinary session
+        // keeps the historical child-space cursor: the first physical row in
+        // the logical head interval (an unlocated fallback Error must not move
+        // it).
+        let (cursor, cursor_session) = if self.inherited > 0 || history_start == 0 {
+            // A fork context has no child physical row below its first entry,
+            // and an ordinary head that IS the whole loaded history has no
+            // first row to point at either: both use the route recorded when
+            // the session was loaded (which also covers a head that begins at
+            // the session's own row zero).
+            match &self.older_route {
+                Some((owner, seq)) => (Some(*seq), Some(owner.clone())),
+                None => (None, None),
+            }
+        } else {
+            let cursor = self.entry_locations[history_start..history_end]
+                .iter()
+                .find_map(|location| location.as_ref())
+                .map(|location| match &location.key {
+                    crate::session_store::LocatedKey::Jsonl { ordinal } => *ordinal,
+                    crate::session_store::LocatedKey::Sqlite { seq, .. }
+                    | crate::session_store::LocatedKey::Greptime { seq, .. } => *seq,
+                });
+            (cursor, None)
+        };
         let mut entries = Vec::new();
         let mut locations = Vec::new();
         // Map every logical insertion boundary in the frozen interval to the
@@ -1552,6 +1607,7 @@ impl Agent {
             entries,
             locations,
             cursor,
+            cursor_session,
             history_start,
             history_end,
             returned_boundaries,
@@ -1570,6 +1626,7 @@ impl Agent {
         self.goal_cleared = cleared;
         self.entry_locations = vec![None; history.len()];
         self.inherited = 0;
+        self.older_route = None;
         self.history = history;
     }
 
@@ -1581,6 +1638,28 @@ impl Agent {
     /// snapshot would do.
     pub fn set_inherited_prefix(&mut self, inherited: usize) {
         self.inherited = inherited.min(self.history.len());
+    }
+
+    /// Record where this session's OLDER audit rows live when its history is a
+    /// zero-copy fork's materialized context: `(owning session, that session's
+    /// paging position immediately below the context)`. The position belongs
+    /// to the named session's physical space and is never a child seq.
+    pub fn set_older_route(&mut self, route: Option<(String, i64)>) {
+        self.older_route = route;
+    }
+
+    /// Restore the goal PROJECTION for a head-only load: the newest goal at or
+    /// before the loaded rows is not necessarily IN them (a `GoalUpdated` is
+    /// never embedded in a compaction summary), so a caller that loaded only
+    /// the head supplies it here.
+    ///
+    /// Projection state only — no history entry is fabricated. `None` means the
+    /// ancestry carries no goal update at all, so the folded state stands.
+    pub fn restore_goal_projection(&mut self, goal: Option<Option<crate::agent::GoalSnapshot>>) {
+        if let Some(goal) = goal {
+            self.goal_cleared = goal.is_none();
+            self.goal = goal;
+        }
     }
 
     /// The fork source this session's inherited prefix was read from, when

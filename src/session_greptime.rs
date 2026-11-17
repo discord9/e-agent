@@ -1098,6 +1098,31 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
     /// group, later rows for that seq may be skipped by the seq cursor. This
     /// is acceptable because they represent the same logical entry. The
     /// paged path makes no cross-page exhaustive divergent-tie guarantee.
+    /// The newest `goal_updated` row at or below `seq` (the fork cut), as a
+    /// decoded [`crate::agent::SessionEntry`]. One bounded row, never the
+    /// transcript: a fork must resolve the goal that applies AT ITS CUT, and a
+    /// `GoalUpdated` is never embedded in a compaction summary.
+    pub async fn latest_goal_before(&self, seq: i64) -> Result<Option<crate::agent::SessionEntry>> {
+        let row = self
+            .client
+            .query_opt(
+                "SELECT payload FROM session_entries \
+                 WHERE workspace_id = $1 AND session_id = $2 \
+                 AND entry_kind = 'goal_updated' AND seq <= $3 \
+                 ORDER BY seq DESC, event_time DESC LIMIT 1",
+                &[&self.workspace_id, &self.session_id, &seq],
+            )
+            .await
+            .context("cannot query the fork cut goal")?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let payload: String = row.get("payload");
+        let entry = serde_json::from_str::<crate::agent::SessionEntry>(&payload)
+            .context("cannot decode the fork cut goal")?;
+        Ok(Some(entry))
+    }
+
     pub async fn load_older_located(
         &self,
         before_seq: i64,

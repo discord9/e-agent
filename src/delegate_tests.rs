@@ -2437,13 +2437,14 @@ async fn resume_replays_scrollback_into_session_sink() {
 #[test]
 fn btw_fork_own_entries_are_marker_and_notice_only() {
     use crate::agent::SessionEntry as AgentEntry;
-    let own = btw_fork_own_entries("web-main", 4, (Some(3), None));
+    let cut = crate::session_store::LocatedKey::Jsonl { ordinal: 3 };
+    let own = btw_fork_own_entries("web-main", &cut, None);
     assert_eq!(own.len(), 2, "marker + notice only: {own:?}");
     assert_eq!(
         own[0],
         AgentEntry::ForkedFrom {
             source: "web-main".into(),
-            at: 4,
+            at: None,
             event_time: None,
             seq: Some(3),
         }
@@ -2582,7 +2583,7 @@ async fn spawn_btw_subagent_forks_history_and_registers_persistent_subagent() {
         loaded[0],
         AgentEntry::ForkedFrom {
             source: "web-main".into(),
-            at: 2,
+            at: None,
             event_time: None,
             seq: Some(1),
         }
@@ -4027,9 +4028,12 @@ async fn fork_spawn_writes_only_the_marker_and_loads_the_parent_prefix() {
         .unwrap();
     assert_eq!(resolved.inherited, parent_entries.len());
     assert_eq!(resolved.entries[..parent_entries.len()], parent_entries[..]);
+    // A new-generation marker: the cut is pinned by the owner's row key and
+    // carries no positional `at` at all.
     assert!(matches!(
         resolved.entries[parent_entries.len()],
-        AgentEntry::ForkedFrom { ref source, at, .. } if source == "parent" && at == parent_entries.len()
+        AgentEntry::ForkedFrom { ref source, at: None, event_time: None, seq: Some(seq) }
+            if source == "parent" && seq == parent_entries.len() as i64 - 1
     ));
     assert!(
         resolved.locations[..parent_entries.len()]
@@ -4685,6 +4689,245 @@ async fn fork_request_carries_the_parent_goal_system_message() {
     );
 }
 
+/// The fork's context starts at the parent's LAST COMPACTION AT OR BEFORE the
+/// cut, so a goal committed BEFORE that compaction is no longer in the
+/// inherited rows. The existing goal freeze supplies it: a head-only load must
+/// never silently drop it, and the marker must pin the cut row instead of a
+/// position (`at` is absent).
+#[tokio::test]
+async fn fork_carries_a_goal_set_before_the_parents_last_compaction() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    let goal = crate::agent::create_goal(
+        None,
+        "goal before compaction".into(),
+        vec!["survives the head-only load".into()],
+    )
+    .unwrap();
+    seed_parent_entries(
+        &root,
+        "parent",
+        &[
+            parent_user(),
+            parent_answer(),
+            crate::agent::SessionEntry::GoalUpdated {
+                goal: Some(goal.clone()),
+            },
+            crate::agent::SessionEntry::Compaction {
+                summary: "parent summary".into(),
+                retained: vec![],
+                current_prompt_at: None,
+                no_current_prompt: false,
+            },
+            parent_user(),
+            parent_answer(),
+        ],
+    );
+    let (url, captured) = capturing_model().await;
+    let model = chat_model(url, "fork-compaction-goal-model");
+    let head_model = model.clone();
+    let head_goal = goal.clone();
+    let mut delegate = forking_delegate(&root, &fork_record(&root, "parent"), model)
+        .with_fork_head(Arc::new(move || {
+            fork_head(
+                head_model.clone(),
+                Some("parent system"),
+                Some(head_goal.clone()),
+                false,
+            )
+        }));
+    let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
+    delegate.set_event_sender(sender);
+    delegate.set_session_handle("parent", live_parent_endpoint());
+
+    delegate
+        .execute(json!({
+            "task": "compaction goal fork",
+            "fork": true
+        }))
+        .await
+        .expect("the compaction-goal fork spawns");
+    let (status, answer) = await_background_status(&mut completions).await;
+    assert_eq!(status.as_deref(), Some("completed"));
+
+    let body = captured_request_body(&captured);
+    let messages = body["messages"].as_array().expect("messages array");
+    assert_eq!(
+        messages[1],
+        json!({
+            "role": "system",
+            "content": format!(
+                "[session goal]\n{}",
+                crate::agent::goal_projection_text(&goal)
+            )
+        }),
+        "the frozen parent goal must survive a context that starts at the compaction"
+    );
+
+    // The materialized context starts at the parent's last compaction, so the
+    // request is the summary followed by the post-compaction turn — the
+    // pre-compaction turn is never replayed alongside it.
+    assert_eq!(
+        messages.len(),
+        6,
+        "prefix (2 system) + summary + one turn + the child's own prompt: {messages:?}"
+    );
+    assert!(
+        messages[2]["content"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("[compacted summary")),
+        "the inherited context starts at the compaction summary: {messages:?}"
+    );
+
+    // The child's own rows: the frozen goal plus a PINNED marker (no `at`).
+    let child_id = answer
+        .strip_prefix("fork session: ")
+        .and_then(|rest| rest.lines().next())
+        .expect("the completion names the child session")
+        .trim()
+        .to_owned();
+    let stored = Session::load(&root, &child_id).unwrap().entries;
+    assert!(
+        stored.len() >= 2,
+        "goal freeze + marker lead the child's own rows: {stored:?}"
+    );
+    assert!(matches!(
+        stored[0],
+        crate::agent::SessionEntry::GoalUpdated { goal: Some(_) }
+    ));
+    assert!(matches!(
+        stored[1],
+        crate::agent::SessionEntry::ForkedFrom {
+            at: None,
+            seq: Some(_),
+            ..
+        }
+    ));
+    let raw =
+        std::fs::read_to_string(root.join(format!(".e-agent/sessions/{child_id}.jsonl"))).unwrap();
+    assert!(
+        !raw.contains(r#""at":"#),
+        "a new marker must not carry a positional `at`: {raw}"
+    );
+    // The inherited context starts at the compaction, NOT at the session
+    // start: the pre-compaction goal row is only available through the
+    // freeze.
+    let resolved = SessionStore::Jsonl
+        .load_fork_located(&root, &child_id)
+        .await
+        .unwrap();
+    assert_eq!(resolved.inherited, 3, "compaction + the child's cut turn");
+}
+
+/// A delegate fork of an UNCOMPACTED zero-copy child that has its own turn
+/// inherits BOTH contexts: the child's request must lead with the ancestor's
+/// conversation, exactly as reloading the child resolves it.
+#[tokio::test]
+async fn fork_of_an_uncompacted_fork_keeps_the_ancestor_turn() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    seed_parent_entries(&root, "ancestor", &[parent_user(), parent_answer()]);
+    Session::append(
+        &root,
+        "mid-fork",
+        &[
+            crate::agent::SessionEntry::ForkedFrom {
+                source: "ancestor".into(),
+                at: None,
+                event_time: None,
+                seq: Some(1),
+            },
+            crate::agent::SessionEntry::Message {
+                message: Message::User {
+                    content: "mid question".into(),
+                    images: vec![],
+                },
+            },
+            crate::agent::SessionEntry::Message {
+                message: Message::Assistant(AssistantMessage {
+                    content: Some("mid answer".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                }),
+            },
+        ],
+    )
+    .unwrap();
+    let (url, captured) = capturing_model().await;
+    let model = chat_model(url, "mid-fork-model");
+    let mut delegate = forking_delegate(&root, &fork_record(&root, "mid-fork"), model);
+    let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
+    delegate.set_event_sender(sender);
+    delegate.set_session_handle("mid-fork", live_parent_endpoint());
+
+    delegate
+        .execute(json!({
+            "task": "fork the mid fork",
+            "fork": true
+        }))
+        .await
+        .expect("the fork of an uncompacted fork spawns");
+    let (status, answer) = await_background_status(&mut completions).await;
+    assert_eq!(status.as_deref(), Some("completed"));
+
+    let body = captured_request_body(&captured);
+    let messages = body["messages"].as_array().expect("messages array");
+    // The ancestor's completed turn leads, then the mid fork's own marker and
+    // its turn, then the child's own prompt.
+    let texts: Vec<String> = messages
+        .iter()
+        .map(|message| message["content"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert_eq!(
+        texts,
+        vec![
+            "parent question".to_owned(),
+            "parent answer".to_owned(),
+            "mid question".to_owned(),
+            "mid answer".to_owned(),
+            texts.last().cloned().unwrap_or_default(),
+        ],
+        "the inherited ancestor turn must be part of the materialized context: {messages:?}"
+    );
+
+    // Fresh seed == marker-based reload: the child's own store resolves to the
+    // same context the request was built from.
+    let child_id = answer
+        .strip_prefix("fork session: ")
+        .and_then(|rest| rest.lines().next())
+        .expect("the completion names the child session")
+        .trim()
+        .to_owned();
+    let reloaded = SessionStore::Jsonl
+        .load_fork_located(&root, &child_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        reloaded.inherited, 5,
+        "ancestor turn + mid's marker + mid's turn"
+    );
+    let inherited_texts: Vec<String> = reloaded.entries[..reloaded.inherited]
+        .iter()
+        .filter_map(|entry| match entry {
+            crate::agent::SessionEntry::Message { message } => Some(match message {
+                Message::User { content, .. } => content.clone(),
+                Message::Assistant(assistant) => assistant.content.clone().unwrap_or_default(),
+                _ => String::new(),
+            }),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        inherited_texts,
+        vec![
+            "parent question".to_owned(),
+            "parent answer".to_owned(),
+            "mid question".to_owned(),
+            "mid answer".to_owned(),
+        ]
+    );
+}
+
 #[tokio::test]
 async fn fork_request_carries_the_cleared_goal_marker_from_the_head() {
     let temp = tempfile::tempdir().unwrap();
@@ -4817,13 +5060,19 @@ async fn spawn_fork_rechecks_delivery_before_creating_anything() {
     // endpoint, a resolved child workspace): only the completion channel is
     // gone.
     delegate.set_session_handle("parent", live_parent_endpoint());
-    let prefix = SessionStore::Jsonl
-        .load_fork_located(&root, "parent")
+    let cut = SessionStore::Jsonl
+        .default_fork_cut(&root, "parent")
         .await
         .unwrap();
-    let at = crate::agent::fork_prefix_complete(&prefix.entries, None)
-        .unwrap()
-        .len();
+    let prefix = crate::agent::fork_prefix_complete(&cut.context, None).unwrap();
+    let inherited = prefix.len();
+    let seeded = crate::session_store::LoadedLocated {
+        entries: prefix,
+        locations: vec![None; inherited],
+        legacy: false,
+        inherited,
+        next_older: None,
+    };
     let head = fork_head(head_model, None, None, false);
 
     let error = delegate
@@ -4831,8 +5080,8 @@ async fn spawn_fork_rechecks_delivery_before_creating_anything() {
             "orphaned work".into(),
             None,
             fork_record(&root, "parent"),
-            prefix,
-            at,
+            seeded,
+            (cut.owner, cut.key),
             head,
             Workspace::new(&root).unwrap(),
         )

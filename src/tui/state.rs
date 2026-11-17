@@ -2023,8 +2023,10 @@ pub(crate) fn session_entry_to_lines(entry: &SessionEntry) -> Vec<DisplayLine> {
             }
             lines
         }
-        SessionEntry::ForkedFrom { source, at, .. } => vec![DisplayLine {
-            text: format!("forked from {source} at entry {at}"),
+        SessionEntry::ForkedFrom { .. } => vec![DisplayLine {
+            text: entry
+                .forked_from_text()
+                .expect("a ForkedFrom entry always projects a provenance line"),
             kind: LineKind::Dim,
             collapsed_summary: None,
         }],

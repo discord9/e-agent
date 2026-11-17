@@ -712,6 +712,7 @@ async function loadHistory(id, wsId, epoch, timeoutMs) {
     state.webGapCursor = null;
     state.webGapAnchor = null;
     state.nextBeforeSeq = (data.next_before_seq !== undefined ? data.next_before_seq : null);
+    state.nextOlderSession = (data.next_older_session !== undefined ? data.next_older_session : null);
     state.olderDone = (state.nextBeforeSeq === null);
     if (state.initSource !== "snapshot") {
       if (state.initSource === "restored") {
@@ -756,6 +757,9 @@ async function loadOlder() {
   // oldest cursor; the cursors must not overwrite each other.
   const gap = state.webGapCursor !== null;
   const cursor = gap ? state.webGapCursor : state.nextBeforeSeq;
+  // Only the oldest-cursor chain can point into a fork ancestor; a web gap
+  // cursor is always this session's own physical interval.
+  const olderSession = gap ? null : state.nextOlderSession;
   if (state.loadingOlder || (!gap && state.olderDone) || !state.sessionId || cursor === null) return;
   const wsId = state.workspace.id;   // 发起时的 workspace：响应回来校验用
   const epoch = sessionOpenEpoch;
@@ -764,7 +768,8 @@ async function loadOlder() {
   const prevHeight = els.messages.scrollHeight;   // 插入前高度
   try {
     const res = await api("/api/sessions/" + encodeURIComponent(sid)
-      + "/history?before_seq=" + cursor + "&limit=" + HISTORY_PAGE);
+      + "/history?before_seq=" + cursor + "&limit=" + HISTORY_PAGE
+      + (olderSession ? "&before_session=" + encodeURIComponent(olderSession) : ""));
     if (epoch !== sessionOpenEpoch || state.workspace.id !== wsId || state.sessionId !== sid) return;
     if (res.status === 401 || res.status === 403) { setBanner("⚠ 认证失败：请检查 Token。"); return; }
     if (!res.ok) return;                          // 静默失败，下次滚动重试
@@ -786,10 +791,14 @@ async function loadOlder() {
       }
     }
     const next = (data.next_before_seq !== undefined ? data.next_before_seq : null);
+    // The owner of the NEXT cursor: another page in the same owner keeps it,
+    // and only a finished chain clears it.
+    const nextOlderSession = (data.next_older_session !== undefined ? data.next_older_session : null);
     if (gap) {
       state.webGapCursor = freshEntries.length ? next : null;
     } else {
       state.nextBeforeSeq = next;
+      state.nextOlderSession = next === null ? null : nextOlderSession;
       if (state.nextBeforeSeq === null) state.olderDone = true;
     }
     if (freshEntries.length) {
@@ -1032,6 +1041,10 @@ function saveSessionState() {
     html: els.messages.innerHTML,
     scrollTop: els.messages.scrollTop,
     nextBeforeSeq: state.nextBeforeSeq,
+    // The owner of that cursor (a fork ancestor's session) travels with it:
+    // restoring a cached cursor with a foreign owner would page the wrong
+    // store.
+    nextOlderSession: state.nextOlderSession,
     olderDone: state.olderDone,
     webOlderPages: state.webOlderPages,
     webHeadLocations: state.webHeadLocations,
@@ -1151,6 +1164,7 @@ function openSession(id, onReady, epoch, timeoutMs) {
     // 替换渲染，否则那些消息（snapshot 也被跳过）永远不会显示。
     state.initSource = "restored";
     state.nextBeforeSeq = cached.nextBeforeSeq;
+    state.nextOlderSession = cached.nextOlderSession !== undefined ? cached.nextOlderSession : null;
     state.loadingOlder = false;
     state.olderDone = cached.olderDone;
     state.webOlderPages = cached.webOlderPages || [];
@@ -1182,6 +1196,7 @@ function openSession(id, onReady, epoch, timeoutMs) {
     state.webGapCursor = null;
     state.webGapAnchor = null;
     state.nextBeforeSeq = null;
+    state.nextOlderSession = null;   // a fresh session starts with no owner
     state.loadingOlder = false;
     state.olderDone = false;
     state.acc = newAccumulator();

@@ -337,6 +337,7 @@ struct WebHead {
     entries: Vec<SessionEntry>,
     locations: Vec<Option<crate::session_store::EntryLocation>>,
     next_before_seq: Option<i64>,
+    next_older_session: Option<String>,
     history_start: usize,
     history_end: usize,
     returned_boundaries: Vec<usize>,
@@ -347,6 +348,7 @@ pub struct WebAttach {
     pub entries: Vec<SessionEntry>,
     pub locations: Vec<Option<crate::session_store::WebEntryLocation>>,
     pub next_before_seq: Option<i64>,
+    pub next_older_session: Option<String>,
     pub replay: Vec<WebReplayEvent>,
     pub status: SessionStatus,
     pub usage: Option<AgentEvent>,
@@ -1179,6 +1181,7 @@ fn respond_web_attach_locked(shared: &Shared, reply: oneshot::Sender<WebAttach>)
             .map(|location| location.as_ref().map(Into::into))
             .collect(),
         next_before_seq: head.next_before_seq,
+        next_older_session: head.next_older_session,
         replay: shared
             .log
             .iter()
@@ -1249,6 +1252,14 @@ impl SessionRunner {
     #[cfg(test)]
     pub(crate) fn user_input_allowed_for_test(&self) -> bool {
         self.user_input_allowed
+    }
+
+    /// The live goal projection a resumed session built its request from. A
+    /// head-only resume loads no pre-compaction row, so this proves the
+    /// separate goal restore reached the agent.
+    #[cfg(test)]
+    pub(crate) fn goal_projection_for_test(&self) -> (Option<crate::agent::GoalSnapshot>, bool) {
+        (self.agent.goal(), self.agent.goal_cleared())
     }
 
     async fn sync_background_projection(&mut self) -> bool {
@@ -2184,14 +2195,28 @@ impl SessionRunner {
     }
 
     fn prepare_web_attach(&self) {
-        let (entries, locations, next_before_seq, history_start, history_end, returned_boundaries) =
-            self.agent.web_head_page(200, self.store.is_jsonl());
+        let (
+            entries,
+            locations,
+            next_before_seq,
+            next_older_session,
+            history_start,
+            history_end,
+            returned_boundaries,
+        ) = self.agent.web_head_page(200, self.store.is_jsonl());
+        // Normalize the page contract at the source: `None` means "this
+        // session". A head-only resume whose own compaction opened the head
+        // carries a cursor tagged with the session's OWN id (its earlier rows
+        // are its own); consumers must not mistake it for a fork ancestor and
+        // suppress the child-bound gap fill. A real ancestor stays `Some`.
+        let next_older_session = next_older_session.filter(|owner| *owner != self.session);
         let mut shared = self.shared.lock().unwrap();
         let log_start = shared.log.len();
         shared.web_head = Some(WebHead {
             entries,
             locations,
             next_before_seq,
+            next_older_session,
             history_start,
             history_end,
             returned_boundaries,
@@ -4221,9 +4246,11 @@ fn entry_event(entry: &SessionEntry) -> Option<AgentEvent> {
             kind: kind.clone(),
             cancellation_source: *cancellation_source,
         }),
-        SessionEntry::ForkedFrom { source, at, .. } => Some(AgentEvent::Display(format!(
-            "forked from {source} at entry {at}"
-        ))),
+        SessionEntry::ForkedFrom { .. } => {
+            Some(AgentEvent::Display(entry.forked_from_text().expect(
+                "a ForkedFrom entry always projects a provenance line",
+            )))
+        }
         // Harness errors are durable and replay as Error events, so a
         // resumed or late-attached view sees the audit trail.
         SessionEntry::Error { text } => Some(AgentEvent::Error(text.clone())),

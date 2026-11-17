@@ -568,7 +568,6 @@ pub(crate) fn format_conflict_error(
 /// segment with the cursor at the seq of the compaction that opens it
 /// (matching the old `load_head` + `head_seq` pair). Only meaningful on
 /// the Greptime and SQLite backends (JSONL has no seq-based paging).
-#[allow(dead_code)]
 const HEAD_OPEN_SENTINEL: i64 = i64::MAX;
 
 /// The exact physical key of one persisted `session_entries` row/line, as
@@ -653,6 +652,11 @@ pub struct EntryLocation {
 pub struct WebEntryLocation {
     pub backend: &'static str,
     pub key: LocatedKey,
+    /// Session that PHYSICALLY stores this row. Backend keys are per-session
+    /// (JSONL ordinals restart at 0 in every file), so the same ordinal in an
+    /// ancestor and in a fork child is two different rows: the UI reconciles
+    /// physical identity, so the owner must be part of it.
+    pub session: String,
 }
 
 impl From<&EntryLocation> for WebEntryLocation {
@@ -660,6 +664,7 @@ impl From<&EntryLocation> for WebEntryLocation {
         Self {
             backend: location.backend,
             key: location.key.clone(),
+            session: location.session.clone(),
         }
     }
 }
@@ -680,6 +685,15 @@ pub struct LoadedLocated {
     /// every ordinary load (and for the copy-based forks written by older
     /// builds, whose prefix really is stored here).
     pub inherited: usize,
+    /// Where this session's OLDER audit rows live when the loaded entries are
+    /// a zero-copy fork's materialized context: `(session that physically
+    /// stores them, its paging position immediately below `entries[0]`).
+    ///
+    /// `None` means there is nothing older to page (the rows start at the
+    /// owning session's own first row) — or that this load is not a fork
+    /// context at all. The position belongs to the NAMED session's physical
+    /// space and must never be fed back as a child seq.
+    pub next_older: Option<(String, i64)>,
 }
 
 impl LoadedLocated {
@@ -695,6 +709,28 @@ impl LoadedLocated {
         self.locations = vec![None; at];
         self.inherited = at;
     }
+}
+
+/// One entry of a resolved fork context and where it physically lives.
+#[derive(Clone, Debug)]
+enum CutOrigin {
+    /// A row stored by this session at this exact pinned key.
+    Row(String, LocatedKey),
+    /// An entry read from `session`'s RESOLVED transcript at this 1-based
+    /// index (the prefix of a legacy positional marker).
+    Resolved(String, usize),
+}
+
+/// The context one zero-copy [`SessionEntry::ForkedFrom`] marker inherits,
+/// with the physical origin of every entry (aligned 1:1 with `entries`).
+#[derive(Clone, Debug, Default)]
+struct InheritedContext {
+    entries: Vec<SessionEntry>,
+    origins: Vec<CutOrigin>,
+    /// Older AUDIT rows below `entries[0]`: the owning session and its paging
+    /// position (the compaction that opens the materialized context). `None`
+    /// when the context already starts at the owner's own first row.
+    older: Option<(String, i64)>,
 }
 
 /// Index of the child's OWN [`SessionEntry::ForkedFrom`] marker when this
@@ -716,6 +752,26 @@ pub(crate) fn zero_copy_marker(entries: &[SessionEntry]) -> Option<usize> {
     }
 }
 
+/// The DEFAULT fork cut of a session, selected from its physical located head
+/// ([`SessionStore::default_fork_cut`]).
+#[derive(Clone, Debug)]
+pub struct ForkHeadCut {
+    /// The session that PHYSICALLY stores the cut row (the session itself, or
+    /// an ancestor when the cut is inherited).
+    pub owner: String,
+    /// That row's exact backend key.
+    pub key: LocatedKey,
+    /// Exactly the rows the child materializes through the cut: the session's
+    /// own head up to its boundary, or the inherited context it reuses.
+    pub context: Vec<SessionEntry>,
+    /// The 1-based RESOLVED index of the cut when it lies in an inherited
+    /// prefix (`None` when the cut is the session's own row).
+    pub inherited: Option<usize>,
+    /// Older AUDIT rows below `context[0]`: `(owning session, its paging
+    /// position)`. `None` = nothing older to page.
+    pub older: Option<(String, i64)>,
+}
+
 /// One bounded history page with the exact physical identity of every row.
 /// The entries and locations remain aligned; cursors retain the existing
 /// backend paging contract.
@@ -724,6 +780,10 @@ pub struct LocatedHistoryPage {
     pub entries: Vec<SessionEntry>,
     pub locations: Vec<Option<EntryLocation>>,
     pub next_before_seq: Option<i64>,
+    /// Session that owns `next_before_seq` when the next older page lives in a
+    /// zero-copy fork's ANCESTOR. `None` = this page's own session (the
+    /// historical contract).
+    pub next_older_session: Option<String>,
 }
 
 /// One session's metadata snapshot from the `sessions` audit table
@@ -1257,10 +1317,21 @@ impl SessionStore {
         if let Some(resolved) = &resolved
             && resolved.inherited > 0
         {
+            // The inherited prefix is served as one page (it has no child
+            // seq), but the AUDIT route below it stays available: the cursor
+            // is the owning session's position, never a child seq.
+            let (cursor, older_session) = match &resolved.next_older {
+                // `None` means "this session": an own-session owner is never
+                // reported as an ancestor.
+                Some((owner, seq)) if owner == name => (Some(*seq), None),
+                Some((owner, seq)) => (Some(*seq), Some(owner.clone())),
+                None => (None, None),
+            };
             return Ok(LocatedHistoryPage {
                 entries: resolved.entries.clone(),
                 locations: resolved.locations.clone(),
-                next_before_seq: None,
+                next_before_seq: cursor,
+                next_older_session: older_session,
             });
         }
         match self {
@@ -1270,14 +1341,54 @@ impl SessionStore {
             // the file (JSONL can only be parsed in full), so reuse it.
             SessionStore::Jsonl => {
                 let loaded = resolved.expect("JSONL always resolves its leading marker");
-                let start = match limit.filter(|&n| n > 0) {
-                    Some(n) if loaded.entries.len() > n => loaded.entries.len() - n,
-                    _ => 0,
+                let bounded = limit
+                    .filter(|&n| n > 0)
+                    .filter(|&n| loaded.entries.len() > n)
+                    .map(|n| loaded.entries.len() - n);
+                // A bounded page's cursor is the ABSOLUTE position of its first
+                // RETURNED row (the same value `load_older_located` consumes),
+                // never a head-relative index: a head anchored at a compaction
+                // starts at an arbitrary ordinal (e.g. 100), so an index of 8
+                // would skip everything above it.
+                if let Some(start) = bounded {
+                    // Absolute position of `entries[0]`: a located row's key
+                    // minus its index. Dense JSONL ordinals make every row agree;
+                    // a legacy whole-document session has no per-row identity and
+                    // starts at position zero.
+                    let abs_start = loaded
+                        .locations
+                        .iter()
+                        .enumerate()
+                        .find_map(|(index, location)| {
+                            location
+                                .as_ref()
+                                .map(|location| location.key.seq() - index as i64)
+                        })
+                        .unwrap_or(0);
+                    let cursor = loaded.locations[start..]
+                        .iter()
+                        .find_map(|location| location.as_ref())
+                        .map(|location| location.key.seq())
+                        .unwrap_or(abs_start + start as i64);
+                    return Ok(LocatedHistoryPage {
+                        entries: loaded.entries[start..].to_vec(),
+                        locations: loaded.locations[start..].to_vec(),
+                        next_before_seq: Some(cursor),
+                        next_older_session: None,
+                    });
+                }
+                // Whole head: hand out the loaded head's own older route (this
+                // session's earlier rows, or a fork ancestor's).
+                let (cursor, older_session) = match &loaded.next_older {
+                    Some((owner, seq)) if owner == name => (Some(*seq), None),
+                    Some((owner, seq)) => (Some(*seq), Some(owner.clone())),
+                    None => (None, None),
                 };
                 Ok(LocatedHistoryPage {
-                    entries: loaded.entries[start..].to_vec(),
-                    locations: loaded.locations[start..].to_vec(),
-                    next_before_seq: (start > 0).then_some(start as i64),
+                    entries: loaded.entries,
+                    locations: loaded.locations,
+                    next_before_seq: cursor,
+                    next_older_session: older_session,
                 })
             }
             #[cfg(feature = "greptime")]
@@ -1292,6 +1403,7 @@ impl SessionStore {
                         .map(|(location, _)| Some(location))
                         .collect(),
                     next_before_seq,
+                    next_older_session: None,
                 })
             }
             #[cfg(feature = "sqlite")]
@@ -1309,6 +1421,7 @@ impl SessionStore {
                         .map(|(location, _)| Some(location))
                         .collect(),
                     next_before_seq,
+                    next_older_session: None,
                 })
             }
         }
@@ -1331,6 +1444,7 @@ impl SessionStore {
                         entries: Vec::new(),
                         locations: Vec::new(),
                         next_before_seq: None,
+                        next_older_session: None,
                     });
                 }
                 let loaded = Session::load_located(root, name)?;
@@ -1343,6 +1457,7 @@ impl SessionStore {
                     entries: loaded.entries[start..before].to_vec(),
                     locations: loaded.locations[start..before].to_vec(),
                     next_before_seq: (start > 0).then_some(start as i64),
+                    next_older_session: None,
                 })
             }
             #[cfg(feature = "greptime")]
@@ -1355,6 +1470,7 @@ impl SessionStore {
                         .map(|(location, _)| Some(location))
                         .collect(),
                     next_before_seq,
+                    next_older_session: None,
                 })
             }
             #[cfg(feature = "sqlite")]
@@ -1372,6 +1488,7 @@ impl SessionStore {
                         .map(|(location, _)| Some(location))
                         .collect(),
                     next_before_seq,
+                    next_older_session: None,
                 })
             }
         }
@@ -1777,6 +1894,7 @@ impl SessionStore {
                     locations: rows.into_iter().map(|(loc, _)| Some(loc)).collect(),
                     legacy: false,
                     inherited: 0,
+                    next_older: None,
                 })
             }
             #[cfg(feature = "sqlite")]
@@ -1792,6 +1910,7 @@ impl SessionStore {
                     locations: rows.into_iter().map(|(loc, _)| Some(loc)).collect(),
                     legacy: false,
                     inherited: 0,
+                    next_older: None,
                 })
             }
         }
@@ -1802,173 +1921,837 @@ impl SessionStore {
     ///
     /// A fork child's storage holds ONLY its own entries — the leading
     /// [`SessionEntry::ForkedFrom`] marker (optionally preceded by the
-    /// child's frozen `GoalUpdated`) names the source session and the 1-based
-    /// entry count `at` inherited from it. The inherited prefix is read back
-    /// from the source session READ-ONLY and prepended in memory, so the
-    /// transcript becomes `[source prefix 0..at][child entries]` without the
-    /// parent rows ever being copied into the child's store. The parent is
-    /// frozen at the marker: later parent appends are invisible because only
-    /// the first `at` entries are ever read.
+    /// child's frozen `GoalUpdated`). The marker has two generations:
+    ///
+    /// - **Pinned** (`at: None`): `source` is the session
+    ///   that PHYSICALLY stores the cut row, pinned by `seq` (and
+    ///   `event_time` on the SQL backends). The context is that owner's rows
+    ///   from the last `Compaction` at or before the cut through the cut. When
+    ///   the cut precedes every compaction of a marker-first owner, the
+    ///   owner's own inherited prefix is resolved instead of its missing
+    ///   earlier rows. Nothing after the cut is ever inherited.
+    /// - **Legacy positional** (`at: Some(n)`): `source` is the logical
+    ///   parent and the first `n` entries of its RESOLVED transcript are
+    ///   inherited. Old rows keep loading exactly as written.
     ///
     /// Inherited entries carry `locations[i] = None` (their physical rows
     /// belong to the source session, and a receipt's numeric `eout1` ref has
     /// no session identity — see [`LoadedLocated::inherited`]), so no receipt
     /// is ever issued against the child's store for them.
     ///
-    /// Fails closed (with the source session named) when the source is
-    /// missing/empty, when it has fewer than `at` entries, or when the entry
-    /// at `at` no longer matches the marker's pinned `seq`/`event_time`
-    /// (a rewritten source store). A fork of a fork resolves the whole chain
-    /// iteratively with cycle detection.
-    ///
-    /// Copy-based forks written by older builds mostly load exactly as
-    /// before: the `[prefix..][ForkedFrom]` layout has no leading marker, so
-    /// it is never resolved. The `[ForkedFrom][prefix..]` layout that commit
-    /// `0e32549` wrote is byte-identical to a zero-copy child whose own first
-    /// messages repeat the parent prefix; when no provenance separates the two
-    /// (no frozen goal before the marker, no `event_time` on it) the load
-    /// fails closed as ambiguous instead of silently dropping or duplicating
-    /// the inherited prefix. A marker-first copy whose source is gone also
-    /// fails closed — the source cannot be compared against.
+    /// Fails closed (naming the source session) when a source is
+    /// missing/empty/truncated, when a pinned cut no longer matches the row it
+    /// names (a rewritten or reused-`seq` source), when a pinned marker is
+    /// missing its `seq`, or when a legacy marker's layout is ambiguous. A
+    /// fork of a fork resolves the whole chain with a depth limit.
     pub async fn load_fork_located(&self, root: &Path, name: &str) -> Result<LoadedLocated> {
-        let backend = self.backend();
-        // Levels from the child upward. `None`-terminated by the first
-        // session without a leading zero-copy marker.
-        let mut levels: Vec<LoadedLocated> = Vec::new();
-        let mut store = self.clone();
-        let mut current = name.to_owned();
-        loop {
-            let loaded = store
-                .load_located(root, &current)
-                .await
-                .with_context(|| format!("cannot load session {current}"))?;
-            let marker = zero_copy_marker(&loaded.entries);
-            levels.push(loaded);
-            let Some(marker) = marker else {
-                break;
+        self.load_fork_located_depth(root, name, 0).await
+    }
+
+    /// [`Self::load_fork_located`] with the ancestry depth threaded through
+    /// every recursive hop (a marker chain that names itself must trip the
+    /// limit instead of recursing forever).
+    async fn load_fork_located_depth(
+        &self,
+        root: &Path,
+        name: &str,
+        depth: usize,
+    ) -> Result<LoadedLocated> {
+        let loaded = self
+            .load_located(root, name)
+            .await
+            .with_context(|| format!("cannot load session {name}"))?;
+        let Some(marker) = zero_copy_marker(&loaded.entries) else {
+            // An ordinary (or copy-based legacy) log: everything really is
+            // stored here.
+            return Ok(loaded);
+        };
+        let context = self
+            .fork_marker_context(root, name, &loaded.entries, marker, depth)
+            .await?;
+        let inherited = context.entries.len();
+        let mut entries = context.entries;
+        entries.extend(loaded.entries);
+        // Inherited entries keep NO child location: their rows live in the
+        // source session's store, and a receipt's numeric `eout1` ref carries
+        // no session identity, so a child-bound ref could read the wrong row.
+        let mut locations = vec![None; inherited];
+        locations.extend(loaded.locations);
+        Ok(LoadedLocated {
+            entries,
+            locations,
+            // `legacy` describes the PHYSICAL store of the session being
+            // loaded (the runner rewrites it), so the child's own flag wins —
+            // an inherited legacy whole-document ancestor must not make this
+            // session rewrite its marker-only log into a full copy.
+            legacy: loaded.legacy,
+            inherited,
+            next_older: context.older,
+        })
+    }
+
+    /// The physical identity of the 1-based RESOLVED entry `at` of `name`:
+    /// `(session that stores the row, its pinned key)`.
+    ///
+    /// Fork producers pin exactly this row in a pinned marker (`at: None`), so
+    /// the cut can never be retargeted by a later insert/rewrite. When the cut
+    /// lies inside a zero-copy inherited prefix the owning session is reached
+    /// by descending the marker chain — ownership comes from the selected
+    /// physical row, never from a numeric `seq` (a child `seq` and an ancestor
+    /// `seq` are different entries).
+    ///
+    /// Fails closed when the entry has no durable physical identity.
+    pub async fn fork_cut_origin(
+        &self,
+        root: &Path,
+        name: &str,
+        at: usize,
+    ) -> Result<(String, LocatedKey)> {
+        self.fork_cut_origin_inner(root, name, at, 0).await
+    }
+
+    async fn fork_cut_origin_inner(
+        &self,
+        root: &Path,
+        name: &str,
+        at: usize,
+        depth: usize,
+    ) -> Result<(String, LocatedKey)> {
+        anyhow::ensure!(
+            depth <= Self::FORK_CHAIN_LIMIT,
+            "fork ancestry of session {name} is cyclic or deeper than {} sessions",
+            Self::FORK_CHAIN_LIMIT
+        );
+        anyhow::ensure!(at > 0, "fork point 0 is out of range");
+        let store = self.source_store(root, name).await?;
+        let own = store
+            .load_located(root, name)
+            .await
+            .with_context(|| format!("cannot load session {name}"))?;
+        let Some(marker) = zero_copy_marker(&own.entries) else {
+            let key = own
+                .locations
+                .get(at - 1)
+                .and_then(|location| location.as_ref())
+                .map(|location| location.key.clone());
+            let Some(key) = key else {
+                anyhow::bail!(
+                    "fork point {at} of session {name} has no durable physical identity: \
+                     the entry is not stored by any session"
+                );
             };
-            let SessionEntry::ForkedFrom { source, at, .. } =
-                &levels[levels.len() - 1].entries[marker]
-            else {
-                unreachable!("zero_copy_marker only matches ForkedFrom")
+            return Ok((name.to_owned(), key));
+        };
+        let context =
+            Box::pin(store.fork_marker_context(root, name, &own.entries, marker, depth)).await?;
+        if at <= context.entries.len() {
+            return match &context.origins[at - 1] {
+                CutOrigin::Row(session, key) => Ok((session.clone(), key.clone())),
+                CutOrigin::Resolved(session, index) => {
+                    Box::pin(self.fork_cut_origin_inner(root, session, *index, depth + 1)).await
+                }
             };
-            anyhow::ensure!(
-                levels.len() <= Self::FORK_CHAIN_LIMIT,
-                "fork ancestry of session {name} is cyclic or deeper than {} sessions",
-                Self::FORK_CHAIN_LIMIT
-            );
-            if *at == 0 {
-                // Nothing inherited: the child is self-contained.
-                break;
-            }
-            let source = source.clone();
-            store = SessionStore::connect(&backend, root, &source)
-                .await
-                .with_context(|| format!("cannot open fork source session {source}"))?;
-            current = source;
         }
-        let mut resolved = levels.pop().expect("the ancestry walk records the child");
-        while let Some(level) = levels.pop() {
-            let Some(marker) = zero_copy_marker(&level.entries) else {
-                unreachable!("every recorded level carries a marker")
+        let own_at = at - 1 - context.entries.len();
+        let key = own
+            .locations
+            .get(own_at)
+            .and_then(|location| location.as_ref())
+            .map(|location| location.key.clone());
+        let Some(key) = key else {
+            anyhow::bail!(
+                "fork point {at} of session {name} has no durable physical identity: \
+                 the entry is not stored by any session"
+            );
+        };
+        Ok((name.to_owned(), key))
+    }
+
+    /// A store bound to `session` on this backend/root instance. Every method
+    /// that touches an OTHER session's rows must connect its own store: the
+    /// SQL backends bind the session id at connect time.
+    async fn source_store(&self, root: &Path, session: &str) -> Result<Self> {
+        Self::connect(&self.backend(), root, session)
+            .await
+            .with_context(|| format!("cannot open fork source session {session}"))
+    }
+
+    /// Resolve what ONE zero-copy marker inherits. `own` is the session's own
+    /// stored rows and `marker` the index of its leading `ForkedFrom` entry
+    /// (see [`zero_copy_marker`]); `name` is the forking session, used only in
+    /// fail-closed messages.
+    ///
+    /// Recursive (a pinned cut can land inside the owner's own inherited
+    /// prefix), so the call edges are boxed and the depth is capped.
+    async fn fork_marker_context(
+        &self,
+        root: &Path,
+        name: &str,
+        own: &[SessionEntry],
+        marker: usize,
+        depth: usize,
+    ) -> Result<InheritedContext> {
+        anyhow::ensure!(
+            depth <= Self::FORK_CHAIN_LIMIT,
+            "fork ancestry of session {name} is cyclic or deeper than {} sessions",
+            Self::FORK_CHAIN_LIMIT
+        );
+        let SessionEntry::ForkedFrom {
+            source,
+            at,
+            event_time,
+            seq,
+        } = &own[marker]
+        else {
+            unreachable!("fork_marker_context is only called on a ForkedFrom marker")
+        };
+        let (source, event_time, seq) = (source.clone(), *event_time, *seq);
+        let Some(at) = *at else {
+            // Pinned marker: the absence of `at` selects the owner+key
+            // semantics, so a missing `seq` has no row to pin.
+            let seq = seq.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "fork session {name} is unusable: its ForkedFrom marker names source \
+                     {source} without a pinned seq; re-record the fork"
+                )
+            })?;
+            return Box::pin(self.fork_owner_context(
+                root,
+                name,
+                &source,
+                seq,
+                event_time,
+                depth + 1,
+            ))
+            .await;
+        };
+        if at == 0 {
+            // Legacy: nothing inherited, the child is self-contained.
+            return Ok(InheritedContext::default());
+        }
+        let store = self.source_store(root, &source).await?;
+        let resolved = Box::pin(store.load_fork_located_depth(root, &source, depth + 1))
+            .await
+            .with_context(|| format!("cannot load fork source session {source}"))?;
+        // Commit `0e32549` wrote the copy-based layout `[ForkedFrom] +
+        // prefix` (marker FIRST). That layout is byte-identical to a genuine
+        // zero-copy child whose own first messages happen to repeat the parent
+        // prefix, so content equality alone cannot decide. Provenance can: the
+        // old layout never froze a goal before the marker and never wrote
+        // `event_time`, so a marker placed after the child's `GoalUpdated` —
+        // or one carrying `event_time` — is zero-copy. Everything else with
+        // the source prefix stored right after a leading marker is AMBIGUOUS
+        // and fails closed rather than guessing: "legacy" would silently drop
+        // the parent turn, "zero-copy" would duplicate it.
+        let stored_prefix = marker + 1..marker + 1 + at;
+        if marker == 0
+            && event_time.is_none()
+            && resolved.entries.len() >= at
+            && own.len() >= marker + 1 + at
+            && own[stored_prefix] == resolved.entries[..at]
+        {
+            anyhow::bail!(
+                "fork session {name} is ambiguous: its ForkedFrom marker (source {source}, \
+                 at {at}) is followed by {at} stored entries identical to the source \
+                 prefix, which is exactly the layout of the legacy marker-first fork copy. \
+                 Refusing to guess between dropping the inherited prefix and duplicating \
+                 it; re-record the fork with a marker carrying event_time (or without the \
+                 stored prefix) to disambiguate."
+            );
+        }
+        anyhow::ensure!(
+            !resolved.entries.is_empty(),
+            "fork source session {source} is missing or empty; session {name} was \
+             forked at entry {at} and cannot be loaded without it"
+        );
+        anyhow::ensure!(
+            resolved.entries.len() >= at,
+            "fork source session {source} has only {} entries but session {name} was \
+             forked at entry {at}",
+            resolved.entries.len()
+        );
+        // Pin the cut: the loaded source must still carry the exact
+        // `seq`/`event_time` the marker recorded (a rewritten source — e.g. a
+        // compaction that replaced entries — fails closed instead of silently
+        // inheriting a different prefix). A source that is itself a fork child
+        // may sit inside an already-inherited region; such entries carry no
+        // physical location of their own and are accepted positionally, as are
+        // legacy whole-document sources.
+        if let Some(end) = resolved.locations.get(at - 1).and_then(|loc| loc.as_ref()) {
+            if let Some(expected) = seq {
+                anyhow::ensure!(
+                    end.key.seq() == expected,
+                    "fork source session {source} no longer matches the marker of \
+                     session {name}: entry {at} moved to seq {}, the marker pinned \
+                     {expected}",
+                    end.key.seq()
+                );
+            }
+            if let Some(expected) = event_time {
+                anyhow::ensure!(
+                    end.key.event_time_us() == Some(expected),
+                    "fork source session {source} no longer matches the marker of \
+                     session {name}: entry {at} moved to event_time {:?}, the marker \
+                     pinned {expected}",
+                    end.key.event_time_us()
+                );
+            }
+        }
+        Ok(InheritedContext {
+            entries: resolved.entries[..at].to_vec(),
+            // Each inherited entry is the source's RESOLVED entry at the same
+            // 1-based index (legacy markers are positional by definition).
+            origins: (1..=at)
+                .map(|index| CutOrigin::Resolved(source.clone(), index))
+                .collect(),
+            // A legacy positional prefix has no physical cursor of its own:
+            // paging further back stays a documented legacy boundary.
+            older: None,
+        })
+    }
+
+    /// The context a PINNED marker inherits: the owner's physical rows from
+    /// the last [`SessionEntry::Compaction`] at or before the cut through the
+    /// cut itself.
+    ///
+    /// The owner's physical head is read first and older compaction segments
+    /// are paged in only until the segment holding the cut is reached, so a
+    /// cut far behind the owner's newest compaction costs one segment, not the
+    /// whole transcript. Rows after the cut are dropped: the child inherits
+    /// exactly the parent's prefix, never later appends.
+    #[allow(clippy::too_many_arguments)]
+    async fn fork_owner_context(
+        &self,
+        root: &Path,
+        name: &str,
+        owner: &str,
+        seq: i64,
+        event_time: Option<i64>,
+        depth: usize,
+    ) -> Result<InheritedContext> {
+        anyhow::ensure!(
+            depth <= Self::FORK_CHAIN_LIMIT,
+            "fork ancestry of session {name} is cyclic or deeper than {} sessions",
+            Self::FORK_CHAIN_LIMIT
+        );
+        let store = self.source_store(root, owner).await?;
+        let mut page = store
+            .load_older_located(root, owner, HEAD_OPEN_SENTINEL, None)
+            .await
+            .with_context(|| format!("cannot load fork source session {owner}"))?;
+        let cut = loop {
+            if let Some(index) = page.locations.iter().position(|location| {
+                location
+                    .as_ref()
+                    .is_some_and(|location| location.key.seq() == seq)
+            }) {
+                break index;
+            }
+            // The cut sits behind this segment: page the immediately older
+            // compaction segment in (the cursor is the compaction opening the
+            // segment just read; `None` means its start is the session's own).
+            let Some(before) = page.next_before_seq else {
+                anyhow::bail!(
+                    "fork source session {owner} no longer contains the entry pinned by \
+                     the marker of session {name} (seq {seq}); the forked history cannot \
+                     be loaded"
+                );
+            };
+            page = store
+                .load_older_located(root, owner, before, None)
+                .await
+                .with_context(|| format!("cannot load fork source session {owner}"))?;
+        };
+        let key = page.locations[cut]
+            .as_ref()
+            .expect("every row of a located page carries its key")
+            .key
+            .clone();
+        anyhow::ensure!(
+            key.event_time_us() == event_time,
+            "fork source session {owner} no longer matches the marker of session {name}: \
+             the pinned entry (seq {seq}) moved to event_time {:?}, the marker pinned \
+             {event_time:?}",
+            key.event_time_us()
+        );
+        let row_origin = |index: usize| {
+            CutOrigin::Row(
+                owner.to_owned(),
+                page.locations[index]
+                    .as_ref()
+                    .expect("every row of a located page carries its key")
+                    .key
+                    .clone(),
+            )
+        };
+        // The last compaction AT OR BEFORE the cut opens the context (the
+        // owner's latest compaction overall would be a different, later one).
+        // Earlier rows are already summarized there and are not needed.
+        if let Some(start) = (0..=cut)
+            .rev()
+            .find(|&index| matches!(page.entries[index], SessionEntry::Compaction { .. }))
+        {
+            // The context opens at that compaction, so the owner's rows BELOW
+            // it are the audit-only older history: keep the route (never a
+            // child seq) instead of materializing them into the model context.
+            let older = Some((
+                owner.to_owned(),
+                page.locations[start]
+                    .as_ref()
+                    .expect("every row of a located page carries its key")
+                    .key
+                    .seq(),
+            ));
+            return Ok(InheritedContext {
+                entries: page.entries[start..=cut].to_vec(),
+                origins: (start..=cut).map(row_origin).collect(),
+                older,
+            });
+        }
+        // No compaction at or before the cut: the cut lies in the owner's own
+        // oldest rows. When that oldest segment starts with the owner's own
+        // zero-copy marker, the owner inherits ITS prefix — resolve it instead
+        // of pretending the owner's first stored row is the session start.
+        let mut entries = Vec::new();
+        let mut origins = Vec::new();
+        let mut older = None;
+        if let Some(marker) = zero_copy_marker(&page.entries).filter(|&marker| marker <= cut) {
+            let prefix =
+                Box::pin(store.fork_marker_context(root, owner, &page.entries, marker, depth + 1))
+                    .await?;
+            entries.extend(prefix.entries);
+            origins.extend(prefix.origins);
+            older = prefix.older;
+        }
+        entries.extend(page.entries[..=cut].iter().cloned());
+        origins.extend((0..=cut).map(row_origin));
+        // The owner's own first row opens this part, but a prepended inherited
+        // prefix may still have older rows below ITS start: keep that route so
+        // audit paging continues in the ancestor.
+        Ok(InheritedContext {
+            entries,
+            origins,
+            older,
+        })
+    }
+
+    /// The session's OWN physical head: the last `Compaction` and everything
+    /// after it, with each row's key. Older rows stay on demand through
+    /// [`Self::load_older_located`] (the returned `next_older` route).
+    ///
+    /// This is the MODEL-CONTEXT view of a session: [`crate::agent::Agent`]
+    /// projects exactly `[last compaction, ∞)`, so initializing from the head
+    /// is equivalent to loading the whole transcript while a paged backend
+    /// reads one segment instead of everything. Legacy whole-document sessions
+    /// (`.json`, rewritten in place on resume) are returned in full, and JSONL
+    /// is always parsed in full — only what is RETURNED is bounded there.
+    pub async fn load_head_located(&self, root: &Path, name: &str) -> Result<LoadedLocated> {
+        match self {
+            SessionStore::Jsonl => {
+                let loaded = Session::load_located(root, name)?;
+                if loaded.legacy {
+                    return Ok(loaded);
+                }
+                let start = loaded
+                    .entries
+                    .iter()
+                    .rposition(|entry| matches!(entry, SessionEntry::Compaction { .. }))
+                    .unwrap_or(0);
+                let mut head = LoadedLocated {
+                    entries: loaded.entries[start..].to_vec(),
+                    locations: loaded.locations[start..].to_vec(),
+                    legacy: false,
+                    inherited: 0,
+                    next_older: None,
+                };
+                head.next_older = (start > 0).then(|| (name.to_owned(), start as i64));
+                Ok(head)
+            }
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session, .. } => {
+                let (rows, cursor) = session.load_older_located(HEAD_OPEN_SENTINEL, None).await?;
+                Ok(LoadedLocated {
+                    entries: rows.iter().map(|(_, entry)| entry.clone()).collect(),
+                    locations: rows
+                        .into_iter()
+                        .map(|(location, _)| Some(location))
+                        .collect(),
+                    legacy: false,
+                    inherited: 0,
+                    next_older: cursor.map(|seq| (name.to_owned(), seq)),
+                })
+            }
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite { session, .. } => {
+                let (rows, cursor) = session
+                    .lock()
+                    .await
+                    .load_older_located(HEAD_OPEN_SENTINEL, None)
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+                Ok(LoadedLocated {
+                    entries: rows.iter().map(|(_, entry)| entry.clone()).collect(),
+                    locations: rows
+                        .into_iter()
+                        .map(|(location, _)| Some(location))
+                        .collect(),
+                    legacy: false,
+                    inherited: 0,
+                    next_older: cursor.map(|seq| (name.to_owned(), seq)),
+                })
+            }
+        }
+    }
+
+    /// HEAD-oriented marker-aware load: the model context this session
+    /// initializes from, without materializing the whole transcript.
+    ///
+    /// - No leading fork marker: [`Self::load_head_located`] — the session's
+    ///   own head, with older rows available on demand.
+    /// - Leading fork marker (zero-copy child) that already compacted on its
+    ///   own: that head IS the context; the ancestry below it is not needed.
+    /// - Leading fork marker and no own compaction: the marker's inherited
+    ///   context is resolved (see [`Self::fork_marker_context`]) and
+    ///   prepended to the child's own rows, exactly like
+    ///   [`Self::load_fork_located`], and the context's older audit rows stay
+    ///   behind [`LoadedLocated::next_older`].
+    ///
+    /// Use [`Self::load_fork_located`] when the FULL resolved transcript is
+    /// required (fork-boundary scans, explicit `--at` resolution).
+    pub async fn load_fork_head_located(&self, root: &Path, name: &str) -> Result<LoadedLocated> {
+        let head = self.load_head_located(root, name).await?;
+        if head.legacy {
+            // A legacy whole-document session has no physical head to page.
+            return Ok(head);
+        }
+        let Some(marker) = zero_copy_marker(&head.entries) else {
+            return Ok(head);
+        };
+        let context = self
+            .fork_marker_context(root, name, &head.entries, marker, 0)
+            .await?;
+        let inherited = context.entries.len();
+        let mut entries = context.entries;
+        entries.extend(head.entries);
+        let mut locations = vec![None; inherited];
+        locations.extend(head.locations);
+        Ok(LoadedLocated {
+            entries,
+            locations,
+            legacy: false,
+            inherited,
+            next_older: context.older,
+        })
+    }
+
+    /// The DEFAULT fork cut of `name`, selected from a physical located HEAD
+    /// instead of a full resolved transcript.
+    ///
+    /// The cut is the newest completed-turn boundary this session can see: its
+    /// own last boundary when it has one, otherwise the cut its own zero-copy
+    /// marker inherits (descending only because the selected prefix needs the
+    /// ancestry). [`ForkHeadCut::context`] is exactly the rows the child will
+    /// materialize, so a producer can prove the boundary without loading the
+    /// rest of the transcript.
+    pub async fn default_fork_cut(&self, root: &Path, name: &str) -> Result<ForkHeadCut> {
+        let head = self.load_head_located(root, name).await?;
+        if let Some(index) = head
+            .entries
+            .iter()
+            .rposition(crate::agent::is_turn_boundary)
+        {
+            let key = head.locations[index]
+                .as_ref()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "fork cut of session {name} has no durable physical identity: \
+                         the boundary entry is not stored by any session"
+                    )
+                })?
+                .key
+                .clone();
+            // A marker-first head (no own compaction yet) reaches its own
+            // completed turn only through the prefix it inherits: the child
+            // materializes BOTH, so resolve that prefix here — otherwise a
+            // fresh seed would disagree with what reloading the child
+            // resolves.
+            let (mut entries, inherited, older) =
+                match zero_copy_marker(&head.entries).filter(|&marker| marker <= index) {
+                    Some(marker) => {
+                        let prefix = self
+                            .fork_marker_context(root, name, &head.entries, marker, 0)
+                            .await?;
+                        let inherited = prefix.entries.len();
+                        let mut entries = prefix.entries;
+                        entries.extend(head.entries.iter().cloned());
+                        (entries, Some(inherited), prefix.older)
+                    }
+                    None => (head.entries.clone(), None, head.next_older.clone()),
+                };
+            let keep = inherited.unwrap_or(0) + index + 1;
+            entries.truncate(keep);
+            return Ok(ForkHeadCut {
+                owner: name.to_owned(),
+                key,
+                context: entries,
+                inherited,
+                // A prepended prefix moves the context start into the
+                // ancestor, so its own older route wins.
+                older,
+            });
+        }
+        // No boundary of its own: a zero-copy child inherits its marker's cut.
+        let Some(marker) = zero_copy_marker(&head.entries) else {
+            return Err(anyhow::anyhow!("no completed turn in session"));
+        };
+        let context = self
+            .fork_marker_context(root, name, &head.entries, marker, 0)
+            .await?;
+        let SessionEntry::ForkedFrom {
+            source,
+            at,
+            event_time,
+            seq,
+        } = &head.entries[marker]
+        else {
+            unreachable!("zero_copy_marker only matches ForkedFrom")
+        };
+        let (owner, key) = match at {
+            // Legacy positional marker: resolving it is allowed to page/load
+            // the ancestor's resolved transcript.
+            Some(at) => self.fork_cut_origin(root, name, *at).await?,
+            None => {
+                let seq = seq.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "fork session {name} is unusable: its ForkedFrom marker names \
+                         source {source} without a pinned seq; re-record the fork"
+                    )
+                })?;
+                (source.clone(), self.marker_key(seq, *event_time))
+            }
+        };
+        anyhow::ensure!(
+            !context.entries.is_empty(),
+            "fork source session {owner} is missing or empty; session {name} was \
+             forked at that cut and cannot be forked again without it"
+        );
+        Ok(ForkHeadCut {
+            owner,
+            key,
+            inherited: Some(context.entries.len()),
+            context: context.entries,
+            older: context.older,
+        })
+    }
+
+    /// The backend key a marker's `seq`/`event_time` pair names.
+    fn marker_key(&self, seq: i64, event_time: Option<i64>) -> LocatedKey {
+        match self.backend() {
+            SessionBackend::Jsonl => LocatedKey::Jsonl { ordinal: seq },
+            #[cfg(feature = "sqlite")]
+            SessionBackend::Sqlite { .. } => LocatedKey::Sqlite {
+                seq,
+                event_time_us: event_time.unwrap_or_default(),
+            },
+            #[cfg(feature = "greptime")]
+            SessionBackend::Greptime { .. } => LocatedKey::Greptime {
+                seq,
+                event_time_us: event_time.unwrap_or_default(),
+            },
+        }
+    }
+
+    /// The goal that applies AT a fork cut: the newest `GoalUpdated` whose row
+    /// is at or below `key` — never one updated after the cut.
+    ///
+    /// A `GoalUpdated` is not embedded in a compaction summary, and the
+    /// materialized context starts at the last compaction at or before the
+    /// cut, so absence inside that context means "look earlier", not "no
+    /// goal": the owner's own rows are queried first, then the owner's own
+    /// inherited prefix (when the owner is itself a zero-copy child) is
+    /// followed with its own cut as the new bound.
+    ///
+    /// `None` = no goal update at/before the cut; `Some(None)` = the newest
+    /// one is a clear tombstone.
+    pub async fn fork_goal_at_cut(
+        &self,
+        root: &Path,
+        owner: &str,
+        key: &LocatedKey,
+    ) -> Result<Option<Option<crate::agent::GoalSnapshot>>> {
+        self.fork_goal_before(root, owner, key.seq()).await
+    }
+
+    /// The newest goal update anywhere in this session's ancestry (the LIVE
+    /// goal a delegate fork freezes, independent of its cut).
+    pub async fn latest_goal(
+        &self,
+        root: &Path,
+        name: &str,
+    ) -> Result<Option<Option<crate::agent::GoalSnapshot>>> {
+        self.fork_goal_before(root, name, i64::MAX).await
+    }
+
+    async fn fork_goal_before(
+        &self,
+        root: &Path,
+        owner: &str,
+        cutoff: i64,
+    ) -> Result<Option<Option<crate::agent::GoalSnapshot>>> {
+        let mut session = owner.to_owned();
+        let mut cutoff = cutoff;
+        for _ in 0..Self::FORK_CHAIN_LIMIT {
+            let store = self.source_store(root, &session).await?;
+            let found = match &store {
+                SessionStore::Jsonl => Session::load(root, &session)?
+                    .entries
+                    .iter()
+                    .enumerate()
+                    // JSONL has no seq column: the marker's `seq` is the
+                    // 0-based line ordinal, so the cutoff compares directly.
+                    .filter(|(index, _)| (*index as i64) <= cutoff)
+                    .filter_map(|(_, entry)| match entry {
+                        SessionEntry::GoalUpdated { goal } => Some(goal.clone()),
+                        _ => None,
+                    })
+                    // Newest first from the back: the goal that applies AT the
+                    // cut, never a later update.
+                    .next_back(),
+                #[cfg(feature = "greptime")]
+                SessionStore::Greptime { session, .. } => session
+                    .latest_goal_before(cutoff)
+                    .await?
+                    .and_then(|entry| match entry {
+                        SessionEntry::GoalUpdated { goal } => Some(goal),
+                        _ => None,
+                    }),
+                #[cfg(feature = "sqlite")]
+                SessionStore::Sqlite { session, .. } => session
+                    .lock()
+                    .await
+                    .latest_goal_before(cutoff)
+                    .await
+                    .map_err(anyhow::Error::msg)?
+                    .and_then(|entry| match entry {
+                        SessionEntry::GoalUpdated { goal } => Some(goal),
+                        _ => None,
+                    }),
+            };
+            if let Some(goal) = found {
+                return Ok(Some(goal));
+            }
+            // Not in this session's own rows: it may live in the prefix this
+            // session itself inherits, bounded by its OWN cut.
+            let Some(marker) = store.leading_fork_marker(root, &session).await? else {
+                return Ok(None);
             };
             let SessionEntry::ForkedFrom {
                 source,
                 at,
                 event_time,
                 seq,
-            } = &level.entries[marker]
+            } = marker
             else {
-                unreachable!("zero_copy_marker only matches ForkedFrom")
+                unreachable!("leading_fork_marker only returns ForkedFrom")
             };
-            let (source, at, event_time, seq) = (source.clone(), *at, *event_time, *seq);
-            // Commit `0e32549` wrote the copy-based layout `[ForkedFrom] +
-            // prefix` (marker FIRST). That layout is byte-identical to a
-            // genuine zero-copy child whose own first messages happen to
-            // repeat the parent prefix, so content equality alone cannot
-            // decide. Provenance can: the old layout never froze a goal before
-            // the marker and never wrote `event_time`, so a marker placed
-            // after the child's `GoalUpdated` — or one carrying `event_time`
-            // — is zero-copy. Everything else with the source prefix stored
-            // right after a leading marker is AMBIGUOUS and fails closed
-            // rather than guessing: "legacy" would silently drop the parent
-            // turn, "zero-copy" would duplicate it.
-            let stored_prefix = marker + 1..marker + 1 + at;
-            if at > 0
-                && marker == 0
-                && event_time.is_none()
-                && resolved.entries.len() >= at
-                && level.entries.len() >= marker + 1 + at
-                && level.entries[stored_prefix] == resolved.entries[..at]
-            {
-                anyhow::bail!(
-                    "fork session {name} is ambiguous: its ForkedFrom marker (source {source}, \
-                     at {at}) is followed by {at} stored entries identical to the source \
-                     prefix, which is exactly the layout of the legacy marker-first fork copy. \
-                     Refusing to guess between dropping the inherited prefix and duplicating \
-                     it; re-record the fork with a marker carrying event_time (or without the \
-                     stored prefix) to disambiguate."
-                );
-            }
-            if at > 0 {
-                anyhow::ensure!(
-                    !resolved.entries.is_empty(),
-                    "fork source session {source} is missing or empty; session {name} was \
-                     forked at entry {at} and cannot be loaded without it"
-                );
-            }
-            anyhow::ensure!(
-                resolved.entries.len() >= at,
-                "fork source session {source} has only {} entries but session {name} was \
-                 forked at entry {at}",
-                resolved.entries.len()
-            );
-            if at > 0 {
-                // Pin the cut: the loaded source must still carry the exact
-                // `seq`/`event_time` the marker recorded (a rewritten source
-                // — e.g. a compaction that replaced entries — fails closed
-                // instead of silently inheriting a different prefix). A
-                // source that is itself a fork child may sit inside an
-                // already-inherited region; such entries carry no physical
-                // location of their own and are accepted positionally, as
-                // are legacy whole-document sources.
-                if let Some(end) = resolved.locations.get(at - 1).and_then(|loc| loc.as_ref()) {
-                    if let Some(expected) = seq {
-                        anyhow::ensure!(
-                            end.key.seq() == expected,
-                            "fork source session {source} no longer matches the marker of \
-                             session {name}: entry {at} moved to seq {}, the marker pinned \
-                             {expected}",
-                            end.key.seq()
-                        );
-                    }
-                    if let Some(expected) = event_time {
-                        anyhow::ensure!(
-                            end.key.event_time_us() == Some(expected),
-                            "fork source session {source} no longer matches the marker of \
-                             session {name}: entry {at} moved to event_time {:?}, the marker \
-                             pinned {expected}",
-                            end.key.event_time_us()
-                        );
-                    }
+            match at {
+                Some(at) => {
+                    // Legacy positional prefix: resolve it and fold positionally.
+                    let resolved = Box::pin(store.load_fork_located_depth(root, &source, 1))
+                        .await
+                        .with_context(|| format!("cannot load fork source session {source}"))?;
+                    anyhow::ensure!(
+                        resolved.entries.len() >= at,
+                        "fork source session {source} has only {} entries but session \
+                         {session} was forked at entry {at}",
+                        resolved.entries.len()
+                    );
+                    let (goal, cleared) = crate::agent::Agent::fold_goal(&resolved.entries[..at]);
+                    return Ok((goal.is_some() || cleared).then_some(goal));
+                }
+                None => {
+                    let seq = seq.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "fork session {session} is unusable: its ForkedFrom marker \
+                             names source {source} without a pinned seq; re-record the fork"
+                        )
+                    })?;
+                    session = source;
+                    cutoff = seq;
+                    let _ = event_time;
                 }
             }
-            // Inherited entries keep NO child location: their rows live in
-            // the source session's store, and a receipt's numeric `eout1` ref
-            // carries no session identity, so a child-bound ref could read the
-            // wrong row.
-            resolved.entries.truncate(at);
-            resolved.locations = vec![None; at];
-            resolved.locations.extend(level.locations);
-            resolved.entries.extend(level.entries);
-            // `legacy` describes the PHYSICAL store of the session being
-            // loaded (the runner rewrites it), so the child's own flag wins —
-            // an inherited legacy whole-document ancestor must not make this
-            // session rewrite its marker-only log into a full copy.
-            resolved.legacy = level.legacy;
-            resolved.inherited = at;
         }
-        Ok(resolved)
+        anyhow::bail!(
+            "fork ancestry of session {owner} is cyclic or deeper than {} sessions",
+            Self::FORK_CHAIN_LIMIT
+        )
+    }
+
+    /// One older AUDIT page of a zero-copy fork's inherited history.
+    ///
+    /// `owner` is the session named by the head page's
+    /// [`LocatedHistoryPage::next_older_session`]; `before_seq` is its physical
+    /// position (never a child seq). Rows at or above the fork's pinned cut are
+    /// never returned, and when the owner's own oldest rows are reached the
+    /// page continues in the ancestor the owner's own marker names (a pinned
+    /// marker only: a legacy positional prefix has no physical cursor).
+    pub async fn load_fork_older_located(
+        &self,
+        root: &Path,
+        owner: &str,
+        before_seq: i64,
+        limit: Option<usize>,
+    ) -> Result<LocatedHistoryPage> {
+        let store = self.source_store(root, owner).await?;
+        let mut page = store
+            .load_older_located(root, owner, before_seq, limit)
+            .await?;
+        if page.next_before_seq.is_none()
+            && let Some(SessionEntry::ForkedFrom {
+                source,
+                at: None,
+                seq: Some(seq),
+                ..
+            }) = store.leading_fork_marker(root, owner).await?
+        {
+            // The owner's own rows are exhausted and it is itself a zero-copy
+            // child: continue in the ancestor that physically stores the rows
+            // below the owner's cut. The ancestor's pinned cut row was NOT
+            // materialized (a compaction summarized it), so the cursor is
+            // INCLUSIVE of it: `seq + 1` is the exclusive bound one row later.
+            // Rows after the cut are still excluded.
+            page.next_before_seq = Some(seq.saturating_add(1));
+            page.next_older_session = Some(source);
+        } else if page.next_before_seq.is_some() {
+            // Another page of THIS owner follows: the cursor still belongs to
+            // the owner, never to the child that requested it.
+            page.next_older_session = Some(owner.to_owned());
+        }
+        Ok(page)
+    }
+
+    /// The session's own leading zero-copy marker, if it has one. Bounded: only
+    /// the FIRST few logical rows are read.
+    async fn leading_fork_marker(&self, root: &Path, name: &str) -> Result<Option<SessionEntry>> {
+        let bound = 3;
+        let entries = match self {
+            SessionStore::Jsonl => Session::load(root, name)?
+                .entries
+                .into_iter()
+                .take(bound)
+                .collect(),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session, .. } => session.load_first(bound).await?,
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite { session, .. } => session
+                .lock()
+                .await
+                .load_first(bound)
+                .await
+                .map_err(anyhow::Error::msg)?,
+        };
+        Ok(zero_copy_marker(&entries).map(|marker| entries[marker].clone()))
     }
 
     /// Depth limit for a fork ancestry walk. A chain longer than this is
@@ -1990,7 +2773,10 @@ impl SessionStore {
         // sees both when a backend numbers the first row `seq = 1`.
         const PROBE: usize = 3;
         if self.is_jsonl() || self.has_leading_fork_marker(root, name, PROBE).await? {
-            return Ok(Some(self.load_fork_located(root, name).await?));
+            // Head-oriented: a fork child that compacted on its own serves its
+            // own head, and the inherited context is only materialized when it
+            // really is the model context.
+            return Ok(Some(self.load_fork_head_located(root, name).await?));
         }
         Ok(None)
     }
@@ -3945,7 +4731,7 @@ mod shared_helpers {
             },
             SessionEntry::ForkedFrom {
                 source: "src".into(),
-                at: 3,
+                at: Some(3),
                 event_time: None,
                 seq: None,
             },
@@ -5087,10 +5873,11 @@ mod tests {
             .collect()
     }
 
+    /// A LEGACY positional marker: `at` is the inherited entry count.
     fn marker(source: &str, at: usize, seq: Option<i64>) -> SessionEntry {
         SessionEntry::ForkedFrom {
             source: source.to_owned(),
-            at,
+            at: Some(at),
             event_time: None,
             seq,
         }
@@ -5543,6 +6330,409 @@ mod tests {
         assert_eq!(page.entries.len(), 6, "no physical cursor to page by");
         assert_eq!(page.next_before_seq, None);
         assert!(page.locations[..4].iter().all(Option::is_none));
+    }
+
+    // ── Pinned (owner + key) fork markers ────────────────────────────
+
+    /// A NEW-generation marker: no positional `at`; the cut row is pinned by
+    /// the session that physically stores it plus that row's backend key.
+    fn pinned(source: &str, seq: i64, event_time: Option<i64>) -> SessionEntry {
+        SessionEntry::ForkedFrom {
+            source: source.to_owned(),
+            at: None,
+            event_time,
+            seq: Some(seq),
+        }
+    }
+
+    fn compaction(summary: &str) -> SessionEntry {
+        SessionEntry::Compaction {
+            summary: summary.to_owned(),
+            retained: Vec::new(),
+            current_prompt_at: None,
+            no_current_prompt: false,
+        }
+    }
+
+    /// The pinned cut inherits from the LAST COMPACTION AT OR BEFORE it — not
+    /// from the owner's latest compaction overall and never from a later one.
+    #[tokio::test]
+    async fn pinned_marker_inherits_from_the_last_compaction_at_or_before_the_cut() {
+        use crate::session::Session;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        // JSONL ordinals: 0 q0, 1 a0, 2 q1, 3 a1, 4 compaction, 5 q2, 6 a2.
+        let rows = vec![
+            fork_user("q0"),
+            fork_assistant("a0"),
+            fork_user("q1"),
+            fork_assistant("a1"),
+            compaction("sum 0..4"),
+            fork_user("q2"),
+            fork_assistant("a2"),
+        ];
+        Session::append(root, "pc-parent", &rows).unwrap();
+        let store = SessionStore::Jsonl;
+
+        // AFTER the compaction (ordinal 6): the context starts AT it.
+        Session::append(root, "after", &[pinned("pc-parent", 6, None)]).unwrap();
+        let resolved = store.load_fork_located(root, "after").await.unwrap();
+        assert_eq!(resolved.inherited, 3);
+        assert_eq!(resolved.entries[..3], rows[4..]);
+        assert_eq!(resolved.entries[3], pinned("pc-parent", 6, None));
+
+        // EXACTLY AT the compaction (ordinal 4): the compaction alone.
+        Session::append(root, "at-comp", &[pinned("pc-parent", 4, None)]).unwrap();
+        let resolved = store.load_fork_located(root, "at-comp").await.unwrap();
+        assert_eq!(resolved.inherited, 1);
+        assert_eq!(resolved.entries[0], rows[4]);
+
+        // BEFORE it (ordinal 3): no compaction applies, so the owner's own
+        // first rows are the context.
+        Session::append(root, "before", &[pinned("pc-parent", 3, None)]).unwrap();
+        let resolved = store.load_fork_located(root, "before").await.unwrap();
+        assert_eq!(resolved.inherited, 4);
+        assert_eq!(resolved.entries[..4], rows[..4]);
+        assert!(
+            resolved.locations[..4].iter().all(Option::is_none),
+            "inherited entries carry no child location"
+        );
+    }
+
+    /// A pinned fork is frozen at the row it named: later appends — a new
+    /// compaction included — never move its context, and rows after the cut
+    /// are never inherited.
+    #[tokio::test]
+    async fn pinned_marker_is_frozen_at_its_cut_across_later_source_compactions() {
+        use crate::session::Session;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let rows = fork_turns(2);
+        Session::append(root, "frozen-pc-parent", &rows).unwrap();
+        Session::append(
+            root,
+            "frozen-pc-fork",
+            &[pinned("frozen-pc-parent", 1, None)],
+        )
+        .unwrap();
+        let store = SessionStore::Jsonl;
+        let before = store
+            .load_fork_located(root, "frozen-pc-fork")
+            .await
+            .unwrap();
+        assert_eq!(before.inherited, 2);
+        assert_eq!(before.entries[..2], rows[..2]);
+
+        // A later completed turn never appears…
+        Session::append(root, "frozen-pc-parent", &fork_turns(1)).unwrap();
+        // …and neither does a later compaction, even though it is now the
+        // owner's LATEST one.
+        Session::append(
+            root,
+            "frozen-pc-parent",
+            &[compaction("sum everything"), fork_user("q9")],
+        )
+        .unwrap();
+        let after = store
+            .load_fork_located(root, "frozen-pc-fork")
+            .await
+            .unwrap();
+        assert_eq!(after.entries, before.entries);
+        assert_eq!(after.inherited, 2);
+    }
+
+    /// A pinned marker with no row to pin fails closed: the owner no longer
+    /// carries that `seq`, or the marker never recorded one.
+    #[tokio::test]
+    async fn pinned_marker_fails_closed_without_its_pinned_row() {
+        use crate::session::Session;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        Session::append(root, "pc-gone-parent", &fork_turns(2)).unwrap();
+        Session::append(root, "pc-missing", &[pinned("pc-gone-parent", 99, None)]).unwrap();
+        Session::append(
+            root,
+            "pc-unpinned",
+            &[SessionEntry::ForkedFrom {
+                source: "pc-gone-parent".into(),
+                at: None,
+                event_time: None,
+                seq: None,
+            }],
+        )
+        .unwrap();
+
+        let error = SessionStore::Jsonl
+            .load_fork_located(root, "pc-missing")
+            .await
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("pc-gone-parent"), "{message}");
+        assert!(message.contains("no longer contains"), "{message}");
+
+        let error = SessionStore::Jsonl
+            .load_fork_located(root, "pc-unpinned")
+            .await
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("without a pinned seq"), "{message}");
+    }
+
+    /// Ownership comes from the selected PHYSICAL ROW, never from the numeric
+    /// `seq`: the ancestor's ordinal 1 and the child's ordinal 1 are different
+    /// entries, and a cut inside an inherited prefix descends to the ancestor
+    /// that really stores it.
+    #[tokio::test]
+    async fn pinned_cut_ownership_follows_the_row_not_the_seq() {
+        use crate::session::Session;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let grand = fork_turns(2); // ordinals 0..3
+        Session::append(root, "own-grand", &grand).unwrap();
+        // middle: its own ordinal 1 is "middle q", pinning grand's ordinal 3.
+        Session::append(
+            root,
+            "own-middle",
+            &[
+                pinned("own-grand", 3, None),
+                fork_user("middle q"),
+                fork_assistant("middle a"),
+            ],
+        )
+        .unwrap();
+        // A cut at grand's ordinal 1 lives in GRAND…
+        Session::append(root, "own-leaf-g", &[pinned("own-grand", 1, None)]).unwrap();
+        // …while middle's OWN ordinal 1 is "middle q".
+        Session::append(root, "own-leaf-m", &[pinned("own-middle", 1, None)]).unwrap();
+        let store = SessionStore::Jsonl;
+
+        let grand_leaf = store.load_fork_located(root, "own-leaf-g").await.unwrap();
+        assert_eq!(grand_leaf.inherited, 2);
+        assert_eq!(grand_leaf.entries[..2], grand[..2]);
+
+        let middle_leaf = store.load_fork_located(root, "own-leaf-m").await.unwrap();
+        // The cut precedes middle's every compaction, so its context starts at
+        // middle's own first stored row — which is middle's marker, whose own
+        // prefix is grand's read-through history.
+        assert_eq!(middle_leaf.entries[..4], grand[..]);
+        assert_eq!(middle_leaf.entries[4], pinned("own-grand", 3, None));
+        assert_eq!(middle_leaf.entries[5], fork_user("middle q"));
+        assert_eq!(middle_leaf.inherited, 6);
+
+        // A producer resolving the same logical cut gets the physical owner.
+        let origin = store.fork_cut_origin(root, "own-middle", 2).await.unwrap();
+        assert_eq!(origin.0, "own-grand", "an inherited cut belongs to grand");
+        assert_eq!(origin.1.seq(), 1);
+        let origin = store.fork_cut_origin(root, "own-middle", 6).await.unwrap();
+        assert_eq!(origin.0, "own-middle", "middle's own row stays middle's");
+        assert_eq!(origin.1.seq(), 1);
+    }
+
+    /// A bounded JSONL head page hands out the ABSOLUTE position of its first
+    /// returned row, so a head anchored at an arbitrary compaction ordinal
+    /// pages back without skipping anything.
+    #[tokio::test]
+    async fn jsonl_bounded_head_cursor_is_absolute_and_recovers_every_row() {
+        use crate::session::Session;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        // Ordinals 0..99 are summarized rows, 100 is the compaction, 101..109
+        // are the head tail.
+        let mut rows: Vec<SessionEntry> =
+            (0..100).map(|i| fork_user(&format!("old {i}"))).collect();
+        rows.push(compaction("sum 0..100"));
+        for i in 0..9 {
+            rows.push(fork_user(&format!("head {i}")));
+        }
+        Session::append(root, "abs-cursor", &rows).unwrap();
+        let store = SessionStore::Jsonl;
+
+        // Head = ordinals 100..109 (10 rows); limit 2 returns the newest two.
+        let page = store
+            .load_head_page_located(root, "abs-cursor", Some(2))
+            .await
+            .unwrap();
+        assert_eq!(page.entries, vec![fork_user("head 7"), fork_user("head 8")]);
+        assert_eq!(
+            page.next_before_seq,
+            Some(108),
+            "cursor is the first returned row's ABSOLUTE ordinal"
+        );
+
+        // Walking only the returned cursors recovers every row exactly once.
+        let mut walked: Vec<SessionEntry> = Vec::new();
+        let mut cursor = page.next_before_seq;
+        let mut guard = 0;
+        while let Some(before) = cursor {
+            let older = store
+                .load_fork_older_located(root, "abs-cursor", before, Some(2))
+                .await
+                .unwrap();
+            let next = older.next_before_seq;
+            walked.splice(0..0, older.entries);
+            cursor = next;
+            guard += 1;
+            assert!(guard < 200, "the cursor chain must terminate");
+        }
+        walked.extend(page.entries);
+        let mut expected = rows.clone();
+        expected.truncate(110);
+        assert_eq!(walked.len(), expected.len(), "no gap, no duplicate");
+        assert_eq!(walked, expected, "the whole file, once");
+
+        // No limit: the whole head + its own route, unchanged.
+        let whole = store
+            .load_head_page_located(root, "abs-cursor", None)
+            .await
+            .unwrap();
+        assert_eq!(whole.entries.len(), 10);
+        assert_eq!(whole.next_before_seq, Some(100));
+    }
+
+    /// The head page of a compacted pinned fork exposes the OWNER's cursor for
+    /// older AUDIT rows: paging recovers the earlier owner entries — with no
+    /// duplicates and nothing after the pinned cut — and follows the owner's
+    /// own marker into its ancestor.
+    #[tokio::test]
+    async fn pinned_fork_head_keeps_an_older_audit_route_across_ancestry() {
+        use crate::session::Session;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let grand = fork_turns(2); // ordinals 0..3
+        Session::append(root, "route-grand", &grand).unwrap();
+        // mid: its own ordinal 3 is "q2"; the compaction at ordinal 1 opens
+        // the context a pinned child inherits.
+        let mid = vec![
+            pinned("route-grand", 3, None),
+            compaction("mid summary"),
+            fork_user("q2"),
+            fork_assistant("a2"),
+        ];
+        Session::append(root, "route-mid", &mid).unwrap();
+        Session::append(root, "route-leaf", &[pinned("route-mid", 3, None)]).unwrap();
+        let store = SessionStore::Jsonl;
+
+        // Model context: only the compaction segment (never the pre-compaction
+        // rows, and never replayed alongside their summary).
+        let loaded = store
+            .load_fork_head_located(root, "route-leaf")
+            .await
+            .unwrap();
+        assert_eq!(loaded.inherited, 3, "compaction + q2 + a2");
+        assert_eq!(loaded.entries[..3], mid[1..]);
+        assert_eq!(
+            loaded.next_older,
+            Some(("route-mid".into(), 1)),
+            "older rows live in the owner, below the context"
+        );
+
+        // The head PAGE carries that route for the pager.
+        let page = store
+            .load_head_page_located(root, "route-leaf", Some(2))
+            .await
+            .unwrap();
+        assert_eq!(page.next_before_seq, Some(1));
+        assert_eq!(page.next_older_session.as_deref(), Some("route-mid"));
+
+        // Page 1: the owner's rows below the compaction (its own marker).
+        let older = store
+            .load_fork_older_located(root, "route-mid", 1, None)
+            .await
+            .unwrap();
+        assert_eq!(older.entries, vec![pinned("route-grand", 3, None)]);
+        // The owner is itself a fork child: continue in ITS ancestor, and
+        // INCLUDE the ancestor's pinned cut row — a compaction summarized it in
+        // the child's context, so nothing else materialized it. Rows after the
+        // cut stay excluded.
+        assert_eq!(older.next_before_seq, Some(4));
+        assert_eq!(older.next_older_session.as_deref(), Some("route-grand"));
+
+        // A fork child that compacted on its OWN still continues through its
+        // marker at its physical start — even though the cursor's owner is the
+        // requested session itself.
+        let mid_head = store
+            .load_head_page_located(root, "route-mid", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            mid_head.entries[0], mid[1],
+            "its own head starts at the compaction"
+        );
+        assert_eq!(mid_head.next_before_seq, Some(1));
+        assert_eq!(
+            mid_head.next_older_session, None,
+            "the owner is the requested session itself"
+        );
+        let crossed = store
+            .load_fork_older_located(root, "route-mid", 1, None)
+            .await
+            .unwrap();
+        assert_eq!(crossed.entries, vec![pinned("route-grand", 3, None)]);
+        assert_eq!(crossed.next_older_session.as_deref(), Some("route-grand"));
+        assert_eq!(crossed.next_before_seq, Some(4));
+
+        // Page 2: the grand ancestor's rows up to and including its cut.
+        let older = store
+            .load_fork_older_located(root, "route-grand", 4, None)
+            .await
+            .unwrap();
+        assert_eq!(older.entries, grand[..4].to_vec());
+        assert_eq!(older.next_before_seq, None);
+        assert_eq!(older.next_older_session, None);
+
+        // Stitching the pages back together yields the complete AUDIT trail
+        // once: grand through its cut, the anchor's own marker, then the
+        // child's materialized context. Nothing repeats and nothing above the
+        // pinned cut appears.
+        let mut recovered = Vec::new();
+        recovered.extend(older.entries);
+        recovered.push(pinned("route-grand", 3, None));
+        recovered.extend(loaded.entries[..3].iter().cloned());
+        assert_eq!(
+            recovered,
+            vec![
+                fork_user("q0"),
+                fork_assistant("a0"),
+                fork_user("q1"),
+                fork_assistant("a1"),
+                pinned("route-grand", 3, None),
+                compaction("mid summary"),
+                fork_user("q2"),
+                fork_assistant("a2"),
+            ],
+            "the recovered trail must not duplicate or overrun the cut"
+        );
+    }
+
+    /// A legacy positional marker WITHOUT any pinned key still loads exactly
+    /// as before: missing provenance is not a rejection reason.
+    #[tokio::test]
+    async fn legacy_marker_without_provenance_still_loads_positionally() {
+        use crate::session::Session;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let entries = fork_turns(3);
+        Session::append(root, "plain-legacy-parent", &entries).unwrap();
+        Session::append(
+            root,
+            "plain-legacy-fork",
+            &[marker("plain-legacy-parent", 4, None)],
+        )
+        .unwrap();
+        let resolved = SessionStore::Jsonl
+            .load_fork_located(root, "plain-legacy-fork")
+            .await
+            .unwrap();
+        assert_eq!(resolved.inherited, 4);
+        assert_eq!(resolved.entries[..4], entries[..4]);
+        assert_eq!(resolved.entries[4], marker("plain-legacy-parent", 4, None));
     }
 }
 

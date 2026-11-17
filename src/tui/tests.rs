@@ -4136,7 +4136,7 @@ fn session_entry_to_lines_maps_persisted_entry_kinds() {
     // ForkedFrom → dim provenance notice.
     let out = lines(&SessionEntry::ForkedFrom {
         source: "abc".into(),
-        at: 3,
+        at: Some(3),
         event_time: None,
         seq: None,
     });
@@ -4637,7 +4637,7 @@ async fn fork_latest_creates_session_up_to_newest_boundary() {
             seq: Some(seq),
         } => {
             assert_eq!(source, "src-session");
-            assert_eq!(*at, 6, "marker at = prefix len");
+            assert_eq!(*at, None, "a new marker pins the row, not a position");
             assert_eq!(*seq, 5, "marker seq = the boundary's JSONL ordinal");
         }
         other => panic!("expected ForkedFrom marker, got {other:?}"),
@@ -4684,7 +4684,7 @@ async fn fork_at_n_counts_boundaries_from_newest() {
             seq: Some(seq),
         } => {
             assert_eq!(source, "src-session");
-            assert_eq!(*at, 2);
+            assert_eq!(*at, None, "a new marker pins the row, not a position");
             assert_eq!(*seq, 1, "marker seq = the first boundary's JSONL ordinal");
         }
         other => panic!("expected ForkedFrom marker, got {other:?}"),

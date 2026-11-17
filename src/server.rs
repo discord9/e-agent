@@ -2595,6 +2595,10 @@ async fn serve_image(
 #[derive(Deserialize)]
 pub struct HistoryParams {
     pub before_seq: Option<i64>,
+    /// Set when the previous response's `next_older_session` named a fork
+    /// ANCESTOR: those older rows live in that session's store, so the cursor
+    /// is read there instead of against this session's own rows.
+    pub before_session: Option<String>,
     pub limit: Option<usize>,
 }
 
@@ -2608,6 +2612,12 @@ pub struct HistoryResponse {
     pub entries: Vec<SessionEntry>,
     pub locations: Vec<Option<crate::session_store::WebEntryLocation>>,
     pub next_before_seq: Option<i64>,
+    /// Session that owns `next_before_seq` when the next older page lives in
+    /// a zero-copy fork's ancestor (feed it back as `before_session`). Omitted
+    /// from the wire when there is none, so an ordinary session's response
+    /// shape is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_older_session: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2623,6 +2633,8 @@ struct WebBootstrap {
     entries: Vec<SessionEntry>,
     locations: Vec<Option<crate::session_store::WebEntryLocation>>,
     next_before_seq: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_older_session: Option<String>,
     replay: Vec<crate::runner::WebReplayEvent>,
     usage: Option<crate::agent::AgentEvent>,
     usage_pre_compaction: bool,
@@ -2686,8 +2698,16 @@ async fn session_history(
             page
         }
         Some(before_seq) => {
+            // A fork's inherited history pages in the session that PHYSICALLY
+            // stores those rows; the numeric cursor is that session's, never
+            // this one's.
+            // Always page through the fork-aware route: the cursor belongs to
+            // the session that named it (the child itself, or an ancestor), and
+            // a zero-copy child's own physical start continues through ITS
+            // marker. An ordinary session behaves exactly like `load_older`.
+            let owner = params.before_session.as_deref().unwrap_or(&id);
             let page = store
-                .load_older_located(root, &id, before_seq, params.limit)
+                .load_fork_older_located(root, owner, before_seq, params.limit)
                 .await
                 .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
             if historical && page.entries.is_empty() {
@@ -2713,6 +2733,7 @@ async fn session_history(
             .map(|location| location.as_ref().map(Into::into))
             .collect(),
         next_before_seq: page.next_before_seq,
+        next_older_session: page.next_older_session,
     }))
 }
 
@@ -3664,6 +3685,7 @@ async fn session_events(
                 entries: attach.entries,
                 locations: attach.locations,
                 next_before_seq: attach.next_before_seq,
+                next_older_session: attach.next_older_session,
                 replay: attach.replay,
                 usage: attach.usage,
                 usage_pre_compaction: attach.usage_pre_compaction,
@@ -9084,6 +9106,7 @@ model = "deepseek-chat"
                 entries,
                 locations: vec![],
                 next_before_seq: Some(42),
+                next_older_session: None,
             })
             .unwrap(),
             serde_json::json!({
@@ -9102,6 +9125,7 @@ model = "deepseek-chat"
                 entries: vec![],
                 locations: vec![],
                 next_before_seq: None,
+                next_older_session: None,
             })
             .unwrap(),
             serde_json::json!({"entries": [], "locations": [], "next_before_seq": null})
@@ -9438,6 +9462,301 @@ model = "deepseek-chat"
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A pinned fork's head page hands out the OWNER's cursor for older audit
+    /// rows, and `before_session` reads them from that session: the child's
+    /// inherited context starts at the compaction, so the earlier rows are only
+    /// reachable through the route (never reinterpreted as child seqs).
+    #[tokio::test]
+    async fn history_older_pages_follow_a_forks_owner() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        use crate::agent::{AssistantMessage, Message};
+        use crate::session::Session;
+
+        let (state, root) = fork_test_state("fork-older-route");
+        let owner = "older-route-src";
+        let source = vec![
+            SessionEntry::Message {
+                message: Message::User {
+                    content: "q0".into(),
+                    images: vec![],
+                },
+            },
+            SessionEntry::Message {
+                message: Message::Assistant(AssistantMessage {
+                    content: Some("a0".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                }),
+            },
+            SessionEntry::Compaction {
+                summary: "rolled up".into(),
+                retained: vec![],
+                current_prompt_at: None,
+                no_current_prompt: false,
+            },
+            SessionEntry::Message {
+                message: Message::User {
+                    content: "q1".into(),
+                    images: vec![],
+                },
+            },
+            SessionEntry::Message {
+                message: Message::Assistant(AssistantMessage {
+                    content: Some("a1".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                }),
+            },
+        ];
+        Session::append(&root, owner, &source).unwrap();
+        // A pinned child at ordinal 4 (a1): its context is the compaction
+        // segment [2..=4].
+        let child = "older-route-fork";
+        Session::append(
+            &root,
+            child,
+            &[SessionEntry::ForkedFrom {
+                source: owner.into(),
+                at: None,
+                event_time: None,
+                seq: Some(4),
+            }],
+        )
+        .unwrap();
+        let app = router(state);
+
+        let head = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sessions/{child}/history"))
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(head.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(head.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["next_before_seq"], serde_json::json!(2));
+        assert_eq!(value["next_older_session"], serde_json::json!(owner));
+        // The head owns an inherited (UNLOCATED) prefix even though it hands
+        // out an older cursor: the web client must treat the head as
+        // authoritative for those rows rather than judging by the cursor.
+        assert!(
+            value["locations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|location| location.is_null()),
+            "inherited rows carry no child location: {value}"
+        );
+        assert_eq!(
+            value["entries"].as_array().unwrap().len(),
+            4,
+            "compaction segment + the child's own marker: {value}"
+        );
+
+        let older = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/sessions/{child}/history?before_seq=2&before_session={owner}"
+                    ))
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(older.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(older.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let entries = value["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2, "the pre-compaction turn: {value}");
+        assert_eq!(entries[0]["message"]["User"]["content"], "q0");
+        assert_eq!(entries[1]["message"]["Assistant"]["content"], "a0");
+        assert_eq!(value["next_before_seq"], serde_json::Value::Null);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Following ONLY the response cursors (`next_before_seq` +
+    /// `next_older_session`) from a compacted pinned fork recovers the complete
+    /// audit trail: every owner page in turn, then the ancestor's prefix
+    /// INCLUDING its pinned cut row, with nothing duplicated and nothing above
+    /// the cut. Overlapping JSONL ordinals between the child and the ancestor
+    /// stay distinct rows (the owner is part of the physical identity).
+    #[tokio::test]
+    async fn history_cursor_chain_recovers_the_whole_audit_trail() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        use crate::agent::{AssistantMessage, Message};
+        use crate::session::Session;
+
+        let (state, root) = fork_test_state("fork-cursor-chain");
+        let user = |text: &str| SessionEntry::Message {
+            message: Message::User {
+                content: text.into(),
+                images: vec![],
+            },
+        };
+        let assistant = |text: &str| SessionEntry::Message {
+            message: Message::Assistant(AssistantMessage {
+                content: Some(text.into()),
+                tool_calls: vec![],
+                reasoning: None,
+            }),
+        };
+        Session::append(
+            &root,
+            "chain-grand",
+            &[user("g0"), assistant("a0"), user("g1"), assistant("a1")],
+        )
+        .unwrap();
+        // mid: pinned to grand ordinal 3, then its own compaction + turn.
+        Session::append(
+            &root,
+            "chain-mid",
+            &[
+                SessionEntry::ForkedFrom {
+                    source: "chain-grand".into(),
+                    at: None,
+                    event_time: None,
+                    seq: Some(3),
+                },
+                SessionEntry::Compaction {
+                    summary: "mid summary".into(),
+                    retained: vec![],
+                    current_prompt_at: None,
+                    no_current_prompt: false,
+                },
+                user("m0"),
+                assistant("a-m0"),
+            ],
+        )
+        .unwrap();
+        // leaf: pinned to mid ordinal 3 (a-m0) — its context is the compaction
+        // segment, so mid's marker and grand's rows are audit-only.
+        Session::append(
+            &root,
+            "chain-leaf",
+            &[SessionEntry::ForkedFrom {
+                source: "chain-mid".into(),
+                at: None,
+                event_time: None,
+                seq: Some(3),
+            }],
+        )
+        .unwrap();
+        let app = router(state);
+
+        let get = |uri: String| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(
+                        Request::builder()
+                            .uri(uri)
+                            .header(header::AUTHORIZATION, "Bearer sekrit")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+            }
+        };
+        let text_of = |entry: &serde_json::Value| -> String {
+            entry["message"]["User"]["content"]
+                .as_str()
+                .or_else(|| entry["message"]["Assistant"]["content"].as_str())
+                .or_else(|| entry["summary"].as_str())
+                .or_else(|| entry["type"].as_str())
+                .unwrap_or_default()
+                .to_owned()
+        };
+
+        // Only the responses drive the walk: no hand-supplied owner.
+        let mut pages: Vec<Vec<serde_json::Value>> = Vec::new();
+        let mut value = get("/api/sessions/chain-leaf/history?limit=2".into()).await;
+        loop {
+            pages.push(value["entries"].as_array().unwrap().clone());
+            let next = value["next_before_seq"].as_i64();
+            let Some(next) = next else { break };
+            let owner = value["next_older_session"].as_str().unwrap_or("chain-leaf");
+            value = get(format!(
+                "/api/sessions/chain-leaf/history?limit=2&before_seq={next}&before_session={owner}"
+            ))
+            .await;
+            assert!(
+                pages.len() < 12,
+                "the cursor chain must terminate: {pages:?}"
+            );
+        }
+        let mut trail: Vec<(String, &serde_json::Value)> = Vec::new();
+        // Pages arrive newest-first: the head page first, then older ones.
+        for page in pages.iter().rev() {
+            for entry in page {
+                trail.push((text_of(entry), entry));
+            }
+        }
+        let texts: Vec<&str> = trail.iter().map(|(text, _)| text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "g0",
+                "a0",
+                "g1",
+                "a1",
+                "forked_from",
+                "mid summary",
+                "m0",
+                "a-m0",
+                "forked_from",
+            ],
+            "the full audit trail, once, through the pinned cut: {texts:?}"
+        );
+
+        // Overlapping JSONL ordinals: grand's row 0 and the leaf's own marker
+        // row 0 are different physical rows, so their WEB identities differ by
+        // owner.
+        let leaf_marker = trail
+            .iter()
+            .find(|(text, _)| text == "forked_from")
+            .map(|(_, entry)| (*entry).clone())
+            .unwrap_or_else(|| panic!("no audited leaf marker"));
+        let grand_first = get("/api/sessions/chain-grand/history?limit=1".into()).await;
+        let grand_loc = grand_first["locations"][0].clone();
+        assert_eq!(
+            grand_loc["key"]["Jsonl"]["ordinal"],
+            serde_json::json!(3),
+            "newest grand row: {grand_loc}"
+        );
+        assert_ne!(grand_loc, leaf_marker);
+        assert_eq!(grand_loc["session"], serde_json::json!("chain-grand"));
+        let leaf_head = get("/api/sessions/chain-leaf/history".into()).await;
+        assert_eq!(
+            leaf_head["locations"][leaf_head["locations"].as_array().unwrap().len() - 1]["session"],
+            serde_json::json!("chain-leaf"),
+            "the child's own row is owned by the child"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Web fork panel: unknown session id → 404, same as `session_history`.
     #[tokio::test]
     async fn fork_candidates_404_unknown() {
@@ -9526,7 +9845,7 @@ model = "deepseek-chat"
             entries[source.len()],
             SessionEntry::ForkedFrom {
                 source: id.to_owned(),
-                at: 4,
+                at: None,
                 event_time: None,
                 seq: Some(3),
             }

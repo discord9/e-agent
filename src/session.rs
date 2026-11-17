@@ -301,6 +301,7 @@ impl Session {
                 locations,
                 legacy: false,
                 inherited: 0,
+                next_older: None,
             });
         }
         let legacy = session_path(root, name, "json")?;
@@ -310,6 +311,7 @@ impl Session {
                 locations: Vec::new(),
                 legacy: false,
                 inherited: 0,
+                next_older: None,
             });
         }
         let saved: LegacySession = serde_json::from_slice(
@@ -327,6 +329,7 @@ impl Session {
             entries,
             legacy: true,
             inherited: 0,
+            next_older: None,
         })
     }
 
@@ -1092,7 +1095,7 @@ mod tests {
         assert_eq!(prefix.len(), 4, "trailing notice must be dropped");
         let marker = SessionEntry::ForkedFrom {
             source: source.into(),
-            at: prefix.len(),
+            at: Some(prefix.len()),
             event_time: None,
             seq: Some(prefix.len() as i64 - 1),
         };

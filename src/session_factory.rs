@@ -878,43 +878,69 @@ impl SessionFactory {
         };
         let mut store = SessionStore::connect(&self.backend, &self.root, &session).await?;
         if let Some((source, at)) = fork_from {
-            // Zero-copy fork: the child's store receives ONLY the marker plus
-            // its own new entries. The source prefix is read back read-only by
+            // Zero-copy fork: the child's store receives ONLY its own frozen
+            // goal plus the marker. The source prefix is read back read-only by
             // the marker-aware loader at startup/resume, so the parent rows are
             // never copied and later parent writes stay invisible. The source
-            // is read here exactly once, to validate the cut and to pin its
-            // provenance (`seq`/`event_time` of the last kept entry).
+            // is read here exactly once, to validate the cut and to pin the
+            // physical row it lands on.
             let source_store = SessionStore::connect(&self.backend, &self.root, &source).await?;
-            let source_history = source_store
-                .load_fork_located(&self.root, &source)
-                .await
-                .with_context(|| format!("cannot load source session {source} for fork"))?;
-            // `at` (1-based, inclusive) is the index of the last kept entry of
-            // the RESOLVED source transcript — the same history the child's
-            // loader reads again, so a fork of a fork resolves identically.
-            let at = crate::agent::fork_prefix(&source_history.entries, at)
-                .map_err(anyhow::Error::msg)
-                .with_context(|| format!("cannot fork session {source}"))?
-                .len();
-            let (seq, event_time) = source_history
-                .locations
-                .get(at - 1)
-                .and_then(|location| location.as_ref())
-                .map_or((None, None), |location| {
-                    (Some(location.key.seq()), location.key.event_time_us())
-                });
-            let marker = SessionEntry::ForkedFrom {
-                source: source.clone(),
-                at,
-                event_time,
-                seq,
+            // The DEFAULT cut is selected from the source's physical located
+            // HEAD (last compaction + after) and its owner/key is carried
+            // forward: no resolved ordinal, and no second full load. An
+            // explicit `--at`/server `at` stays a 1-based index into the
+            // RESOLVED transcript, which may page/load older entries.
+            let (owner, key) = match at {
+                None => {
+                    let cut = source_store
+                        .default_fork_cut(&self.root, &source)
+                        .await
+                        .with_context(|| format!("cannot fork session {source}"))?;
+                    (cut.owner, cut.key)
+                }
+                Some(at) => {
+                    let source_history = source_store
+                        .load_fork_located(&self.root, &source)
+                        .await
+                        .with_context(|| format!("cannot load source session {source} for fork"))?;
+                    let at = crate::agent::fork_prefix(&source_history.entries, Some(at))
+                        .map_err(anyhow::Error::msg)
+                        .with_context(|| format!("cannot fork session {source}"))?
+                        .len();
+                    // The cut row may belong to an ANCESTOR (the source can
+                    // itself be a zero-copy child): pin the row that really
+                    // stores it.
+                    source_store
+                        .fork_cut_origin(&self.root, &source, at)
+                        .await
+                        .with_context(|| format!("cannot fork session {source}"))?
+                }
             };
+            // `GoalUpdated` is not embedded in a `Compaction` and the child's
+            // context starts at the last compaction at or before the cut, so
+            // freeze the goal that applies AT the cut — resolved through the
+            // owning history, never from the materialized prefix alone (a
+            // fork of a fork keeps a goal that sits before the compaction).
+            let mut own_entries = Vec::with_capacity(2);
+            if let Some(goal) = source_store
+                .fork_goal_at_cut(&self.root, &owner, &key)
+                .await
+                .with_context(|| format!("cannot fork session {source}"))?
+            {
+                own_entries.push(SessionEntry::GoalUpdated { goal });
+            }
+            own_entries.push(SessionEntry::ForkedFrom {
+                source: owner,
+                at: None,
+                event_time: key.event_time_us(),
+                seq: Some(key.seq()),
+            });
             let new_id = fork_target
                 .map(str::to_owned)
                 .unwrap_or_else(|| crate::session::new_id_prefixed("fork-"));
             store = SessionStore::connect(&self.backend, &self.root, &new_id).await?;
             store
-                .append(&self.root, &new_id, std::slice::from_ref(&marker))
+                .append(&self.root, &new_id, &own_entries)
                 .await
                 .with_context(|| format!("cannot write the fork marker of session {new_id}"))?;
             eprintln!("e-agent: forked session: {new_id}");
@@ -1065,13 +1091,21 @@ impl SessionFactory {
         if let Some(rounds) = max_rounds {
             agent = agent.max_tool_rounds(rounds);
         }
-        // Marker-aware: a zero-copy fork child resolves its inherited prefix
-        // from the source session read-only and prepends it in memory.
-        let loaded = store.load_fork_located(&self.root, &session).await?;
+        // Head-oriented marker-aware load: the model context this session
+        // initializes from — its own head, or a zero-copy child's resolved
+        // inherited context — never the whole transcript. Older rows stay
+        // readable on demand through the history pager.
+        let loaded = store.load_fork_head_located(&self.root, &session).await?;
         let legacy = loaded.legacy;
         let inherited = loaded.inherited;
+        let older_route = loaded.next_older;
         agent.restore_located(loaded.entries, loaded.locations);
         agent.set_inherited_prefix(inherited);
+        agent.set_older_route(older_route);
+        // The head excludes the rows a compaction summarized, and a
+        // `GoalUpdated` is never inside the summary: restore the newest goal in
+        // the ancestry so a resumed goal (or its clear tombstone) survives.
+        agent.restore_goal_projection(store.latest_goal(&self.root, &session).await?);
         // Capture the request head AFTER the history restore: its goal fields
         // must carry the session's live folded goal (not the pre-restore
         // "never set" state) so a fork's first request projects the exact
@@ -2914,6 +2948,678 @@ context_window = 3000
         let (model, context_window) = resolver().expect("main fallback");
         assert_eq!(model.display_name(), "m1");
         assert_eq!(context_window, Some(1000));
+    }
+}
+
+#[cfg(test)]
+mod fork_marker_tests {
+    use super::*;
+    use crate::agent::SessionEntry;
+    use crate::session::Session;
+
+    fn user(text: &str) -> SessionEntry {
+        crate::agent::Message::User {
+            content: text.to_owned(),
+            images: vec![],
+        }
+        .into()
+    }
+
+    fn assistant(text: &str) -> SessionEntry {
+        crate::agent::Message::Assistant(crate::agent::AssistantMessage {
+            content: Some(text.to_owned()),
+            tool_calls: vec![],
+            reasoning: None,
+        })
+        .into()
+    }
+
+    fn compaction(summary: &str) -> SessionEntry {
+        SessionEntry::Compaction {
+            summary: summary.to_owned(),
+            retained: vec![],
+            current_prompt_at: None,
+            no_current_prompt: false,
+        }
+    }
+
+    /// A main/server fork writes a PINNED marker (owner + row key, no
+    /// positional `at`) and freezes the newest goal at or before the cut, so a
+    /// context that starts at the last compaction cannot drop it.
+    #[tokio::test]
+    async fn main_fork_pins_the_cut_and_freezes_the_goal_at_the_cut() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let source = "main-fork-src";
+        let goal = crate::agent::create_goal(
+            None,
+            "main fork goal".into(),
+            vec!["survives the head-only load".into()],
+        )
+        .unwrap();
+        // JSONL ordinals: 0 q0, 1 a0, 2 goal, 3 compaction, 4 q1, 5 a1.
+        Session::append(
+            &root,
+            source,
+            &[
+                user("q0"),
+                assistant("a0"),
+                SessionEntry::GoalUpdated {
+                    goal: Some(goal.clone()),
+                },
+                compaction("main summary"),
+                user("q1"),
+                assistant("a1"),
+            ],
+        )
+        .unwrap();
+        let factory = SessionFactory::test_factory(root.clone());
+        let build = factory
+            .build_fork(
+                "main-fork-target",
+                source.to_owned(),
+                None,
+                IdlePolicy::FinishWhenIdle,
+                UnfinishedPolicy::Preserve,
+            )
+            .await
+            .expect("the main fork builds");
+        assert_eq!(build.session, "main-fork-target");
+        drop(build);
+
+        let stored = Session::load(&root, "main-fork-target").unwrap().entries;
+        assert_eq!(stored.len(), 2, "goal freeze + marker only: {stored:?}");
+        assert!(matches!(
+            stored[0],
+            SessionEntry::GoalUpdated { goal: Some(_) }
+        ));
+        assert!(
+            matches!(
+                stored[1],
+                SessionEntry::ForkedFrom {
+                    at: None,
+                    seq: Some(5),
+                    ..
+                }
+            ),
+            "the cut is pinned by row, not by position: {stored:?}"
+        );
+        let raw =
+            std::fs::read_to_string(root.join(".e-agent/sessions/main-fork-target.jsonl")).unwrap();
+        assert!(!raw.contains(r#""at":"#), "no positional `at`: {raw}");
+
+        // The inherited context starts at the compaction, so the pre-compaction
+        // goal row is only available through the freeze — and it is.
+        let loaded = SessionStore::Jsonl
+            .load_fork_located(&root, "main-fork-target")
+            .await
+            .unwrap();
+        assert_eq!(loaded.inherited, 3, "compaction + q1 + a1");
+        assert_eq!(loaded.entries[0], compaction("main summary"));
+        let (folded, cleared) = Agent::fold_goal(&loaded.entries);
+        assert!(!cleared);
+        assert_eq!(
+            folded.map(|goal| goal.objective),
+            Some(goal.objective.clone()),
+            "the frozen goal must survive the head-only context"
+        );
+    }
+
+    /// A fork of a ZERO-COPY child: a cut inside the inherited prefix is
+    /// pinned to the ANCESTOR that physically stores that row, a cut inside
+    /// the child's own rows stays the child's. `--at` stays a 1-based index
+    /// into the RESOLVED transcript, never a physical `seq`.
+    #[tokio::test]
+    async fn main_fork_of_a_fork_resolves_the_cut_to_its_physical_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        Session::append(
+            &root,
+            "chain-grand",
+            &[user("q0"), assistant("a0"), user("q1"), assistant("a1")],
+        )
+        .unwrap();
+        // middle: a LEGACY positional marker (grand ordinals 0..4) plus two own
+        // rows at its own ordinals 1 and 2.
+        Session::append(
+            &root,
+            "chain-middle",
+            &[
+                SessionEntry::ForkedFrom {
+                    source: "chain-grand".into(),
+                    at: Some(4),
+                    event_time: None,
+                    seq: Some(3),
+                },
+                user("q-m"),
+                assistant("a-m"),
+            ],
+        )
+        .unwrap();
+        let factory = SessionFactory::test_factory(root.clone());
+
+        // 1-based resolved index 2 = grand's "a0" (grand ordinal 1).
+        let inherited = factory
+            .build_fork(
+                "chain-leaf-inherited",
+                "chain-middle".into(),
+                Some(2),
+                IdlePolicy::FinishWhenIdle,
+                UnfinishedPolicy::Preserve,
+            )
+            .await
+            .expect("the inherited-cut fork builds");
+        drop(inherited);
+        let stored = Session::load(&root, "chain-leaf-inherited")
+            .unwrap()
+            .entries;
+        assert_eq!(
+            stored,
+            vec![SessionEntry::ForkedFrom {
+                source: "chain-grand".into(),
+                at: None,
+                event_time: None,
+                seq: Some(1),
+            }],
+            "an inherited cut belongs to the ancestor that stores the row"
+        );
+        let resolved = SessionStore::Jsonl
+            .load_fork_located(&root, "chain-leaf-inherited")
+            .await
+            .unwrap();
+        assert_eq!(resolved.inherited, 2);
+        assert_eq!(resolved.entries[..2], [user("q0"), assistant("a0")]);
+
+        // The default cut is middle's own last completed turn (resolved index
+        // 7 = middle's own ordinal 2).
+        let own = factory
+            .build_fork(
+                "chain-leaf-own",
+                "chain-middle".into(),
+                None,
+                IdlePolicy::FinishWhenIdle,
+                UnfinishedPolicy::Preserve,
+            )
+            .await
+            .expect("the own-cut fork builds");
+        drop(own);
+        let stored = Session::load(&root, "chain-leaf-own").unwrap().entries;
+        assert_eq!(
+            stored,
+            vec![SessionEntry::ForkedFrom {
+                source: "chain-middle".into(),
+                at: None,
+                event_time: None,
+                seq: Some(2),
+            }],
+            "a cut in the child's own rows stays the child's"
+        );
+        let resolved = SessionStore::Jsonl
+            .load_fork_located(&root, "chain-leaf-own")
+            .await
+            .unwrap();
+        assert_eq!(resolved.inherited, 7);
+        assert_eq!(resolved.entries[6], assistant("a-m"));
+    }
+
+    /// A fork OF a fork keeps a goal that sits BEFORE the compaction: the
+    /// child's materialized context starts at the compaction, so folding the
+    /// visible prefix would find nothing. The goal is resolved through the
+    /// owning history at the cut (two generations: `A` compacted, `B` a fork
+    /// of `A` whose own rows carry only the frozen goal).
+    ///
+    /// `A=[Goal(G), Compaction(C), Assistant(a)]`, `B=[Goal(G), pinned(A,a)]`;
+    /// forking `B` at its inherited cut must still freeze `G`.
+    async fn assert_two_generation_goal(goal: Option<crate::agent::GoalSnapshot>, cleared: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let goal_row = SessionEntry::GoalUpdated { goal: goal.clone() };
+        Session::append(
+            &root,
+            "gen-a",
+            &[
+                goal_row.clone(),
+                compaction("gen summary"),
+                assistant("gen a"),
+            ],
+        )
+        .unwrap();
+        let factory = SessionFactory::test_factory(root.clone());
+        factory
+            .build_fork(
+                "gen-b",
+                "gen-a".into(),
+                None,
+                IdlePolicy::FinishWhenIdle,
+                UnfinishedPolicy::Preserve,
+            )
+            .await
+            .expect("the first generation builds");
+        let b = Session::load(&root, "gen-b").unwrap().entries;
+        assert_eq!(b[0], goal_row, "generation B froze the goal: {b:?}");
+        assert!(matches!(
+            b[1],
+            SessionEntry::ForkedFrom {
+                at: None,
+                seq: Some(_),
+                ..
+            }
+        ));
+
+        // B resolves to [C, a, goal, marker]: the goal is AFTER the cut.
+        let resolved_b = SessionStore::Jsonl
+            .load_fork_located(&root, "gen-b")
+            .await
+            .unwrap();
+        assert_eq!(resolved_b.inherited, 2, "the compaction and its turn");
+        assert_eq!(resolved_b.entries[0], compaction("gen summary"));
+
+        // Generation C: default cut = B's inherited cut.
+        factory
+            .build_fork(
+                "gen-c",
+                "gen-b".into(),
+                None,
+                IdlePolicy::FinishWhenIdle,
+                UnfinishedPolicy::Preserve,
+            )
+            .await
+            .expect("the second generation builds");
+        let c = Session::load(&root, "gen-c").unwrap().entries;
+        assert_eq!(
+            c[0], goal_row,
+            "the two-generation fork must not lose the pre-compaction goal: {c:?}"
+        );
+        let (folded, folded_cleared) = Agent::fold_goal(
+            &SessionStore::Jsonl
+                .load_fork_located(&root, "gen-c")
+                .await
+                .unwrap()
+                .entries,
+        );
+        assert_eq!(folded, goal);
+        assert_eq!(folded_cleared, cleared);
+
+        // An EXPLICIT inherited cut resolves the same way.
+        factory
+            .build_fork(
+                "gen-d",
+                "gen-b".into(),
+                Some(2),
+                IdlePolicy::FinishWhenIdle,
+                UnfinishedPolicy::Preserve,
+            )
+            .await
+            .expect("the explicit inherited cut builds");
+        let d = Session::load(&root, "gen-d").unwrap().entries;
+        assert_eq!(
+            d[0], goal_row,
+            "an explicit inherited cut keeps the goal too: {d:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_generation_fork_keeps_a_pre_compaction_goal() {
+        let goal = crate::agent::create_goal(
+            None,
+            "pre-compaction goal".into(),
+            vec!["survives two generations".into()],
+        )
+        .unwrap();
+        assert_two_generation_goal(Some(goal), false).await;
+    }
+
+    /// The cleared variant: the tombstone is preserved, never mistaken for
+    /// "no goal at all".
+    #[tokio::test]
+    async fn two_generation_fork_keeps_a_pre_compaction_cleared_tombstone() {
+        assert_two_generation_goal(None, true).await;
+    }
+
+    /// A goal the OWNER updated AFTER the cut is never inherited: the lookup is
+    /// bounded by the cut row, not by the session's newest goal.
+    #[tokio::test]
+    async fn fork_goal_at_cut_ignores_a_later_goal() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let early = crate::agent::create_goal(None, "early goal".into(), vec![]).unwrap();
+        // A newer snapshot of the same goal (no lifecycle transition needed).
+        let mut late = early.clone();
+        late.revision += 1;
+        late.objective = "late goal".into();
+        // JSONL ordinals: 0 q0, 1 a0, 2 early goal, 3 q1, 4 a1, 5 late goal.
+        Session::append(
+            &root,
+            "late-goal-src",
+            &[
+                user("q0"),
+                assistant("a0"),
+                SessionEntry::GoalUpdated {
+                    goal: Some(early.clone()),
+                },
+                user("q1"),
+                assistant("a1"),
+                SessionEntry::GoalUpdated {
+                    goal: Some(late.clone()),
+                },
+            ],
+        )
+        .unwrap();
+        let factory = SessionFactory::test_factory(root.clone());
+        factory
+            .build_fork(
+                "late-goal-fork",
+                "late-goal-src".into(),
+                Some(5),
+                IdlePolicy::FinishWhenIdle,
+                UnfinishedPolicy::Preserve,
+            )
+            .await
+            .expect("the explicit-cut fork builds");
+        let stored = Session::load(&root, "late-goal-fork").unwrap().entries;
+        assert_eq!(
+            stored[0],
+            SessionEntry::GoalUpdated { goal: Some(early) },
+            "the goal at the cut wins over a later update: {stored:?}"
+        );
+    }
+
+    /// Default creation on a COMPACTED SQL source reads only the physical
+    /// head: the child's materialized context starts at the last compaction,
+    /// never at the session start, and no pre-compaction row is loaded.
+    #[tokio::test]
+    async fn main_fork_on_a_compacted_sql_source_materializes_only_the_head() {
+        use crate::session_store::SessionStore;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let backend = crate::config::SessionBackend::Sqlite {
+            path: Some(
+                temp.path()
+                    .join("sessions.db")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        };
+        let source = SessionStore::connect(&backend, &root, "sql-compacted-src")
+            .await
+            .unwrap();
+        // 120 pre-compaction rows: a full load would return all of them.
+        let mut rows: Vec<SessionEntry> = (0..60)
+            .flat_map(|i| [user(&format!("old q{i}")), assistant(&format!("old a{i}"))])
+            .collect();
+        rows.push(compaction("sql summary"));
+        rows.push(user("new q"));
+        rows.push(assistant("new a"));
+        source
+            .append(&root, "sql-compacted-src", &rows)
+            .await
+            .unwrap();
+
+        let factory = SessionFactory::test_factory_with_backend(root.clone(), backend.clone());
+        let build = factory
+            .build_fork(
+                "sql-compacted-fork",
+                "sql-compacted-src".into(),
+                None,
+                IdlePolicy::FinishWhenIdle,
+                UnfinishedPolicy::Preserve,
+            )
+            .await
+            .expect("the compacted SQL fork builds");
+        drop(build);
+
+        let child = SessionStore::connect(&backend, &root, "sql-compacted-fork")
+            .await
+            .unwrap();
+        let stored = child
+            .load(&root, "sql-compacted-fork")
+            .await
+            .unwrap()
+            .entries;
+        assert_eq!(stored.len(), 1, "marker only: {stored:?}");
+        assert!(matches!(
+            stored[0],
+            SessionEntry::ForkedFrom {
+                at: None,
+                seq: Some(_),
+                ..
+            }
+        ));
+        // The child's own load is head-oriented too: exactly the compaction
+        // and the two rows after it.
+        let loaded = child
+            .load_fork_head_located(&root, "sql-compacted-fork")
+            .await
+            .unwrap();
+        assert_eq!(loaded.inherited, 3, "compaction + new q + new a");
+        assert_eq!(loaded.entries[0], compaction("sql summary"));
+        assert_eq!(loaded.entries.len(), 4, "context + the child's own marker");
+        assert!(
+            !loaded
+                .entries
+                .iter()
+                .any(|entry| matches!(entry, SessionEntry::Message {
+                    message: crate::agent::Message::User { content, .. }
+                } if content.starts_with("old q")))
+        );
+        // Older audit rows remain reachable on demand.
+        let (owner, cursor) = loaded.next_older.clone().expect("an older route");
+        assert_eq!(owner, "sql-compacted-src");
+        let older = child
+            .load_fork_older_located(&root, &owner, cursor, Some(4))
+            .await
+            .unwrap();
+        assert_eq!(older.entries.len(), 4, "the newest pre-compaction rows");
+        assert!(matches!(
+            &older.entries[3],
+            SessionEntry::Message {
+                message: crate::agent::Message::Assistant(_)
+            }
+        ));
+    }
+
+    /// Forking an UNCOMPACTED zero-copy child that has its own completed turn
+    /// materializes BOTH its inherited context and its own rows: the fresh seed
+    /// a producer computes and the marker-based reload must be identical.
+    #[tokio::test]
+    async fn fork_of_an_uncompacted_fork_matches_its_reload() {
+        use crate::session_store::SessionStore;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        Session::append(&root, "seed-grand", &[user("g q"), assistant("g a")]).unwrap();
+        // B: marker-first, uncompacted, with its own completed turn.
+        Session::append(
+            &root,
+            "seed-b",
+            &[
+                SessionEntry::ForkedFrom {
+                    source: "seed-grand".into(),
+                    at: None,
+                    event_time: None,
+                    seq: Some(1),
+                },
+                user("b q"),
+                assistant("b a"),
+            ],
+        )
+        .unwrap();
+
+        let cut = SessionStore::Jsonl
+            .default_fork_cut(&root, "seed-b")
+            .await
+            .expect("the uncompacted fork has a cut");
+        // The cut stays B's own boundary…
+        assert_eq!(cut.owner, "seed-b");
+        assert_eq!(cut.key.seq(), 2);
+        // …but the context it materializes includes grand's prefix.
+        assert_eq!(cut.inherited, Some(2));
+        assert_eq!(
+            cut.context,
+            vec![
+                user("g q"),
+                assistant("g a"),
+                SessionEntry::ForkedFrom {
+                    source: "seed-grand".into(),
+                    at: None,
+                    event_time: None,
+                    seq: Some(1),
+                },
+                user("b q"),
+                assistant("b a"),
+            ],
+            "the fresh seed must carry the inherited context"
+        );
+
+        let factory = SessionFactory::test_factory(root.clone());
+        factory
+            .build_fork(
+                "seed-c",
+                "seed-b".into(),
+                None,
+                IdlePolicy::FinishWhenIdle,
+                UnfinishedPolicy::Preserve,
+            )
+            .await
+            .expect("the fork of an uncompacted fork builds");
+        let reloaded = SessionStore::Jsonl
+            .load_fork_located(&root, "seed-c")
+            .await
+            .unwrap();
+        assert_eq!(reloaded.inherited, cut.context.len());
+        assert_eq!(
+            reloaded.entries[..reloaded.inherited],
+            cut.context[..],
+            "fresh seed and reload must agree"
+        );
+    }
+
+    /// Head-only RESUME must not lose a goal (or its clear tombstone) that
+    /// precedes the newest compaction: the projection is restored from the
+    /// ancestry, without fabricating a history entry. Ordinary and fork
+    /// sessions both.
+    async fn assert_resume_keeps_goal(goal: Option<crate::agent::GoalSnapshot>, cleared: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let goal_row = SessionEntry::GoalUpdated { goal: goal.clone() };
+        // Ordinary session: the goal (or tombstone) sits BEFORE the compaction.
+        Session::append(
+            &root,
+            "resume-goal-src",
+            &[
+                goal_row.clone(),
+                compaction("resume summary"),
+                user("q0"),
+                assistant("a0"),
+            ],
+        )
+        .unwrap();
+        let factory = SessionFactory::test_factory(root.clone());
+        let build = factory
+            .build(
+                "resume-goal-src",
+                None,
+                None,
+                IdlePolicy::FinishWhenIdle,
+                UnfinishedPolicy::Preserve,
+            )
+            .await
+            .expect("the ordinary resume builds");
+        let (resumed_goal, resumed_cleared) = build.runner.goal_projection_for_test();
+        assert_eq!(resumed_goal, goal, "ordinary resume keeps the goal");
+        assert_eq!(resumed_cleared, cleared);
+        drop(build);
+
+        // The same goal in a FORK child that later compacted on its own: the
+        // frozen goal leads the child's own rows, and the child's own
+        // compaction hides it from a head-only load.
+        Session::append(&root, "resume-grand", &[user("g q"), assistant("g a")]).unwrap();
+        Session::append(
+            &root,
+            "resume-fork",
+            &[
+                goal_row.clone(),
+                SessionEntry::ForkedFrom {
+                    source: "resume-grand".into(),
+                    at: None,
+                    event_time: None,
+                    seq: Some(1),
+                },
+                user("c q"),
+                assistant("c a"),
+                compaction("child summary"),
+                user("c q2"),
+                assistant("c a2"),
+            ],
+        )
+        .unwrap();
+        let build = factory
+            .build(
+                "resume-fork",
+                None,
+                None,
+                IdlePolicy::FinishWhenIdle,
+                UnfinishedPolicy::Preserve,
+            )
+            .await
+            .expect("the fork resume builds");
+        let (resumed_goal, resumed_cleared) = build.runner.goal_projection_for_test();
+        assert_eq!(resumed_goal, goal, "fork resume keeps the goal");
+        assert_eq!(resumed_cleared, cleared);
+        // The persisted history is untouched: only the projection was restored.
+        let stored = Session::load(&root, "resume-fork").unwrap().entries;
+        assert_eq!(stored[0], goal_row);
+        assert_eq!(stored.len(), 7, "no entry fabricated: {stored:?}");
+    }
+
+    #[tokio::test]
+    async fn head_only_resume_keeps_a_pre_compaction_goal() {
+        let goal =
+            crate::agent::create_goal(None, "resumed goal".into(), vec!["kept".into()]).unwrap();
+        assert_resume_keeps_goal(Some(goal), false).await;
+    }
+
+    #[tokio::test]
+    async fn head_only_resume_keeps_a_pre_compaction_cleared_tombstone() {
+        assert_resume_keeps_goal(None, true).await;
+    }
+
+    /// A source with no goal at the cut writes no `GoalUpdated`: the child's
+    /// store is the marker alone.
+    #[tokio::test]
+    async fn main_fork_without_a_goal_writes_only_the_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        Session::append(
+            &root,
+            "plain-src",
+            &[user("q0"), assistant("a0"), user("q1"), assistant("a1")],
+        )
+        .unwrap();
+        let factory = SessionFactory::test_factory(root.clone());
+        let build = factory
+            .build_fork(
+                "plain-fork",
+                "plain-src".into(),
+                Some(2),
+                IdlePolicy::FinishWhenIdle,
+                UnfinishedPolicy::Preserve,
+            )
+            .await
+            .expect("the main fork builds");
+        drop(build);
+        let stored = Session::load(&root, "plain-fork").unwrap().entries;
+        assert_eq!(
+            stored,
+            vec![SessionEntry::ForkedFrom {
+                source: "plain-src".into(),
+                at: None,
+                event_time: None,
+                seq: Some(1),
+            }],
+            "an explicit 1-based `at` is resolved, then pinned by row"
+        );
     }
 }
 
