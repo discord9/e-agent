@@ -208,13 +208,16 @@ async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-/// One cached session summary: the one-sentence Chinese text generated at
-/// the end of the most recent turn with real activity, plus the time it was
+/// One cached session summary: the two-line Chinese reply generated at the
+/// end of the most recent turn with real activity, plus the time it was
 /// generated. Written by the per-session turn-end listener, read by the
-/// desktop pet. Entries are never evicted: a live session has at most one,
-/// and a stale-but-bounded cache is fine for a click-time display.
+/// desktop pet and the sidebar. Entries are never evicted: a live session has
+/// at most one, and a stale-but-bounded cache is fine for a click-time display.
 #[derive(Clone)]
 pub struct SummaryEntry {
+    /// Sidebar line: one complete short phrase (≤[`SUMMARY_SHORT_MAX_CHARS`]).
+    pub short: String,
+    /// Desktop-pet summary (≤[`SUMMARY_TEXT_MAX_CHARS`]).
     pub text: String,
     pub at: std::time::SystemTime,
 }
@@ -993,6 +996,23 @@ struct SidebarSnapshot {
     sessions: Vec<SessionMeta>,
     totals: SidebarTotals,
     child_counts: HashMap<String, i64>,
+    /// Main-session id → the cached two-line summary from the desktop-pet
+    /// summarizer (`short` = sidebar phrase, `full` = pet text/hover title).
+    /// Covers every cached main session in the merged list, including rows the
+    /// compact window dropped (the full list can render them). Reused
+    /// verbatim; polling never generates one, so a cold cache simply omits the
+    /// key (and the sidebar omits the activity line).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    summaries: HashMap<String, SidebarSummary>,
+}
+
+/// The summarizer's one cached reply, split for its two readers: `short`
+/// (≤16 chars) drives the sidebar activity line, `full` (≤30 chars) is the
+/// desktop-pet summary and the sidebar line's hover title.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+struct SidebarSummary {
+    short: String,
+    full: String,
 }
 
 fn sidebar_mode(mode: Option<&str>) -> bool {
@@ -1075,7 +1095,46 @@ fn compact_sidebar(merged: Vec<SessionMeta>) -> SidebarSnapshot {
         sessions,
         totals,
         child_counts,
+        summaries: HashMap::new(),
     }
+}
+
+/// Collect the cached summaries for EVERY main session in the merged list,
+/// not just the compact window `compact_sidebar` selects: the full list can
+/// render a row the 16-root window dropped (17th root, archived live root),
+/// and this map is what lets its activity line appear. Main sessions only
+/// (subagent rows stay bare in this pass) and cache-only: the desktop pet
+/// already writes these at turn end, so a poll never triggers a model call.
+fn collect_sidebar_summaries(
+    merged: &[SessionMeta],
+    state: &AppState,
+) -> HashMap<String, SidebarSummary> {
+    let mut summaries = HashMap::new();
+    for meta in merged
+        .iter()
+        .filter(|meta| meta.parent_session_id.is_none())
+    {
+        let Some(entry) = summary_get(state, &meta.id) else {
+            continue;
+        };
+        let short = entry.short.trim();
+        if short.is_empty() {
+            continue;
+        }
+        let full = entry.text.trim();
+        summaries.insert(
+            meta.id.clone(),
+            SidebarSummary {
+                short: short.to_owned(),
+                full: if full.is_empty() {
+                    short.to_owned()
+                } else {
+                    full.to_owned()
+                },
+            },
+        );
+    }
+    summaries
 }
 
 /// Whether `?exclude=archived_children` drops this entry: archived sessions
@@ -1336,7 +1395,13 @@ async fn list_sessions(
     timing.merge_ms = phase_start.elapsed().as_millis();
     let serialization_start = std::time::Instant::now();
     let body = if sidebar {
-        let snapshot = compact_sidebar(merged);
+        // Read the summary cache BEFORE `compact_sidebar` consumes the merged
+        // list: the map covers every cached main session, so a row outside the
+        // compact window still gets its activity line when the full list
+        // renders it.
+        let summaries = collect_sidebar_summaries(&merged, &state);
+        let mut snapshot = compact_sidebar(merged);
+        snapshot.summaries = summaries;
         record_returned_rows(&mut timing, &snapshot.sessions);
         serde_json::to_vec(&snapshot)
     } else {
@@ -2862,10 +2927,11 @@ const SUMMARY_MAX_EVENTS: usize = 20;
 /// work, so a slow/stuck model must never pile up behind a turn.
 const SUMMARY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-fn summary_put(state: &AppState, id: &str, text: String) {
+fn summary_put(state: &AppState, id: &str, short: String, text: String) {
     state.summaries.lock().unwrap().insert(
         id.to_owned(),
         SummaryEntry {
+            short,
             text,
             at: std::time::SystemTime::now(),
         },
@@ -2874,6 +2940,30 @@ fn summary_put(state: &AppState, id: &str, text: String) {
 
 fn summary_get(state: &AppState, id: &str) -> Option<SummaryEntry> {
     state.summaries.lock().unwrap().get(id).cloned()
+}
+
+/// Hard caps for the one summarizer reply: line 1 is the sidebar phrase,
+/// line 2 is the desktop-pet summary. One model call produces both.
+const SUMMARY_SHORT_MAX_CHARS: usize = 16;
+const SUMMARY_TEXT_MAX_CHARS: usize = 30;
+
+/// Parse the summarizer reply: exactly two plain-text lines, trimmed, the
+/// first ≤16 chars and the second ≤30 chars. Anything else (one line, extra
+/// non-empty lines, overlong line, empty line) is malformed and must leave
+/// the previous cache entry untouched — best-effort, never a second call.
+fn parse_summary_reply(reply: &str) -> Option<(String, String)> {
+    let mut lines = reply.lines().map(str::trim).filter(|line| !line.is_empty());
+    let short = lines.next()?;
+    let text = lines.next()?;
+    if lines.next().is_some() {
+        return None;
+    }
+    if short.chars().count() > SUMMARY_SHORT_MAX_CHARS
+        || text.chars().count() > SUMMARY_TEXT_MAX_CHARS
+    {
+        return None;
+    }
+    Some((short.to_owned(), text.to_owned()))
 }
 
 /// Count of "substantive" events in the in-memory event log: stable events
@@ -2935,9 +3025,10 @@ fn digest_recent(events: &[AgentEvent], max: usize) -> String {
     lines.join("\n")
 }
 
-/// Generate and cache one one-sentence Chinese summary for a live session.
+/// Generate and cache one two-line Chinese summary for a live session (line 1
+/// = sidebar phrase, line 2 = desktop-pet summary) with a single model call.
 /// Best-effort and fully silent: any failure (empty digest, model error,
-/// timeout, empty/absent reply) leaves the previous cache entry untouched
+/// timeout, malformed/absent reply) leaves the previous cache entry untouched
 /// and never blocks or fails the session.
 async fn generate_summary(state: &AppState, id: &str, digest: &str) {
     if digest.is_empty() {
@@ -2951,8 +3042,9 @@ async fn generate_summary(state: &AppState, id: &str, digest: &str) {
     model.set_request_session_id(&crate::session::new_id_prefixed("summary-"));
     let messages = vec![
         Message::System {
-            content: "你是 e-agent 桌宠的会话总结器。用一句不超过 30 字的中文，\
-概括这个 AI 编程会话最近在做什么。只输出总结本身，不要任何前缀、引号或解释。"
+            content: "你是 e-agent 桌宠的会话总结器。只输出两行纯文本，不要编号、前缀、\
+引号、JSON 或解释。第一行不超过 16 个字符，概括这个 AI 编程会话最近在做什么，用于侧边栏；\
+第二行不超过 30 个字符，用于桌宠总结。"
                 .into(),
         },
         Message::User {
@@ -2987,14 +3079,14 @@ async fn generate_summary(state: &AppState, id: &str, digest: &str) {
     {
         tracing::warn!("e-agent: cannot record summarizer usage: {error:#}");
     }
-    let Some(text) = assistant.content else {
+    let Some(reply) = assistant.content else {
         return;
     };
-    let text = text.trim().to_owned();
-    if text.is_empty() {
+    // Malformed reply = leave the previous cache entry untouched.
+    let Some((short, text)) = parse_summary_reply(&reply) else {
         return;
-    }
-    summary_put(state, id, text);
+    };
+    summary_put(state, id, short, text);
 }
 
 /// Background per-session turn-end hook: subscribes to the runner's status
@@ -5168,8 +5260,13 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
-        // Cached summary -> 200 with text + rfc3339 timestamp.
-        summary_put(&state, &id, "正在调试 Windows 沙盒编译错误".into());
+        // Cached summary -> 200 with the full (pet) text + rfc3339 timestamp.
+        summary_put(
+            &state,
+            &id,
+            "调试沙盒编译".to_owned(),
+            "正在调试 Windows 沙盒编译错误".to_owned(),
+        );
         assert!(summary_get(&state, &id).is_some());
         let response = app
             .oneshot(
@@ -8043,6 +8140,317 @@ model = "deepseek-chat"
         assert_eq!(snapshot.child_counts.get("parent"), Some(&1));
         assert_eq!(snapshot.totals.historical_children, 1);
         assert_eq!(snapshot.totals.archived, 1);
+    }
+
+    /// The sidebar snapshot carries the summarizer cache's two lines for
+    /// selected MAIN sessions only: `short` (sidebar phrase) + `full` (pet
+    /// text) are trimmed and shipped, a main with no cache (or only a blank
+    /// `short`) gets no entry, and a cached subagent summary stays out of the
+    /// map. The full-list response keeps its pre-existing shape (no
+    /// `summaries` key at all).
+    #[tokio::test]
+    async fn sidebar_snapshot_carries_only_main_session_summaries() {
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let store = SessionStore::Jsonl;
+        store
+            .create_meta(
+                &root,
+                "main-warm",
+                Some("test-model"),
+                None,
+                None,
+                None,
+                Some("主会话"),
+            )
+            .await
+            .unwrap();
+        store
+            .create_meta(
+                &root,
+                "main-cold",
+                Some("test-model"),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .create_meta(
+                &root,
+                "sub-warm",
+                Some("test-model"),
+                None,
+                Some("main-warm"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        // Pinned so the compact window renders the subagent row too.
+        store.set_pinned(&root, "sub-warm", true).await.unwrap();
+
+        let state = Arc::new(AppState {
+            factory: crate::session_factory::SessionFactory::test_factory(root),
+            registry: Arc::new(SessionRegistry::default()),
+            token: "sekrit".to_owned(),
+            meta_store: SessionStore::Jsonl,
+            summaries: Arc::new(Mutex::new(HashMap::new())),
+            summary_pending: Arc::new(SummaryPending(Mutex::new(HashSet::new()))),
+            shutdown: watch::channel(()).0,
+        });
+        summary_put(
+            &state,
+            "main-warm",
+            "  整理侧边栏  ".to_owned(),
+            "  正在整理侧边栏的会话摘要  ".to_owned(),
+        );
+        summary_put(
+            &state,
+            "main-cold",
+            "   ".to_owned(),
+            "只有空白的侧边栏行".to_owned(),
+        );
+        summary_put(
+            &state,
+            "sub-warm",
+            "子会话摘要".to_owned(),
+            "子会话自己的摘要".to_owned(),
+        );
+        let app = router(state.clone());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions?mode=sidebar")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let snapshot: SidebarSnapshot = serde_json::from_slice(&body).unwrap();
+        assert!(
+            snapshot.sessions.iter().any(|m| m.id == "sub-warm"),
+            "subagent row must be rendered for the omission check to mean anything"
+        );
+        assert_eq!(
+            snapshot.summaries,
+            HashMap::from([(
+                "main-warm".to_owned(),
+                SidebarSummary {
+                    short: "整理侧边栏".to_owned(),
+                    full: "正在整理侧边栏的会话摘要".to_owned(),
+                }
+            )]),
+            "only the cached, non-empty MAIN summary ships, both lines trimmed"
+        );
+        // Wire shape the frontend consumes: `{id: {short, full}}`.
+        let wire: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(wire["summaries"]["main-warm"]["short"], "整理侧边栏");
+        assert_eq!(
+            wire["summaries"]["main-warm"]["full"],
+            "正在整理侧边栏的会话摘要"
+        );
+        assert!(wire["summaries"].get("sub-warm").is_none());
+
+        // Non-sidebar `/api/sessions` behavior is unchanged: no summaries key.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let rows: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(rows.is_array(), "full list stays a bare array");
+        assert!(
+            rows.as_array()
+                .is_some_and(|rows| rows.iter().all(|row| row.get("summaries").is_none())),
+            "full-list rows gain no summaries field"
+        );
+    }
+
+    /// Regression: the summary map covers EVERY cached main session, not just
+    /// the compact window. With more than `SIDEBAR_WINDOW_ROOTS` live main
+    /// sessions the 17th+ root is dropped from `sessions`, and an archived
+    /// live main is never a window root — both must still ship their cached
+    /// summary (the full list renders those rows on demand). A cached
+    /// subagent summary stays out.
+    #[tokio::test]
+    async fn sidebar_summaries_cover_main_sessions_outside_the_compact_window() {
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let store = SessionStore::Jsonl;
+        let state = Arc::new(AppState {
+            factory: crate::session_factory::SessionFactory::test_factory(root.clone()),
+            registry: Arc::new(SessionRegistry::default()),
+            token: "sekrit".to_owned(),
+            meta_store: SessionStore::Jsonl,
+            summaries: Arc::new(Mutex::new(HashMap::new())),
+            summary_pending: Arc::new(SummaryPending(Mutex::new(HashSet::new()))),
+            shutdown: watch::channel(()).0,
+        });
+        // More live main roots than the compact window keeps.
+        let mut roots = Vec::new();
+        for i in 0..(SIDEBAR_WINDOW_ROOTS + 2) {
+            let id = format!("main-{i:02}");
+            store
+                .create_meta(&root, &id, Some("test-model"), None, None, None, None)
+                .await
+                .unwrap();
+            let (live_id, session) = live_session(&id);
+            state.registry.insert(live_id, session);
+            summary_put(&state, &id, format!("短语{i}"), format!("摘要{i}"));
+            roots.push(id);
+        }
+        // Archived but live main root: never a compact-window root.
+        store
+            .create_meta(
+                &root,
+                "main-archived",
+                Some("test-model"),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let (live_id, session) = live_session("main-archived");
+        state.registry.insert(live_id, session);
+        store
+            .set_archived(&root, "main-archived", true)
+            .await
+            .unwrap();
+        summary_put(
+            &state,
+            "main-archived",
+            "归档短语".to_owned(),
+            "归档摘要".to_owned(),
+        );
+        // Cached subagent: main-only map.
+        store
+            .create_meta(
+                &root,
+                "sub-cached",
+                Some("test-model"),
+                None,
+                Some("main-00"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        store.set_pinned(&root, "sub-cached", true).await.unwrap();
+        summary_put(
+            &state,
+            "sub-cached",
+            "子短语".to_owned(),
+            "子摘要".to_owned(),
+        );
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions?mode=sidebar")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let snapshot: SidebarSnapshot = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        let outside: Vec<&String> = roots
+            .iter()
+            .filter(|id| !snapshot.sessions.iter().any(|m| &m.id == *id))
+            .collect();
+        assert!(
+            !outside.is_empty(),
+            "the compact window must overflow for this regression to mean anything"
+        );
+        for id in &outside {
+            assert!(
+                snapshot.summaries.contains_key(*id),
+                "summary for a main root outside the compact window must still ship"
+            );
+        }
+        assert!(
+            snapshot.sessions.iter().all(|m| m.id != "main-archived"),
+            "an archived unpinned root is never a compact-window row"
+        );
+        assert!(snapshot.summaries.contains_key("main-archived"));
+        assert!(snapshot.sessions.iter().any(|m| m.id == "sub-cached"));
+        assert!(
+            !snapshot.summaries.contains_key("sub-cached"),
+            "subagent summaries stay out of the map"
+        );
+        assert_eq!(
+            snapshot.summaries.len(),
+            SIDEBAR_WINDOW_ROOTS + 3,
+            "every cached main session ships, window or not"
+        );
+    }
+
+    #[test]
+    fn parse_summary_reply_requires_two_capped_lines() {
+        // Valid: surrounding blank lines and per-line spaces are trimmed.
+        assert_eq!(
+            parse_summary_reply(
+                "\n  修复 fork 零复制  \n\n  正在修复 fork 复制问题，保留源会话只读历史  \n"
+            ),
+            Some((
+                "修复 fork 零复制".to_owned(),
+                "正在修复 fork 复制问题，保留源会话只读历史".to_owned()
+            ))
+        );
+        // Both caps are inclusive (char count, not bytes).
+        let at_cap = format!("{}\n{}", "短".repeat(16), "全".repeat(30));
+        assert!(parse_summary_reply(&at_cap).is_some());
+
+        // Missing second line.
+        assert_eq!(parse_summary_reply("只有一行"), None);
+        // Blank reply.
+        assert_eq!(parse_summary_reply("  \n \n"), None);
+        // Overlong first line (sidebar phrase).
+        assert_eq!(
+            parse_summary_reply(&format!("{}\n桌宠总结", "短".repeat(17))),
+            None
+        );
+        // Overlong second line (pet summary).
+        assert_eq!(
+            parse_summary_reply(&format!("侧边栏\n{}", "全".repeat(31))),
+            None
+        );
+        // A third non-empty line is not the two-line contract.
+        assert_eq!(parse_summary_reply("一行\n二行\n三行"), None);
     }
 
     #[tokio::test]
