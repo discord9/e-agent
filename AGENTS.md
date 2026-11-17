@@ -120,8 +120,9 @@ result or user correction challenges an assumption.
   `background` argument is rejected), with isolated Agent state: fresh history and builtin
   tools only (no MCP, no nested `delegate`). The one exception is `fork: true`:
   the child starts from the parent's completed-turn prefix on the parent's
-  current model and workspace and reconnects the parent's MCP tool set (which
-  must match exactly, else the fork fails closed), and it still cannot delegate
+  current model and reconnects the parent's MCP servers in its own workspace
+  (the parent root unless the caller passes a different `workspace`, which then
+  gives up byte-identical prefix parity), and it still cannot delegate
   further or ask the user questions. They share the parent's unbounded
   running-task registry so nested background bash stays visible. No
   arbitrary agent-to-agent messaging (only direct live parent/child `send_message`) or worker/concurrency pool. Process-level isolation

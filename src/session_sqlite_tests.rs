@@ -5207,7 +5207,7 @@ async fn zero_copy_fork_child_stores_one_marker_row_and_loads_the_prefix() {
     let pinned = &parent_locations[3];
     let marker = SessionEntry::ForkedFrom {
         source: "sql-parent".into(),
-        at: 4,
+        at: Some(4),
         event_time: pinned.key.event_time_us(),
         seq: Some(pinned.key.seq()),
     };
@@ -5262,7 +5262,7 @@ async fn zero_copy_fork_child_stores_one_marker_row_and_loads_the_prefix() {
         "sql-bad-fork",
         &[SessionEntry::ForkedFrom {
             source: "sql-parent".into(),
-            at: 4,
+            at: Some(4),
             event_time: None,
             seq: Some(999),
         }],
@@ -5279,6 +5279,327 @@ async fn zero_copy_fork_child_stores_one_marker_row_and_loads_the_prefix() {
         message.contains("no longer matches the marker"),
         "{message}"
     );
+}
+
+/// Default fork CREATION reads only the source's physical HEAD: a row before
+/// the last compaction that cannot even be decoded must not be touched by the
+/// cut selection (a full transcript load would fail closed on it).
+#[tokio::test]
+async fn default_fork_cut_and_head_creation_read_only_the_physical_head() {
+    use crate::session_store::SessionStore;
+
+    let (dir, path) = temp_db();
+    let root = dir.path();
+    let backend = crate::config::SessionBackend::Sqlite {
+        path: Some(path.to_string_lossy().into_owned()),
+    };
+    let source = SessionStore::connect(&backend, root, "poison-parent")
+        .await
+        .unwrap();
+    // seq 0 is an UNDECODABLE payload: reading it is a hard error on every
+    // backend that decodes rows.
+    {
+        let SessionStore::Sqlite { session, .. } = &source else {
+            panic!("expected the sqlite backend");
+        };
+        let session = session.lock().await;
+        let conn = session.conn.lock().await;
+        conn.execute(
+            "INSERT INTO session_entries (workspace_id,session_id,seq,event_time_us,entry_kind,payload,schema_version,is_error) VALUES (?1,?2,0,?3,'message','not-json',1,0)",
+            (
+                derive_workspace_id(root),
+                "poison-parent",
+                crate::session_store::next_event_time_us(),
+            ),
+        )
+        .await
+        .unwrap();
+    }
+    let rows: Vec<SessionEntry> = vec![
+        SessionEntry::Compaction {
+            summary: "sum".into(),
+            retained: vec![],
+            current_prompt_at: None,
+            no_current_prompt: false,
+        },
+        Message::User {
+            content: "q1".into(),
+            images: vec![],
+        }
+        .into(),
+        Message::Assistant(AssistantMessage {
+            content: Some("a1".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        })
+        .into(),
+    ];
+    {
+        // The normal append cursor starts at 0; place these rows ABOVE the
+        // poisoned one so the head is [compaction, a1].
+        let SessionStore::Sqlite { session, .. } = &source else {
+            panic!("expected the sqlite backend");
+        };
+        let session = session.lock().await;
+        let conn = session.conn.lock().await;
+        for (offset, entry) in rows.iter().enumerate() {
+            let seq = offset as i64 + 1;
+            conn.execute(
+                "INSERT INTO session_entries (workspace_id,session_id,seq,event_time_us,entry_kind,payload,schema_version,is_error) VALUES (?1,?2,?3,?4,?5,?6,1,0)",
+                (
+                    derive_workspace_id(root),
+                    "poison-parent",
+                    seq,
+                    crate::session_store::next_event_time_us(),
+                    crate::session_store::entry_kind(entry),
+                    serde_json::to_string(entry).unwrap(),
+                ),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    // The default cut comes from the head: no decode of seq 0.
+    let cut = source
+        .default_fork_cut(root, "poison-parent")
+        .await
+        .expect("the default cut must not read the pre-compaction rows");
+    assert_eq!(cut.owner, "poison-parent");
+    assert_eq!(cut.key.seq(), 3, "the pinned row is the head's boundary");
+    assert_eq!(cut.context, rows[..], "context = compaction + the cut turn");
+
+    // Head-oriented initialization of the resulting child (its marker is
+    // written by the producer) also stays inside the head.
+    let marker = SessionEntry::ForkedFrom {
+        source: cut.owner.clone(),
+        at: None,
+        event_time: cut.key.event_time_us(),
+        seq: Some(cut.key.seq()),
+    };
+    let child = SessionStore::connect(&backend, root, "poison-fork")
+        .await
+        .unwrap();
+    child
+        .append(root, "poison-fork", std::slice::from_ref(&marker))
+        .await
+        .unwrap();
+    let loaded = child
+        .load_fork_head_located(root, "poison-fork")
+        .await
+        .expect("the head-oriented load must not read the ancestor's whole log");
+    assert_eq!(loaded.inherited, 3, "compaction + q1 + a1");
+    assert_eq!(loaded.entries[..3], rows[..]);
+    // Older audit rows start BELOW the compaction that opens the context.
+    assert_eq!(loaded.next_older, Some(("poison-parent".into(), 1)));
+}
+
+/// A pinned (owner + key) marker on SQL: the cut may sit BEHIND the owner's
+/// newest compaction, so the loader pages older segments until the segment
+/// holding the pinned row, then inherits from that segment's own compaction.
+#[tokio::test]
+async fn sqlite_pinned_fork_marker_pages_to_the_segment_holding_the_cut() {
+    use crate::session_store::SessionStore;
+
+    let (dir, path) = temp_db();
+    let root = dir.path();
+    let backend = crate::config::SessionBackend::Sqlite {
+        path: Some(path.to_string_lossy().into_owned()),
+    };
+    let source = SessionStore::connect(&backend, root, "pin-parent")
+        .await
+        .unwrap();
+    let rows: Vec<SessionEntry> = vec![
+        Message::User {
+            content: "q0".into(),
+            images: vec![],
+        }
+        .into(),
+        Message::Assistant(AssistantMessage {
+            content: Some("a0".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        })
+        .into(),
+        SessionEntry::Compaction {
+            summary: "sum 0..2".into(),
+            retained: vec![],
+            current_prompt_at: None,
+            no_current_prompt: false,
+        },
+        Message::User {
+            content: "q1".into(),
+            images: vec![],
+        }
+        .into(),
+        Message::Assistant(AssistantMessage {
+            content: Some("a1".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        })
+        .into(),
+        SessionEntry::Compaction {
+            summary: "sum 2..5".into(),
+            retained: vec![],
+            current_prompt_at: None,
+            no_current_prompt: false,
+        },
+        Message::User {
+            content: "q2".into(),
+            images: vec![],
+        }
+        .into(),
+        Message::Assistant(AssistantMessage {
+            content: Some("a2".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        })
+        .into(),
+    ];
+    let locations = source
+        .append_located(root, "pin-parent", &rows)
+        .await
+        .unwrap();
+    // seqs 0..8; the newest compaction is seq 5, so a cut at seq 3 (q1) is in
+    // the middle segment [2, 5).
+    let pinned = &locations[3];
+    assert_eq!(pinned.key.seq(), 3);
+
+    let marker = SessionEntry::ForkedFrom {
+        source: "pin-parent".into(),
+        at: None,
+        event_time: pinned.key.event_time_us(),
+        seq: Some(pinned.key.seq()),
+    };
+    let child = SessionStore::connect(&backend, root, "pin-fork")
+        .await
+        .unwrap();
+    child
+        .append(root, "pin-fork", std::slice::from_ref(&marker))
+        .await
+        .unwrap();
+    let resolved = child.load_fork_located(root, "pin-fork").await.unwrap();
+    // The context starts at the compaction AT OR BEFORE the cut (seq 2), not
+    // at the owner's newest one (seq 5) and not at the session start.
+    assert_eq!(resolved.inherited, 2);
+    assert_eq!(resolved.entries[..2], rows[2..4]);
+    assert_eq!(resolved.entries[2], marker);
+    assert!(resolved.locations[..2].iter().all(Option::is_none));
+    assert!(resolved.locations[2].is_some());
+}
+
+/// The SQL backends pin `seq` AND `event_time`: a marker whose pinned row was
+/// overwritten at the same seq fails closed instead of inheriting a different
+/// entry. Sparse `seq`s (gaps) are not a reason to reject anything.
+#[tokio::test]
+async fn sqlite_pinned_fork_marker_rejects_a_timestamp_mismatch_and_tolerates_gaps() {
+    use crate::session_store::SessionStore;
+
+    let (dir, path) = temp_db();
+    let root = dir.path();
+    let backend = crate::config::SessionBackend::Sqlite {
+        path: Some(path.to_string_lossy().into_owned()),
+    };
+    let source = SessionStore::connect(&backend, root, "gap-parent")
+        .await
+        .unwrap();
+    let location = source
+        .append_located(
+            root,
+            "gap-parent",
+            &[
+                Message::User {
+                    content: "q0".into(),
+                    images: vec![],
+                }
+                .into(),
+                Message::Assistant(AssistantMessage {
+                    content: Some("a0".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                })
+                .into(),
+            ],
+        )
+        .await
+        .unwrap();
+    let cut = &location[1];
+    let marker = SessionEntry::ForkedFrom {
+        source: "gap-parent".into(),
+        at: None,
+        event_time: cut.key.event_time_us(),
+        seq: Some(cut.key.seq()),
+    };
+    let child = SessionStore::connect(&backend, root, "gap-fork")
+        .await
+        .unwrap();
+    child
+        .append(root, "gap-fork", std::slice::from_ref(&marker))
+        .await
+        .unwrap();
+    let resolved = child.load_fork_located(root, "gap-fork").await.unwrap();
+    assert_eq!(resolved.inherited, 2);
+
+    // Same seq, a different physical version: the timestamp no longer matches.
+    let stale = SessionEntry::ForkedFrom {
+        source: "gap-parent".into(),
+        at: None,
+        event_time: Some(cut.key.event_time_us().unwrap() - 1),
+        seq: Some(cut.key.seq()),
+    };
+    let bad = SessionStore::connect(&backend, root, "gap-bad")
+        .await
+        .unwrap();
+    bad.append(root, "gap-bad", std::slice::from_ref(&stale))
+        .await
+        .unwrap();
+    let error = bad.load_fork_located(root, "gap-bad").await.unwrap_err();
+    let message = format!("{error:#}");
+    assert!(message.contains("gap-parent"), "{message}");
+    assert!(message.contains("moved to event_time"), "{message}");
+
+    // A pinned row that only exists behind a `seq` GAP still resolves: the
+    // child's own rows are sparse (goal at seq 0, marker at seq 10) and its
+    // cut points at the parent's row 1.
+    let sparse_marker = SessionEntry::ForkedFrom {
+        source: "gap-parent".into(),
+        at: None,
+        event_time: cut.key.event_time_us(),
+        seq: Some(cut.key.seq()),
+    };
+    let sparse = SessionStore::connect(&backend, root, "gap-sparse")
+        .await
+        .unwrap();
+    {
+        let SessionStore::Sqlite { session, .. } = &sparse else {
+            panic!("expected the sqlite backend");
+        };
+        let goal = serde_json::to_string(&SessionEntry::GoalUpdated { goal: None }).unwrap();
+        let marker_payload = serde_json::to_string(&sparse_marker).unwrap();
+        let session = session.lock().await;
+        let conn = session.conn.lock().await;
+        for (seq, kind, payload) in [
+            (0i64, "goal_updated", goal),
+            (10i64, "forked_from", marker_payload),
+        ] {
+            conn.execute(
+                "INSERT INTO session_entries (workspace_id,session_id,seq,event_time_us,entry_kind,payload,schema_version,is_error) VALUES (?1,?2,?3,?4,?5,?6,1,0)",
+                (
+                    derive_workspace_id(root),
+                    "gap-sparse",
+                    seq,
+                    crate::session_store::next_event_time_us(),
+                    kind,
+                    payload,
+                ),
+            )
+            .await
+            .unwrap();
+        }
+    }
+    let resolved = sparse.load_fork_located(root, "gap-sparse").await.unwrap();
+    assert_eq!(resolved.inherited, 2);
+    assert_eq!(resolved.entries.len(), 4, "prefix + goal + marker");
 }
 
 /// `load_head_page_located` must stay BOUNDED for an ordinary SQL session
@@ -5324,7 +5645,7 @@ async fn head_page_probe_keeps_ordinary_sql_pages_bounded_and_resolves_forks() {
     // complete page with no cursor.
     let marker = SessionEntry::ForkedFrom {
         source: "sql-head-parent".into(),
-        at: 40,
+        at: Some(40),
         event_time: None,
         seq: Some(39),
     };
@@ -5378,7 +5699,7 @@ async fn head_page_probe_folds_duplicate_versions_before_the_physical_limit() {
     source.append(root, "dup-parent", &parent).await.unwrap();
     let marker = SessionEntry::ForkedFrom {
         source: "dup-parent".into(),
-        at: 2,
+        at: Some(2),
         event_time: None,
         seq: Some(1),
     };
@@ -5473,7 +5794,7 @@ async fn head_page_probe_finds_a_marker_beyond_a_sparse_seq() {
     let goal = SessionEntry::GoalUpdated { goal: None };
     let marker = SessionEntry::ForkedFrom {
         source: "sparse-parent".into(),
-        at: 2,
+        at: Some(2),
         event_time: None,
         seq: Some(1),
     };

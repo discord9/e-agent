@@ -167,6 +167,26 @@ class El {
       toggle:(c,force)=>{ const on = force !== undefined ? !!force : !this._classes.has(c);
         if (on) this._classes.add(c); else this._classes.delete(c); return on; } }; }
   get children(){ return this._children; }
+  /* Browser `dataset`: a live view of the element's data-* attributes, so
+     `node.dataset.entryLocation = key` and `setAttribute("data-entry-location")`
+     interoperate (the fork/older-history code reads dataset off `children`). */
+  get dataset(){ if (!this._datasetProxy) {
+      const keyOf = (prop) => "data-" + String(prop).replace(/[A-Z]/g, (c) => "-" + c.toLowerCase());
+      const attrs = this._attrs;
+      this._datasetProxy = new Proxy(attrs, {
+        get: (target, prop) => (typeof prop === "string"
+          ? (Object.prototype.hasOwnProperty.call(target, keyOf(prop)) ? target[keyOf(prop)] : undefined)
+          : undefined),
+        set: (target, prop, value) => { target[keyOf(prop)] = String(value); return true; },
+        has: (target, prop) => typeof prop === "string"
+          && Object.prototype.hasOwnProperty.call(target, keyOf(prop)),
+        deleteProperty: (target, prop) => { delete target[keyOf(prop)]; return true; },
+        ownKeys: (target) => Object.keys(target).filter((k) => k.startsWith("data-")),
+        getOwnPropertyDescriptor: (target, prop) => (Object.prototype.hasOwnProperty.call(target, keyOf(prop))
+          ? { value: target[keyOf(prop)], enumerable: true, configurable: true } : undefined),
+      });
+    }
+    return this._datasetProxy; }
   get parentNode(){ return this._parent ?? null; }
   contains(node){ for(let n=node; n; n=n.parentNode ?? n._parent ?? null) if(n===this) return true; return false; }
   get firstChild(){ return this._children[0] ?? null; }
@@ -2205,6 +2225,168 @@ async function main(){
     await flush(); await flush();       // 陈旧响应返回：finally 必须无条件复位
     chk("stale loadOlder resets loadingOlder", state.loadingOlder === false,
         "=" + state.loadingOlder);
+    // ---- fork 继承前缀：SSE 重连不得重复渲染；祖先 owner 只随游标存在 ----
+    {
+      const forkBootstrap = (cursor, owner) => {
+        // 继承行没有 child location；子会话自己的 marker 行有。
+        handleSSEBlock("event: bootstrap\ndata: " + JSON.stringify({
+          entries: [
+            {type: "notice", text: "继承-A"},
+            {type: "notice", text: "继承-B"},
+            {type: "forked_from", source: "owner-a", at: undefined, seq: 3},
+          ],
+          locations: [null, null, {backend: "jsonl", key: {Jsonl: {ordinal: 0}}, session: "s1"}],
+          replay: [],
+          next_before_seq: cursor,
+          next_older_session: owner,
+        }) + "\n\n", state.sessionId, state.workspace.id, sessionOpenEpoch);
+      };
+      forkBootstrap(5, "owner-a");
+      await flush();
+      chk("fork head carries the ancestor cursor + owner",
+          state.nextBeforeSeq === 5 && state.nextOlderSession === "owner-a",
+          "cursor=" + state.nextBeforeSeq + " owner=" + state.nextOlderSession);
+
+      // 重连前状态：上一份 head 的继承前缀（无 location）+ 一页已读的祖先审计
+      // 页（有 location）。新 head 对该前缀是权威的（即使它还带 older 游标），
+      // 物理可定位的祖先页必须保留。
+      state.webHeadEntries = [{type: "notice", text: "继承-A"}];
+      state.webHeadLocations = [null];
+      state.webOlderPages = [
+        { entries: [{type: "notice", text: "旧继承-A"}], locations: [null] },
+        { entries: [{type: "notice", text: "祖先审计页"}],
+          locations: [{backend: "jsonl", key: {Jsonl: {ordinal: 9}}, session: "owner-a"}] },
+      ];
+      forkBootstrap(5, "owner-a");
+      await flush();
+      let forkText = elsById["messages"].textContent;
+      chk("fork reconnect supersedes the stale unlocated prefix",
+          !forkText.includes("旧继承-A"), "text=" + JSON.stringify(forkText));
+      chk("fork reconnect keeps one copy of the inherited prefix",
+          (forkText.match(/继承-A/g) || []).length === 1,
+          "n=" + (forkText.match(/继承-A/g) || []).length);
+      chk("fork reconnect retains the located ancestor audit page",
+          forkText.includes("祖先审计页"), "text=" + JSON.stringify(forkText));
+      chk("fork reconnect keeps the owner with the cursor",
+          state.nextBeforeSeq === 5 && state.nextOlderSession === "owner-a");
+
+      // 加载过一页祖先审计后再次重连：仍然只有一份前缀。
+      forkBootstrap(5, "owner-a");
+      await flush();
+      forkText = elsById["messages"].textContent;
+      chk("fork reconnect after paging keeps one inherited prefix",
+          (forkText.match(/继承-A/g) || []).length === 1,
+          "n=" + (forkText.match(/继承-A/g) || []).length);
+      chk("fork reconnect after paging keeps the ancestor page",
+          forkText.includes("祖先审计页"));
+
+      // owner 生命周期：随游标保存/恢复，新会话不继承任何 owner。
+      state.nextBeforeSeq = 42;
+      state.nextOlderSession = "owner-a";
+      saveSessionState();
+      const cachedOwner = state.sessionStates[state.workspace.id + ":s1"];
+      chk("cached view stores the cursor owner",
+          !!cachedOwner && cachedOwner.nextBeforeSeq === 42
+            && cachedOwner.nextOlderSession === "owner-a",
+          "cached=" + (cachedOwner ? cachedOwner.nextOlderSession : "none"));
+      delete state.sessionStates[state.workspace.id + ":s2"];
+      openSession("s2");
+      chk("a freshly opened session has no cursor owner",
+          state.nextOlderSession === null && state.nextBeforeSeq === null,
+          "cursor=" + state.nextBeforeSeq + " owner=" + state.nextOlderSession);
+      await flush(); await flush();
+      state.sessionId = null;             // 别让 s2 的视图覆盖 s1 的缓存
+      openSession("s1");
+      chk("cached restore brings the owner back with its cursor",
+          state.nextBeforeSeq === 42 && state.nextOlderSession === "owner-a",
+          "cursor=" + state.nextBeforeSeq + " owner=" + state.nextOlderSession);
+      await flush(); await flush();
+      state.nextBeforeSeq = null;
+      state.nextOlderSession = null;
+      state.olderDone = true;
+      state.webOlderPages = [];
+      state.webHeadEntries = [];
+      state.webHeadLocations = [];
+    }
+
+    // ---- 断线重连：head 的 cursor 属于本会话（自身 compaction 打开 head）时，
+    // 旧 head 与新 head 之间的物理 gap 必须照常补齐——不能因为 owner 被标成本
+    // 会话 id 就当成祖先游标而抑制 gap 填充（那会丢掉中间的行） ----
+    {
+      const oldPageKey = {backend: "jsonl", key: {Jsonl: {ordinal: 1}}, session: "s1"};
+      const oldHeadKey = {backend: "jsonl", key: {Jsonl: {ordinal: 2}}, session: "s1"};
+      const newHeadKey = {backend: "jsonl", key: {Jsonl: {ordinal: 150}}, session: "s1"};
+      // 重连前：一页已保留的旧页 + 上一份 head（都是本会话的物理行）。
+      state.webOlderPages = [{ entries: [{type: "notice", text: "保留的旧页"}], locations: [oldPageKey] }];
+      state.webHeadEntries = [{type: "notice", text: "旧 head"}];
+      state.webHeadLocations = [oldHeadKey];
+      state.nextBeforeSeq = 50;
+      state.nextOlderSession = null;
+      state.olderDone = false;
+      state.loadingOlder = false;
+      // 新 head：自身 compaction 打开，cursor 100 指向本会话更早的行。
+      // 服务器已把 owner 归一化成 null；这里故意再喂一次自身 id 验证前端兜底。
+      for (const owner of [null, "s1"]) {
+        handleSSEBlock("event: bootstrap\ndata: " + JSON.stringify({
+          entries: [{type: "notice", text: "新 head"}],
+          locations: [newHeadKey],
+          replay: [],
+          next_before_seq: 100,
+          next_older_session: owner,
+        }) + "\n\n", state.sessionId, state.workspace.id, sessionOpenEpoch);
+        await flush();
+        chk("self-owned head cursor arms the child gap (owner=" + owner + ")",
+            state.webGapCursor === 100, "gap=" + state.webGapCursor);
+        chk("self-owned head cursor is not stored as an ancestor (owner=" + owner + ")",
+            state.nextOlderSession === null, "owner=" + state.nextOlderSession);
+        const gapFetchBefore = FETCHES.filter((u) => u.includes("before_seq=100")).length;
+        state.loadingOlder = false;
+        await loadOlder();
+        await flush();
+        chk("gap fill issued one child-bound request (owner=" + owner + ")",
+            FETCHES.filter((u) => u.includes("before_seq=100")).length === gapFetchBefore + 1
+              && FETCHES.filter((u) => u.includes("before_seq=100") && !u.includes("before_session=")).length >= 1,
+            "fetches=" + JSON.stringify(FETCHES.filter((u) => u.includes("before_seq=100"))));
+        chk("gap fill recovered the intervening rows (owner=" + owner + ")",
+            elsById["messages"].textContent.includes("保留的旧页")
+              && elsById["messages"].textContent.includes("更早的历史消息")
+              && state.webGapCursor === null,
+            "gap=" + state.webGapCursor
+              + " text=" + JSON.stringify(elsById["messages"].textContent));
+        // 重来一遍：恢复重连前状态，换下一种 owner 形态。
+        state.webOlderPages = [{ entries: [{type: "notice", text: "保留的旧页"}], locations: [oldPageKey] }];
+        state.webHeadEntries = [{type: "notice", text: "旧 head"}];
+        state.webHeadLocations = [oldHeadKey];
+        state.nextBeforeSeq = 50;
+        state.nextOlderSession = null;
+        state.olderDone = false;
+      }
+      // 真正的祖先 owner 仍然抑制 gap（它的 cursor 不属于本会话）。
+      state.webOlderPages = [{ entries: [{type: "notice", text: "保留的旧页"}], locations: [oldPageKey] }];
+      state.webHeadEntries = [{type: "notice", text: "旧 head"}];
+      state.webHeadLocations = [oldHeadKey];
+      state.nextBeforeSeq = 50;
+      state.nextOlderSession = null;
+      state.olderDone = false;
+      handleSSEBlock("event: bootstrap\ndata: " + JSON.stringify({
+        entries: [{type: "notice", text: "祖先 head"}],
+        locations: [null],
+        replay: [],
+        next_before_seq: 100,
+        next_older_session: "ancestor-session",
+      }) + "\n\n", state.sessionId, state.workspace.id, sessionOpenEpoch);
+      await flush();
+      chk("an ancestor head cursor still suppresses the child gap",
+          state.webGapCursor === null, "gap=" + state.webGapCursor);
+      state.nextBeforeSeq = null;
+      state.nextOlderSession = null;
+      state.olderDone = true;
+      state.webOlderPages = [];
+      state.webHeadEntries = [];
+      state.webHeadLocations = [];
+      state.webGapCursor = null;
+    }
+
     // ---- 回归：restored 分支 reattachInFlight（切回缓存会话不重复思考块） ----
     function buildInflightView(){
       const m = elsById["messages"];

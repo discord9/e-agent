@@ -1417,8 +1417,11 @@ function renderEntry(entry, acc, pendingCards) {
     case "background_completion":
       return appendBackgroundCompletion(entry.id ?? "?", entry.label, entry.output || "");
     case "forked_from":
+      // 新标记按「物理行」pin 切点（没有位置 at），旧标记才有 1-based at。
       els.messages.appendChild(el("div", "forked",
-        "分叉自会话 " + shortId(entry.source) + " @ 条目 #" + (entry.at ?? "?")));
+        "分叉自会话 " + shortId(entry.source) +
+        (entry.at != null ? " @ 条目 #" + entry.at
+          : entry.seq != null ? " @ 行 " + entry.seq : "")));
       return scrollBottom(false);
     case "goal_updated":
       // goal 快照/墓碑：一行 notice（不当作用户消息）

@@ -93,6 +93,7 @@ async function handleLive404Refresh(id, wsId, epoch) {
       const entries = Array.isArray(data) ? data : (data.entries || []);
       renderHistory(entries, data.locations || []);
       state.nextBeforeSeq = data.next_before_seq !== undefined ? data.next_before_seq : null;
+      state.nextOlderSession = data.next_older_session !== undefined ? data.next_older_session : null;
       state.olderDone = state.nextBeforeSeq === null;
       state.initSource = "history";
       setConn("ended", "会话已结束");
@@ -362,6 +363,7 @@ function handleSSEBlock(block, id, wsId, epoch) {
     const oldHeight = els.messages.scrollHeight;
     const oldCursor = state.nextBeforeSeq;
     const oldOlderDone = state.olderDone;
+    const oldOlderSession = state.nextOlderSession;
     const wasAtBottom = oldHeight - oldTop - els.messages.clientHeight <= 4;
     const anchor = [...els.messages.children].find((node) => node.offsetTop >= oldTop && node.dataset.entryLocation);
     const anchorKey = anchor && anchor.dataset.entryLocation;
@@ -385,15 +387,19 @@ function handleSSEBlock(block, id, wsId, epoch) {
     }
     const locationKey = (location) => location ? JSON.stringify(location) : null;
     const headKeys = new Set((bootstrap.locations || []).map(locationKey).filter(Boolean));
-    // A complete head that carries rows WITHOUT a physical location is an
-    // authoritative zero-copy fork transcript: its inherited prefix is read
-    // through from the source session, so those rows have no identity to
-    // reconcile by. Older retained rows with no location can only belong to a
-    // previous copy of that same inherited prefix, so they are superseded
-    // (keeping them would append the prefix a second time on reconnect).
-    const headComplete = (bootstrap.next_before_seq !== undefined ? bootstrap.next_before_seq : null) === null;
-    const forkHeadSupersedesUnlocated = headComplete
-      && (bootstrap.locations || []).some((location) => !location);
+    // A head that carries rows WITHOUT a physical location is an authoritative
+    // zero-copy fork transcript: its inherited prefix is read through from the
+    // source session, so those rows have no identity to reconcile by. Retained
+    // rows with no location can only belong to a previous copy of that same
+    // inherited prefix, so they are superseded — keeping them would prepend the
+    // prefix a second time on reconnect.
+    //
+    // This is INDEPENDENT of older-history exhaustion: a fork head now hands
+    // out an older cursor (its ancestor's), so `next_before_seq` alone no
+    // longer means "the head is a plain physical interval". The head still owns
+    // its whole materialized prefix; physically LOCATED older audit pages stay
+    // and are reconciled by key below.
+    const forkHeadSupersedesUnlocated = (bootstrap.locations || []).some((location) => !location);
     // Older pages retain their own physical keys. A new head may overlap a
     // previously retained page only at a backend boundary; remove exactly
     // those rows by physical identity, never by content or task id.
@@ -444,9 +450,24 @@ function handleSSEBlock(block, id, wsId, epoch) {
     // disjoint interval above them; drain it with its own cursor so `null`
     // for the true oldest page never hides the gap.
     const headCursor = bootstrap.next_before_seq !== undefined ? bootstrap.next_before_seq : null;
-    state.webGapCursor = retained.length ? headCursor : null;
+    // A fork head's cursor belongs to the session that stores the inherited
+    // rows; an ordinary head's cursor belongs to this session.
+    // `None`/own-session both mean "this session": a head-only resume whose own
+    // compaction opened the head tags its cursor with its OWN id, which is not
+    // an ancestor. Defense in depth: the server already normalizes it.
+    const headOlderRaw = bootstrap.next_older_session !== undefined ? bootstrap.next_older_session : null;
+    const headOlderSession = headOlderRaw && headOlderRaw !== state.sessionId ? headOlderRaw : null;
+    // The gap drain is a CHILD-only physical interval: an ancestor cursor must
+    // never enter it (the gap request cannot name an owner).
+    state.webGapCursor = retained.length && !headOlderSession ? headCursor : null;
     state.webGapAnchor = null;
     state.nextBeforeSeq = retained.length ? oldCursor : headCursor;
+    // An owner is only meaningful WITH its cursor: a reconnect that ends the
+    // chain (or keeps no retained cursor) must not carry a stale owner from the
+    // previous head.
+    state.nextOlderSession = state.nextBeforeSeq === null
+      ? null
+      : (retained.length ? oldOlderSession : headOlderSession);
     state.olderDone = retained.length ? oldOlderDone : state.nextBeforeSeq === null;
     state.initSource = "history";
     if (bootstrap.usage && bootstrap.usage.data !== undefined) {

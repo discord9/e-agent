@@ -676,22 +676,49 @@ precedence over the selected profile values.
 `e-agent --fork <session-id> [--at <n>] [PROMPT]` starts a brand-new session that
 inherits the source session's history up to a completed turn. The fork is
 **marker + read-through, never a copy**: the new session's own storage holds
-only a `ForkedFrom` marker (source id, fork point, and the source entry's
-`seq`/`event_time` when the backend has one), and its history is rebuilt at
-load time by reading the source session's first `at` entries read-only. The
-source session is never modified; only its first `at` entries are read, so
-later appends never appear in the fork. A source rewrite that moves the pinned
-entry fails closed where the backend exposes `seq`/`event_time`; JSONL pins
-only the ordinal. The fork keeps the source's history prefix up
-to (and including) the last completed turn — an assistant message with no
-pending tool calls, or a compaction — and drops anything after it
-(background-completion notices, for example). `--at <n>` picks the fork point
-explicitly: `n` is 1-based and inclusive, and it must land on a turn boundary,
-otherwise the fork fails rather than cutting mid-turn. Without a completed turn
-in the source, the fork fails; if the source is deleted, unreadable, or no
-longer matches the marker's pinned entry, loading the fork fails closed with an
-error naming the source instead of showing a truncated transcript. Forking a
-fork resolves the whole chain.
+only its own frozen goal (when the source has one at or before the cut) plus a
+`ForkedFrom` marker, and its history is rebuilt at load time by reading the
+source read-only.
+
+The marker pins the cut ROW, not a position: it names the session that
+physically stores that row — an ancestor, when the cut lands inside a prefix the
+source itself only inherits — together with that row's backend key (`seq`, plus
+`event_time` on the SQL backends; JSONL pins its 0-based ordinal and claims only
+the append-only guarantee, so a same-ordinal rewrite is not detected). Loading
+reads that owner's last compaction at or before the cut through the cut itself
+and drops everything after it, so later appends — including later compactions —
+never appear in the fork, and an owner's older segments are paged in only when
+the cut sits behind its newest compaction. A source rewrite that moves the
+pinned row fails closed, as does a SQL row whose `event_time` changed, and
+nothing is ever loaded as a silently truncated transcript. Markers written by
+older builds recorded a 1-based entry count instead of a row key; those rows
+keep loading positionally, and the ambiguity of the very first copy-based
+layout still fails closed instead of guessing.
+
+Neither creating nor opening a fork loads the whole transcript. The DEFAULT cut
+is selected from the physical located head (the last compaction and everything
+after it) and its owner+key carried forward; the child then initializes from
+that head — or from the resolved inherited context when it is a zero-copy
+child, which is also prepended when the cut is the child's OWN completed turn —
+and reads older rows only on demand. Because a head omits the rows a compaction
+summarized and a `GoalUpdated` is never inside the summary, both a fresh fork
+and a resume restore the newest goal (or clear tombstone) at or before the cut
+separately, as projection state only: no history entry is fabricated. An
+explicit `--at` stays a 1-based index over the RESOLVED transcript and may page
+older segments. JSONL is always parsed in full (its lower bound) and a legacy
+whole-document session is still read whole because it is rewritten in place.
+
+The fork keeps the source's prefix up to (and including) the last completed
+turn — an assistant message with no pending tool calls, or a compaction — and
+drops anything after it (background-completion notices, for example). `--at
+<n>` picks the fork point explicitly: `n` is 1-based and inclusive over the
+RESOLVED transcript, and it must land on a turn boundary, otherwise the fork
+fails rather than cutting mid-turn. Because the inherited context starts at a
+compaction and a `GoalUpdated` is not embedded in a compaction summary, the
+newest goal at or before the cut is frozen into the fork as its own entry, so a
+head-only load never drops it. Without a completed turn in the source, the fork
+fails; if the source is deleted or unreadable, loading the fork fails closed
+with an error naming the source. Forking a fork resolves the whole chain.
 
 The marker is display/audit only: it is rendered as a dim notice in the TUI and
 is never sent to the provider on the model wire. The forked session has fresh
@@ -704,13 +731,26 @@ equivalently.
 Non-goals / known boundaries of the read-through fork: inherited parent entries
 have no receipt (`eout1` refs are session-local numeric ids, so no ref is issued
 for them — their oversized fields stay full in the request instead of being
-truncated), the web/TUI transcript *pager* still lists only the forked
-session's own physical rows, and a compaction whose retained tail would reach
+truncated), the model context never replays rows that a compaction already
+summarized, the web/TUI transcript *pager* lists the child's own physical rows
+plus, for an inherited context, the owner's rows below it: the head page carries
+the owner's cursor (`next_older_session`/`before_session`) so older owner
+segments stay readable on demand, following pinned markers across ancestry: every
+continuation keeps the owning session (`next_older_session`), and crossing into a
+prefix includes that ancestor's own pinned cut row (a compaction summarized it, so
+nothing else materialized it) while still excluding later rows. A web row's
+physical identity includes its owning session, because backend keys restart per
+session (JSONL ordinals especially), so identical ordinals in an ancestor and in a
+child are two distinct rows. The pager stops at a legacy positional prefix (it has
+no physical cursor of its own),
+and a compaction whose retained tail would reach
 into the inherited prefix fails closed instead of copying parent messages into
 the fork (the fork's own new messages compact normally). Marker-first copies
 written by the original copy layout are ambiguous when their stored prefix
 matches the source prefix; they fail closed rather than guessing, and a
-marker-first copy whose source is gone cannot be compared.
+marker-first copy whose source is gone cannot be compared. A pinned marker
+carries no descriptors, watermarks, or view ids: it is one session id plus one
+backend key.
 
 ### TUI commands
 
@@ -1039,16 +1079,18 @@ starts from the parent's **completed-turn prefix** (the in-flight turn is
 excluded, so put everything the child needs in `task`). It stores only a
 `ForkedFrom` marker — the prefix is read back from the parent session — so
 spawning a fork writes O(1) entries, never the parent history. It runs on the
-parent's **current** model and workspace, inheriting the parent's system
-prompt, tool schemas and MCP tool set so its request is a byte-identical prefix
-and reuses the parent's provider-side prompt cache. The parent's goal is frozen into the
-request head. A fork still cannot delegate further or ask the user questions.
-Constraints: `fork` is mutually exclusive with `role` and `resume`; the parent
-must have a completed turn (a mid-turn compaction is rejected); `workspace`
-must resolve to the parent root; and the reconnected MCP tool set must equal the
-parent's captured list exactly — a missing, extra, reordered or changed tool
-fails closed instead of forking a different provider tool set (this is the only
-case where a subagent gets MCP tools).
+parent's **current** model, inheriting the parent's system prompt, tool schemas
+and MCP tool set, and the parent's goal is frozen into the request head.
+`workspace` is optional and defaults to the parent root: with that default the
+child's request is a byte-identical prefix and reuses the parent's
+provider-side prompt cache. An explicit different `workspace` is allowed and
+only moves the child's file/bash tools and MCP connections there — the model,
+history prefix and goal still come from the parent — so such a request is no
+longer guaranteed to be a byte-identical prefix or a cache hit. A fork still
+cannot delegate further or ask the user questions. Constraints: `fork` is
+mutually exclusive with `role` and `resume`; the parent must have a completed
+turn (a mid-turn compaction is rejected). This is the only case where a
+subagent gets MCP tools.
 
 Subagents always run in the background without blocking the main agent; there
 is no foreground mode. The immediate tool result includes both the background
@@ -1507,8 +1549,9 @@ executes the commands its `.e-agent/config.toml` declares. A global
 re-enable: the merged config keeps the disabled global entry, so a
 same-named project server is skipped (`connect_all` skips disabled servers).
 Project MCP servers apply to the main session and to explicit `fork: true`
-delegates, which reconnect the parent's tool set and fail closed if it differs.
-Ordinary subagents do not connect MCP.
+delegates, which reconnect the parent's project servers in the child's own
+workspace (a server that fails to start is skipped, exactly as for a main
+session). Ordinary subagents do not connect MCP.
 
 Each entry spawns `command` with the workspace as its current directory
 (override with `cwd`), plus optional `env`. Servers are connected one at a

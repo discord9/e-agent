@@ -58,6 +58,7 @@ const state = {
   sse: { ctrl: null, retryTimer: null, stopped: false },
   acc: null,                 // 增量渲染累积器（见 newAccumulator）
   nextBeforeSeq: null,       // 历史分页游标：下一段更早历史的 before_seq（loadHistory 响应里取；null=没有更多）
+  nextOlderSession: null,    // 该游标所属的会话 id（zero-copy fork 的继承前缀：更早的行存在源会话里；null=本会话）
   webOlderPages: [],         // Web bootstrap head 之前已加载的 {entries,locations} 物理页
   webHeadLocations: [],      // 当前 Web bootstrap head 的 EntryLocation 元数据
   webHeadEntries: [],        // 当前 Web bootstrap head；用于填补重连时的物理 gap

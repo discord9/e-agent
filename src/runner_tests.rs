@@ -1915,7 +1915,7 @@ fn persisted_request_user_input_call_is_repaired_on_resume_not_waiting() {
 fn entry_event_projects_forked_from_as_display() {
     let event = entry_event(&SessionEntry::ForkedFrom {
         source: "src-123".into(),
-        at: 4,
+        at: Some(4),
         event_time: Some(1_700_000_000_000_000),
         seq: Some(3),
     });
@@ -1926,12 +1926,24 @@ fn entry_event_projects_forked_from_as_display() {
     // Provenance fields never leak into the projection.
     let event = entry_event(&SessionEntry::ForkedFrom {
         source: "src-123".into(),
-        at: 4,
+        at: Some(4),
         event_time: None,
         seq: None,
     });
     assert!(
         matches!(event, Some(AgentEvent::Display(text)) if text == "forked from src-123 at entry 4")
+    );
+    // A pinned marker has no positional `at`: the replayed line names the
+    // pinned row instead of inventing a position.
+    let event = entry_event(&SessionEntry::ForkedFrom {
+        source: "src-123".into(),
+        at: None,
+        event_time: Some(1_700_000_000_000_000),
+        seq: Some(3),
+    });
+    assert!(
+        matches!(event, Some(AgentEvent::Display(text)) if text == "forked from src-123 at seq 3"),
+        "a pinned marker must not claim a positional entry index"
     );
 }
 
@@ -4013,7 +4025,8 @@ async fn web_head_keeps_logical_boundary_when_unlocated_error_is_in_tail() {
     agent.apply_entry(SessionEntry::Error {
         text: "fallback".into(),
     });
-    let (entries, locations, cursor, start, end, _) = agent.web_head_page(200, true);
+    let (entries, locations, cursor, _cursor_session, start, end, _) =
+        agent.web_head_page(200, true);
     assert_eq!((start, end), (2, 202));
     assert_eq!(entries.len(), 199);
     assert_eq!(locations.len(), 199);
@@ -4025,6 +4038,74 @@ async fn web_head_keeps_logical_boundary_when_unlocated_error_is_in_tail() {
         entries
             .iter()
             .all(|entry| !matches!(entry, SessionEntry::Error { .. }))
+    );
+}
+
+/// A head-only resume of a session whose OWN compaction opened the head
+/// records a cursor tagged with the session itself. The published web page must
+/// normalize that to "no ancestor" (`None`): otherwise the client treats it as a
+/// fork ancestor and refuses to drain the child-bound gap on reconnect. A real
+/// ancestor owner is preserved.
+#[tokio::test]
+async fn web_attach_normalizes_a_self_owned_older_cursor_and_keeps_an_ancestor() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut runner, _handle) = SessionRunner::new(
+        Agent::new(
+            Box::new(ScriptedAssistantModel {
+                replies: VecDeque::new(),
+            }),
+            Vec::new(),
+        ),
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "self-owner".into(),
+        IdlePolicy::WaitForInput,
+    );
+    // A head-only history: its own compaction opens it, so the route points at
+    // the SAME session.
+    runner.agent.restore_located(
+        vec![
+            SessionEntry::Compaction {
+                summary: "head summary".into(),
+                retained: vec![],
+                current_prompt_at: None,
+                no_current_prompt: false,
+            },
+            Message::User {
+                content: "own".into(),
+                images: vec![],
+            }
+            .into(),
+        ],
+        vec![None, None],
+    );
+    runner.agent.set_older_route(Some(("self-owner".into(), 0)));
+    runner.prepare_web_attach();
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    respond_web_attach_shared(&runner.shared, reply);
+    let attach = rx.await.unwrap();
+    assert_eq!(
+        attach.next_before_seq,
+        Some(0),
+        "the cursor itself is real: rows exist below the head"
+    );
+    assert_eq!(
+        attach.next_older_session, None,
+        "an own-session owner is normalized to `None`, never reported as an ancestor"
+    );
+
+    // A genuine ancestor owner survives normalization.
+    runner
+        .agent
+        .set_older_route(Some(("ancestor-session".into(), 7)));
+    runner.prepare_web_attach();
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    respond_web_attach_shared(&runner.shared, reply);
+    let attach = rx.await.unwrap();
+    assert_eq!(attach.next_before_seq, Some(7));
+    assert_eq!(
+        attach.next_older_session.as_deref(),
+        Some("ancestor-session")
     );
 }
 

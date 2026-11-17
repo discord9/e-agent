@@ -1146,6 +1146,43 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
 
     /// `MAX(seq)` of the newest compaction entry with `seq < before`
     /// (`None` = no upper bound), i.e. the last compaction overall.
+    /// The newest `goal_updated` row at or below `seq` (the fork cut), as a
+    /// decoded [`crate::agent::SessionEntry`]. One bounded row, never the
+    /// transcript: a fork must resolve the goal that applies AT ITS CUT, and a
+    /// `GoalUpdated` is never embedded in a compaction summary.
+    pub async fn latest_goal_before(
+        &self,
+        seq: i64,
+    ) -> Result<Option<crate::agent::SessionEntry>, String> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT payload FROM session_entries \
+                 WHERE workspace_id = ?1 AND session_id = ?2 \
+                 AND entry_kind = 'goal_updated' AND seq <= ?3 \
+                 ORDER BY seq DESC, event_time_us DESC LIMIT 1",
+                (self.workspace_id.as_str(), self.session_id.as_str(), seq),
+            )
+            .await
+            .map_err(|e| format!("cannot query the fork cut goal: {e}"))?;
+        let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| format!("cannot query the fork cut goal: {e}"))?
+        else {
+            return Ok(None);
+        };
+        let payload: String = row
+            .get_value(0)
+            .map_err(|e| format!("cannot query the fork cut goal: {e}"))?
+            .as_text()
+            .ok_or_else(|| "cannot query the fork cut goal: payload is not text".to_string())?
+            .to_owned();
+        let entry = serde_json::from_str::<crate::agent::SessionEntry>(&payload)
+            .map_err(|e| format!("cannot decode the fork cut goal: {e}"))?;
+        Ok(Some(entry))
+    }
+
     async fn last_compaction_seq(&self, before: Option<i64>) -> Result<Option<i64>, String> {
         let conn = self.conn.lock().await;
         let mut rows = match before {
