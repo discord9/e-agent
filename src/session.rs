@@ -300,6 +300,7 @@ impl Session {
                 entries,
                 locations,
                 legacy: false,
+                inherited: 0,
             });
         }
         let legacy = session_path(root, name, "json")?;
@@ -308,6 +309,7 @@ impl Session {
                 entries: Vec::new(),
                 locations: Vec::new(),
                 legacy: false,
+                inherited: 0,
             });
         }
         let saved: LegacySession = serde_json::from_slice(
@@ -324,6 +326,7 @@ impl Session {
             locations: vec![None; entries.len()],
             entries,
             legacy: true,
+            inherited: 0,
         })
     }
 
@@ -1067,8 +1070,11 @@ mod tests {
         assert_eq!(mode, 0o600);
     }
 
-    #[test]
-    fn fork_roundtrip_writes_marker_plus_prefix_and_leaves_source_untouched() {
+    /// The zero-copy fork contract at the storage layer: the child file is
+    /// the marker ALONE, the source is untouched, and the marker-aware load
+    /// reconstructs `[prefix..][marker]` without copying anything.
+    #[tokio::test]
+    async fn fork_writes_only_the_marker_and_resolves_the_prefix_read_through() {
         use crate::agent::fork_prefix;
 
         let temp = tempfile::tempdir().unwrap();
@@ -1090,30 +1096,36 @@ mod tests {
             event_time: None,
             seq: Some(prefix.len() as i64 - 1),
         };
-        let mut fork_entries = vec![marker];
-        fork_entries.extend(prefix);
         let forked = "forked-session";
-        Session::rewrite(temp.path(), forked, &fork_entries).unwrap();
+        Session::rewrite(temp.path(), forked, std::slice::from_ref(&marker)).unwrap();
 
         // Source session is byte-for-byte unchanged.
         assert_eq!(Session::load(temp.path(), source).unwrap().entries, history);
-        // The new session file is exactly [ForkedFrom] + prefix, and loads
-        // back as the same entries (restore_history consumes this shape).
+        // The new session file is exactly the marker — no parent entry.
         let raw =
             std::fs::read_to_string(temp.path().join(".e-agent/sessions/forked-session.jsonl"))
                 .unwrap();
-        assert_eq!(raw.lines().count(), fork_entries.len());
+        assert_eq!(raw.lines().count(), 1);
         assert!(
             raw.lines()
                 .next()
                 .unwrap()
                 .contains(r#""type":"forked_from""#),
-            "first line must be the marker: {}",
+            "the only line must be the marker: {}",
             raw.lines().next().unwrap()
         );
         let reloaded = Session::load(temp.path(), forked).unwrap();
         assert!(!reloaded.legacy);
-        assert_eq!(reloaded.entries, fork_entries);
+        assert_eq!(reloaded.entries, vec![marker.clone()]);
+        // The transcript is reconstructed read-through from the source.
+        let resolved = crate::session_store::SessionStore::Jsonl
+            .load_fork_located(temp.path(), forked)
+            .await
+            .unwrap();
+        assert_eq!(resolved.inherited, prefix.len());
+        let mut expected = prefix;
+        expected.push(marker);
+        assert_eq!(resolved.entries, expected);
     }
 
     #[test]

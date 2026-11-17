@@ -651,10 +651,7 @@ impl Delegate {
         background: BackgroundTasks,
         task: DelegatedTask,
         persist: PersistConfig,
-        resume: Option<(
-            Vec<crate::agent::SessionEntry>,
-            Vec<Option<crate::session_store::EntryLocation>>,
-        )>,
+        resume: Option<crate::session_store::LoadedLocated>,
         bootstrap: Option<SessionBootstrap>,
         policy: IdlePolicy,
         compaction_mode: CompactionMode,
@@ -726,8 +723,10 @@ impl Delegate {
             instructions.push_str(&content);
         }
         agent.set_context_prefix(instructions);
-        if let Some((entries, locations)) = resume {
-            agent.restore_located(entries, locations);
+        if let Some(loaded) = resume {
+            let inherited = loaded.inherited;
+            agent.restore_located(loaded.entries, loaded.locations);
+            agent.set_inherited_prefix(inherited);
         }
         let store = SessionStore::connect(&persist.backend, &persist.root, &persist.session_id)
             .await
@@ -788,12 +787,19 @@ impl Delegate {
             .ok_or_else(|| "fork requires the parent's current model".to_string())
     }
 
+    /// Spawn a forked child. `parent` is the parent's resolved history and
+    /// `at` the 1-based fork point in it: the prefix becomes the child's
+    /// IN-MEMORY history only. The child's store receives nothing but its own
+    /// entries — the goal freeze and the `ForkedFrom` marker — so spawning
+    /// never performs O(N) durable writes and the parent rows are never
+    /// copied.
     async fn spawn_fork(
         &self,
         task: String,
         label: Option<String>,
         record: crate::session_store::BackgroundRecord,
-        prefix: Vec<crate::agent::SessionEntry>,
+        parent: crate::session_store::LoadedLocated,
+        at: usize,
         head: crate::session_factory::RequestHead,
     ) -> Result<String, String> {
         // Admission preflight: `execute` checked delivery before the awaited
@@ -883,8 +889,24 @@ impl Delegate {
         if let Some(window) = context_window {
             agent.set_context_window(window);
         }
-        let at = prefix.len();
-        let mut initial_entries = prefix;
+        // Provenance for the marker: the pinned key of the last inherited
+        // entry, so a later load can prove the source prefix did not move.
+        // Read it BEFORE the prefix is normalized to "inherited" (inherited
+        // entries deliberately keep no location).
+        let (seq, event_time) = parent
+            .locations
+            .get(at.saturating_sub(1))
+            .and_then(|location| location.as_ref())
+            .map_or((None, None), |location| {
+                (Some(location.key.seq()), location.key.event_time_us())
+            });
+        // Seed the inherited prefix in MEMORY (never in the child's store);
+        // the marker-aware loader rebuilds exactly this prefix on resume.
+        let mut prefix = parent;
+        prefix.inherit_prefix(at);
+        agent.restore_located(prefix.entries, prefix.locations);
+        agent.set_inherited_prefix(at);
+        let mut initial_entries = Vec::with_capacity(2);
         // Freeze the goal projection via the existing append-only goal path:
         // the newest GoalUpdated entry wins on resume, so the child's request
         // carries the parent's exact `[session goal]` system message even when
@@ -897,8 +919,8 @@ impl Delegate {
         initial_entries.push(crate::agent::SessionEntry::ForkedFrom {
             source: record.session.clone(),
             at,
-            event_time: None,
-            seq: None,
+            event_time,
+            seq,
         });
         let bootstrap = SessionBootstrap {
             recovery_tasks: Vec::new(),
@@ -1146,32 +1168,28 @@ pub struct BtwContext {
     pub parent_handle: WeakSessionHandle,
 }
 
-/// The initial history of a btw fork: the source session's prefix up to its
-/// last completed turn (the same cut [`crate::agent::fork_prefix`] applies
-/// to `--fork` main sessions), then the `ForkedFrom` marker, then the
-/// explanatory notice line. The question itself is NOT part of the history
-/// — it is delivered as the runner's initial prompt (the first user
-/// message).
-fn btw_fork_entries(
+/// The btw fork's OWN initial entries — the `ForkedFrom` marker plus the
+/// explanatory notice line. The inherited prefix is NOT stored: the marker
+/// names the source session and the cut, and the marker-aware loader reads
+/// the prefix back read-only (the same zero-copy rule `--fork` main sessions
+/// and `delegate { fork: true }` follow). The question itself is not part of
+/// the history — it is delivered as the runner's initial prompt.
+fn btw_fork_own_entries(
     source: &str,
-    entries: &[crate::agent::SessionEntry],
-) -> Result<Vec<crate::agent::SessionEntry>, String> {
-    let prefix = crate::agent::fork_prefix(entries, None)?;
-    let at = prefix.len();
-    let mut fork_entries = Vec::with_capacity(prefix.len() + 2);
-    fork_entries.extend(prefix);
-    fork_entries.push(crate::agent::SessionEntry::ForkedFrom {
-        source: source.to_owned(),
-        at,
-        // JSONL has no event_time column and the fork path keeps seq as an
-        // optional provenance slot (mirrors session_factory's fork marker).
-        event_time: None,
-        seq: None,
-    });
-    fork_entries.push(crate::agent::SessionEntry::Notice {
-        text: "（btw fork：在主线之外继续探讨）".to_owned(),
-    });
-    Ok(fork_entries)
+    at: usize,
+    (seq, event_time): (Option<i64>, Option<i64>),
+) -> Vec<crate::agent::SessionEntry> {
+    vec![
+        crate::agent::SessionEntry::ForkedFrom {
+            source: source.to_owned(),
+            at,
+            event_time,
+            seq,
+        },
+        crate::agent::SessionEntry::Notice {
+            text: "（btw fork：在主线之外继续探讨）".to_owned(),
+        },
+    ]
 }
 
 /// Fork a live session's full history into a persistent interactive
@@ -1224,13 +1242,25 @@ pub async fn spawn_btw_subagent(
     let source_store = SessionStore::connect(&backend, &persist_root, source_session)
         .await
         .map_err(|e| format!("btw fork failed: {e:#}"))?;
-    let source_entries = source_store
-        .load(&persist_root, source_session)
+    // Marker-aware: a source that is itself a fork child resolves its own
+    // inherited prefix, so the cut always indexes the same resolved history
+    // the child's loader reads back.
+    let mut prefix = source_store
+        .load_fork_located(&persist_root, source_session)
         .await
-        .map_err(|e| format!("btw fork failed: {e:#}"))?
-        .entries;
-    let fork_entries = btw_fork_entries(source_session, &source_entries)
-        .map_err(|e| format!("cannot fork session {source_session}: {e}"))?;
+        .map_err(|e| format!("btw fork failed: {e:#}"))?;
+    let at = crate::agent::fork_prefix(&prefix.entries, None)
+        .map_err(|e| format!("cannot fork session {source_session}: {e}"))?
+        .len();
+    let (seq, event_time) = prefix
+        .locations
+        .get(at.saturating_sub(1))
+        .and_then(|location| location.as_ref())
+        .map_or((None, None), |location| {
+            (Some(location.key.seq()), location.key.event_time_us())
+        });
+    prefix.inherit_prefix(at);
+    let fork_entries = btw_fork_own_entries(source_session, at, (seq, event_time));
     let session_id = crate::session::new_id_prefixed("btw-");
     let local_permit = local_sessions
         .reserve(crate::session_factory::LocalSessionRegistry::key(
@@ -1267,7 +1297,7 @@ pub async fn spawn_btw_subagent(
             interactive: true,
         },
         persist,
-        None,
+        Some(prefix),
         Some(fork_bootstrap),
         IdlePolicy::WaitForInput,
         // A btw fork is an interactive main-style conversation (real user
@@ -1547,19 +1577,21 @@ impl Tool for Delegate {
                         .into(),
                 );
             }
-            let entries = record
+            // Marker-aware: a parent that is itself a zero-copy fork child
+            // resolves its inherited prefix here, so `at` always indexes the
+            // same resolved transcript the child re-loads.
+            let parent = record
                 .store
-                .load(&record.root, &record.session)
+                .load_fork_located(&record.root, &record.session)
                 .await
-                .map_err(|e| format!("cannot load parent history: {e:#}"))?
-                .entries;
+                .map_err(|e| format!("cannot load parent history: {e:#}"))?;
             // A delegate fork must cut at a COMPLETED turn: a bare
             // `fork_prefix` also accepts a mid-turn compaction, whose retained
             // tail can end with an unanswered tool call (the child would then
             // see a fabricated `[turn interrupted …]` result the parent never
             // had).
-            let prefix = crate::agent::fork_prefix_complete(&entries, None)?;
-            if prefix.is_empty() {
+            let at = crate::agent::fork_prefix_complete(&parent.entries, None)?.len();
+            if at == 0 {
                 return Err("parent session has no completed turn to fork".into());
             }
             let mut head = factory();
@@ -1569,13 +1601,23 @@ impl Tool for Delegate {
             // build-time head can predate a later human `/goal` command.
             // Fall back to the head only when the history carries no goal
             // update at all.
-            let (history_goal, history_cleared) = crate::agent::Agent::fold_goal(&entries);
+            let (history_goal, history_cleared) = crate::agent::Agent::fold_goal(&parent.entries);
             if history_goal.is_some() || history_cleared {
                 head.goal = history_goal;
                 head.goal_cleared = history_cleared;
             }
+            // The inherited prefix is seeded in memory only (never written to
+            // the child's store); the child's own entries are the goal freeze
+            // plus the marker.
             return self
-                .spawn_fork(task, label_arg(&arguments), record.clone(), prefix, head)
+                .spawn_fork(
+                    task,
+                    label_arg(&arguments),
+                    record.clone(),
+                    parent,
+                    at,
+                    head,
+                )
                 .await
                 .map(ToolOutput::text);
         }
@@ -1746,20 +1788,22 @@ impl Tool for Delegate {
                 let temp_store = SessionStore::connect(&self.persist_backend, &root, &id)
                     .await
                     .map_err(|error| format!("cannot resume session `{id}`: {error:#}"))?;
+                // Marker-aware: resuming a zero-copy fork child rebuilds its
+                // inherited prefix from the source session read-only.
                 let located = temp_store
-                    .load_located(&root, &id)
+                    .load_fork_located(&root, &id)
                     .await
                     .map_err(|error| format!("cannot resume session `{id}`: {error:#}"))?;
                 if located.entries.is_empty() {
                     return Err(format!("no such subagent session: `{id}`"));
                 }
-                Some((id, located.entries, located.locations))
+                Some((id, located))
             }
             None => None,
         };
         let model_name = model.profile_key();
         let (resume_id, resume) = match resume {
-            Some((id, entries, locations)) => (Some(id), Some((entries, locations))),
+            Some((id, loaded)) => (Some(id), Some(loaded)),
             None => (None, None),
         };
         // A fresh spawn records the task-panel label as the subagent

@@ -385,6 +385,15 @@ function handleSSEBlock(block, id, wsId, epoch) {
     }
     const locationKey = (location) => location ? JSON.stringify(location) : null;
     const headKeys = new Set((bootstrap.locations || []).map(locationKey).filter(Boolean));
+    // A complete head that carries rows WITHOUT a physical location is an
+    // authoritative zero-copy fork transcript: its inherited prefix is read
+    // through from the source session, so those rows have no identity to
+    // reconcile by. Older retained rows with no location can only belong to a
+    // previous copy of that same inherited prefix, so they are superseded
+    // (keeping them would append the prefix a second time on reconnect).
+    const headComplete = (bootstrap.next_before_seq !== undefined ? bootstrap.next_before_seq : null) === null;
+    const forkHeadSupersedesUnlocated = headComplete
+      && (bootstrap.locations || []).some((location) => !location);
     // Older pages retain their own physical keys. A new head may overlap a
     // previously retained page only at a backend boundary; remove exactly
     // those rows by physical identity, never by content or task id.
@@ -401,7 +410,9 @@ function handleSSEBlock(block, id, wsId, epoch) {
       const entries = [], locations = [];
       for (let i = 0; i < page.entries.length; i++) {
         const location = (page.locations || [])[i];
-        if (!headKeys.has(locationKey(location))) {
+        const key = locationKey(location);
+        if (forkHeadSupersedesUnlocated && !key) continue;
+        if (!headKeys.has(key)) {
           entries.push(page.entries[i]);
           locations.push(location);
           older.push(page.entries[i]);

@@ -4622,20 +4622,14 @@ async fn fork_latest_creates_session_up_to_newest_boundary() {
     assert!(notice.starts_with("已 fork 到新会话：fork-"), "{notice}");
     assert!(notice.contains("保留 6 条历史"), "{notice}");
     let fork_path = fork_session_file(temp.path()).expect("fork session must exist");
-    let loaded = crate::session::Session::load(
-        temp.path(),
-        fork_path.file_stem().unwrap().to_str().unwrap(),
-    )
-    .unwrap();
-    // 6 source entries up to the newest boundary (a2) + ForkedFrom marker;
-    // the trailing Notice is dropped.
-    assert_eq!(loaded.entries.len(), 7);
-    assert_eq!(
-        loaded.entries[..6],
-        fork_session_entries()[..6],
-        "prefix must keep everything up to the newest boundary"
-    );
-    match loaded.entries.last().unwrap() {
+    let fork_id = fork_path.file_stem().unwrap().to_str().unwrap().to_owned();
+    // The fork's file holds the marker ALONE (zero-copy): the 6 source
+    // entries are never copied, they are read back from the source session.
+    let stored = crate::session::Session::load(temp.path(), &fork_id)
+        .unwrap()
+        .entries;
+    assert_eq!(stored.len(), 1, "marker only: {stored:?}");
+    match &stored[0] {
         SessionEntry::ForkedFrom {
             source,
             at,
@@ -4648,6 +4642,20 @@ async fn fork_latest_creates_session_up_to_newest_boundary() {
         }
         other => panic!("expected ForkedFrom marker, got {other:?}"),
     }
+    // Loading through the marker-aware path reconstructs the identical
+    // history the built session received, cut at the newest boundary.
+    let resolved = crate::session_store::SessionStore::Jsonl
+        .load_fork_located(temp.path(), &fork_id)
+        .await
+        .unwrap();
+    assert_eq!(resolved.inherited, 6);
+    assert_eq!(resolved.entries.len(), 7);
+    assert_eq!(
+        resolved.entries[..6],
+        fork_session_entries()[..6],
+        "prefix must keep everything up to the newest boundary"
+    );
+    assert_eq!(resolved.entries[6], stored[0]);
 }
 
 #[tokio::test]
@@ -4662,19 +4670,13 @@ async fn fork_at_n_counts_boundaries_from_newest() {
     assert!(notice.starts_with("已 fork 到新会话：fork-"), "{notice}");
     assert!(notice.contains("保留 2 条历史"), "{notice}");
     let fork_path = fork_session_file(temp.path()).expect("fork session must exist");
-    let loaded = crate::session::Session::load(
-        temp.path(),
-        fork_path.file_stem().unwrap().to_str().unwrap(),
-    )
-    .unwrap();
-    // 2 source entries up to the first boundary (a1) + ForkedFrom marker.
-    assert_eq!(loaded.entries.len(), 3);
-    assert_eq!(
-        loaded.entries[..2],
-        fork_session_entries()[..2],
-        "prefix must keep everything up to the 2nd-newest boundary"
-    );
-    match loaded.entries.last().unwrap() {
+    let fork_id = fork_path.file_stem().unwrap().to_str().unwrap().to_owned();
+    // Marker only, no copied prefix.
+    let stored = crate::session::Session::load(temp.path(), &fork_id)
+        .unwrap()
+        .entries;
+    assert_eq!(stored.len(), 1, "marker only: {stored:?}");
+    match &stored[0] {
         SessionEntry::ForkedFrom {
             source,
             at,
@@ -4687,6 +4689,17 @@ async fn fork_at_n_counts_boundaries_from_newest() {
         }
         other => panic!("expected ForkedFrom marker, got {other:?}"),
     }
+    let resolved = crate::session_store::SessionStore::Jsonl
+        .load_fork_located(temp.path(), &fork_id)
+        .await
+        .unwrap();
+    assert_eq!(resolved.inherited, 2);
+    assert_eq!(
+        resolved.entries[..2],
+        fork_session_entries()[..2],
+        "prefix must keep everything up to the 2nd-newest boundary"
+    );
+    assert_eq!(resolved.entries[2], stored[0]);
 }
 
 #[tokio::test]

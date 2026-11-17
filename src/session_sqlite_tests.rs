@@ -5160,3 +5160,378 @@ fn located_sqlite_paged_query_is_deduplicated_and_limited_in_sql() {
     assert!(source.contains("ORDER BY t.seq DESC LIMIT ?5"));
     assert!(source.contains("ORDER BY t.seq DESC LIMIT ?4"));
 }
+
+/// Zero-copy fork on SQLite: the child's store holds ONE marker row (the
+/// parent's entries are never copied), and the marker-aware load reads the
+/// source prefix read-only and prepends it in memory.
+#[tokio::test]
+async fn zero_copy_fork_child_stores_one_marker_row_and_loads_the_prefix() {
+    use crate::session_store::SessionStore;
+
+    let (dir, path) = temp_db();
+    let root = dir.path();
+    let backend = crate::config::SessionBackend::Sqlite {
+        path: Some(path.to_string_lossy().into_owned()),
+    };
+    let source = SessionStore::connect(&backend, root, "sql-parent")
+        .await
+        .unwrap();
+    let entries: Vec<SessionEntry> = vec![
+        Message::User {
+            content: "q0".into(),
+            images: vec![],
+        }
+        .into(),
+        Message::Assistant(AssistantMessage {
+            content: Some("a0".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        })
+        .into(),
+        Message::User {
+            content: "q1".into(),
+            images: vec![],
+        }
+        .into(),
+        Message::Assistant(AssistantMessage {
+            content: Some("a1".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        })
+        .into(),
+    ];
+    let parent_locations = source
+        .append_located(root, "sql-parent", &entries)
+        .await
+        .unwrap();
+    let pinned = &parent_locations[3];
+    let marker = SessionEntry::ForkedFrom {
+        source: "sql-parent".into(),
+        at: 4,
+        event_time: pinned.key.event_time_us(),
+        seq: Some(pinned.key.seq()),
+    };
+
+    let child = SessionStore::connect(&backend, root, "sql-fork")
+        .await
+        .unwrap();
+    child
+        .append(root, "sql-fork", std::slice::from_ref(&marker))
+        .await
+        .unwrap();
+    assert_eq!(
+        child.count_entries(root, "sql-fork").await.unwrap(),
+        1,
+        "the child row set is the marker alone"
+    );
+
+    let resolved = child.load_fork_located(root, "sql-fork").await.unwrap();
+    assert_eq!(resolved.inherited, 4);
+    assert_eq!(resolved.entries[..4], entries[..]);
+    assert_eq!(resolved.entries[4], marker);
+    assert!(
+        resolved.locations[..4].iter().all(Option::is_none),
+        "inherited entries carry no child location"
+    );
+    assert!(resolved.locations[4].is_some());
+
+    // A later parent append stays invisible to the fork.
+    source
+        .append(
+            root,
+            "sql-parent",
+            &[Message::User {
+                content: "late q".into(),
+                images: vec![],
+            }
+            .into()],
+        )
+        .await
+        .unwrap();
+    let again = child.load_fork_located(root, "sql-fork").await.unwrap();
+    assert_eq!(again.entries[..5], resolved.entries[..5]);
+    assert_eq!(again.entries.len(), 5);
+
+    // A moved fork point (a `seq` the source no longer has at `at`) fails
+    // closed instead of inheriting a different prefix.
+    let bad = SessionStore::connect(&backend, root, "sql-bad-fork")
+        .await
+        .unwrap();
+    bad.append(
+        root,
+        "sql-bad-fork",
+        &[SessionEntry::ForkedFrom {
+            source: "sql-parent".into(),
+            at: 4,
+            event_time: None,
+            seq: Some(999),
+        }],
+    )
+    .await
+    .unwrap();
+    let error = bad
+        .load_fork_located(root, "sql-bad-fork")
+        .await
+        .unwrap_err();
+    let message = format!("{error:#}");
+    assert!(message.contains("sql-parent"), "{message}");
+    assert!(
+        message.contains("no longer matches the marker"),
+        "{message}"
+    );
+}
+
+/// `load_head_page_located` must stay BOUNDED for an ordinary SQL session
+/// (the leading-marker probe reads only the oldest rows) while a zero-copy
+/// fork child still resolves its inherited prefix as one cursorless page.
+#[tokio::test]
+async fn head_page_probe_keeps_ordinary_sql_pages_bounded_and_resolves_forks() {
+    use crate::session_store::SessionStore;
+
+    let (dir, path) = temp_db();
+    let root = dir.path();
+    let backend = crate::config::SessionBackend::Sqlite {
+        path: Some(path.to_string_lossy().into_owned()),
+    };
+    let source = SessionStore::connect(&backend, root, "sql-head-parent")
+        .await
+        .unwrap();
+    let entries: Vec<SessionEntry> = (0..40)
+        .map(|i| {
+            Message::User {
+                content: format!("m{i}"),
+                images: vec![],
+            }
+            .into()
+        })
+        .collect();
+    source
+        .append(root, "sql-head-parent", &entries)
+        .await
+        .unwrap();
+
+    // An ordinary session: the bounded physical page (2 newest rows + a
+    // cursor), NOT the whole 40-entry transcript with no cursor.
+    let page = source
+        .load_head_page_located(root, "sql-head-parent", Some(2))
+        .await
+        .unwrap();
+    assert_eq!(page.entries.len(), 2, "the page stays bounded");
+    assert_eq!(page.entries, entries[38..].to_vec());
+    assert!(page.next_before_seq.is_some(), "a physical cursor is kept");
+
+    // A fork child of it: the inherited prefix is resolved and served as one
+    // complete page with no cursor.
+    let marker = SessionEntry::ForkedFrom {
+        source: "sql-head-parent".into(),
+        at: 40,
+        event_time: None,
+        seq: Some(39),
+    };
+    let child = SessionStore::connect(&backend, root, "sql-head-fork")
+        .await
+        .unwrap();
+    child
+        .append(root, "sql-head-fork", std::slice::from_ref(&marker))
+        .await
+        .unwrap();
+    let page = child
+        .load_head_page_located(root, "sql-head-fork", Some(2))
+        .await
+        .unwrap();
+    assert_eq!(page.entries.len(), 41, "inherited prefix + marker");
+    assert_eq!(page.entries[..40], entries[..]);
+    assert_eq!(page.next_before_seq, None, "no child seq to page by");
+    assert!(page.locations[..40].iter().all(Option::is_none));
+    assert!(page.locations[40].is_some());
+}
+
+/// The head-page marker probe reads the oldest LOGICAL rows. Duplicate
+/// physical versions at `seq = 2` consume a physical LIMIT in a segment page,
+/// which would hide a leading marker at `seq = 0`; the bounded logical probe
+/// folds same-seq winners first, so detection still succeeds.
+#[tokio::test]
+async fn head_page_probe_folds_duplicate_versions_before_the_physical_limit() {
+    use crate::session_store::SessionStore;
+
+    let (dir, path) = temp_db();
+    let root = dir.path();
+    let backend = crate::config::SessionBackend::Sqlite {
+        path: Some(path.to_string_lossy().into_owned()),
+    };
+    let source = SessionStore::connect(&backend, root, "dup-parent")
+        .await
+        .unwrap();
+    let parent: Vec<SessionEntry> = vec![
+        Message::User {
+            content: "q0".into(),
+            images: vec![],
+        }
+        .into(),
+        Message::Assistant(AssistantMessage {
+            content: Some("a0".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        })
+        .into(),
+    ];
+    source.append(root, "dup-parent", &parent).await.unwrap();
+    let marker = SessionEntry::ForkedFrom {
+        source: "dup-parent".into(),
+        at: 2,
+        event_time: None,
+        seq: Some(1),
+    };
+    let own: SessionEntry = Message::User {
+        content: "own".into(),
+        images: vec![],
+    }
+    .into();
+    let child = SessionStore::connect(&backend, root, "dup-fork")
+        .await
+        .unwrap();
+    child
+        .append(root, "dup-fork", std::slice::from_ref(&marker))
+        .await
+        .unwrap();
+    child
+        .append(root, "dup-fork", std::slice::from_ref(&own))
+        .await
+        .unwrap();
+    // Two retry versions of seq 2 (same payload, newer event time): a
+    // physical-LIMIT page would spend its slots on these.
+    let SessionStore::Sqlite { session, .. } = &child else {
+        panic!("expected the sqlite backend");
+    };
+    {
+        let raw = serde_json::to_string(&own).unwrap();
+        let session = session.lock().await;
+        let conn = session.conn.lock().await;
+        for _ in 0..2 {
+            conn.execute(
+                "INSERT INTO session_entries (workspace_id,session_id,seq,event_time_us,entry_kind,payload,schema_version,is_error) VALUES (?1,?2,2,?3,'message',?4,1,0)",
+                (
+                    crate::session_store::derive_workspace_id(root),
+                    "dup-fork",
+                    crate::session_store::next_event_time_us(),
+                    raw.clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        }
+    }
+    let first = session.lock().await.load_first(3).await.unwrap();
+    assert_eq!(first.len(), 3, "three LOGICAL rows: {first:?}");
+    assert_eq!(first[0], marker);
+    assert_eq!(first[1], own);
+    assert_eq!(first[2], own, "the seq-2 winner survives the fold");
+    // Hence the probe still detects the leading marker, and the head page
+    // resolves the fork (inherited prefix + marker) instead of a physical page.
+    let page = child
+        .load_head_page_located(root, "dup-fork", Some(1))
+        .await
+        .unwrap();
+    assert_eq!(page.entries.len(), 5, "2 inherited + 3 child rows");
+    assert_eq!(page.entries[..2], parent[..]);
+    assert_eq!(page.entries[2], marker);
+    assert_eq!(page.next_before_seq, None);
+}
+
+/// Sequences can be SPARSE: a child may store its `GoalUpdated` at seq 0 and
+/// its `ForkedFrom` marker at seq 10. A numeric `seq < n` probe cutoff would
+/// see only the goal and bypass resolution, losing the inherited prefix; the
+/// bounded logical probe orders by winning `event_time`, so it still finds the
+/// marker and the head page resolves the fork with no cursor.
+#[tokio::test]
+async fn head_page_probe_finds_a_marker_beyond_a_sparse_seq() {
+    use crate::session_store::SessionStore;
+
+    let (dir, path) = temp_db();
+    let root = dir.path();
+    let backend = crate::config::SessionBackend::Sqlite {
+        path: Some(path.to_string_lossy().into_owned()),
+    };
+    let source = SessionStore::connect(&backend, root, "sparse-parent")
+        .await
+        .unwrap();
+    let parent: Vec<SessionEntry> = vec![
+        Message::User {
+            content: "q0".into(),
+            images: vec![],
+        }
+        .into(),
+        Message::Assistant(AssistantMessage {
+            content: Some("a0".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        })
+        .into(),
+    ];
+    source.append(root, "sparse-parent", &parent).await.unwrap();
+
+    let goal = SessionEntry::GoalUpdated { goal: None };
+    let marker = SessionEntry::ForkedFrom {
+        source: "sparse-parent".into(),
+        at: 2,
+        event_time: None,
+        seq: Some(1),
+    };
+    let child = SessionStore::connect(&backend, root, "sparse-fork")
+        .await
+        .unwrap();
+    {
+        // Sparse physical layout: goal at seq 0, marker at seq 10, with
+        // increasing event times so the canonical order is goal → marker.
+        let goal_payload = serde_json::to_string(&goal).unwrap();
+        let marker_payload = serde_json::to_string(&marker).unwrap();
+        let SessionStore::Sqlite { session, .. } = &child else {
+            panic!("expected the sqlite backend");
+        };
+        let session = session.lock().await;
+        let conn = session.conn.lock().await;
+        conn.execute(
+            "INSERT INTO session_entries (workspace_id,session_id,seq,event_time_us,entry_kind,payload,schema_version,is_error) VALUES (?1,?2,0,?3,'goal_updated',?4,1,0)",
+            (
+                crate::session_store::derive_workspace_id(root),
+                "sparse-fork",
+                crate::session_store::next_event_time_us(),
+                goal_payload,
+            ),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_entries (workspace_id,session_id,seq,event_time_us,entry_kind,payload,schema_version,is_error) VALUES (?1,?2,10,?3,'forked_from',?4,1,0)",
+            (
+                crate::session_store::derive_workspace_id(root),
+                "sparse-fork",
+                crate::session_store::next_event_time_us(),
+                marker_payload,
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
+    let first = {
+        let SessionStore::Sqlite { session, .. } = &child else {
+            panic!("expected the sqlite backend");
+        };
+        session.lock().await.load_first(3).await.unwrap()
+    };
+    assert_eq!(first, vec![goal.clone(), marker.clone()]);
+
+    let page = child
+        .load_head_page_located(root, "sparse-fork", Some(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        page.entries,
+        vec![parent[0].clone(), parent[1].clone(), goal, marker],
+        "the inherited prefix is resolved despite the sparse marker seq"
+    );
+    assert_eq!(page.next_before_seq, None, "no child seq to page by");
+    assert!(page.locations[..2].iter().all(Option::is_none));
+    assert!(page.locations[2..].iter().all(Option::is_some));
+}

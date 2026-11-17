@@ -1272,6 +1272,13 @@ pub struct Agent {
     /// with `history` (`None` = the entry has no located key: legacy/test
     /// in-memory entries, entries pushed without a location).
     entry_locations: Vec<Option<EntryLocation>>,
+    /// Number of LEADING history entries inherited read-only from a
+    /// zero-copy fork source ([`crate::session_store::SessionStore::load_fork_located`]).
+    /// They are never persisted in this session, so compaction must not copy
+    /// them into a `Compaction.retained` snapshot (see
+    /// [`Self::set_inherited_prefix`]). Zero for every ordinary session and
+    /// for the copy-based forks written by older builds.
+    inherited: usize,
     /// The session kind for compaction (see [`CompactionMode`]). Set by the
     /// caller — never inferred from the history. Both variants now select
     /// the same bounded tail; the field is kept for API compatibility.
@@ -1316,6 +1323,7 @@ impl Agent {
             goal: None,
             goal_cleared: false,
             entry_locations: Vec::new(),
+            inherited: 0,
             compaction_mode: CompactionMode::Main,
             omitted_images: HashSet::new(),
         }
@@ -1488,15 +1496,24 @@ impl Agent {
     /// runner owns this projection; it is derived from the same located
     /// history that it just committed, never from the presentation log.
     pub(crate) fn web_head_page(&self, limit: usize, jsonl: bool) -> WebHeadPage {
-        let segment_start = if jsonl {
+        // A zero-copy fork child's inherited prefix has no child physical
+        // rows, so neither a bounded tail nor a physical cursor can address
+        // it: the whole resolved history is the authoritative head, exactly
+        // like `SessionStore::load_head_page_located` (no cursor, no older
+        // page). A bounded tail here would strand the inherited prefix.
+        let history_start = if self.inherited > 0 {
             0
         } else {
-            self.history
-                .iter()
-                .rposition(|entry| matches!(entry, SessionEntry::Compaction { .. }))
-                .unwrap_or(0)
+            let segment_start = if jsonl {
+                0
+            } else {
+                self.history
+                    .iter()
+                    .rposition(|entry| matches!(entry, SessionEntry::Compaction { .. }))
+                    .unwrap_or(0)
+            };
+            self.history.len().saturating_sub(limit).max(segment_start)
         };
-        let history_start = self.history.len().saturating_sub(limit).max(segment_start);
         let history_end = self.history.len();
         // The pagination boundary is the first physical row in the logical
         // head interval. An unlocated fallback Error must not move it.
@@ -1552,7 +1569,32 @@ impl Agent {
         self.goal = goal;
         self.goal_cleared = cleared;
         self.entry_locations = vec![None; history.len()];
+        self.inherited = 0;
         self.history = history;
+    }
+
+    /// Mark the leading history entries inherited read-only from a zero-copy
+    /// fork source (the loader's [`crate::session_store::LoadedLocated::inherited`]).
+    /// Call right after [`Self::restore_located`] on a fork-resolved load:
+    /// those entries live in the source session and must never be copied into
+    /// this session's store, which is exactly what a `Compaction.retained`
+    /// snapshot would do.
+    pub fn set_inherited_prefix(&mut self, inherited: usize) {
+        self.inherited = inherited.min(self.history.len());
+    }
+
+    /// The fork source this session's inherited prefix was read from, when
+    /// the leading region really is inherited (used for fail-closed messages).
+    fn inherited_source(&self) -> Option<&str> {
+        if self.inherited == 0 {
+            return None;
+        }
+        self.history.get(self.inherited..).and_then(|entries| {
+            entries.iter().find_map(|entry| match entry {
+                SessionEntry::ForkedFrom { source, .. } => Some(source.as_str()),
+                _ => None,
+            })
+        })
     }
 
     /// Restore the exact physical located keys aligned with the history
@@ -2150,6 +2192,58 @@ impl Agent {
                 None => anyhow::bail!("nothing to compact"),
             },
         };
+        // A zero-copy fork inherits its LEADING history from the source
+        // session: those messages are stored only there and must never be
+        // copied into a `Compaction.retained` snapshot (there is no reference
+        // form yet). The child's own messages compact normally, so a retained
+        // tail that starts after the inherited region is fine; one that
+        // reaches into it fails closed instead of duplicating parent rows.
+        if self.inherited > 0 {
+            let boundary = self.inherited.min(self.history.len());
+            let own_compaction = self.history[boundary..]
+                .iter()
+                .any(|entry| matches!(entry, SessionEntry::Compaction { .. }));
+            let inherited_items = if own_compaction {
+                // The newest compaction is this session's own, so the
+                // projection starts after it: no inherited message reaches
+                // `items` at all.
+                0
+            } else {
+                // The inherited messages are a contiguous leading run of the
+                // REPAIRED projection (the newest compaction, if any, is
+                // inside the prefix). Repair matters: the inherited prefix
+                // ends at a completed turn, so a dropped orphan/synthetic
+                // result inside it must shrink the boundary with it — the
+                // unrepaired count would overstate where this session's own
+                // messages begin.
+                repair_item_pairs(Self::history_items(
+                    &self.history[..boundary],
+                    self.entry_locations.get(..boundary).unwrap_or_default(),
+                    None,
+                ))
+                .len()
+            };
+            // `split` indexes the REPAIRED `items`, which does NOT include the
+            // history alone: the context prefix and the goal (or its cleared
+            // override) are prepended as system messages. Count those
+            // directly — deriving the offset as
+            // `items.len() - history_items(..).len()` is wrong whenever
+            // `repair_item_pairs` drops (or inserts) a tool result, which
+            // silently shifts the inherited boundary and lets a parent message
+            // into `retained`.
+            let non_history = usize::from(self.context_prefix.is_some())
+                + usize::from(self.goal.is_some() || self.goal_cleared);
+            if split < non_history + inherited_items {
+                anyhow::bail!(
+                    "cannot compact this forked session yet: the retained tail would copy \
+                     messages inherited read-only from session {} into this session's store. \
+                     Keep working without compaction; the forked session's own messages \
+                     compact normally once the inherited prefix falls outside the retained \
+                     window.",
+                    self.inherited_source().unwrap_or("(unknown source)")
+                );
+            }
+        }
         // Do not call the model unless the portion actually replaced by the
         // compaction contains assistant/tool activity: a prompt-only (or
         // summary-only) context is correctly a no-op.

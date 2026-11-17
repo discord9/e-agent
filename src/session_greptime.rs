@@ -1233,6 +1233,79 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
         Ok((rows, cursor))
     }
 
+    /// The first `n` LOGICAL stored entries (oldest first) — a BOUNDED probe
+    /// for the zero-copy fork marker.
+    ///
+    /// Canonical key selection first: the first `n` logical keys
+    /// `(seq, MAX(event_time))` over the WHOLE session, ordered by
+    /// `MAX(event_time) ASC, seq ASC, LIMIT n`. That aggregates keys only — no
+    /// payloads, no numeric `seq` cutoff — so the probe stays bounded however
+    /// long the transcript is, sparse sequences (a child can store its
+    /// `GoalUpdated` at seq 0 and its `ForkedFrom` at seq 10) are ordered
+    /// correctly, and a page-local fold can never let an obsolete version win.
+    ///
+    /// The winning payloads are then fetched with EVERY physical version of
+    /// each selected key, so the shared [`dedup_raw_entries`] winner fold sees
+    /// complete tie groups and divergent same-key ties still fail closed. A
+    /// shortfall (a selected key without exactly one logical winner) is an
+    /// error, never a partial result the caller could read as "no marker".
+    pub async fn load_first(&self, n: usize) -> Result<Vec<SessionEntry>> {
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        // 1. Canonical keys: winning event_time per seq, oldest first.
+        let keys = self
+            .client
+            .query(
+                "SELECT seq, MAX(event_time) AS me FROM session_entries \
+                 WHERE workspace_id = $1 AND session_id = $2 \
+                 GROUP BY seq ORDER BY me ASC, seq ASC LIMIT $3",
+                &[&self.workspace_id, &self.session_id, &(n as i64)],
+            )
+            .await
+            .context("cannot select the oldest entry keys")?;
+        let seqs: Vec<i64> = keys.iter().map(|row| row.get("seq")).collect();
+        if seqs.is_empty() {
+            return Ok(Vec::new());
+        }
+        // 2. Every physical version of those keys, so the tie check is
+        //    complete (Greptime keeps every same-seq row).
+        let mut raw: Vec<(i64, chrono::NaiveDateTime, String)> = Vec::new();
+        for seq in &seqs {
+            let rows = self
+                .client
+                .query(
+                    "SELECT seq, event_time, payload FROM session_entries \
+                     WHERE workspace_id = $1 AND session_id = $2 AND seq = $3",
+                    &[&self.workspace_id, &self.session_id, seq],
+                )
+                .await
+                .context("cannot load oldest entries")?;
+            raw.extend(rows.iter().map(|r| {
+                let seq: i64 = r.get("seq");
+                let et: chrono::NaiveDateTime = r.get("event_time");
+                let payload: String = r.get("payload");
+                (seq, et, payload)
+            }));
+        }
+        // 3. Shared winner fold: max event_time per seq wins, divergent ties
+        //    fail closed.
+        let mut entries =
+            dedup_raw_entries(&raw, &self.session_id, &self.workspace_id, "event_time")
+                .map_err(anyhow::Error::msg)?;
+        entries.truncate(n);
+        anyhow::ensure!(
+            entries.len() == seqs.len(),
+            "cannot resolve the oldest {} logical entries of session {}: {} winning keys \
+             yielded {} logical rows",
+            n,
+            self.session_id,
+            seqs.len(),
+            entries.len()
+        );
+        Ok(entries.into_iter().map(|(_, entry)| entry).collect())
+    }
+
     /// Load the selected bounded segment without physical locations.
     pub async fn load_older(
         &self,

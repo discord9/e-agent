@@ -1366,6 +1366,53 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
         Ok((rows, cursor))
     }
 
+    /// The first `n` LOGICAL stored entries (oldest first) — a BOUNDED probe
+    /// for the zero-copy fork marker.
+    ///
+    /// It selects the first `n` LOGICAL rows in canonical order — the winning
+    /// `event_time_us` per seq, `ORDER BY event_time_us ASC, seq ASC` — and
+    /// folds the winners with the same conflict handling as every other load.
+    /// A numeric `seq < n` cutoff would be wrong: sequences may be sparse (a
+    /// child can store its `GoalUpdated` at seq 0 and its `ForkedFrom` marker
+    /// at seq 10), and a segment page's LIMIT counts physical retry versions
+    /// rather than logical rows. Never reads the whole transcript: the join
+    /// aggregates `(seq, event_time_us)` only and the LIMIT bounds the
+    /// returned payloads.
+    pub async fn load_first(&self, n: usize) -> Result<Vec<SessionEntry>, String> {
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let raw = {
+            let conn = self.conn.lock().await;
+            // Same winner join as the segment loaders: keep every physical row
+            // at each seq's max event time so the tie/conflict check below
+            // still sees divergent duplicates.
+            let rows = conn
+                .query(
+                    "SELECT t.seq, t.event_time_us, t.payload FROM session_entries t \
+                     JOIN ( \
+                         SELECT seq, MAX(event_time_us) AS me FROM session_entries \
+                         WHERE workspace_id = ?1 AND session_id = ?2 \
+                         GROUP BY seq \
+                     ) g ON t.seq = g.seq AND t.event_time_us = g.me \
+                     WHERE t.workspace_id = ?1 AND t.session_id = ?2 \
+                     ORDER BY t.event_time_us ASC, t.seq ASC LIMIT ?3",
+                    (
+                        self.workspace_id.as_str(),
+                        self.session_id.as_str(),
+                        n as i64,
+                    ),
+                )
+                .await
+                .map_err(|e| format!("cannot load oldest entries: {e}"))?;
+            rows_to_raw(rows).await?
+        };
+        let mut entries =
+            dedup_raw_entries(&raw, &self.session_id, &self.workspace_id, "event_time_us")?;
+        entries.truncate(n);
+        Ok(entries.into_iter().map(|(_, entry)| entry).collect())
+    }
+
     /// Load the selected bounded segment without physical locations.
     pub async fn load_older(
         &self,
