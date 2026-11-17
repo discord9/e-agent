@@ -673,24 +673,44 @@ precedence over the selected profile values.
 
 ### Forking a session
 
-`e-agent --fork <session-id> [--at <n>] [PROMPT]` starts a brand-new session whose
-history is a verbatim copy of the source session up to a completed turn. The
-source session is never modified. The fork keeps the source's history prefix up
+`e-agent --fork <session-id> [--at <n>] [PROMPT]` starts a brand-new session that
+inherits the source session's history up to a completed turn. The fork is
+**marker + read-through, never a copy**: the new session's own storage holds
+only a `ForkedFrom` marker (source id, fork point, and the source entry's
+`seq`/`event_time` when the backend has one), and its history is rebuilt at
+load time by reading the source session's first `at` entries read-only. The
+source session is never modified; only its first `at` entries are read, so
+later appends never appear in the fork. A source rewrite that moves the pinned
+entry fails closed where the backend exposes `seq`/`event_time`; JSONL pins
+only the ordinal. The fork keeps the source's history prefix up
 to (and including) the last completed turn — an assistant message with no
 pending tool calls, or a compaction — and drops anything after it
 (background-completion notices, for example). `--at <n>` picks the fork point
 explicitly: `n` is 1-based and inclusive, and it must land on a turn boundary,
 otherwise the fork fails rather than cutting mid-turn. Without a completed turn
-in the source, the fork fails.
+in the source, the fork fails; if the source is deleted, unreadable, or no
+longer matches the marker's pinned entry, loading the fork fails closed with an
+error naming the source instead of showing a truncated transcript. Forking a
+fork resolves the whole chain.
 
-The new session starts with a `ForkedFrom` marker entry recording the source id
-and fork point. The marker is display/audit only: it is rendered as a dim notice
-in the TUI and is never sent to the provider on the model wire. The forked
-session has fresh token accounting (usage counters start at zero) and is
-resumed or forked again like any other session. The new id is printed as
-`e-agent: forked session: <id>`; `--fork` is mutually exclusive with `--session`
-and cannot be combined with `--at` without `--fork`. JSONL, GreptimeDB, and
-SQLite backends behave equivalently.
+The marker is display/audit only: it is rendered as a dim notice in the TUI and
+is never sent to the provider on the model wire. The forked session has fresh
+token accounting (usage counters start at zero) and is resumed or forked again
+like any other session. The new id is printed as `e-agent: forked session:
+<id>`; `--fork` is mutually exclusive with `--session` and cannot be combined
+with `--at` without `--fork`. JSONL, GreptimeDB, and SQLite backends behave
+equivalently.
+
+Non-goals / known boundaries of the read-through fork: inherited parent entries
+have no receipt (`eout1` refs are session-local numeric ids, so no ref is issued
+for them — their oversized fields stay full in the request instead of being
+truncated), the web/TUI transcript *pager* still lists only the forked
+session's own physical rows, and a compaction whose retained tail would reach
+into the inherited prefix fails closed instead of copying parent messages into
+the fork (the fork's own new messages compact normally). Marker-first copies
+written by the original copy layout are ambiguous when their stored prefix
+matches the source prefix; they fail closed rather than guessing, and a
+marker-first copy whose source is gone cannot be compared.
 
 ### TUI commands
 
@@ -1016,10 +1036,12 @@ depth is capped at 1 by construction. Tool rounds are unlimited.
 
 `fork: true` is the one explicit exception to that empty history. The child
 starts from the parent's **completed-turn prefix** (the in-flight turn is
-excluded, so put everything the child needs in `task`) and runs on the parent's
-**current** model and workspace, inheriting the parent's system prompt, tool
-schemas and MCP tool set so its request is a byte-identical prefix and reuses
-the parent's provider-side prompt cache. The parent's goal is frozen into the
+excluded, so put everything the child needs in `task`). It stores only a
+`ForkedFrom` marker — the prefix is read back from the parent session — so
+spawning a fork writes O(1) entries, never the parent history. It runs on the
+parent's **current** model and workspace, inheriting the parent's system
+prompt, tool schemas and MCP tool set so its request is a byte-identical prefix
+and reuses the parent's provider-side prompt cache. The parent's goal is frozen into the
 request head. A fork still cannot delegate further or ask the user questions.
 Constraints: `fork` is mutually exclusive with `role` and `resume`; the parent
 must have a completed turn (a mid-turn compaction is rejected); `workspace`

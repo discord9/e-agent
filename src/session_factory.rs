@@ -882,44 +882,46 @@ impl SessionFactory {
             None
         };
         let mut store = SessionStore::connect(&self.backend, &self.root, &session).await?;
-        let mut bootstrap_entries = Vec::new();
         if let Some((source, at)) = fork_from {
-            // Fork: copy the source session's history up to a completed-turn
-            // boundary into a brand-new session id. The source is only read;
-            // it never changes.
+            // Zero-copy fork: the child's store receives ONLY the marker plus
+            // its own new entries. The source prefix is read back read-only by
+            // the marker-aware loader at startup/resume, so the parent rows are
+            // never copied and later parent writes stay invisible. The source
+            // is read here exactly once, to validate the cut and to pin its
+            // provenance (`seq`/`event_time` of the last kept entry).
             let source_store = SessionStore::connect(&self.backend, &self.root, &source).await?;
-            let with_seq = source_store
-                .load_with_seq(&self.root, &source)
+            let source_history = source_store
+                .load_fork_located(&self.root, &source)
                 .await
                 .with_context(|| format!("cannot load source session {source} for fork"))?;
-            let source_entries: Vec<SessionEntry> =
-                with_seq.iter().map(|(_, entry)| entry.clone()).collect();
-            let prefix = crate::agent::fork_prefix(&source_entries, at)
+            // `at` (1-based, inclusive) is the index of the last kept entry of
+            // the RESOLVED source transcript — the same history the child's
+            // loader reads again, so a fork of a fork resolves identically.
+            let at = crate::agent::fork_prefix(&source_history.entries, at)
                 .map_err(anyhow::Error::msg)
-                .with_context(|| format!("cannot fork session {source}"))?;
-            // `at` (1-based, inclusive) is the index of the last kept entry.
-            let at = prefix.len();
-            let seq = with_seq.get(at - 1).map(|(seq, _)| *seq);
+                .with_context(|| format!("cannot fork session {source}"))?
+                .len();
+            let (seq, event_time) = source_history
+                .locations
+                .get(at - 1)
+                .and_then(|location| location.as_ref())
+                .map_or((None, None), |location| {
+                    (Some(location.key.seq()), location.key.event_time_us())
+                });
             let marker = SessionEntry::ForkedFrom {
                 source: source.clone(),
                 at,
-                // JSONL has no event_time column and SessionStore does not
-                // expose one; kept as an optional provenance slot.
-                event_time: None,
+                event_time,
                 seq,
             };
-            // The marker sits at the fork point: source prefix first, then
-            // the marker, then the session's own new messages — so scrolling
-            // the forked session reads as "source history … forked from …
-            // new work".
-            let mut fork_entries = Vec::with_capacity(prefix.len() + 1);
-            fork_entries.extend(prefix);
-            fork_entries.push(marker);
             let new_id = fork_target
                 .map(str::to_owned)
                 .unwrap_or_else(|| crate::session::new_id_prefixed("fork-"));
             store = SessionStore::connect(&self.backend, &self.root, &new_id).await?;
-            bootstrap_entries = fork_entries;
+            store
+                .append(&self.root, &new_id, std::slice::from_ref(&marker))
+                .await
+                .with_context(|| format!("cannot write the fork marker of session {new_id}"))?;
             eprintln!("e-agent: forked session: {new_id}");
             session = new_id;
             if local_permit.is_none() {
@@ -1072,9 +1074,13 @@ impl SessionFactory {
         if let Some(rounds) = max_rounds {
             agent = agent.max_tool_rounds(rounds);
         }
-        let loaded = store.load_located(&self.root, &session).await?;
+        // Marker-aware: a zero-copy fork child resolves its inherited prefix
+        // from the source session read-only and prepends it in memory.
+        let loaded = store.load_fork_located(&self.root, &session).await?;
         let legacy = loaded.legacy;
+        let inherited = loaded.inherited;
         agent.restore_located(loaded.entries, loaded.locations);
+        agent.set_inherited_prefix(inherited);
         // Capture the request head AFTER the history restore: its goal fields
         // must carry the session's live folded goal (not the pre-restore
         // "never set" state) so a fork's first request projects the exact
@@ -1113,7 +1119,9 @@ impl SessionFactory {
                 Vec::new()
             },
             legacy,
-            initial_entries: bootstrap_entries,
+            // Zero-copy forks write their marker above; nothing else is
+            // bootstrapped, so a fork never performs O(N) durable writes.
+            initial_entries: Vec::new(),
         };
 
         if let Some(window) = main_context_window {

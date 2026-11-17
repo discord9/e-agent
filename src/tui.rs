@@ -1072,7 +1072,10 @@ async fn handle_fork(command: ForkCommand, state: &mut TuiState) {
         return;
     }
     let session_id = state.session_id.clone();
-    let with_seq = match store.load_with_seq(&root, &session_id).await {
+    // Marker-aware: the boundaries (and therefore `at`) index the RESOLVED
+    // transcript, which is what the fork itself re-loads — a chain of forks
+    // would otherwise count the inherited prefix as missing entries.
+    let with_seq = match store.load_fork_with_seq(&root, &session_id).await {
         Ok(with_seq) => with_seq,
         Err(error) => {
             push_display(state, format!("无法 fork：{error:#}"));

@@ -2749,8 +2749,11 @@ async fn fork_candidates(
 ) -> Result<Json<Vec<ForkCandidate>>, (StatusCode, String)> {
     let root = state.factory.root();
     let (store, historical) = resolve_session_store(&state, &id, false).await?;
+    // Marker-aware: `at` must index the resolved transcript (the inherited
+    // prefix of a zero-copy fork child included), exactly what the fork
+    // endpoint re-loads and validates.
     let with_seq = store
-        .load_with_seq(root, &id)
+        .load_fork_with_seq(root, &id)
         .await
         .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     if historical && with_seq.is_empty() {

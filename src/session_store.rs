@@ -595,6 +595,26 @@ impl LocatedKey {
             LocatedKey::Greptime { .. } => "greptime",
         }
     }
+
+    /// The backend's logical sequence pinned by this key: the JSONL 0-based
+    /// line ordinal, or the SQL backends' `seq` column. This is the value a
+    /// [`crate::agent::SessionEntry::ForkedFrom`] marker records as `seq`.
+    pub fn seq(&self) -> i64 {
+        match self {
+            LocatedKey::Jsonl { ordinal } => *ordinal,
+            LocatedKey::Sqlite { seq, .. } | LocatedKey::Greptime { seq, .. } => *seq,
+        }
+    }
+
+    /// The row's event time (µs since epoch). `None` on JSONL, which has no
+    /// event_time column.
+    pub fn event_time_us(&self) -> Option<i64> {
+        match self {
+            LocatedKey::Jsonl { .. } => None,
+            LocatedKey::Sqlite { event_time_us, .. }
+            | LocatedKey::Greptime { event_time_us, .. } => Some(*event_time_us),
+        }
+    }
 }
 
 /// The exact physical location of one persisted entry: backend kind
@@ -654,6 +674,46 @@ pub struct LoadedLocated {
     pub entries: Vec<SessionEntry>,
     pub locations: Vec<Option<EntryLocation>>,
     pub legacy: bool,
+    /// Number of LEADING `entries` inherited read-only from a zero-copy fork
+    /// source ([`SessionStore::load_fork_located`]). Those entries are never
+    /// persisted in this session, so they carry no child location; `0` for
+    /// every ordinary load (and for the copy-based forks written by older
+    /// builds, whose prefix really is stored here).
+    pub inherited: usize,
+}
+
+impl LoadedLocated {
+    /// Cut this loaded history to the first `at` entries and mark them as the
+    /// inherited fork prefix: exactly the shape
+    /// [`SessionStore::load_fork_located`] returns, with NO child location for
+    /// an inherited entry (its row lives in the source session's store, and a
+    /// numeric `eout1` ref has no session identity — a child-bound ref could
+    /// read the wrong row). Used by the fork producers to seed a child's
+    /// in-memory history without writing anything.
+    pub fn inherit_prefix(&mut self, at: usize) {
+        self.entries.truncate(at);
+        self.locations = vec![None; at];
+        self.inherited = at;
+    }
+}
+
+/// Index of the child's OWN [`SessionEntry::ForkedFrom`] marker when this
+/// session's stored entries are a zero-copy fork — i.e. the marker is the
+/// first stored entry, or the second one right after the child's frozen
+/// `GoalUpdated`. Anything else (no marker, or a marker deeper in the log,
+/// which is the copy-based fork layout written by older builds that already
+/// contains the parent prefix) is not resolved: those entries really are
+/// stored here.
+pub(crate) fn zero_copy_marker(entries: &[SessionEntry]) -> Option<usize> {
+    match entries {
+        [SessionEntry::ForkedFrom { .. }, ..] => Some(0),
+        [
+            SessionEntry::GoalUpdated { .. },
+            SessionEntry::ForkedFrom { .. },
+            ..,
+        ] => Some(1),
+        _ => None,
+    }
 }
 
 /// One bounded history page with the exact physical identity of every row.
@@ -1176,18 +1236,40 @@ impl SessionStore {
     /// like [`Self::load_head`].
     /// The same bounded head contract as [`Self::load_head_page`], retaining
     /// each selected row's physical identity for Web reconciliation.
+    ///
+    /// A zero-copy fork child is resolved first
+    /// ([`Self::load_fork_located`]): its physical rows are only the marker
+    /// and its own entries, so a physical page would hide the inherited
+    /// prefix. The whole resolved transcript is returned as ONE page with no
+    /// older cursor — the inherited prefix has no child seq to page by, and
+    /// it already starts at position 0 of the source. The leading-marker probe
+    /// is BOUNDED (see [`Self::leading_fork_history`]), so an ordinary SQL
+    /// session keeps its bounded physical page instead of loading its whole
+    /// transcript; JSONL can only be parsed in full, so it resolves directly
+    /// (one parse, reused below).
     pub async fn load_head_page_located(
         &self,
         root: &Path,
         name: &str,
         limit: Option<usize>,
     ) -> Result<LocatedHistoryPage> {
+        let resolved = self.leading_fork_history(root, name).await?;
+        if let Some(resolved) = &resolved
+            && resolved.inherited > 0
+        {
+            return Ok(LocatedHistoryPage {
+                entries: resolved.entries.clone(),
+                locations: resolved.locations.clone(),
+                next_before_seq: None,
+            });
+        }
         match self {
             // JSONL has no seq.  Its cursor is an absolute entry position,
             // including for legacy whole-document sessions whose locations
-            // are deliberately absent.
+            // are deliberately absent. The resolved load above already read
+            // the file (JSONL can only be parsed in full), so reuse it.
             SessionStore::Jsonl => {
-                let loaded = Session::load_located(root, name)?;
+                let loaded = resolved.expect("JSONL always resolves its leading marker");
                 let start = match limit.filter(|&n| n > 0) {
                     Some(n) if loaded.entries.len() > n => loaded.entries.len() - n,
                     _ => 0,
@@ -1694,6 +1776,7 @@ impl SessionStore {
                     entries: rows.iter().map(|(_, entry)| entry.clone()).collect(),
                     locations: rows.into_iter().map(|(loc, _)| Some(loc)).collect(),
                     legacy: false,
+                    inherited: 0,
                 })
             }
             #[cfg(feature = "sqlite")]
@@ -1708,9 +1791,263 @@ impl SessionStore {
                     entries: rows.iter().map(|(_, entry)| entry.clone()).collect(),
                     locations: rows.into_iter().map(|(loc, _)| Some(loc)).collect(),
                     legacy: false,
+                    inherited: 0,
                 })
             }
         }
+    }
+
+    /// Marker-aware load: [`Self::load_located`] plus zero-copy fork
+    /// resolution.
+    ///
+    /// A fork child's storage holds ONLY its own entries — the leading
+    /// [`SessionEntry::ForkedFrom`] marker (optionally preceded by the
+    /// child's frozen `GoalUpdated`) names the source session and the 1-based
+    /// entry count `at` inherited from it. The inherited prefix is read back
+    /// from the source session READ-ONLY and prepended in memory, so the
+    /// transcript becomes `[source prefix 0..at][child entries]` without the
+    /// parent rows ever being copied into the child's store. The parent is
+    /// frozen at the marker: later parent appends are invisible because only
+    /// the first `at` entries are ever read.
+    ///
+    /// Inherited entries carry `locations[i] = None` (their physical rows
+    /// belong to the source session, and a receipt's numeric `eout1` ref has
+    /// no session identity — see [`LoadedLocated::inherited`]), so no receipt
+    /// is ever issued against the child's store for them.
+    ///
+    /// Fails closed (with the source session named) when the source is
+    /// missing/empty, when it has fewer than `at` entries, or when the entry
+    /// at `at` no longer matches the marker's pinned `seq`/`event_time`
+    /// (a rewritten source store). A fork of a fork resolves the whole chain
+    /// iteratively with cycle detection.
+    ///
+    /// Copy-based forks written by older builds mostly load exactly as
+    /// before: the `[prefix..][ForkedFrom]` layout has no leading marker, so
+    /// it is never resolved. The `[ForkedFrom][prefix..]` layout that commit
+    /// `0e32549` wrote is byte-identical to a zero-copy child whose own first
+    /// messages repeat the parent prefix; when no provenance separates the two
+    /// (no frozen goal before the marker, no `event_time` on it) the load
+    /// fails closed as ambiguous instead of silently dropping or duplicating
+    /// the inherited prefix. A marker-first copy whose source is gone also
+    /// fails closed — the source cannot be compared against.
+    pub async fn load_fork_located(&self, root: &Path, name: &str) -> Result<LoadedLocated> {
+        let backend = self.backend();
+        // Levels from the child upward. `None`-terminated by the first
+        // session without a leading zero-copy marker.
+        let mut levels: Vec<LoadedLocated> = Vec::new();
+        let mut store = self.clone();
+        let mut current = name.to_owned();
+        loop {
+            let loaded = store
+                .load_located(root, &current)
+                .await
+                .with_context(|| format!("cannot load session {current}"))?;
+            let marker = zero_copy_marker(&loaded.entries);
+            levels.push(loaded);
+            let Some(marker) = marker else {
+                break;
+            };
+            let SessionEntry::ForkedFrom { source, at, .. } =
+                &levels[levels.len() - 1].entries[marker]
+            else {
+                unreachable!("zero_copy_marker only matches ForkedFrom")
+            };
+            anyhow::ensure!(
+                levels.len() <= Self::FORK_CHAIN_LIMIT,
+                "fork ancestry of session {name} is cyclic or deeper than {} sessions",
+                Self::FORK_CHAIN_LIMIT
+            );
+            if *at == 0 {
+                // Nothing inherited: the child is self-contained.
+                break;
+            }
+            let source = source.clone();
+            store = SessionStore::connect(&backend, root, &source)
+                .await
+                .with_context(|| format!("cannot open fork source session {source}"))?;
+            current = source;
+        }
+        let mut resolved = levels.pop().expect("the ancestry walk records the child");
+        while let Some(level) = levels.pop() {
+            let Some(marker) = zero_copy_marker(&level.entries) else {
+                unreachable!("every recorded level carries a marker")
+            };
+            let SessionEntry::ForkedFrom {
+                source,
+                at,
+                event_time,
+                seq,
+            } = &level.entries[marker]
+            else {
+                unreachable!("zero_copy_marker only matches ForkedFrom")
+            };
+            let (source, at, event_time, seq) = (source.clone(), *at, *event_time, *seq);
+            // Commit `0e32549` wrote the copy-based layout `[ForkedFrom] +
+            // prefix` (marker FIRST). That layout is byte-identical to a
+            // genuine zero-copy child whose own first messages happen to
+            // repeat the parent prefix, so content equality alone cannot
+            // decide. Provenance can: the old layout never froze a goal before
+            // the marker and never wrote `event_time`, so a marker placed
+            // after the child's `GoalUpdated` — or one carrying `event_time`
+            // — is zero-copy. Everything else with the source prefix stored
+            // right after a leading marker is AMBIGUOUS and fails closed
+            // rather than guessing: "legacy" would silently drop the parent
+            // turn, "zero-copy" would duplicate it.
+            let stored_prefix = marker + 1..marker + 1 + at;
+            if at > 0
+                && marker == 0
+                && event_time.is_none()
+                && resolved.entries.len() >= at
+                && level.entries.len() >= marker + 1 + at
+                && level.entries[stored_prefix] == resolved.entries[..at]
+            {
+                anyhow::bail!(
+                    "fork session {name} is ambiguous: its ForkedFrom marker (source {source}, \
+                     at {at}) is followed by {at} stored entries identical to the source \
+                     prefix, which is exactly the layout of the legacy marker-first fork copy. \
+                     Refusing to guess between dropping the inherited prefix and duplicating \
+                     it; re-record the fork with a marker carrying event_time (or without the \
+                     stored prefix) to disambiguate."
+                );
+            }
+            if at > 0 {
+                anyhow::ensure!(
+                    !resolved.entries.is_empty(),
+                    "fork source session {source} is missing or empty; session {name} was \
+                     forked at entry {at} and cannot be loaded without it"
+                );
+            }
+            anyhow::ensure!(
+                resolved.entries.len() >= at,
+                "fork source session {source} has only {} entries but session {name} was \
+                 forked at entry {at}",
+                resolved.entries.len()
+            );
+            if at > 0 {
+                // Pin the cut: the loaded source must still carry the exact
+                // `seq`/`event_time` the marker recorded (a rewritten source
+                // — e.g. a compaction that replaced entries — fails closed
+                // instead of silently inheriting a different prefix). A
+                // source that is itself a fork child may sit inside an
+                // already-inherited region; such entries carry no physical
+                // location of their own and are accepted positionally, as
+                // are legacy whole-document sources.
+                if let Some(end) = resolved.locations.get(at - 1).and_then(|loc| loc.as_ref()) {
+                    if let Some(expected) = seq {
+                        anyhow::ensure!(
+                            end.key.seq() == expected,
+                            "fork source session {source} no longer matches the marker of \
+                             session {name}: entry {at} moved to seq {}, the marker pinned \
+                             {expected}",
+                            end.key.seq()
+                        );
+                    }
+                    if let Some(expected) = event_time {
+                        anyhow::ensure!(
+                            end.key.event_time_us() == Some(expected),
+                            "fork source session {source} no longer matches the marker of \
+                             session {name}: entry {at} moved to event_time {:?}, the marker \
+                             pinned {expected}",
+                            end.key.event_time_us()
+                        );
+                    }
+                }
+            }
+            // Inherited entries keep NO child location: their rows live in
+            // the source session's store, and a receipt's numeric `eout1` ref
+            // carries no session identity, so a child-bound ref could read the
+            // wrong row.
+            resolved.entries.truncate(at);
+            resolved.locations = vec![None; at];
+            resolved.locations.extend(level.locations);
+            resolved.entries.extend(level.entries);
+            // `legacy` describes the PHYSICAL store of the session being
+            // loaded (the runner rewrites it), so the child's own flag wins —
+            // an inherited legacy whole-document ancestor must not make this
+            // session rewrite its marker-only log into a full copy.
+            resolved.legacy = level.legacy;
+            resolved.inherited = at;
+        }
+        Ok(resolved)
+    }
+
+    /// Depth limit for a fork ancestry walk. A chain longer than this is
+    /// treated as a cycle and fails closed instead of resolving forever.
+    const FORK_CHAIN_LIMIT: usize = 32;
+
+    /// The resolved zero-copy fork transcript, but ONLY when this session
+    /// really stores a leading fork marker.
+    ///
+    /// JSONL can only be parsed in full, so it resolves unconditionally and
+    /// the caller reuses that single parse. The SQL backends probe the
+    /// session's oldest rows first (a bounded read, never the whole
+    /// transcript) and return `None` for an ordinary session, which keeps its
+    /// bounded physical page.
+    async fn leading_fork_history(&self, root: &Path, name: &str) -> Result<Option<LoadedLocated>> {
+        // The marker is the FIRST stored entry (a lone `ForkedFrom`, or the
+        // child's frozen `GoalUpdated` right before it), so three LOGICAL
+        // entries are enough. The bound is 3 rather than 2 so the probe still
+        // sees both when a backend numbers the first row `seq = 1`.
+        const PROBE: usize = 3;
+        if self.is_jsonl() || self.has_leading_fork_marker(root, name, PROBE).await? {
+            return Ok(Some(self.load_fork_located(root, name).await?));
+        }
+        Ok(None)
+    }
+
+    /// Bounded probe: does this session's stored log BEGIN with its own
+    /// zero-copy fork marker?
+    ///
+    /// It reads the first `bound` LOGICAL entries — the rows with
+    /// `seq < bound + 1`, folded by the same same-seq winner logic as every
+    /// other load — so an ordinary session never pays for its whole
+    /// transcript, and duplicate physical retry rows can never consume the
+    /// probe and hide the leading marker (a segment page would: its LIMIT
+    /// counts physical versions).
+    async fn has_leading_fork_marker(&self, root: &Path, name: &str, bound: usize) -> Result<bool> {
+        let entries = match self {
+            SessionStore::Jsonl => Session::load(root, name)?
+                .entries
+                .into_iter()
+                .take(bound)
+                .collect(),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session, .. } => session.load_first(bound).await?,
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite { session, .. } => session
+                .lock()
+                .await
+                .load_first(bound)
+                .await
+                .map_err(anyhow::Error::msg)?,
+        };
+        Ok(zero_copy_marker(&entries).is_some())
+    }
+
+    /// [`Self::load_fork_located`] paired with each entry's backend `seq`
+    /// (the JSONL ordinal or the SQL `seq` column; the entry index when the
+    /// entry has no child location, i.e. an inherited prefix entry). Used by
+    /// the fork-boundary scans (TUI `/fork`, Web fork-candidates) so `at`
+    /// always indexes the RESOLVED transcript the fork itself re-loads.
+    pub async fn load_fork_with_seq(
+        &self,
+        root: &Path,
+        name: &str,
+    ) -> Result<Vec<(i64, SessionEntry)>> {
+        let loaded = self.load_fork_located(root, name).await?;
+        let seqs: Vec<i64> = loaded
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                loaded
+                    .locations
+                    .get(index)
+                    .and_then(|location| location.as_ref())
+                    .map_or(index as i64, |location| location.key.seq())
+            })
+            .collect();
+        Ok(seqs.into_iter().zip(loaded.entries).collect())
     }
 
     /// Exact-version field read: resolve a verified `eout1` receipt to the
@@ -4715,6 +5052,497 @@ mod tests {
         assert_eq!(older.entries.len(), 1);
         assert_eq!(older.next_before_seq, None);
         assert!(older.locations.iter().all(Option::is_none));
+    }
+    // ── Zero-copy fork: marker-only storage + read-through load ──────
+
+    fn fork_user(text: &str) -> SessionEntry {
+        SessionEntry::Message {
+            message: crate::agent::Message::User {
+                content: text.to_owned(),
+                images: vec![],
+            },
+        }
+    }
+
+    fn fork_assistant(text: &str) -> SessionEntry {
+        SessionEntry::Message {
+            message: crate::agent::Message::Assistant(crate::agent::AssistantMessage {
+                content: Some(text.to_owned()),
+                tool_calls: vec![],
+                reasoning: None,
+            }),
+        }
+    }
+
+    /// `turns` completed turns (`user`, `assistant`) — every assistant is a
+    /// fork boundary.
+    fn fork_turns(turns: usize) -> Vec<SessionEntry> {
+        (0..turns)
+            .flat_map(|i| {
+                [
+                    fork_user(&format!("q{i}")),
+                    fork_assistant(&format!("a{i}")),
+                ]
+            })
+            .collect()
+    }
+
+    fn marker(source: &str, at: usize, seq: Option<i64>) -> SessionEntry {
+        SessionEntry::ForkedFrom {
+            source: source.to_owned(),
+            at,
+            event_time: None,
+            seq,
+        }
+    }
+
+    /// Only the two LEADING layouts are a zero-copy fork. A marker deeper in
+    /// the log is the copy-based layout older builds wrote, whose prefix
+    /// really is stored (resolving it again would duplicate the history).
+    #[test]
+    fn zero_copy_marker_recognizes_only_the_leading_layouts() {
+        let goal = SessionEntry::GoalUpdated { goal: None };
+        let fork = marker("src", 3, None);
+        assert_eq!(zero_copy_marker(std::slice::from_ref(&fork)), Some(0));
+        assert_eq!(zero_copy_marker(&[goal.clone(), fork.clone()]), Some(1));
+        assert_eq!(zero_copy_marker(&[fork_user("q"), fork]), None);
+        assert_eq!(zero_copy_marker(&[]), None);
+        assert_eq!(zero_copy_marker(&[goal]), None);
+    }
+
+    fn child_lines(root: &Path, name: &str) -> usize {
+        std::fs::read_to_string(root.join(format!(".e-agent/sessions/{name}.jsonl")))
+            .map(|raw| raw.lines().filter(|line| !line.trim().is_empty()).count())
+            .unwrap_or(0)
+    }
+
+    /// The core contract: a fork child's storage holds ONLY the marker (plus
+    /// its own later entries). The parent prefix is never copied, and loading
+    /// reconstructs it read-only from the source session.
+    #[tokio::test]
+    async fn zero_copy_fork_child_stores_only_the_marker_and_loads_the_prefix() {
+        use crate::session::Session;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let parent = "fork-parent";
+        let entries = fork_turns(3);
+        Session::append(root, parent, &entries).unwrap();
+
+        let at = 4usize;
+        Session::append(
+            root,
+            "forked",
+            std::slice::from_ref(&marker(parent, at, Some(3))),
+        )
+        .unwrap();
+        assert_eq!(
+            child_lines(root, "forked"),
+            1,
+            "the child store holds the marker alone"
+        );
+
+        let store = SessionStore::Jsonl;
+        let resolved = store.load_fork_located(root, "forked").await.unwrap();
+        assert_eq!(resolved.inherited, at);
+        assert_eq!(resolved.entries.len(), at + 1);
+        assert_eq!(resolved.entries[..at], entries[..at]);
+        assert_eq!(resolved.entries[at], marker(parent, at, Some(3)));
+        assert!(
+            resolved.locations[..at].iter().all(Option::is_none),
+            "inherited entries never carry a child location"
+        );
+        assert!(
+            resolved.locations[at].is_some(),
+            "the child's own marker is located"
+        );
+
+        // The child's own new entries land AFTER the marker (inherited
+        // prefix … forked-from … new work) without touching the parent rows.
+        Session::append(root, "forked", &[fork_user("own q")]).unwrap();
+        assert_eq!(child_lines(root, "forked"), 2);
+        let resolved = store.load_fork_located(root, "forked").await.unwrap();
+        assert_eq!(resolved.entries.len(), at + 2);
+        assert_eq!(resolved.entries[..at], entries[..at]);
+        assert_eq!(resolved.entries[at + 1], fork_user("own q"));
+        assert!(resolved.locations[at + 1].is_some());
+
+        // A non-fork session is untouched by the marker-aware path.
+        let plain = store.load_fork_located(root, parent).await.unwrap();
+        assert_eq!(plain.inherited, 0);
+        assert_eq!(plain.entries, entries);
+    }
+
+    /// The parent is frozen at the marker: appends AFTER the fork never show
+    /// up in the child's resolved transcript.
+    #[tokio::test]
+    async fn zero_copy_fork_child_is_immune_to_later_parent_appends() {
+        use crate::session::Session;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let parent = "frozen-parent";
+        let entries = fork_turns(2);
+        Session::append(root, parent, &entries).unwrap();
+        let at = entries.len();
+        Session::append(
+            root,
+            "frozen-fork",
+            std::slice::from_ref(&marker(parent, at, Some(at as i64 - 1))),
+        )
+        .unwrap();
+
+        Session::append(root, parent, &fork_turns(1)).unwrap();
+        let store = SessionStore::Jsonl;
+        let resolved = store.load_fork_located(root, "frozen-fork").await.unwrap();
+        assert_eq!(resolved.entries[..at], entries[..]);
+        assert_eq!(
+            resolved.entries.len(),
+            at + 1,
+            "the later parent turn stays invisible: {:?}",
+            resolved.entries
+        );
+    }
+
+    /// A deleted/unreadable source fails closed with a message that names it
+    /// instead of silently loading a truncated transcript.
+    #[tokio::test]
+    async fn zero_copy_fork_child_fails_closed_when_the_source_is_gone() {
+        use crate::session::Session;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let entries = fork_turns(2);
+        Session::append(root, "gone-parent", &entries).unwrap();
+        Session::append(
+            root,
+            "orphan-fork",
+            std::slice::from_ref(&marker("gone-parent", 4, Some(3))),
+        )
+        .unwrap();
+        std::fs::remove_file(root.join(".e-agent/sessions/gone-parent.jsonl")).unwrap();
+
+        let error = SessionStore::Jsonl
+            .load_fork_located(root, "orphan-fork")
+            .await
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("gone-parent"), "{message}");
+        assert!(message.contains("missing or empty"), "{message}");
+    }
+
+    /// A rewritten/moved source no longer matches the marker's pinned `seq`
+    /// and the load fails closed rather than inheriting a different prefix.
+    #[tokio::test]
+    async fn zero_copy_fork_child_fails_closed_on_a_moved_fork_point() {
+        use crate::session::Session;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let entries = fork_turns(2);
+        Session::append(root, "moved-parent", &entries).unwrap();
+        Session::append(
+            root,
+            "pinned-fork",
+            std::slice::from_ref(&marker("moved-parent", 4, Some(99))),
+        )
+        .unwrap();
+
+        let error = SessionStore::Jsonl
+            .load_fork_located(root, "pinned-fork")
+            .await
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("moved-parent"), "{message}");
+        assert!(
+            message.contains("no longer matches the marker"),
+            "{message}"
+        );
+    }
+
+    /// A fork of a fork resolves the whole chain (each level read-only), and
+    /// a cyclic ancestry walk fails closed instead of recursing forever.
+    #[tokio::test]
+    async fn fork_of_fork_resolves_the_chain_and_rejects_cycles() {
+        use crate::session::Session;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let grand = fork_turns(2);
+        Session::append(root, "grand", &grand).unwrap();
+        // middle inherits all 4 grand entries, then adds one of its own.
+        Session::append(
+            root,
+            "middle",
+            &[
+                marker("grand", 4, Some(3)),
+                fork_user("middle q"),
+                fork_assistant("middle a"),
+            ],
+        )
+        .unwrap();
+        // child inherits the first 6 entries of middle's resolved
+        // transcript: grand's 4 entries + middle's marker + "middle q".
+        // `seq = 1` pins middle's OWN ordinal 1 ("middle q").
+        Session::append(
+            root,
+            "leaf",
+            std::slice::from_ref(&marker("middle", 6, Some(1))),
+        )
+        .unwrap();
+
+        let resolved = SessionStore::Jsonl
+            .load_fork_located(root, "leaf")
+            .await
+            .unwrap();
+        assert_eq!(resolved.inherited, 6);
+        assert_eq!(resolved.entries[..4], grand[..]);
+        assert_eq!(resolved.entries[4], marker("grand", 4, Some(3)));
+        assert_eq!(resolved.entries[5], fork_user("middle q"));
+        assert_eq!(resolved.entries[6], marker("middle", 6, Some(1)));
+        assert_eq!(resolved.entries.len(), 7);
+        assert_eq!(
+            SessionStore::Jsonl
+                .load_fork_located(root, "middle")
+                .await
+                .unwrap()
+                .inherited,
+            4
+        );
+
+        // Cycle: two sessions naming each other as source.
+        Session::append(
+            root,
+            "cycle-a",
+            std::slice::from_ref(&marker("cycle-b", 1, None)),
+        )
+        .unwrap();
+        Session::append(
+            root,
+            "cycle-b",
+            std::slice::from_ref(&marker("cycle-a", 1, None)),
+        )
+        .unwrap();
+        let error = SessionStore::Jsonl
+            .load_fork_located(root, "cycle-a")
+            .await
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("cyclic"), "{message}");
+    }
+
+    /// The copy-based fork layout written by older builds (marker deeper in
+    /// the log, parent rows really stored) loads exactly as before.
+    #[tokio::test]
+    async fn legacy_copy_based_fork_children_load_unchanged() {
+        use crate::session::Session;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let entries = fork_turns(1);
+        Session::append(root, "legacy-parent", &entries).unwrap();
+        let stored = vec![
+            entries[0].clone(),
+            entries[1].clone(),
+            marker("legacy-parent", 2, Some(1)),
+            fork_user("own q"),
+        ];
+        Session::append(root, "legacy-fork", &stored).unwrap();
+
+        let resolved = SessionStore::Jsonl
+            .load_fork_located(root, "legacy-fork")
+            .await
+            .unwrap();
+        assert_eq!(resolved.inherited, 0, "the prefix really is stored here");
+        assert_eq!(resolved.entries, stored);
+        assert!(resolved.locations.iter().all(Option::is_some));
+    }
+
+    /// A marker-first `[ForkedFrom] + prefix` log is byte-identical to a
+    /// genuine zero-copy child whose own first messages repeat the parent
+    /// prefix (`0e32549`'s copy layout had `event_time: None` and no goal
+    /// freeze). With no provenance to separate them the load must fail closed
+    /// instead of silently dropping the inherited prefix (legacy reading) or
+    /// duplicating it (zero-copy reading).
+    #[tokio::test]
+    async fn marker_first_prefix_is_ambiguous_and_fails_closed() {
+        use crate::session::Session;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let entries = fork_turns(2);
+        Session::append(root, "lead-parent", &entries).unwrap();
+        // Same bytes for both readings: the legacy `0e32549` copy AND a
+        // zero-copy child whose own first two messages equal the parent's.
+        let stored = vec![
+            marker("lead-parent", 4, Some(3)),
+            entries[0].clone(),
+            entries[1].clone(),
+            entries[2].clone(),
+            entries[3].clone(),
+        ];
+        Session::append(root, "lead-fork", &stored).unwrap();
+
+        let error = SessionStore::Jsonl
+            .load_fork_located(root, "lead-fork")
+            .await
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("ambiguous"), "{message}");
+        assert!(message.contains("lead-parent"), "{message}");
+        assert!(
+            message.contains("legacy marker-first fork copy"),
+            "{message}"
+        );
+    }
+
+    /// Provenance breaks the tie: the old marker-first copy never preceded the
+    /// marker with the child's frozen `GoalUpdated`, so that shape IS a
+    /// zero-copy child (its repeated first messages stay its own).
+    #[tokio::test]
+    async fn marker_after_a_goal_freeze_is_unambiguously_zero_copy() {
+        use crate::session::Session;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let entries = fork_turns(2);
+        Session::append(root, "goal-parent", &entries).unwrap();
+        let stored = vec![
+            SessionEntry::GoalUpdated { goal: None },
+            marker("goal-parent", 4, Some(3)),
+            entries[0].clone(),
+            entries[1].clone(),
+        ];
+        Session::append(root, "goal-fork", &stored).unwrap();
+
+        let resolved = SessionStore::Jsonl
+            .load_fork_located(root, "goal-fork")
+            .await
+            .unwrap();
+        assert_eq!(resolved.inherited, 4);
+        assert_eq!(resolved.entries[..4], entries[..]);
+        assert_eq!(resolved.entries[4], stored[0]);
+        assert_eq!(resolved.entries[5], stored[1]);
+        assert_eq!(
+            resolved.entries[6..],
+            stored[2..],
+            "the child's own repeated messages stay after the marker"
+        );
+    }
+
+    /// The copy-based `[prefix..][ForkedFrom]` layout has no leading marker,
+    /// so it keeps loading exactly as before.
+    #[tokio::test]
+    async fn copy_based_fork_with_a_trailing_marker_loads_unchanged() {
+        use crate::session::Session;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let entries = fork_turns(2);
+        Session::append(root, "tail-parent", &entries).unwrap();
+        let mut tail_layout = entries[..4].to_vec();
+        tail_layout.push(marker("tail-parent", 4, Some(3)));
+        Session::append(root, "tail-fork", &tail_layout).unwrap();
+        let tail = SessionStore::Jsonl
+            .load_fork_located(root, "tail-fork")
+            .await
+            .unwrap();
+        assert_eq!(tail.inherited, 0);
+        assert_eq!(tail.entries, tail_layout);
+        assert!(tail.locations.iter().all(Option::is_some));
+    }
+
+    /// A legacy whole-document (`.json`) parent must not make the zero-copy
+    /// child look legacy: `legacy` describes the child's OWN store, and the
+    /// runner would otherwise rewrite the marker-only log into a full copy.
+    #[tokio::test]
+    async fn fork_of_a_legacy_json_parent_keeps_a_marker_only_child_store() {
+        use crate::agent::Message;
+        use crate::session::Session;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let dir = root.join(".e-agent/sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        let messages: Vec<Message> = fork_turns(2)
+            .into_iter()
+            .map(|entry| match entry {
+                SessionEntry::Message { message } => message,
+                other => panic!("unexpected entry: {other:?}"),
+            })
+            .collect();
+        std::fs::write(
+            dir.join("legacy-parent.json"),
+            serde_json::json!({ "version": 1, "messages": messages }).to_string(),
+        )
+        .unwrap();
+        let source = Session::load(root, "legacy-parent").unwrap();
+        assert!(source.legacy);
+        Session::append(
+            root,
+            "legacy-fork",
+            std::slice::from_ref(&marker("legacy-parent", 4, None)),
+        )
+        .unwrap();
+
+        let resolved = SessionStore::Jsonl
+            .load_fork_located(root, "legacy-fork")
+            .await
+            .unwrap();
+        assert_eq!(resolved.inherited, 4);
+        assert_eq!(resolved.entries[..4], source.entries[..]);
+        assert!(
+            !resolved.legacy,
+            "the child's own JSONL store is not legacy — it must not be rewritten"
+        );
+        assert_eq!(
+            child_lines(root, "legacy-fork"),
+            1,
+            "the child store stays marker-only"
+        );
+    }
+
+    /// The fork-boundary scans index the RESOLVED transcript, so `at` means
+    /// the same thing to the panel and to the fork itself.
+    #[tokio::test]
+    async fn load_fork_with_seq_indexes_the_resolved_transcript() {
+        use crate::session::Session;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let entries = fork_turns(2);
+        Session::append(root, "seq-parent", &entries).unwrap();
+        Session::append(
+            root,
+            "seq-fork",
+            &[marker("seq-parent", 4, Some(3)), fork_user("own q")],
+        )
+        .unwrap();
+
+        let store = SessionStore::Jsonl;
+        let with_seq = store.load_fork_with_seq(root, "seq-fork").await.unwrap();
+        assert_eq!(with_seq.len(), 6);
+        assert_eq!(
+            with_seq[..4],
+            [
+                (0, entries[0].clone()),
+                (1, entries[1].clone()),
+                (2, entries[2].clone()),
+                (3, entries[3].clone()),
+            ]
+        );
+        assert_eq!(with_seq[4].1, marker("seq-parent", 4, Some(3)));
+        // The child's own second line carries its own ordinal (1).
+        assert_eq!(with_seq[5], (1, fork_user("own q")));
+
+        // The Web head page resolves the inherited prefix as one page.
+        let page = store
+            .load_head_page_located(root, "seq-fork", Some(2))
+            .await
+            .unwrap();
+        assert_eq!(page.entries.len(), 6, "no physical cursor to page by");
+        assert_eq!(page.next_before_seq, None);
+        assert!(page.locations[..4].iter().all(Option::is_none));
     }
 }
 

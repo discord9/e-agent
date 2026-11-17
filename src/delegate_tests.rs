@@ -2430,61 +2430,40 @@ async fn resume_replays_scrollback_into_session_sink() {
 // btw fork subagent
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-/// `btw_fork_entries` cuts the source history at the last completed turn,
-/// then stamps the `ForkedFrom` marker + the explanation notice. Entries
-/// after the boundary are dropped; an empty session (or one with no
-/// completed turn) is rejected.
+/// A btw fork stores ONLY its own initial entries: the `ForkedFrom` marker
+/// (pinned to the source cut) plus the explanation notice. The inherited
+/// prefix is read back from the source session read-only at load time, so
+/// nothing of the parent ever reaches the child's store.
 #[test]
-fn btw_fork_entries_cuts_at_last_completed_turn() {
+fn btw_fork_own_entries_are_marker_and_notice_only() {
     use crate::agent::SessionEntry as AgentEntry;
+    let own = btw_fork_own_entries("web-main", 4, (Some(3), None));
+    assert_eq!(own.len(), 2, "marker + notice only: {own:?}");
+    assert_eq!(
+        own[0],
+        AgentEntry::ForkedFrom {
+            source: "web-main".into(),
+            at: 4,
+            event_time: None,
+            seq: Some(3),
+        }
+    );
+    assert_eq!(
+        own[1],
+        AgentEntry::Notice {
+            text: "（btw fork：在主线之外继续探讨）".into(),
+        }
+    );
+    // The cut itself is still validated by `fork_prefix`: no completed turn
+    // (and an empty session) is rejected before any spawn happens.
     let user = |text: &str| AgentEntry::Message {
         message: Message::User {
             content: text.into(),
             images: vec![],
         },
     };
-    let assistant = |text: &str| AgentEntry::Message {
-        message: Message::Assistant(AssistantMessage {
-            content: Some(text.into()),
-            tool_calls: vec![],
-            reasoning: None,
-        }),
-    };
-    let entries = vec![
-        user("hello"),
-        assistant("hi"),
-        user("question 1"),
-        assistant("answer 1"),
-        // Trailing entries after the last completed turn are dropped.
-        AgentEntry::Notice {
-            text: "[background task 1 completed]".into(),
-        },
-    ];
-    let fork = btw_fork_entries("web-main", &entries).unwrap();
-    assert_eq!(fork.len(), 6, "prefix + marker + notice: {fork:?}");
-    assert_eq!(fork[0], user("hello"));
-    assert_eq!(fork[1], assistant("hi"));
-    assert_eq!(fork[2], user("question 1"));
-    assert_eq!(fork[3], assistant("answer 1"));
-    assert_eq!(
-        fork[4],
-        AgentEntry::ForkedFrom {
-            source: "web-main".into(),
-            at: 4,
-            event_time: None,
-            seq: None,
-        }
-    );
-    assert_eq!(
-        fork[5],
-        AgentEntry::Notice {
-            text: "（btw fork：在主线之外继续探讨）".into(),
-        }
-    );
-    // No completed turn → error (mirrors `fork_prefix`).
-    let no_boundary = vec![user("only a question")];
-    assert!(btw_fork_entries("web-main", &no_boundary).is_err());
-    assert!(btw_fork_entries("web-main", &[]).is_err());
+    assert!(crate::agent::fork_prefix(&[user("only a question")], None).is_err());
+    assert!(crate::agent::fork_prefix(&[], None).is_err());
 }
 
 /// Full JSONL spawn: the source session's history is forked into a fresh
@@ -2583,47 +2562,72 @@ async fn spawn_btw_subagent_forks_history_and_registers_persistent_subagent() {
     assert_eq!(entry.model, "test-model");
     assert_eq!(entry.role, None);
 
-    // The btw session file: fork prefix + marker + notice, then the
-    // question as the first user message (committed by the runner; poll
-    // because the commit is async).
+    // The btw session file holds ONLY its own entries — marker + notice,
+    // then the question as the first user message (committed by the runner;
+    // poll because the commit is async). No parent entry is ever written.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     let loaded = loop {
         let loaded = crate::session::Session::load(&root, &id).unwrap().entries;
-        if loaded.len() >= 5 || std::time::Instant::now() > deadline {
+        if loaded.len() >= 3 || std::time::Instant::now() > deadline {
             break loaded;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     };
     assert_eq!(
         loaded.len(),
-        5,
-        "2 prefix + marker + notice + question: {loaded:?}"
+        3,
+        "marker + notice + question only: {loaded:?}"
     );
-    assert_eq!(loaded[0], source_entries[0]);
-    assert_eq!(loaded[1], source_entries[1]);
     assert_eq!(
-        loaded[2],
+        loaded[0],
         AgentEntry::ForkedFrom {
             source: "web-main".into(),
             at: 2,
             event_time: None,
-            seq: None,
+            seq: Some(1),
         }
     );
     assert_eq!(
-        loaded[3],
+        loaded[1],
         AgentEntry::Notice {
             text: "（btw fork：在主线之外继续探讨）".into(),
         }
     );
     assert_eq!(
-        loaded[4],
+        loaded[2],
         AgentEntry::Message {
             message: Message::User {
                 content: "side question".into(),
                 images: vec![],
             },
         }
+    );
+    // The child store contains no parent message: the inherited prefix is
+    // rebuilt in memory from the source session by the marker-aware loader.
+    assert!(
+        !loaded.iter().any(|entry| matches!(
+            entry,
+            AgentEntry::Message {
+                message: Message::Assistant(_)
+            }
+        )),
+        "no parent entry may be copied into the btw store: {loaded:?}"
+    );
+    let resolved = SessionStore::Jsonl
+        .load_fork_located(&root, &id)
+        .await
+        .unwrap();
+    assert_eq!(resolved.inherited, 2, "two inherited parent entries");
+    assert_eq!(resolved.entries[0], source_entries[0]);
+    assert_eq!(resolved.entries[1], source_entries[1]);
+    assert_eq!(resolved.entries[2], loaded[0]);
+    assert!(
+        resolved.locations[..2].iter().all(Option::is_none),
+        "inherited entries must not carry child locations"
+    );
+    assert!(
+        resolved.locations[2].is_some(),
+        "the child's own marker is located"
     );
 
     // The task stays registered (WaitForInput: the runner does not finish
@@ -3940,6 +3944,127 @@ async fn fork_completion_carries_the_child_answer_with_completed_status() {
     );
 }
 
+/// A delegate fork stores ONLY the marker: the spawn performs no O(N)
+/// durable writes (the parent prefix is not copied), and the marker-aware
+/// loader rebuilds the identical parent prefix for the child.
+#[tokio::test]
+async fn fork_spawn_writes_only_the_marker_and_loads_the_parent_prefix() {
+    use crate::agent::SessionEntry as AgentEntry;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    // Six completed turns: 12 parent entries the copy-based implementation
+    // would have written into the child's store.
+    let mut parent_entries: Vec<AgentEntry> = Vec::new();
+    for i in 0..6 {
+        parent_entries.push(AgentEntry::Message {
+            message: Message::User {
+                content: format!("parent q{i}"),
+                images: vec![],
+            },
+        });
+        parent_entries.push(AgentEntry::Message {
+            message: Message::Assistant(AssistantMessage {
+                content: Some(format!("parent a{i}")),
+                tool_calls: vec![],
+                reasoning: None,
+            }),
+        });
+    }
+    Session::append(&root, "parent", &parent_entries).unwrap();
+    let head = chat_model(successful_model("fork child answer").await, "stale-model");
+    let mut delegate = forking_delegate(&root, &fork_record(&root, "parent"), head);
+    let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
+    delegate.set_event_sender(sender);
+    delegate.set_session_handle("parent", live_parent_endpoint());
+
+    delegate
+        .execute(json!({
+            "task": "answer this",
+            "fork": true,
+            "workspace": root.display().to_string()
+        }))
+        .await
+        .expect("the fork spawns");
+    // The receipt has returned. The child store must hold at most the marker
+    // plus the child's own first commit — never the 12 inherited entries.
+    let child_file = std::fs::read_dir(root.join(".e-agent/sessions"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("sub-") && name.ends_with(".jsonl"))
+        })
+        .expect("the fork created its child session file");
+    let raw = std::fs::read_to_string(&child_file).unwrap();
+    let lines: Vec<&str> = raw.lines().filter(|line| !line.trim().is_empty()).collect();
+    assert!(
+        lines.len() <= 2,
+        "spawning a fork must not write the parent prefix ({} lines): {raw}",
+        lines.len()
+    );
+    assert!(
+        lines[0].contains(r#""type":"forked_from""#),
+        "the first child line is the marker: {}",
+        lines[0]
+    );
+    assert!(
+        !lines.iter().any(|line| line.contains("parent q")),
+        "no parent entry may reach the child store: {raw}"
+    );
+
+    let (status, _output) = await_background_status(&mut completions).await;
+    assert_eq!(status.as_deref(), Some("completed"));
+    let child_id = child_file
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap()
+        .to_owned();
+    // Reloading the child (what resume / a later turn does) rebuilds the
+    // exact parent prefix the fork cut keeps.
+    let resolved = SessionStore::Jsonl
+        .load_fork_located(&root, &child_id)
+        .await
+        .unwrap();
+    assert_eq!(resolved.inherited, parent_entries.len());
+    assert_eq!(resolved.entries[..parent_entries.len()], parent_entries[..]);
+    assert!(matches!(
+        resolved.entries[parent_entries.len()],
+        AgentEntry::ForkedFrom { ref source, at, .. } if source == "parent" && at == parent_entries.len()
+    ));
+    assert!(
+        resolved.locations[..parent_entries.len()]
+            .iter()
+            .all(Option::is_none),
+        "inherited entries carry no child location"
+    );
+    // The parent is frozen at the marker: a later parent append stays out.
+    Session::append(
+        &root,
+        "parent",
+        &[AgentEntry::Message {
+            message: Message::User {
+                content: "parent late".into(),
+                images: vec![],
+            },
+        }],
+    )
+    .unwrap();
+    let again = SessionStore::Jsonl
+        .load_fork_located(&root, &child_id)
+        .await
+        .unwrap();
+    assert_eq!(again.entries[..parent_entries.len()], parent_entries[..]);
+    assert!(
+        !again.entries.iter().any(|entry| matches!(
+            entry,
+            AgentEntry::Message { message: Message::User { content, .. } } if content == "parent late"
+        )),
+        "a later parent append is invisible to the fork"
+    );
+}
+
 #[tokio::test]
 async fn fork_child_cannot_ask_the_user_questions() {
     // A fork has no frontend that could answer a WaitingInput request: the
@@ -4726,12 +4851,13 @@ async fn spawn_fork_rechecks_delivery_before_creating_anything() {
     // Everything else a fork needs is in place (persistence, a live parent
     // endpoint, a matching MCP set): only the completion channel is gone.
     delegate.set_session_handle("parent", live_parent_endpoint());
-    let entries = SessionStore::Jsonl
-        .load(&root, "parent")
+    let prefix = SessionStore::Jsonl
+        .load_fork_located(&root, "parent")
         .await
+        .unwrap();
+    let at = crate::agent::fork_prefix_complete(&prefix.entries, None)
         .unwrap()
-        .entries;
-    let prefix = crate::agent::fork_prefix_complete(&entries, None).unwrap();
+        .len();
     let head = fork_head(head_model, None, None, false, Vec::new());
 
     let error = delegate
@@ -4740,6 +4866,7 @@ async fn spawn_fork_rechecks_delivery_before_creating_anything() {
             None,
             fork_record(&root, "parent"),
             prefix,
+            at,
             head,
         )
         .await
