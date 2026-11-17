@@ -1873,6 +1873,22 @@
     overflow: hidden;
     text-overflow: ellipsis;
   }
+  /* 主会话行下一行：桌宠总结器同一次调用产出的侧边栏短语（≤16 字）。不按
+     字符截断，只有真正窄的视口才靠单行省略。左缩进对齐标题文字：3px 左边条
+     + 8px 行内 padding + 24px 折叠按钮 + 2×4px gap + 6px 状态点 = 49px。 */
+  .tree-activity {
+    margin: 1px 8px 4px 49px;
+    font-size: 11px;
+    line-height: 1.4;
+    color: var(--base01);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  /* hover / 当前会话：活动行跟着提亮，不在 muted 灰里失去可读性 */
+  .tree-row:hover ~ .tree-activity,
+  .tree-row.current ~ .tree-activity,
+  .tree-activity:hover { color: var(--base02); }
   .tree-group { color: var(--base01); }
   /* 「+N 个更早的会话」按钮 */
   .tree-more {

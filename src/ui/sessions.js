@@ -260,9 +260,11 @@ async function pollWorkspaceSessionsNow(ws, identity) {
       const data = response.json;
       const snapshot = Array.isArray(data) ? {
         partial: false, sessions: data, totals: null, child_counts: null,
+        summaries: {},
       } : {
         partial: true, sessions: data.sessions,
         totals: data.totals || null, child_counts: data.child_counts || {},
+        summaries: data.summaries || {},
       };
       // 摘要变化 → 标记已加载的完整列表过期（保留 loaded）。只打标记、不发
       // 请求：自动渲染见到 stale 只显示刷新控件，重拉必须由用户显式触发。
@@ -2415,6 +2417,7 @@ function sidebarTreeSig() {
       + (state.sidebar.showAllWs.has(ws.id) ? 1 : 0) + ":"
       + JSON.stringify((workspaceSnapshotFor(ws) || {}).totals || {}) + ":"
       + JSON.stringify((workspaceSnapshotFor(ws) || {}).child_counts || {}) + ":"
+      + JSON.stringify((workspaceSnapshotFor(ws) || {}).summaries || {}) + ":"
       + JSON.stringify(list.map((s) => [
         s.id, s.title || "", s.label || "", s.status, s.busy ? 1 : 0, s.active === false ? 0 : 1,
         s.entry_count ?? null, s.parent_session_id || "", s.pinned === true ? 1 : 0,
@@ -2935,6 +2938,18 @@ function buildTreeRoot(s, kids, wsId) {
     openSessionIn(wsId, s.id);
   });
   node.appendChild(row);
+  // 主会话行下一行：复用桌宠总结器同一次调用产出的两行摘要——short（≤16 字）
+  // 是侧边栏的一句「正在做什么」，full（≤30 字）留给 title。不再截断字符：
+  // 窄视口只靠 CSS 单行省略。无缓存 → 不占行高；subagent 行本 pass 不加。
+  const summary = isMainSession(s) && snapshot && snapshot.summaries
+    ? snapshot.summaries[s.id] : null;
+  const activityShort = summary && typeof summary === "object"
+    ? String(summary.short || "").trim() : "";
+  if (activityShort) {
+    const activity = el("div", "tree-activity", activityShort);
+    activity.title = String(summary.full || activityShort);   // 完整 30 字摘要留给 hover
+    node.appendChild(activity);
+  }
   if (hasKids) {
     const children = el("div", "tree-children");
     children.hidden = true;
