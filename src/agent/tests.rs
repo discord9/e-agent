@@ -4587,126 +4587,134 @@ async fn compaction_rejects_empty_summary() {
     );
 }
 
+/// Text of any message variant (test helper for the fork compaction cases).
+fn message_text(message: &Message) -> String {
+    match message {
+        Message::System { content } | Message::User { content, .. } => content.clone(),
+        Message::Assistant(assistant) => assistant.content.clone().unwrap_or_default(),
+        Message::Tool { content, .. } => content.clone(),
+    }
+}
+
 /// A zero-copy fork child inherits its leading history from the source
-/// session. Compaction must never copy those messages into the child's own
-/// `Compaction.retained` snapshot, so a retained tail that would reach into
-/// the inherited region fails closed with a message naming the source.
+/// session. Those messages may be SUMMARIZED — the compaction request is
+/// derived at read time and persists nothing but its summary — but they must
+/// never be copied into the child's own `Compaction.retained` snapshot. A
+/// retained tail that would reach into the inherited region is therefore
+/// clamped up to the inherited boundary: a fresh fork (far fewer own messages
+/// than `RETAIN_TAIL`) compacts instead of failing closed.
 #[tokio::test]
-async fn compaction_of_a_zero_copy_fork_fails_closed_when_the_tail_reaches_the_prefix() {
+async fn compaction_of_a_zero_copy_fork_clamps_the_tail_to_the_inherited_boundary() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
     let mut agent = Agent::new(
         Box::new(ScriptedModel {
-            replies: vec![],
-            requests: Arc::new(Mutex::new(Vec::new())),
+            replies: vec![AssistantMessage {
+                content: Some("fork summary".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            }],
+            requests: requests.clone(),
             delays: Default::default(),
         }),
         vec![],
     );
-    let inherited: Vec<SessionEntry> = vec![
-        Message::User {
-            content: "inherited q0".into(),
-            images: vec![],
-        }
-        .into(),
-        Message::Assistant(AssistantMessage {
-            content: Some("inherited a0".into()),
-            tool_calls: vec![],
-            reasoning: None,
-        })
-        .into(),
-        Message::User {
-            content: "inherited q1".into(),
-            images: vec![],
-        }
-        .into(),
-        Message::Assistant(AssistantMessage {
-            content: Some("inherited a1".into()),
-            tool_calls: vec![],
-            reasoning: None,
-        })
-        .into(),
-    ];
-    let own: Vec<SessionEntry> = vec![
-        Message::User {
-            content: "own q".into(),
-            images: vec![],
-        }
-        .into(),
-        Message::Assistant(AssistantMessage {
-            content: Some("own a".into()),
-            tool_calls: vec![],
-            reasoning: None,
-        })
-        .into(),
-    ];
-    let mut history = inherited;
+    let mut history = completed_turn("inherited q0", "inherited a0");
+    history.extend(completed_turn("inherited q1", "inherited a1"));
     history.push(SessionEntry::ForkedFrom {
         source: "source-session".into(),
         at: Some(4),
         event_time: None,
         seq: Some(3),
     });
-    history.extend(own);
+    history.extend(completed_turn("own q", "own a"));
     agent.restore_history(history);
     agent.set_inherited_prefix(4);
-    let error = match agent.prepare_compaction().await {
-        Ok(_) => panic!("a retained tail reaching into the inherited prefix must fail closed"),
-        Err(error) => error,
+    // context = [iq0, ia0, iq1, ia1, own q, own a] → keep 3 → the nominal cut
+    // opens on the inherited `ia1`, which is clamped up to the own `own a`.
+    assert_eq!(agent.compact().await.unwrap(), "fork summary");
+    let SessionEntry::Compaction {
+        summary,
+        retained,
+        current_prompt_at,
+        no_current_prompt,
+    } = agent.history().last().unwrap()
+    else {
+        panic!("expected a compaction entry");
     };
-    let message = format!("{error:#}");
-    assert!(
-        message.contains("inherited read-only from session source-session"),
-        "{message}"
+    assert_eq!(summary, "fork summary");
+    assert_eq!(
+        retained,
+        &vec![Message::Assistant(AssistantMessage {
+            content: Some("own a".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        })],
+        "only this session's own messages may be retained"
     );
-    assert!(message.contains("retained tail"), "{message}");
+    assert!(
+        !retained
+            .iter()
+            .any(|message| message_text(message).contains("inherited")),
+        "an inherited message reached `retained`: {retained:?}"
+    );
+    // The clamped tail holds no actual user at all → explicit "no prompt".
+    assert_eq!(*current_prompt_at, None);
+    assert!(*no_current_prompt);
+    // The inherited prefix is summarized instead of retained.
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let sent: Vec<String> = requests[0].iter().map(message_text).collect();
+    for expected in [
+        "inherited q0",
+        "inherited a0",
+        "inherited q1",
+        "inherited a1",
+    ] {
+        assert!(
+            sent.iter().any(|text| text == expected),
+            "the request must carry the inherited context ({expected} missing): {sent:?}"
+        );
+    }
+    assert!(sent.iter().any(|text| text == "own q"), "{sent:?}");
+    assert!(
+        !sent.iter().any(|text| text == "own a"),
+        "the retained tail must not be summarized: {sent:?}"
+    );
+    assert!(matches!(
+        requests[0].last().unwrap(),
+        Message::User { content, .. } if content.contains("Summarize the earlier conversation")
+    ));
 }
 
-/// The guard compares `split` (an `items` index, which starts with the
-/// context prefix / goal system messages) against the inherited region's
-/// HISTORY offset. With a prefix system message the inherited region starts
-/// one item later than the raw inherited count, so a bound that ignored it
-/// would let the last inherited message into `retained`.
+/// The clamp boundary compares `split` (an `items` index, which starts with
+/// the context prefix / goal system messages) against the inherited region's
+/// HISTORY offset. With a prefix system message the inherited region starts one
+/// item later than the raw inherited count, so a bound that ignored it would
+/// clamp too late and let the last inherited message into `retained`.
 #[tokio::test]
-async fn compaction_guard_counts_the_non_history_prefix_messages() {
+async fn compaction_clamp_counts_the_non_history_prefix_messages() {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let mut agent = Agent::new(
         Box::new(ScriptedModel {
-            replies: vec![],
+            replies: vec![AssistantMessage {
+                content: Some("fork summary".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            }],
             requests: requests.clone(),
             delays: Default::default(),
         }),
         vec![],
     );
     agent.set_context_prefix("SYSTEM PREAMBLE".into());
-    let mut history: Vec<SessionEntry> = vec![
-        Message::User {
-            content: "inherited q0".into(),
-            images: vec![],
-        }
-        .into(),
-        Message::Assistant(AssistantMessage {
-            content: Some("inherited a0".into()),
-            tool_calls: vec![],
-            reasoning: None,
-        })
-        .into(),
-        Message::User {
-            content: "inherited q1".into(),
-            images: vec![],
-        }
-        .into(),
-        Message::Assistant(AssistantMessage {
-            content: Some("inherited a1".into()),
-            tool_calls: vec![],
-            reasoning: None,
-        })
-        .into(),
-        SessionEntry::ForkedFrom {
-            source: "source-session".into(),
-            at: Some(4),
-            event_time: None,
-            seq: Some(3),
-        },
-    ];
+    let mut history = completed_turn("inherited q0", "inherited a0");
+    history.extend(completed_turn("inherited q1", "inherited a1"));
+    history.push(SessionEntry::ForkedFrom {
+        source: "source-session".into(),
+        at: Some(4),
+        event_time: None,
+        seq: Some(3),
+    });
     history.push(
         Message::Assistant(AssistantMessage {
             content: Some("own a0".into()),
@@ -4732,22 +4740,60 @@ async fn compaction_guard_counts_the_non_history_prefix_messages() {
     );
     agent.restore_history(history);
     agent.set_inherited_prefix(4);
-    // items = [system, u0, a0, u1, a1, own a0, own q, own a1] → keep 4 →
-    // split lands on the inherited `a1`. The raw inherited count (4) would
-    // allow this split; the correct bound is 1 system message + 4 = 5.
-    let error = match agent.prepare_compaction().await {
-        Ok(_) => panic!("an inherited message must never reach `retained`"),
-        Err(error) => error,
+    // items = [system, iq0, ia0, iq1, ia1, own a0, own q, own a1] → keep 4 →
+    // the nominal split lands on the inherited `ia1`. The raw inherited count
+    // (4) would accept that split; the correct bound is 1 system message + 4 =
+    // 5, so the tail is clamped up to the own `own a0`.
+    assert_eq!(agent.compact().await.unwrap(), "fork summary");
+    let SessionEntry::Compaction {
+        retained,
+        current_prompt_at,
+        ..
+    } = agent.history().last().unwrap()
+    else {
+        panic!("expected a compaction entry");
     };
-    let message = format!("{error:#}");
-    assert!(
-        message.contains("inherited read-only from session source-session"),
-        "{message}"
+    assert_eq!(
+        retained,
+        &vec![
+            Message::Assistant(AssistantMessage {
+                content: Some("own a0".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            }),
+            Message::User {
+                content: "own q".into(),
+                images: vec![],
+            },
+            Message::Assistant(AssistantMessage {
+                content: Some("own a1".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            }),
+        ],
+        "the tail must open on this session's own first Assistant"
     );
     assert!(
-        requests.lock().unwrap().is_empty(),
-        "the guard must fail closed before any provider call"
+        !retained
+            .iter()
+            .any(|message| message_text(message).contains("inherited")),
+        "an inherited message reached `retained`: {retained:?}"
     );
+    // Provenance is indexed inside the clamped tail: `own q` is retained[1].
+    assert_eq!(*current_prompt_at, Some(1));
+    let requests = requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        1,
+        "the clamp must not skip the provider call"
+    );
+    let sent: Vec<String> = requests[0].iter().map(message_text).collect();
+    assert!(
+        sent.iter().any(|text| text == "SYSTEM PREAMBLE"),
+        "{sent:?}"
+    );
+    assert!(sent.iter().any(|text| text == "inherited a1"), "{sent:?}");
+    assert!(!sent.iter().any(|text| text == "own a0"), "{sent:?}");
 }
 
 /// `repair_item_pairs` can DROP an orphan tool result from this session's own
@@ -4756,47 +4802,29 @@ async fn compaction_guard_counts_the_non_history_prefix_messages() {
 /// one and shifts the inherited boundary left, letting the last inherited
 /// message into `retained`. The offset must be counted directly.
 #[tokio::test]
-async fn compaction_guard_is_not_shifted_by_a_dropped_own_tool_result() {
+async fn compaction_clamp_is_not_shifted_by_a_dropped_own_tool_result() {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let mut agent = Agent::new(
         Box::new(ScriptedModel {
-            replies: vec![],
+            replies: vec![AssistantMessage {
+                content: Some("fork summary".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            }],
             requests: requests.clone(),
             delays: Default::default(),
         }),
         vec![],
     );
     agent.set_context_prefix("SYSTEM PREAMBLE".into());
-    let mut history: Vec<SessionEntry> = vec![
-        Message::User {
-            content: "inherited q0".into(),
-            images: vec![],
-        }
-        .into(),
-        Message::Assistant(AssistantMessage {
-            content: Some("inherited a0".into()),
-            tool_calls: vec![],
-            reasoning: None,
-        })
-        .into(),
-        Message::User {
-            content: "inherited q1".into(),
-            images: vec![],
-        }
-        .into(),
-        Message::Assistant(AssistantMessage {
-            content: Some("inherited a1".into()),
-            tool_calls: vec![],
-            reasoning: None,
-        })
-        .into(),
-        SessionEntry::ForkedFrom {
-            source: "source-session".into(),
-            at: Some(4),
-            event_time: None,
-            seq: Some(3),
-        },
-    ];
+    let mut history = completed_turn("inherited q0", "inherited a0");
+    history.extend(completed_turn("inherited q1", "inherited a1"));
+    history.push(SessionEntry::ForkedFrom {
+        source: "source-session".into(),
+        at: Some(4),
+        event_time: None,
+        seq: Some(3),
+    });
     // This session's own region opens with an ORPHAN tool result: no assistant
     // ever declared `own-orphan`, so `repair_item_pairs` drops it.
     history.push(
@@ -4810,7 +4838,7 @@ async fn compaction_guard_is_not_shifted_by_a_dropped_own_tool_result() {
         }
         .into(),
     );
-    for content in ["own a0", "own q"] {
+    for content in ["own q0", "own q1"] {
         history.push(
             Message::User {
                 content: content.into(),
@@ -4829,20 +4857,157 @@ async fn compaction_guard_is_not_shifted_by_a_dropped_own_tool_result() {
     );
     agent.restore_history(history);
     agent.set_inherited_prefix(4);
-    // Repaired items = [system, u0, a0, u1, a1, own a0, own q, own a1] → keep
-    // 4 → split lands on the inherited `a1`, which must fail closed.
+    // Repaired items = [system, iq0, ia0, iq1, ia1, own q0, own q1, own a1] →
+    // keep 4 → the nominal split lands on the inherited `ia1`. The correct
+    // bound is 1 system message + 4 = 5, so the tail is clamped up to this
+    // session's own `own a1`.
+    assert_eq!(agent.compact().await.unwrap(), "fork summary");
+    let SessionEntry::Compaction {
+        retained,
+        current_prompt_at,
+        no_current_prompt,
+        ..
+    } = agent.history().last().unwrap()
+    else {
+        panic!("expected a compaction entry");
+    };
+    assert_eq!(
+        retained,
+        &vec![Message::Assistant(AssistantMessage {
+            content: Some("own a1".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        })],
+        "an inherited message reached `retained`: {retained:?}"
+    );
+    assert!(
+        !retained
+            .iter()
+            .any(|message| message_text(message).contains("inherited")),
+        "an inherited message reached `retained`: {retained:?}"
+    );
+    assert_eq!(*current_prompt_at, None);
+    assert!(*no_current_prompt);
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let sent: Vec<String> = requests[0].iter().map(message_text).collect();
+    assert!(sent.iter().any(|text| text == "inherited a1"), "{sent:?}");
+    assert!(!sent.iter().any(|text| text == "own a1"), "{sent:?}");
+}
+
+/// A fresh zero-copy fork can hold own messages but no own Assistant yet (its
+/// prompt, or pending tool results, with the answer still in flight). The
+/// clamp then keeps an EMPTY retained tail: the whole context — inherited
+/// prefix and own prompt — is summarized, `retained` is empty, and the
+/// provenance is the explicit `no_current_prompt` marker.
+#[tokio::test]
+async fn compaction_of_a_fresh_fork_keeps_an_empty_retained_tail() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = Agent::new(
+        Box::new(ScriptedModel {
+            replies: vec![AssistantMessage {
+                content: Some("fork summary".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            }],
+            requests: requests.clone(),
+            delays: Default::default(),
+        }),
+        vec![],
+    );
+    let mut history = completed_turn("inherited q0", "inherited a0");
+    history.extend(completed_turn("inherited q1", "inherited a1"));
+    history.push(SessionEntry::ForkedFrom {
+        source: "source-session".into(),
+        at: Some(4),
+        event_time: None,
+        seq: Some(3),
+    });
+    history.push(
+        Message::User {
+            content: "own q".into(),
+            images: vec![],
+        }
+        .into(),
+    );
+    agent.restore_history(history);
+    agent.set_inherited_prefix(4);
+    // context = [iq0, ia0, iq1, ia1, own q] → keep 2 → the nominal split opens
+    // on the inherited `ia1`; there is no own Assistant at all, so the tail is
+    // empty and the request carries the whole context.
+    assert_eq!(agent.compact().await.unwrap(), "fork summary");
+    let SessionEntry::Compaction {
+        retained,
+        current_prompt_at,
+        no_current_prompt,
+        ..
+    } = agent.history().last().unwrap()
+    else {
+        panic!("expected a compaction entry");
+    };
+    assert!(retained.is_empty(), "expected an empty tail: {retained:?}");
+    assert_eq!(*current_prompt_at, None);
+    assert!(*no_current_prompt);
+    let context = agent.context();
+    assert_eq!(context.len(), 1, "only the summary survives: {context:?}");
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let sent: Vec<String> = requests[0].iter().map(message_text).collect();
+    for expected in ["inherited q0", "inherited a1", "own q"] {
+        assert!(
+            sent.iter().any(|text| text == expected),
+            "the request must carry {expected}: {sent:?}"
+        );
+    }
+}
+
+/// The clamp never manufactures something to summarize: a context with no
+/// Assistant to anchor the tail on still fails closed with "nothing to
+/// compact", fork or not, before any provider call.
+#[tokio::test]
+async fn compaction_of_a_fork_without_any_assistant_still_fails_closed() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = Agent::new(
+        Box::new(ScriptedModel {
+            replies: vec![],
+            requests: requests.clone(),
+            delays: Default::default(),
+        }),
+        vec![],
+    );
+    let mut history: Vec<SessionEntry> = vec![
+        Message::User {
+            content: "inherited q0".into(),
+            images: vec![],
+        }
+        .into(),
+    ];
+    history.push(SessionEntry::ForkedFrom {
+        source: "source-session".into(),
+        at: Some(1),
+        event_time: None,
+        seq: Some(0),
+    });
+    history.push(
+        Message::User {
+            content: "own q".into(),
+            images: vec![],
+        }
+        .into(),
+    );
+    agent.restore_history(history);
+    agent.set_inherited_prefix(1);
     let error = match agent.prepare_compaction().await {
-        Ok(_) => panic!("an inherited message must never reach `retained`"),
+        Ok(_) => panic!("a context with no Assistant must stay uncompactable"),
         Err(error) => error,
     };
-    let message = format!("{error:#}");
     assert!(
-        message.contains("inherited read-only from session source-session"),
-        "{message}"
+        format!("{error:#}").contains("nothing to compact"),
+        "{error:#}"
     );
     assert!(
         requests.lock().unwrap().is_empty(),
-        "the guard must fail closed before any provider call"
+        "the refusal must happen before any provider call"
     );
 }
 
