@@ -8,17 +8,15 @@ a time, returns results to the model, and prints its final answer.
 
 Use it as a one-shot CLI command, an interactive terminal UI (the default with
 no prompt in a terminal), or a line-based REPL. `e-agent web` starts the local
-web UI and HTTP API. Sessions retain conversation history in the workspace by
-default; SQLite and GreptimeDB storage are also available. The built-in tools
-cover workspace files and shell commands, background work, and asynchronous
-subagent tasks. Background and subagent completion notifications are delivered
-to the session when they finish. A human can explicitly arm goal continuation
-with `/goal continue` indefinitely or `/goal continue N` with an actual-token
-soft cap; active goals and restarts do not arm it, each newly admitted
-automatic turn reminds the model to re-check the goal, turns wait for this
-session's own non-detached background work, and Cancel stops the driver
-without stopping existing background tasks. See [Session goals](#session-goals)
-for the full behavior. Local stdio MCP servers can optionally add tools.
+web UI and HTTP API. SQLite is the default session backend; JSONL and
+GreptimeDB are selectable in `[session]` (see
+[SQLite session backend](#sqlite-session-backend)). The built-in tools cover
+workspace files, persistent notes, shell and background work, and
+main-session delegation. Background and subagent completion notifications are
+delivered to the session when they finish. A human can explicitly arm goal
+continuation with `/goal continue [N]`; active goals and restarts never arm it.
+See [Session goals](#session-goals) for the full behavior. Local stdio MCP
+servers can optionally add tools.
 
 ## Quick start
 
@@ -64,29 +62,25 @@ pkg install curl coreutils tar && (installer=$(mktemp) && curl -fsSL https://git
 ```
 
 The installer resolves the latest release tag once, then fetches every payload
-from that pinned tag. Re-running the same latest-release command above installs
-an upgrade in place after downloading and validating all assets. It replaces
-`$PREFIX/bin/e-agent`. Any different existing Widget shortcut is retained,
-including an older default launcher; only a shortcut identical to the current
-generated template is recognized as unchanged. Use `--force-shortcut` to
-explicitly replace an existing shortcut. Existing config, credentials,
-workspace, token, and other files are not reset.
-To install a particular release, download that release's `install-termux.sh`
-asset and run `bash install-termux.sh --version TAG`; this is an explicit pin,
-not automatic rollback.
+from that pinned tag. Re-running the same command installs an upgrade in place
+after downloading and validating all assets; it replaces `$PREFIX/bin/e-agent`.
+Any different existing Widget shortcut is retained (including an older default
+launcher) — only a shortcut identical to the current generated template counts
+as unchanged — so use `--force-shortcut` to replace one explicitly. Existing
+config, credentials, workspace, token, and other files are not reset. To install
+a particular release, download that release's `install-termux.sh` and run
+`bash install-termux.sh --version TAG`; this is an explicit pin, not automatic
+rollback.
 
-A customized `$HOME/.shortcuts/e-agent-web` is preserved with a notice while
-the binary upgrade proceeds. Only pass `--force-shortcut` when you explicitly
-want the installer to replace that shortcut. The installer does not replace
-Cargo's usual `$HOME/.cargo/bin/e-agent`; a pre-existing `$PREFIX/bin/e` alias
-is also left untouched. Check which executable is selected with
-`command -v e-agent`, and verify the release binary directly with
-`$PREFIX/bin/e-agent --version`. To activate an upgraded binary, run
-`sv restart e-agent-web`. An older foreground server must be stopped first;
-the installer leaves its new service disabled if port 8766 is already occupied
-or its state is uncertain. Only an explicit TCP connection refusal permits
-initial startup; HTTP timeouts, resets and non-HTTP listeners are not treated
-as a free port. The start shortcut applies the same check.
+To activate an upgraded binary, run `sv restart e-agent-web`. The installer does
+not replace Cargo's usual `$HOME/.cargo/bin/e-agent`, and a pre-existing
+`$PREFIX/bin/e` alias is left untouched: check which executable is selected with
+`command -v e-agent` and verify the release binary with
+`$PREFIX/bin/e-agent --version`. An older foreground server must be stopped
+first; the installer leaves its new service disabled if port 8766 is already
+occupied or its state is uncertain. Only an explicit TCP connection refusal
+counts as a free port (timeouts, resets, and non-HTTP listeners do not), and the
+start shortcut applies the same check.
 
 The installer installs `termux-services` if needed and creates
 `$PREFIX/var/service/e-agent-web/run` plus its `log/run` subservice. The Web
@@ -103,31 +97,30 @@ tail -n 100 "$PREFIX/var/log/sv/e-agent-web/current"
 ```
 
 Reinstalling updates generated service files, preserves edited `run`,
-`log/run`, and log rotation settings, and keeps a previously disabled service
-disabled. To change the workspace permanently, edit the service's `run` file
-(default: `$HOME/e-agent-workspace`); changing a Widget's environment does not
+`log/run`, and rotation settings, and keeps a disabled service disabled. To
+change the workspace permanently, edit the service's `run` file (default:
+`$HOME/e-agent-workspace`); changing a Widget's environment does not
 reconfigure an already-running supervisor.
 
-Install Termux:Widget from the same source as Termux. At the end of installation,
-the installer opens its Android shortcut chooser: select `e-agent-web` to add a
-**one-icon (1×1) desktop shortcut** and approve any launcher permission prompt.
-Use the Termux shortcut picker again to add `e-agent-stop` as the second icon.
-The installer places a green play icon (start/open) and a red square icon (stop)
-in `$HOME/.shortcuts/icons`. Custom icons are preserved unless `--force-shortcut`
-is used. If existing desktop shortcuts keep their old icons, remove them from
-the launcher and add them again through the picker.
-Alternatively add/refresh the Termux Widget list. Clicking starts the supervised
-service if needed, waits for authenticated readiness, opens the browser, and
-returns; closing the terminal or browser does not stop the service. The stop
-icon disables and stops the entire e-agent service, forcing termination after
-five seconds if needed. It stays stopped across Termux starts until the start
-icon is clicked again. The stop shortcut then checks port 8766: if it still
-responds or the check is uncertain, it returns an error instead of claiming
-success. A preserved older foreground launcher must be stopped separately;
-the stop shortcut does not kill unmanaged processes. It stops agent execution in that process; it does not
-undo actions already sent to other apps or stop independently detached programs. On first
-visit, paste the server token into the UI. Only an authenticated e-agent server
-on `127.0.0.1:8766` is opened; unrelated services are refused.
+Install Termux:Widget from the same source as Termux. At the end of installation
+the installer opens its shortcut chooser: select `e-agent-web` to add a
+**one-icon (1×1) desktop shortcut** and approve any launcher permission prompt,
+then use the picker again to add `e-agent-stop` as the second icon. The installer
+places a green play icon (start/open) and a red square icon (stop) in
+`$HOME/.shortcuts/icons`; custom icons are preserved unless `--force-shortcut`
+is used, and shortcuts that keep old icons must be removed from the launcher and
+added again. Clicking the start icon (or refreshing the Widget list) starts the
+supervised service if needed, waits for authenticated readiness, opens the
+browser, and returns — closing the terminal or browser does not stop the
+service. The stop icon disables and stops the whole service (forcing termination
+after five seconds if needed) and it stays stopped across Termux starts until
+the start icon is clicked again; it then checks port 8766 and returns an error
+instead of claiming success if it still responds or the check is uncertain. A
+preserved older foreground launcher must be stopped separately — the shortcut
+does not kill unmanaged processes — and it does not undo actions already sent to
+other apps or stop independently detached programs. On first visit, paste the
+server token into the UI; only an authenticated e-agent server on
+`127.0.0.1:8766` is opened, and unrelated services are refused.
 
 The latest port-check and stop-reporting changes have not yet been verified
 on a phone. Earlier service, log and shortcut behavior was checked separately.
@@ -370,15 +363,14 @@ loop_ms = 1200        # default 1200; duration of one idle-row cycle
 ```
 
 Only PNG, JPEG, WebP, and GIF files up to 10 MiB are served. Each sprite-sheet
-row is treated as a separate animation state: `idle_row` stays fixed while
-`idle_frames` controls how many cells in that row play. Remove the `[pet]`
-section (or its `spritesheet` key) to hide the pet entirely. The pet
-remains hidden if config or sprite loading fails, and it is available on narrow
-mobile screens when configured. The config is read live, so saving it and
-reloading the page does not require a server restart. A project `[pet]` section replaces the global section
-wholesale, like `[tui]`; omitted fields use the built-in defaults rather than
-global field values. Sprite files are user-supplied and are never embedded in
-or distributed with e-agent.
+row is one animation state: `idle_row` stays fixed while `idle_frames` controls
+how many cells in that row play. Remove the `[pet]` section (or its
+`spritesheet` key) to hide the pet; it also stays hidden if config or sprite
+loading fails, and it is available on narrow mobile screens when configured. The
+config is read live, so no server restart is needed. A project `[pet]` section
+replaces the global one wholesale, like `[tui]`; omitted fields use built-in
+defaults rather than global values. Sprite files are user-supplied and are never
+embedded in or distributed with e-agent.
 
 ### TUI submit/newline keys
 
@@ -427,16 +419,15 @@ read_only = true
 Audit the workspace and report findings; do not modify anything.
 ```
 
-A read-only role gets no `write_file`/`edit_file` tools. Its `bash`, when the
-sandbox is enabled, runs in a narrowed bubblewrap policy: the workspace is
-mounted read-only, extra writable roots are dropped, and the network is
-disabled (`--unshare-net`). `read_file`, `get_background_tasks`,
-`cancel_background_task`, `web_search` (when configured) and DeepSeek's
-`web_fetch` stay available — both deliberately still reach the network.
-Background bash commands started inside the subagent inherit the role's
-narrowed sandbox too (they never fall back to the parent's wider policy). If
-the sandbox is not enabled (or bwrap is unavailable), a read-only role gets
-**no `bash` tool at all** —
+A read-only role loses the write and edit tools. Its shell, when the sandbox is
+enabled, runs in a narrowed bubblewrap policy: the workspace is mounted
+read-only, extra writable roots are dropped, and the network is disabled
+(`--unshare-net`). Read tools stay available, including the network read tools
+(web search, and DeepSeek's page fetch), which deliberately still reach the
+network. Background bash commands started inside the subagent inherit the
+role's narrowed sandbox too (they never fall back to the parent's wider
+policy). If the sandbox is not enabled (or bwrap is unavailable), a read-only
+role gets **no `bash` tool at all** —
 fail closed rather than an unsandboxed shell.
 
 Read-only is a tool boundary, not a host security framework: it constrains
@@ -446,11 +437,10 @@ host's real `/tmp` (writable for main and subagents alike) and the `$HOME`
 tmpfs remains writable scratch space; the file tools are the
 authoritative write path, and they are absent.
 
-The main session can request the same policy with `--read-only`: no
-write/edit tools, no MCP tools (MCP tools carry no read-only marker), and the
-main bash sandbox narrowed the same way — no bash at all when the sandbox is
-disabled. Delegation stays available (spawning a subagent does not mutate the
-host session), and each subagent resolves its own role template.
+The main session can request the same policy with `--read-only` (MCP tools are
+dropped too, since they carry no read-only marker). Delegation stays available
+(spawning a subagent does not mutate the host session), and each subagent
+resolves its own role template.
 
 `--read-only` narrows **only the main session's own tools**; it is not
 inherited by delegated subagents. A `delegate` subagent with no role override
@@ -480,14 +470,14 @@ Fix the code and run the checks.
 ```
 
 This matters on Windows: the write-sandbox MVP has no way to make `.git`
-read-only, so when `protect_git = true` it fails closed — every shell command
-in a delegated subagent/fixer is rejected before execution with guidance in
-the error message. Setting `protect_git = false` in the role's frontmatter
-(and accepting that `.git` stays writable inside the sandbox) restores a
-working shell for that role. The key defaults to `true` when omitted, so
-For ordinary repositories, `protect_git = false` disables this protection.
-For delegated linked worktrees, the retained Git metadata stays read-only even
-with that opt-out; it does not authorize writable metadata aliases.
+read-only, so with `protect_git = true` every shell command in a delegated
+subagent/fixer is rejected before execution with guidance in the error message.
+Setting `protect_git = false` in the role's frontmatter (accepting that `.git`
+stays writable inside the sandbox) restores a working shell for that role; the
+key defaults to `true` when omitted. For ordinary repositories that opt-out
+disables the protection, but for delegated linked worktrees the retained Git
+metadata stays read-only even then — the opt-out does not authorize writable
+metadata aliases.
 
 The `bash` tool can be sandboxed with `bubblewrap` when it is installed. The
 sandbox is off unless explicitly enabled:
@@ -549,84 +539,61 @@ tool and requires `rocminfo` to enumerate the requested architecture, PyTorch
 to see that HIP device, and a real tensor operation to match the CPU result.
 `--gpu=false` runs the negative control on the same path.
 
-When the sandbox is **enabled**, the workspace itself becomes a logical policy
-entry for the file tools: with `workspace_writable = false` the file tools
-deny writes/edits/removes inside the workspace (reads stay allowed), exactly
-like the read-only Bash mount, while an explicit writable child path still
-wins by the most-specific-entry rule and the workspace entry wins over an
-external ancestor or an equal external destination. When the sandbox is
-**disabled**, the workspace is not a policy entry and the file tools keep the
-historical always-writable workspace (Bash is unsandboxed); external roots
-stay active either way.
-
 `writable_paths` / `readable_paths` define one resolved policy shared by Bash
 mounts and the file tools' external capabilities. A leading `~` expands to the
-home directory; relative paths resolve against the main workspace. Existing
-file/directory roots are canonicalized (including symlink aliases); only
-identical (canonical source, configured destination) pairs are deduplicated,
-while two configured aliases of the same canonical source with different
-destinations are both preserved as separate mount entries (the canonical
-authority itself is never duplicated — the path vectors still deduplicate by
-source). Missing global roots are skipped. Each configured root is
-kept as a **(canonical source, configured logical destination)** pair: Bash
-mounts the canonical source at the configured destination, and the file tools
-open their capability from the canonical source but look up absolute paths by
-the configured logical destination (the path the user wrote, before
-canonicalization). Lookup is lexical — the input path is never ambiently
-canonicalized — and picks the single most-specific logical winner among all
-entries; an equal destination
-resolves to the workspace entry. The winner's mode is then enforced: a
-writable operation against a most-specific read-only winner is rejected
-outright and never falls back to a broader writable parent (reads select the
-same winner). The same canonical source can therefore exist
-independently as a canonical read-write entry and an alias read-only entry
+home directory; relative paths resolve against the main workspace; missing
+global roots are skipped. Each configured root is kept as a **(canonical
+source, configured logical destination)** pair: Bash mounts the canonical source
+at the configured destination, and the file tools look up absolute paths by the
+configured logical destination (the path the user wrote), lexically — the input
+path is never ambiently canonicalized. The single most-specific logical winner
+decides, with an equal destination resolving to the workspace entry; a writable
+operation against a most-specific read-only winner is rejected outright and
+never falls back to a broader writable parent. The same canonical source can
+therefore exist as a canonical read-write entry and an alias read-only entry
 (e.g. a `~/.cargo` symlink onto a canonical writable root: the alias stays
 read-only while the canonical path stays writable).
 
-A project-local `<workspace>/.e-agent/config.toml` merges with these global
-roots instead of replacing them. A project path that is a strict subpath of a
-global root replaces that global root (narrowing it — the global ancestor is
-dropped, so only the project subpath remains), while a project path with no
-ancestor relationship is accumulated alongside the global roots. A project
-path equal to a global root is a no-op, and multiple project subpaths of the
-same global root all survive as separate narrowing points. An absent
-file/section — or a `[sandbox]` with no paths — inherits all global roots
-unchanged. If either path field appears, selection mode applies and the other
-field is empty. Readable selections may come from global readable or writable
-roots (downgrading authority), while writable selections must come from global
-writable roots: the user-level `[sandbox]` defines the authorized roots, and a
-project can only narrow or accumulate within them — it can never widen them.
-A project path outside every global root is a startup error naming the
-offending path and the fix: add that path or an ancestor to the user-level
-`[sandbox]` (e.g. `writable_paths` for writes), or remove/narrow the
-project-local entry. With no user-level `[sandbox]` at all, project path
-fields are rejected with the same guidance; project scalar overrides such as
-`enabled = true` still apply without any global `[sandbox]`. Malformed or
-unreadable project config is a startup error. The project `[sandbox]` scalars
-`enabled`, `network`, and `workspace_writable` override the global keys
-per-key: a key present in the project config replaces the global value, and
-absent project keys keep the global values (so a project can turn the sandbox
-on or off, or flip only the network policy, without restating the paths). A
-read-only child under a
-writable parent is rejected rather than silently restoring write authority;
-select a narrower writable root or downgrade the whole selected root instead.
-After narrowing, the configured mounts are filtered by the final canonical
-roots: a stale mount whose canonical source is no longer inside any final
-writable root (a narrowed-away global writable parent) is dropped so Bash
-cannot regain the removed authority through the stale bind, while unrelated
-global mounts and independent read-only alias mounts whose source lies inside
-a final writable root survive.
+When the sandbox is **enabled**, the workspace itself becomes a policy entry:
+`workspace_writable = false` makes the file tools deny writes/edits/removes
+inside the workspace (reads stay allowed), exactly like the read-only Bash
+mount, while an explicit writable child path still wins by the most-specific
+rule. When the sandbox is **disabled**, the workspace is not a policy entry and
+the file tools keep the always-writable workspace; external roots stay active
+either way.
+
+A project-local `<workspace>/.e-agent/config.toml` merges with the global roots
+instead of replacing them: a project path that is a strict subpath of a global
+root replaces (narrows) that root, unrelated project paths accumulate, an equal
+path is a no-op, and an absent file/section inherits the global roots unchanged.
+If either path field appears, selection mode applies and the other field is
+empty: readable selections may downgrade global writable roots, but writable
+selections must come from global writable roots — the user-level `[sandbox]`
+defines the authorized roots, and a project can only narrow or accumulate
+within them, never widen them. A project path outside every global root is a
+startup error naming the offending path and the fix (add that path or an
+ancestor to the user-level `[sandbox]`, or remove/narrow the project entry);
+with no user-level `[sandbox]` at all, project path fields are rejected with the
+same guidance, while project scalar overrides such as `enabled = true` still
+apply. Malformed or unreadable project config is a startup error. The project
+scalars `enabled`, `network`, and `workspace_writable` override the global keys
+per-key, so a project can flip one policy without restating the paths. After
+narrowing, mounts are filtered by the final canonical roots: a stale mount whose
+source is no longer inside any final writable root is dropped so Bash cannot
+regain the removed authority through a stale bind, while unrelated global mounts
+and read-only alias mounts inside a final writable root survive.
+
 The exact workspace-relative `.e-agent/config.toml` policy file is readable by
 file tools but write/edit protected and must be changed by the user outside the
 agent. Bash binds an existing policy over `/dev/null`; if only `.e-agent/`
 exists, that directory is mounted read-only so a writable child cannot create
 the policy. If neither exists, no mountpoint is needed or created.
 
-Note that the sandbox hides all of `$HOME` behind a fresh tmpfs and then
-binds in only the workspace and these extra paths — so personal files such as
+Note that the sandbox hides all of `$HOME` behind a fresh tmpfs and then binds
+in only the workspace and these extra paths — so personal files such as
 `~/.ssh`, `~/.gitconfig`, or `~/.config` are NOT visible inside the sandbox
-unless explicitly listed in `readable_paths`. Toolchains installed under
-`$HOME` (rustup, pyenv, nvm, ...) must be listed for the agent to use them.
+unless explicitly listed in `readable_paths`. Toolchains installed under `$HOME`
+(rustup, pyenv, nvm, ...) must be listed for the agent to use them.
 
 See "Safety boundaries" for what the sandbox does and does not constrain.
 
@@ -657,102 +624,51 @@ persistence to GreptimeDB as well (see the backend sections below). Without `--s
 fresh unique session ID. History is restored for
 model context on startup, while display projections are replayed in the TUI;
 the model only sees the latest compaction summary and everything after it.
-`Notice` is a durable notification delivered to the model. `Display` is a
-live/session-log presentation event only, never model input or a persisted
-`SessionEntry`; compaction and fork displays are reconstructed from their
-existing durable entries. This adds no `SessionEntry` migration. Legacy `.json`
-sessions are migrated on first load. `--version` (or `-V`) prints the exact
-package build version without loading the workspace or configuration. Optional CLI overrides
-are `--base-url URL`, `--model MODEL`, `--profile PROFILE`, `--workspace PATH`, `--session NAME`,
-`--fork SESSION`, `--at N`, and `--max-rounds N` (tool-call rounds are unlimited by default;
-the flag sets an explicit cap). `--read-only` applies the read-only role policy to the main
-session (see "Read-only roles").
+Compaction and fork displays are reconstructed from their durable entries, so no
+session migration is needed; legacy `.json` sessions are migrated on first load.
+`--version` (or `-V`) prints the exact package build version without loading the
+workspace or configuration. Optional CLI overrides are `--base-url URL`,
+`--model MODEL`, `--profile PROFILE`, `--workspace PATH`, `--session NAME`,
+`--fork SESSION`, `--at N`, and `--max-rounds N` (tool-call rounds are unlimited
+by default; the flag sets an explicit cap). `--read-only` applies the read-only
+role policy to the main session (see "Read-only roles").
 `--profile` selects a TOML profile and requires a TOML config. When config is
 used, `--base-url` and `--model` are raw API wire-value overrides and take
 precedence over the selected profile values.
 
 ### Forking a session
 
-`e-agent --fork <session-id> [--at <n>] [PROMPT]` starts a brand-new session that
-inherits the source session's history up to a completed turn. The fork is
-**marker + read-through, never a copy**: the new session's own storage holds
-only its own frozen goal (when the source has one at or before the cut) plus a
-`ForkedFrom` marker, and its history is rebuilt at load time by reading the
-source read-only.
+`e-agent --fork <session-id> [--at <n>] [PROMPT]` starts a brand-new session
+that inherits the source session's history up to a completed turn. The fork is
+read-through, never a copy: the new session stores its own entries plus a
+marker naming where it was cut, and rebuilds the inherited prefix by reading
+the source read-only.
 
-The marker pins the cut ROW, not a position: it names the session that
-physically stores that row — an ancestor, when the cut lands inside a prefix the
-source itself only inherits — together with that row's backend key (`seq`, plus
-`event_time` on the SQL backends; JSONL pins its 0-based ordinal and claims only
-the append-only guarantee, so a same-ordinal rewrite is not detected). Loading
-reads that owner's last compaction at or before the cut through the cut itself
-and drops everything after it, so later appends — including later compactions —
-never appear in the fork, and an owner's older segments are paged in only when
-the cut sits behind its newest compaction. A source rewrite that moves the
-pinned row fails closed, as does a SQL row whose `event_time` changed, and
-nothing is ever loaded as a silently truncated transcript. Markers written by
-older builds recorded a 1-based entry count instead of a row key; those rows
-keep loading positionally, and the ambiguity of the very first copy-based
-layout still fails closed instead of guessing.
+The prefix ends at (and includes) the last completed turn — an assistant
+message with no pending tool calls, or a compaction — and drops everything
+after it (background-completion notices, for example). `--at <n>` picks the
+fork point explicitly: `n` is 1-based and inclusive, and it must land on a turn
+boundary, otherwise the fork fails rather than cutting mid-turn. Without a
+completed turn in the source, the fork fails; if the source is deleted,
+rewritten, or unreadable, loading the fork fails closed with an explicit error
+naming the source — never a silently truncated transcript. The newest goal at
+or before the cut is frozen into the fork, so a fork starts with the goal it
+inherited. Forking a fork resolves the whole chain.
 
-Neither creating nor opening a fork loads the whole transcript. The DEFAULT cut
-is selected from the physical located head (the last compaction and everything
-after it) and its owner+key carried forward; the child then initializes from
-that head — or from the resolved inherited context when it is a zero-copy
-child, which is also prepended when the cut is the child's OWN completed turn —
-and reads older rows only on demand. Because a head omits the rows a compaction
-summarized and a `GoalUpdated` is never inside the summary, both a fresh fork
-and a resume restore the newest goal (or clear tombstone) at or before the cut
-separately, as projection state only: no history entry is fabricated. An
-explicit `--at` stays a 1-based index over the RESOLVED transcript and may page
-older segments. JSONL is always parsed in full (its lower bound) and a legacy
-whole-document session is still read whole because it is rewritten in place.
+The new session has fresh token accounting (usage counters start at zero) and is
+resumed or forked again like any other session. The new id is printed as
+`e-agent: forked session: <id>`; `--fork` and `--session` are mutually
+exclusive, and `--at` cannot be used without `--fork`. JSONL, GreptimeDB, and
+SQLite backends behave equivalently.
 
-The fork keeps the source's prefix up to (and including) the last completed
-turn — an assistant message with no pending tool calls, or a compaction — and
-drops anything after it (background-completion notices, for example). `--at
-<n>` picks the fork point explicitly: `n` is 1-based and inclusive over the
-RESOLVED transcript, and it must land on a turn boundary, otherwise the fork
-fails rather than cutting mid-turn. Because the inherited context starts at a
-compaction and a `GoalUpdated` is not embedded in a compaction summary, the
-newest goal at or before the cut is frozen into the fork as its own entry, so a
-head-only load never drops it. Without a completed turn in the source, the fork
-fails; if the source is deleted or unreadable, loading the fork fails closed
-with an error naming the source. Forking a fork resolves the whole chain.
-
-The marker is display/audit only: it is rendered as a dim notice in the TUI and
-is never sent to the provider on the model wire. The forked session has fresh
-token accounting (usage counters start at zero) and is resumed or forked again
-like any other session. The new id is printed as `e-agent: forked session:
-<id>`; `--fork` is mutually exclusive with `--session` and cannot be combined
-with `--at` without `--fork`. JSONL, GreptimeDB, and SQLite backends behave
-equivalently.
-
-Non-goals / known boundaries of the read-through fork: inherited parent entries
-have no receipt (`eout1` refs are session-local numeric ids, so no ref is issued
-for them — their oversized fields stay full in the request instead of being
-truncated), the model context never replays rows that a compaction already
-summarized, the web/TUI transcript *pager* lists the child's own physical rows
-plus, for an inherited context, the owner's rows below it: the head page carries
-the owner's cursor (`next_older_session`/`before_session`) so older owner
-segments stay readable on demand, following pinned markers across ancestry: every
-continuation keeps the owning session (`next_older_session`), and crossing into a
-prefix includes that ancestor's own pinned cut row (a compaction summarized it, so
-nothing else materialized it) while still excluding later rows. A web row's
-physical identity includes its owning session, because backend keys restart per
-session (JSONL ordinals especially), so identical ordinals in an ancestor and in a
-child are two distinct rows. The pager stops at a legacy positional prefix (it has
-no physical cursor of its own),
-and a compaction never copies inherited messages into the fork: a retained tail
-that would reach into the inherited prefix is clamped up to the inherited
-boundary, so inherited messages are summarized in the compaction request while
-`retained` stays the fork's own messages — a fork compacts with a shorter, or
-when it has no own assistant message yet, empty retained tail instead of
-failing closed. Marker-first copies written by the original copy layout are
-ambiguous when their stored prefix matches the source prefix; they fail closed
-rather than guessing, and a marker-first copy whose source is gone cannot be
-compared. A pinned marker carries no descriptors, watermarks, or view ids: it is
-one session id plus one backend key.
+Known boundaries of a read-through fork: inherited parent entries have no
+receipt (`eout1` refs are session-local, so oversized inherited fields stay
+full in the request instead of being truncated), the model context never
+replays rows a compaction already summarized, and older inherited segments are
+read on demand rather than loaded up front. A compaction never copies inherited
+messages into the fork: a retained tail that would reach into the inherited
+prefix is clamped to that boundary, so inherited messages are summarized while
+`retained` stays the fork's own messages.
 
 ### TUI commands
 
@@ -773,11 +689,11 @@ command set through its slash-command menu):
 - `/model <profile> [effort|default|omit]` — switch the session's model at
   runtime (not listed by bare `/help`; the profile must be resolvable from the
   config). The optional second token overrides `reasoning_effort` for this
-  session only: a literal value is sent as-is, `default` clears the override,
-  and `omit` leaves the field out of the request entirely (for Codex that
-  removes the whole `reasoning` object, including its explicit summary
-  request). Switching profile without a token uses that profile's configured
-  effort and clears any previous override. The override is in memory only.
+  session only: a literal value is sent as-is, `default` clears the override, and
+  `omit` leaves the field out of the request entirely (for Codex that removes the
+  whole `reasoning` object, including its summary request). Switching profile
+  without a token uses that profile's configured effort and clears any previous
+  override; the override is in memory only.
 
 The TUI renders with a truecolor (24-bit) Solarized Light palette; terminals
 without truecolor support may render colors incorrectly.
@@ -796,25 +712,14 @@ The title is never persisted or used as a session key. Users who prefer an
 explicit label can override it with `zellij action rename-pane
 "<custom>"` at any time — Zellij's own title takes precedence.
 
-The built-in local tool set always includes the capability-relative file tools
-`read_file`, `write_file`, and `edit_file`, plus the `notes` tool rooted at
-`.e-agent/notes`. Notes provide `list`, `search`, `read`, and `write` (write is
-unavailable to read-only roles). List and search return deterministic pages and
-keep at most one process-local cursor per tool instance; starting another list
-or search replaces it. Cursors are not persisted or shared across restarts.
-`read` uses stateless UTF-8 byte-offset paging and rejects offsets inside a
-codepoint. List and search retain their normal `notes`/`results` arrays while
-adding `incomplete` and machine-readable `errors` (`path`, `reason`) when a
-note or traversal entry cannot be processed; those diagnostics remain on every
-cursor page. Paths are relative to the notes root and use the existing Workspace
-capability and symlink authorization; notes do not add a second path subsystem.
-
-The built-in local tool set always includes the capability-relative file tools
-`read_file`, `write_file`, and `edit_file`, plus `bash`,
-`get_background_tasks`, and `cancel_background_task`. Main-agent sessions also
-register `delegate`; delegated subagents do not, which caps delegation depth at
-1. `web_search` is registered for either kind of session when a backend is
-configured:
+The built-in local tool set is small and capability-based: capability-relative
+workspace file tools (read/write/edit) rooted at the canonical workspace,
+persistent project notes under `.e-agent/notes` with deterministic,
+non-persisted paging (write is unavailable to read-only roles), shell execution
+with background-task listing and cancellation, and main-session delegation —
+only the main agent can delegate, which caps delegation depth at 1. Web search
+(plus DeepSeek's page fetch) is added to either kind of session when a backend
+is configured:
 
 ```toml
 [web_search]
@@ -893,31 +798,23 @@ ends the turn.
 ## Safety boundaries
 
 The workspace and configured external capabilities constrain only the agent's
-file tools. Relative paths use the workspace; absolute paths require an
-authorized external root, matched by the configured logical destination (the
-canonical source backs the capability; the input path is never canonicalized).
-Readable roots permit reads, while
-writable roots permit read/write/edit. For a writable operation the
-most-specific logical winner decides: a read-only winner (e.g. a read-only
-child under a writable parent) rejects the operation outright rather than
-falling back to a broader writable root, and an exact read-only file denies
-only itself — its siblings follow the parent's own policy. Exact-file roots do not grant authority
-to siblings. Directory capabilities permit symlinks that remain inside their
-root and reject symlink escapes. Exact-file capabilities use a durable handle
-opened at startup: if the trusted host renames or replaces that pathname, file
-tools still address the original inode, while Bash resolves and mounts the
-pathname on each invocation. The trusted host should keep configured roots
+file tools, and they are not a process sandbox. Relative paths use the
+workspace; absolute paths require an authorized external root, matched by the
+configured logical destination (the canonical source backs the capability; the
+input path is never canonicalized). Reads need a readable root, writes and edits
+need a writable one, and a read-only winner rejects a writable operation outright
+rather than falling back to a broader writable root while an exact read-only file
+denies only itself (see the sandbox policy rules above). Directory capabilities
+permit symlinks that stay inside their root and reject symlink escapes.
+Exact-file capabilities use a durable handle opened at startup, so file tools
+keep addressing the original inode if the trusted host renames or replaces that
+pathname (Bash resolves the pathname on each invocation) — keep configured roots
 stable for the run. Delegated custom workspaces must be canonical directories
 inside the startup workspace or an authorized writable external directory;
-read-only and exact-file capabilities cannot be rerooted, configured alias
-destinations never extend reroot, and when the sandbox is enabled a read-only
-workspace is not writable provenance either — reroot then derives only from
-writable canonical directory capabilities (an explicit writable canonical
-child of a read-only workspace still reroots through its external
-capability). Capabilities do not
-constrain hardlink inode origins or hardlink aliases to the protected project
-policy file, do not make read/edit sequences atomic, and are not a process
-sandbox.
+read-only and exact-file capabilities cannot be rerooted, and configured alias
+destinations never extend reroot. Capabilities do not constrain hardlink inode
+origins or hardlink aliases to the protected project policy file, do not make
+read/edit sequences atomic, and do not isolate the agent process.
 
 `bash` runs `/bin/bash -lc` with the workspace as its current directory. By
 default it is not sandboxed: commands can access files outside the workspace,
@@ -941,44 +838,38 @@ for the explicitly stripped credential variables (`EXA_API_KEY`,
 `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY`,
 and `KIMI_API_KEY`), parent-process environment variables remain visible to the
 child process; this is not read or secret isolation. Locations already writable
-through Everyone or the current logon SID, including
-some public locations, may remain writable. Only existing canonical directory paths on
-fixed local NTFS volumes are accepted. UNC/device paths, non-directory roots,
-roots that are symlinks/reparse points, NULL DACLs, and case-sensitive roots
-are rejected. Before the first installation (or a versioned ACE upgrade), every
-write root that needs its complete inheritable capability ACE is scanned without
-following links. Hard-linked file descendants whose aliases all stay inside the
-write roots are allowed; a hardlink that aliases a file outside the write roots
-(out-of-bounds) is rejected with every alias path listed. Nested
-symlink/reparse point descendants are unsupported and rejected. Once the exact current-version ACE is
-installed, later commands skip both ACL propagation and that root's full-tree
-scan. The ACE grants create/overwrite plus child rename/delete/atomic replace
-through `FILE_DELETE_CHILD` inherited by directories, without granting `DELETE`
-on the write root itself. Concurrent path replacement races (TOCTOU) remain a
-risk. In practice this makes cargo's `link_or_copy` (which hardlinks cached
-files, e.g. from `~/.cargo/registry/src`, into the build target directory)
-work when every alias stays inside the write roots — for example a writable
-workspace plus `~/.cargo/registry` as a narrowed write root instead of the
-broader `~/.cargo`. A hardlink that would alias a file outside the write roots
-is still rejected with all alias paths listed, so align the write roots with
-the locations the build actually shares. Windows shell
-execution with protected Git metadata (`protect_git = true`, used by delegated
-subagents/fixers) is unsupported and fails closed before token or ACL changes
-with actionable guidance in the error message; there is no `.git` ACL
-carve-out. A role template can opt out per role with `protect_git = false` in
-its frontmatter (see "Role frontmatter: `protect_git`" above), restoring a
-working shell for that role under the Windows sandbox.
+through Everyone or the current logon SID, including some public locations, may
+remain writable.
 
-Synthetic capability allow ACEs persist after successful execution. If adding
-an ACE to a later root fails, ACEs already added to earlier roots may also
-remain; the process is not started and no whole-DACL rollback is attempted.
-These synthetic SID ACEs are inert for ordinary tokens that do not contain the
-SID, but administrators may need to remove them manually. Cancellation,
-timeout, and running-task registry teardown currently terminate only the
-top-level process. Descendants may keep running with the capability and continue
-writing the allowed roots. Atomic assignment to a Job Object, with process-tree
-termination on cancellation, timeout, and registry teardown, is a future
-lifecycle enhancement.
+Only existing canonical directory paths on fixed local NTFS volumes are
+accepted: UNC/device paths, non-directory roots, symlinks/reparse points, NULL
+DACLs, and case-sensitive roots are rejected. The first run (or a versioned ACE
+upgrade) of each write root scans its tree without following links; later
+commands skip that scan because the exact current-version ACE is installed. The
+ACE grants create/overwrite plus child rename/delete/atomic replace through
+`FILE_DELETE_CHILD` inherited by directories, without granting `DELETE` on the
+write root itself. Hard-linked file descendants whose aliases all stay inside
+the write roots are allowed — this is what makes cargo's `link_or_copy` work
+with a narrowed `~/.cargo/registry` write root instead of the broader
+`~/.cargo` — while a hardlink that aliases a file outside the write roots is
+rejected with every alias path listed, so align the write roots with the
+locations the build actually shares. Nested symlink/reparse point descendants
+are unsupported and rejected. Concurrent path replacement races (TOCTOU) remain
+a risk.
+
+Consequences: synthetic capability allow ACEs persist after successful
+execution, and a failure on a later root leaves the earlier ones in place (the
+process is not started and no whole-DACL rollback is attempted); these SID ACEs
+are inert for ordinary tokens, but administrators may need to remove them
+manually. Cancellation, timeout, and running-task registry teardown terminate
+only the top-level process, so descendants may keep running with the capability
+and keep writing the allowed roots; Job Object assignment with process-tree
+termination is a future enhancement. Windows shell execution with protected Git
+metadata (`protect_git = true`, used by delegated subagents/fixers) is
+unsupported and fails closed before token or ACL changes with actionable
+guidance in the error message; there is no `.git` ACL carve-out, and a role can
+opt out with `protect_git = false` in its frontmatter (see "Role frontmatter:
+`protect_git`" above), restoring a working shell for that role.
 
 On Linux/macOS every `bash` call—main agent and subagents alike—is wrapped in
 `bwrap`: system directories are mounted read-only, the workspace is mounted
@@ -988,35 +879,47 @@ host's real `/tmp` (bound writable for main-agent and subagent Bash alike),
 blocked via `--new-session`. Network stays available by default; `network = false` unshares
 it. When the host uses systemd-resolved, the stub resolver at
 `/run/systemd/resolve` is mounted read-only so DNS resolution via the symlinked
-`/etc/resolv.conf` works inside the sandbox. With `gpu = true` the sandbox
-also exposes the host GPU device nodes (AMD `/dev/kfd` + `/dev/dri`, NVIDIA
-`/dev/nvidia*`) and the read-only AMD ROCm sysfs subtrees (`/sys/devices`,
-`/sys/dev/char`, `/sys/module/amdgpu`) the runtime reads to enumerate real
-devices; that enlarges the kernel/driver attack surface and shares the GPUs —
-a resource with no per-command isolation — with model-generated code. It is
-off by default and can only be enabled in the global config. The restriction
-constrains the spawned command, not the agent process itself. It is
-best-effort: bwrap is not setuid, the host network is shared by default, and
-environment variables of the parent process other than the stripped credential
-names (`EXA_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
-`DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY`, `KIMI_API_KEY`) remain visible.
+`/etc/resolv.conf` works inside the sandbox. `gpu = true` (off by default and
+global-config only) additionally exposes the host GPU device nodes and the
+AMD ROCm sysfs subtrees described under `gpu` in the sandbox config; that
+enlarges the kernel/driver attack surface and shares GPUs — a resource with no
+per-command isolation — with model-generated code. The restriction constrains
+the spawned command, not the agent process itself. It is best-effort: bwrap is
+not setuid, the host network is shared by default, and environment variables of
+the parent process other than the stripped credential names listed above remain
+visible.
 
-On Linux/Android, the workspace `.git` entry depends on the role. The main
-agent leaves it writable for repository operations. Delegated subagents/fixers
-bind `<workspace>/.git` read-only after writable mounts. For a linked worktree,
-the `.git` pointer and caller-authorized main-worktree metadata and administrative
-paths are read-only, while normal workspace files remain writable; writable
-aliases to protected metadata are rejected. This does not authorize other
-repositories or external object stores. Background commands inherit the
-parent's role.
+On Linux/Android, the workspace `.git` entry depends on the role: the main agent
+leaves it writable for repository operations, while delegated subagents/fixers
+bind it read-only (for a linked worktree, the `.git` pointer plus the
+caller-authorized main-worktree metadata and administrative paths, with
+writable aliases rejected) and normal workspace files stay writable. This does
+not authorize other repositories or external object stores. Background commands
+inherit the parent's role.
 
 ### Code mode: `run_rust` (experimental)
 
 `[code_mode] enabled = true` in the **user-level** config (a project `.e-agent/config.toml` cannot carry it) registers the experimental `run_rust` tool for the **main agent only** — subagents never inherit it; read-only main sessions get it only when a `[sandbox]` policy exists to narrow. It compiles one model-supplied Rust source (edition 2021, std only, ≤ 128 KiB) and runs it, both stages in a forced Linux bubblewrap sandbox:
 
-- Inherits the resolved `[sandbox]` policy: workspace per `workspace_writable`, configured paths/mounts keep their semantics, `.git` always read-only, network always off, minimal PATH/locale env (credentials never set). Anonymous `/tmp` writes land in a private 0700 scratch (`<tmp>/e-agent-run-rust-*`) mounted as the sandbox `/tmp`, removed only after confirmed teardown (bwrap reaped + process group gone) by descriptor-relative `O_NOFOLLOW` removal (chmod only ever targets pinned directory fds; the final unlink verifies the created inode identity); on any teardown uncertainty the scratch is retained/quarantined and reported, never force-deleted. Hostile swaps or chmod-000 trees can fail or retry cleanup but never follow or mutate anything outside it; authorized real-path writes land on the host.
-- The compile stage mounts the host rustc/rustup toolchain and runs with its PATH/RUSTUP_HOME; the run stage gets PATH `/bin:/usr/bin` and no toolchain mounts added by run_rust, so Cargo/toolchain is not supplied on the run-stage PATH/mounts (the prebuilt `/tmp/runner` and `/tmp/main` still run on system runtime libraries; no claim against a user-supplied cargo binary invoked by explicit path). No Cargo/crates, stdin, background/daemon execution, or custom env/mount/cwd/timeout; 60-second compile / 30-second run timeouts kill the group, reap, bound the drain, and confirm the group is gone before removing the scratch (uncertain teardown retains/quarantines it); output capped at 24 KiB head + 8 KiB tail. The run status is an in-sandbox wrapper over a private inherited socketpair (dumpable-off + CLOEXEC before exec, so no descendant can forge; exactly one packet then EOF, gated on outer bwrap exit 0), so an explicit `process::exit(134)` is never misreported as a signal; the result reports the source SHA-256, the stable commands, both stage statuses and captured output — the source text is not repeated.
-- Enabling `[code_mode]` fails closed at startup without Linux+bwrap+rustc; experimental, Linux-only, main-agent-only, no sandbox-escape model claimed beyond the exact bwrap policy above.
+- Inherits the resolved `[sandbox]` policy: workspace per `workspace_writable`,
+  configured paths/mounts keep their semantics, `.git` always read-only, network
+  always off, minimal PATH/locale env, and no credentials. Anonymous `/tmp`
+  writes land in a private 0700 scratch that is removed only after confirmed
+  teardown; on any teardown uncertainty it is retained/quarantined and reported,
+  never force-deleted, so cleanup can fail but never follows links or mutates
+  anything outside it. Authorized real-path writes land on the host.
+- The compile stage mounts the host rustc/rustup toolchain; the run stage gets
+  PATH `/bin:/usr/bin` and no toolchain mounts added by `run_rust`, so
+  Cargo/crates are not supplied at run time (a prebuilt binary still runs on
+  system runtime libraries). No Cargo/crates, stdin, background/daemon
+  execution, or custom env/mount/cwd/timeout; 60-second compile and 30-second run
+  timeouts kill the process group, reap, and confirm the group is gone before
+  removing the scratch; output is capped at 24 KiB head + 8 KiB tail. The result
+  reports the source SHA-256, the stable commands, both stage statuses, and
+  captured output — the source text is not repeated.
+- Enabling `[code_mode]` fails closed at startup without Linux+bwrap+rustc;
+  experimental, Linux-only, main-agent-only, with no sandbox-escape model claimed
+  beyond that bwrap policy.
 
 Every `web_search` query is disclosed to the configured backend — Exa, the
 SearXNG instance from `[web_search] base_url` (which forwards it to its
@@ -1033,19 +936,16 @@ cannot guarantee that a model will not disclose sensitive context.
 
 The `bash` tool accepts `background: true` to run a command without blocking.
 Bash tasks and subagents share one running-task registry with no built-in
-concurrency limit. Each bash task starts a process; subagents run as independent
-SessionRunner tasks on the shared Tokio runtime. Callers remain responsible for
-resource use. Background bash has
-the same workspace cwd, process-group handling, and per-stream 64 KiB output
-limit as foreground Bash, with a 30-minute timeout.
-Completions surface as a TUI notification while a
-turn is active, and the complete output is injected as a clearly labelled user
-message at the next model call — whether that is the next round of an active
-turn or, if the agent is idle, a new turn started by that delivery. F2 toggles
-a tasks panel listing what is running. In
-one-shot mode a still-running task is reported before exit;
-the process then best-effort terminates its process group. Uninjected background
-results are not persisted in sessions.
+concurrency limit; callers remain responsible for resource use. Background bash
+has the same workspace cwd, process-group handling, and per-stream 64 KiB output
+limit as foreground Bash, with a 30-minute timeout. Completions surface as a TUI
+notification while a turn is active, and the complete output is injected as a
+clearly labelled user message at the next model call — whether that is the next
+round of an active turn or, if the agent is idle, a new turn started by that
+delivery. F2 toggles a tasks panel listing what is running. In one-shot mode a
+still-running task is reported before exit; the process then best-effort
+terminates its process group. Uninjected background results are not persisted in
+sessions.
 
 A `FinishWhenIdle` session (a delegated subagent, or a one-shot CLI session)
 that finished its work waits indefinitely for its blocking background tasks
@@ -1067,35 +967,30 @@ The `delegate` tool spawns a subagent with a fresh context to work on a
 self-contained task. Use it for subtasks whose intermediate steps (searching,
 reading many files, focused edits) would clutter the main context.
 
-Each subagent runs as an independent `SessionRunner` task on the shared Tokio
-runtime with an empty history. Its isolated Agent state and event log are
-exposed through a `SessionHandle`, while the parent's running-task registry
-remains shared so nested background bash commands stay visible and report
-completion to the parent. It gets the same builtins as its parent: file/bash
-tools and, when
-configured, `web_search`; no MCP tools and no `delegate` itself, so delegation
-depth is capped at 1 by construction. Tool rounds are unlimited.
+Each subagent runs as an independent background task with an empty history and
+its own isolated agent state and event log; the parent's running-task registry
+stays shared, so nested background bash commands remain visible and report
+completion to the parent. It gets the same builtins as its parent — file and
+bash tools plus, when configured, web search — but no MCP tools and no
+`delegate` itself, so delegation depth is capped at 1 by construction. Tool
+rounds are unlimited.
 
 `fork: true` is the one explicit exception to that empty history. The child
 starts from the parent's **completed-turn prefix** (the in-flight turn is
-excluded, so put everything the child needs in `task`). It stores only a
-`ForkedFrom` marker — the prefix is read back from the parent session — so
-spawning a fork writes O(1) entries, never the parent history. It runs on the
-parent's **current** model, inheriting the parent's system prompt and MCP tool
-set, and the parent's goal is frozen into the request head. A fork does not
-expose the parent's main-only tools, so its tool set matches the parent's only
-when the parent exposed no such tool; the named exception is documented with
-the `delegate` tool. `workspace` is optional and defaults to the parent root:
-with that default, and when parent and child expose the same tool set, the
-child's request is a byte-identical prefix and reuses the parent's
-provider-side prompt cache. An explicit different `workspace` is allowed and
-only moves the child's file/bash tools and MCP connections there — the model,
-history prefix and goal still come from the parent — so such a request is no
-longer guaranteed to be a byte-identical prefix or a cache hit. A fork still
-cannot delegate further or ask the user questions. Constraints: `fork` is
-mutually exclusive with `role` and `resume`; the parent must have a completed
-turn (a mid-turn compaction is rejected). This is the only case where a
-subagent gets MCP tools.
+excluded, so put everything the child needs in `task`) and reads that prefix
+back from the parent session, so spawning a fork does not copy the parent
+history. It runs on the parent's **current** model, inheriting the parent's
+system prompt and MCP tool set, and the parent's goal is frozen into its
+request. A fork does not expose the parent's main-only tools, so its tool set
+matches the parent's only when the parent exposed no such tool. `workspace` is
+optional and defaults to the parent root: with that default and an identical
+tool set the child's request reuses the parent's provider-side prompt cache; an
+explicit different `workspace` only moves the child's file/bash tools and MCP
+connections there, so the prefix and cache hit are no longer guaranteed. A fork
+still cannot delegate further or ask the user questions. Constraints: `fork` is
+mutually exclusive with `role` and `resume`, and the parent must have a
+completed turn (a mid-turn compaction is rejected). This is the only case where
+a subagent gets MCP tools.
 
 Subagents always run in the background without blocking the main agent; there
 is no foreground mode. The immediate tool result includes both the background
@@ -1133,17 +1028,11 @@ Use `/compact` in the TUI or `--repl` to manually summarize earlier history.
 The agent summarizes everything before a bounded tail of the most recent
 messages and appends a compaction entry (summary plus that retained tail) to
 the append-only session log; earlier messages stay persisted and visible in the
-TUI. The tail is sized by message count (`RETAIN_TAIL`); a context no longer
-than that keeps half of itself so it stays compactable. The cut is aligned to
-an assistant boundary so a tool batch is never split, which can extend the tail
-past that count when user-shaped notices follow the last assistant. In a
-zero-copy fork the tail is additionally clamped up to the inherited boundary,
-so parent messages are only ever summarized and never retained (see "Forking a
-session"). The current user prompt gets no special treatment: it is projected
-like any other field, and its full text remains retrievable from the durable
-session. Subsequent model calls use the latest summary plus everything after
-it. When a configured model profile provides a context window, the agent also
-compacts automatically at 80% usage.
+TUI. The cut never splits a tool batch, and in a zero-copy fork the tail is
+clamped to the inherited boundary so parent messages are only ever summarized
+(see "Forking a session"). Subsequent model calls use the latest summary plus
+everything after it. When a configured model profile provides a context window,
+the agent also compacts automatically at 80% usage.
 
 ## Session goals
 
@@ -1157,72 +1046,68 @@ verifier). Fields: `id`, `revision`, `objective`, `success_criteria`,
   `POST /api/sessions/{id}/goal` with `{"action":"set","objective":…}`.
   Creation is rejected while a non-completed goal exists; a completed or
   cleared goal frees the slot. The model never creates goals.
-- **Model updates**: the `get_goal` and `update_goal` tools read the current
-  goal and apply transitions (`progress`, `pause`, `resume`, `block`,
-  `complete`, `clear`) under an `id` + `revision` CAS; `get_goal` returns
-  the FULL machine-usable snapshot (all fields as JSON), while the provider
-  context keeps a short ≤400-char projection. `update_goal` can replace
-  `success_criteria` and append `evidence` (both must be string arrays).
-  `complete` requires non-empty `evidence` in the SAME call — pure analysis
-  may use an explicit `unverified: <analysis>` string; a completed goal
-  keeps its evidence. `resume` unblocks paused OR blocked goals (clearing
-  `blocked_reason`).
-- **Append-only persistence**: every change appends a complete snapshot as a
-  `SessionEntry::GoalUpdated` (`goal: null` is the clear tombstone). The
-  latest snapshot wins on resume (fold) and survives compaction: a short
-  projection is prepended to every provider context, so the goal is never
-  lost across compaction/resume/restart. After a clear, the context injects
-  an explicit `none (cleared)` override so a stale compaction summary can
-  never re-introduce the old goal.
-- **Forks inherit**: `--fork`/`/fork`/btw forks copy the source prefix up to
-  the fork boundary, including goal updates before it; the forked session
-  folds the newest snapshot naturally.
-- **Explicit goal continuation**: `/goal continue` arms an in-memory indefinite driver; `/goal continue N` arms it with a cumulative actual-token soft cap. An active goal alone never auto-arms. The driver continues after ordinary text, empty text, no-tool rounds, and unchanged revisions, and resumes after required background follow-up. Usage is charged as input plus output tokens with saturation; a capped driver may overshoot on its final call but never starts another call after reaching the cap. Missing usage under an explicit cap fails closed. Driver state is live-only and never persisted; restart starts unarmed. A prompt takes precedence over the next automatic call without implicitly disarming the driver; Cancel, inactive/cleared goals, unrecoverable errors, closed sessions, and budget exhaustion disarm it.
+- **Model updates**: the goal tools read the current goal and apply transitions
+  (`progress`, `pause`, `resume`, `block`, `complete`, `clear`), each against
+  the `id` + `revision` the model read, so a stale revision is rejected instead
+  of overwriting a newer goal. The read returns the FULL machine-usable
+  snapshot (all fields as JSON), while the provider context keeps a short
+  ≤400-char projection. `update_goal` can replace `success_criteria` and append
+  `evidence` (both must be string arrays). `complete` requires non-empty
+  `evidence` in the SAME call — pure analysis may use an explicit
+  `unverified: <analysis>` string; a completed goal keeps its evidence.
+  `resume` unblocks paused OR blocked goals (clearing `blocked_reason`).
+- **Persistence**: every change appends a complete snapshot, and a cleared goal
+  appends a tombstone. The latest snapshot wins on resume and survives
+  compaction: a short projection is prepended to every provider context, so the
+  goal is never lost across compaction/resume/restart. After a clear, the
+  context injects an explicit `none (cleared)` override so a stale compaction
+  summary can never re-introduce the old goal.
+- **Forks inherit**: `--fork`/`/fork`/btw forks inherit the source prefix up to
+  the fork boundary, including goal updates before it; the forked session picks
+  up the newest snapshot.
+- **Explicit goal continuation**: `/goal continue` arms an in-memory indefinite
+  driver; `/goal continue N` arms it with a cumulative actual-token soft cap. An
+  active goal alone never auto-arms. The driver continues after ordinary text,
+  empty text, no-tool rounds, and unchanged revisions, and resumes after
+  required background follow-up. Usage is charged as input plus output tokens
+  with saturation; a capped driver may overshoot on its final call but never
+  starts another call after reaching the cap. Missing usage under an explicit
+  cap fails closed. Driver state is live-only and never persisted; a restart
+  starts unarmed. A prompt takes precedence over the next automatic call
+  without implicitly disarming the driver; Cancel, inactive/cleared goals,
+  unrecoverable errors, closed sessions, and budget exhaustion disarm it.
 - **Own background work suspends the next automatic turn**: a *fresh*
-  automatic Goal turn is admitted only while this session has no own
-  non-detached background work — `bash`/`pwsh` tasks (the pre-existing
-  `running_background` gate) and live `delegate`/btw children (registered
-  synchronously by the spawn wrapper's `on_id` hook, i.e. before the
-  wrapper's work is released, and released only after the child's completion
-  entry was durably committed). The fresh owned-set check at that point is the
-  admission linearization point: a child registered before it suspends the
-  fresh turn; one registered after it gates the *next* automatic turn and
-  never revokes an already-admitted turn. `/btw` API acceptance and child
-  startup happen before that registration, so suspension is not promised from
-  the moment the fork request is accepted; an idle interactive btw child stays
-  outstanding (suspending fresh automatic turns) until its conversation closes
-  or is cancelled. The interrupted turn's own model rounds, same-turn FIFO
-  maintenance resumes (a queued compaction, agent message, or goal command in
-  the turn that started the work), human input, the ordinary completion
-  reaction, and `FinishWhenIdle` are deliberately NOT gated by the child set:
-  a Goal turn that starts its own background work still finishes that turn,
-  and only the next automatically admitted turn waits for it. The child set is
-  Goal-admission state only — it is not a task registry, never cancels or
-  freezes an already-admitted child, and adds no scheduler, priority, or
-  generalized reservation.
+  automatic Goal turn starts only while this session has no own non-detached
+  background work — bash/pwsh tasks (`running_background`) and live
+  `delegate`/btw children, which stay outstanding until their completion entry
+  is durably committed and, for an idle interactive btw child, until its
+  conversation closes or is cancelled. The interrupted turn's own model rounds,
+  same-turn queued maintenance (compaction, agent message, or goal command),
+  human input, the ordinary completion reaction, and `FinishWhenIdle` are
+  deliberately NOT gated: a Goal turn that starts its own background work still
+  finishes that turn, and only the next automatically admitted turn waits for
+  it. This child set is Goal-admission state only — it is not a task registry,
+  never cancels or freezes already-running work, and adds no scheduler,
+  priority, or generalized reservation.
 - **A fresh automatic turn announces itself durably**: each genuinely new
-  automatic Goal turn commits one `SessionEntry::Notice`
+  automatic Goal turn commits one model-facing Notice
   (`[goal continuation] Check the current goal …`) before its first provider
-  call: it asks the model to re-read status/remaining work/evidence with
-  `get_goal` and then continue the relevant work or update the goal, instead
-  of repeating its previous answer. It is an instruction to the model, not a
-  guarantee that the model complies or reports truthfully. It is a durable
-  model-facing entry (a resumed or late-attached view replays the audit line),
-  not a user prompt and not a UI-only display; it never arms a separate
-  ordinary reaction request. One per fresh automatic turn: same-turn
-  maintenance resumes, queued prompts, waiting-input answers, cap exhaustion,
-  inactive goals, and cancelled sessions do not generate a new reminder of
-  their own. Because the Notice is committed before the provider request, a
-  Cancel (or the last command handle closing) admitted after that durable
-  append but before the request can end the turn with the audit Notice
-  already on disk and no Goal provider call. Replaying it never arms or wakes
-  the driver — a restart still starts unarmed.
-- **Subagent isolation**: subagents get the goal tools but their runner
-  applies them against the subagent's own (usually empty) goal state — a
-  subagent can never take a mutable reference to its parent's goal.
-- **UI**: the TUI and web UI render goal updates as a notice line plus a
-  fixed GoalBar (`🎯 [status] objective`); the UI shows evidence/`unverified`
-  only, never a claim of independent verification.
+  call: it asks the model to re-read status/remaining work/evidence and then
+  continue the relevant work or update the goal, instead of repeating its
+  previous answer. It is an instruction to the model, not a guarantee that the
+  model complies or reports truthfully. It is durable (a resumed or
+  late-attached view replays the audit line), not a user prompt and not a
+  UI-only display, and it never arms a separate reaction request. One per fresh
+  automatic turn: queued prompts, waiting-input answers, cap exhaustion,
+  inactive goals, and cancelled sessions do not generate a new reminder of their
+  own. Replaying it never arms or wakes the driver — a restart still starts
+  unarmed.
+- **Subagent isolation**: subagents get the goal tools but their runner applies
+  them against the subagent's own (usually empty) goal state — a subagent can
+  never mutate its parent's goal.
+- **UI**: the TUI and web UI render goal updates as a notice line plus a fixed
+  GoalBar (`🎯 [status] objective`); the UI shows evidence/`unverified` only,
+  never a claim of independent verification.
 
 Non-goals (deliberately out of scope): todo/plan/workflow stages, deadlines,
 reminders, goal DAGs / multiple goals per session, goal-specific
@@ -1244,9 +1129,9 @@ row. Field codes are `b` background output, `t` tool content, `n` notice text,
 compaction retained data. The runner always binds a direct ref to its current
 store, workspace, and session; a ref contains no backend or session selector.
 
-Historical self-contained `eout1.<base64url JSON>` refs remain accepted. Their
-location/field/size JSON is parsed directly and any old `m` member is ignored,
-so persisted history containing old long refs remains readable.
+Historical self-contained `eout1.<base64url JSON>` refs remain accepted (their
+location/field/size JSON is parsed directly and any old `m` member is ignored),
+so persisted history containing old long refs stays readable.
 
 `read_output` is always available and takes `ref`, byte `offset` (default 0),
 and `limit` (default 12 KiB, maximum 32 KiB). It returns a UTF-8-safe JSON page
@@ -1268,17 +1153,17 @@ The always-available `history` tool has `list`, `read`, and `search` actions.
 `search` examines User content, Assistant text and tool calls (tool name plus
 the unparsed argument JSON), and Notice text. Recovering a lost edit means
 searching a distinctive fragment of what was written — a function name or
-another unique string — not `"write_file"`, which lists every write.
-A `search` is bounded to 60 seconds; expiry returns an explicit timeout error
-(never an empty or partial result page), so narrow the scope or query.
+another unique string — not `"write_file"`, which lists every write. A `search`
+is bounded to 60 seconds; expiry returns an explicit timeout error (never an
+empty or partial result page), so narrow the scope or query.
 
 An omitted `scope` normalizes to `session`, and every call returns
 `workspace_id` and `session_id` provenance on each entry; `list`/`search`
 additionally return `next_cursor`. Selector defaults resolve against the
-runner-bound session: in session scope, an omitted `workspace_id` means the current workspace,
-and an omitted `session_id` means the current session only while the selected
-workspace is the current one — a foreign `workspace_id` must name its
-`session_id`. Supplying IDs without a `scope` is the same as `scope:
+runner-bound session: in session scope, an omitted `workspace_id` means the
+current workspace, and an omitted `session_id` means the current session only
+while the selected workspace is the current one — a foreign `workspace_id` must
+name its `session_id`. Supplying IDs without a `scope` is the same as `scope:
 "session"`.
 
 Explicit scopes query the same configured store read-only:
@@ -1297,30 +1182,23 @@ Explicit scopes query the same configured store read-only:
 ```
 
 Results include `workspace_id`, `session_id`, `seq`, and the complete logical
-`entry`. `list`/`search` return `next_cursor`; pass a non-null cursor with the
-same action, scope, selectors and query to continue — a cursor is bound to the
-resolved effective scope/workspace/session/query, so equivalent omitted and
-explicit selectors are interchangeable. Ordering is workspace ID ascending,
-session ID ascending, then sequence descending—not cross-session chronological
-order. Search scans the full logical history with the same searchable text
-projection; `limit` (default 20, maximum 100) caps the page, never the scan, so
-no fixed scan window silently hides older matches. This is a live view, not a
-frozen snapshot: new entries before the cursor require a fresh query. Session
-identities are queried in bounded batches; one complete transcript is loaded at
-a time for logical winner resolution, so a very large individual session can
-still require substantial memory. Entry-count limits are not byte limits.
+`entry`; pass a non-null `next_cursor` with the same action, scope, selectors
+and query to continue (equivalent omitted and explicit selectors are
+interchangeable). Ordering is workspace ID ascending, session ID ascending,
+then sequence descending — not cross-session chronological order. Search scans
+the full logical history, so `limit` caps the page, never the scan, and no
+fixed window silently hides older matches; `next_cursor` is a live view, not a
+frozen snapshot, so entries added before the cursor require a fresh query.
+Limits are entry counts, not bytes: one complete transcript is loaded at a time,
+so a very large single session can still require substantial memory.
 
 Database scopes use only the existing connection; they do not create/resume
 sessions, run schema setup, or select another database. SQLite global scope
 covers only the configured database file. JSONL has no cross-workspace catalog:
 its global scope covers transcript files in the current root, including those
 without metadata sidecars; foreign workspace selectors return an error and
-never open model-supplied filesystem paths.
-
-Physical duplicate writes and same-seq replacements use existing logical
-winner/conflict semantics before filtering. Backend failures are logged
-internally but sanitized in model-facing errors. No History-specific content
-truncation is introduced.
+never open model-supplied filesystem paths. Backend failures are logged
+internally but sanitized in model-facing errors.
 
 Non-goals: physical-row inspection, arbitrary SQL or backend selection,
 federating database instances or JSONL roots, searching Tool result content,
@@ -1382,7 +1260,10 @@ The `/api` surface (JSON except for the SSE endpoint):
 | DELETE | `/api/sessions/{id}/tasks/{task_id}` | cancel one background task |
 | GET | `/api/sessions/{id}/tasks/{task_id}/output` | full output of a running bash task |
 
-Background completion records may include cancellation provenance: `user` for an authenticated API or TUI task cancellation, `agent` for the model cancellation tool, and `system` for a configured timeout or a live wrapper cleanup that produces an existing completion. Provenance annotates existing completion records only; owned-task teardown and registry drop create no completion event or provenance audit record.
+Background completion records may carry cancellation provenance (`user` for an
+authenticated API/TUI cancellation, `agent` for the model cancellation tool,
+`system` for a configured timeout or cleanup); it annotates existing records
+only, and teardown creates none.
 
 Usage dashboard accepts `from`/`to` (default: the last 7 days, maximum 366
 days, half-open `[from,to)`), `bucket=hour|day` (UTC), optional
@@ -1400,62 +1281,53 @@ configuration, database credentials, arbitrary SQL, or write capability.
 curl 'http://127.0.0.1:8766/api/usage/dashboard?bucket=day&top_n=10'
 ```
 
-The web UI's usage view also shows an account row above its filters,
-backed by the authenticated `GET /api/provider-quotas`. It returns one card
-per distinct `(endpoint URL, api key)` account; providers whose `base_url`
-host has no known usage endpoint are skipped, and ChatGPT is recognized by its
-login credentials rather than by host:
-DeepSeek balance, SiliconFlow balance, Zhipu/GLM Coding Plan and Kimi Code
-quota windows, OpenCode Go rolling/weekly/monthly percentages, and the
-ChatGPT/Codex plan and rate windows (through the existing `e-agent login`
-credentials). The endpoint caches nothing and has no background poller:
-each request queries the live upstream APIs concurrently, and one provider's
-failure is reported as that provider's own card. The browser fetches the
-cards once on page load, then at most every 10 minutes (a hidden tab pauses
-the timer; returning after a short switch reuses the cached result), and the
-card row's 刷新 button forces an immediate refresh. Opening the usage view
-only renders the cached row. Quota windows are drawn as **remaining** credit:
-a full bar means plenty left, and the color tracks what is left (>30% normal,
-10–30% warning, ≤10% danger), while the used percentage stays in the tooltip
-and `aria-valuetext`. A window whose upstream percentage is missing renders
-as unknown (no `aria-valuenow`, neutral color) instead of being read as a
-full bar. Non-goals: billing history, cost accounting or
-price calculation, auto top-up, arbitrary user-supplied usage endpoints, and
-background quota monitoring or notifications.
+The web UI's usage view also shows an account row above its filters, backed by
+the authenticated `GET /api/provider-quotas`. It returns one card per distinct
+`(endpoint URL, api key)` account; providers whose `base_url` host has no known
+usage endpoint are skipped, and ChatGPT is recognized by its login credentials
+rather than by host (DeepSeek/SiliconFlow balances, Zhipu/GLM Coding Plan and
+Kimi Code quota windows, OpenCode Go rolling/weekly/monthly percentages, and
+ChatGPT/Codex plan and rate windows through the existing `e-agent login`
+credentials). The endpoint caches nothing and has no background poller: each
+request queries the live upstream APIs concurrently, and one provider's failure
+is reported as that provider's own card. Quota windows are drawn as **remaining**
+credit — a full bar means plenty left, the color tracks what is left (>30%
+normal, 10–30% warning, ≤10% danger), the used percentage stays in the
+tooltip and `aria-valuetext`, and a window with a missing upstream percentage
+renders as unknown instead of a full bar. Non-goals: billing history, cost
+accounting or price calculation, auto top-up, arbitrary user-supplied usage
+endpoints, and background quota monitoring or notifications.
 
-SSE connections are kept alive with 15-second heartbeat pings. SSE clients
-must handle live `Display` events; the bundled web UI does. `Display` is not a
-`SessionEntry`, so existing sessions need no migration. Ctrl-C shuts the server
-down gracefully: SSE streams self-close on the shutdown signal and in-flight
-requests get a hard 2-second drain deadline before the process force-exits; a
-second Ctrl-C kills it outright.
+SSE connections are kept alive with 15-second heartbeat pings and carry live
+display events alongside durable ones. Ctrl-C shuts the server down gracefully:
+SSE streams self-close on the shutdown signal and in-flight requests get a hard
+2-second drain deadline before the process force-exits; a second Ctrl-C kills it
+outright.
 
 ### Multi-workspace launcher (development)
 
 `scripts/multi_web.py` can launch several local web servers from a JSON config;
 `scripts/multi_web.example.json` is a development example, not a replacement for
 existing configs. The example's explicit `../target/debug/e-agent` command is
-resolved relative to the config file, so keep the example config under `scripts`
-or set an explicit debug-binary path (including `CARGO_TARGET_DIR` if used).
-Build it from the repository root with `cargo build --locked --bin e-agent`;
-the launcher does not build implicitly. Rust changes require a rebuild and
-launcher restart; for frontend changes, use the web UI's refresh action. The
-runtime still reads UI assets from the Rust source checkout, which must remain
-available. The example's landing port is 18765 to
-avoid common preview-port collisions, and browser opening is off by default in
-this development example; adjust both for your local use.
+resolved relative to the config file, so keep the example under `scripts` or set
+an explicit debug-binary path (including `CARGO_TARGET_DIR` if used). Build it
+from the repository root with `cargo build --locked --bin e-agent`; the launcher
+does not build implicitly, and Rust changes require a rebuild and launcher
+restart (for frontend changes use the web UI's refresh action). The runtime still
+reads UI assets from the Rust source checkout, which must remain available. The
+example's landing port is 18765 to avoid common preview-port collisions, and
+browser opening is off by default; adjust both for your local use.
 
 For an optional per-user systemd service, edit
-`scripts/e-agent-multi-web.service.example` for your checkout and config, then
-install it with `install -Dm644 scripts/e-agent-multi-web.service.example
-"$HOME/.config/systemd/user/e-agent-multi-web.service"` and run
-`systemctl --user daemon-reload`; explicitly enable/start it only if desired.
-These are manual instructions, not launcher actions. It runs one foreground
-launcher, not a build or a supervisor for each web server. Children start
-sequentially; startup/runtime failures go to the journal, and unhealthy children
-are not automatically restarted. SIGTERM stops only children started by that
-launcher, with bounded per-child waits. `Restart=on-failure` applies only to
-the launcher process.
+`scripts/e-agent-multi-web.service.example` for your checkout and config, install
+it with `install -Dm644 scripts/e-agent-multi-web.service.example
+"$HOME/.config/systemd/user/e-agent-multi-web.service"`, and run `systemctl
+--user daemon-reload`; explicitly enable/start it only if desired. These are
+manual instructions, not launcher actions: it runs one foreground launcher, not
+a build or a supervisor per server. Children start sequentially, failures go to
+the journal, unhealthy children are not restarted automatically, SIGTERM stops
+only that launcher's children with bounded per-child waits, and
+`Restart=on-failure` applies only to the launcher process.
 
 The e-agent startup log includes its server token. The sample service inherits
 child output into the user journal; treat journal access as private and do not
@@ -1476,59 +1348,46 @@ the process exits. The transcript stays; a later resume still works.
 
 ## Config hot reload
 
-The headless server (`--serve` / `web`) and the TUI watch the config files
-(the global `config.toml` plus the project override
-`<workspace>/.e-agent/config.toml`) and, when a file changes, re-read and
-atomically swap the effective config. After a successful swap, tracing-only
-per-source TOML leaf edits are reported separately for `origin=global` and
-`origin=project`. Each edit names its stable TOML path, add/remove or
-before/after values, and status: `effective`, `shadowed`, or `unknown`.
-`effective` means only that the source wins the existing overlay and feeds a
-reload-aware consumer for future/new sessions; it does not promise provider
-behavior or mutate existing sessions. `shadowed` warnings explain the
-overriding or restart-only rule. `unknown` warnings contain `source edit;
-effective status unknown`; this means source precedence wins but existing
-resolution, canonicalization, clamping, or defer behavior prevents a stronger
-claim. Source diagnostics use sanitized snapshots: credential values are
+The headless server (`--serve` / `web`) and the TUI watch the config files (the
+global `config.toml` plus the project override
+`<workspace>/.e-agent/config.toml`) and, when one changes, re-read and
+atomically swap the effective config. Per-source TOML leaf edits are reported
+for `origin=global` and `origin=project`: each names its stable TOML path,
+add/remove or before/after values, and a status of `effective` (the source wins
+the overlay and feeds a reload-aware consumer for future/new sessions — it does
+not promise provider behavior or mutate existing sessions), `shadowed`
+(explaining the overriding or restart-only rule), or `unknown` (precedence wins,
+but resolution, canonicalization, clamping, or defer behavior prevents a
+stronger claim). Diagnostics use sanitized snapshots: credential values are
 never retained or compared, and MCP environment values plus provider
 compatibility fields are redacted. No-op and mtime-only reloads still validate
-and refresh runtime state but emit no source edit. Credential-file contents are
-not read for diagnostics.
-Rejected reloads keep the old runtime and emit no success diff.
+and refresh runtime state but emit no source edit; rejected reloads keep the old
+runtime and emit no success diff.
 
 - `[models]` / `[providers]` / `[roles]` — new profile definitions are
-  immediately available to the web `/model` autocomplete and `POST
-  /api/sessions/{id}/model` / TUI `/model` switches, and newly built
-  sessions start with the edited default and role routing.
-- `[mcp]`, `[bash]` foreground residence threshold, `[background]` timeout —
-  winning edits apply to sessions built after the reload; existing MCP
-  connections are unchanged.
-
-`[bash] timeout_secs` defaults to 30 seconds and is the foreground residence
-threshold: commands exceeding it continue in the background rather than being
-killed. Set it to `0` to disable automatic adoption and run foreground commands
-to completion; explicit `background: true` and `detached: true` behavior is
-unchanged. Automatic adoption is available only when the bash facade has a live
-completion channel; without one, commands stay foreground so their result is not
-lost. Adoption uses the facade's configured shell on supported platforms;
-sandboxed Windows commands instead keep the previous behaviour: the foreground
-command is killed when the threshold expires. Adopted foreground commands are
-currently not bounded by `[background] timeout_secs`.
+  immediately available to the web `/model` autocomplete, `POST
+  /api/sessions/{id}/model` and TUI `/model` switches, and newly built sessions
+  start with the edited default and role routing.
+- `[mcp]`, the `[bash]` foreground residence threshold, and the `[background]`
+  timeout — winning edits apply to sessions built after the reload; existing
+  MCP connections are unchanged. `[bash] timeout_secs` defaults to 30 seconds:
+  longer commands continue in the background instead of being killed, `0`
+  disables automatic adoption and runs foreground commands to completion, and
+  explicit `background: true` / `detached: true` behavior is unchanged. Adoption
+  needs a live completion channel (otherwise the command stays foreground so its
+  result is not lost), uses the facade's configured shell where supported, and
+  is not bounded by `[background] timeout_secs`; sandboxed Windows commands keep
+  the previous behavior and are killed when the threshold expires.
 - Existing sessions, startup file capabilities, TUI input mapping, and the
   session backend are unchanged.
 
-Deliberately NOT hot-reloaded (restart required):
-
-- `[sandbox]` scalar policy and workspace/file capabilities are wired at
-  startup (sandbox path edits are retained as unresolved source diagnostics).
-- `[session]` backend — stores are connected at startup.
-- `[web_search]` backend changes — the resolved key / SearXNG `base_url` is
-  injected into the process env once at startup (`std::env::set_var` is only
-  safe single-threaded). The SearXNG base URL travels through the internal
-  `E_AGENT_SEARXNG_BASE_URL` variable (plumbing shared with subagent sessions,
-  not a user-facing knob); both backends therefore need a restart to change.
-- `AGENTS.md` / skills instructions and existing sessions' models (existing
-  sessions keep their model until a `/model` switch).
+Restart required: `[sandbox]` scalar policy and workspace/file capabilities are
+wired at startup (sandbox path edits are retained as unresolved source
+diagnostics), the `[session]` backend connects at startup, a `[web_search]`
+backend change injects the resolved key or SearXNG `base_url` into the process
+environment once at startup, and `AGENTS.md`/skills instructions plus existing
+sessions' models stay as loaded (a session keeps its model until a `/model`
+switch).
 
 ## MCP (local servers)
 
@@ -1560,16 +1419,13 @@ delegates, which reconnect the parent's project servers in the child's own
 workspace (a server that fails to start is skipped, exactly as for a main
 session). Ordinary subagents do not connect MCP.
 
-Each entry spawns `command` with the workspace as its current directory
-(override with `cwd`), plus optional `env`. Servers are connected one at a
-time at startup; a server that fails to start is skipped with a warning and
-does not abort the session. Server-provided instructions (from the MCP
-`initialize` response) are prepended to the model context as a system
-message on every call, but are not persisted in sessions. Only tools are
-supported — no resources, prompts, or server-initiated notifications. MCP
-tools are sorted by name for deterministic provider requests, so the tool
-array a provider sees is stable across runs and a forked child can reuse the
-parent's prompt cache.
+Servers are connected one at a time at startup; a server that fails to start is
+skipped with a warning and does not abort the session. Server-provided
+instructions (from the MCP `initialize` response) are prepended to the model
+context as a system message on every call, but are not persisted in sessions.
+Only tools are supported — no resources, prompts, or server-initiated
+notifications. MCP tools are sorted by name, so the tool array a provider sees is
+stable across runs and a forked child can reuse the parent's prompt cache.
 
 ## Environment
 
@@ -1603,9 +1459,7 @@ segmentation faults, or a top-level `Err` return; those are not ordinary Rust
 panics.
 
 TOML config is optional. When present, it supplies the selected provider
-credential and profile values instead of `OPENAI_*`; see [Run](#run). A
-provider using `api_key_env` reads the variable named by that field (for
-example, `KIMI_API_KEY`).
+credential and profile values instead of `OPENAI_*`; see [Run](#run).
 
 ## Image input (multimodal)
 
@@ -1624,17 +1478,15 @@ sessions) at `$XDG_STATE_HOME/e-agent/images/`, falling back to
   image to the next prompt; the placeholder line
   `[image attached: <path>]` is included in the prompt text.
 
-Sessions persist only `ImageRef { hash, mime }` references — never base64.
-At send time the wire re-reads the file and builds the provider format:
-`image_url` parts (an object) for OpenAI-compatible chat, `input_image` parts
-(a bare-string `image_url`) for ChatGPT Responses. An image-bearing tool
-result is encoded natively on both wires: the chat wire emits all tool
-results as plain `role:"tool"` text and then appends at most one aggregated
+Sessions persist only image references (hash plus MIME type) — never base64.
+At send time the wire re-reads the cached file and builds the provider format
+(OpenAI-compatible chat image parts, or ChatGPT Responses input-image parts). An
+image-bearing tool result is encoded natively on both wires: the chat wire emits
+tool results as plain `role:"tool"` text and then appends at most one aggregated
 temporary user image message per consecutive tool batch (wire-only, never
-persisted), while the Responses wire emits a `function_call_output` whose
-`output` is an array of `input_text` + `input_image` parts. A missing cache
-file degrades to a `[image missing: <hash>]` text placeholder instead of
-failing.
+persisted), while the Responses wire returns the image inside that tool result's
+output parts. A missing cache file degrades to a `[image missing: <hash>]` text
+placeholder instead of failing.
 
 A model only receives images when its profile sets `vision = true` (see
 [Run](#run)). On a non-vision model the request copy strips image parts from
@@ -1653,44 +1505,40 @@ include a preview of the response body. Provider requests time out after
 
 The main agent (never read-only sessions, subagents, or btw forks) can
 generate an image from a text prompt on **Linux and Android only**:
-`generate_image {prompt, path, transparent_background?}` POSTs directly to
-the ChatGPT Codex image endpoint
+`generate_image {prompt, path, transparent_background?}` POSTs directly to the
+ChatGPT Codex image endpoint
 (`https://chatgpt.com/backend-api/codex/images/generations`, model
 `gpt-image-2`, quality/size `auto`) with the shared ChatGPT login — the same
 lazy credential cache `auth = "chatgpt"` profiles resolve through, so an
 `e-agent login` after startup is picked up on first use.
 
 Every other platform (Windows, macOS, BSD, …) is unsupported: the tool is
-refused after the path/policy checks and before any request (nothing is
-spent) with an explicit "unavailable on this platform" error. This is a
-deliberate capability narrowing, not a silent degradation — only the
-Linux/Android exclusive-create path can publish without following a parent
-symlink that appeared after the preflight.
+refused after path/policy checks and before any request (nothing is spent) with
+an explicit "unavailable on this platform" error. Only the Linux/Android
+exclusive-create path can publish without following a parent symlink that
+appeared after the preflight.
 
 `path` must be a workspace-relative `.png` path with only normal components
-(checked lexically: no `.`, `..`, empty, absolute, drive or backslash
-forms); it is validated, and an occupied directory entry (including a
-dangling final symlink), a symlinked parent component, or a policy-denied
-target (read-only workspace, read-only external entry, protected policy
-file) is refused, before any request is sent. Those early
-checks are policy checks, not filesystem-permission probes: a permission
-failure can still surface at the final write. The final write is an
-exclusive create (`O_EXCL`), so a race can never overwrite an existing
-file; if the process cannot finish writing, a partial new file may remain —
-the error says so, and no automatic removal is attempted (an unlink could
-hit a concurrent replacement). The image bytes
-are structurally checked (PNG signature + IHDR, nonzero dimensions — not
-decoded) before the file becomes visible, and the result names only the
-relative path and byte count, never base64. Response body and decoded image
-sizes are boundedly capped, redirects are not followed, and there is no
-automatic retry after an ambiguous network failure; a failure reports only
-the HTTP status and a short safe provider request id (≤128 identifier
-characters; omitted otherwise) — never the response body — and HTTP 401
-returns "run `e-agent login`" as a normal tool error. Credential-resolution
-failures always surface as one fixed actionable login message, so the auth
-chain's own diagnostics cannot reflect file contents. The request uses
-native HTTP, which the `[sandbox]` file-tool policy does not wrap (like
-`web_search`).
+(checked lexically: no `.`, `..`, empty, absolute, drive or backslash forms).
+An occupied directory entry (including a dangling final symlink), a symlinked
+parent component, or a policy-denied target (read-only workspace, read-only
+external entry, protected policy file) is refused before any request is sent;
+those are policy checks, not filesystem-permission probes, so a permission
+failure can still surface at the final write. The final write is an exclusive
+create (`O_EXCL`), so a race can never overwrite an existing file; if the
+process cannot finish writing, a partial new file may remain — the error says
+so, and no automatic removal is attempted. Image bytes are structurally checked
+(PNG signature + IHDR, nonzero dimensions — not decoded) before the file becomes
+visible, and the result names only the relative path and byte count, never
+base64. Response and decoded image sizes are boundedly capped, redirects are not
+followed, and there is no automatic retry after an ambiguous network failure; a
+failure reports only the HTTP status and a short safe provider request id
+(≤128 identifier characters; omitted otherwise) — never the response body —
+and HTTP 401 returns "run `e-agent login`" as a normal tool error.
+Credential-resolution failures always surface as one fixed actionable login
+message, so the auth chain's own diagnostics cannot reflect file contents. The
+request uses native HTTP, which the `[sandbox]` file-tool policy does not wrap
+(like `web_search`).
 
 ## SQLite session backend
 
@@ -1782,33 +1630,22 @@ with the same name in different workspaces remain isolated.
 - GreptimeDB server must be running before e-agent starts
 - `tokio-postgres` needs the `with-chrono-0_4` feature for TIMESTAMP params
   (already included in the `greptime` feature)
-- `event_time` is wall-clock time with microsecond precision.  Within a
-  single process, the monotonic `next_event_time_us` atomic guarantees strict
-  ordering (same-µs or backward clock → prev+1).  Dedup: per seq, only rows
-  with the latest `event_time` are retained; at the same max `event_time`,
-  identical deserialised `SessionEntry` values are folded and divergent ones
-  cause a hard error. Canonical conversation order is the winning
-  `event_time ASC`, with `seq ASC` only as a tie-breaker; seq remains identity
-  and continuity metadata.
+- `event_time` is wall-clock time with microsecond precision; within one process
+  a monotonic counter keeps it strictly increasing (same-µs or a backward clock
+  → prev+1). Per seq only rows with the latest `event_time` are retained, and at
+  the same maximum `event_time` identical retried entries are folded while
+  divergent ones are a hard error. Canonical order is `event_time ASC` with
+  `seq ASC` only as a tie-breaker; seq stays identity/continuity metadata.
 - No transactions — atomicity is per multi-row INSERT statement
-- **Concurrent-write detection is fail-closed, point-in-time, not
-  atomic**: GreptimeDB's pg-wire has no transactions and no
-  conditional-write/lease mechanism, so the max-seq pre-check, the
-  INSERT, and the post-insert verification are separate statements, and
-  the post-insert verification is a point-in-time re-read. e-agent
-  verifies AFTER committing: every committed row in the written range is
-  re-read and must still be the physical winner for its seq (latest
-  `event_time`, identical duplicates folded); if a foreign writer
-  superseded or diverged any row at verification time, the append fails
-  with a `concurrent write conflict` error instead of silently
-  latest-winning or advertising a receipt location the logical read path
-  would not pick. Ambiguity that is visible at verification time is
-  detected and reported — never hidden. But a foreign writer can still
-  commit at the same seqs AFTER the verification query and BEFORE
-  `append_located` returns; that post-verification race is irreducible
-  without a server-side lease or conditional write (winner-at-return
-  would require one). Exact physical receipt pinning still holds for
-  every location this process verified before the race window closed.
+- **Concurrent-write detection is fail-closed, point-in-time, not atomic**:
+  pg-wire has no transactions and no conditional write or lease, so the max-seq
+  pre-check, the INSERT, and a post-insert re-read are separate statements.
+  After committing, every written row must still be the physical winner for its
+  seq; if a foreign writer superseded or diverged a row at verification time the
+  append fails with a `concurrent write conflict` instead of latest-winning
+  silently or advertising an unreachable receipt location. A foreign writer can
+  still commit at the same seqs after the verification query returns — a race
+  irreducible without a server-side lease.
 - Subagents each open their own database connection (bounded, fine for
   single-user agents)
 
@@ -1854,35 +1691,25 @@ e-agent-import-jsonl --session <SESSION_ID> [--workspace <PATH>] [--conn <CONN>]
 
 1. The tool requires the JSONL file at exactly `.e-agent/sessions/<id>.jsonl`
    to exist (empty files are valid). Legacy `.json` format is rejected.
-2. The DB's seq values are verified to be strictly 0..N continuous before
-   planning (gaps or divergent-deserialised-`SessionEntry` duplicates cause a
-   hard error; identical deserialised entries are silently folded).
-3. If the DB has **more** entries than the JSONL file, the tool errors out
-   without writing — it will never truncate.
-4. If the existing DB prefix **differs** from the same-length prefix of the
-   JSONL file, the tool reports the first divergent sequence number and
-   refuses to write.
-5. When the prefix matches, the tool re-reads the DB immediately before
-   writing (TOCTOU mitigation) to detect concurrent changes. If the DB
-   changed, the tool errors out.
-6. After writing, the tool reloads the DB and verifies it matches the JSONL
-   file exactly by length and per-entry content. Verification failure is
-   reported as an error.
-7. **Not safe for concurrent writers**: GreptimeDB has no transactions, so a
-   concurrent writer between the pre-write check and the INSERT can still
-   race. Ensure the target session is **idle** during import.
-8. **Partial commits**: chunks of >9000 entries use separate INSERT
-   statements. If the first chunk commits and the second fails, some entries
-   are written. Fix the issue (e.g. network, JSONL source) and re-run.
-9. **Duplicate handling**: within a seq, older `event_time` rows are
-   silently overwritten by the latest `event_time` row. If the latest
-   `event_time` has multiple physical rows (same microsecond), their
-   payloads are deserialised and compared as `SessionEntry` values.
-   Identical deserialised entries are folded silently; divergent entries
-   cause a hard error — stop writers, inspect with SQL, and resolve
-   manually.
-
-
+2. Before planning, the DB's seq values must be strictly 0..N continuous:
+   gaps cause a hard error, and divergent duplicates at one seq are rejected
+   while identical retried entries are silently folded.
+3. A DB with **more** entries than the JSONL file errors out without writing —
+   it will never truncate.
+4. A DB prefix that **differs** from the same-length JSONL prefix is refused,
+   so import only ever appends a matching prefix.
+5. The tool re-reads the DB immediately before writing to detect concurrent
+   changes and errors out if it changed. It is still **not safe for concurrent
+   writers**: a writer can race between that check and the INSERT, so keep the
+   target session idle during import.
+6. Large imports use separate INSERT chunks; if a later chunk fails after an
+   earlier one commits, some entries are written. Fix the cause and re-run —
+   the append-only prefix check makes this safe.
+7. Within a seq, the latest `event_time` row wins. Identical retried entries at
+   the same time are folded; divergent entries at one seq are a hard error —
+   stop writers, inspect with SQL, and resolve manually.
+8. `--dry-run` still connects (and may execute CREATE TABLE) but inserts no
+   rows.
 
 #### Example
 
