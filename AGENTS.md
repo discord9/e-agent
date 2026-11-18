@@ -123,8 +123,11 @@ result or user correction challenges an assumption.
   current model and reconnects the parent's MCP servers in its own workspace
   (the parent root unless the caller passes a different `workspace`, which then
   gives up byte-identical prefix parity), and it still cannot delegate
-  further or ask the user questions. They share the parent's unbounded
-  running-task registry so nested background bash stays visible. No
+  further or ask the user questions. A same-workspace fork of a main session
+  that exposed `generate_image` omits that main-only tool schema (there is no
+  disabled placeholder), so that fork's tool array is not byte-identical. They
+  share the parent's unbounded running-task registry so nested background bash
+  stays visible. No
   arbitrary agent-to-agent messaging (only direct live parent/child `send_message`) or worker/concurrency pool. Process-level isolation
   (subagents as subprocesses) is the planned evolution but not implemented.
 

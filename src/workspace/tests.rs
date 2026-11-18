@@ -1782,6 +1782,7 @@ fn write_new_rejects_policy_file_and_read_only_workspace() {
     assert!(!ro_temp.path().join("new.png").exists());
 }
 
+#[cfg(unix)]
 #[test]
 fn write_new_rejects_symlink_escape_without_an_outside_file() {
     use std::os::unix::fs::symlink;

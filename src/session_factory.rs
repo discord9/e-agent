@@ -1015,11 +1015,18 @@ impl SessionFactory {
         // Only the root/main session can pause for Web human input.
         add_root_user_input_tool(&mut tools);
         // Main-agent only: `generate_image` (direct Codex image HTTP).
-        // Read-only sessions skip it (it creates files), and children/btw
-        // forks use the common builtins, so they never see it.
+        // Read-only sessions skip it (it creates files). It gets the main
+        // session's tools workspace — the plain workspace plus the
+        // read-only global-skills capability — so a path under that
+        // read-only entry is refused before any request. Children/btw
+        // forks use the common builtins, so they never see it; a
+        // same-workspace fork therefore lacks this one tool even when its
+        // main-session parent had it (the documented fork-prefix
+        // exception, covered by `image_generation::tests::
+        // generate_image_is_not_in_common_builtins`).
         register_generate_image(
             &mut tools,
-            &self.workspace,
+            &tools_workspace,
             self.generate_image_auth(),
             self.read_only,
         );

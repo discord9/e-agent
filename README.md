@@ -1660,8 +1660,9 @@ lazy credential cache `auth = "chatgpt"` profiles resolve through, so an
 `path` must be a workspace-relative `.png` path with only normal components
 (checked lexically: no `.`, `..`, empty, absolute, drive or backslash
 forms); it is validated, and an occupied directory entry (including a
-dangling final symlink) or a policy-denied target (read-only workspace,
-protected policy file) is refused, before any request is sent. Those early
+dangling final symlink), a symlinked parent component, or a policy-denied
+target (read-only workspace, read-only external entry, protected policy
+file) is refused, before any request is sent. Those early
 checks are policy checks, not filesystem-permission probes: a permission
 failure can still surface at the final write. The final write is an
 exclusive create (`O_EXCL` on Linux, `create_new` on the degraded Windows

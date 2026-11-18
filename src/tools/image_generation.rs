@@ -191,6 +191,16 @@ impl Tool for GenerateImage {
                 "`{path}` must be inside the workspace; configured external roots are not writable by generate_image"
             ));
         }
+        // A symlinked PARENT is refused before any request: the final
+        // exclusive create never follows it, so a generation spent here
+        // could never publish. The final component stays the
+        // occupied-entry check below (a dangling final symlink counts as
+        // occupied).
+        if self.workspace.parent_contains_symlink(&path)? {
+            return Err(format!(
+                "`{path}` has a symlinked parent directory; generate_image refuses to follow it (no request was sent)"
+            ));
+        }
         // Occupied-entry check on the final component WITHOUT following a
         // final symlink: a dangling `out.png -> missing.png` is still an
         // occupied directory entry that the exclusive create must refuse.
@@ -835,6 +845,10 @@ mod tests {
         assert!(!fixture.temp.path().join("n.png").exists());
     }
 
+    /// The common builtin sets (main assembly and subagent/fork) never
+    /// include `generate_image`; the session factory adds it to main
+    /// sessions only. This is why a same-workspace `fork: true` child's
+    /// tool array lacks it even when the main parent exposed it.
     #[test]
     fn generate_image_is_not_in_common_builtins() {
         let temp = tempfile::tempdir().unwrap();
@@ -896,8 +910,16 @@ mod tests {
             assert!(error.contains("HTTP 500"), "{error}");
             assert!(!error.contains(id), "unsafe request id echoed: {error}");
         }
+    }
 
+    /// A dangling final symlink is an occupied directory entry and must be
+    /// refused before any request. Unix-only: the fixture needs
+    /// `std::os::unix::fs::symlink`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dangling_output_symlink_is_rejected_before_any_request() {
         use std::os::unix::fs::symlink;
+        let fixture = Fixture::new();
         symlink(
             fixture.temp.path().join("missing.png"),
             fixture.temp.path().join("dangling.png"),
@@ -1046,6 +1068,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_only_external_entry_inside_the_workspace_is_refused_before_any_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let skills = temp.path().join("global-skills");
+        std::fs::create_dir(&skills).unwrap();
+        // The main session's tools workspace carries the global-skills
+        // directory as a read-only external entry (it may be lexically
+        // inside the workspace). The most-specific winner must be that
+        // read-only entry, never the writable workspace.
+        let policy = crate::config::Sandbox {
+            readable_paths: vec![skills.to_str().unwrap().to_owned()],
+            ..Default::default()
+        };
+        let workspace = Workspace::new(temp.path())
+            .unwrap()
+            .with_external_roots(&policy)
+            .unwrap();
+        assert!(
+            !workspace
+                .targets_workspace("global-skills/out.png")
+                .unwrap(),
+            "the read-only external entry must win over the workspace"
+        );
+        let error = workspace
+            .check_writable("global-skills/out.png")
+            .unwrap_err();
+        assert!(error.contains("read-only"), "{error}");
+        let (endpoint, server) = serve(image_response(&png_bytes())).await;
+        let tool = GenerateImage::for_test(
+            workspace,
+            Arc::new(|| unreachable!("auth must not be resolved for a read-only target")),
+            endpoint,
+            Duration::from_secs(2),
+            MAX_RESPONSE_BYTES,
+            MAX_IMAGE_BYTES,
+        );
+        let error = tool
+            .execute(json!({"prompt": "x", "path": "global-skills/out.png"}))
+            .await
+            .unwrap_err();
+        assert!(error.contains("inside the workspace"), "{error}");
+        assert!(server.await.unwrap().is_empty());
+        assert!(!skills.join("out.png").exists());
+    }
+
+    #[tokio::test]
     async fn read_only_workspace_is_refused_before_any_request() {
         let temp = tempfile::tempdir().unwrap();
         let policy = crate::config::Sandbox {
@@ -1151,6 +1218,7 @@ mod tests {
         let _ = server.await;
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn symlink_escape_is_refused_without_an_outside_file() {
         use std::os::unix::fs::symlink;
@@ -1159,12 +1227,14 @@ mod tests {
         symlink(outside.path(), fixture.temp.path().join("escape")).unwrap();
         let (endpoint, server) = serve(image_response(&png_bytes())).await;
         let tool = fixture.tool(&endpoint, MAX_RESPONSE_BYTES, MAX_IMAGE_BYTES);
-        let result = tool
+        let error = tool
             .execute(json!({"prompt": "x", "path": "escape/x.png"}))
-            .await;
-        assert!(result.is_err(), "{result:?}");
+            .await
+            .unwrap_err();
+        assert!(error.contains("symlinked parent"), "{error}");
         assert!(!outside.path().join("x.png").exists());
-        let _ = server.await;
+        let requests = server.await.unwrap();
+        assert!(requests.is_empty(), "the symlinked parent spent a request");
     }
 
     /// Known-good 1x1 RGBA PNG (IHDR + IDAT + IEND, every chunk CRC valid): a

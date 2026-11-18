@@ -1489,7 +1489,7 @@ impl Tool for Delegate {
             "task": {"type": "string", "description": "complete, self-contained instructions for the subagent"}
         });
         if self.fork_head.is_some() {
-            properties["fork"] = json!({"type":"boolean", "description":"Continue from the parent's completed-turn prefix: the child inherits the parent's current model, system prompt, goal and tool schemas. `workspace` defaults to the parent's root; with that default (and the same MCP tool set) the child's request is a byte-identical provider prefix and reuses the parent's prompt cache, while an explicit different `workspace` runs the child's tools/MCP elsewhere and loses that guarantee. Mutually exclusive with `role` and `resume`. The current in-flight turn is excluded, so put everything the child needs in `task`."});
+            properties["fork"] = json!({"type":"boolean", "description":"Continue from the parent's completed-turn prefix: the child inherits the parent's current model, system prompt, goal and tool schemas, except `generate_image`, which is main-only and absent from every fork (no placeholder is exposed, so a fork of a main session that exposed it has a different tool array). `workspace` defaults to the parent's root; with that default (apart from that one main-only tool, and with the same MCP tool set) the child's request is a byte-identical provider prefix and reuses the parent's prompt cache, while an explicit different `workspace` runs the child's tools/MCP elsewhere and loses that guarantee. Mutually exclusive with `role` and `resume`. The current in-flight turn is excluded, so put everything the child needs in `task`."});
         }
         ToolSpec {
             name: "delegate".into(),

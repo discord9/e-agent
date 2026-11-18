@@ -591,6 +591,36 @@ impl Workspace {
         }
     }
 
+    /// Whether any PARENT component of `input` is an existing symlink,
+    /// checked one component at a time without following it (the final
+    /// component stays [`Workspace::entry_exists`]'s job). `generate_image`
+    /// uses this as a pre-request gate: the exclusive create refuses a
+    /// symlinked parent, so a generation must not be spent on that path.
+    /// An external winner returns `false`; `generate_image` rejects those
+    /// through [`Workspace::targets_workspace`] before this check.
+    pub fn parent_contains_symlink(&self, input: &str) -> Result<bool, String> {
+        let Resolved::Workspace { remainder } = self.resolve_path(input, false)? else {
+            return Ok(false);
+        };
+        let Some(parent) = remainder.parent() else {
+            return Ok(false);
+        };
+        let mut prefix = PathBuf::new();
+        for component in parent.components() {
+            let Component::Normal(name) = component else {
+                return Ok(false);
+            };
+            prefix.push(name);
+            match self.dir.symlink_metadata(&prefix) {
+                Ok(metadata) if metadata.file_type().is_symlink() => return Ok(true),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(format!("stat failed: {error}")),
+            }
+        }
+        Ok(false)
+    }
+
     /// Whether `input` resolves to the workspace itself rather than a
     /// configured external root, using the same logical winner a write
     /// would pick. `generate_image` requires this: its output stays below
