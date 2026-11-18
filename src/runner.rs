@@ -2,9 +2,9 @@
 
 use crate::{
     agent::{
-        Agent, AgentEvent, CompactionOutput, GoalStatus, ImagePart, Message, Model,
-        POLL_GUARD_TERMINATION_NOTICE, RoundOutput, SessionEntry, ToolCall, ToolOutput, ToolSpec,
-        is_poll_guard_terminate, tool_error_content,
+        Agent, AgentEvent, BACKGROUND_REMINDER, CompactionOutput, GoalStatus, ImagePart, Message,
+        Model, POLL_GUARD_TERMINATION_NOTICE, RoundOutput, SessionEntry, ToolCall, ToolOutput,
+        ToolSpec, is_poll_guard_terminate, tool_error_content,
     },
     model::{ImageRejection, image_rejection},
     session_store::{LocatedKey, SessionStore},
@@ -3566,6 +3566,9 @@ impl SessionRunner {
                 // commit_backgrounds safe point.
                 let mut poll_terminate = false;
                 let mut requested_compaction = false;
+                // One do-not-wait reminder per sibling batch, however many
+                // calls started background work (coalesced below).
+                let mut background_started = false;
                 for call in calls {
                     // The ToolCall projection was already published with the
                     // assistant commit above (before any compaction), so this
@@ -3900,6 +3903,9 @@ impl SessionRunner {
                     if call.name == "get_background_tasks" && is_poll_guard_terminate(&result) {
                         poll_terminate = true;
                     }
+                    if let Ok(output) = &result {
+                        background_started |= output.background_started;
+                    }
                     // One canonical image-bearing Tool entry: the text
                     // summary plus the structured image references ride on
                     // the Tool message itself (no marker parsing, no
@@ -3958,6 +3964,23 @@ impl SessionRunner {
                         }
                         break 'turn;
                     }
+                }
+                // The batch started background work: the do-not-wait
+                // guidance is durable NOW, as one user-shaped Notice per
+                // batch, so the NEXT provider request carries it right after
+                // the real tool results. This is ingress for the turn that is
+                // already running — it arms no trigger, forces no turn end,
+                // and never duplicates the background-completion channel.
+                if background_started
+                    && let Err(error) = self
+                        .commit(SessionEntry::Notice {
+                            text: BACKGROUND_REMINDER.to_owned(),
+                        })
+                        .await
+                {
+                    self.terminate(SessionResult::Failed(format!("{error:#}")), Vec::new())
+                        .await;
+                    return;
                 }
                 // The assistant's full tool-result batch is durably
                 // committed: drain + durably commit any background

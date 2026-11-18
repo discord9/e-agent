@@ -161,6 +161,7 @@ impl Tool for ReadImage {
                 hash,
                 mime: mime.into(),
             }],
+            background_started: false,
         })
     }
 }

@@ -6,7 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use super::*;
-use crate::tools::bash::DO_NOT_WAIT_LINE;
+use crate::agent::BACKGROUND_REMINDER;
 
 fn web_search(endpoint: String) -> WebSearch {
     WebSearch::for_test("test-api-key".into(), endpoint, Duration::from_secs(1))
@@ -2627,6 +2627,7 @@ async fn foreground_or_adopt_fast_command_returns_result_without_completion_even
         .await
         .unwrap();
     assert!(result.content.contains("stdout:\nfast\n"));
+    assert!(!result.background_started);
     assert!(receiver.try_recv().is_err());
     assert!(bash.background.running().is_empty());
 }
@@ -2653,13 +2654,18 @@ async fn foreground_zero_threshold_adopts_immediately_and_delivers_output_once()
         shell,
         owner_session: None,
     };
-    let receipt = task
-        .execute(json!({"command":"ignored"}))
-        .await
-        .unwrap()
-        .content;
-    assert!(receipt.contains(DO_NOT_WAIT_LINE));
+    let adopted = task.execute(json!({"command":"ignored"})).await.unwrap();
+    assert!(
+        adopted.background_started,
+        "auto-adoption starts background work"
+    );
+    assert!(
+        !adopted.content.contains(BACKGROUND_REMINDER),
+        "the reminder is delivered as a separate Notice, never in the tool result"
+    );
+    let receipt = adopted.content;
     assert!(receipt.contains("foreground threshold"));
+    assert!(receipt.contains("started background task"));
     let AgentEvent::BackgroundCompleted { output, .. } =
         tokio::time::timeout(Duration::from_secs(5), events.recv())
             .await
@@ -2717,12 +2723,19 @@ async fn foreground_zero_threshold_parking_command_is_adopted_once_with_output()
         shell,
         owner_session: None,
     };
-    let receipt = task
+    let adopted = task
         .execute(json!({"command":"printf after"}))
         .await
-        .unwrap()
-        .content;
-    assert!(receipt.contains(DO_NOT_WAIT_LINE));
+        .unwrap();
+    assert!(
+        adopted.background_started,
+        "auto-adoption starts background work"
+    );
+    assert!(
+        !adopted.content.contains(BACKGROUND_REMINDER),
+        "the reminder is delivered as a separate Notice, never in the tool result"
+    );
+    let receipt = adopted.content;
     assert!(receipt.contains("foreground threshold"));
     let AgentEvent::BackgroundCompleted { output, .. } =
         tokio::time::timeout(Duration::from_secs(5), events.recv())
@@ -2754,8 +2767,16 @@ async fn foreground_adoption_keeps_process_output_and_exposes_task() {
     let running = tokio::spawn(async move { bash.execute(json!({"command": command})).await });
     wait_for_path(&temp.path().join("ready")).await;
     assert!(background.running().is_empty());
-    let receipt = running.await.unwrap().unwrap().content;
-    assert!(receipt.contains(DO_NOT_WAIT_LINE));
+    let adopted = running.await.unwrap().unwrap();
+    assert!(
+        adopted.background_started,
+        "auto-adoption starts background work"
+    );
+    assert!(
+        !adopted.content.contains(BACKGROUND_REMINDER),
+        "the reminder is delivered as a separate Notice, never in the tool result"
+    );
+    let receipt = adopted.content;
     assert!(receipt.contains("foreground threshold"));
     let task = background.running();
     assert_eq!(task.len(), 1);
@@ -4890,15 +4911,14 @@ async fn background_title_labels_task_but_keeps_full_command() {
             "title": title
         }))
         .await
-        .unwrap()
-        .content;
+        .unwrap();
+    assert!(started.background_started);
     assert_eq!(
-        started,
-        format!(
-            "started background task 1: {normalized_title}\n{}",
-            DO_NOT_WAIT_LINE
-        )
+        started.content,
+        format!("started background task 1: {normalized_title}"),
+        "the receipt is the whole tool result; the reminder is a separate Notice"
     );
+    assert!(!started.content.contains(BACKGROUND_REMINDER));
 
     let running = background.running();
     assert_eq!(running.len(), 1);
@@ -4947,10 +4967,10 @@ async fn background_title_blank_falls_back_and_fast_foreground_is_not_listed() {
     let started = bash
         .execute(json!({"command": "sleep 30", "background": true, "title": "  \n\t "}))
         .await
-        .unwrap()
-        .content;
-    assert!(started.starts_with("started background task 2: sleep 30\n"));
-    assert!(started.ends_with(DO_NOT_WAIT_LINE), "{started}");
+        .unwrap();
+    assert!(started.background_started);
+    assert_eq!(started.content, "started background task 2: sleep 30");
+    assert!(!started.content.contains(BACKGROUND_REMINDER));
     assert_eq!(bash.background.running()[0].label, "sleep 30");
     assert_eq!(
         bash.background
@@ -4968,22 +4988,53 @@ async fn explicit_background_and_detached_modes_keep_delivery_contracts() {
     let receipt = bash
         .execute(json!({"command":"printf bg", "background":true}))
         .await
-        .unwrap()
-        .content;
-    assert!(receipt.starts_with("started background task 1:"));
+        .unwrap();
+    assert!(
+        receipt.background_started,
+        "a non-detached background launch qualifies"
+    );
+    assert!(receipt.content.starts_with("started background task 1:"));
+    assert!(!receipt.content.contains(BACKGROUND_REMINDER));
     assert!(events.recv().await.is_some());
     assert!(events.try_recv().is_err());
     let detached = bash
         .execute(json!({"command":"printf detached", "background":true, "detached":true}))
         .await
-        .unwrap()
-        .content;
-    assert!(detached.starts_with("started background task 2:"));
+        .unwrap();
+    assert!(
+        !detached.background_started,
+        "a detached launch never delivers a completion, so it carries no reminder"
+    );
+    assert!(detached.content.starts_with("started background task 2:"));
     assert!(
         tokio::time::timeout(Duration::from_millis(50), events.recv())
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn background_launch_failure_reports_no_started_flag() {
+    // No delivery sender: `start_with_sender` fails closed. A failed launch is
+    // an `Err` (never a `ToolOutput`), so it cannot mark background work as
+    // started and cannot trigger the runner's reminder.
+    let temp = tempfile::tempdir().unwrap();
+    let bash = Bash {
+        workspace: Workspace::new(temp.path()).unwrap(),
+        timeout: Some(Duration::from_secs(10)),
+        sender: None,
+        background: BackgroundTasks::new(None, None),
+        sandbox: None,
+        protect_git: false,
+        shell: Shell::detect().unwrap(),
+        owner_session: None,
+    };
+    let error = bash
+        .execute(json!({"command": "sleep 30", "background": true}))
+        .await
+        .unwrap_err();
+    assert_eq!(error, "background task delivery is unavailable");
+    assert!(bash.background.running().is_empty());
 }
 
 #[tokio::test]
@@ -5640,7 +5691,7 @@ async fn completion_delivery_available_requires_an_open_receiver() {
         )
         .unwrap();
     // spawn_with_id is the raw registry receipt (also reused by delegate/
-    // detached); the do-not-wait line is appended only by Bash::execute.
+    // detached); Bash::execute adds only the `background_started` flag.
     assert_eq!(started, "started background task 1: starts now");
     assert!(matches!(
         receiver.recv().await,

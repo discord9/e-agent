@@ -92,10 +92,6 @@ pub(super) struct Bash {
     pub(super) owner_session: Option<String>,
 }
 
-/// The do-not-wait reminder appended to every non-detached background bash
-/// receipt. Test-visible so exact-equality assertions share one source.
-pub(crate) const DO_NOT_WAIT_LINE: &str = "Do not wait for it: no sleep, no polling, no re-checks. The completion is delivered automatically as [background task completed] injected into this conversation; continue other work or end your turn now.";
-
 #[async_trait]
 impl Tool for Bash {
     fn spec(&self) -> ToolSpec {
@@ -241,11 +237,15 @@ impl Tool for Bash {
                     title,
                 )
                 .map(|receipt| {
-                    // The tool schema says this, but the receipt is what the
-                    // model reads at the moment it decides what to do next:
-                    // repeat the do-not-wait contract here so a background
-                    // task is not followed by sleep/poll busywork.
-                    ToolOutput::text(format!("{receipt}\n{DO_NOT_WAIT_LINE}"))
+                    // The receipt is all the model needs here: the do-not-wait
+                    // guidance is delivered by the runner as a separate
+                    // user-shaped Notice on the next provider request, so a
+                    // background task is not followed by sleep/poll busywork.
+                    ToolOutput {
+                        content: receipt,
+                        images: Vec::new(),
+                        background_started: true,
+                    }
                 });
         }
         let threshold = self.timeout;
@@ -284,9 +284,13 @@ impl Tool for Bash {
             super::background::ForegroundOutcome::Done(result) => result.map(ToolOutput::text),
             super::background::ForegroundOutcome::Adopted(receipt) => {
                 let seconds = threshold.map(|value| value.as_secs()).unwrap_or_default();
-                Ok(ToolOutput::text(format!(
-                    "{receipt}\n{DO_NOT_WAIT_LINE}\nThe command exceeded the {seconds}s foreground threshold and is now running in the background."
-                )))
+                Ok(ToolOutput {
+                    content: format!(
+                        "{receipt}\nThe command exceeded the {seconds}s foreground threshold and is now running in the background."
+                    ),
+                    images: Vec::new(),
+                    background_started: true,
+                })
             }
         }
     }
