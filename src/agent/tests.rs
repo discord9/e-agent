@@ -264,6 +264,168 @@ async fn direct_agent_consumes_notice_then_completion_in_order() {
     assert!(requests.lock().unwrap().iter().any(|request| request.iter().any(|message| matches!(message, Message::User { content, .. } if content == "stall warning"))));
 }
 
+/// Tool that STARTS background work: the structured `background_started`
+/// flag — never the receipt text — is what the batch-level reminder keys on.
+struct BackgroundStartingTool;
+
+#[async_trait]
+impl Tool for BackgroundStartingTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "bash".into(),
+            description: "background-start test".into(),
+            parameters: json!({"type":"object"}),
+        }
+    }
+    async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
+        Ok(ToolOutput {
+            content: "started background task 1: build".into(),
+            images: vec![],
+            background_started: true,
+        })
+    }
+}
+
+/// Positions of the background reminder in one provider request (it is
+/// user-SHAPED but is never a real user prompt).
+fn reminder_positions(messages: &[Message]) -> Vec<usize> {
+    messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| {
+            matches!(message, Message::User { content, .. } if content == BACKGROUND_REMINDER)
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+#[tokio::test]
+async fn direct_agent_appends_one_background_reminder_after_the_whole_batch() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let model = ScriptedModel {
+        replies: vec![
+            AssistantMessage {
+                content: None,
+                tool_calls: vec![
+                    call("b1", "bash", r#"{"background":true}"#),
+                    call("b2", "bash", r#"{"background":true}"#),
+                ],
+                reasoning: None,
+            },
+            AssistantMessage {
+                content: Some("done".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            },
+        ],
+        requests: requests.clone(),
+        delays: Default::default(),
+    };
+    let mut agent = Agent::new(Box::new(model), vec![Box::new(BackgroundStartingTool)]);
+    assert_eq!(agent.run("go".into()).await.unwrap(), "done");
+
+    // Both real tool results survive the projection; the SINGLE reminder
+    // follows the whole batch (two launches coalesce into one notice).
+    let request = &requests.lock().unwrap()[1];
+    let tools: Vec<usize> = request
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| matches!(message, Message::Tool { .. }))
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(tools.len(), 2, "{request:?}");
+    assert_eq!(reminder_positions(request), vec![tools[1] + 1]);
+    assert_eq!(
+        agent
+            .history()
+            .iter()
+            .filter(|entry| matches!(
+                entry,
+                SessionEntry::Notice { text } if text == BACKGROUND_REMINDER
+            ))
+            .count(),
+        1,
+        "the reminder is committed once per batch, not once per launch"
+    );
+}
+
+#[tokio::test]
+async fn background_reminder_notice_is_never_the_compaction_current_prompt() {
+    // The reminder is user-shaped in the provider projection but is NOT an
+    // actual user prompt: a compaction must not record it as
+    // `current_prompt_at`, or a resume would treat it as the live prompt.
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let model = ScriptedModel {
+        replies: vec![AssistantMessage {
+            content: Some("summary".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        }],
+        requests: requests.clone(),
+        delays: Default::default(),
+    };
+    let mut agent = Agent::new(Box::new(model), vec![]);
+    let history: Vec<SessionEntry> = vec![
+        Message::User {
+            content: "do work".into(),
+            images: vec![],
+        }
+        .into(),
+        Message::Assistant(AssistantMessage {
+            content: None,
+            tool_calls: vec![call("c1", "bash", r#"{}"#)],
+            reasoning: None,
+        })
+        .into(),
+        Message::Tool {
+            call_id: "c1".into(),
+            name: "bash".into(),
+            content: "result".into(),
+            images: vec![],
+            is_error: false,
+            synthetic: false,
+        }
+        .into(),
+        Message::Assistant(AssistantMessage {
+            content: Some("still working".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        })
+        .into(),
+        SessionEntry::Notice {
+            text: BACKGROUND_REMINDER.to_owned(),
+        },
+        // The trailing assistant keeps the notice inside the retained tail
+        // (the cut lands on the first assistant at/after the nominal one).
+        Message::Assistant(AssistantMessage {
+            content: Some("answer".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        })
+        .into(),
+    ];
+    agent.restore_history(history);
+    agent.compact().await.unwrap();
+
+    let SessionEntry::Compaction {
+        retained,
+        current_prompt_at,
+        no_current_prompt,
+        ..
+    } = agent.history().last().unwrap()
+    else {
+        panic!("expected a compaction entry");
+    };
+    assert!(
+        retained
+            .iter()
+            .any(|message| matches!(message, Message::User { content, .. } if content == BACKGROUND_REMINDER)),
+        "the reminder must be part of the retained tail for this assertion to bind"
+    );
+    assert_eq!(*current_prompt_at, None);
+    assert!(*no_current_prompt);
+}
+
 struct SlowEchoTool;
 
 #[async_trait]
@@ -3907,6 +4069,7 @@ impl Tool for ImageTool {
                 hash,
                 mime: "image/png".into(),
             }],
+            background_started: false,
         })
     }
 }

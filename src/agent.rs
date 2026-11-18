@@ -251,6 +251,14 @@ pub const IMAGE_MAX_BYTES: usize = 10 * 1024 * 1024;
 pub struct ToolOutput {
     pub content: String,
     pub images: Vec<ImagePart>,
+    /// Set by a tool that just STARTED background work whose completion
+    /// arrives asynchronously (`bash` non-detached background, or a
+    /// foreground command auto-adopted past the threshold). The runner folds
+    /// every `true` in one sibling batch into a single
+    /// [`SessionEntry::Notice`] carrying [`BACKGROUND_REMINDER`], so the
+    /// do-not-wait guidance reaches the NEXT provider request as a
+    /// user-shaped entry instead of trailing text in the tool result.
+    pub background_started: bool,
 }
 
 impl ToolOutput {
@@ -259,9 +267,16 @@ impl ToolOutput {
         Self {
             content: content.into(),
             images: Vec::new(),
+            background_started: false,
         }
     }
 }
+
+/// Provider-facing do-not-wait guidance for a tool batch that started
+/// background work. Committed ONCE per sibling batch as
+/// [`SessionEntry::Notice`] (projected as a user-shaped context entry); it
+/// never forces a turn end, an extra model call, or a wait.
+pub(crate) const BACKGROUND_REMINDER: &str = "Continue independent work if available; otherwise finish your response. Do not sleep, poll task status, or rerun a command to wait. Background command results arrive automatically.";
 
 /// Remove image attachments from user AND tool messages, text-degrading the
 /// message (a short note is appended where images were dropped). Non-vision
@@ -2580,6 +2595,9 @@ impl Agent {
             // assistant batch gets a real ToolResult (no repair_tool_pairs
             // hole).
             let mut poll_terminate = false;
+            // One reminder per sibling batch, however many calls started
+            // background work (coalesced below).
+            let mut background_started = false;
             for call in &assistant.tool_calls {
                 self.emit(AgentEvent::ToolCall {
                     name: call.name.clone(),
@@ -2589,6 +2607,9 @@ impl Agent {
                 let result = Self::execute_on(&self.tools, call).await;
                 if call.name == "get_background_tasks" && is_poll_guard_terminate(&result) {
                     poll_terminate = true;
+                }
+                if let Ok(output) = &result {
+                    background_started |= output.background_started;
                 }
                 self.after_tool_entry(call, &result)
                     .await
@@ -2617,6 +2638,15 @@ impl Agent {
                     images,
                     is_error,
                     synthetic: false,
+                });
+            }
+            if background_started {
+                // The full sibling batch is recorded; the do-not-wait
+                // guidance rides as a user-shaped Notice on the NEXT request
+                // through the normal entry path (no UserPrompt, no extra
+                // model call, no turn end).
+                self.apply_entry(SessionEntry::Notice {
+                    text: BACKGROUND_REMINDER.to_owned(),
                 });
             }
             if poll_terminate {

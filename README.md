@@ -1876,6 +1876,11 @@ is `DELETE /api/sessions/{id}` or the tasks-panel cancel (which aborts a
 subagent through its parent's background-task registry). Idle-runner
 lifecycle management (idle timeouts / GC for parked sessions) is not in
 scope.
+No shell-command classifier and no forced turn ending/continuation for
+background waits; the do-not-wait reminder only changes where the guidance is
+delivered (a durable user-shaped Notice on the next request, never trailing
+tool-result text and never an extra model call). Interrupted or cancelled
+batches do not emit this reminder.
 Windows restricted-token MVP is only an accident-prevention write restriction:
 no read isolation, network isolation, Job Object, AppContainer, broker/IPC,
 ConPTY, dedicated user, protected-git shell execution, or bwrap-equivalent

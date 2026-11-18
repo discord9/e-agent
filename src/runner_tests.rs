@@ -2207,6 +2207,7 @@ impl Tool for MarkerTool {
                 hash: "hash123".into(),
                 mime: "image/png".into(),
             }],
+            background_started: false,
         })
     }
 }
@@ -2273,6 +2274,7 @@ impl Tool for BlockingMarkerTool {
                 hash: "hash123".into(),
                 mime: "image/png".into(),
             }],
+            background_started: false,
         })
     }
 }
@@ -7401,6 +7403,558 @@ async fn detached_daemon_does_not_block_finish_when_idle() {
     assert_eq!(daemons[0].kind, "bash");
     // Explicitly cancel to avoid leaking the sleep process past the test.
     background.cancel_with_source(daemons[0].id, crate::agent::CancellationSource::System);
+    assert!(background.running().is_empty());
+}
+
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// Background bash: the do-not-wait reminder rides as a durable Notice
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+//
+// A tool batch that STARTED background work must reach the next provider
+// request with the do-not-wait guidance as ONE user-shaped
+// `SessionEntry::Notice` after the real tool results — never as trailing
+// tool-result text, never as a user prompt, never an extra model call, and
+// never a turn end/wake.
+
+/// Positions of the background reminder in one captured provider request.
+fn background_reminders(messages: &[Message]) -> Vec<usize> {
+    messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| {
+            matches!(message, Message::User { content, .. }
+                if content == crate::agent::BACKGROUND_REMINDER)
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// Bash-shaped tool that reports STARTED background work through the
+/// structured flag only; the receipt text carries no reminder.
+struct StartingBashMock(Arc<AtomicUsize>);
+
+#[async_trait]
+impl Tool for StartingBashMock {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "bash".into(),
+            description: "reminder test".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+    async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
+        let id = self.0.fetch_add(1, Ordering::SeqCst) + 1;
+        Ok(ToolOutput {
+            content: format!("started background task {id}: build {id}"),
+            images: Vec::new(),
+            background_started: true,
+        })
+    }
+}
+
+/// Ordinary sibling tool: a plain text result and no background work.
+struct OrdinarySiblingMock;
+
+#[async_trait]
+impl Tool for OrdinarySiblingMock {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "echo".into(),
+            description: "reminder test".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+    async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
+        Ok(ToolOutput::text("ordinary sibling result"))
+    }
+}
+
+/// Bash-shaped tool that always fails: a failed result carries no flag, so it
+/// can never contribute a reminder.
+struct FailingBashMock;
+
+#[async_trait]
+impl Tool for FailingBashMock {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "bash".into(),
+            description: "reminder test".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+    async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
+        Err("background task delivery is unavailable".into())
+    }
+}
+
+fn reminder_bash_call(id: &str) -> ToolCall {
+    ToolCall {
+        id: id.into(),
+        name: "bash".into(),
+        arguments: "{}".into(),
+    }
+}
+
+fn reminder_echo_call(id: &str) -> ToolCall {
+    ToolCall {
+        id: id.into(),
+        name: "echo".into(),
+        arguments: "{}".into(),
+    }
+}
+
+#[tokio::test]
+async fn background_reminder_coalesces_two_launches_into_one_notice_after_the_batch() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![
+                (
+                    AssistantMessage {
+                        content: None,
+                        tool_calls: vec![
+                            reminder_bash_call("b1"),
+                            reminder_bash_call("b2"),
+                            reminder_echo_call("e1"),
+                        ],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("done".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+            ]
+            .into(),
+            calls: calls.clone(),
+        }),
+        vec![
+            Box::new(StartingBashMock(Arc::new(AtomicUsize::new(0)))),
+            Box::new(OrdinarySiblingMock),
+        ],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "bg-reminder-batch".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let task = runner.start(Some("start two builds".into()));
+
+    wait_for_calls(&calls, 2).await;
+    let request = calls.lock().unwrap()[1].clone();
+    // Every real sibling result survives the provider projection, in order.
+    let tools: Vec<&Message> = request
+        .iter()
+        .filter(|message| matches!(message, Message::Tool { .. }))
+        .collect();
+    assert_eq!(tools.len(), 3, "{request:?}");
+    assert!(
+        matches!(tools[0], Message::Tool { call_id, content, is_error: false, .. }
+        if call_id == "b1" && content.contains("build 1"))
+    );
+    assert!(
+        matches!(tools[1], Message::Tool { call_id, content, is_error: false, .. }
+        if call_id == "b2" && content.contains("build 2"))
+    );
+    assert!(
+        matches!(tools[2], Message::Tool { call_id, content, is_error: false, .. }
+        if call_id == "e1" && content == "ordinary sibling result")
+    );
+    // Two launches, one reminder, AFTER the whole batch.
+    let last_tool = request
+        .iter()
+        .rposition(|message| matches!(message, Message::Tool { .. }))
+        .unwrap();
+    assert_eq!(background_reminders(&request), vec![last_tool + 1]);
+
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "done"),
+    )
+    .await;
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "bg-reminder-batch")
+        .await
+        .unwrap();
+    assert_eq!(
+        loaded
+            .entries
+            .iter()
+            .filter(|entry| matches!(
+                entry,
+                SessionEntry::Notice { text } if text == crate::agent::BACKGROUND_REMINDER
+            ))
+            .count(),
+        1,
+        "one durable notice for the whole batch"
+    );
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn background_reminder_absent_for_failed_and_foreground_batches() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![
+                (
+                    AssistantMessage {
+                        content: None,
+                        tool_calls: vec![reminder_bash_call("f1"), reminder_echo_call("e1")],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("done".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+            ]
+            .into(),
+            calls: calls.clone(),
+        }),
+        vec![Box::new(FailingBashMock), Box::new(OrdinarySiblingMock)],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "bg-reminder-none".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let task = runner.start(Some("run a failing launch".into()));
+
+    wait_for_calls(&calls, 2).await;
+    let request = calls.lock().unwrap()[1].clone();
+    assert!(
+        request
+            .iter()
+            .any(|message| matches!(message, Message::Tool { call_id, is_error: true, .. } if call_id == "f1")),
+        "the failed launch is a real (error) tool result: {request:?}"
+    );
+    assert!(
+        background_reminders(&request).is_empty(),
+        "a failed launch and a completed foreground command carry no reminder"
+    );
+    assert!(
+        !request
+            .iter()
+            .any(|message| matches!(message, Message::Tool { content, .. }
+            if content.contains(crate::agent::BACKGROUND_REMINDER))),
+        "the reminder never rides in the tool result"
+    );
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "done"),
+    )
+    .await;
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "bg-reminder-none")
+        .await
+        .unwrap();
+    assert!(
+        !loaded.entries.iter().any(|entry| matches!(
+            entry,
+            SessionEntry::Notice { text } if text == crate::agent::BACKGROUND_REMINDER
+        )),
+        "no durable reminder for a batch that started nothing"
+    );
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+/// Gated POSIX command: prints, signals readiness, then blocks until the gate
+/// file exists. Auto-adoption of this foreground command is deterministic and
+/// needs no fixed sleep.
+#[cfg(unix)]
+fn gated_bash_command(temp: &std::path::Path) -> String {
+    format!(
+        "printf before; touch '{}'; while [ ! -f '{}' ]; do /bin/sleep 0.02; done; printf after",
+        temp.join("ready").display(),
+        temp.join("gate").display()
+    )
+}
+
+#[cfg(unix)]
+async fn wait_for_path(path: &std::path::Path) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !path.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("command did not reach its synchronization point");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn background_reminder_reaches_the_next_request_once_without_waking_the_turn() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = crate::workspace::Workspace::new(temp.path()).unwrap();
+    // A real bash facade with a short foreground threshold: the gated command
+    // is auto-adopted, exactly like a production long-running build.
+    let (tools, background) = crate::tools::builtins_with_bash_timeout(
+        workspace,
+        None,
+        false,
+        None,
+        Some(std::time::Duration::from_millis(200)),
+    );
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![
+                (
+                    AssistantMessage {
+                        content: None,
+                        tool_calls: vec![ToolCall {
+                            id: "c1".into(),
+                            name: "bash".into(),
+                            arguments:
+                                serde_json::json!({"command": gated_bash_command(temp.path())})
+                                    .to_string(),
+                        }],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+                (
+                    // Independent work instead of waiting: no poll, no sleep.
+                    AssistantMessage {
+                        content: None,
+                        tool_calls: vec![ToolCall {
+                            id: "c2".into(),
+                            name: "bash".into(),
+                            arguments: serde_json::json!({"command": "printf independent"})
+                                .to_string(),
+                        }],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("still working".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+                (
+                    AssistantMessage {
+                        content: Some("background done".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+            ]
+            .into(),
+            calls: calls.clone(),
+        }),
+        tools,
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "bg-reminder".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let mut status = handle.status();
+    let task = runner.start(Some("start the long build".into()));
+
+    // Second regular request: the ADOPTED command's real result, then exactly
+    // one user-shaped reminder.
+    wait_for_calls(&calls, 2).await;
+    let second = calls.lock().unwrap()[1].clone();
+    let adopted = second
+        .iter()
+        .position(|message| {
+            matches!(message, Message::Tool { name, content, is_error: false, .. }
+                if name == "bash"
+                    && content.contains("started background task 1")
+                    && content.contains("foreground threshold"))
+        })
+        .unwrap_or_else(|| panic!("adopted bash result missing: {second:?}"));
+    let Message::Tool { content, .. } = &second[adopted] else {
+        unreachable!()
+    };
+    assert!(
+        !content.contains(crate::agent::BACKGROUND_REMINDER),
+        "the reminder is not trailing tool-result text: {content:?}"
+    );
+    assert_eq!(
+        second[adopted + 1],
+        Message::User {
+            content: crate::agent::BACKGROUND_REMINDER.to_owned(),
+            images: vec![],
+        },
+        "the reminder is the entry immediately after the real tool result"
+    );
+    assert_eq!(background_reminders(&second), vec![adopted + 1]);
+    wait_for_path(&temp.path().join("ready")).await;
+
+    // Third request (an independent foreground command): the reminder is
+    // replayed once and the new tool result follows it.
+    wait_for_calls(&calls, 3).await;
+    let third = calls.lock().unwrap()[2].clone();
+    assert_eq!(background_reminders(&third), vec![adopted + 1]);
+    let independent = third
+        .iter()
+        .position(|message| {
+            matches!(message, Message::Tool { call_id, content, .. }
+                if call_id == "c2" && content.contains("independent"))
+        })
+        .unwrap_or_else(|| panic!("independent result missing: {third:?}"));
+    assert!(
+        independent > adopted + 1,
+        "the independent result follows the reminder: {third:?}"
+    );
+
+    // Natural turn end: the reminder must not arm an extra provider request
+    // (it is ingress for the running turn, not a reaction trigger).
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "still working"),
+    )
+    .await;
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            calls_reached(&calls, 4)
+        )
+        .await
+        .is_err(),
+        "the reminder must not wake the idle session with an extra request"
+    );
+    // Provenance: the reminder is never a user prompt, and it is fanned out
+    // exactly once (never again through the background-completion channel).
+    let log = handle.snapshot();
+    assert!(
+        !log.iter()
+            .any(|event| matches!(event, AgentEvent::UserPrompt(text)
+            if text.contains(crate::agent::BACKGROUND_REMINDER))),
+        "the reminder must never be a UserPrompt event"
+    );
+    assert_eq!(
+        log.iter()
+            .filter(|event| matches!(event, AgentEvent::Notice(text)
+                if text == crate::agent::BACKGROUND_REMINDER))
+            .count(),
+        1,
+        "one durable Notice, no duplicate background-channel emission"
+    );
+
+    // Release the gated command: its completion arrives automatically and
+    // the next turn replays the reminder exactly once (no re-injection).
+    std::fs::write(temp.path().join("gate"), "").unwrap();
+    wait_for_calls(&calls, 4).await;
+    let fourth = calls.lock().unwrap()[3].clone();
+    assert_eq!(
+        background_reminders(&fourth),
+        vec![adopted + 1],
+        "reloading/replaying history must not duplicate the reminder"
+    );
+    assert!(
+        fourth
+            .iter()
+            .any(|message| matches!(message, Message::User { content, .. }
+            if content.contains("[background task 1 completed") && content.contains("after"))),
+        "the completion output arrives through the completion entry: {fourth:?}"
+    );
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "background done"),
+    )
+    .await;
+    wait_for_status(&mut status, |s| matches!(s, SessionStatus::Idle)).await;
+
+    // Durable history: exactly one reminder Notice, never re-appended.
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "bg-reminder")
+        .await
+        .unwrap();
+    let reminders = loaded
+        .entries
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry,
+                SessionEntry::Notice { text } if text == crate::agent::BACKGROUND_REMINDER
+            )
+        })
+        .count();
+    assert_eq!(reminders, 1, "durable history holds exactly one reminder");
+
+    // Resuming the persisted history replays it once and appends nothing: the
+    // resumed request carries one reminder and the store still holds one.
+    let replay_calls = Arc::new(Mutex::new(Vec::new()));
+    let mut resumed = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![(
+                AssistantMessage {
+                    content: Some("resumed answer".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+                None,
+            )]
+            .into(),
+            calls: replay_calls.clone(),
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    resumed.restore_history(loaded.entries.clone());
+    let (resumed_runner, resumed_handle) = SessionRunner::new(
+        resumed,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "bg-reminder".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let resumed_task = resumed_runner.start(Some("continue".into()));
+    wait_for_calls(&replay_calls, 1).await;
+    assert_eq!(
+        background_reminders(&replay_calls.lock().unwrap()[0]).len(),
+        1,
+        "the persisted reminder is replayed exactly once"
+    );
+    drop(resumed_handle);
+    resumed_task.join().await.unwrap();
+    let reloaded = SessionStore::Jsonl
+        .load(temp.path(), "bg-reminder")
+        .await
+        .unwrap();
+    assert_eq!(
+        reloaded
+            .entries
+            .iter()
+            .filter(|entry| matches!(
+                entry,
+                SessionEntry::Notice { text } if text == crate::agent::BACKGROUND_REMINDER
+            ))
+            .count(),
+        1,
+        "resuming must not append a second reminder"
+    );
+
+    drop(handle);
+    task.join().await.unwrap();
     assert!(background.running().is_empty());
 }
 
