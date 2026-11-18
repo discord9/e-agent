@@ -442,22 +442,16 @@ impl SessionFactory {
         workspace = workspace
             .with_external_roots(&resolved_policy)
             .map_err(anyhow::Error::msg)?;
-        // Main-session file tools only: clone the workspace with one extra
-        // read-only capability rooted at the global skills directory, so the
-        // model can `read_file` the SKILL.md paths the index advertises.
-        // The stored plain `workspace` (used by the delegate and btw forks)
-        // never gains this root, and bash keeps the original policy.
-        let skills_workspace = global_skills_dir
-            .as_ref()
-            .map(|dir| {
-                let mut with_skills = resolved_policy.clone();
-                with_skills.readable_paths.push(dir.display().to_string());
-                workspace
-                    .clone()
-                    .with_external_roots(&with_skills)
-                    .map_err(anyhow::Error::msg)
-            })
-            .transpose()?;
+        // Main-session file tools only: the plain workspace plus a read-only
+        // capability for the global skills directory (see
+        // [`main_tools_workspace`]). The stored plain `workspace` (used by
+        // the delegate and btw forks) never gains this root, and bash keeps
+        // the original policy.
+        let skills_workspace = main_tools_workspace(
+            workspace.clone(),
+            &resolved_policy,
+            global_skills_dir.as_deref(),
+        )?;
         let sandbox = resolved_policy.enabled.then_some(resolved_policy.clone());
         if let Some(policy) = &sandbox {
             preflight_sandbox(policy, announce)?;
@@ -1321,6 +1315,46 @@ pub(crate) fn register_run_rust(tools: &mut Vec<Box<dyn crate::agent::Tool>>, wo
         let narrowed = if read_only { sandbox.as_ref().map(crate::tools::read_only_sandbox) } else { sandbox };
         tools.push(crate::tools::run_rust_tool(workspace, narrowed.as_ref()));
     }
+}
+
+/// Build the MAIN session's tools workspace: the plain workspace plus one
+/// extra read-only capability at the global skills directory, so the model
+/// can `read_file` the SKILL.md paths the index advertises.
+///
+/// The configured logical path AND its canonical form are both installed as
+/// read-only entries. [`skills_root_is_dir`] only rules out a symlinked
+/// `skills` directory itself, not a symlinked PARENT component: the index
+/// advertises the logical path, while the file tools match entry
+/// destinations lexically, so a parent-symlink alias leaves the real
+/// directory (which can sit inside the workspace, where the workspace entry
+/// is writable) unprotected. A canonicalization failure is a construction
+/// error rather than a silently dropped protection.
+fn main_tools_workspace(
+    workspace: Workspace,
+    policy: &Sandbox,
+    global_skills_dir: Option<&Path>,
+) -> anyhow::Result<Option<Workspace>> {
+    let Some(dir) = global_skills_dir else {
+        return Ok(None);
+    };
+    let canonical = std::fs::canonicalize(dir).with_context(|| {
+        format!(
+            "cannot canonicalize the global skills directory {}",
+            dir.display()
+        )
+    })?;
+    let mut with_skills = policy.clone();
+    with_skills.readable_paths.push(dir.display().to_string());
+    if canonical.as_path() != dir {
+        with_skills
+            .readable_paths
+            .push(canonical.display().to_string());
+    }
+    Ok(Some(
+        workspace
+            .with_external_roots(&with_skills)
+            .map_err(anyhow::Error::msg)?,
+    ))
 }
 
 /// Register the main-agent-only `generate_image` tool. Read-only sessions
@@ -3768,6 +3802,109 @@ mod generate_image_registration_tests {
         assert_eq!(
             auth.current_access_token_and_account().await.unwrap(),
             ("access".to_owned(), "account".to_owned())
+        );
+    }
+
+    /// Red-before-fix regression: [`skills_root_is_dir`] only rules out a
+    /// symlinked `skills` directory itself, never a symlinked PARENT. With a
+    /// parent-symlink alias the real skills directory can sit inside the
+    /// workspace, whose entry is writable, and only the configured logical
+    /// path (an alias the file tools match lexically) would be read-only. The
+    /// canonical path must be installed as its own read-only entry, so the
+    /// factory-registered `generate_image` refuses the real directory before
+    /// auth; the shared resolver here is `unreachable!`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn main_tools_workspace_protects_the_canonical_global_skills_path() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let real_skills = temp.path().join("real/skills/demo");
+        std::fs::create_dir_all(&real_skills).unwrap();
+        std::fs::write(real_skills.join("SKILL.md"), "# demo").unwrap();
+        // A parent-component alias: the configured logical skills path is
+        // `<ws>/alias/skills`, the real directory `<ws>/real/skills`.
+        symlink(temp.path().join("real"), temp.path().join("alias")).unwrap();
+        let logical = temp.path().join("alias/skills");
+        assert!(
+            skills_root_is_dir(&logical),
+            "the alias itself is a real directory"
+        );
+
+        let tools_workspace = main_tools_workspace(
+            Workspace::new(temp.path()).unwrap(),
+            &Sandbox::default(),
+            Some(&logical),
+        )
+        .expect("the skills workspace builds")
+        .expect("a skills root is installed");
+        let mut tools = Vec::new();
+        register_generate_image(
+            &mut tools,
+            &tools_workspace,
+            Arc::new(|| unreachable!("the canonical skills path must be refused before auth")),
+            false,
+        );
+        let tool = tools.first().expect("generate_image is registered");
+
+        // The canonical path names the real directory with no symlinked
+        // parent, so only the canonical read-only entry can refuse it.
+        let error = tool
+            .execute(serde_json::json!({"prompt": "x", "path": "real/skills/out.png"}))
+            .await
+            .unwrap_err();
+        assert!(error.contains("inside the workspace"), "{error}");
+        assert!(!temp.path().join("real/skills/out.png").exists());
+        // The logical alias path stays refused through its read-only entry
+        // (or the symlinked-parent gate) and never publishes.
+        assert!(
+            tool.execute(serde_json::json!({"prompt": "x", "path": "alias/skills/out.png"}))
+                .await
+                .is_err()
+        );
+        assert!(!temp.path().join("real/skills/out.png").exists());
+
+        // A root that canonicalizes to the configured path keeps exactly the
+        // same read-only protection (the deduplicated branch).
+        let plain = temp.path().join("plain-skills");
+        std::fs::create_dir_all(&plain).unwrap();
+        let plain_workspace = main_tools_workspace(
+            Workspace::new(temp.path()).unwrap(),
+            &Sandbox::default(),
+            Some(&plain),
+        )
+        .expect("the skills workspace builds")
+        .expect("a skills root is installed");
+        let mut plain_tools = Vec::new();
+        register_generate_image(
+            &mut plain_tools,
+            &plain_workspace,
+            Arc::new(|| unreachable!("a read-only skills dir must be refused before auth")),
+            false,
+        );
+        let error = plain_tools[0]
+            .execute(serde_json::json!({"prompt": "x", "path": "plain-skills/out.png"}))
+            .await
+            .unwrap_err();
+        assert!(error.contains("inside the workspace"), "{error}");
+        assert!(!plain.join("out.png").exists());
+    }
+
+    /// Fail closed: if the global skills directory cannot be canonicalized
+    /// (e.g. it vanished after the [`skills_root_is_dir`] filter), the
+    /// workspace construction errors instead of silently dropping the
+    /// read-only entry.
+    #[test]
+    fn main_tools_workspace_fails_closed_when_canonicalization_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing-skills");
+        assert!(
+            main_tools_workspace(
+                Workspace::new(temp.path()).unwrap(),
+                &Sandbox::default(),
+                Some(&missing),
+            )
+            .is_err()
         );
     }
 }

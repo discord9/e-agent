@@ -154,7 +154,7 @@ impl Tool for GenerateImage {
     fn spec(&self) -> ToolSpec {
         spec(
             "generate_image",
-            "Generate one image from a text prompt with the ChatGPT Codex image backend and save it as a new PNG file below the workspace. Requires an existing ChatGPT login (`e-agent login`). `path` must be a workspace-relative `.png` path that does not already exist; describe content, style, composition, and any text in `prompt`.",
+            "Generate one image from a text prompt with the ChatGPT Codex image backend and save it as a new PNG file below the workspace (Linux/Android only: every other platform refuses before any request is sent). Requires an existing ChatGPT login (`e-agent login`). `path` must be a workspace-relative `.png` path that does not already exist; describe content, style, composition, and any text in `prompt`.",
             json!({
                 "prompt": {"type": "string", "description": "the image prompt; non-empty, at most 32000 bytes"},
                 "path": {"type": "string", "description": "workspace-relative `.png` output path that must not already exist"},
@@ -173,19 +173,6 @@ impl Tool for GenerateImage {
         // POLICY checks, not filesystem-permission probes: a permission
         // failure can still surface at the final exclusive create, which
         // stays the authority against a race.
-        //
-        // Elsewhere `secure_dir_write` is fail-closed (macOS/BSD), so refuse
-        // before spending a generation on a platform that cannot publish.
-        if cfg!(not(any(
-            target_os = "linux",
-            target_os = "android",
-            target_os = "windows"
-        ))) {
-            return Err(
-                "generate_image is unavailable on this platform: secure workspace file writes require Linux (Windows uses the degraded path)"
-                    .to_owned(),
-            );
-        }
         if !self.workspace.targets_workspace(&path)? {
             return Err(format!(
                 "`{path}` must be inside the workspace; configured external roots are not writable by generate_image"
@@ -213,6 +200,23 @@ impl Tool for GenerateImage {
         // before the request too: a write that could never publish must not
         // spend a generation.
         self.workspace.check_writable(&path)?;
+        // Linux/Android are the only supported publishers. Elsewhere the
+        // publish cannot be made safe — macOS/BSD `secure_dir_write` is
+        // fail-closed, and the Windows `create_dir_all` + `open_with` pair
+        // can follow a parent symlink introduced after the preflight above —
+        // so the tool is explicitly unavailable instead of degrading
+        // silently. This sits after the path/policy gates (a bad path still
+        // reports the real reason) and before auth/HTTP, so an unsupported
+        // platform never spends a generation.
+        //
+        // `cfg!` rather than `#[cfg(..)] return`: an attribute guard would
+        // leave the rest of the function unreachable on those targets.
+        if cfg!(not(any(target_os = "linux", target_os = "android"))) {
+            return Err(
+                "generate_image is unavailable on this platform (Linux/Android only); no request was sent"
+                    .to_owned(),
+            );
+        }
         let auth = (self.auth)().map_err(|_| AUTH_UNAVAILABLE.to_owned())?;
         let (access_token, account_id) = auth
             .access_token_and_account()
@@ -420,7 +424,12 @@ fn validate_png(bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(test)]
+/// Publisher tests: the success path, the pre-request refusals that use a
+/// local HTTP fixture, and the workspace/symlink cases all assume the tool
+/// can publish. Linux/Android are the only supported publishers (see
+/// [`GenerateImage::execute`]), so the module is gated to them; the
+/// unsupported-platform refusal has its own module below.
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 mod tests {
     use super::*;
     use crate::agent::*;
@@ -913,9 +922,8 @@ mod tests {
     }
 
     /// A dangling final symlink is an occupied directory entry and must be
-    /// refused before any request. Unix-only: the fixture needs
-    /// `std::os::unix::fs::symlink`.
-    #[cfg(unix)]
+    /// refused before any request. Linux/Android-only like the module: the
+    /// fixture needs `std::os::unix::fs::symlink`.
     #[tokio::test]
     async fn dangling_output_symlink_is_rejected_before_any_request() {
         use std::os::unix::fs::symlink;
@@ -1218,7 +1226,6 @@ mod tests {
         let _ = server.await;
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn symlink_escape_is_refused_without_an_outside_file() {
         use std::os::unix::fs::symlink;
@@ -1452,5 +1459,38 @@ mod tests {
             std::fs::copy(&artifact, dir.join("pixel.png")).unwrap();
             std::fs::write(dir.join("request.http"), request).unwrap();
         }
+    }
+}
+
+/// Every other platform: Linux/Android are the only supported publishers, so
+/// the tool must refuse a well-formed, unoccupied workspace path before auth
+/// is resolved and before any HTTP request — never degrade silently, never
+/// spend a generation on a file it cannot publish safely.
+#[cfg(all(test, not(any(target_os = "linux", target_os = "android"))))]
+mod unsupported_platform_tests {
+    use super::*;
+    use crate::agent::Tool;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn unsupported_platform_refuses_before_auth_and_http() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new(temp.path()).unwrap();
+        let tool = GenerateImage::for_test(
+            workspace,
+            Arc::new(|| unreachable!("an unsupported platform must refuse before auth")),
+            "http://127.0.0.1:9/backend-api/codex/images/generations".to_owned(),
+            Duration::from_secs(1),
+            MAX_RESPONSE_BYTES,
+            MAX_IMAGE_BYTES,
+        );
+        let error = tool
+            .execute(json!({"prompt": "x", "path": "out.png"}))
+            .await
+            .unwrap_err();
+        assert!(error.contains("unavailable on this platform"), "{error}");
+        assert!(error.contains("Linux/Android"), "{error}");
+        assert!(error.contains("no request was sent"), "{error}");
+        assert!(!temp.path().join("out.png").exists());
     }
 }

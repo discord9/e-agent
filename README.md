@@ -1081,9 +1081,12 @@ starts from the parent's **completed-turn prefix** (the in-flight turn is
 excluded, so put everything the child needs in `task`). It stores only a
 `ForkedFrom` marker — the prefix is read back from the parent session — so
 spawning a fork writes O(1) entries, never the parent history. It runs on the
-parent's **current** model, inheriting the parent's system prompt, tool schemas
-and MCP tool set, and the parent's goal is frozen into the request head.
-`workspace` is optional and defaults to the parent root: with that default the
+parent's **current** model, inheriting the parent's system prompt and MCP tool
+set, and the parent's goal is frozen into the request head. A fork does not
+expose the parent's main-only tools, so its tool set matches the parent's only
+when the parent exposed no such tool; the named exception is documented with
+the `delegate` tool. `workspace` is optional and defaults to the parent root:
+with that default, and when parent and child expose the same tool set, the
 child's request is a byte-identical prefix and reuses the parent's
 provider-side prompt cache. An explicit different `workspace` is allowed and
 only moves the child's file/bash tools and MCP connections there — the model,
@@ -1649,13 +1652,20 @@ include a preview of the response body. Provider requests time out after
 ### Image generation (`generate_image`)
 
 The main agent (never read-only sessions, subagents, or btw forks) can
-generate an image from a text prompt:
+generate an image from a text prompt on **Linux and Android only**:
 `generate_image {prompt, path, transparent_background?}` POSTs directly to
 the ChatGPT Codex image endpoint
 (`https://chatgpt.com/backend-api/codex/images/generations`, model
 `gpt-image-2`, quality/size `auto`) with the shared ChatGPT login — the same
 lazy credential cache `auth = "chatgpt"` profiles resolve through, so an
 `e-agent login` after startup is picked up on first use.
+
+Every other platform (Windows, macOS, BSD, …) is unsupported: the tool is
+refused after the path/policy checks and before any request (nothing is
+spent) with an explicit "unavailable on this platform" error. This is a
+deliberate capability narrowing, not a silent degradation — only the
+Linux/Android exclusive-create path can publish without following a parent
+symlink that appeared after the preflight.
 
 `path` must be a workspace-relative `.png` path with only normal components
 (checked lexically: no `.`, `..`, empty, absolute, drive or backslash
@@ -1665,12 +1675,10 @@ target (read-only workspace, read-only external entry, protected policy
 file) is refused, before any request is sent. Those early
 checks are policy checks, not filesystem-permission probes: a permission
 failure can still surface at the final write. The final write is an
-exclusive create (`O_EXCL` on Linux, `create_new` on the degraded Windows
-path), so a race can never overwrite an existing file; if the process cannot
-finish writing, a partial new file may remain — the error says so, and no
-automatic removal is attempted (an unlink could hit a concurrent
-replacement). Platforms whose secure workspace writes are fail-closed
-(macOS/BSD) refuse the tool before spending a generation. The image bytes
+exclusive create (`O_EXCL`), so a race can never overwrite an existing
+file; if the process cannot finish writing, a partial new file may remain —
+the error says so, and no automatic removal is attempted (an unlink could
+hit a concurrent replacement). The image bytes
 are structurally checked (PNG signature + IHDR, nonzero dimensions — not
 decoded) before the file becomes visible, and the result names only the
 relative path and byte count, never base64. Response body and decoded image
@@ -1979,8 +1987,9 @@ Image generation (`generate_image`) is deliberately one concrete tool: one
 fixed model/quality/size, no CLI, SDK, account store, API-key fallback,
 generic provider framework, or per-call knobs beyond the prompt and
 transparent background; no URL fetching, automatic retries, or idempotency
-keys after an ambiguous failure; and no inline base64 in the result or the
-session log.
+keys after an ambiguous failure; no inline base64 in the result or the
+session log; and Linux/Android only — no degraded publisher on Windows or
+any other platform.
 The web UI is a single self-contained HTML page, assembled from disk on
 every request in dev builds and compiled into the binary via `include_str!`
 in release builds: deliberately no frontend bundler/build pipeline, no
