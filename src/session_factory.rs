@@ -187,6 +187,12 @@ pub struct SessionFactory {
     /// [`SessionFactory::workspace`] keeps no such capability, so delegated
     /// subagents and btw forks never see global skills.
     skills_workspace: Option<Workspace>,
+    /// The canonical global skills directory (`None` when there is no usable
+    /// global skills root). [`register_generate_image`] refuses to register
+    /// when the workspace root is at or below it: there an ordinary output
+    /// path resolves as the writable workspace entry, not as the read-only
+    /// skills entry (which only wins on a strict child).
+    skills_root: Option<PathBuf>,
     /// Print startup/session announcements to stderr (`false` for the TUI,
     /// whose alternate screen must stay clean).
     announce: bool,
@@ -452,6 +458,19 @@ impl SessionFactory {
             &resolved_policy,
             global_skills_dir.as_deref(),
         )?;
+        // Canonical global-skills path for `generate_image`'s registration
+        // guard. Fails closed like the capability: a workspace construction
+        // that cannot canonicalize the skills root must not silently keep a
+        // tool that could publish into it.
+        let skills_root = match global_skills_dir.as_deref() {
+            Some(dir) => Some(crate::canonicalize_path(dir).with_context(|| {
+                format!(
+                    "cannot canonicalize the global skills directory {}",
+                    dir.display()
+                )
+            })?),
+            None => None,
+        };
         let sandbox = resolved_policy.enabled.then_some(resolved_policy.clone());
         if let Some(policy) = &sandbox {
             preflight_sandbox(policy, announce)?;
@@ -496,6 +515,7 @@ impl SessionFactory {
             agents_instructions,
             skills_instructions,
             skills_workspace,
+            skills_root,
             announce,
         })
     }
@@ -1009,7 +1029,10 @@ impl SessionFactory {
         // Only the root/main session can pause for Web human input.
         add_root_user_input_tool(&mut tools);
         // Main-agent only: `generate_image` (direct Codex image HTTP).
-        // Read-only sessions skip it (it creates files). It gets the main
+        // Read-only sessions skip it (it creates files), and so does a
+        // workspace rooted at or below the canonical global skills
+        // directory (`skills_root`: there the workspace entry is writable
+        // and would publish into global skills). Otherwise it gets the main
         // session's tools workspace — the plain workspace plus the
         // read-only global-skills capability — so a path under that
         // read-only entry is refused before any request. Children/btw
@@ -1023,6 +1046,7 @@ impl SessionFactory {
             &tools_workspace,
             self.generate_image_auth(),
             self.read_only,
+            self.skills_root.as_deref(),
         );
         // Read-only sessions skip MCP entirely: MCP tools carry no read-only
         // marker, so exposing them would defeat the policy. Delegation stays —
@@ -1285,6 +1309,7 @@ impl SessionFactory {
             agents_instructions: None,
             skills_instructions: None,
             skills_workspace: None,
+            skills_root: None,
             announce: false,
         }
     }
@@ -1329,6 +1354,11 @@ pub(crate) fn register_run_rust(tools: &mut Vec<Box<dyn crate::agent::Tool>>, wo
 /// directory (which can sit inside the workspace, where the workspace entry
 /// is writable) unprotected. A canonicalization failure is a construction
 /// error rather than a silently dropped protection.
+///
+/// [`crate::canonicalize_path`] (not raw `std::fs::canonicalize`) is used so
+/// the Windows `\\?\` verbatim prefix is stripped and the destination
+/// compares equal to `Workspace` roots and inputs, which are stripped the
+/// same way.
 fn main_tools_workspace(
     workspace: Workspace,
     policy: &Sandbox,
@@ -1337,7 +1367,7 @@ fn main_tools_workspace(
     let Some(dir) = global_skills_dir else {
         return Ok(None);
     };
-    let canonical = std::fs::canonicalize(dir).with_context(|| {
+    let canonical = crate::canonicalize_path(dir).with_context(|| {
         format!(
             "cannot canonicalize the global skills directory {}",
             dir.display()
@@ -1362,12 +1392,21 @@ fn main_tools_workspace(
 /// forks build the common builtins without it. A client-construction
 /// failure skips the tool (mirroring `bash_tool`) instead of failing the
 /// whole session build.
+///
+/// `protected_skills` is the canonical global skills directory (if any). A
+/// workspace rooted AT or BELOW it registers nothing: the read-only skills
+/// entry only wins for a strict child, so an ordinary output path would
+/// resolve as the writable workspace entry and publish into global skills.
 pub(crate) fn register_generate_image(
     tools: &mut Vec<Box<dyn crate::agent::Tool>>,
     workspace: &Workspace,
     auth: AuthResolver,
     read_only: bool,
+    protected_skills: Option<&Path>,
 ) {
+    if protected_skills.is_some_and(|skills| workspace.root().starts_with(skills)) {
+        return;
+    }
     if !read_only && let Ok(tool) = generate_image_tool(workspace.clone(), auth) {
         tools.push(tool);
     }
@@ -3782,12 +3821,71 @@ mod generate_image_registration_tests {
         let workspace = Workspace::new(temp.path()).unwrap();
         let auth: AuthResolver = Arc::new(|| unreachable!("registration resolves no auth"));
         let mut main = Vec::new();
-        register_generate_image(&mut main, &workspace, auth.clone(), false);
+        register_generate_image(&mut main, &workspace, auth.clone(), false, None);
         assert_eq!(tool_names(&main), vec!["generate_image"]);
         assert_eq!(main[0].spec().name, "generate_image");
         let mut read_only = Vec::new();
-        register_generate_image(&mut read_only, &workspace, auth, true);
+        register_generate_image(&mut read_only, &workspace, auth, true, None);
         assert!(read_only.is_empty(), "read-only sessions must not see it");
+    }
+
+    /// A workspace rooted AT or BELOW the canonical global-skills directory
+    /// must register NO `generate_image`: the read-only skills entry only
+    /// wins for a strict child, so there an ordinary output path resolves as
+    /// the writable workspace entry and would publish into global skills. A
+    /// sibling workspace (and a build with no global skills root) keeps the
+    /// tool. The auth resolver is `unreachable!`: registration must not
+    /// resolve it on any of these paths.
+    #[test]
+    fn workspace_at_or_below_the_global_skills_dir_registers_no_generate_image() {
+        let temp = tempfile::tempdir().unwrap();
+        let skills = temp.path().join("skills");
+        std::fs::create_dir(&skills).unwrap();
+        let below = skills.join("nested");
+        std::fs::create_dir(&below).unwrap();
+        let sibling = temp.path().join("sibling");
+        std::fs::create_dir(&sibling).unwrap();
+        let protected = crate::canonicalize_path(&skills).unwrap();
+        let auth =
+            || -> AuthResolver { Arc::new(|| unreachable!("registration must not resolve auth")) };
+
+        for root in [&skills, &below] {
+            let mut tools = Vec::new();
+            register_generate_image(
+                &mut tools,
+                &Workspace::new(root).unwrap(),
+                auth(),
+                false,
+                Some(&protected),
+            );
+            assert!(
+                tools.is_empty(),
+                "{} must not expose generate_image",
+                root.display()
+            );
+        }
+
+        // A sibling workspace is outside the protected root: still registered.
+        let mut sibling_tools = Vec::new();
+        register_generate_image(
+            &mut sibling_tools,
+            &Workspace::new(&sibling).unwrap(),
+            auth(),
+            false,
+            Some(&protected),
+        );
+        assert_eq!(tool_names(&sibling_tools), vec!["generate_image"]);
+
+        // No global skills root (or a build without one) is unchanged.
+        let mut unprotected = Vec::new();
+        register_generate_image(
+            &mut unprotected,
+            &Workspace::new(&skills).unwrap(),
+            auth(),
+            false,
+            None,
+        );
+        assert_eq!(tool_names(&unprotected), vec!["generate_image"]);
     }
 
     #[tokio::test]
@@ -3844,6 +3942,7 @@ mod generate_image_registration_tests {
             &tools_workspace,
             Arc::new(|| unreachable!("the canonical skills path must be refused before auth")),
             false,
+            Some(&crate::canonicalize_path(&logical).unwrap()),
         );
         let tool = tools.first().expect("generate_image is registered");
 
@@ -3881,6 +3980,7 @@ mod generate_image_registration_tests {
             &plain_workspace,
             Arc::new(|| unreachable!("a read-only skills dir must be refused before auth")),
             false,
+            Some(&crate::canonicalize_path(&plain).unwrap()),
         );
         let error = plain_tools[0]
             .execute(serde_json::json!({"prompt": "x", "path": "plain-skills/out.png"}))

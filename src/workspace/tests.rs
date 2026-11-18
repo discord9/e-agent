@@ -1723,6 +1723,10 @@ fn reroot_exact_file_source_rejects_without_fallback_to_broader_rw() {
     assert_eq!(workspace.reroot(&sub).unwrap().root(), sub);
 }
 
+/// Successful-write test: `secure_dir_write` is fail-closed on macOS/BSD
+/// (`secure directory writes require Linux`), so it only runs where real
+/// secure writes are implemented.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))]
 #[test]
 fn write_new_creates_exclusively_while_write_still_replaces() {
     let temp = tempfile::tempdir().unwrap();
@@ -1796,6 +1800,10 @@ fn write_new_rejects_symlink_escape_without_an_outside_file() {
     assert!(!outside.path().join("new.png").exists());
 }
 
+/// The baseline `write` calls here must actually succeed, which needs an
+/// implemented `secure_dir_write` (Linux/Android/Windows); macOS/BSD fail
+/// closed, so the test is gated like the exclusive-create one above.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))]
 #[test]
 fn write_new_rejects_external_roots_even_when_writable() {
     let temp = tempfile::tempdir().unwrap();
