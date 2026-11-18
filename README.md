@@ -743,14 +743,16 @@ physical identity includes its owning session, because backend keys restart per
 session (JSONL ordinals especially), so identical ordinals in an ancestor and in a
 child are two distinct rows. The pager stops at a legacy positional prefix (it has
 no physical cursor of its own),
-and a compaction whose retained tail would reach
-into the inherited prefix fails closed instead of copying parent messages into
-the fork (the fork's own new messages compact normally). Marker-first copies
-written by the original copy layout are ambiguous when their stored prefix
-matches the source prefix; they fail closed rather than guessing, and a
-marker-first copy whose source is gone cannot be compared. A pinned marker
-carries no descriptors, watermarks, or view ids: it is one session id plus one
-backend key.
+and a compaction never copies inherited messages into the fork: a retained tail
+that would reach into the inherited prefix is clamped up to the inherited
+boundary, so inherited messages are summarized in the compaction request while
+`retained` stays the fork's own messages — a fork compacts with a shorter, or
+when it has no own assistant message yet, empty retained tail instead of
+failing closed. Marker-first copies written by the original copy layout are
+ambiguous when their stored prefix matches the source prefix; they fail closed
+rather than guessing, and a marker-first copy whose source is gone cannot be
+compared. A pinned marker carries no descriptors, watermarks, or view ids: it is
+one session id plus one backend key.
 
 ### TUI commands
 
@@ -1131,12 +1133,14 @@ the append-only session log; earlier messages stay persisted and visible in the
 TUI. The tail is sized by message count (`RETAIN_TAIL`); a context no longer
 than that keeps half of itself so it stays compactable. The cut is aligned to
 an assistant boundary so a tool batch is never split, which can extend the tail
-past that count when user-shaped notices follow the last assistant. The current
-user prompt gets no special treatment: it is projected like any other field,
-and its full text remains retrievable from the durable session. Subsequent model
-calls use the latest summary plus everything after it. When a configured model
-profile provides a context window, the agent also compacts automatically at
-80% usage.
+past that count when user-shaped notices follow the last assistant. In a
+zero-copy fork the tail is additionally clamped up to the inherited boundary,
+so parent messages are only ever summarized and never retained (see "Forking a
+session"). The current user prompt gets no special treatment: it is projected
+like any other field, and its full text remains retrievable from the durable
+session. Subsequent model calls use the latest summary plus everything after
+it. When a configured model profile provides a context window, the agent also
+compacts automatically at 80% usage.
 
 ## Session goals
 

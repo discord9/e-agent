@@ -1677,20 +1677,6 @@ impl Agent {
         }
     }
 
-    /// The fork source this session's inherited prefix was read from, when
-    /// the leading region really is inherited (used for fail-closed messages).
-    fn inherited_source(&self) -> Option<&str> {
-        if self.inherited == 0 {
-            return None;
-        }
-        self.history.get(self.inherited..).and_then(|entries| {
-            entries.iter().find_map(|entry| match entry {
-                SessionEntry::ForkedFrom { source, .. } => Some(source.as_str()),
-                _ => None,
-            })
-        })
-    }
-
     /// Restore the exact physical located keys aligned with the history
     /// restored by [`Self::restore_history`]. Must be called with a vector
     /// of the same length; defensive truncation keeps the alignment
@@ -2273,7 +2259,7 @@ impl Agent {
         // tail extends back to that Assistant — potentially far past `keep`.
         // The message count is the sizing rule, but pairing wins over size:
         // retaining extra notices is harmless, cutting a batch is not.
-        let split = match context[start..]
+        let mut split = match context[start..]
             .iter()
             .position(|message| matches!(message, Message::Assistant(_)))
         {
@@ -2287,11 +2273,14 @@ impl Agent {
             },
         };
         // A zero-copy fork inherits its LEADING history from the source
-        // session: those messages are stored only there and must never be
-        // copied into a `Compaction.retained` snapshot (there is no reference
-        // form yet). The child's own messages compact normally, so a retained
-        // tail that starts after the inherited region is fine; one that
-        // reaches into it fails closed instead of duplicating parent rows.
+        // session: those messages live only there and must never be COPIED
+        // into a `Compaction.retained` snapshot (there is no reference form
+        // yet). They may be SUMMARIZED: the compaction request is derived at
+        // read time and persists nothing but its summary. So a retained tail
+        // that would reach into the inherited region is clamped up to the
+        // inherited boundary instead of failing closed — a fresh fork has far
+        // fewer own messages than `RETAIN_TAIL` and could otherwise never
+        // compact at all.
         if self.inherited > 0 {
             let boundary = self.inherited.min(self.history.len());
             let own_compaction = self.history[boundary..]
@@ -2327,15 +2316,31 @@ impl Agent {
             // into `retained`.
             let non_history = usize::from(self.context_prefix.is_some())
                 + usize::from(self.goal.is_some() || self.goal_cleared);
-            if split < non_history + inherited_items {
-                anyhow::bail!(
-                    "cannot compact this forked session yet: the retained tail would copy \
-                     messages inherited read-only from session {} into this session's store. \
-                     Keep working without compaction; the forked session's own messages \
-                     compact normally once the inherited prefix falls outside the retained \
-                     window.",
-                    self.inherited_source().unwrap_or("(unknown source)")
-                );
+            // First item this session OWNS (`items` and `context` align 1:1).
+            // Clamped defensively: repairing the inherited prefix alone can
+            // insert a synthetic result the whole-context repair does not, so
+            // the repaired prefix count can overstate the inherited region —
+            // never understate it, which is the safe direction here.
+            let own_start = (non_history + inherited_items).min(context.len());
+            if split < own_start {
+                // Keep the tail opening on an Assistant so an assistant/tool
+                // batch is never cut in half; when this session's own region
+                // holds no Assistant at all (a fresh fork whose only own
+                // messages are its prompt and pending tool results), the tail
+                // is EMPTY: `split` is the end of the context, hence
+                // `retained` is empty and the provenance is `None` with
+                // `no_current_prompt` set. The whole context — inherited
+                // prefix and this session's own prompt — is then summarized
+                // and nothing inherited is copied. A context with no
+                // Assistant anywhere to anchor the tail on still fails closed
+                // above with "nothing to compact".
+                split = match context[own_start..]
+                    .iter()
+                    .position(|message| matches!(message, Message::Assistant(_)))
+                {
+                    Some(offset) => own_start + offset,
+                    None => context.len(),
+                };
             }
         }
         // Do not call the model unless the portion actually replaced by the
