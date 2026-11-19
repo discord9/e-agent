@@ -7677,6 +7677,895 @@ async fn background_reminder_absent_for_failed_and_foreground_batches() {
     task.join().await.unwrap();
 }
 
+/// Successful `bash`-shaped tool that executes nothing: the behavior audit
+/// classifies a call by name and arguments only, so a mock keeps the trigger
+/// deterministic and cheap.
+struct QuietBashMock;
+
+#[async_trait]
+impl Tool for QuietBashMock {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "bash".into(),
+            description: "behavior audit test".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+    async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
+        Ok(ToolOutput::text("ok"))
+    }
+}
+
+fn status_bash_call(id: &str, command: &str) -> ToolCall {
+    ToolCall {
+        id: id.into(),
+        name: "bash".into(),
+        arguments: serde_json::json!({"command": command}).to_string(),
+    }
+}
+
+/// Positions of the behavior-audit Notice in a provider request (Notices
+/// project as user-shaped entries).
+fn audit_notices(messages: &[Message]) -> Vec<usize> {
+    messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| {
+            matches!(message, Message::User { content, .. }
+                if content == crate::agent::POLL_AUDIT_NOTICE)
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+fn audit_notice_count(entries: &[SessionEntry]) -> usize {
+    entries
+        .iter()
+        .filter(|entry| {
+            matches!(entry, SessionEntry::Notice { text }
+                if text == crate::agent::POLL_AUDIT_NOTICE)
+        })
+        .count()
+}
+
+#[test]
+fn behavior_audit_classifies_simple_probes_conservatively() {
+    for command in [
+        "ps aux",
+        "pgrep -f cargo",
+        "git status --short",
+        "ls -la",
+        "date",
+        "sleep 5",
+        "true",
+        "cat build.log",
+        "cat build.log.1",
+        "tail -20 .e-agent/tasks/1.log",
+        "cat target/test_stdout.txt",
+        "head test_output.txt",
+        "pwd",
+        "uptime",
+    ] {
+        assert!(
+            status_check_command(&status_bash_call("a", command)).is_some(),
+            "{command}"
+        );
+    }
+    for command in [
+        "cargo test",
+        "cat src/runner.rs",
+        "cat src/parser.log.rs",
+        "tail src/session.rs",
+        "head README.md",
+        "git status && cargo build",
+        "cargo test; ls",
+        "ps aux | tail -5",
+        "cat build.log src/main.rs",
+        "cat /tmp/task.txt",
+        "echo true",
+        "sudo ps aux",
+    ] {
+        assert!(
+            status_check_command(&status_bash_call("a", command)).is_none(),
+            "{command}"
+        );
+    }
+    assert_eq!(
+        status_check_command(&status_bash_call("a", "  git   status  --short ")),
+        status_check_command(&status_bash_call("b", "git status --short")),
+    );
+    assert!(
+        status_check_command(&ToolCall {
+            id: "a".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({"command": "ps aux", "background": true}).to_string(),
+        })
+        .is_none()
+    );
+    assert!(status_check_command(&poll_call("a")).is_none());
+    assert!(
+        status_check_command(&ToolCall {
+            id: "a".into(),
+            name: "read_file".into(),
+            arguments: "{}".into(),
+        })
+        .is_none()
+    );
+}
+
+fn audit_round(calls: Vec<ToolCall>) -> (AssistantMessage, Option<Usage>) {
+    (
+        AssistantMessage {
+            content: None,
+            tool_calls: calls,
+            reasoning: None,
+        },
+        None,
+    )
+}
+
+fn audit_done() -> (AssistantMessage, Option<Usage>) {
+    (
+        AssistantMessage {
+            content: Some("done".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        },
+        None,
+    )
+}
+
+async fn audit_run(
+    session: &str,
+    rounds: Vec<Vec<ToolCall>>,
+) -> (Vec<Vec<Message>>, Vec<SessionEntry>) {
+    let temp = tempfile::tempdir().unwrap();
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let workspace = crate::workspace::Workspace::new(temp.path()).unwrap();
+    let (mut tools, _) = crate::tools::builtins(workspace, None, false, None);
+    tools.retain(|tool| tool.spec().name == "get_background_tasks");
+    tools.push(Box::new(QuietBashMock));
+    let replies = rounds
+        .into_iter()
+        .map(audit_round)
+        .chain([audit_done()])
+        .collect();
+    let agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies,
+            calls: captured.clone(),
+        }),
+        tools,
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        session.into(),
+        IdlePolicy::WaitForInput,
+    );
+    let task = runner.start(Some("check the build".into()));
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "done"),
+    )
+    .await;
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), session)
+        .await
+        .unwrap()
+        .entries;
+    let requests = captured.lock().unwrap().clone();
+    drop(handle);
+    task.join().await.unwrap();
+    (requests, entries)
+}
+
+#[tokio::test]
+async fn behavior_audit_three_checks_and_no_duplicates_across_rounds() {
+    let (requests, entries) = audit_run(
+        "audit-three",
+        vec![
+            vec![
+                status_bash_call("s1", "ls -la"),
+                status_bash_call("s2", "ls -la"),
+            ],
+            vec![status_bash_call("s3", " ls   -la ")],
+            vec![
+                status_bash_call("s4", "ls -la"),
+                status_bash_call("s5", "ls -la"),
+                status_bash_call("s6", "ls -la"),
+            ],
+        ],
+    )
+    .await;
+    assert!(
+        audit_notices(&requests[1]).is_empty(),
+        "two checks are insufficient"
+    );
+    let request = &requests[2];
+    let last_result = request
+        .iter()
+        .rposition(|message| matches!(message, Message::Tool { .. }))
+        .unwrap();
+    assert_eq!(audit_notices(request), vec![last_result + 1]);
+    assert_eq!(
+        audit_notices(&requests[3]).len(),
+        1,
+        "later status-only round must not duplicate"
+    );
+    assert_eq!(audit_notice_count(&entries), 1);
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| matches!(
+                entry,
+                SessionEntry::Message {
+                    message: Message::User { .. }
+                }
+            ))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn behavior_audit_independent_work_and_source_reads_reset() {
+    for (session, calls) in [
+        (
+            "audit-two",
+            vec![status_bash_call("a", "date"), status_bash_call("b", "date")],
+        ),
+        (
+            "audit-work",
+            vec![
+                status_bash_call("a", "ps"),
+                status_bash_call("b", "cargo build"),
+                status_bash_call("c", "ps"),
+                status_bash_call("d", "ps"),
+            ],
+        ),
+        (
+            "audit-source",
+            vec![
+                status_bash_call("a", "cat build.log"),
+                status_bash_call("b", "tail src/session.rs"),
+                status_bash_call("c", "cat build.log"),
+                status_bash_call("d", "cat build.log"),
+            ],
+        ),
+    ] {
+        let (requests, entries) = audit_run(session, vec![calls]).await;
+        assert!(audit_notices(&requests[1]).is_empty(), "{session}");
+        assert_eq!(audit_notice_count(&entries), 0, "{session}");
+    }
+}
+
+#[tokio::test]
+async fn behavior_audit_rotating_probe_variants_trigger() {
+    let (requests, entries) = audit_run(
+        "audit-variants",
+        vec![vec![
+            status_bash_call("a", "ps"),
+            status_bash_call("b", "date"),
+            status_bash_call("c", "tail build.log"),
+        ]],
+    )
+    .await;
+    assert_eq!(audit_notices(&requests[1]).len(), 1);
+    assert_eq!(audit_notice_count(&entries), 1);
+}
+
+/// Model round-trip boundary that can be delayed without sleeping in tests.
+struct AuditDelayedModel {
+    replies: VecDeque<AssistantMessage>,
+    entered: mpsc::UnboundedSender<usize>,
+    proceed: mpsc::UnboundedReceiver<()>,
+    calls: Arc<Mutex<Vec<Vec<Message>>>>,
+}
+
+#[async_trait]
+impl Model for AuditDelayedModel {
+    async fn complete(
+        &mut self,
+        messages: &[Message],
+        _: &[ToolSpec],
+        _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        let count = {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push(messages.to_vec());
+            calls.len()
+        };
+        if count == 2 || count == 3 {
+            self.entered.send(count).unwrap();
+            self.proceed.recv().await.expect("provider gate closed");
+        }
+        Ok((self.replies.pop_front().expect("unexpected call"), None))
+    }
+}
+
+#[tokio::test]
+async fn behavior_audit_sleep_30_across_delayed_model_rounds() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+    let (proceed_tx, proceed_rx) = mpsc::unbounded_channel();
+    let replies = vec![
+        audit_round(vec![status_bash_call("s1", "sleep 30")]).0,
+        audit_round(vec![status_bash_call("s2", "sleep 30")]).0,
+        audit_round(vec![status_bash_call("s3", "sleep 30")]).0,
+        audit_done().0,
+    ]
+    .into();
+    let agent = Agent::new(
+        Box::new(AuditDelayedModel {
+            replies,
+            entered: entered_tx,
+            proceed: proceed_rx,
+            calls: calls.clone(),
+        }),
+        vec![Box::new(QuietBashMock)],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "audit-latency".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let task = runner.start(Some("check".into()));
+    for expected in [2, 3] {
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx.recv())
+                .await
+                .unwrap(),
+            Some(expected)
+        );
+        assert!(audit_notices(&calls.lock().unwrap()[expected - 1]).is_empty());
+        proceed_tx.send(()).unwrap();
+    }
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "done"),
+    )
+    .await;
+    assert_eq!(
+        audit_notices(calls.lock().unwrap().last().unwrap()).len(),
+        1
+    );
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "audit-latency")
+        .await
+        .unwrap()
+        .entries;
+    assert_eq!(audit_notice_count(&entries), 1);
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn behavior_audit_test_log_probes_trigger() {
+    for (i, command) in ["cat build.log", "tail target/test_stdout.txt", "true"]
+        .iter()
+        .enumerate()
+    {
+        let calls = (0..3)
+            .map(|n| status_bash_call(&format!("{n}"), command))
+            .collect();
+        let (requests, entries) = audit_run(&format!("audit-log-{i}"), vec![calls]).await;
+        assert_eq!(audit_notices(&requests[1]).len(), 1, "{command}");
+        assert_eq!(audit_notice_count(&entries), 1, "{command}");
+    }
+}
+
+#[tokio::test]
+async fn behavior_audit_gbt_is_neither_probe_nor_breaker() {
+    let (requests, entries) = audit_run(
+        "audit-gbt-only",
+        vec![vec![
+            poll_call("g1"),
+            poll_call("g2"),
+            poll_call("g3"),
+            poll_call("g4"),
+            poll_call("g5"),
+        ]],
+    )
+    .await;
+    assert!(audit_notices(&requests[1]).is_empty());
+    assert_eq!(audit_notice_count(&entries), 0);
+    let (requests, entries) = audit_run(
+        "audit-gbt-mixed",
+        vec![
+            vec![
+                status_bash_call("s1", "date"),
+                poll_call("g1"),
+                status_bash_call("s2", "date"),
+                poll_call("g2"),
+            ],
+            vec![poll_call("g3"), status_bash_call("s3", "date")],
+        ],
+    )
+    .await;
+    assert!(
+        audit_notices(&requests[1]).is_empty(),
+        "GBT must not count toward three"
+    );
+    assert_eq!(
+        audit_notices(&requests[2]).len(),
+        1,
+        "GBT must not reset the bash streak"
+    );
+    assert_eq!(audit_notice_count(&entries), 1);
+}
+
+#[tokio::test]
+async fn behavior_audit_earned_notice_survives_trailing_work_and_rearms() {
+    let (requests, entries) = audit_run(
+        "audit-earned",
+        vec![
+            vec![
+                status_bash_call("s1", "ls"),
+                status_bash_call("s2", "ls"),
+                status_bash_call("s3", "ls"),
+                status_bash_call("work", "cargo test"),
+            ],
+            vec![
+                status_bash_call("s5", "ls"),
+                status_bash_call("s6", "ls"),
+                status_bash_call("s7", "ls"),
+            ],
+        ],
+    )
+    .await;
+    let request = &requests[1];
+    let notice = audit_notices(request);
+    assert_eq!(notice.len(), 1);
+    for id in ["s1", "s2", "s3", "work"] {
+        let position = request
+            .iter()
+            .position(|message| matches!(message, Message::Tool { call_id, .. } if call_id == id))
+            .unwrap();
+        assert!(
+            position < notice[0],
+            "{id} must be committed before the Notice"
+        );
+    }
+    assert_eq!(
+        audit_notices(&requests[2]).len(),
+        2,
+        "independent work re-arms"
+    );
+    assert_eq!(audit_notice_count(&entries), 2);
+}
+
+#[tokio::test]
+async fn behavior_audit_background_followup_starts_a_fresh_streak() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let sender = Arc::new(Mutex::new(None));
+    let agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![
+                audit_round(vec![
+                    status_bash_call("s1", "ls"),
+                    status_bash_call("s2", "ls"),
+                ]),
+                (
+                    AssistantMessage {
+                        content: Some("waiting".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+                audit_round(vec![status_bash_call("s4", "ls")]),
+                audit_done(),
+            ]
+            .into(),
+            calls: calls.clone(),
+        }),
+        vec![
+            Box::new(QuietBashMock),
+            Box::new(NoticeEmitter {
+                sender: sender.clone(),
+            }),
+        ],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "audit-neutral".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let (_, _, mut status) = handle.attach();
+    let task = runner.start(Some("check".into()));
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "waiting"),
+    )
+    .await;
+    wait_for_status(&mut status, |state| matches!(state, SessionStatus::Idle)).await;
+    sender
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .send(AgentEvent::Notice("task update".into()))
+        .unwrap();
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "done"),
+    )
+    .await;
+    assert!(audit_notices(calls.lock().unwrap().last().unwrap()).is_empty());
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "audit-neutral")
+        .await
+        .unwrap();
+    assert_eq!(audit_notice_count(&loaded.entries), 0);
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn behavior_audit_in_turn_background_notice_keeps_streak() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let sender = Arc::new(Mutex::new(None));
+    let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+    let (proceed_tx, proceed_rx) = mpsc::unbounded_channel();
+    let agent = Agent::new(
+        Box::new(AuditDelayedModel {
+            replies: vec![
+                audit_round(vec![
+                    status_bash_call("s1", "ls"),
+                    status_bash_call("s2", "ls"),
+                ])
+                .0,
+                audit_round(vec![status_bash_call("s3", "date")]).0,
+                audit_done().0,
+            ]
+            .into(),
+            entered: entered_tx,
+            proceed: proceed_rx,
+            calls: calls.clone(),
+        }),
+        vec![
+            Box::new(QuietBashMock),
+            Box::new(NoticeEmitter {
+                sender: sender.clone(),
+            }),
+        ],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "audit-in-turn".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let task = runner.start(Some("check".into()));
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx.recv())
+            .await
+            .unwrap(),
+        Some(2)
+    );
+    sender
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .send(AgentEvent::Notice("background event".into()))
+        .unwrap();
+    proceed_tx.send(()).unwrap();
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx.recv())
+            .await
+            .unwrap(),
+        Some(3)
+    );
+    let request = calls.lock().unwrap()[2].clone();
+    assert_eq!(audit_notices(&request).len(), 1);
+    assert!(request.iter().any(
+        |message| matches!(message, Message::User { content, .. } if content == "background event")
+    ));
+    proceed_tx.send(()).unwrap();
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "done"),
+    )
+    .await;
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "audit-in-turn")
+        .await
+        .unwrap()
+        .entries;
+    assert_eq!(audit_notice_count(&entries), 1);
+    assert!(
+        entries.iter().any(
+            |entry| matches!(entry, SessionEntry::Notice { text } if text == "background event")
+        )
+    );
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn behavior_audit_real_user_prompt_resets_the_streak() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![
+                audit_round(vec![
+                    status_bash_call("s1", "ls"),
+                    status_bash_call("s2", "ls"),
+                ]),
+                (
+                    AssistantMessage {
+                        content: Some("waiting".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+                audit_round(vec![
+                    status_bash_call("s4", "ls"),
+                    status_bash_call("s5", "ls"),
+                ]),
+                audit_done(),
+            ]
+            .into(),
+            calls: calls.clone(),
+        }),
+        vec![
+            Box::new(QuietBashMock),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "audit-prompt".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let (_, _, mut status) = handle.attach();
+    let task = runner.start(Some("check".into()));
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "waiting"),
+    )
+    .await;
+    wait_for_status(&mut status, |state| matches!(state, SessionStatus::Idle)).await;
+    handle.prompt("continue");
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "done"),
+    )
+    .await;
+    assert!(audit_notices(calls.lock().unwrap().last().unwrap()).is_empty());
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "audit-prompt")
+        .await
+        .unwrap();
+    assert_eq!(audit_notice_count(&loaded.entries), 0);
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn behavior_audit_does_not_write_notice_into_unanswered_batch() {
+    // Check both question-first and question-last ordering against the
+    // durable entries, not the repaired provider context.
+    for question_first in [true, false] {
+        let temp = tempfile::tempdir().unwrap();
+        let mut batch = (1..=3)
+            .map(|i| status_bash_call(&format!("s{i}"), "ls"))
+            .collect::<Vec<_>>();
+        let question = ToolCall {
+            id: "question".into(),
+            name: "request_user_input".into(),
+            arguments: r#"{"questions":[{"id":"a","prompt":"answer?"}]}"#.into(),
+        };
+        if question_first {
+            batch.insert(0, question);
+        } else {
+            batch.push(question);
+        }
+        let agent = Agent::new(
+            Box::new(ScriptedContextCaptureModel {
+                replies: vec![audit_round(batch), audit_done()].into(),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }),
+            vec![
+                Box::new(QuietBashMock),
+                Box::new(crate::tools::user_input::RequestUserInput),
+            ],
+        );
+        let (runner, handle) = SessionRunner::new(
+            agent,
+            SessionStore::Jsonl,
+            temp.path().into(),
+            "audit-unanswered".into(),
+            IdlePolicy::WaitForInput,
+        );
+        let runner = runner.with_user_input_allowed();
+        let (_, _, mut status) = handle.attach();
+        let task = runner.start(Some("check".into()));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            wait_for_status(&mut status, |state| {
+                matches!(state, SessionStatus::WaitingInput(_))
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            handle.submit_prompt_with_call_id(Some("question".into()), " ".into()),
+            PromptSubmission::Answered
+        );
+        wait_for_log_event(
+            &handle,
+            |event| matches!(event, AgentEvent::AssistantText(text) if text == "done"),
+        )
+        .await;
+        let entries = SessionStore::Jsonl
+            .load(temp.path(), "audit-unanswered")
+            .await
+            .unwrap()
+            .entries;
+        assert_eq!(
+            audit_notice_count(&entries),
+            0,
+            "unanswered sibling; question_first={question_first}"
+        );
+        assert!(!entries.iter().any(|entry| matches!(entry, SessionEntry::Message { message: Message::Tool { call_id, .. } } if call_id == "question")));
+        for id in ["s1", "s2", "s3"] {
+            assert!(entries.iter().any(|entry| matches!(entry, SessionEntry::Message { message: Message::Tool { call_id, synthetic: false, .. } } if call_id == id)), "missing {id}");
+        }
+        drop(handle);
+        task.join().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn behavior_audit_cancel_before_last_result_withholds_notice() {
+    let temp = tempfile::tempdir().unwrap();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let mut batch = (1..=3)
+        .map(|i| status_bash_call(&format!("s{i}"), "ls"))
+        .collect::<Vec<_>>();
+    batch.push(ToolCall {
+        id: "blocked".into(),
+        name: "read_image".into(),
+        arguments: "{}".into(),
+    });
+    let agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: vec![audit_round(batch).0].into(),
+        }),
+        vec![
+            Box::new(QuietBashMock),
+            Box::new(BlockingMarkerTool {
+                entered: entered.clone(),
+                release,
+            }),
+        ],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "audit-before-cancel".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let mut status = handle.status();
+    let task = runner.start(Some("check".into()));
+    tokio::time::timeout(std::time::Duration::from_secs(10), entered.notified())
+        .await
+        .unwrap();
+    handle.cancel();
+    let final_status = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        wait_for_status(&mut status, |state| {
+            matches!(state, SessionStatus::Finished(_))
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        final_status,
+        SessionStatus::Finished(SessionResult::Cancelled)
+    );
+    task.join().await.unwrap();
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "audit-before-cancel")
+        .await
+        .unwrap()
+        .entries;
+    assert_eq!(audit_notice_count(&entries), 0);
+    assert!(!entries.iter().any(|entry| matches!(entry, SessionEntry::Message { message: Message::Tool { call_id, .. } } if call_id == "blocked")));
+}
+
+#[tokio::test]
+async fn behavior_audit_cancel_after_final_result_commits_notice() {
+    // Cover both the normal bash result and the runner-intercepted result.
+    for intercepted in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let mut batch = (1..=3)
+            .map(|i| status_bash_call(&format!("s{i}"), "ls"))
+            .collect::<Vec<_>>();
+        let last_id = if intercepted {
+            batch.push(ToolCall {
+                id: "final".into(),
+                name: "get_context_usage".into(),
+                arguments: "{}".into(),
+            });
+            "final"
+        } else {
+            "s3"
+        };
+        let agent = Agent::new(
+            Box::new(ScriptedAssistantModel {
+                replies: vec![audit_round(batch.clone()).0].into(),
+            }),
+            vec![Box::new(QuietBashMock)],
+        );
+        let (mut runner, handle) = SessionRunner::new(
+            agent,
+            SessionStore::Jsonl,
+            temp.path().into(),
+            "audit-after-cancel".into(),
+            IdlePolicy::FinishWhenIdle,
+        );
+        // Queue Cancel exactly after the final Tool result is durable and
+        // before the runner performs the post-result steering check.
+        let commands = handle.commands.clone();
+        runner.after_tool_commit = Some((
+            last_id.into(),
+            Box::new(move || {
+                commands.send(SessionCommand::Cancel).unwrap();
+            }),
+        ));
+        let mut status = handle.status();
+        let task = runner.start(Some("check".into()));
+        let final_status = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            wait_for_status(&mut status, |state| {
+                matches!(state, SessionStatus::Finished(_))
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            final_status,
+            SessionStatus::Finished(SessionResult::Cancelled)
+        );
+        task.join().await.unwrap();
+        let entries = SessionStore::Jsonl
+            .load(temp.path(), "audit-after-cancel")
+            .await
+            .unwrap()
+            .entries;
+        assert_eq!(audit_notice_count(&entries), 1, "intercepted={intercepted}");
+        let notice = entries
+            .iter()
+            .position(
+                |entry| matches!(entry, SessionEntry::Notice { text } if text == POLL_AUDIT_NOTICE),
+            )
+            .unwrap();
+        for call in batch {
+            let result = entries.iter().position(|entry| matches!(entry, SessionEntry::Message { message: Message::Tool { call_id, synthetic: false, .. } } if call_id == &call.id)).unwrap();
+            assert!(result < notice, "{} must precede Notice", call.id);
+        }
+    }
+}
+
 /// Gated POSIX command: prints, signals readiness, then blocks until the gate
 /// file exists. Auto-adoption of this foreground command is deterministic and
 /// needs no fixed sleep.

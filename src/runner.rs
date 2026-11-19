@@ -3,8 +3,8 @@
 use crate::{
     agent::{
         Agent, AgentEvent, BACKGROUND_REMINDER, CompactionOutput, GoalStatus, ImagePart, Message,
-        Model, POLL_GUARD_TERMINATION_NOTICE, RoundOutput, SessionEntry, ToolCall, ToolOutput,
-        ToolSpec, is_poll_guard_terminate, tool_error_content,
+        Model, POLL_AUDIT_NOTICE, POLL_GUARD_TERMINATION_NOTICE, RoundOutput, SessionEntry,
+        ToolCall, ToolOutput, ToolSpec, is_poll_guard_terminate, tool_error_content,
     },
     model::{ImageRejection, image_rejection},
     session_store::{LocatedKey, SessionStore},
@@ -188,6 +188,75 @@ fn label_retry_failure<T>(
         }
         outcome => outcome,
     }
+}
+
+/// Classify only simple bash probes. Shell operators, expansions and quoting
+/// are deliberately left to independent work rather than parsed here.
+fn status_check_command(call: &ToolCall) -> Option<String> {
+    if call.name != "bash" {
+        return None;
+    }
+    let arguments: serde_json::Value = serde_json::from_str(&call.arguments).ok()?;
+    if arguments.get("background").and_then(|flag| flag.as_bool()) == Some(true) {
+        return None;
+    }
+    let command = arguments.get("command")?.as_str()?;
+    if command.chars().any(|c| {
+        matches!(
+            c,
+            ';' | '\n'
+                | '\r'
+                | '|'
+                | '&'
+                | '<'
+                | '>'
+                | '$'
+                | '`'
+                | '\\'
+                | '\''
+                | '"'
+                | '('
+                | ')'
+                | '{'
+                | '}'
+        )
+    }) {
+        return None;
+    }
+    let words: Vec<&str> = command.split_whitespace().collect();
+    let (program, args) = words.split_first()?;
+    let program = program.rsplit('/').next()?;
+    let is_probe = match program {
+        "ps" | "pgrep" | "ls" | "date" | "sleep" | "true" | "pwd" | "jobs" | "uptime" => true,
+        "git" => args.first() == Some(&"status"),
+        "head" | "tail" | "cat" => {
+            let mut files = args
+                .iter()
+                .filter(|arg| !arg.starts_with('-') && !arg.chars().all(|c| c.is_ascii_digit()))
+                .peekable();
+            files.peek().is_some()
+                && files.all(|arg| {
+                    let name = arg
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or_default()
+                        .to_ascii_lowercase();
+                    name.ends_with(".log")
+                        || name.rsplit_once(".log.").is_some_and(|(_, suffix)| {
+                            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                        })
+                        || name.ends_with(".out")
+                        || name.ends_with("_stdout.txt")
+                        || name.ends_with("_stderr.txt")
+                        || name == "stdout"
+                        || name == "stderr"
+                        || name.ends_with("test_output.txt")
+                        || name.ends_with("test-output.txt")
+                })
+        }
+        _ => false,
+    };
+    is_probe.then(|| words.join(" "))
 }
 
 async fn await_tool(
@@ -1147,6 +1216,8 @@ pub struct SessionRunner {
     /// Goal/Resume driver state: maintenance and a stopped driver must not
     /// consume it, and multiple fresh entries coalesce into one request.
     pending_regular_reaction: bool,
+    /// Consecutive qualifying bash probes; saturates at the audit threshold.
+    status_streak: usize,
     bootstrap: Option<SessionBootstrap>,
     #[cfg(test)]
     before_finalize: Option<Box<dyn FnOnce() + Send>>,
@@ -1154,6 +1225,8 @@ pub struct SessionRunner {
     before_goal_notice_drain: Option<Box<dyn FnOnce() + Send>>,
     #[cfg(test)]
     before_read_only_tool: Option<Box<dyn FnOnce() + Send>>,
+    #[cfg(test)]
+    after_tool_commit: Option<(String, Box<dyn FnOnce() + Send>)>,
 }
 
 impl Drop for SessionRunner {
@@ -1417,6 +1490,7 @@ impl SessionRunner {
                 turn_just_ended: false,
                 maintenance_resume: false,
                 pending_regular_reaction: false,
+                status_streak: 0,
                 goal_notice_unconsumed: false,
                 goal_continuation_remaining: None,
                 goal_continuation_usage_unavailable: false,
@@ -1428,6 +1502,8 @@ impl SessionRunner {
                 before_goal_notice_drain: None,
                 #[cfg(test)]
                 before_read_only_tool: None,
+                #[cfg(test)]
+                after_tool_commit: None,
             },
             handle,
         )
@@ -1532,6 +1608,13 @@ impl SessionRunner {
             LocatedKey::Greptime { seq, .. } | LocatedKey::Sqlite { seq, .. } => Some(*seq),
             LocatedKey::Jsonl { .. } => None,
         });
+        #[cfg(test)]
+        let tool_call_id = match &entry {
+            SessionEntry::Message {
+                message: Message::Tool { call_id, .. },
+            } => Some(call_id.clone()),
+            _ => None,
+        };
         let event = match &entry {
             SessionEntry::Message {
                 message: Message::User { content, .. },
@@ -1578,6 +1661,15 @@ impl SessionRunner {
             // exists; using Agent's normal event path prevents a second UI-only
             // injection and preserves session fanout semantics.
             self.shared.lock().unwrap().emit_durable(event);
+        }
+        #[cfg(test)]
+        if self
+            .after_tool_commit
+            .as_ref()
+            .is_some_and(|(id, _)| Some(id) == tool_call_id.as_ref())
+            && let Some((_, hook)) = self.after_tool_commit.take()
+        {
+            hook();
         }
         Ok(committed_seq)
     }
@@ -2035,6 +2127,7 @@ impl SessionRunner {
         &mut self,
         call: &ToolCall,
         result: Result<ToolOutput, String>,
+        audit_due: bool,
     ) -> anyhow::Result<Steering> {
         let (tool_text, images) = match &result {
             Ok(output) => (output.content.clone(), output.images.clone()),
@@ -2061,6 +2154,9 @@ impl SessionRunner {
                 images: event_images,
                 call_id: Some(call.id.clone()),
             });
+        if audit_due {
+            self.commit_poll_audit().await?;
+        }
         let steering = self.intake_after_operation(Vec::new());
         if steering != Steering::None {
             self.shared
@@ -2069,6 +2165,14 @@ impl SessionRunner {
                 .emit_presentation(AgentEvent::Display("turn cancelled".into()));
         }
         Ok(steering)
+    }
+
+    async fn commit_poll_audit(&mut self) -> anyhow::Result<()> {
+        self.commit(SessionEntry::Notice {
+            text: POLL_AUDIT_NOTICE.to_owned(),
+        })
+        .await?;
+        Ok(())
     }
 
     fn begin_waiting_input(&mut self, request: UserInputRequest) {
@@ -3283,6 +3387,7 @@ impl SessionRunner {
             // never reset it.
             if !resume_turn {
                 self.agent.start_turn();
+                self.status_streak = 0;
             }
             let specs = self.agent.tool_specs();
             // A valid answer is human-owned work required to complete the
@@ -3569,7 +3674,22 @@ impl SessionRunner {
                 // One do-not-wait reminder per sibling batch, however many
                 // calls started background work (coalesced below).
                 let mut background_started = false;
-                for call in calls {
+                let mut notice_due = false;
+                let mut batch_complete = true;
+                let call_count = calls.len();
+                for (index, call) in calls.into_iter().enumerate() {
+                    let final_call = index + 1 == call_count;
+                    // GBT is governed by its existing guard, not this audit.
+                    if call.name != "get_background_tasks" {
+                        if status_check_command(&call).is_some() {
+                            if self.status_streak < 3 {
+                                self.status_streak += 1;
+                                notice_due |= self.status_streak == 3;
+                            }
+                        } else {
+                            self.status_streak = 0;
+                        }
+                    }
                     // The ToolCall projection was already published with the
                     // assistant commit above (before any compaction), so this
                     // loop only executes. Publishing again here would duplicate
@@ -3584,7 +3704,14 @@ impl SessionRunner {
                         // normal tool error and the loop continues.
                         if !self.user_input_allowed {
                             let result = Err(USER_INPUT_UNAVAILABLE.to_owned());
-                            match self.finish_intercepted_tool(&call, result).await {
+                            match self
+                                .finish_intercepted_tool(
+                                    &call,
+                                    result,
+                                    final_call && batch_complete && notice_due,
+                                )
+                                .await
+                            {
                                 Ok(Steering::None) => {}
                                 Ok(steering) => {
                                     if self.release_after_preempt(steering) {
@@ -3632,6 +3759,18 @@ impl SessionRunner {
                                         images: Vec::new(),
                                         call_id: Some(call.id.clone()),
                                     });
+                                if final_call
+                                    && batch_complete
+                                    && notice_due
+                                    && let Err(error) = self.commit_poll_audit().await
+                                {
+                                    self.terminate(
+                                        SessionResult::Failed(format!("{error:#}")),
+                                        Vec::new(),
+                                    )
+                                    .await;
+                                    return;
+                                }
                                 continue;
                             }
                         };
@@ -3652,7 +3791,11 @@ impl SessionRunner {
                                 call.id
                             );
                             match self
-                                .finish_intercepted_tool(&call, Ok(ToolOutput::text(receipt)))
+                                .finish_intercepted_tool(
+                                    &call,
+                                    Ok(ToolOutput::text(receipt)),
+                                    final_call && batch_complete && notice_due,
+                                )
                                 .await
                             {
                                 Ok(Steering::None) => {}
@@ -3680,11 +3823,13 @@ impl SessionRunner {
                                 let answer = answers.into_iter().next();
                                 let Some((id, value)) = answer else {
                                     self.clear_waiting_input(SessionStatus::Busy);
+                                    batch_complete = false;
                                     continue;
                                 };
                                 let expected = questions[0].id.clone();
                                 if id != expected || value.trim().is_empty() {
                                     self.clear_waiting_input(SessionStatus::Busy);
+                                    batch_complete = false;
                                     continue;
                                 }
                                 let content =
@@ -3718,6 +3863,18 @@ impl SessionRunner {
                                         images: Vec::new(),
                                         call_id: Some(call.id.clone()),
                                     });
+                                if final_call
+                                    && batch_complete
+                                    && notice_due
+                                    && let Err(error) = self.commit_poll_audit().await
+                                {
+                                    self.terminate(
+                                        SessionResult::Failed(format!("{error:#}")),
+                                        waited.pending,
+                                    )
+                                    .await;
+                                    return;
+                                }
                                 let steering = self.intake_after_operation(waited.pending);
                                 if steering != Steering::None {
                                     break 'turn;
@@ -3753,7 +3910,14 @@ impl SessionRunner {
                     }
                     if call.name == "get_context_usage" {
                         let result = self.execute_context_usage(&call);
-                        match self.finish_intercepted_tool(&call, result).await {
+                        match self
+                            .finish_intercepted_tool(
+                                &call,
+                                result,
+                                final_call && batch_complete && notice_due,
+                            )
+                            .await
+                        {
                             Ok(Steering::None) => {}
                             Ok(steering) => {
                                 if self.release_after_preempt(steering) {
@@ -3788,7 +3952,14 @@ impl SessionRunner {
                         if result.is_ok() && request_compaction_allowed {
                             requested_compaction = true;
                         }
-                        match self.finish_intercepted_tool(&call, result).await {
+                        match self
+                            .finish_intercepted_tool(
+                                &call,
+                                result,
+                                final_call && batch_complete && notice_due,
+                            )
+                            .await
+                        {
                             Ok(Steering::None) => {}
                             Ok(steering) => {
                                 if self.release_after_preempt(steering) {
@@ -3812,7 +3983,14 @@ impl SessionRunner {
                     // plain tool cannot reach. They never create goals.
                     if call.name == "get_goal" || call.name == "update_goal" {
                         let result = self.execute_goal_tool(&call).await;
-                        match self.finish_intercepted_tool(&call, result).await {
+                        match self
+                            .finish_intercepted_tool(
+                                &call,
+                                result,
+                                final_call && batch_complete && notice_due,
+                            )
+                            .await
+                        {
                             Ok(Steering::None) => {}
                             Ok(steering) => {
                                 if self.release_after_preempt(steering) {
@@ -3948,6 +4126,15 @@ impl SessionRunner {
                             images,
                             call_id: Some(call.id.clone()),
                         });
+                    if final_call
+                        && batch_complete
+                        && notice_due
+                        && let Err(error) = self.commit_poll_audit().await
+                    {
+                        self.terminate(SessionResult::Failed(format!("{error:#}")), pending)
+                            .await;
+                        return;
+                    }
                     // A release that raced the tool's own completion: the
                     // tool result was committed above (contract: completed
                     // output is never lost), but the release stops the turn

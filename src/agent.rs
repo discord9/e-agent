@@ -280,6 +280,13 @@ impl ToolOutput {
 /// their completion automatically.
 pub(crate) const BACKGROUND_REMINDER: &str = "Continue independent work if available; otherwise end your turn. Leave running background tasks untouched; do not cancel them. Do not sleep, poll task status, or rerun a command to wait; their completion will arrive automatically.";
 
+/// Provider-facing behavior-audit guidance. Committed ONCE per burst of
+/// three consecutive bash status checks in one turn, before the next model
+/// call. Independent tool calls reset the streak; get_background_tasks is neutral.
+/// It is guidance only: no tool is blocked, no turn is ended, and running
+/// background tasks are never cancelled.
+pub(crate) const POLL_AUDIT_NOTICE: &str = "[behavior audit] Repeated status/check calls were detected. Do not call get_background_tasks, date, git status, ls, ps, or any other status/check tool again. If independent work remains, continue with non-status tools; otherwise end the turn. Leave running background tasks untouched; do not cancel them.";
+
 /// Remove image attachments from user AND tool messages, text-degrading the
 /// message (a short note is appended where images were dropped). Non-vision
 /// models cannot consume image parts, so the REQUEST COPY strips them before
