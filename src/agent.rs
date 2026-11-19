@@ -275,8 +275,10 @@ impl ToolOutput {
 /// Provider-facing do-not-wait guidance for a tool batch that started
 /// background work. Committed ONCE per sibling batch as
 /// [`SessionEntry::Notice`] (projected as a user-shaped context entry); it
-/// never forces a turn end, an extra model call, or a wait.
-pub(crate) const BACKGROUND_REMINDER: &str = "Continue independent work if available; otherwise finish your response. Do not sleep, poll task status, or rerun a command to wait. Background command results arrive automatically.";
+/// never forces a turn end, an extra model call, or a wait. "End your turn"
+/// must not be read as cancelling the tasks: they keep running and deliver
+/// their completion automatically.
+pub(crate) const BACKGROUND_REMINDER: &str = "Continue independent work if available; otherwise end your turn. Leave running background tasks untouched; do not cancel them. Do not sleep, poll task status, or rerun a command to wait; their completion will arrive automatically.";
 
 /// Remove image attachments from user AND tool messages, text-degrading the
 /// message (a short note is appended where images were dropped). Non-vision
