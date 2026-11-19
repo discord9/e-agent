@@ -649,6 +649,36 @@ impl SessionFactory {
         }
     }
 
+    /// Resolve auditor → subagent → main from one live model snapshot.
+    /// The startup snapshot is used only when there is no live config.
+    pub(crate) fn auditor_model_resolver(
+        &self,
+    ) -> Arc<dyn Fn() -> Option<ConfiguredModel> + Send + Sync> {
+        let reloadable = self.reloadable.clone();
+        let startup = self
+            .role_models
+            .get("auditor")
+            .cloned()
+            .or_else(|| self.subagent_model.clone())
+            .unwrap_or_else(|| self.main_model.clone());
+        Arc::new(move || {
+            let state = reloadable.read().unwrap();
+            Some(match &state.models {
+                Some(models) => models
+                    .roles
+                    .get("auditor")
+                    .or(models.subagent.as_ref())
+                    .unwrap_or(&models.main)
+                    .clone(),
+                None => startup.clone(),
+            })
+        })
+    }
+
+    pub(crate) fn auditor_model(&self) -> Option<ConfiguredModel> {
+        self.auditor_model_resolver()()
+    }
+
     /// Snapshot of the current (possibly hot-reloaded) config. Runtime
     /// readers that render config-driven UI (e.g. the TUI's key bindings)
     /// re-read this when they want live config instead of the startup copy.
@@ -1087,7 +1117,9 @@ impl SessionFactory {
         // routed role) read `[roles] subagent` from the reloadable config at
         // spawn time, exactly like the routed-role path above reads `[roles]
         // <role>` — both survive config hot reloads without a restart.
-        delegate = delegate.with_subagent_model_source(self.subagent_model_resolver());
+        delegate = delegate
+            .with_subagent_model_source(self.subagent_model_resolver())
+            .with_auditor_model_source(self.auditor_model_resolver());
         let head_cell = Arc::new(std::sync::Mutex::new(None::<RequestHead>));
         let cell = head_cell.clone();
         delegate = delegate.with_fork_head(Arc::new(move || {
@@ -1106,7 +1138,8 @@ impl SessionFactory {
             subagent_sessions.clone(),
         )));
         tools.push(Box::new(delegate));
-        let mut agent = Agent::new(Box::new(main_model.clone()), tools);
+        let (mut agent, auditor_sender) =
+            Agent::new_with_notice_sender(Box::new(main_model.clone()), tools);
         let mut context = Vec::new();
         // The main agent's orchestrator template resolves through the same role
         // layers as delegated roles; the highest-priority available template
@@ -1227,6 +1260,11 @@ impl SessionFactory {
         // allowed to suspend on `request_user_input` for an answer.
         let runner = runner
             .with_background_tasks(background.clone())
+            .with_auditor_model(
+                self.auditor_model()
+                    .map(|model| Box::new(model) as Box<dyn crate::agent::Model>),
+                auditor_sender,
+            )
             .with_user_input_allowed();
         Ok(SessionBuild {
             runner,
@@ -2637,6 +2675,109 @@ model = "m2"
         assert_eq!(factory.model_profiles(), vec!["p1/m1", "p2/m2"]);
 
         unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+    }
+
+    #[test]
+    fn auditor_role_and_delegate_model_fallback_follow_reload() {
+        let temp = tempfile::tempdir().unwrap();
+        let factory = SessionFactory::test_factory(temp.path().to_path_buf());
+        let config = |roles: &str| -> Config {
+            toml::from_str(&format!(
+                r#"default = "p/main"
+[providers.p]
+base_url = "http://localhost"
+api_key_env = "PATH"
+[models."p/main"]
+model = "main"
+[models."p/sub"]
+model = "sub"
+[models."p/audit"]
+model = "audit"
+[models."p/summary"]
+model = "summary"
+[roles]
+{roles}
+"#
+            ))
+            .unwrap()
+        };
+        for (roles, expected) in [
+            ("summarizer = \"p/summary\"", "main"),
+            ("summarizer = \"p/summary\"\nsubagent = \"p/sub\"", "sub"),
+            (
+                "summarizer = \"p/summary\"\nsubagent = \"p/sub\"\nauditor = \"p/audit\"",
+                "audit",
+            ),
+        ] {
+            let mut state = factory.reloadable.write().unwrap();
+            apply_reloaded_config(&mut state, Some(config(roles)), None, &None, &None);
+            drop(state);
+            assert_eq!(factory.auditor_model().unwrap().display_name(), expected);
+        }
+    }
+
+    #[test]
+    fn auditor_selection_uses_one_snapshot_during_interleaving_reload() {
+        let temp = tempfile::tempdir().unwrap();
+        let factory = SessionFactory::test_factory(temp.path().to_path_buf());
+        let config = |auditor: bool| -> Config {
+            let roles = if auditor {
+                "subagent = \"p/sub-b\"\nauditor = \"p/audit-b\""
+            } else {
+                "subagent = \"p/sub-a\""
+            };
+            toml::from_str(&format!(
+                r#"default = "p/main"
+[providers.p]
+base_url = "http://localhost"
+api_key_env = "PATH"
+[models."p/main"]
+model = "main"
+[models."p/sub-a"]
+model = "sub-a"
+[models."p/sub-b"]
+model = "sub-b"
+[models."p/audit-b"]
+model = "audit-b"
+[roles]
+{roles}
+"#
+            ))
+            .unwrap()
+        };
+        {
+            let mut state = factory.reloadable.write().unwrap();
+            apply_reloaded_config(&mut state, Some(config(false)), None, &None, &None);
+        }
+        let role = factory.role_models_resolver();
+        let fallback = factory.subagent_model_resolver();
+        let select = factory.auditor_model_resolver();
+        assert!(
+            role("auditor").is_none(),
+            "the stale A lookup sees no auditor"
+        );
+        {
+            let mut state = factory.reloadable.write().unwrap();
+            apply_reloaded_config(&mut state, Some(config(true)), None, &None, &None);
+        }
+        assert_eq!(
+            fallback().unwrap().0.display_name(),
+            "sub-b",
+            "mixing A then B would wrongly choose sub-b"
+        );
+        assert_eq!(select().unwrap().display_name(), "audit-b");
+        assert_eq!(factory.auditor_model().unwrap().display_name(), "audit-b");
+        let (_, background) = crate::tools::builtins(factory.workspace.clone(), None, false, None);
+        let delegate = crate::delegate::Delegate::new(
+            factory.main_model(),
+            factory.workspace.clone(),
+            background,
+        )
+        .with_auditor_model_source(select.clone());
+        assert_eq!(
+            delegate.auditor_model_for_test().unwrap().display_name(),
+            "audit-b"
+        );
     }
 
     #[test]

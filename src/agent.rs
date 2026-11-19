@@ -280,11 +280,10 @@ impl ToolOutput {
 /// their completion automatically.
 pub(crate) const BACKGROUND_REMINDER: &str = "Continue independent work if available; otherwise end your turn. Leave running background tasks untouched; do not cancel them. Do not sleep, poll task status, or rerun a command to wait; their completion will arrive automatically.";
 
-/// Provider-facing behavior-audit guidance. Committed ONCE per burst of
-/// three consecutive bash status checks in one turn, before the next model
-/// call. Independent tool calls reset the streak; get_background_tasks is neutral.
-/// It is guidance only: no tool is blocked, no turn is ended, and running
-/// background tasks are never cancelled.
+/// Provider-facing behavior-audit guidance. Three consecutive bash status
+/// checks in one turn trigger an independent auditor; only its FAIL or SUSPECT
+/// verdict commits this Notice. Independent tool calls reset the streak;
+/// get_background_tasks is neutral. Guidance only: nothing is blocked or cancelled.
 pub(crate) const POLL_AUDIT_NOTICE: &str = "[behavior audit] Repeated status/check calls were detected. Do not call get_background_tasks, date, git status, ls, ps, or any other status/check tool again. If independent work remains, continue with non-status tools; otherwise end the turn. Leave running background tasks untouched; do not cancel them.";
 
 /// Remove image attachments from user AND tool messages, text-degrading the
@@ -1354,7 +1353,21 @@ pub struct Agent {
 }
 
 impl Agent {
-    pub fn new(model: Box<dyn Model>, mut tools: Vec<Box<dyn Tool>>) -> Self {
+    pub fn new(model: Box<dyn Model>, tools: Vec<Box<dyn Tool>>) -> Self {
+        Self::new_inner(model, tools).0
+    }
+
+    pub(crate) fn new_with_notice_sender(
+        model: Box<dyn Model>,
+        tools: Vec<Box<dyn Tool>>,
+    ) -> (Self, mpsc::UnboundedSender<AgentEvent>) {
+        Self::new_inner(model, tools)
+    }
+
+    fn new_inner(
+        model: Box<dyn Model>,
+        mut tools: Vec<Box<dyn Tool>>,
+    ) -> (Self, mpsc::UnboundedSender<AgentEvent>) {
         let (background_sender, background_receiver) = mpsc::unbounded_channel();
         for tool in &mut tools {
             // A tool may own an explicit sink (notably a Bash facade). Such
@@ -1363,33 +1376,36 @@ impl Agent {
                 tool.set_event_sender(background_sender.clone());
             }
         }
-        Self {
-            model,
-            request_session_id: None,
-            tools,
-            history: Vec::new(),
-            event_handler: None,
-            max_tool_rounds: None,
-            background_receiver,
-            pending_background: VecDeque::new(),
-            subscriber: None,
-            running_background: HashSet::new(),
-            session_input_tokens: 0,
-            session_output_tokens: 0,
-            last_context_input: None,
-            last_observed_context_input: 0,
-            context_window: None,
-            auto_compacted: false,
-            context_prefix: None,
-            compaction_reminder: None,
-            goal: None,
-            goal_cleared: false,
-            entry_locations: Vec::new(),
-            inherited: 0,
-            older_route: None,
-            compaction_mode: CompactionMode::Main,
-            omitted_images: HashSet::new(),
-        }
+        (
+            Self {
+                model,
+                request_session_id: None,
+                tools,
+                history: Vec::new(),
+                event_handler: None,
+                max_tool_rounds: None,
+                background_receiver,
+                pending_background: VecDeque::new(),
+                subscriber: None,
+                running_background: HashSet::new(),
+                session_input_tokens: 0,
+                session_output_tokens: 0,
+                last_context_input: None,
+                last_observed_context_input: 0,
+                context_window: None,
+                auto_compacted: false,
+                context_prefix: None,
+                compaction_reminder: None,
+                goal: None,
+                goal_cleared: false,
+                entry_locations: Vec::new(),
+                inherited: 0,
+                older_route: None,
+                compaction_mode: CompactionMode::Main,
+                omitted_images: HashSet::new(),
+            },
+            background_sender,
+        )
     }
 
     /// Set the compaction mode explicitly (see [`CompactionMode`]). Main by

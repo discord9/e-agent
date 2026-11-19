@@ -115,6 +115,43 @@ fn delegate(workspace: &std::path::Path) -> Delegate {
     delegate_with_url(workspace, "http://localhost".into())
 }
 
+#[test]
+fn auditor_model_uses_live_role_then_delegate_default() {
+    let temp = tempfile::tempdir().unwrap();
+    let model = |name: &str| {
+        ConfiguredModel::chat(
+            crate::model::OpenAiModel::new(
+                "http://localhost".into(),
+                "test-key".into(),
+                name.into(),
+                None,
+            )
+            .unwrap(),
+        )
+    };
+    let route = Arc::new(Mutex::new(Some(model("auditor"))));
+    let routed = route.clone();
+    let subagent = model("live-subagent");
+    let delegate = delegate(temp.path())
+        .with_subagent_model(model("snapshot-subagent"))
+        .with_auditor_model_source(Arc::new(move || {
+            Some(
+                routed
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| subagent.clone()),
+            )
+        }));
+    assert_eq!(delegate.auditor_model().unwrap().name(), "auditor");
+    *route.lock().unwrap() = None;
+    assert_eq!(delegate.auditor_model().unwrap().name(), "live-subagent");
+    let child = delegate.fork_child_delegate();
+    assert_eq!(child.auditor_model().unwrap().name(), "live-subagent");
+    *route.lock().unwrap() = Some(model("reloaded-auditor"));
+    assert_eq!(child.auditor_model().unwrap().name(), "reloaded-auditor");
+}
+
 /// Await the next BackgroundCompleted event's output (background-only
 /// delegate tests extract the subagent session id and answer from it).
 async fn await_completion(
@@ -2236,6 +2273,7 @@ async fn btw_unwritable_record_root_does_not_abort_live_child() {
         BtwContext {
             model,
             context_window: None,
+            auditor: None,
             workspace,
             sandbox: None,
             read_only: false,
@@ -2527,6 +2565,7 @@ async fn spawn_btw_subagent_forks_history_and_registers_persistent_subagent() {
         BtwContext {
             model,
             context_window: None,
+            auditor: None,
             workspace,
             sandbox: None,
             read_only: false,
@@ -3595,6 +3634,7 @@ async fn btw_child_suspends_fresh_automatic_goal_until_completion_commits() {
                 .unwrap(),
             ),
             context_window: None,
+            auditor: None,
             workspace: workspace.clone(),
             sandbox: None,
             read_only: false,

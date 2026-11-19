@@ -1687,6 +1687,7 @@ async fn session_btw(
             // built session.
             model: state.factory.main_model().clone(),
             context_window: state.factory.main_context_window(),
+            auditor: state.factory.auditor_model(),
             workspace: state.factory.workspace().clone(),
             sandbox: state.factory.sandbox().cloned(),
             read_only: state.factory.read_only(),

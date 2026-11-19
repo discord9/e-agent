@@ -259,6 +259,150 @@ fn status_check_command(call: &ToolCall) -> Option<String> {
     is_probe.then(|| words.join(" "))
 }
 
+/// Build a bounded, content-free projection for the auditor. In particular,
+/// never send commands, paths, tool output, prompts, or model text verbatim.
+fn poll_audit_events(history: &[SessionEntry]) -> Vec<serde_json::Value> {
+    const MAX_EVENTS: usize = 48;
+    let mut events = VecDeque::new();
+    let mut commands = Vec::<String>::new();
+    // Process newest first and retain only a bounded window of events even
+    // for an assistant message with an unusually large sibling batch.
+    for entry in history.iter().rev().take(128) {
+        match entry {
+            SessionEntry::Message {
+                message: Message::Assistant(message),
+            } => {
+                for call in message
+                    .tool_calls
+                    .iter()
+                    .rev()
+                    .take(MAX_EVENTS - events.len())
+                {
+                    let tool = audit_tool_name(&call.name);
+                    let args = if call.name == "bash" {
+                        let background = serde_json::from_str::<serde_json::Value>(&call.arguments)
+                            .ok()
+                            .and_then(|args| args.get("background").and_then(|v| v.as_bool()))
+                            .unwrap_or(false);
+                        if let Some(command) = status_check_command(call) {
+                            let program = command.split_whitespace().next().unwrap_or("");
+                            let program = program.rsplit('/').next().unwrap_or("");
+                            // `git status` is the only admitted git probe;
+                            // communicate its subcommand without raw args.
+                            let program = if program == "git" {
+                                "git_status"
+                            } else {
+                                program
+                            }
+                            .to_owned();
+                            let index = commands
+                                .iter()
+                                .position(|seen| seen == &command)
+                                .unwrap_or_else(|| {
+                                    commands.push(command);
+                                    commands.len() - 1
+                                });
+                            serde_json::json!({"kind": "status_probe", "program": program, "command_group": index + 1, "background": false})
+                        } else {
+                            serde_json::json!({"kind": "other_command", "background": background})
+                        }
+                    } else {
+                        serde_json::json!({"kind": "omitted"})
+                    };
+                    events.push_front(
+                        serde_json::json!({"role": "assistant", "tool": tool, "args": args}),
+                    );
+                }
+            }
+            SessionEntry::Message {
+                message:
+                    Message::Tool {
+                        name,
+                        content,
+                        is_error,
+                        synthetic,
+                        ..
+                    },
+            } => {
+                let category = if *synthetic {
+                    "interrupted"
+                } else if *is_error {
+                    "tool_error"
+                } else if name == "get_background_tasks"
+                    && content == "No background tasks running."
+                {
+                    "no_background_tasks"
+                } else if name == "get_background_tasks"
+                    && content
+                        .lines()
+                        .next()
+                        .is_some_and(|line| line.ends_with(" background task(s) running:"))
+                {
+                    "background_tasks_running"
+                } else if content.starts_with("started background task ") {
+                    "background_started"
+                } else if name == "bash" && content.starts_with("exit code: 0\n") {
+                    "command_succeeded"
+                } else if name == "bash" && content.starts_with("exit code: ") {
+                    "command_failed"
+                } else {
+                    "success"
+                };
+                events.push_front(serde_json::json!({"role": "tool", "tool": audit_tool_name(name), "result": category}));
+            }
+            SessionEntry::BackgroundCompletion { status, .. } => {
+                let category = match status.as_deref() {
+                    Some("completed") => "completed",
+                    Some("failed") => "failed",
+                    Some("killed") => "killed",
+                    _ => "unknown",
+                };
+                events.push_front(serde_json::json!({"role": "background", "result": category}));
+            }
+            SessionEntry::Message {
+                message: Message::User { .. },
+            } => {
+                events.push_front(serde_json::json!({"role": "user", "content": "omitted"}));
+            }
+            SessionEntry::Notice { .. } => {
+                events.push_front(serde_json::json!({"role": "notice", "content": "omitted"}));
+            }
+            _ => {}
+        }
+        if events.len() >= MAX_EVENTS {
+            break;
+        }
+    }
+    events.into_iter().collect()
+}
+
+fn audit_tool_name(name: &str) -> &str {
+    match name {
+        "bash"
+        | "get_background_tasks"
+        | "read_file"
+        | "write_file"
+        | "edit_file"
+        | "delegate"
+        | "send_message"
+        | "request_user_input"
+        | "request_compaction"
+        | "get_context_usage"
+        | "get_goal"
+        | "update_goal"
+        | "web_search"
+        | "web_fetch"
+        | "cancel_background_task" => name,
+        _ => "other",
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PollAuditResponse {
+    verdict: String,
+}
+
 async fn await_tool(
     agent: &mut Agent,
     call: &ToolCall,
@@ -1218,9 +1362,20 @@ pub struct SessionRunner {
     pending_regular_reaction: bool,
     /// Consecutive qualifying bash probes; saturates at the audit threshold.
     status_streak: usize,
+    /// Optional second-stage model and the existing per-session Notice ingress.
+    auditor_model: Option<Arc<tokio::sync::Mutex<Box<dyn Model>>>>,
+    poll_audit_sender: Option<mpsc::UnboundedSender<AgentEvent>>,
+    /// Calls in committed assistant batches that have no durable real result.
+    open_tool_calls: HashSet<String>,
+    /// Ready verdicts are withheld while a sibling batch is incomplete.
+    poll_audit_pending: usize,
     bootstrap: Option<SessionBootstrap>,
     #[cfg(test)]
     before_finalize: Option<Box<dyn FnOnce() + Send>>,
+    #[cfg(test)]
+    poll_audit_timeout: Option<std::time::Duration>,
+    #[cfg(test)]
+    poll_audit_admitted: Option<std::sync::mpsc::Sender<()>>,
     #[cfg(test)]
     before_goal_notice_drain: Option<Box<dyn FnOnce() + Send>>,
     #[cfg(test)]
@@ -1301,6 +1456,16 @@ fn respond_web_attach_locked(shared: &Shared, reply: oneshot::Sender<WebAttach>)
 }
 
 impl SessionRunner {
+    pub(crate) fn with_auditor_model(
+        mut self,
+        model: Option<Box<dyn Model>>,
+        sender: mpsc::UnboundedSender<AgentEvent>,
+    ) -> Self {
+        self.auditor_model = model.map(|model| Arc::new(tokio::sync::Mutex::new(model)));
+        self.poll_audit_sender = self.auditor_model.as_ref().map(|_| sender);
+        self
+    }
+
     pub(crate) fn with_background_tasks(
         mut self,
         background: crate::tools::BackgroundTasks,
@@ -1421,6 +1586,27 @@ impl SessionRunner {
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
         agent.set_request_session_id(request_session_id);
+        let mut open_tool_calls = HashSet::new();
+        for entry in agent.history() {
+            match entry {
+                SessionEntry::Message {
+                    message: Message::Assistant(assistant),
+                } => {
+                    open_tool_calls.extend(assistant.tool_calls.iter().map(|call| call.id.clone()));
+                }
+                SessionEntry::Message {
+                    message:
+                        Message::Tool {
+                            call_id,
+                            synthetic: false,
+                            ..
+                        },
+                } => {
+                    open_tool_calls.remove(call_id);
+                }
+                _ => {}
+            }
+        }
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
         let (status, _) = watch::channel(SessionStatus::Idle);
         let replay: Vec<LogEvent> = agent
@@ -1491,6 +1677,10 @@ impl SessionRunner {
                 maintenance_resume: false,
                 pending_regular_reaction: false,
                 status_streak: 0,
+                auditor_model: None,
+                poll_audit_sender: None,
+                open_tool_calls,
+                poll_audit_pending: 0,
                 goal_notice_unconsumed: false,
                 goal_continuation_remaining: None,
                 goal_continuation_usage_unavailable: false,
@@ -1498,6 +1688,10 @@ impl SessionRunner {
                 bootstrap: None,
                 #[cfg(test)]
                 before_finalize: None,
+                #[cfg(test)]
+                poll_audit_timeout: None,
+                #[cfg(test)]
+                poll_audit_admitted: None,
                 #[cfg(test)]
                 before_goal_notice_drain: None,
                 #[cfg(test)]
@@ -1651,6 +1845,25 @@ impl SessionRunner {
             }
             _ => None,
         };
+        match &entry {
+            SessionEntry::Message {
+                message: Message::Assistant(assistant),
+            } => {
+                self.open_tool_calls
+                    .extend(assistant.tool_calls.iter().map(|call| call.id.clone()));
+            }
+            SessionEntry::Message {
+                message:
+                    Message::Tool {
+                        call_id,
+                        synthetic: false,
+                        ..
+                    },
+            } => {
+                self.open_tool_calls.remove(call_id);
+            }
+            _ => {}
+        }
         self.agent.apply_entry_located(entry, location);
         self.shared
             .lock()
@@ -2155,7 +2368,7 @@ impl SessionRunner {
                 call_id: Some(call.id.clone()),
             });
         if audit_due {
-            self.commit_poll_audit().await?;
+            self.start_poll_audit();
         }
         let steering = self.intake_after_operation(Vec::new());
         if steering != Steering::None {
@@ -2167,12 +2380,69 @@ impl SessionRunner {
         Ok(steering)
     }
 
-    async fn commit_poll_audit(&mut self) -> anyhow::Result<()> {
-        self.commit(SessionEntry::Notice {
-            text: POLL_AUDIT_NOTICE.to_owned(),
-        })
-        .await?;
-        Ok(())
+    fn start_poll_audit(&self) {
+        let Some(model) = self.auditor_model.clone() else {
+            return;
+        };
+        let Some(sender) = self.poll_audit_sender.as_ref() else {
+            return;
+        };
+        let sender = sender.clone();
+        let session = Arc::downgrade(&self.shared);
+        let timeout = std::time::Duration::from_secs(10);
+        #[cfg(test)]
+        let timeout = self.poll_audit_timeout.unwrap_or(timeout);
+        #[cfg(test)]
+        let admitted = self.poll_audit_admitted.clone();
+        let events = poll_audit_events(self.agent.history());
+        let messages = [
+            Message::System {
+                content: "You are a read-only behavior auditor. Decide whether these recent classified events show repeated status checking to wait for background work rather than independent work. The events omit all raw content and may be incomplete. CLEAN means no evidence of problematic polling; SUSPECT means likely polling; FAIL means clear polling. Reply with exactly one JSON object and no other text: {\"verdict\":\"CLEAN\"}, {\"verdict\":\"SUSPECT\"}, or {\"verdict\":\"FAIL\"}.".into(),
+            },
+            Message::User {
+                content: serde_json::json!({"events": events}).to_string(),
+                images: Vec::new(),
+            },
+        ];
+        tokio::spawn(async move {
+            let response = tokio::time::timeout(timeout, async {
+                let mut model = model.lock().await;
+                if !session
+                    .upgrade()
+                    .is_some_and(|shared| shared.lock().unwrap().commands_open)
+                {
+                    return None;
+                }
+                Some(model.complete(&messages, &[], None).await)
+            })
+            .await;
+            let should_warn = match response {
+                Ok(Some(Ok((assistant, _)))) if assistant.tool_calls.is_empty() => assistant
+                    .content
+                    .as_deref()
+                    // Struct deserialization accepts arrays; reject them first.
+                    .filter(|content| content.trim_start().starts_with('{'))
+                    .and_then(|content| serde_json::from_str::<PollAuditResponse>(content).ok())
+                    .is_some_and(|response| {
+                        matches!(response.verdict.as_str(), "FAIL" | "SUSPECT")
+                    }),
+                _ => false,
+            };
+            if should_warn && let Some(shared) = session.upgrade() {
+                let guard = shared.lock().unwrap();
+                if guard.commands_open {
+                    let sent = sender.send(AgentEvent::Notice(POLL_AUDIT_NOTICE.to_owned()));
+                    #[cfg(test)]
+                    if sent.is_ok()
+                        && let Some(admitted) = admitted
+                    {
+                        let _ = admitted.send(());
+                    }
+                    #[cfg(not(test))]
+                    let _ = sent;
+                }
+            }
+        });
     }
 
     fn begin_waiting_input(&mut self, request: UserInputRequest) {
@@ -2375,6 +2645,22 @@ impl SessionRunner {
         }
         let command = {
             let mut shared = self.shared.lock().unwrap();
+            // Normal completion shares the audit admission lock, so every
+            // verdict accepted before closure is drained and reacted to.
+            // Cancellation/failure retain their existing termination rules.
+            if matches!(&result, SessionResult::Completed(_)) {
+                self.agent.drain_background_ready();
+                if self.agent.peek_background_entry().is_some() {
+                    return false;
+                }
+                if self.poll_audit_pending > 0 {
+                    // A skipped sibling remains repairable in the next
+                    // provider context; react instead of losing the verdict.
+                    self.open_tool_calls.clear();
+                    self.armed_trigger = Some(RunnerTrigger::Background);
+                    return false;
+                }
+            }
             match self.commands.try_recv() {
                 Ok(command) => Some(command),
                 Err(mpsc::error::TryRecvError::Empty) => {
@@ -2567,8 +2853,21 @@ impl SessionRunner {
             // the channel past this flush — it would miss this safety
             // boundary (the next provider call would not see it).
             self.agent.drain_background_ready();
-            let Some(entry) = self.agent.peek_background_entry() else {
-                return Ok(any);
+            let mut deferred_audit = false;
+            let entry = match self.agent.peek_background_entry() {
+                Some(SessionEntry::Notice { ref text }) if text == POLL_AUDIT_NOTICE => {
+                    self.agent.ack_background_entry();
+                    self.poll_audit_pending += 1;
+                    continue;
+                }
+                Some(entry) => entry,
+                None if self.poll_audit_pending > 0 && self.open_tool_calls.is_empty() => {
+                    deferred_audit = true;
+                    SessionEntry::Notice {
+                        text: POLL_AUDIT_NOTICE.to_owned(),
+                    }
+                }
+                None => return Ok(any),
             };
             // Persist the completion first, then drop the id from the live
             // set and re-project, and only then apply/publish. Ordering is
@@ -2586,7 +2885,11 @@ impl SessionRunner {
                 .append_located(&self.root, &self.session, std::slice::from_ref(&entry))
                 .await?;
             let location = locations.into_iter().next();
-            self.agent.ack_background_entry();
+            if deferred_audit {
+                self.poll_audit_pending -= 1;
+            } else {
+                self.agent.ack_background_entry();
+            }
             if let Some(id) = child_id {
                 self.shared.lock().unwrap().goal_children.remove(&id);
             }
@@ -3417,6 +3720,21 @@ impl SessionRunner {
                 {
                     break 'turn;
                 }
+                // The next provider request repairs any unanswered calls
+                // from an interrupted or incomplete batch. A deferred audit
+                // can now be committed after that batch, before the request.
+                self.open_tool_calls.clear();
+                if self.poll_audit_pending > 0
+                    && let Err(error) = self.commit_backgrounds().await
+                {
+                    self.terminate(SessionResult::Failed(format!("{error:#}")), Vec::new())
+                        .await;
+                    return;
+                }
+                if goal_turn && !human_required_continuation && self.pending_regular_reaction {
+                    self.armed_trigger = Some(RunnerTrigger::Background);
+                    break 'turn;
+                }
                 // This is the regular-request linearization point. A prompt
                 // coalesces fresh ingress; Background is its empty request.
                 // A resumed accepted answer is ordinary human-required work,
@@ -3675,6 +3993,14 @@ impl SessionRunner {
                 // calls started background work (coalesced below).
                 let mut background_started = false;
                 let mut notice_due = false;
+                // Do not enqueue optional audits from capped automatic Goal
+                // turns: the cap could be exhausted while an audit waits for
+                // the model lock. Sibling results still all commit.
+                let audit_allowed = !charged_compaction_failed
+                    && (!goal_turn
+                        || human_required_continuation
+                        || (self.goal_continuation_remaining.is_none()
+                            && !self.goal_continuation_usage_unavailable));
                 let mut batch_complete = true;
                 let call_count = calls.len();
                 for (index, call) in calls.into_iter().enumerate() {
@@ -3708,7 +4034,7 @@ impl SessionRunner {
                                 .finish_intercepted_tool(
                                     &call,
                                     result,
-                                    final_call && batch_complete && notice_due,
+                                    final_call && batch_complete && notice_due && audit_allowed,
                                 )
                                 .await
                             {
@@ -3759,17 +4085,8 @@ impl SessionRunner {
                                         images: Vec::new(),
                                         call_id: Some(call.id.clone()),
                                     });
-                                if final_call
-                                    && batch_complete
-                                    && notice_due
-                                    && let Err(error) = self.commit_poll_audit().await
-                                {
-                                    self.terminate(
-                                        SessionResult::Failed(format!("{error:#}")),
-                                        Vec::new(),
-                                    )
-                                    .await;
-                                    return;
+                                if final_call && batch_complete && notice_due && audit_allowed {
+                                    self.start_poll_audit();
                                 }
                                 continue;
                             }
@@ -3794,7 +4111,7 @@ impl SessionRunner {
                                 .finish_intercepted_tool(
                                     &call,
                                     Ok(ToolOutput::text(receipt)),
-                                    final_call && batch_complete && notice_due,
+                                    final_call && batch_complete && notice_due && audit_allowed,
                                 )
                                 .await
                             {
@@ -3863,17 +4180,8 @@ impl SessionRunner {
                                         images: Vec::new(),
                                         call_id: Some(call.id.clone()),
                                     });
-                                if final_call
-                                    && batch_complete
-                                    && notice_due
-                                    && let Err(error) = self.commit_poll_audit().await
-                                {
-                                    self.terminate(
-                                        SessionResult::Failed(format!("{error:#}")),
-                                        waited.pending,
-                                    )
-                                    .await;
-                                    return;
+                                if final_call && batch_complete && notice_due && audit_allowed {
+                                    self.start_poll_audit();
                                 }
                                 let steering = self.intake_after_operation(waited.pending);
                                 if steering != Steering::None {
@@ -3914,7 +4222,7 @@ impl SessionRunner {
                             .finish_intercepted_tool(
                                 &call,
                                 result,
-                                final_call && batch_complete && notice_due,
+                                final_call && batch_complete && notice_due && audit_allowed,
                             )
                             .await
                         {
@@ -3956,7 +4264,7 @@ impl SessionRunner {
                             .finish_intercepted_tool(
                                 &call,
                                 result,
-                                final_call && batch_complete && notice_due,
+                                final_call && batch_complete && notice_due && audit_allowed,
                             )
                             .await
                         {
@@ -3987,7 +4295,7 @@ impl SessionRunner {
                             .finish_intercepted_tool(
                                 &call,
                                 result,
-                                final_call && batch_complete && notice_due,
+                                final_call && batch_complete && notice_due && audit_allowed,
                             )
                             .await
                         {
@@ -4126,14 +4434,8 @@ impl SessionRunner {
                             images,
                             call_id: Some(call.id.clone()),
                         });
-                    if final_call
-                        && batch_complete
-                        && notice_due
-                        && let Err(error) = self.commit_poll_audit().await
-                    {
-                        self.terminate(SessionResult::Failed(format!("{error:#}")), pending)
-                            .await;
-                        return;
+                    if final_call && batch_complete && notice_due && audit_allowed {
+                        self.start_poll_audit();
                     }
                     // A release that raced the tool's own completion: the
                     // tool result was committed above (contract: completed
@@ -4169,16 +4471,11 @@ impl SessionRunner {
                         .await;
                     return;
                 }
-                // The assistant's full tool-result batch is durably
-                // committed: drain + durably commit any background
-                // completions that arrived while this batch executed (or
-                // during the provider stream that produced it), so the next
-                // provider call within this same turn sees them immediately
-                // instead of only after the turn ends. This is the safe
-                // point — never between the assistant's tool_calls and a
-                // real Tool result of the batch. Pending commands (if any)
-                // are unaffected: `commit_backgrounds` only drains the
-                // agent's background channel.
+                // Drain background completions at this batch boundary so the
+                // next provider call sees them. An incomplete batch keeps
+                // its audit notices deferred until provider-context repair.
+                // Pending commands are unaffected: `commit_backgrounds` only
+                // drains the agent's background channel.
                 match self.commit_backgrounds().await {
                     Ok(true) => {}
                     Ok(false) => {}

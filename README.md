@@ -313,7 +313,22 @@ model = "k2"
 
 [roles]
 subagent = "kimi/k2"
+# Optional separate model for behavior audits:
+# auditor = "kimi/k2"
 ```
+
+A candidate run of three consecutive simple bash status probes triggers a
+read-only second-stage behavior audit in main, delegate, fork, and btw sessions.
+Capped automatic Goal turns skip this optional audit; their tool results still
+commit. The `[roles] auditor` model is used when configured; otherwise the
+default subagent model (including its main-profile fallback) is used. The
+auditor runs asynchronously, without delaying turn progress or steering, and
+receives only a bounded, classified summary of recent tool calls/results, not
+raw prompts, commands, paths, or output. An exact JSON verdict of `FAIL` or
+`SUSPECT` yields one advisory notice at a safe boundary while the session
+remains live; `CLEAN`, invalid responses, errors, timeouts, or an unavailable
+model produce none. A verdict arriving after session termination is dropped.
+No tools are blocked and no running task is cancelled.
 
 A project-local `<workspace>/.e-agent/config.toml` overlays `default`,
 `[models]`, `[roles]`, `[mcp]`, `[tui]`, and `[pet]` onto this global config: models

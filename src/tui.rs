@@ -1243,6 +1243,7 @@ fn btw_context(
     Some(crate::delegate::BtwContext {
         model: state.model.clone()?,
         context_window: state.context_window,
+        auditor: state.factory.as_ref()?.auditor_model(),
         workspace: state.workspace.clone()?,
         sandbox: state.sandbox.clone(),
         read_only: state.read_only,

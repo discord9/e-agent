@@ -7793,6 +7793,112 @@ fn behavior_audit_classifies_simple_probes_conservatively() {
     );
 }
 
+struct FakeAuditor {
+    response: Option<String>,
+    requests: Arc<Mutex<Vec<Vec<Message>>>>,
+    finished: Option<oneshot::Sender<()>>,
+}
+
+#[async_trait]
+impl Model for FakeAuditor {
+    async fn complete(
+        &mut self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        assert!(tools.is_empty());
+        self.requests.lock().unwrap().push(messages.to_vec());
+        let result = self.response.clone();
+        if let Some(finished) = self.finished.take() {
+            let _ = finished.send(());
+        }
+        let Some(content) = result else {
+            anyhow::bail!("fake auditor error");
+        };
+        Ok((
+            AssistantMessage {
+                content: Some(content),
+                tool_calls: vec![],
+                reasoning: None,
+            },
+            None,
+        ))
+    }
+}
+
+struct GatedAuditor {
+    response: Option<String>,
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+    finished: Option<oneshot::Sender<()>>,
+    dropped: Option<Arc<Notify>>,
+}
+
+impl Drop for GatedAuditor {
+    fn drop(&mut self) {
+        if let Some(dropped) = &self.dropped {
+            dropped.notify_one();
+        }
+    }
+}
+
+#[async_trait]
+impl Model for GatedAuditor {
+    async fn complete(
+        &mut self,
+        _: &[Message],
+        tools: &[ToolSpec],
+        _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        assert!(tools.is_empty());
+        self.entered.notify_one();
+        self.release.notified().await;
+        let result = self.response.clone();
+        if let Some(finished) = self.finished.take() {
+            let _ = finished.send(());
+        }
+        let Some(content) = result else {
+            anyhow::bail!("gated auditor error");
+        };
+        Ok((
+            AssistantMessage {
+                content: Some(content),
+                tool_calls: vec![],
+                reasoning: None,
+            },
+            None,
+        ))
+    }
+}
+
+struct TimeoutAuditor {
+    entered: Arc<Notify>,
+    cancelled: Arc<Notify>,
+}
+
+#[async_trait]
+impl Model for TimeoutAuditor {
+    async fn complete(
+        &mut self,
+        _: &[Message],
+        _: &[ToolSpec],
+        _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        let _cancelled = DropProbe(self.cancelled.clone());
+        self.entered.notify_one();
+        std::future::pending().await
+    }
+}
+
+fn failing_auditor() -> Box<dyn Model> {
+    Box::new(FakeAuditor {
+        response: Some(r#"{"verdict":"FAIL"}"#.into()),
+        requests: Arc::new(Mutex::new(Vec::new())),
+        finished: None,
+    })
+}
+
 fn audit_round(calls: Vec<ToolCall>) -> (AssistantMessage, Option<Usage>) {
     (
         AssistantMessage {
@@ -7815,6 +7921,24 @@ fn audit_done() -> (AssistantMessage, Option<Usage>) {
     )
 }
 
+struct AuditTestModel {
+    replies: VecDeque<(AssistantMessage, Option<Usage>)>,
+    calls: Arc<Mutex<Vec<Vec<Message>>>>,
+}
+
+#[async_trait]
+impl Model for AuditTestModel {
+    async fn complete(
+        &mut self,
+        messages: &[Message],
+        _: &[ToolSpec],
+        _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        self.calls.lock().unwrap().push(messages.to_vec());
+        Ok(self.replies.pop_front().unwrap_or_else(audit_done))
+    }
+}
+
 async fn audit_run(
     session: &str,
     rounds: Vec<Vec<ToolCall>>,
@@ -7825,13 +7949,28 @@ async fn audit_run(
     let (mut tools, _) = crate::tools::builtins(workspace, None, false, None);
     tools.retain(|tool| tool.spec().name == "get_background_tasks");
     tools.push(Box::new(QuietBashMock));
+    let mut streak = 0;
+    let mut expected_audits = 0;
+    for call in rounds.iter().flatten() {
+        if call.name == "get_background_tasks" {
+            continue;
+        }
+        if status_check_command(call).is_some() {
+            if streak < 3 {
+                streak += 1;
+                expected_audits += usize::from(streak == 3);
+            }
+        } else {
+            streak = 0;
+        }
+    }
     let replies = rounds
         .into_iter()
         .map(audit_round)
         .chain([audit_done()])
         .collect();
-    let agent = Agent::new(
-        Box::new(ScriptedContextCaptureModel {
+    let (agent, audit_sender) = Agent::new_with_notice_sender(
+        Box::new(AuditTestModel {
             replies,
             calls: captured.clone(),
         }),
@@ -7844,12 +7983,23 @@ async fn audit_run(
         session.into(),
         IdlePolicy::WaitForInput,
     );
+    let runner = runner.with_auditor_model(Some(failing_auditor()), audit_sender);
     let task = runner.start(Some("check the build".into()));
     wait_for_log_event(
         &handle,
         |event| matches!(event, AgentEvent::AssistantText(text) if text == "done"),
     )
     .await;
+    if expected_audits > 0 {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if handle.snapshot().iter().filter(|event| matches!(event, AgentEvent::Notice(text) if text == POLL_AUDIT_NOTICE)).count() >= expected_audits {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("audit notices");
+    }
     let entries = SessionStore::Jsonl
         .load(temp.path(), session)
         .await
@@ -7859,6 +8009,1147 @@ async fn audit_run(
     drop(handle);
     task.join().await.unwrap();
     (requests, entries)
+}
+
+async fn run_auditor_case(
+    calls: Vec<ToolCall>,
+    auditor: Option<Box<dyn Model>>,
+    finished: Option<oneshot::Receiver<()>>,
+    expected_notice: bool,
+) -> Vec<SessionEntry> {
+    let temp = tempfile::tempdir().unwrap();
+    let (agent, audit_sender) = Agent::new_with_notice_sender(
+        Box::new(AuditTestModel {
+            replies: vec![
+                audit_round(calls),
+                audit_done(),
+                (
+                    AssistantMessage {
+                        content: Some("audit barrier".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    None,
+                ),
+            ]
+            .into(),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        }),
+        vec![Box::new(QuietBashMock)],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "audit-decision".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let task = runner
+        .with_auditor_model(auditor, audit_sender)
+        .start(Some("private-user-secret".into()));
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "done"),
+    )
+    .await;
+    let had_completion = finished.is_some();
+    if let Some(finished) = finished {
+        tokio::time::timeout(std::time::Duration::from_secs(5), finished)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    if expected_notice {
+        wait_for_log_event(
+            &handle,
+            |event| matches!(event, AgentEvent::Notice(text) if text == POLL_AUDIT_NOTICE),
+        )
+        .await;
+    } else if had_completion {
+        handle.prompt("audit barrier");
+        wait_for_log_event(
+            &handle,
+            |event| matches!(event, AgentEvent::AssistantText(text) if text == "audit barrier"),
+        )
+        .await;
+    }
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "audit-decision")
+        .await
+        .unwrap()
+        .entries;
+    drop(handle);
+    task.join().await.unwrap();
+    entries
+}
+
+#[tokio::test]
+async fn behavior_audit_model_decisions_fail_closed_and_do_not_call_without_trigger() {
+    for (response, expected) in [
+        (Some(r#"{"verdict":"FAIL"}"#), 1),
+        (Some(r#"{"verdict":"SUSPECT"}"#), 1),
+        (Some(r#"{"verdict":"CLEAN"}"#), 0),
+        (Some(""), 0),
+        (Some("FAIL"), 0),
+        (Some(r#"["FAIL"]"#), 0),
+        (Some(r#"{"verdict":{"FAIL":null}}"#), 0),
+        (Some(r#"{"verdict":"FAIL","verdict":"FAIL"}"#), 0),
+        (Some(r#"{"verdict":"FAIL","extra":1}"#), 0),
+        (Some(r#"{"verdict":"fail"}"#), 0),
+        (None, 0),
+    ] {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (finished_tx, finished_rx) = oneshot::channel();
+        let auditor = FakeAuditor {
+            response: response.map(str::to_owned),
+            requests: requests.clone(),
+            finished: Some(finished_tx),
+        };
+        let calls = (0..3)
+            .map(|i| status_bash_call(&format!("s{i}"), "ps"))
+            .collect();
+        let entries = run_auditor_case(
+            calls,
+            Some(Box::new(auditor)),
+            Some(finished_rx),
+            expected != 0,
+        )
+        .await;
+        assert_eq!(
+            audit_notice_count(&entries),
+            expected,
+            "response: {response:?}"
+        );
+        assert_eq!(requests.lock().unwrap().len(), 1, "response: {response:?}");
+    }
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let auditor = FakeAuditor {
+        response: Some(r#"{"verdict":"FAIL"}"#.into()),
+        requests: requests.clone(),
+        finished: None,
+    };
+    let calls = vec![status_bash_call("a", "ps"), status_bash_call("b", "date")];
+    let entries = run_auditor_case(calls, Some(Box::new(auditor)), None, false).await;
+    assert_eq!(audit_notice_count(&entries), 0);
+    assert!(requests.lock().unwrap().is_empty());
+
+    let calls = (0..3)
+        .map(|i| status_bash_call(&format!("s{i}"), "ps"))
+        .collect();
+    let entries = run_auditor_case(calls, None, None, false).await;
+    assert_eq!(
+        audit_notice_count(&entries),
+        0,
+        "no auditor disables notices"
+    );
+}
+
+#[tokio::test]
+async fn behavior_audit_prompt_contains_only_classified_events() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let (finished_tx, finished_rx) = oneshot::channel();
+    let auditor = FakeAuditor {
+        response: Some(r#"{"verdict":"CLEAN"}"#.into()),
+        requests: requests.clone(),
+        finished: Some(finished_tx),
+    };
+    let calls = vec![
+        status_bash_call("private-call-id", "cat private-source-secret.log"),
+        status_bash_call("b", "  cat   private-source-secret.log "),
+        status_bash_call("c", "ps private-argument-secret"),
+    ];
+    let entries = run_auditor_case(calls, Some(Box::new(auditor)), Some(finished_rx), false).await;
+    assert_eq!(audit_notice_count(&entries), 0);
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let prompt = &requests[0];
+    assert_eq!(prompt.len(), 2);
+    assert!(matches!(&prompt[0], Message::System { content } if content.contains("verdict")));
+    let Message::User { content, images } = &prompt[1] else {
+        panic!("missing event summary")
+    };
+    assert!(images.is_empty());
+    for secret in [
+        "private-user-secret",
+        "private-call-id",
+        "private-source-secret",
+        "private-argument-secret",
+        "ok",
+    ] {
+        assert!(!content.contains(secret), "leaked {secret}: {content}");
+    }
+    let summary: Value = serde_json::from_str(content).unwrap();
+    let events = summary["events"].as_array().unwrap();
+    let calls: Vec<_> = events
+        .iter()
+        .filter(|event| event["role"] == "assistant")
+        .collect();
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[0]["tool"], "bash");
+    assert_eq!(calls[0]["args"]["kind"], "status_probe");
+    assert_eq!(calls[0]["args"]["program"], "cat");
+    assert_eq!(
+        calls[0]["args"]["command_group"],
+        calls[1]["args"]["command_group"]
+    );
+    assert_ne!(
+        calls[0]["args"]["command_group"],
+        calls[2]["args"]["command_group"]
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["role"] == "tool" && event["result"] == "success")
+            .count(),
+        3
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["role"] == "user" && event["content"] == "omitted")
+    );
+}
+
+#[tokio::test]
+async fn behavior_audit_slow_verdict_allows_next_round_and_cancel_then_reacts_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let audit_entered = Arc::new(Notify::new());
+    let audit_release = Arc::new(Notify::new());
+    let model_entered = Arc::new(Notify::new());
+    let model_dropped = Arc::new(Notify::new());
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let probes = (1..=3)
+        .map(|i| status_bash_call(&format!("s{i}"), "ps"))
+        .collect();
+    let (agent, sender) = Agent::new_with_notice_sender(
+        Box::new(BlockingContextCaptureModel {
+            replies: vec![audit_round(probes).0, audit_done().0, audit_done().0].into(),
+            block_call: 2,
+            entered: model_entered.clone(),
+            release: Arc::new(Notify::new()),
+            dropped: Some(model_dropped.clone()),
+            calls: calls.clone(),
+            call_count: 0,
+        }),
+        vec![Box::new(QuietBashMock)],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "audit-slow-cancel".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let task = runner
+        .with_auditor_model(
+            Some(Box::new(GatedAuditor {
+                response: Some(r#"{"verdict":"FAIL"}"#.into()),
+                entered: audit_entered.clone(),
+                release: audit_release.clone(),
+                finished: None,
+                dropped: None,
+            })),
+            sender,
+        )
+        .start(Some("check".into()));
+    wait_for_notify(&audit_entered, "gated auditor").await;
+    wait_for_notify(&model_entered, "next provider round").await;
+    let (_, mut events, mut status) = handle.attach();
+    handle.cancel();
+    wait_for_notify(&model_dropped, "cancelled provider round").await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        wait_for_status(&mut status, |state| matches!(state, SessionStatus::Idle)),
+    )
+    .await
+    .unwrap();
+    let before = SessionStore::Jsonl
+        .load(temp.path(), "audit-slow-cancel")
+        .await
+        .unwrap()
+        .entries;
+    assert_eq!(audit_notice_count(&before), 0);
+    for id in ["s1", "s2", "s3"] {
+        assert!(before.iter().any(|entry| matches!(entry, SessionEntry::Message { message: Message::Tool { call_id, synthetic: false, .. } } if call_id == id)));
+    }
+    audit_release.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if matches!(events.recv().await.unwrap(), AgentEvent::AssistantText(text) if text == "done") {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let requests = calls.lock().unwrap().clone();
+    assert_eq!(requests.len(), 3);
+    assert!(audit_notices(&requests[1]).is_empty());
+    assert_eq!(audit_notices(&requests[2]).len(), 1);
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "audit-slow-cancel")
+        .await
+        .unwrap()
+        .entries;
+    assert_eq!(audit_notice_count(&entries), 1);
+    let notice = entries
+        .iter()
+        .position(
+            |entry| matches!(entry, SessionEntry::Notice { text } if text == POLL_AUDIT_NOTICE),
+        )
+        .unwrap();
+    for id in ["s1", "s2", "s3"] {
+        assert!(entries.iter().position(|entry| matches!(entry, SessionEntry::Message { message: Message::Tool { call_id, synthetic: false, .. } } if call_id == id)).unwrap() < notice);
+    }
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn behavior_audit_late_clean_and_error_do_not_react() {
+    for response in [Some(r#"{"verdict":"CLEAN"}"#), None] {
+        let temp = tempfile::tempdir().unwrap();
+        let audit_entered = Arc::new(Notify::new());
+        let audit_release = Arc::new(Notify::new());
+        let (finished_tx, finished_rx) = oneshot::channel();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let probes = (1..=3)
+            .map(|i| status_bash_call(&format!("s{i}"), "ps"))
+            .collect();
+        let (agent, sender) = Agent::new_with_notice_sender(
+            Box::new(AuditTestModel {
+                replies: vec![
+                    audit_round(probes),
+                    audit_done(),
+                    (
+                        AssistantMessage {
+                            content: Some("audit barrier".into()),
+                            tool_calls: vec![],
+                            reasoning: None,
+                        },
+                        None,
+                    ),
+                ]
+                .into(),
+                calls: calls.clone(),
+            }),
+            vec![Box::new(QuietBashMock)],
+        );
+        let (runner, handle) = SessionRunner::new(
+            agent,
+            SessionStore::Jsonl,
+            temp.path().into(),
+            "audit-late-no-reaction".into(),
+            IdlePolicy::WaitForInput,
+        );
+        let (_, mut events, mut status) = handle.attach();
+        let task = runner
+            .with_auditor_model(
+                Some(Box::new(GatedAuditor {
+                    response: response.map(str::to_owned),
+                    entered: audit_entered.clone(),
+                    release: audit_release.clone(),
+                    finished: Some(finished_tx),
+                    dropped: None,
+                })),
+                sender,
+            )
+            .start(Some("check".into()));
+        wait_for_notify(&audit_entered, "gated auditor").await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if matches!(events.recv().await.unwrap(), AgentEvent::AssistantText(text) if text == "done") {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            wait_for_status(&mut status, |state| matches!(state, SessionStatus::Idle)),
+        )
+        .await
+        .unwrap();
+        audit_release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), finished_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        handle.prompt("audit barrier");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if matches!(events.recv().await.unwrap(), AgentEvent::AssistantText(text) if text == "audit barrier") {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let entries = SessionStore::Jsonl
+            .load(temp.path(), "audit-late-no-reaction")
+            .await
+            .unwrap()
+            .entries;
+        assert_eq!(audit_notice_count(&entries), 0, "{response:?}");
+        let requests = calls.lock().unwrap().clone();
+        assert_eq!(requests.len(), 3, "{response:?}");
+        assert!(
+            requests
+                .iter()
+                .all(|request| audit_notices(request).is_empty())
+        );
+        drop(handle);
+        task.join().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn behavior_audit_late_verdict_waits_for_incomplete_batch_repair() {
+    let temp = tempfile::tempdir().unwrap();
+    let audit_entered = Arc::new(Notify::new());
+    let audit_release = Arc::new(Notify::new());
+    let tool_entered = Arc::new(Notify::new());
+    let (finished_tx, finished_rx) = oneshot::channel();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let probes = (1..=3)
+        .map(|i| status_bash_call(&format!("s{i}"), "ps"))
+        .collect();
+    let next_batch = vec![
+        status_bash_call("work", "cargo build"),
+        ToolCall {
+            id: "blocked".into(),
+            name: "blocker".into(),
+            arguments: "{}".into(),
+        },
+    ];
+    let (agent, sender) = Agent::new_with_notice_sender(
+        Box::new(AuditTestModel {
+            replies: vec![audit_round(probes), audit_round(next_batch), audit_done()].into(),
+            calls: calls.clone(),
+        }),
+        vec![
+            Box::new(QuietBashMock),
+            Box::new(BlockingNoopTool {
+                entered: tool_entered.clone(),
+                release: Arc::new(Notify::new()),
+            }),
+        ],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "audit-batch-repair".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let (_, mut events, mut status) = handle.attach();
+    let task = runner
+        .with_auditor_model(
+            Some(Box::new(GatedAuditor {
+                response: Some(r#"{"verdict":"FAIL"}"#.into()),
+                entered: audit_entered.clone(),
+                release: audit_release.clone(),
+                finished: Some(finished_tx),
+                dropped: None,
+            })),
+            sender,
+        )
+        .start(Some("check".into()));
+    wait_for_notify(&audit_entered, "gated auditor").await;
+    wait_for_notify(&tool_entered, "next batch's blocked sibling").await;
+    audit_release.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(5), finished_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    // A completed auditor sends its ingress before the notified test resumes.
+    // The durable goal update proves the outer loop visited its safe point.
+    assert!(handle.goal_command(GoalCommand::Create {
+        objective: "test boundary".into(),
+        success_criteria: vec![],
+    }));
+    handle.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if matches!(events.recv().await.unwrap(), AgentEvent::GoalUpdated { .. }) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        wait_for_status(&mut status, |state| matches!(state, SessionStatus::Idle)),
+    )
+    .await
+    .unwrap();
+    let incomplete = SessionStore::Jsonl
+        .load(temp.path(), "audit-batch-repair")
+        .await
+        .unwrap()
+        .entries;
+    assert_eq!(audit_notice_count(&incomplete), 0);
+    assert!(incomplete.iter().any(|entry| matches!(entry, SessionEntry::Message { message: Message::Tool { call_id, synthetic: false, .. } } if call_id == "work")));
+    assert!(!incomplete.iter().any(|entry| matches!(entry, SessionEntry::Message { message: Message::Tool { call_id, .. } } if call_id == "blocked")));
+    handle.prompt("resume");
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if matches!(events.recv().await.unwrap(), AgentEvent::AssistantText(text) if text == "done") {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "audit-batch-repair")
+        .await
+        .unwrap()
+        .entries;
+    assert_eq!(audit_notice_count(&entries), 1);
+    let resume = entries.iter().position(|entry| matches!(entry, SessionEntry::Message { message: Message::User { content, .. } } if content == "resume")).unwrap();
+    let notice = entries
+        .iter()
+        .position(
+            |entry| matches!(entry, SessionEntry::Notice { text } if text == POLL_AUDIT_NOTICE),
+        )
+        .unwrap();
+    assert!(
+        resume < notice,
+        "notice must wait for the new-turn repair boundary"
+    );
+    {
+        let requests = calls.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        let repaired = &requests[2];
+        let missing = repaired.iter().position(|message| matches!(message, Message::Tool { call_id, synthetic: true, .. } if call_id == "blocked")).unwrap();
+        assert!(missing < audit_notices(repaired)[0]);
+    }
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn behavior_audit_resumed_repair_does_not_split_next_batch() {
+    let temp = tempfile::tempdir().unwrap();
+    let audit_entered = Arc::new(Notify::new());
+    let audit_release = Arc::new(Notify::new());
+    let tool_entered = Arc::new(Notify::new());
+    let (finished_tx, finished_rx) = oneshot::channel();
+    let probes = (1..=3)
+        .map(|i| status_bash_call(&format!("s{i}"), "ps"))
+        .collect();
+    let question = ToolCall {
+        id: "question".into(),
+        name: "request_user_input".into(),
+        arguments: r#"{"questions":[{"id":"answer","prompt":"continue?"}]}"#.into(),
+    };
+    let blocked = ToolCall {
+        id: "blocked".into(),
+        name: "blocker".into(),
+        arguments: "{}".into(),
+    };
+    let next_batch = vec![status_bash_call("work", "cargo build"), question, blocked];
+    let (agent, sender) = Agent::new_with_notice_sender(
+        Box::new(AuditTestModel {
+            replies: vec![audit_round(probes), audit_round(next_batch), audit_done()].into(),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        }),
+        vec![
+            Box::new(QuietBashMock),
+            Box::new(BlockingNoopTool {
+                entered: tool_entered.clone(),
+                release: Arc::new(Notify::new()),
+            }),
+        ],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "audit-resume-repair".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let (_, mut events, mut status) = handle.attach();
+    let task = runner
+        .with_user_input_allowed()
+        .with_auditor_model(
+            Some(Box::new(GatedAuditor {
+                response: Some(r#"{"verdict":"FAIL"}"#.into()),
+                entered: audit_entered.clone(),
+                release: audit_release.clone(),
+                finished: Some(finished_tx),
+                dropped: None,
+            })),
+            sender,
+        )
+        .start(Some("check".into()));
+    wait_for_notify(&audit_entered, "gated auditor").await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        wait_for_status(&mut status, |state| {
+            matches!(state, SessionStatus::WaitingInput(_))
+        }),
+    )
+    .await
+    .unwrap();
+    audit_release.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(5), finished_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("question".into()), "yes".into()),
+        PromptSubmission::Answered,
+    );
+    wait_for_notify(&tool_entered, "blocked final sibling").await;
+    assert!(handle.goal_command(GoalCommand::Create {
+        objective: "test boundary".into(),
+        success_criteria: vec![],
+    }));
+    handle.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if matches!(events.recv().await.unwrap(), AgentEvent::GoalUpdated { .. }) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "audit-resume-repair")
+        .await
+        .unwrap()
+        .entries;
+    assert_eq!(audit_notice_count(&entries), 0);
+    assert!(entries.iter().any(|entry| matches!(entry, SessionEntry::Message { message: Message::Tool { call_id, synthetic: false, .. } } if call_id == "question")));
+    assert!(!entries.iter().any(|entry| matches!(entry, SessionEntry::Message { message: Message::Tool { call_id, .. } } if call_id == "blocked")));
+    handle.prompt("resume");
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if matches!(events.recv().await.unwrap(), AgentEvent::AssistantText(text) if text == "done") {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "audit-resume-repair")
+        .await
+        .unwrap()
+        .entries;
+    assert_eq!(audit_notice_count(&entries), 1);
+    let resume = entries.iter().position(|entry| matches!(entry, SessionEntry::Message { message: Message::User { content, .. } } if content == "resume")).unwrap();
+    let notice = entries
+        .iter()
+        .position(
+            |entry| matches!(entry, SessionEntry::Notice { text } if text == POLL_AUDIT_NOTICE),
+        )
+        .unwrap();
+    assert!(resume < notice);
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn behavior_audit_deferred_repair_reacts_before_queued_goal() {
+    let temp = tempfile::tempdir().unwrap();
+    let audit_entered = Arc::new(Notify::new());
+    let audit_release = Arc::new(Notify::new());
+    let tool_entered = Arc::new(Notify::new());
+    let (finished_tx, finished_rx) = oneshot::channel();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let probes = (1..=3)
+        .map(|i| status_bash_call(&format!("s{i}"), "ps"))
+        .collect();
+    let next_batch = vec![
+        status_bash_call("work", "cargo build"),
+        ToolCall {
+            id: "blocked".into(),
+            name: "blocker".into(),
+            arguments: "{}".into(),
+        },
+    ];
+    let (agent, sender) = Agent::new_with_notice_sender(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![
+                audit_round(probes),
+                audit_round(next_batch),
+                audit_done(),
+                (
+                    AssistantMessage {
+                        content: Some("goal continuation".into()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    },
+                    Some(Usage {
+                        input_tokens: 1,
+                        ..Usage::default()
+                    }),
+                ),
+            ]
+            .into(),
+            calls: calls.clone(),
+        }),
+        vec![
+            Box::new(QuietBashMock),
+            Box::new(BlockingNoopTool {
+                entered: tool_entered.clone(),
+                release: Arc::new(Notify::new()),
+            }),
+        ],
+    );
+    let (runner, handle) = SessionRunner::new_with_bootstrap(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "audit-repair-goal".into(),
+        IdlePolicy::WaitForInput,
+        SessionBootstrap {
+            recovery_tasks: vec![],
+            legacy: false,
+            initial_entries: vec![test_goal_entry()],
+        },
+    )
+    .await
+    .unwrap();
+    let (_, mut events, _) = handle.attach();
+    let task = runner
+        .with_auditor_model(
+            Some(Box::new(GatedAuditor {
+                response: Some(r#"{"verdict":"FAIL"}"#.into()),
+                entered: audit_entered.clone(),
+                release: audit_release.clone(),
+                finished: Some(finished_tx),
+                dropped: None,
+            })),
+            sender,
+        )
+        .start(Some("check".into()));
+    wait_for_notify(&audit_entered, "gated auditor").await;
+    wait_for_notify(&tool_entered, "blocked sibling").await;
+    audit_release.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(5), finished_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        handle.goal_command(GoalCommand::Action(crate::agent::GoalAction::Progress {
+            progress: "test boundary".into(),
+        }))
+    );
+    handle.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if matches!(events.recv().await.unwrap(), AgentEvent::GoalUpdated { goal: Some(goal) } if goal.progress == "test boundary") {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(handle.continue_goal(Some(1)));
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if matches!(events.recv().await.unwrap(), AgentEvent::AssistantText(text) if text == "goal continuation") {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "audit-repair-goal")
+        .await
+        .unwrap()
+        .entries;
+    assert_eq!(audit_notice_count(&entries), 1);
+    let notice = entries
+        .iter()
+        .position(
+            |entry| matches!(entry, SessionEntry::Notice { text } if text == POLL_AUDIT_NOTICE),
+        )
+        .unwrap();
+    let goal = entries
+        .iter()
+        .position(
+            |entry| matches!(entry, SessionEntry::Notice { text } if text == GOAL_TURN_NOTICE),
+        )
+        .unwrap();
+    let answer = entries.iter().position(|entry| matches!(entry, SessionEntry::Message { message: Message::Assistant(assistant) } if assistant.content.as_deref() == Some("done"))).unwrap();
+    let continuation = entries.iter().position(|entry| matches!(entry, SessionEntry::Message { message: Message::Assistant(assistant) } if assistant.content.as_deref() == Some("goal continuation"))).unwrap();
+    assert!(goal < notice && notice < answer && answer < continuation);
+    assert_eq!(audit_notices(&calls.lock().unwrap()[2]).len(), 1);
+    handle.cancel();
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn behavior_audit_accepted_at_finalization_is_persisted_and_reacted_to() {
+    let temp = tempfile::tempdir().unwrap();
+    let audit_entered = Arc::new(Notify::new());
+    let audit_release = Arc::new(Notify::new());
+    let (audit_admitted, admitted_rx) = std::sync::mpsc::channel();
+    let (closing_tx, closing_rx) = oneshot::channel();
+    let model_entered = Arc::new(Notify::new());
+    let model_release = Arc::new(Notify::new());
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let probes = (1..=3)
+        .map(|i| status_bash_call(&format!("s{i}"), "ps"))
+        .collect();
+    let reaction = AssistantMessage {
+        content: Some("reacted".into()),
+        tool_calls: vec![],
+        reasoning: None,
+    };
+    let (agent, sender) = Agent::new_with_notice_sender(
+        Box::new(BlockingContextCaptureModel {
+            replies: vec![audit_round(probes).0, audit_done().0, reaction].into(),
+            block_call: 2,
+            entered: model_entered.clone(),
+            release: model_release.clone(),
+            dropped: None,
+            calls: calls.clone(),
+            call_count: 0,
+        }),
+        vec![Box::new(QuietBashMock)],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "audit-before-close".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let mut runner = runner.with_auditor_model(
+        Some(Box::new(GatedAuditor {
+            response: Some(r#"{"verdict":"FAIL"}"#.into()),
+            entered: audit_entered.clone(),
+            release: audit_release.clone(),
+            finished: None,
+            dropped: None,
+        })),
+        sender,
+    );
+    runner.poll_audit_admitted = Some(audit_admitted);
+    runner.before_finalize = Some(Box::new(move || {
+        let _ = closing_tx.send(());
+        admitted_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("auditor admitted before closing");
+    }));
+    let mut status = handle.status();
+    let task = runner.start(Some("check".into()));
+    wait_for_notify(&audit_entered, "gated auditor").await;
+    wait_for_notify(&model_entered, "next provider round").await;
+    model_release.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(5), closing_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    audit_release.notify_one();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        wait_for_status(&mut status, |state| {
+            matches!(state, SessionStatus::Finished(_))
+        }),
+    )
+    .await
+    .unwrap();
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "audit-before-close")
+        .await
+        .unwrap()
+        .entries;
+    assert_eq!(audit_notice_count(&entries), 1);
+    assert_eq!(audit_notices(&calls.lock().unwrap()[2]).len(), 1);
+    assert!(
+        handle
+            .snapshot()
+            .iter()
+            .any(|event| matches!(event, AgentEvent::AssistantText(text) if text == "reacted"))
+    );
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn behavior_audit_late_result_after_session_finish_is_dropped() {
+    let temp = tempfile::tempdir().unwrap();
+    let audit_entered = Arc::new(Notify::new());
+    let audit_release = Arc::new(Notify::new());
+    let audit_dropped = Arc::new(Notify::new());
+    let model_entered = Arc::new(Notify::new());
+    let model_release = Arc::new(Notify::new());
+    let (finished_tx, finished_rx) = oneshot::channel();
+    let probes = (1..=3)
+        .map(|i| status_bash_call(&format!("s{i}"), "ps"))
+        .collect();
+    let (agent, sender) = Agent::new_with_notice_sender(
+        Box::new(BlockingContextCaptureModel {
+            replies: vec![audit_round(probes).0, audit_done().0].into(),
+            block_call: 2,
+            entered: model_entered.clone(),
+            release: model_release.clone(),
+            dropped: None,
+            calls: Arc::new(Mutex::new(Vec::new())),
+            call_count: 0,
+        }),
+        vec![Box::new(QuietBashMock)],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "audit-finished".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let mut status = handle.status();
+    let task = runner
+        .with_auditor_model(
+            Some(Box::new(GatedAuditor {
+                response: Some(r#"{"verdict":"FAIL"}"#.into()),
+                entered: audit_entered.clone(),
+                release: audit_release.clone(),
+                finished: Some(finished_tx),
+                dropped: Some(audit_dropped.clone()),
+            })),
+            sender,
+        )
+        .start(Some("check".into()));
+    wait_for_notify(&audit_entered, "gated auditor").await;
+    wait_for_notify(&model_entered, "next provider round").await;
+    model_release.notify_one();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        wait_for_status(&mut status, |state| {
+            matches!(state, SessionStatus::Finished(_))
+        }),
+    )
+    .await
+    .unwrap();
+    task.join().await.unwrap();
+    let before = SessionStore::Jsonl
+        .load(temp.path(), "audit-finished")
+        .await
+        .unwrap()
+        .entries;
+    assert_eq!(audit_notice_count(&before), 0);
+    audit_release.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(5), finished_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    wait_for_notify(&audit_dropped, "completed late auditor task").await;
+    let after = SessionStore::Jsonl
+        .load(temp.path(), "audit-finished")
+        .await
+        .unwrap()
+        .entries;
+    assert_eq!(
+        serde_json::to_value(&before).unwrap(),
+        serde_json::to_value(&after).unwrap()
+    );
+    assert!(
+        !handle
+            .snapshot()
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Notice(text) if text == POLL_AUDIT_NOTICE))
+    );
+}
+
+#[tokio::test]
+async fn behavior_audit_finish_reacts_after_incomplete_batch_repair() {
+    let temp = tempfile::tempdir().unwrap();
+    let audit_entered = Arc::new(Notify::new());
+    let audit_release = Arc::new(Notify::new());
+    let (finished_tx, finished_rx) = oneshot::channel();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let probes = (1..=3)
+        .map(|i| status_bash_call(&format!("s{i}"), "ps"))
+        .collect();
+    let next = vec![
+        ToolCall {
+            id: "question".into(),
+            name: "request_user_input".into(),
+            arguments: r#"{"questions":[{"id":"q","prompt":"continue?"}]}"#.into(),
+        },
+        status_bash_call("work", "cargo build"),
+    ];
+    let (agent, sender) = Agent::new_with_notice_sender(
+        Box::new(AuditTestModel {
+            replies: vec![audit_round(probes), audit_round(next), audit_done()].into(),
+            calls: calls.clone(),
+        }),
+        vec![Box::new(QuietBashMock)],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "audit-finish-repair".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let (_, mut events, mut status) = handle.attach();
+    let task = runner
+        .with_user_input_allowed()
+        .with_auditor_model(
+            Some(Box::new(GatedAuditor {
+                response: Some(r#"{"verdict":"FAIL"}"#.into()),
+                entered: audit_entered.clone(),
+                release: audit_release.clone(),
+                finished: Some(finished_tx),
+                dropped: None,
+            })),
+            sender,
+        )
+        .start(Some("check".into()));
+    wait_for_notify(&audit_entered, "gated auditor").await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        wait_for_status(&mut status, |state| {
+            matches!(state, SessionStatus::WaitingInput(_))
+        }),
+    )
+    .await
+    .unwrap();
+    audit_release.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(5), finished_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    handle
+        .commands
+        .send(SessionCommand::Answer {
+            call_id: "question".into(),
+            answers: Vec::new(),
+        })
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if matches!(events.recv().await.unwrap(), AgentEvent::Notice(text) if text == POLL_AUDIT_NOTICE) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        wait_for_status(&mut status, |state| {
+            matches!(state, SessionStatus::Finished(_))
+        }),
+    )
+    .await
+    .unwrap();
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "audit-finish-repair")
+        .await
+        .unwrap()
+        .entries;
+    assert_eq!(audit_notice_count(&entries), 1);
+    assert!(entries.iter().any(|entry| matches!(entry, SessionEntry::Message { message: Message::Tool { call_id, synthetic: false, .. } } if call_id == "work")));
+    assert!(!entries.iter().any(|entry| matches!(entry, SessionEntry::Message { message: Message::Tool { call_id, .. } } if call_id == "question")));
+    let requests = calls.lock().unwrap().clone();
+    assert_eq!(requests.len(), 3);
+    let repaired = &requests[2];
+    let missing = repaired.iter().position(|message| matches!(message, Message::Tool { call_id, synthetic: true, .. } if call_id == "question")).unwrap();
+    assert!(missing < audit_notices(repaired)[0]);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn behavior_audit_timeout_has_no_notice_or_turn_stall() {
+    let temp = tempfile::tempdir().unwrap();
+    let entered = Arc::new(Notify::new());
+    let cancelled = Arc::new(Notify::new());
+    let model_entered = Arc::new(Notify::new());
+    let model_release = Arc::new(Notify::new());
+    let probes = (1..=3)
+        .map(|i| status_bash_call(&format!("s{i}"), "ps"))
+        .collect();
+    let (agent, sender) = Agent::new_with_notice_sender(
+        Box::new(BlockingContextCaptureModel {
+            replies: vec![audit_round(probes).0, audit_done().0].into(),
+            block_call: 2,
+            entered: model_entered.clone(),
+            release: model_release.clone(),
+            dropped: None,
+            calls: Arc::new(Mutex::new(Vec::new())),
+            call_count: 0,
+        }),
+        vec![Box::new(QuietBashMock)],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "audit-timeout".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let mut runner = runner.with_auditor_model(
+        Some(Box::new(TimeoutAuditor {
+            entered: entered.clone(),
+            cancelled: cancelled.clone(),
+        })),
+        sender,
+    );
+    // The production deadline remains ten seconds; shorten it only here.
+    runner.poll_audit_timeout = Some(std::time::Duration::from_secs(1));
+    let (_, mut events, _) = handle.attach();
+    let task = runner.start(Some("check".into()));
+    wait_for_notify(&entered, "auditor started").await;
+    wait_for_notify(&model_entered, "next provider round before timeout").await;
+    model_release.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if matches!(events.recv().await.unwrap(), AgentEvent::AssistantText(text) if text == "done") {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    wait_for_notify(&cancelled, "auditor timeout cancellation").await;
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "audit-timeout")
+        .await
+        .unwrap()
+        .entries;
+    assert_eq!(audit_notice_count(&entries), 0);
+    assert!(
+        !handle
+            .snapshot()
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Notice(text) if text == POLL_AUDIT_NOTICE))
+    );
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[test]
+fn behavior_audit_summary_is_bounded_even_for_large_sibling_batches() {
+    let message = SessionEntry::Message {
+        message: Message::Assistant(
+            audit_round(
+                (0..200)
+                    .map(|i| status_bash_call(&i.to_string(), &format!("ps {i}")))
+                    .collect(),
+            )
+            .0,
+        ),
+    };
+    let events = poll_audit_events(&[message]);
+    assert_eq!(events.len(), 48);
+    assert!(
+        events
+            .iter()
+            .all(|event| event["args"]["kind"] == "status_probe")
+    );
 }
 
 #[tokio::test]
@@ -7883,18 +9174,20 @@ async fn behavior_audit_three_checks_and_no_duplicates_across_rounds() {
         audit_notices(&requests[1]).is_empty(),
         "two checks are insufficient"
     );
-    let request = &requests[2];
-    let last_result = request
-        .iter()
-        .rposition(|message| matches!(message, Message::Tool { .. }))
-        .unwrap();
-    assert_eq!(audit_notices(request), vec![last_result + 1]);
-    assert_eq!(
-        audit_notices(&requests[3]).len(),
-        1,
-        "later status-only round must not duplicate"
+    assert!(
+        requests
+            .iter()
+            .any(|request| audit_notices(request).len() == 1)
     );
     assert_eq!(audit_notice_count(&entries), 1);
+    let notice = entries
+        .iter()
+        .position(
+            |entry| matches!(entry, SessionEntry::Notice { text } if text == POLL_AUDIT_NOTICE),
+        )
+        .unwrap();
+    let third = entries.iter().position(|entry| matches!(entry, SessionEntry::Message { message: Message::Tool { call_id, synthetic: false, .. } } if call_id == "s3")).unwrap();
+    assert!(third < notice);
     assert_eq!(
         entries
             .iter()
@@ -7952,7 +9245,11 @@ async fn behavior_audit_rotating_probe_variants_trigger() {
         ]],
     )
     .await;
-    assert_eq!(audit_notices(&requests[1]).len(), 1);
+    assert!(
+        requests
+            .iter()
+            .any(|request| audit_notices(request).len() == 1)
+    );
     assert_eq!(audit_notice_count(&entries), 1);
 }
 
@@ -7981,7 +9278,10 @@ impl Model for AuditDelayedModel {
             self.entered.send(count).unwrap();
             self.proceed.recv().await.expect("provider gate closed");
         }
-        Ok((self.replies.pop_front().expect("unexpected call"), None))
+        Ok((
+            self.replies.pop_front().unwrap_or_else(|| audit_done().0),
+            None,
+        ))
     }
 }
 
@@ -7998,7 +9298,7 @@ async fn behavior_audit_sleep_30_across_delayed_model_rounds() {
         audit_done().0,
     ]
     .into();
-    let agent = Agent::new(
+    let (agent, audit_sender) = Agent::new_with_notice_sender(
         Box::new(AuditDelayedModel {
             replies,
             entered: entered_tx,
@@ -8014,6 +9314,7 @@ async fn behavior_audit_sleep_30_across_delayed_model_rounds() {
         "audit-latency".into(),
         IdlePolicy::WaitForInput,
     );
+    let runner = runner.with_auditor_model(Some(failing_auditor()), audit_sender);
     let task = runner.start(Some("check".into()));
     for expected in [2, 3] {
         assert_eq!(
@@ -8030,10 +9331,11 @@ async fn behavior_audit_sleep_30_across_delayed_model_rounds() {
         |event| matches!(event, AgentEvent::AssistantText(text) if text == "done"),
     )
     .await;
-    assert_eq!(
-        audit_notices(calls.lock().unwrap().last().unwrap()).len(),
-        1
-    );
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::Notice(text) if text == POLL_AUDIT_NOTICE),
+    )
+    .await;
     let entries = SessionStore::Jsonl
         .load(temp.path(), "audit-latency")
         .await
@@ -8054,7 +9356,12 @@ async fn behavior_audit_test_log_probes_trigger() {
             .map(|n| status_bash_call(&format!("{n}"), command))
             .collect();
         let (requests, entries) = audit_run(&format!("audit-log-{i}"), vec![calls]).await;
-        assert_eq!(audit_notices(&requests[1]).len(), 1, "{command}");
+        assert!(
+            requests
+                .iter()
+                .any(|request| audit_notices(request).len() == 1),
+            "{command}"
+        );
         assert_eq!(audit_notice_count(&entries), 1, "{command}");
     }
 }
@@ -8091,9 +9398,10 @@ async fn behavior_audit_gbt_is_neither_probe_nor_breaker() {
         audit_notices(&requests[1]).is_empty(),
         "GBT must not count toward three"
     );
-    assert_eq!(
-        audit_notices(&requests[2]).len(),
-        1,
+    assert!(
+        requests
+            .iter()
+            .any(|request| audit_notices(request).len() == 1),
         "GBT must not reset the bash streak"
     );
     assert_eq!(audit_notice_count(&entries), 1);
@@ -8118,25 +9426,25 @@ async fn behavior_audit_earned_notice_survives_trailing_work_and_rearms() {
         ],
     )
     .await;
-    let request = &requests[1];
-    let notice = audit_notices(request);
-    assert_eq!(notice.len(), 1);
-    for id in ["s1", "s2", "s3", "work"] {
-        let position = request
+    assert_eq!(audit_notice_count(&entries), 2);
+    assert!(
+        requests
             .iter()
-            .position(|message| matches!(message, Message::Tool { call_id, .. } if call_id == id))
-            .unwrap();
+            .any(|request| !audit_notices(request).is_empty())
+    );
+    let notice = entries
+        .iter()
+        .position(
+            |entry| matches!(entry, SessionEntry::Notice { text } if text == POLL_AUDIT_NOTICE),
+        )
+        .unwrap();
+    for id in ["s1", "s2", "s3", "work"] {
+        let position = entries.iter().position(|entry| matches!(entry, SessionEntry::Message { message: Message::Tool { call_id, .. } } if call_id == id)).unwrap();
         assert!(
-            position < notice[0],
+            position < notice,
             "{id} must be committed before the Notice"
         );
     }
-    assert_eq!(
-        audit_notices(&requests[2]).len(),
-        2,
-        "independent work re-arms"
-    );
-    assert_eq!(audit_notice_count(&entries), 2);
 }
 
 #[tokio::test]
@@ -8144,7 +9452,7 @@ async fn behavior_audit_background_followup_starts_a_fresh_streak() {
     let temp = tempfile::tempdir().unwrap();
     let calls = Arc::new(Mutex::new(Vec::new()));
     let sender = Arc::new(Mutex::new(None));
-    let agent = Agent::new(
+    let (agent, audit_sender) = Agent::new_with_notice_sender(
         Box::new(ScriptedContextCaptureModel {
             replies: vec![
                 audit_round(vec![
@@ -8179,6 +9487,7 @@ async fn behavior_audit_background_followup_starts_a_fresh_streak() {
         "audit-neutral".into(),
         IdlePolicy::WaitForInput,
     );
+    let runner = runner.with_auditor_model(Some(failing_auditor()), audit_sender);
     let (_, _, mut status) = handle.attach();
     let task = runner.start(Some("check".into()));
     wait_for_log_event(
@@ -8216,7 +9525,7 @@ async fn behavior_audit_in_turn_background_notice_keeps_streak() {
     let sender = Arc::new(Mutex::new(None));
     let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
     let (proceed_tx, proceed_rx) = mpsc::unbounded_channel();
-    let agent = Agent::new(
+    let (agent, audit_sender) = Agent::new_with_notice_sender(
         Box::new(AuditDelayedModel {
             replies: vec![
                 audit_round(vec![
@@ -8246,6 +9555,7 @@ async fn behavior_audit_in_turn_background_notice_keeps_streak() {
         "audit-in-turn".into(),
         IdlePolicy::WaitForInput,
     );
+    let runner = runner.with_auditor_model(Some(failing_auditor()), audit_sender);
     let task = runner.start(Some("check".into()));
     assert_eq!(
         tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx.recv())
@@ -8268,7 +9578,6 @@ async fn behavior_audit_in_turn_background_notice_keeps_streak() {
         Some(3)
     );
     let request = calls.lock().unwrap()[2].clone();
-    assert_eq!(audit_notices(&request).len(), 1);
     assert!(request.iter().any(
         |message| matches!(message, Message::User { content, .. } if content == "background event")
     ));
@@ -8276,6 +9585,11 @@ async fn behavior_audit_in_turn_background_notice_keeps_streak() {
     wait_for_log_event(
         &handle,
         |event| matches!(event, AgentEvent::AssistantText(text) if text == "done"),
+    )
+    .await;
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::Notice(text) if text == POLL_AUDIT_NOTICE),
     )
     .await;
     let entries = SessionStore::Jsonl
@@ -8297,7 +9611,7 @@ async fn behavior_audit_in_turn_background_notice_keeps_streak() {
 async fn behavior_audit_real_user_prompt_resets_the_streak() {
     let temp = tempfile::tempdir().unwrap();
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let agent = Agent::new(
+    let (agent, audit_sender) = Agent::new_with_notice_sender(
         Box::new(ScriptedContextCaptureModel {
             replies: vec![
                 audit_round(vec![
@@ -8333,6 +9647,7 @@ async fn behavior_audit_real_user_prompt_resets_the_streak() {
         "audit-prompt".into(),
         IdlePolicy::WaitForInput,
     );
+    let runner = runner.with_auditor_model(Some(failing_auditor()), audit_sender);
     let (_, _, mut status) = handle.attach();
     let task = runner.start(Some("check".into()));
     wait_for_log_event(
@@ -8376,7 +9691,7 @@ async fn behavior_audit_does_not_write_notice_into_unanswered_batch() {
         } else {
             batch.push(question);
         }
-        let agent = Agent::new(
+        let (agent, audit_sender) = Agent::new_with_notice_sender(
             Box::new(ScriptedContextCaptureModel {
                 replies: vec![audit_round(batch), audit_done()].into(),
                 calls: Arc::new(Mutex::new(Vec::new())),
@@ -8393,7 +9708,15 @@ async fn behavior_audit_does_not_write_notice_into_unanswered_batch() {
             "audit-unanswered".into(),
             IdlePolicy::WaitForInput,
         );
-        let runner = runner.with_user_input_allowed();
+        let audit_requests = Arc::new(Mutex::new(Vec::new()));
+        let runner = runner.with_user_input_allowed().with_auditor_model(
+            Some(Box::new(FakeAuditor {
+                response: Some(r#"{"verdict":"FAIL"}"#.into()),
+                requests: audit_requests.clone(),
+                finished: None,
+            })),
+            audit_sender,
+        );
         let (_, _, mut status) = handle.attach();
         let task = runner.start(Some("check".into()));
         tokio::time::timeout(
@@ -8423,6 +9746,10 @@ async fn behavior_audit_does_not_write_notice_into_unanswered_batch() {
             0,
             "unanswered sibling; question_first={question_first}"
         );
+        assert!(
+            audit_requests.lock().unwrap().is_empty(),
+            "no auditor call for incomplete batch"
+        );
         assert!(!entries.iter().any(|entry| matches!(entry, SessionEntry::Message { message: Message::Tool { call_id, .. } } if call_id == "question")));
         for id in ["s1", "s2", "s3"] {
             assert!(entries.iter().any(|entry| matches!(entry, SessionEntry::Message { message: Message::Tool { call_id, synthetic: false, .. } } if call_id == id)), "missing {id}");
@@ -8445,7 +9772,7 @@ async fn behavior_audit_cancel_before_last_result_withholds_notice() {
         name: "read_image".into(),
         arguments: "{}".into(),
     });
-    let agent = Agent::new(
+    let (agent, audit_sender) = Agent::new_with_notice_sender(
         Box::new(ScriptedAssistantModel {
             replies: vec![audit_round(batch).0].into(),
         }),
@@ -8463,6 +9790,15 @@ async fn behavior_audit_cancel_before_last_result_withholds_notice() {
         temp.path().into(),
         "audit-before-cancel".into(),
         IdlePolicy::FinishWhenIdle,
+    );
+    let audit_requests = Arc::new(Mutex::new(Vec::new()));
+    let runner = runner.with_auditor_model(
+        Some(Box::new(FakeAuditor {
+            response: Some(r#"{"verdict":"FAIL"}"#.into()),
+            requests: audit_requests.clone(),
+            finished: None,
+        })),
+        audit_sender,
     );
     let mut status = handle.status();
     let task = runner.start(Some("check".into()));
@@ -8489,11 +9825,12 @@ async fn behavior_audit_cancel_before_last_result_withholds_notice() {
         .unwrap()
         .entries;
     assert_eq!(audit_notice_count(&entries), 0);
+    assert!(audit_requests.lock().unwrap().is_empty());
     assert!(!entries.iter().any(|entry| matches!(entry, SessionEntry::Message { message: Message::Tool { call_id, .. } } if call_id == "blocked")));
 }
 
 #[tokio::test]
-async fn behavior_audit_cancel_after_final_result_commits_notice() {
+async fn behavior_audit_cancel_after_final_result_drops_late_notice() {
     // Cover both the normal bash result and the runner-intercepted result.
     for intercepted in [false, true] {
         let temp = tempfile::tempdir().unwrap();
@@ -8510,7 +9847,7 @@ async fn behavior_audit_cancel_after_final_result_commits_notice() {
         } else {
             "s3"
         };
-        let agent = Agent::new(
+        let (agent, audit_sender) = Agent::new_with_notice_sender(
             Box::new(ScriptedAssistantModel {
                 replies: vec![audit_round(batch.clone()).0].into(),
             }),
@@ -8523,6 +9860,8 @@ async fn behavior_audit_cancel_after_final_result_commits_notice() {
             "audit-after-cancel".into(),
             IdlePolicy::FinishWhenIdle,
         );
+        runner.auditor_model = Some(Arc::new(tokio::sync::Mutex::new(failing_auditor())));
+        runner.poll_audit_sender = Some(audit_sender);
         // Queue Cancel exactly after the final Tool result is durable and
         // before the runner performs the post-result steering check.
         let commands = handle.commands.clone();
@@ -8552,16 +9891,9 @@ async fn behavior_audit_cancel_after_final_result_commits_notice() {
             .await
             .unwrap()
             .entries;
-        assert_eq!(audit_notice_count(&entries), 1, "intercepted={intercepted}");
-        let notice = entries
-            .iter()
-            .position(
-                |entry| matches!(entry, SessionEntry::Notice { text } if text == POLL_AUDIT_NOTICE),
-            )
-            .unwrap();
+        assert_eq!(audit_notice_count(&entries), 0, "intercepted={intercepted}");
         for call in batch {
-            let result = entries.iter().position(|entry| matches!(entry, SessionEntry::Message { message: Message::Tool { call_id, synthetic: false, .. } } if call_id == &call.id)).unwrap();
-            assert!(result < notice, "{} must precede Notice", call.id);
+            assert!(entries.iter().any(|entry| matches!(entry, SessionEntry::Message { message: Message::Tool { call_id, synthetic: false, .. } } if call_id == &call.id)), "missing {}", call.id);
         }
     }
 }
@@ -13447,6 +14779,188 @@ async fn goal_continue_inflight_cancel_discards_transferred_continue_and_fresh_c
         matches!(status, SessionStatus::Idle)
     })
     .await;
+    drop(handle);
+    task.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn goal_capped_probe_batch_commits_all_results_without_auditor() {
+    for (usage, session) in [
+        (
+            Some(Usage {
+                input_tokens: 10,
+                ..Usage::default()
+            }),
+            "goal-audit-exhausted",
+        ),
+        (None, "goal-audit-unknown-usage"),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let model_calls = Arc::new(Mutex::new(Vec::new()));
+        let auditor_calls = Arc::new(Mutex::new(Vec::new()));
+        let (agent, audit_sender) = Agent::new_with_notice_sender(
+            Box::new(ScriptedContextCaptureModel {
+                replies: vec![(
+                    audit_round(
+                        (1..=3)
+                            .map(|i| status_bash_call(&format!("s{i}"), "ls"))
+                            .collect(),
+                    )
+                    .0,
+                    usage,
+                )]
+                .into(),
+                calls: model_calls.clone(),
+            }),
+            vec![Box::new(QuietBashMock)],
+        );
+        let (runner, handle) = SessionRunner::new_with_bootstrap(
+            agent,
+            SessionStore::Jsonl,
+            temp.path().into(),
+            session.into(),
+            IdlePolicy::WaitForInput,
+            SessionBootstrap {
+                recovery_tasks: vec![],
+                legacy: false,
+                initial_entries: vec![test_goal_entry()],
+            },
+        )
+        .await
+        .unwrap();
+        let runner = runner.with_auditor_model(
+            Some(Box::new(FakeAuditor {
+                response: Some(r#"{"verdict":"FAIL"}"#.into()),
+                requests: auditor_calls.clone(),
+                finished: None,
+            })),
+            audit_sender,
+        );
+        let mut status = handle.status();
+        let task = runner.start(None);
+        handle.continue_goal(Some(10));
+        wait_for_log_event(
+            &handle,
+            |event| matches!(event, AgentEvent::ToolResult { call_id: Some(id), .. } if id == "s3"),
+        )
+        .await;
+        wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)).await;
+        let entries = SessionStore::Jsonl
+            .load(temp.path(), session)
+            .await
+            .unwrap()
+            .entries;
+        let results = entries
+            .iter()
+            .filter(|entry| {
+                matches!(entry, SessionEntry::Message {
+            message: Message::Tool { call_id, synthetic: false, .. }
+        } if ["s1", "s2", "s3"].contains(&call_id.as_str()))
+            })
+            .count();
+        assert_eq!(results, 3, "{session}");
+        assert_eq!(model_calls.lock().unwrap().len(), 1, "{session}");
+        assert!(auditor_calls.lock().unwrap().is_empty(), "{session}");
+        assert_eq!(audit_notice_count(&entries), 0, "{session}");
+        drop(handle);
+        task.join().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn goal_capped_candidate_never_queues_auditor_before_later_exhaustion() {
+    let temp = tempfile::tempdir().unwrap();
+    let second_entered = Arc::new(Notify::new());
+    let second_release = Arc::new(Notify::new());
+    let audit_calls = Arc::new(Mutex::new(Vec::new()));
+    let model_calls = Arc::new(Mutex::new(Vec::new()));
+    let probes = (1..=3)
+        .map(|i| status_bash_call(&format!("s{i}"), "ls"))
+        .collect();
+    let (agent, sender) = Agent::new_with_notice_sender(
+        Box::new(GatedContextCaptureModel {
+            replies: vec![
+                (
+                    audit_round(probes).0,
+                    Some(Usage {
+                        input_tokens: 1,
+                        ..Usage::default()
+                    }),
+                ),
+                (
+                    audit_done().0,
+                    Some(Usage {
+                        input_tokens: 9,
+                        ..Usage::default()
+                    }),
+                ),
+            ]
+            .into(),
+            block_call: 2,
+            entered: second_entered.clone(),
+            release: second_release.clone(),
+            calls: model_calls.clone(),
+            call_count: 0,
+        }),
+        vec![Box::new(QuietBashMock)],
+    );
+    let (runner, handle) = SessionRunner::new_with_bootstrap(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "goal-audit-queued".into(),
+        IdlePolicy::WaitForInput,
+        SessionBootstrap {
+            recovery_tasks: vec![],
+            legacy: false,
+            initial_entries: vec![test_goal_entry()],
+        },
+    )
+    .await
+    .unwrap();
+    let runner = runner.with_auditor_model(
+        Some(Box::new(FakeAuditor {
+            response: Some(r#"{"verdict":"FAIL"}"#.into()),
+            requests: audit_calls.clone(),
+            finished: None,
+        })),
+        sender,
+    );
+    // Hold the auditor model lock across both Goal rounds: the previous
+    // implementation queued a call here, which began after cap exhaustion.
+    let auditor = runner.auditor_model.as_ref().unwrap().clone();
+    let auditor_lock = auditor.lock().await;
+    let mut status = handle.status();
+    let task = runner.start(None);
+    assert!(handle.continue_goal(Some(10)));
+    wait_for_notify(&second_entered, "second capped Goal round").await;
+    assert!(audit_calls.lock().unwrap().is_empty());
+    second_release.notify_one();
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::Display(text) if text == "goal continuation stopped: token cap exhausted"),
+    )
+    .await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        wait_for_status(&mut status, |state| matches!(state, SessionStatus::Idle)),
+    )
+    .await
+    .unwrap();
+    drop(auditor_lock);
+    // Acquiring behind a queued auditor is a deterministic FIFO barrier.
+    drop(auditor.lock().await);
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "goal-audit-queued")
+        .await
+        .unwrap()
+        .entries;
+    for id in ["s1", "s2", "s3"] {
+        assert!(entries.iter().any(|entry| matches!(entry, SessionEntry::Message { message: Message::Tool { call_id, synthetic: false, .. } } if call_id == id)));
+    }
+    assert_eq!(model_calls.lock().unwrap().len(), 2);
+    assert!(audit_calls.lock().unwrap().is_empty());
+    assert_eq!(audit_notice_count(&entries), 0);
     drop(handle);
     task.join().await.unwrap();
 }

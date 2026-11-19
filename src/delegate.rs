@@ -317,6 +317,8 @@ pub struct Delegate {
     /// `None` (a Delegate constructed directly, e.g. in tests) falls back
     /// to the construction-time `subagent_model` snapshot.
     subagent_model_source: Option<SubagentModelSource>,
+    /// Resolve auditor, subagent, and main together from one live snapshot.
+    auditor_model_source: Option<Arc<dyn Fn() -> Option<ConfiguredModel> + Send + Sync>>,
     /// Workspace root used to resolve role templates across global, legacy
     /// project (`agents/`), and canonical project (`.e-agent/agents/`) layers.
     roles_root: Option<std::path::PathBuf>,
@@ -440,6 +442,7 @@ impl Delegate {
             role_context_windows: self.role_context_windows.clone(),
             role_model_source: self.role_model_source.clone(),
             subagent_model_source: self.subagent_model_source.clone(),
+            auditor_model_source: self.auditor_model_source.clone(),
             roles_root: self.roles_root.clone(),
             sandbox: self.sandbox.clone(),
             record_in: self.record_in.clone(),
@@ -473,6 +476,31 @@ impl Delegate {
         }
     }
 
+    fn auditor_model(&self) -> Option<ConfiguredModel> {
+        match &self.auditor_model_source {
+            Some(source) => source(),
+            None => Some(
+                self.role_models
+                    .get("auditor")
+                    .cloned()
+                    .unwrap_or_else(|| self.subagent_model.clone()),
+            ),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn auditor_model_for_test(&self) -> Option<ConfiguredModel> {
+        self.auditor_model()
+    }
+
+    pub(crate) fn with_auditor_model_source(
+        mut self,
+        source: Arc<dyn Fn() -> Option<ConfiguredModel> + Send + Sync>,
+    ) -> Self {
+        self.auditor_model_source = Some(source);
+        self
+    }
+
     pub fn new(model: ConfiguredModel, workspace: Workspace, background: BackgroundTasks) -> Self {
         Self {
             subagent_model: model,
@@ -485,6 +513,7 @@ impl Delegate {
             role_context_windows: std::collections::HashMap::new(),
             role_model_source: None,
             subagent_model_source: None,
+            auditor_model_source: None,
             roles_root: None,
             sandbox: None,
             record_in: None,
@@ -636,6 +665,7 @@ impl Delegate {
     async fn start_runner(
         model: ConfiguredModel,
         context_window: Option<u64>,
+        auditor: Option<ConfiguredModel>,
         workspace: Workspace,
         background: BackgroundTasks,
         task: DelegatedTask,
@@ -666,7 +696,7 @@ impl Delegate {
         if let Some(parent) = parent_endpoint {
             tools.push(Box::new(SendMessage::child(parent)));
         }
-        let mut agent = Agent::new(Box::new(model), tools);
+        let (mut agent, auditor_sender) = Agent::new_with_notice_sender(Box::new(model), tools);
         // Delegated one-shot subagents compact as single tasks (tool-loop
         // tail retained, no actual user required for repeated compaction);
         // btw forks pass Main (interactive conversation with real user
@@ -757,7 +787,12 @@ impl Delegate {
         )
         .await
         .map_err(|e| format!("subagent bootstrap failed: {e:#}"))?;
-        let runner = runner.with_background_tasks(background.clone());
+        let runner = runner
+            .with_background_tasks(background.clone())
+            .with_auditor_model(
+                auditor.map(|model| Box::new(model) as Box<dyn crate::agent::Model>),
+                auditor_sender,
+            );
         let runner_task = runner.start(Some(task.task));
         Ok((handle, runner_task))
     }
@@ -889,7 +924,8 @@ impl Delegate {
                 .ok_or("parent session endpoint unavailable")?,
         )));
         tools.push(Box::new(child_delegate));
-        let mut agent = Agent::new(Box::new(model.clone()), tools);
+        let (mut agent, auditor_sender) =
+            Agent::new_with_notice_sender(Box::new(model.clone()), tools);
         if let Some(prefix) = head.context_prefix {
             agent.set_context_prefix(prefix);
         }
@@ -947,7 +983,13 @@ impl Delegate {
         // session by its runner (main's single writer), exactly like
         // `start_runner`/btw: the registry lives in the shared parent
         // `BackgroundTasks`, but only this child's tasks belong to this row set.
-        let runner = runner.with_background_tasks(self.background.clone());
+        let runner = runner
+            .with_background_tasks(self.background.clone())
+            .with_auditor_model(
+                self.auditor_model()
+                    .map(|model| Box::new(model) as Box<dyn crate::agent::Model>),
+                auditor_sender,
+            );
         let runner_task = runner.start(Some(format!("{task}\n\n[You are a forked subagent continuing the parent session's completed history. You run on the parent's model with the parent's tools. You cannot delegate further and cannot ask the user questions; work autonomously and return a concise final answer.]")));
         let id_slot = Arc::new(Mutex::new(None::<u64>));
         let slot_hook = id_slot.clone();
@@ -1147,6 +1189,8 @@ pub struct BtwContext {
     pub model: ConfiguredModel,
     /// Context window for `model` (the parent's).
     pub context_window: Option<u64>,
+    /// The configured auditor (or default subagent model), if available.
+    pub auditor: Option<ConfiguredModel>,
     /// Workspace the subagent works in (the parent's).
     pub workspace: Workspace,
     /// bwrap policy inherited from the parent (`None` = sandbox disabled).
@@ -1234,6 +1278,7 @@ pub async fn spawn_btw_subagent(
     let BtwContext {
         model,
         context_window,
+        auditor,
         workspace,
         sandbox,
         read_only,
@@ -1300,6 +1345,7 @@ pub async fn spawn_btw_subagent(
     let (handle, runner_task) = Delegate::start_runner(
         model,
         context_window,
+        auditor,
         workspace,
         background.clone(),
         DelegatedTask {
@@ -1896,6 +1942,7 @@ impl Tool for Delegate {
         let (handle, runner_task) = Self::start_runner(
             model,
             context_window,
+            self.auditor_model(),
             workspace.clone(),
             self.background.clone(),
             DelegatedTask {
