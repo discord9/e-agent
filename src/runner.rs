@@ -4768,3 +4768,9 @@ fn entry_event(entry: &SessionEntry) -> Option<AgentEvent> {
 #[cfg(test)]
 #[path = "runner_tests.rs"]
 mod tests;
+
+/// Manual, ignored, three-arm plumbing run for the poll-audit path. It only
+/// compiles into test builds and never runs under a plain `cargo test`.
+#[cfg(test)]
+#[path = "poll_audit_trajectory_tests.rs"]
+mod poll_audit_trajectory_tests;
