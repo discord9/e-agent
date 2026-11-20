@@ -59,7 +59,69 @@ pub struct ProviderQuota {
     pub currency: Option<String>,
     pub plan: Option<String>,
     pub windows: Vec<QuotaWindow>,
+    /// Provider-specific figures that fit neither `amount` nor `windows`
+    /// (DeepSeek granted/topped-up, SiliconFlow split, ChatGPT credits,
+    /// OpenCode window status). Only reported fields produce a detail.
+    pub details: Vec<QuotaDetail>,
     pub error: Option<String>,
+    /// Out-of-plan booster wallet (Kimi Code today). `None` when the upstream
+    /// reports no wallet, and every field stays absent unless the upstream
+    /// reported it. The one documented default: a `type=BOOSTER` balance
+    /// without `amountLeft` is drained, so `balance` is 0 rather than unknown.
+    pub extra: Option<QuotaExtra>,
+}
+
+/// One labelled provider figure on a card.
+#[derive(Debug, Serialize, PartialEq, Clone)]
+pub struct QuotaDetail {
+    pub label: String,
+    pub value: QuotaDetailValue,
+}
+
+/// A detail value: a currency amount (rendered with its symbol) or short text
+/// (a reported status token, or a balance whose currency is unknown). The
+/// server never invents either shape for an absent field.
+#[derive(Debug, Serialize, PartialEq, Clone)]
+#[serde(untagged)]
+pub enum QuotaDetailValue {
+    Money {
+        amount: f64,
+        currency: Option<String>,
+    },
+    Text {
+        text: String,
+    },
+}
+
+impl QuotaDetail {
+    fn money(label: &str, amount: f64, currency: Option<String>) -> Self {
+        Self {
+            label: label.to_owned(),
+            value: QuotaDetailValue::Money { amount, currency },
+        }
+    }
+
+    fn text(label: &str, text: impl Into<String>) -> Self {
+        Self {
+            label: label.to_owned(),
+            value: QuotaDetailValue::Text { text: text.into() },
+        }
+    }
+}
+
+/// A booster / extra-usage wallet that sits outside the plan windows. Every
+/// field is `None` unless the upstream reported it (see `ProviderQuota.extra`
+/// for the drained-booster default).
+#[derive(Debug, Serialize, PartialEq, Clone)]
+pub struct QuotaExtra {
+    /// Normalised to `enabled` / `disabled` / `frozen` / `unavailable`.
+    pub status: Option<String>,
+    pub balance: Option<f64>,
+    pub monthly_used: Option<f64>,
+    pub monthly_charge_limit: Option<f64>,
+    pub currency: Option<String>,
+    pub allow_topup: Option<bool>,
+    pub topup_limit: Option<f64>,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq, Clone, Copy)]
@@ -219,7 +281,9 @@ impl ProviderQuota {
             currency,
             plan: None,
             windows: Vec::new(),
+            details: Vec::new(),
             error: None,
+            extra: None,
         }
     }
 
@@ -232,7 +296,9 @@ impl ProviderQuota {
             currency: None,
             plan,
             windows,
+            details: Vec::new(),
             error: None,
+            extra: None,
         }
     }
 
@@ -245,7 +311,9 @@ impl ProviderQuota {
             currency: None,
             plan: None,
             windows: Vec::new(),
+            details: Vec::new(),
             error: Some(error),
+            extra: None,
         }
     }
 }
@@ -321,29 +389,58 @@ fn parse_deepseek(value: &Value, id: &str, label: &str) -> Result<ProviderQuota,
         .get("total_balance")
         .and_then(number)
         .ok_or_else(parse_error)?;
-    Ok(ProviderQuota::balance(
-        id,
-        label,
-        amount,
-        info.get("currency")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-    ))
+    let currency = info
+        .get("currency")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let mut card = ProviderQuota::balance(id, label, amount, currency.clone());
+    card.details = deepseek_details(value, info, currency);
+    Ok(card)
 }
 
-/// `{"code":20000,...,"data":{"balance":"0.88","totalBalance":"88.88"}}`
+/// `is_available` plus the granted / topped-up split of the chosen balance.
+/// `total_balance` is the card amount, so it is not repeated as a detail.
+fn deepseek_details(value: &Value, info: &Value, currency: Option<String>) -> Vec<QuotaDetail> {
+    let mut details = Vec::new();
+    if let Some(available) = value.get("is_available").and_then(Value::as_bool) {
+        details.push(QuotaDetail::text(
+            "可用状态",
+            if available { "可用" } else { "不可用" },
+        ));
+    }
+    for (key, label) in [
+        ("granted_balance", "赠送余额"),
+        ("topped_up_balance", "充值余额"),
+    ] {
+        if let Some(amount) = info.get(key).and_then(number) {
+            details.push(QuotaDetail::money(label, amount, currency.clone()));
+        }
+    }
+    details
+}
+
+/// `{"status":true,"data":{"balance":"0.88","chargeBalance":"88.00","totalBalance":"88.88"}}`
 fn parse_siliconflow(value: &Value, id: &str, label: &str) -> Result<ProviderQuota, String> {
-    let amount = value
-        .get("data")
-        .and_then(|data| data.get("totalBalance"))
+    let data = value.get("data").ok_or_else(parse_error)?;
+    let amount = data
+        .get("totalBalance")
         .and_then(number)
         .ok_or_else(parse_error)?;
-    Ok(ProviderQuota::balance(
-        id,
-        label,
-        amount,
-        Some("CNY".to_owned()),
-    ))
+    let currency = Some("CNY".to_owned());
+    let mut card = ProviderQuota::balance(id, label, amount, currency.clone());
+    if let Some(status) = value.get("status").and_then(Value::as_bool) {
+        card.details.push(QuotaDetail::text(
+            "状态",
+            if status { "可用" } else { "不可用" },
+        ));
+    }
+    for (key, label) in [("balance", "余额"), ("chargeBalance", "充值余额")] {
+        if let Some(amount) = data.get(key).and_then(number) {
+            card.details
+                .push(QuotaDetail::money(label, amount, currency.clone()));
+        }
+    }
+    Ok(card)
 }
 
 /// `{"code":200,"data":{"limits":[{"unit":3,"percentage":0,...}],"level":"max"}}`
@@ -390,15 +487,19 @@ fn zhipu_window(limit: &Value) -> Option<QuotaWindow> {
 }
 
 /// Prefers the `usages` block; falls back to the legacy `usage` + `limits`
-/// shape when it is absent.
+/// shape when it is absent. A monthly-only plan is a complete card, and a
+/// `boosterWallet` / `booster_wallet` adds the extra-usage section.
 fn parse_kimi(value: &Value, id: &str, label: &str) -> Result<ProviderQuota, String> {
-    kimi_usages(value)
+    let windows = kimi_usages(value)
         .or_else(|| kimi_legacy(value))
-        .map(|windows| ProviderQuota::quota(id, label, None, windows))
-        .ok_or_else(parse_error)
+        .ok_or_else(parse_error)?;
+    let mut card = ProviderQuota::quota(id, label, None, windows);
+    card.extra = kimi_booster(value);
+    Ok(card)
 }
 
-/// `{"usages":{"limit_5h":{"used_ratio":0.0709,"reset_time":"..."},"limit_7d":{...}}}`
+/// `{"usages":{"limit_5h":{"used_ratio":0.0709,"reset_time":"..."},
+/// "limit_7d":{...},"limit_month_total":{...},"limit_month_code":{...}}}`
 fn kimi_usages(value: &Value) -> Option<Vec<QuotaWindow>> {
     let usages = value.get("usages")?;
     let mut windows = Vec::new();
@@ -418,7 +519,45 @@ fn kimi_usages(value: &Value) -> Option<Vec<QuotaWindow>> {
                 .map(str::to_owned),
         });
     }
+    if let Some(monthly) = kimi_monthly(usages) {
+        windows.push(monthly);
+    }
     (!windows.is_empty()).then_some(windows)
+}
+
+/// `limit_month_total` and `limit_month_code` are two meters on the same
+/// monthly window, so they merge into one card entry: the larger `used_ratio`
+/// wins (either meter can throttle) and the earlier `reset_time` is kept.
+fn kimi_monthly(usages: &Value) -> Option<QuotaWindow> {
+    let entries: Vec<&Value> = ["limit_month_total", "limit_month_code"]
+        .iter()
+        .filter_map(|key| usages.get(*key))
+        .collect();
+    let mut highest: Option<f64> = None;
+    for entry in &entries {
+        if let Some(used) = entry.get("used_ratio").and_then(number) {
+            highest = Some(highest.map_or(used, |highest| highest.max(used)));
+        }
+    }
+    Some(QuotaWindow {
+        label: "每月".to_owned(),
+        used_percent: highest? * 100.0,
+        reset_at: earliest_reset(&entries),
+    })
+}
+
+/// The earliest parseable `reset_time`, kept as the upstream string.
+/// Unparseable timestamps are skipped instead of compared as text.
+fn earliest_reset(entries: &[&Value]) -> Option<String> {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let text = entry.get("reset_time").and_then(Value::as_str)?;
+            let at = DateTime::parse_from_rfc3339(text).ok()?;
+            Some((at, text))
+        })
+        .min_by(|left, right| left.0.cmp(&right.0))
+        .map(|(_, text)| text.to_owned())
 }
 
 /// Legacy shape: `usage` is the weekly window, `limits[0].detail` the 5-hour
@@ -453,7 +592,123 @@ fn kimi_percent(entry: &Value) -> Option<f64> {
     (limit > 0.0).then(|| used / limit * 100.0)
 }
 
-/// `{"usage":{"rolling":{"percent":12.5,"resetInSec":3600},"weekly":{...}}}`
+/// The booster wallet, reported as `boosterWallet` (camelCase) or
+/// `booster_wallet` (the API-key route). `None` when the upstream reports no
+/// wallet, and also when the payload carries no money at all: `status` or
+/// `allowTopup` alone must not invent billing figures.
+fn kimi_booster(value: &Value) -> Option<QuotaExtra> {
+    let wallet = value
+        .get("boosterWallet")
+        .or_else(|| value.get("booster_wallet"))?;
+    let balance = kimi_booster_balance(wallet);
+    let monthly_used = kimi_money(wallet, &["monthlyUsed", "monthly_used"]);
+    let monthly_charge_limit = kimi_money(wallet, &["monthlyChargeLimit", "monthly_charge_limit"]);
+    if balance.is_none() && monthly_used.is_none() && monthly_charge_limit.is_none() {
+        return None;
+    }
+    Some(QuotaExtra {
+        status: wallet
+            .get("status")
+            .and_then(Value::as_str)
+            .and_then(booster_status)
+            .map(str::to_owned),
+        balance,
+        monthly_used,
+        monthly_charge_limit,
+        currency: kimi_booster_currency(wallet),
+        allow_topup: wallet
+            .get("allowTopup")
+            .or_else(|| wallet.get("allow_topup"))
+            .and_then(Value::as_bool),
+        topup_limit: kimi_money(wallet, &["topupLimit", "topup_limit"]),
+    })
+}
+
+/// The remaining booster balance in currency units. Accepts a plain number, or
+/// the upstream balance object whose `amountLeft` is fixed-point cents ×10^6.
+/// A `type=BOOSTER` object always reports its total `amount`, and `amountLeft`
+/// is the remaining part: a missing `amountLeft` means the booster is drained,
+/// so it renders as ¥0.00. `amount` is the total and is never used as the
+/// remaining balance.
+fn kimi_booster_balance(wallet: &Value) -> Option<f64> {
+    let balance = wallet.get("balance")?;
+    if let Some(amount) = number(balance) {
+        return Some(amount);
+    }
+    let remaining = balance
+        .get("amountLeft")
+        .or_else(|| balance.get("amount_left"))
+        .and_then(number);
+    let booster_total = balance
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("BOOSTER"))
+        && balance.get("amount").and_then(number).is_some();
+    match remaining {
+        Some(cents) => Some(cents / 1_000_000.0 / 100.0),
+        None if booster_total => Some(0.0),
+        None => None,
+    }
+}
+
+/// A money field: a plain number in currency units, or the upstream
+/// `{"currency":"CNY","priceInCents":"17500"}` object (cents).
+fn kimi_money(wallet: &Value, keys: &[&str]) -> Option<f64> {
+    let value = keys.iter().find_map(|key| wallet.get(*key))?;
+    if let Some(amount) = number(value) {
+        return Some(amount);
+    }
+    let cents = number(
+        value
+            .get("priceInCents")
+            .or_else(|| value.get("price_in_cents"))?,
+    )?;
+    Some(cents / 100.0)
+}
+
+/// The wallet currency, taken from any money object that reports one.
+fn kimi_booster_currency(wallet: &Value) -> Option<String> {
+    [
+        "monthlyUsed",
+        "monthly_used",
+        "monthlyChargeLimit",
+        "monthly_charge_limit",
+        "topupLimit",
+        "topup_limit",
+    ]
+    .iter()
+    .find_map(|key| {
+        wallet
+            .get(*key)?
+            .get("currency")?
+            .as_str()
+            .map(str::to_owned)
+    })
+    .or_else(|| {
+        wallet
+            .get("currency")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    })
+}
+
+/// Upstream wallet statuses (`STATUS_ACTIVE`, `frozen`, ...) normalised to the
+/// four states the card renders. An unknown value stays unknown rather than
+/// guessing a billing state.
+fn booster_status(status: &str) -> Option<&'static str> {
+    let status = status.trim().to_ascii_uppercase();
+    let status = status.strip_prefix("STATUS_").unwrap_or(status.as_str());
+    Some(match status {
+        "ACTIVE" | "ENABLED" => "enabled",
+        "DISABLED" => "disabled",
+        "FROZEN" => "frozen",
+        "UNAVAILABLE" => "unavailable",
+        _ => return None,
+    })
+}
+
+/// `{"usage":{"rolling":{"status":"ok","percent":52,"resetsAt":"2026-09-23T00:34:52.704Z"},
+/// "weekly":{...},"monthly":{...}}}` — percentages only, no dollar amounts.
 fn parse_opencode(
     value: &Value,
     now: DateTime<Utc>,
@@ -462,6 +717,7 @@ fn parse_opencode(
 ) -> Result<ProviderQuota, String> {
     let usage = value.get("usage").ok_or_else(parse_error)?;
     let mut windows = Vec::new();
+    let mut statuses = Vec::new();
     for (key, label) in [
         ("rolling", "5 小时"),
         ("weekly", "每周"),
@@ -476,16 +732,39 @@ fn parse_opencode(
         windows.push(QuotaWindow {
             label: label.to_owned(),
             used_percent,
+            // `resetsAt` is the live field; `resetInSec` is the older relative
+            // one. An unparseable timestamp is dropped, not rendered as text.
             reset_at: window
-                .get("resetInSec")
-                .and_then(number)
-                .and_then(|seconds| rfc3339_after(now, seconds as i64)),
+                .get("resetsAt")
+                .and_then(Value::as_str)
+                .and_then(rfc3339_normalized)
+                .or_else(|| {
+                    window
+                        .get("resetInSec")
+                        .and_then(number)
+                        .and_then(|seconds| rfc3339_after(now, seconds as i64))
+                }),
         });
+        // `status: "ok"` is the quiet normal state; anything else is worth a
+        // row, and is shown as the reported token rather than a translation.
+        if let Some(status) = window
+            .get("status")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|status| !status.is_empty() && !status.eq_ignore_ascii_case("ok"))
+        {
+            statuses.push(format!("{label} {status}"));
+        }
     }
     if windows.is_empty() {
         return Err(ERR_PARSE.to_owned());
     }
-    Ok(ProviderQuota::quota(id, label, None, windows))
+    let mut card = ProviderQuota::quota(id, label, None, windows);
+    if !statuses.is_empty() {
+        card.details
+            .push(QuotaDetail::text("状态", statuses.join(" · ")));
+    }
+    Ok(card)
 }
 
 /// `{"plan_type":"pro","rate_limit":{"primary_window":{...},"secondary_window":null}}`
@@ -517,7 +796,7 @@ fn parse_chatgpt(
     if windows.is_empty() {
         return Err(ERR_PARSE.to_owned());
     }
-    Ok(ProviderQuota::quota(
+    let mut card = ProviderQuota::quota(
         id,
         label,
         value
@@ -525,7 +804,35 @@ fn parse_chatgpt(
             .and_then(Value::as_str)
             .map(str::to_owned),
         windows,
-    ))
+    );
+    if let Some(credits) = chatgpt_credits(value.get("credits")) {
+        card.details.push(credits);
+    }
+    Ok(card)
+}
+
+/// `{"has_credits":false,"unlimited":false,"balance":"0"}` as one Extra Credits
+/// row. Only reported parts are joined, the reported balance is kept as-is
+/// (including an observed `0`), and no currency is invented.
+fn chatgpt_credits(credits: Option<&Value>) -> Option<QuotaDetail> {
+    let credits = credits?;
+    let mut parts = Vec::new();
+    match (
+        credits.get("unlimited").and_then(Value::as_bool),
+        credits.get("has_credits").and_then(Value::as_bool),
+    ) {
+        (Some(true), _) => parts.push("无限".to_owned()),
+        (_, Some(true)) => parts.push("有额度".to_owned()),
+        (_, Some(false)) => parts.push("无额度".to_owned()),
+        _ => {}
+    }
+    if let Some(balance) = credits.get("balance").and_then(|balance| match balance {
+        Value::String(text) => Some(text.trim().to_owned()).filter(|text| !text.is_empty()),
+        other => number(other).map(|amount| format!("{amount}")),
+    }) {
+        parts.push(format!("余额 {balance}"));
+    }
+    (!parts.is_empty()).then(|| QuotaDetail::text("Extra Credits", parts.join(" · ")))
 }
 
 fn chatgpt_window_label(seconds: Option<f64>) -> String {
@@ -676,6 +983,15 @@ fn rfc3339_millis(millis: i64) -> Option<String> {
         .map(|at| at.to_rfc3339_opts(SecondsFormat::Millis, true))
 }
 
+/// An upstream RFC3339 timestamp normalised to UTC milliseconds. Values that
+/// do not parse are dropped instead of reaching the UI as invalid dates.
+fn rfc3339_normalized(text: &str) -> Option<String> {
+    DateTime::parse_from_rfc3339(text).ok().map(|at| {
+        at.with_timezone(&Utc)
+            .to_rfc3339_opts(SecondsFormat::Millis, true)
+    })
+}
+
 fn rfc3339_after(now: DateTime<Utc>, seconds: i64) -> Option<String> {
     let delta = TimeDelta::try_seconds(seconds)?;
     now.checked_add_signed(delta)
@@ -728,6 +1044,26 @@ mod tests {
         assert_eq!(card.currency.as_deref(), Some("CNY"));
         assert!(card.windows.is_empty());
         assert_eq!(Source::DeepSeek.label(), "DeepSeek");
+        // total_balance stays the amount; the split and availability are rows.
+        assert_eq!(
+            card.details,
+            vec![
+                QuotaDetail::text("可用状态", "可用"),
+                QuotaDetail::money("赠送余额", 0.0, Some("CNY".to_owned())),
+                QuotaDetail::money("充值余额", 10.44, Some("CNY".to_owned())),
+            ]
+        );
+    }
+
+    /// Absent DeepSeek fields produce no rows, and the second currency record
+    /// (USD) is not mixed into the CNY split.
+    #[test]
+    fn deepseek_absent_split_fields_are_hidden() {
+        let body = json!({"balance_infos":[{"currency":"USD","total_balance":"1.50"}]});
+        let card = parse_value(Source::DeepSeek, &body.to_string()).unwrap();
+        assert_eq!(card.amount, Some(1.5));
+        assert_eq!(card.currency.as_deref(), Some("USD"));
+        assert!(card.details.is_empty());
     }
 
     #[test]
@@ -747,6 +1083,23 @@ mod tests {
         assert_eq!(card.amount, Some(88.88));
         assert_eq!(card.currency.as_deref(), Some("CNY"));
         assert_eq!(Source::SiliconFlow.label(), "SiliconFlow");
+        assert_eq!(
+            card.details,
+            vec![
+                QuotaDetail::text("状态", "可用"),
+                QuotaDetail::money("余额", 0.88, Some("CNY".to_owned())),
+                QuotaDetail::money("充值余额", 88.0, Some("CNY".to_owned())),
+            ]
+        );
+    }
+
+    /// Without `status` / split fields the card keeps just the total.
+    #[test]
+    fn siliconflow_without_status_or_split_has_no_details() {
+        let body = json!({"code":20000,"data":{"totalBalance":"88.88"}});
+        let card = parse_value(Source::SiliconFlow, &body.to_string()).unwrap();
+        assert_eq!(card.amount, Some(88.88));
+        assert!(card.details.is_empty());
     }
 
     #[test]
@@ -764,6 +1117,8 @@ mod tests {
             Some("2026-10-26T03:29:35.998Z")
         );
         assert_eq!(Source::Zhipu.label(), "GLM Coding Plan");
+        // level + windows only: no invented detail rows.
+        assert!(card.details.is_empty());
     }
 
     #[test]
@@ -854,6 +1209,385 @@ mod tests {
         assert_eq!(card, "响应格式无法解析");
     }
 
+    /// A new-plan response can carry only the monthly meters; that is a
+    /// complete card, not "响应格式无法解析".
+    #[test]
+    fn kimi_monthly_only_plan_is_a_card() {
+        let body = json!({"usages":{
+            "limit_month_total":{"used_ratio":0.5,"reset_time":"2026-11-25T00:00:00Z"}
+        }});
+        let card = parse(
+            Source::Kimi,
+            &body,
+            at(1_760_000_000),
+            "test",
+            Source::Kimi.label(),
+        )
+        .unwrap();
+        assert_eq!(card.kind, QuotaKind::Quota);
+        assert_eq!(labels(&card.windows), ["每月"]);
+        assert!(close(card.windows[0].used_percent, 50.0));
+        assert_eq!(
+            card.windows[0].reset_at.as_deref(),
+            Some("2026-11-25T00:00:00Z")
+        );
+        assert_eq!(card.extra, None);
+        assert!(card.details.is_empty());
+    }
+
+    /// `total` and `code` are two meters on one monthly window: the larger
+    /// ratio wins (either can throttle) and the earlier reset is kept, so the
+    /// card shows exactly one 每月 entry.
+    #[test]
+    fn kimi_monthly_merges_total_and_code() {
+        let body = json!({"usages":{
+            "limit_month_total":{"used_ratio":0.4,"reset_time":"2026-11-25T00:00:00Z"},
+            "limit_month_code":{"used_ratio":0.75,"reset_time":"2026-11-03T00:00:00Z"}
+        }});
+        let card = parse(
+            Source::Kimi,
+            &body,
+            at(1_760_000_000),
+            "test",
+            Source::Kimi.label(),
+        )
+        .unwrap();
+        assert_eq!(labels(&card.windows), ["每月"]);
+        assert!(close(card.windows[0].used_percent, 75.0));
+        assert_eq!(
+            card.windows[0].reset_at.as_deref(),
+            Some("2026-11-03T00:00:00Z")
+        );
+    }
+
+    /// Earliest reset wins even when the larger ratio comes from the other
+    /// meter.
+    #[test]
+    fn kimi_monthly_earliest_reset_is_independent_of_the_ratio() {
+        let body = json!({"usages":{
+            "limit_month_total":{"used_ratio":0.2,"reset_time":"2026-11-03T08:00:00+08:00"},
+            "limit_month_code":{"used_ratio":0.6,"reset_time":"2026-11-03T09:00:00Z"}
+        }});
+        let card = parse(
+            Source::Kimi,
+            &body,
+            at(1_760_000_000),
+            "test",
+            Source::Kimi.label(),
+        )
+        .unwrap();
+        assert_eq!(labels(&card.windows), ["每月"]);
+        assert!(close(card.windows[0].used_percent, 60.0));
+        // 2026-11-03T08:00:00+08:00 is 2026-11-03T00:00:00Z, i.e. the earlier one.
+        assert_eq!(
+            card.windows[0].reset_at.as_deref(),
+            Some("2026-11-03T08:00:00+08:00")
+        );
+    }
+
+    /// 5-hour rolling window plus the monthly meters, and no `limit_7d`: one
+    /// window per real meter, no duplicate 每月.
+    #[test]
+    fn kimi_monthly_and_5h_windows() {
+        let body = json!({"usages":{
+            "limit_5h":{"used_ratio":0.0,"reset_time":"2026-11-08T21:37:23Z"},
+            "limit_month_total":{"used_ratio":0.9885,"reset_time":"2026-11-25T00:00:00Z"},
+            "limit_month_code":{"used_ratio":0.9873,"reset_time":"2026-11-25T00:00:00Z"}
+        }});
+        let card = parse(
+            Source::Kimi,
+            &body,
+            at(1_760_000_000),
+            "test",
+            Source::Kimi.label(),
+        )
+        .unwrap();
+        assert_eq!(labels(&card.windows), ["5 小时", "每月"]);
+        assert!(close(card.windows[0].used_percent, 0.0));
+        assert!(close(card.windows[1].used_percent, 98.85));
+        assert_eq!(
+            card.windows[1].reset_at.as_deref(),
+            Some("2026-11-25T00:00:00Z")
+        );
+    }
+
+    /// Monthly meters next to an explicit `limit_7d` keep both windows: the
+    /// weekly and monthly meters are different limits.
+    #[test]
+    fn kimi_monthly_keeps_a_separate_weekly_window() {
+        let body = json!({"usages":{
+            "limit_5h":{"used_ratio":0.1},
+            "limit_7d":{"used_ratio":0.2,"reset_time":"2026-11-12T00:00:00Z"},
+            "limit_month_total":{"used_ratio":0.3,"reset_time":"2026-11-25T00:00:00Z"}
+        }});
+        let card = parse(
+            Source::Kimi,
+            &body,
+            at(1_760_000_000),
+            "test",
+            Source::Kimi.label(),
+        )
+        .unwrap();
+        assert_eq!(labels(&card.windows), ["5 小时", "每周", "每月"]);
+        assert!(close(card.windows[1].used_percent, 20.0));
+        assert!(close(card.windows[2].used_percent, 30.0));
+    }
+
+    /// The legacy `usage` + `limits[]` shape is untouched by monthly parsing:
+    /// it still wins when `usages` is absent, and never grows an extra section.
+    #[test]
+    fn kimi_legacy_shape_is_unchanged() {
+        let body = json!({
+            "usage":{"limit":"100","used":"1","resetTime":"2026-10-27T06:49:31Z"},
+            "limits":[{"detail":{"limit":"100","used":"7","resetTime":"2026-10-20T11:49:31Z"}}]
+        });
+        let card = parse(
+            Source::Kimi,
+            &body,
+            at(1_760_000_000),
+            "test",
+            Source::Kimi.label(),
+        )
+        .unwrap();
+        assert_eq!(labels(&card.windows), ["5 小时", "每周"]);
+        assert!(close(card.windows[0].used_percent, 7.0));
+        assert!(close(card.windows[1].used_percent, 1.0));
+        assert_eq!(card.extra, None);
+    }
+
+    /// Active booster wallet, in the API-key (`booster_wallet`) shape: money
+    /// objects carry `priceInCents`, the balance is fixed-point cents ×10^6.
+    #[test]
+    fn kimi_booster_wallet_active() {
+        let body = json!({
+            "usages":{"limit_5h":{"used_ratio":0.2,"reset_time":"2026-11-08T21:37:23Z"}},
+            "booster_wallet":{
+                "balance":{"type":"BOOSTER","amount":"17500000000","amountLeft":"1000000000"},
+                "status":"STATUS_ACTIVE",
+                "allowTopup":true,
+                "topupLimit":{"currency":"CNY","priceInCents":"300000"},
+                "monthlyChargeLimit":{"currency":"CNY","priceInCents":"10000"},
+                "monthlyUsed":{"currency":"CNY","priceInCents":"17500"}
+            }
+        });
+        let card = parse(
+            Source::Kimi,
+            &body,
+            at(1_760_000_000),
+            "test",
+            Source::Kimi.label(),
+        )
+        .unwrap();
+        assert_eq!(labels(&card.windows), ["5 小时"]);
+        let extra = card.extra.unwrap();
+        assert_eq!(extra.status.as_deref(), Some("enabled"));
+        // 1000000000 fixed-point cents ×10^6 -> ¥10.00.
+        assert_eq!(extra.balance, Some(10.0));
+        assert_eq!(extra.monthly_used, Some(175.0));
+        assert_eq!(extra.monthly_charge_limit, Some(100.0));
+        assert_eq!(extra.currency.as_deref(), Some("CNY"));
+        assert_eq!(extra.allow_topup, Some(true));
+        assert_eq!(extra.topup_limit, Some(3000.0));
+    }
+
+    /// Only the fields the upstream reported are serialized; the rest stay
+    /// `null` so the UI hides them.
+    #[test]
+    fn kimi_booster_serializes_reported_fields_only() {
+        let body = json!({"usages":{"limit_month_total":{"used_ratio":0.5}},
+            "boosterWallet":{"status":"STATUS_DISABLED","monthlyUsed":3.5,"currency":"CNY"}});
+        let card = parse(
+            Source::Kimi,
+            &body,
+            at(1_760_000_000),
+            "test",
+            Source::Kimi.label(),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&card).unwrap().get("extra").cloned(),
+            Some(
+                json!({"status":"disabled","balance":null,"monthly_used":3.5,
+                        "monthly_charge_limit":null,"currency":"CNY",
+                        "allow_topup":null,"topup_limit":null})
+            )
+        );
+    }
+
+    /// An observed zero is preserved: a drained wallet must not look absent.
+    #[test]
+    fn kimi_booster_zero_balance_is_preserved() {
+        let body = json!({"usages":{"limit_month_total":{"used_ratio":0.5}},
+            "booster_wallet":{"balance":0,"monthlyUsed":0,"monthlyChargeLimit":100,
+                "currency":"CNY"}});
+        let card = parse(
+            Source::Kimi,
+            &body,
+            at(1_760_000_000),
+            "test",
+            Source::Kimi.label(),
+        )
+        .unwrap();
+        let extra = card.extra.unwrap();
+        assert_eq!(extra.balance, Some(0.0));
+        assert_eq!(extra.monthly_used, Some(0.0));
+        assert_eq!(extra.monthly_charge_limit, Some(100.0));
+        // Not reported upstream, so not invented here.
+        assert_eq!(extra.status, None);
+        assert_eq!(extra.allow_topup, None);
+        assert_eq!(extra.topup_limit, None);
+    }
+
+    /// The real API-key response shape: a `BOOSTER` balance reports only its
+    /// total `amount` (fixed-point cents ×10^6) and no `amountLeft`, which
+    /// means the booster is drained. The card shows ¥0.00 next to the reported
+    /// monthly spend/limit instead of hiding the balance.
+    #[test]
+    fn kimi_booster_real_shape_drained_balance_is_zero() {
+        let body = json!({
+            "usages":{
+                "limit_5h":{"used_ratio":0,"reset_time":"2026-11-08T21:37:23Z"},
+                "limit_month_total":{"used_ratio":0.9885,"reset_time":"2026-11-25T00:00:00Z"},
+                "limit_month_code":{"used_ratio":0.9873,"reset_time":"2026-11-25T00:00:00Z"}
+            },
+            "booster_wallet":{
+                "id":"wallet",
+                "balance":{"id":"balance","type":"BOOSTER","amount":"17500000000",
+                           "unit":"UNIT_CURRENCY"},
+                "status":"STATUS_ACTIVE",
+                "allowTopup":true,
+                "topupLimit":{"currency":"CNY","priceInCents":"300000"},
+                "monthlyChargeLimit":{"currency":"CNY","priceInCents":"10000"},
+                "monthlyUsed":{"currency":"CNY","priceInCents":"17500"}
+            }
+        });
+        let card = parse(
+            Source::Kimi,
+            &body,
+            at(1_760_000_000),
+            "test",
+            Source::Kimi.label(),
+        )
+        .unwrap();
+        assert_eq!(labels(&card.windows), ["5 小时", "每月"]);
+        assert!(close(card.windows[1].used_percent, 98.85));
+        // The JSON the web UI consumes carries a real 0, not `null`.
+        let serialized = serde_json::to_value(&card).unwrap();
+        assert_eq!(
+            serialized
+                .get("extra")
+                .and_then(|extra| extra.get("balance"))
+                .cloned(),
+            Some(json!(0.0))
+        );
+        let extra = card.extra.unwrap();
+        assert_eq!(extra.status.as_deref(), Some("enabled"));
+        // Missing `amountLeft` on a BOOSTER balance is a drained booster, not
+        // an unknown one; `amount` (175.00 total) is never the remaining part.
+        assert_eq!(extra.balance, Some(0.0));
+        assert_eq!(extra.monthly_used, Some(175.0));
+        assert_eq!(extra.monthly_charge_limit, Some(100.0));
+        assert_eq!(extra.currency.as_deref(), Some("CNY"));
+        assert_eq!(extra.allow_topup, Some(true));
+        assert_eq!(extra.topup_limit, Some(3000.0));
+    }
+
+    /// `amount` is the total, so it never becomes the remaining balance: only
+    /// `amountLeft` is, and a non-BOOSTER object without it reports nothing.
+    #[test]
+    fn kimi_booster_total_amount_is_never_the_remaining_balance() {
+        let with_left = json!({"usages":{"limit_month_total":{"used_ratio":0.5}},
+        "booster_wallet":{
+            "balance":{"type":"BOOSTER","amount":"17500000000","amountLeft":"1000000000"},
+            "monthlyUsed":{"currency":"CNY","priceInCents":"17500"}
+        }});
+        let extra = parse(
+            Source::Kimi,
+            &with_left,
+            at(1_760_000_000),
+            "test",
+            Source::Kimi.label(),
+        )
+        .unwrap()
+        .extra
+        .unwrap();
+        // 1000000000 fixed-point cents ×10^6 -> ¥10.00, not the ¥175.00 total.
+        assert_eq!(extra.balance, Some(10.0));
+
+        let without_left = json!({"usages":{"limit_month_total":{"used_ratio":0.5}},
+        "booster_wallet":{
+            "balance":{"type":"CREDIT","amount":"17500000000"},
+            "monthlyUsed":{"currency":"CNY","priceInCents":"17500"}
+        }});
+        let extra = parse(
+            Source::Kimi,
+            &without_left,
+            at(1_760_000_000),
+            "test",
+            Source::Kimi.label(),
+        )
+        .unwrap()
+        .extra
+        .unwrap();
+        assert_eq!(extra.balance, None);
+        assert_eq!(extra.monthly_used, Some(175.0));
+    }
+
+    /// A sparse wallet must not invent billing: an unknown status, or
+    /// `allowTopup` alone, produces no extra section at all.
+    #[test]
+    fn kimi_booster_sparse_payloads_are_rejected() {
+        for wallet in [
+            json!({"status":"STATUS_MYSTERY"}),
+            json!({"allowTopup":true}),
+            json!({"status":"STATUS_ACTIVE","allowTopup":true}),
+            json!({}),
+        ] {
+            let body = json!({"usages":{"limit_month_total":{"used_ratio":0.5}},
+                "boosterWallet":wallet});
+            let card = parse(
+                Source::Kimi,
+                &body,
+                at(1_760_000_000),
+                "test",
+                Source::Kimi.label(),
+            )
+            .unwrap();
+            assert_eq!(card.kind, QuotaKind::Quota);
+            assert_eq!(labels(&card.windows), ["每月"]);
+            assert_eq!(card.extra, None, "wallet {wallet} must be rejected");
+        }
+    }
+
+    #[test]
+    fn kimi_booster_status_maps_four_states() {
+        assert_eq!(booster_status("STATUS_ACTIVE"), Some("enabled"));
+        assert_eq!(booster_status(" enabled "), Some("enabled"));
+        assert_eq!(booster_status("STATUS_DISABLED"), Some("disabled"));
+        assert_eq!(booster_status("frozen"), Some("frozen"));
+        assert_eq!(booster_status("STATUS_UNAVAILABLE"), Some("unavailable"));
+        assert_eq!(booster_status("STATUS_MYSTERY"), None);
+    }
+
+    /// `boosterWallet` (camelCase) and `booster_wallet` carry the same data.
+    #[test]
+    fn kimi_booster_accepts_both_key_spellings() {
+        let usages = r#""usages":{"limit_month_total":{"used_ratio":0.5}}"#;
+        let wallet = r#"{"status":"STATUS_FROZEN","balance":12.5,"monthlyUsed":5,
+            "monthlyChargeLimit":20,"currency":"CNY"}"#;
+        for body in [
+            format!(r#"{{{usages},"boosterWallet":{wallet}}}"#),
+            format!(r#"{{{usages},"booster_wallet":{wallet}}}"#),
+        ] {
+            let card = parse_value(Source::Kimi, &body).unwrap();
+            let extra = card.extra.unwrap();
+            assert_eq!(extra.status.as_deref(), Some("frozen"), "{body}");
+            assert_eq!(extra.balance, Some(12.5), "{body}");
+            assert_eq!(extra.monthly_used, Some(5.0), "{body}");
+            assert_eq!(extra.monthly_charge_limit, Some(20.0), "{body}");
+        }
+    }
+
     #[test]
     fn opencode_windows_from_percent_and_seconds() {
         let card = parse_value(Source::OpenCode, OPENCODE).unwrap();
@@ -875,6 +1609,72 @@ mod tests {
         assert_eq!(Source::OpenCode.label(), "OpenCode Go");
     }
 
+    /// The live OpenCode shape uses absolute `resetsAt` timestamps and a
+    /// per-window `status`.
+    #[test]
+    fn opencode_live_resets_at_and_status() {
+        let body = json!({"usage":{
+            "rolling":{"status":"ok","percent":52,"resetsAt":"2026-09-23T00:34:52.704Z"},
+            "weekly":{"status":"ok","percent":20,"resetsAt":"2026-09-28T00:00:00Z"},
+            "monthly":{"status":"exceeded","percent":100,"resetsAt":"2026-09-25T14:30:41.5Z"}
+        }});
+        let card = parse(
+            Source::OpenCode,
+            &body,
+            at(1_760_000_000),
+            "test",
+            Source::OpenCode.label(),
+        )
+        .unwrap();
+        assert_eq!(labels(&card.windows), ["5 小时", "每周", "每月"]);
+        assert_eq!(
+            card.windows[0].reset_at.as_deref(),
+            Some("2026-09-23T00:34:52.704Z")
+        );
+        // Normalised to UTC milliseconds, not passed through raw.
+        assert_eq!(
+            card.windows[1].reset_at.as_deref(),
+            Some("2026-09-28T00:00:00.000Z")
+        );
+        assert_eq!(
+            card.windows[2].reset_at.as_deref(),
+            Some("2026-09-25T14:30:41.500Z")
+        );
+        // Only the non-`ok` window is worth a row; percentages only, no money.
+        assert_eq!(
+            card.details,
+            vec![QuotaDetail::text("状态", "每月 exceeded")]
+        );
+    }
+
+    /// All-`ok` statuses (the quiet normal state) render no status row, and an
+    /// unparseable `resetsAt` falls back to the relative `resetInSec`.
+    #[test]
+    fn opencode_ok_status_is_quiet_and_bad_timestamp_falls_back() {
+        let body = json!({"usage":{
+            "rolling":{"status":"ok","percent":1,"resetsAt":"not-a-time","resetInSec":3600},
+            "weekly":{"status":"OK","percent":2,"resetsAt":"2026-09-28T00:00:00Z"}
+        }});
+        let card = parse(
+            Source::OpenCode,
+            &body,
+            at(1_760_000_000),
+            "test",
+            Source::OpenCode.label(),
+        )
+        .unwrap();
+        assert!(card.details.is_empty());
+        // now + 3600s.
+        assert_eq!(
+            card.windows[0].reset_at.as_deref(),
+            Some("2025-10-09T09:53:20Z")
+        );
+        assert_eq!(
+            card.windows[1].reset_at.as_deref(),
+            Some("2026-09-28T00:00:00.000Z")
+        );
+    }
+
     #[test]
     fn chatgpt_plan_and_weekly_window() {
         let card = parse_value(Source::ChatGpt, CHATGPT).unwrap();
@@ -886,6 +1686,45 @@ mod tests {
             Some("2026-10-27T06:33:13Z")
         );
         assert_eq!(Source::ChatGpt.label(), "ChatGPT");
+    }
+
+    /// `credits` becomes one Extra Credits row: the reported balance (here an
+    /// observed `"0"`) is kept, and an absent `credits` block adds no row.
+    #[test]
+    fn chatgpt_credits_row_keeps_reported_balance() {
+        let card = parse_value(Source::ChatGpt, CHATGPT).unwrap();
+        assert_eq!(
+            card.details,
+            vec![QuotaDetail::text("Extra Credits", "无额度 · 余额 0")]
+        );
+
+        let unlimited = json!({"plan_type":"pro","credits":{"unlimited":true,"has_credits":true},
+            "rate_limit":{"primary_window":{"used_percent":5,"limit_window_seconds":18000}}});
+        let card = parse(
+            Source::ChatGpt,
+            &unlimited,
+            at(1_760_000_000),
+            "test",
+            Source::ChatGpt.label(),
+        )
+        .unwrap();
+        assert_eq!(
+            card.details,
+            vec![QuotaDetail::text("Extra Credits", "无限")]
+        );
+
+        let without = json!({"plan_type":"pro",
+            "rate_limit":{"primary_window":{"used_percent":5,"limit_window_seconds":18000}}});
+        let card = parse(
+            Source::ChatGpt,
+            &without,
+            at(1_760_000_000),
+            "test",
+            Source::ChatGpt.label(),
+        )
+        .unwrap();
+        assert!(card.details.is_empty());
+        assert_eq!(card.plan.as_deref(), Some("pro"));
     }
 
     #[test]
@@ -1129,7 +1968,9 @@ mod tests {
                     currency: Some("CNY".to_owned()),
                     plan: None,
                     windows: Vec::new(),
+                    details: Vec::new(),
                     error: None,
+                    extra: None,
                 },
                 ProviderQuota {
                     id: "zhipu".to_owned(),
@@ -1143,7 +1984,9 @@ mod tests {
                         used_percent: 0.0,
                         reset_at: Some("2026-10-26T03:29:35.998Z".to_owned()),
                     }],
+                    details: Vec::new(),
                     error: None,
+                    extra: None,
                 },
                 ProviderQuota::error("opencode", Source::OpenCode.label(), ERR_EXPIRED.to_owned()),
             ],
@@ -1152,15 +1995,37 @@ mod tests {
             serde_json::to_value(&quotas).unwrap(),
             json!({"providers":[
                 {"id":"deepseek","label":"DeepSeek","kind":"balance","amount":10.44,
-                 "currency":"CNY","plan":null,"windows":[],"error":null},
+                 "currency":"CNY","plan":null,"windows":[],"details":[],
+                 "error":null,"extra":null},
                 {"id":"zhipu","label":"GLM Coding Plan","kind":"quota","amount":null,
                  "currency":null,"plan":"max",
                  "windows":[{"label":"5 小时","used_percent":0.0,
-                             "reset_at":"2026-10-26T03:29:35.998Z"}],"error":null},
+                             "reset_at":"2026-10-26T03:29:35.998Z"}],"details":[],
+                 "error":null,"extra":null},
                 {"id":"opencode","label":"OpenCode Go","kind":"error","amount":null,
                  "currency":null,"plan":null,"windows":[],
-                 "error":"API 密钥已过期，请重新生成"}
+                 "details":[],"error":"API 密钥已过期，请重新生成","extra":null}
             ]})
+        );
+    }
+
+    /// Details serialize as `{label, value:{amount,currency}|{text}}`, so the
+    /// UI can format money itself and hide everything absent.
+    #[test]
+    fn details_serialize_as_money_or_text() {
+        let body = json!({
+            "is_available":true,
+            "balance_infos":[{"currency":"CNY","total_balance":"10.44",
+                              "granted_balance":"0","topped_up_balance":"10.44"}]
+        });
+        let card = parse_value(Source::DeepSeek, &body.to_string()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&card).unwrap().get("details").cloned(),
+            Some(json!([
+                {"label":"可用状态","value":{"text":"可用"}},
+                {"label":"赠送余额","value":{"amount":0.0,"currency":"CNY"}},
+                {"label":"充值余额","value":{"amount":10.44,"currency":"CNY"}}
+            ]))
         );
     }
 }

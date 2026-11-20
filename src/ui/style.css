@@ -2591,6 +2591,17 @@
   .quota-track { height: 5px; margin-top: 6px; border-radius: 999px; overflow: hidden; background: color-mix(in srgb, var(--base1) 55%, var(--base2)); }
   .quota-fill { height: 100%; background: var(--quota-color); }
   .quota-reset { margin: 5px 0 0; }
+  /* Out-of-plan booster wallet (Kimi Code Extra Usage): a quieter block under
+     the plan windows, with only the reported figures. */
+  .quota-extra { margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--base1); }
+  .quota-extra h4 { margin: 0; color: var(--base02); font-size: 12px; }
+  .quota-extra-status { margin: 4px 0 0; color: var(--base01); font-size: 11px; }
+  /* Shared label/value rows: provider details and the extra-usage figures. */
+  .quota-figures { margin: 6px 0 0; display: grid; gap: 4px; }
+  .quota-figure-row { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
+  .quota-figure-row dt { color: var(--base01); font-size: 11px; }
+  .quota-figure-row dd { margin: 0; color: var(--base02); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .quota-details { margin-top: 12px; }
   .quota-error { margin: 14px 0 0; color: var(--status-yellow); font-size: 12px; line-height: 1.6; }
   .quota-unavailable { grid-column: 1 / -1; margin: 0; }
   @media (max-width: 640px) {

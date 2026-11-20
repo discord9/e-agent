@@ -1288,14 +1288,25 @@ usage endpoint are skipped, and ChatGPT is recognized by its login credentials
 rather than by host (DeepSeek/SiliconFlow balances, Zhipu/GLM Coding Plan and
 Kimi Code quota windows, OpenCode Go rolling/weekly/monthly percentages, and
 ChatGPT/Codex plan and rate windows through the existing `e-agent login`
-credentials). The endpoint caches nothing and has no background poller: each
-request queries the live upstream APIs concurrently, and one provider's failure
-is reported as that provider's own card. Quota windows are drawn as **remaining**
+credentials). Cards show only fields the upstream actually reported: DeepSeek's
+`is_available` plus its granted/topped-up split, SiliconFlow's `status` and
+balance/charge split, OpenCode Go's `resetsAt` reset times and non-`ok` window
+status, ChatGPT's `credits` row, and Kimi Code's merged monthly window
+(`limit_month_total`/`limit_month_code`: larger ratio, earlier reset) plus an
+Extra Usage block from `boosterWallet`/`booster_wallet` (a `BOOSTER` wallet
+without `amountLeft` is drained and shows ¥0.00; `amount` is the total and is
+never shown as the remaining balance). A reported `0` renders as zero, an
+absent field is hidden instead of estimated, and no shared-membership total or
+per-product split is claimed because the APIs do not expose one. The endpoint
+caches nothing and has no background poller: each request queries the live
+upstream APIs concurrently, and one provider's failure is reported as that
+provider's own card. Quota windows are drawn as **remaining**
 credit — a full bar means plenty left, the color tracks what is left (>30%
 normal, 10–30% warning, ≤10% danger), the used percentage stays in the
 tooltip and `aria-valuetext`, and a window with a missing upstream percentage
 renders as unknown instead of a full bar. Non-goals: billing history, cost
-accounting or price calculation, auto top-up, arbitrary user-supplied usage
+accounting or price calculation, auto top-up, inferred or estimated balances
+the upstream does not report, arbitrary user-supplied usage
 endpoints, and background quota monitoring or notifications.
 
 SSE connections are kept alive with 15-second heartbeat pings and carry live

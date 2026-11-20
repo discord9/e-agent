@@ -388,6 +388,72 @@ function renderQuotaNotice(message) {
   $("quotaCardsRow").replaceChildren(el("p", "quota-unavailable", message));
 }
 
+/* Currency amounts, shared by the balance headline, the provider detail rows
+   and the extra-usage section. `null` (absent) stays `null` so callers hide
+   the row instead of painting a false ¥0.00. */
+function quotaMoney(currency, value) {
+  if (value === null || value === undefined) return null;
+  const amount = Number(value);
+  if (!Number.isFinite(amount)) return null;
+  const symbol = currency === "CNY" ? "¥" : currency === "USD" ? "$" : (currency || "");
+  return symbol + amount.toFixed(2);
+}
+
+/* Label/value rows shared by the booster wallet and the provider details.
+   Callers build rows from reported fields only and pass `null` for an absent
+   value, which drops the row instead of painting a placeholder. */
+function renderQuotaFigures(rows, cls) {
+  const figures = el("dl", cls ? "quota-figures " + cls : "quota-figures");
+  for (const [label, value] of rows) {
+    if (value === null) continue;
+    const item = el("div", "quota-figure-row");
+    item.append(el("dt", "", label), el("dd", "", value));
+    figures.append(item);
+  }
+  return figures;
+}
+
+const QUOTA_EXTRA_STATUS = { enabled: "已启用", disabled: "已停用", frozen: "已冻结", unavailable: "不可用" };
+
+/* Out-of-plan booster wallet (Kimi Code Extra Usage / fuel pack). Only fields
+   the server actually reported are rendered; a missing amount is omitted, not
+   shown as zero. No raw response and no credential ever reaches this view. */
+function renderQuotaExtra(extra) {
+  const section = el("section", "quota-extra");
+  section.append(el("h4", "", "Extra Usage"));
+  const status = QUOTA_EXTRA_STATUS[extra.status];
+  if (status) section.append(el("p", "quota-extra-status", status));
+  const figures = renderQuotaFigures([
+    ["余额", quotaMoney(extra.currency, extra.balance)],
+    ["本月支出", quotaMoney(extra.currency, extra.monthly_used)],
+    ["本月上限", quotaMoney(extra.currency, extra.monthly_charge_limit)],
+  ]);
+  if (figures.children.length) section.append(figures);
+  return section;
+}
+
+/* One provider detail as display text: a money value keeps its currency
+   symbol, a text value is shown verbatim (status tokens, reported balances
+   without a currency). Returns `null` when the server sent nothing usable. */
+function quotaDetailText(detail) {
+  const value = detail.value || {};
+  if (typeof value.amount === "number" && Number.isFinite(value.amount)) {
+    return quotaMoney(value.currency, value.amount);
+  }
+  const text = typeof value.text === "string" ? value.text.trim() : "";
+  return text || null;
+}
+
+/* Provider-specific figures (DeepSeek granted/topped-up, SiliconFlow split,
+   ChatGPT credits, OpenCode window status). An empty list renders nothing. */
+function renderQuotaDetails(details) {
+  if (!Array.isArray(details) || !details.length) return null;
+  const figures = renderQuotaFigures(
+    details.map((detail) => [String(detail.label || ""), quotaDetailText(detail)]),
+    "quota-details");
+  return figures.children.length ? figures : null;
+}
+
 function renderQuotaCards(providers) {
   const row = $("quotaCardsRow");
   row.replaceChildren();
@@ -402,8 +468,7 @@ function renderQuotaCards(providers) {
     if (provider.plan) head.append(el("span", "quota-plan", provider.plan));
     card.append(head);
     if (provider.kind === "balance") {
-      const currency = provider.currency === "CNY" ? "¥" : provider.currency === "USD" ? "$" : (provider.currency || "");
-      card.append(el("p", "quota-amount", provider.amount === null ? "暂不可用" : currency + Number(provider.amount).toFixed(2)));
+      card.append(el("p", "quota-amount", quotaMoney(provider.currency, provider.amount) || "暂不可用"));
     } else if (provider.kind === "quota") {
       for (const window of provider.windows) {
         /* `Number(null)` is 0, which would paint an unknown window as a full
@@ -439,6 +504,9 @@ function renderQuotaCards(providers) {
     } else if (provider.kind === "error") {
       card.append(el("p", "quota-error", provider.error || "额度信息暂不可用"));
     }
+    const details = renderQuotaDetails(provider.details);
+    if (details) card.append(details);
+    if (provider.kind === "quota" && provider.extra) card.append(renderQuotaExtra(provider.extra));
     row.append(card);
   }
 }
