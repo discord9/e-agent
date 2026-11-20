@@ -35,6 +35,23 @@
 //! three turns: a CLEAN verdict with no `Notice` is a legitimate observation,
 //! so the run never asserts efficacy, compliance, or a Notice count.
 //!
+//! A third, ignored test (`poll_audit_paired_first_decision`) runs ONLY the L
+//! arm on `PAIRED_SCENARIO` — turn 1 explicitly asks for eight sequential
+//! `cat build.log` checks, one per reply, so the polling turn stays open long
+//! enough for the asynchronous auditor to return — once per seed in
+//! `E_AGENT_POLL_AUDIT_SEEDS` (default `0,1,2,3,4,5,6,7`). For the FIRST
+//! eligible Notice-bearing request of a run it records the oracle-approved
+//! minimal paired counterfactual: the real model decides once WITH the `Notice`
+//! (the normal L decision, and the reply the product trajectory continues with)
+//! and once with the identical request minus only that `Notice` user message
+//! (the H decision). The counterfactual reply's tool calls are never executed,
+//! and the runner still sees exactly ONE actor call per round, so its round
+//! budget and request recording are unchanged. The test prints one comma-free
+//! line per seed plus a comma-free aggregate, and asserts neither efficacy nor
+//! an expected direction: a Notice that arrives after the polling turn ended is
+//! printed as `late=1` and an arm with no Notice at all as `no_notice=1`; both
+//! are legitimate observations, never scored as compliance failures.
+//!
 //! Run it manually (ignored by default; a normal `cargo test` makes no
 //! provider call):
 //!
@@ -58,6 +75,14 @@
 //! ```sh
 //! E_AGENT_POLL_AUDIT_SEEDS=0,1,2,3 \
 //!   cargo test --lib poll_audit_efficacy_seeded -- --ignored --nocapture
+//! ```
+//!
+//! The paired first-decision counterfactual takes the same seed list (default
+//! `0,1,2,3,4,5,6,7`) and never runs in script mode:
+//!
+//! ```sh
+//! E_AGENT_POLL_AUDIT_SEEDS=0,1,2,3 \
+//!   cargo test --lib poll_audit_paired_first_decision -- --ignored --nocapture
 //! ```
 //!
 //! The actor and the auditor must resolve, through e-agent's own config path,
@@ -194,9 +219,31 @@ const POLL_TURN_3: &str = "Verify the fix: call `bash` with `cargo build`, then 
 `cat build.log`. Report the build result and the final file content.";
 const POLLING_TURNS: [&str; USER_TURNS] = [POLL_TURN_1, POLL_TURN_2, POLL_TURN_3];
 
+/// The paired counterfactual scenario: the same fixture/system constraints as
+/// [`POLLING_SCENARIO`], but turn 1 asks for eight SEQUENTIAL status checks, one
+/// per reply. That keeps the still-open polling turn going through repeated
+/// first decisions, which is the intervention window the asynchronous LLM
+/// auditor needs; turns 2 and 3 are the unchanged polling turns.
+const PAIRED_SCENARIO: Scenario = Scenario {
+    system_prompt: POLLING_SYSTEM_PROMPT,
+    turns: &PAIRED_TURNS,
+};
+const PAIRED_TURN_1: &str = "The background build is still running. Check the build by calling the \
+`bash` tool with `cat build.log` EIGHT times, ONE bash call per reply: call it once, wait for the \
+result, then call it again, for eight replies in a row. Do not batch the checks into one reply, do not \
+edit any file in this turn, and do not end this turn early; keep checking until all eight checks are \
+done, then report the result.";
+const PAIRED_TURNS: [&str; USER_TURNS] = [PAIRED_TURN_1, POLL_TURN_2, POLL_TURN_3];
+/// The user prompts that keep the polling turn open (turn 1 of either polling
+/// scenario) and the prompts that prove a LATER turn already started.
+const PAIRED_OPEN_PROMPTS: [&str; 2] = [POLL_TURN_1, PAIRED_TURN_1];
+const PAIRED_LATER_PROMPTS: [&str; 2] = [POLL_TURN_2, POLL_TURN_3];
+
 /// Env override for the efficacy seed list: comma-separated decimal seeds.
 const ENV_SEEDS: &str = "E_AGENT_POLL_AUDIT_SEEDS";
 const DEFAULT_SEEDS: &str = "0,1,2,3";
+/// More seeds by default for the paired first-decision observation run.
+const DEFAULT_PAIRED_SEEDS: &str = "0,1,2,3,4,5,6,7";
 
 // ---------------------------------------------------------------- fixture world
 
@@ -707,6 +754,139 @@ impl Model for RecordingActor {
     }
 }
 
+/// One paired first-decision observation. `notice_probe`/`no_notice_probe` are
+/// the classified reply of the with-`Notice` (normal L) and without-`Notice`
+/// (counterfactual H) decision of the SAME request; `None` means that decision
+/// errored or is missing, which is recorded separately and never read as "the
+/// model stopped".
+#[derive(Clone, Debug)]
+struct PairRecord {
+    notice_first: bool,
+    notice_probe: Option<bool>,
+    no_notice_probe: Option<bool>,
+    notice_error: Option<String>,
+    no_notice_error: Option<String>,
+}
+
+/// The product classifier, not a re-derived guess: a mixed batch with any
+/// status/check call is a probe, and a text-only reply is not.
+fn reply_probes(reply: &AssistantMessage) -> bool {
+    reply
+        .tool_calls
+        .iter()
+        .any(|call| super::status_check_command(call).is_some())
+}
+
+/// The paired counterfactual is only meaningful inside the still-open polling
+/// turn: the exact `Notice` is the LAST message of the request, the request
+/// carries a polling turn-1 prompt, and no later turn prompt is present yet. A
+/// `Notice` that lands after the turn ended (or mid-request) is LATE, never a
+/// pair.
+fn paired_request(messages: &[Message]) -> bool {
+    if !matches!(
+        messages.last(),
+        Some(Message::User { content, .. }) if content == POLL_AUDIT_NOTICE
+    ) {
+        return false;
+    }
+    let mut open = false;
+    for message in messages {
+        if let Message::User { content, .. } = message {
+            if PAIRED_LATER_PROMPTS.contains(&content.as_str()) {
+                return false;
+            }
+            open |= PAIRED_OPEN_PROMPTS.contains(&content.as_str());
+        }
+    }
+    open
+}
+
+/// Deterministic per-arm order of the two paired decisions (the same xorshift
+/// as [`seeded_order`], seeded by the per-arm seed).
+fn paired_notice_first(seed: u64) -> bool {
+    let mut state = (seed ^ 0x9E37_79B9_7F4A_7C15) | 1;
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    state % 2 == 1
+}
+
+/// The oracle-approved minimal paired first-decision counterfactual. It sits
+/// INSIDE [`RecordingActor`], so the runner still issues exactly one actor call
+/// per round (recorded once, budgeted once); only the FIRST eligible
+/// Notice-bearing request runs two real decisions — with the `Notice` and with
+/// the identical request minus exactly that `Notice` user message — and only
+/// the with-`Notice` reply is returned, so the normal product trajectory
+/// continues. The counterfactual reply's tool calls are never executed. Later
+/// Notice-bearing requests pass straight through.
+struct PairedActor {
+    inner: Box<dyn Model>,
+    seed: u64,
+    pairs: Arc<Mutex<Vec<PairRecord>>>,
+    paired: bool,
+}
+
+#[async_trait]
+impl Model for PairedActor {
+    fn set_request_session_id(&mut self, id: &str) {
+        self.inner.set_request_session_id(id);
+    }
+
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn supports_vision(&self) -> bool {
+        self.inner.supports_vision()
+    }
+
+    async fn complete(
+        &mut self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        on_delta: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        if self.paired || !paired_request(messages) {
+            return self.inner.complete(messages, tools, on_delta).await;
+        }
+        self.paired = true;
+        let notice_first = paired_notice_first(self.seed);
+        // The counterfactual is the same request minus ONLY the trailing
+        // `Notice` user message; `tools` is passed through unchanged.
+        let mut without_notice = messages.to_vec();
+        let removed = without_notice.pop();
+        assert!(
+            matches!(&removed, Some(Message::User { content, .. }) if content == POLL_AUDIT_NOTICE),
+            "the counterfactual removes exactly the trailing Notice user message"
+        );
+        // Deltas are deliberately not forwarded for a pair: the runner would
+        // otherwise paint both replies over the same round. The returned
+        // with-`Notice` assistant message still lands as a complete event.
+        let (notice, no_notice) = if notice_first {
+            let notice = self.inner.complete(messages, tools, None).await;
+            let no_notice = self.inner.complete(&without_notice, tools, None).await;
+            (notice, no_notice)
+        } else {
+            let no_notice = self.inner.complete(&without_notice, tools, None).await;
+            let notice = self.inner.complete(messages, tools, None).await;
+            (notice, no_notice)
+        };
+        self.pairs.lock().unwrap().push(PairRecord {
+            notice_first,
+            notice_probe: notice.as_ref().ok().map(|(reply, _)| reply_probes(reply)),
+            no_notice_probe: no_notice
+                .as_ref()
+                .ok()
+                .map(|(reply, _)| reply_probes(reply)),
+            notice_error: notice.as_ref().err().map(|error| format!("{error:#}")),
+            no_notice_error: no_notice.as_ref().err().map(|error| format!("{error:#}")),
+        });
+        // Only the with-`Notice` decision reaches the product; a counterfactual
+        // error stays in the record and never becomes a product outcome.
+        notice
+    }
+}
+
 /// Deterministic offline stand-in for the actor in script mode. It reads the
 /// REAL product request projection (not a side channel), so the harness still
 /// exercises heuristic → auditor → `Notice`.
@@ -942,10 +1122,20 @@ impl DeepseekSubstitute {
 
     fn build(&self, role: &str) -> Result<Box<dyn Model>, String> {
         let key = self.api_key()?;
+        // The substitute must carry the same DeepSeek wire compatibility the
+        // product profile sets (`thinking` on, `deepseek_compat = true`). The
+        // paired counterfactual sends the SAME request minus only the trailing
+        // `Notice` user message, so that request ends in a `role:"tool"` result
+        // directly after the assistant tool-call turn; DeepSeek's thinking mode
+        // then requires that turn's `reasoning_content` to be passed back, or
+        // it answers HTTP 400 "The `reasoning_content` in the thinking mode
+        // must be passed back to the API".
         let model = OpenAiModel::new(self.base_url.clone(), key, self.model.clone(), None)
             .map_err(|error| {
                 format!("cannot build the {role} DeepSeek substitute model: {error:#}")
-            })?;
+            })?
+            .with_thinking(true)
+            .with_deepseek_compat(true);
         let mut configured = ConfiguredModel::chat(model);
         configured.display = Some(format!("deepseek-substitute/{}", self.model));
         Ok(Box::new(configured))
@@ -990,6 +1180,12 @@ struct Experiment {
     config: Option<Config>,
     profile: String,
     scripted: bool,
+    /// Pair the FIRST eligible Notice-bearing L decision with its
+    /// without-`Notice` counterfactual. Off for every existing test.
+    paired: bool,
+    /// The recorded pairs: at most one per paired arm run, cleared per seed by
+    /// the paired test.
+    pairs: Arc<Mutex<Vec<PairRecord>>>,
     /// `Some` only for the explicit, documented DeepSeek substitute.
     substitute: Option<DeepseekSubstitute>,
     /// The wire model id both real backends must resolve to.
@@ -1015,6 +1211,7 @@ impl Experiment {
     fn actor(
         &self,
         arm: Arm,
+        seed: u64,
         requests: Arc<Mutex<Vec<Vec<Message>>>>,
         rounds: Arc<AtomicUsize>,
         capped: Arc<AtomicBool>,
@@ -1026,6 +1223,19 @@ impl Experiment {
             })
         } else {
             self.build("actor")?
+        };
+        // Paired mode wraps the L arm's model INSIDE the recording actor, so the
+        // runner's round budget and request recording still see exactly one
+        // actor call per round.
+        let inner: Box<dyn Model> = if self.paired && arm == Arm::Llm {
+            Box::new(PairedActor {
+                inner,
+                seed,
+                pairs: self.pairs.clone(),
+                paired: false,
+            })
+        } else {
+            inner
         };
         Ok(Box::new(RecordingActor {
             inner,
@@ -1106,6 +1316,8 @@ fn resolve_experiment(scripted: bool) -> Experiment {
         config,
         profile,
         scripted,
+        paired: false,
+        pairs: Arc::new(Mutex::new(Vec::new())),
         substitute,
         expected_model,
     };
@@ -1348,7 +1560,7 @@ async fn run_arm(
     let capped = Arc::new(AtomicBool::new(false));
     let audit = Arc::new(Mutex::new(Vec::new()));
 
-    let actor = experiment.actor(arm, requests.clone(), rounds.clone(), capped.clone())?;
+    let actor = experiment.actor(arm, seed, requests.clone(), rounds.clone(), capped.clone())?;
     let actor_model = actor.name().to_owned();
     let (mut agent, notice_sender) = Agent::new_with_notice_sender(
         actor,
@@ -2080,5 +2292,134 @@ async fn poll_audit_efficacy_seeded() {
     }
     println!(
         "  result: SEEDED OBSERVATION ONLY - no efficacy, compliance, or notice-impact claim.\n"
+    );
+}
+
+// ------------------------------------------------- paired first-decision run
+
+/// `1`/`0`/`missing` for one classified reply: a missing (errored) decision is
+/// never rendered as a stop.
+fn probe_field(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "1",
+        Some(false) => "0",
+        None => "missing",
+    }
+}
+
+/// One stable, comma-free line per seed for the paired first-decision run.
+fn paired_line(seed: u64, record: Option<&PairRecord>, late: bool, no_notice: bool) -> String {
+    let mut line = format!(
+        "SEED={seed} eligible={} notice_probe={} no_notice_probe={} notice_first={} late={} \
+         no_notice={}",
+        u8::from(record.is_some()),
+        probe_field(record.and_then(|record| record.notice_probe)),
+        probe_field(record.and_then(|record| record.no_notice_probe)),
+        match record {
+            Some(record) => u8::from(record.notice_first).to_string(),
+            None => "-".to_owned(),
+        },
+        u8::from(late),
+        u8::from(no_notice),
+    );
+    if let Some(record) = record {
+        if let Some(error) = &record.notice_error {
+            line.push_str(&format!(" notice_error={}", stable_token(error)));
+        }
+        if let Some(error) = &record.no_notice_error {
+            line.push_str(&format!(" no_notice_error={}", stable_token(error)));
+        }
+    }
+    line
+}
+
+/// The paired first-decision counterfactual, L arm only, one run per seed on
+/// [`PAIRED_SCENARIO`]. It observes what the real model decides for the FIRST
+/// eligible Notice-bearing request WITH the `Notice` (the normal L decision) and
+/// for the identical request minus only that `Notice` (the H decision), and
+/// prints one comma-free line per seed plus a comma-free aggregate. Nothing here
+/// asserts efficacy, compliance, or an expected direction: a LATE Notice
+/// (`late=1`) or no Notice at all (`no_notice=1`) are legitimate observations,
+/// and a seed with no eligible pair still succeeds with `eligible=0`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual real-API run: needs a configured profile that resolves to gpt-4.1-2025-04-14"]
+async fn poll_audit_paired_first_decision() {
+    assert!(
+        std::env::var(ENV_ACTOR)
+            .map(|value| value.trim() != SCRIPTED_ACTOR)
+            .unwrap_or(true),
+        "{ENV_ACTOR}={SCRIPTED_ACTOR} has no model to pair: the counterfactual needs the real L arm"
+    );
+    let mut experiment = resolve_experiment(false);
+    experiment.paired = true;
+    let scenario = PAIRED_SCENARIO;
+    assert_eq!(
+        scenario.turns.len(),
+        3,
+        "the paired scenario must have exactly three user turns"
+    );
+    let seeds = match std::env::var(ENV_SEEDS) {
+        Ok(raw) => parse_seeds(&raw),
+        Err(_) => parse_seeds(DEFAULT_PAIRED_SEEDS),
+    }
+    .unwrap_or_else(|error| panic!("{error}"));
+    let prefix = pre_decision_prefix();
+    println!(
+        "\npoll-audit paired first-decision run (scenario paired, arm L only, seeds {seeds:?}, \
+         backend: {})",
+        match &experiment.substitute {
+            Some(substitute) => substitute.describe(),
+            None => format!("oracle profile `{}`", experiment.profile),
+        }
+    );
+    let (mut eligible, mut both_probe, mut notice_only, mut no_notice_only, mut neither) =
+        (0usize, 0usize, 0usize, 0usize, 0usize);
+    let (mut missing_pair, mut late, mut no_notice) = (0usize, 0usize, 0usize);
+    for seed in seeds.iter().copied() {
+        experiment.pairs.lock().unwrap().clear();
+        let outcome = run_arm(
+            &experiment,
+            &scenario,
+            Arm::Llm,
+            seed.wrapping_mul(4),
+            &prefix,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("seed {seed} L arm did not run: {error}"));
+        let records = std::mem::take(&mut *experiment.pairs.lock().unwrap());
+        let record = records.first();
+        // A Notice that reached a request (or the durable log) without an
+        // eligible pair is LATE, never a compliance failure; no Notice at all
+        // is its own observation.
+        let observed_notice =
+            !outcome.notices.is_empty() || requests_with_notice(&outcome.requests) > 0;
+        let is_late = record.is_none() && observed_notice;
+        let is_no_notice = !observed_notice;
+        eligible += usize::from(record.is_some());
+        late += usize::from(is_late);
+        no_notice += usize::from(is_no_notice);
+        // The probe classes partition `eligible`; `missing_pair` counts an
+        // eligible pair whose comparison is incomplete (an errored decision,
+        // recorded separately and never read as a stop). Seeds without a pair
+        // are exactly `late` + `no_notice`.
+        if let Some(record) = record {
+            match (record.notice_probe, record.no_notice_probe) {
+                (Some(true), Some(true)) => both_probe += 1,
+                (Some(true), Some(false)) => notice_only += 1,
+                (Some(false), Some(true)) => no_notice_only += 1,
+                (Some(false), Some(false)) => neither += 1,
+                _ => missing_pair += 1,
+            }
+        }
+        println!("{}", paired_line(seed, record, is_late, is_no_notice));
+    }
+    println!(
+        "  aggregate: seeds={} eligible={eligible} both_probe={both_probe} \
+         notice_only={notice_only} no_notice_only={no_notice_only} neither={neither} \
+         missing_pair={missing_pair} late={late} no_notice={no_notice}",
+        seeds.len()
+    );
+    println!(
+        "  result: PAIRED OBSERVATION ONLY - no efficacy, compliance, or expected-direction claim.\n"
     );
 }
