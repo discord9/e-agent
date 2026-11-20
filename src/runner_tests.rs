@@ -4111,6 +4111,175 @@ async fn web_attach_normalizes_a_self_owned_older_cursor_and_keeps_an_ancestor()
     );
 }
 
+/// The published live Web bootstrap payload must WIDEN like the historical
+/// `/history` head page: on a seq backend the frozen head starts right after the
+/// previous compaction, so the rows the newest compaction summarized reach the
+/// client instead of surviving only as its provider-projection `retained` tail.
+/// The cursor is the MINIMUM seq of that interval.
+#[tokio::test]
+async fn web_attach_bootstrap_widens_the_head_to_the_previous_compaction() {
+    let temp = tempfile::tempdir().unwrap();
+    let backend = crate::config::SessionBackend::Sqlite {
+        path: Some(
+            temp.path()
+                .join("sessions.db")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    };
+    let store = SessionStore::connect(&backend, temp.path(), "bootstrap-widen")
+        .await
+        .unwrap();
+    let (mut runner, _handle) = SessionRunner::new(
+        Agent::new(
+            Box::new(ScriptedAssistantModel {
+                replies: VecDeque::new(),
+            }),
+            Vec::new(),
+        ),
+        store,
+        temp.path().into(),
+        "bootstrap-widen".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let compaction = |summary: &str| SessionEntry::Compaction {
+        summary: summary.into(),
+        retained: vec![Message::User {
+            content: "retained".into(),
+            images: vec![],
+        }],
+        current_prompt_at: None,
+        no_current_prompt: true,
+    };
+    let user = |text: &str| {
+        SessionEntry::from(Message::User {
+            content: text.into(),
+            images: vec![],
+        })
+    };
+    // seqs: q0=0, c1=1, q1=2, c2=3, q2=4.
+    let history = [
+        user("q0"),
+        compaction("c1"),
+        user("q1"),
+        compaction("c2"),
+        user("q2"),
+    ];
+    for (seq, entry) in history.iter().cloned().enumerate() {
+        runner.agent.apply_entry_located(
+            entry,
+            Some(crate::session_store::EntryLocation {
+                backend: "sqlite",
+                fingerprint: "f".repeat(64),
+                backend_fp: "b".repeat(32),
+                session: "bootstrap-widen".into(),
+                key: crate::session_store::LocatedKey::Sqlite {
+                    seq: seq as i64,
+                    event_time_us: 1_000 + seq as i64,
+                },
+                entry_hash: String::new(),
+            }),
+        );
+    }
+
+    runner.prepare_web_attach();
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    respond_web_attach_shared(&runner.shared, reply);
+    let attach = rx.await.unwrap();
+    assert_eq!(
+        attach.entries,
+        history[2..].to_vec(),
+        "the bootstrap head starts after the PREVIOUS compaction"
+    );
+    assert_eq!(attach.locations.len(), attach.entries.len());
+    assert_eq!(
+        attach.next_before_seq,
+        Some(2),
+        "minimum seq of the widened interval"
+    );
+    assert!(attach.next_older_session.is_none());
+}
+
+/// The boundary map runs to the FROZEN LOGICAL END, so a presentation event
+/// emitted after the last SELECTED row (its logical boundary is past them) still
+/// replays exactly once, at the final returned-entry offset.
+#[tokio::test]
+async fn web_attach_replays_a_trailing_display_after_the_selected_rows() {
+    let temp = tempfile::tempdir().unwrap();
+    let backend = crate::config::SessionBackend::Sqlite {
+        path: Some(
+            temp.path()
+                .join("sessions.db")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    };
+    let store = SessionStore::connect(&backend, temp.path(), "trailing-display")
+        .await
+        .unwrap();
+    let (mut runner, _handle) = SessionRunner::new(
+        Agent::new(
+            Box::new(ScriptedAssistantModel {
+                replies: VecDeque::new(),
+            }),
+            Vec::new(),
+        ),
+        store,
+        temp.path().into(),
+        "trailing-display".into(),
+        IdlePolicy::WaitForInput,
+    );
+    // 206 rows: display is `[6..=205, 0..=5]`, so the newest 200 PHYSICAL keys
+    // are displayed FIRST and the six lowest seqs display last — the head page
+    // (limit 200) selects display 0..200 and leaves 200..206 trailing.
+    let total = 206usize;
+    for index in 0..total {
+        let (seq, event_time_us) = if index < 200 {
+            (index as i64 + 6, 1_000 + index as i64)
+        } else {
+            (index as i64 - 200, 5_000 + index as i64)
+        };
+        runner.agent.apply_entry_located(
+            SessionEntry::from(Message::User {
+                content: format!("row{index}"),
+                images: vec![],
+            }),
+            Some(crate::session_store::EntryLocation {
+                backend: "sqlite",
+                fingerprint: "f".repeat(64),
+                backend_fp: "b".repeat(32),
+                session: "trailing-display".into(),
+                key: crate::session_store::LocatedKey::Sqlite { seq, event_time_us },
+                entry_hash: String::new(),
+            }),
+        );
+    }
+    assert_eq!(runner.agent.history().len(), total);
+    {
+        let mut shared = runner.shared.lock().unwrap();
+        shared.set_history_boundary(total - 1);
+        shared.emit_presentation(AgentEvent::Display("trailing display".into()));
+    }
+
+    runner.prepare_web_attach();
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    respond_web_attach_shared(&runner.shared, reply);
+    let attach = rx.await.unwrap();
+    assert_eq!(attach.entries.len(), 200, "the head stays bounded");
+    let displays: Vec<_> = attach
+        .replay
+        .iter()
+        .filter(|item| matches!(item.event, AgentEvent::Display(_)))
+        .collect();
+    assert_eq!(displays.len(), 1, "replayed exactly once, not dropped");
+    assert!(displays[0].transient);
+    assert_eq!(
+        displays[0].head_boundary,
+        Some(attach.entries.len()),
+        "mapped past the selected rows to the final returned-entry offset"
+    );
+}
+
 #[tokio::test]
 async fn web_attach_replays_only_transients_in_the_head_history_range() {
     let temp = tempfile::tempdir().unwrap();

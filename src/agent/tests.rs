@@ -5116,6 +5116,332 @@ fn web_head_of_a_head_only_session_uses_its_recorded_older_route() {
     assert_eq!(cursor_session.as_deref(), Some("own-session"));
 }
 
+/// A SQLite located key: `seq` plus its winning event time.
+fn sqlite_location(session: &str, seq: i64, event_time_us: i64) -> EntryLocation {
+    EntryLocation {
+        backend: "sqlite",
+        fingerprint: "f".repeat(64),
+        backend_fp: "b".repeat(32),
+        session: session.to_owned(),
+        key: crate::session_store::LocatedKey::Sqlite { seq, event_time_us },
+        entry_hash: String::new(),
+    }
+}
+
+/// The live Web bootstrap head widens exactly like the historical `/history`
+/// page: the frozen interval starts right AFTER the previous compaction, so the
+/// rows the newest compaction summarized reach the client instead of surviving
+/// only as its provider-projection `retained` tail. The cursor is the MINIMUM
+/// seq of that interval — never the first displayed row.
+#[test]
+fn web_head_bootstrap_widens_to_the_previous_compaction() {
+    let session = "bootstrap-widen";
+    let compaction = |summary: &str| SessionEntry::Compaction {
+        summary: summary.into(),
+        retained: vec![Message::User {
+            content: "retained".into(),
+            images: vec![],
+        }],
+        current_prompt_at: None,
+        no_current_prompt: true,
+    };
+    let user = |text: &str| {
+        SessionEntry::from(Message::User {
+            content: text.into(),
+            images: vec![],
+        })
+    };
+    let new_agent = || {
+        Agent::new(
+            Box::new(ScriptedModel {
+                replies: vec![],
+                requests: Arc::new(Mutex::new(Vec::new())),
+                delays: Default::default(),
+            }),
+            vec![],
+        )
+    };
+
+    // seqs: q0=0, c1=1, q1=2, c2=3, q2=4.
+    let history = vec![
+        user("q0"),
+        compaction("c1"),
+        user("q1"),
+        compaction("c2"),
+        user("q2"),
+    ];
+    let mut agent = new_agent();
+    agent.restore_located(
+        history.clone(),
+        (0..history.len())
+            .map(|seq| Some(sqlite_location(session, seq as i64, 1_000 + seq as i64)))
+            .collect(),
+    );
+    let (entries, locations, cursor, cursor_session, start, end, _) =
+        agent.web_head_page(200, false);
+    assert_eq!(
+        (start, end),
+        (2, 5),
+        "the interval starts after the PREVIOUS compaction"
+    );
+    assert_eq!(entries, history[2..].to_vec(), "q1, c2, q2");
+    assert_eq!(locations.len(), entries.len());
+    assert_eq!(cursor, Some(2), "minimum seq of the frozen interval");
+    assert!(cursor_session.is_none());
+
+    // Display order can disagree with seq order: a rewritten row displayed LAST
+    // still bounds the cursor, so the next page cannot re-return it.
+    // seqs: zero=0, c1=1, rewritten=2 (displayed last), three=3, c2=4,
+    // five=5, six=6.
+    let rewritten = user("two rewritten");
+    let history = vec![
+        user("zero"),
+        compaction("c1"),
+        user("three"),
+        compaction("c2"),
+        user("five"),
+        user("six"),
+        rewritten.clone(),
+    ];
+    let seqs = [0i64, 1, 3, 4, 5, 6, 2];
+    let mut agent = new_agent();
+    agent.restore_located(
+        history.clone(),
+        seqs.iter()
+            .enumerate()
+            .map(|(index, seq)| {
+                // The rewrite's event time is the newest of the session, which
+                // is why it is displayed last.
+                let event_time = if *seq == 2 {
+                    9_000
+                } else {
+                    1_000 + index as i64
+                };
+                Some(sqlite_location(session, *seq, event_time))
+            })
+            .collect(),
+    );
+    let (entries, _, cursor, _, start, end, _) = agent.web_head_page(200, false);
+    assert_eq!(
+        (start, end),
+        (2, 7),
+        "after the previous compaction (index 1)"
+    );
+    assert_eq!(entries.first(), Some(&history[2]), "seq 3 displays first");
+    assert_eq!(
+        entries.last(),
+        Some(&rewritten),
+        "the rewrite displays last"
+    );
+    assert_eq!(
+        cursor,
+        Some(2),
+        "cursor = minimum seq, not the first displayed row's seq"
+    );
+
+    // LIMITATION (documented on `web_head_page`): resume loads HEAD-ONLY, so a
+    // resumed session's history starts at its newest compaction and there is
+    // nothing to widen into — the recorded older route still names the rows
+    // below.
+    let mut head_only = new_agent();
+    head_only.restore_located(
+        vec![compaction("c2"), user("q2")],
+        vec![
+            Some(sqlite_location(session, 3, 1_003)),
+            Some(sqlite_location(session, 4, 1_004)),
+        ],
+    );
+    head_only.set_older_route(Some(("own-session".into(), 2)));
+    let (entries, _, cursor, cursor_session, start, end, _) = head_only.web_head_page(200, false);
+    assert_eq!((start, end), (0, 2), "nothing to widen into");
+    assert_eq!(entries.len(), 2);
+    assert_eq!(cursor, Some(2), "older rows exist below the head");
+    assert_eq!(cursor_session.as_deref(), Some("own-session"));
+}
+
+/// The bounded head is selected by PHYSICAL SEQ and only then emitted in
+/// display order. A display-position bound would hand out a page whose lowest
+/// seq is not the cursor's floor, stranding the seqs between that floor and the
+/// display tail: with display `[0, 1, 3, 4, 5, 6, 2]` and `limit = 3` the old
+/// last-three-displayed selection is `[5, 6, 2]`, cursor `2`, so seqs 3 and 4
+/// are returned by NO page.
+#[test]
+fn web_head_page_selects_the_bounded_interval_by_seq_not_by_display_position() {
+    let session = "widen-seq-first";
+    let user = |text: &str| {
+        SessionEntry::from(Message::User {
+            content: text.into(),
+            images: vec![],
+        })
+    };
+    let located_agent = |history: Vec<SessionEntry>, keys: &[(i64, i64)]| {
+        let mut agent = Agent::new(
+            Box::new(ScriptedModel {
+                replies: vec![],
+                requests: Arc::new(Mutex::new(Vec::new())),
+                delays: Default::default(),
+            }),
+            vec![],
+        );
+        agent.restore_located(
+            history,
+            keys.iter()
+                .map(|(seq, event_time)| Some(sqlite_location(session, *seq, *event_time)))
+                .collect(),
+        );
+        agent
+    };
+
+    // Display order seqs: 0, 1, 3, 4, 5, 6, 2 — seq 2 is a rewrite whose winning
+    // event time is the newest, so it displays LAST.
+    let history: Vec<SessionEntry> = ["zero", "one", "three", "four", "five", "six", "two"]
+        .into_iter()
+        .map(user)
+        .collect();
+    let keys = [
+        (0i64, 1_000i64),
+        (1, 1_001),
+        (3, 1_003),
+        (4, 1_004),
+        (5, 1_005),
+        (6, 1_006),
+        (2, 9_000),
+    ];
+    let agent = located_agent(history.clone(), &keys);
+    let (entries, locations, cursor, _, start, end, boundaries) = agent.web_head_page(3, false);
+    // The three highest KEYS are 4, 5, 6 (display positions 3..6), not the
+    // three newest displayed rows.
+    assert_eq!(entries, history[3..6].to_vec(), "seqs 4, 5, 6");
+    assert_eq!(locations.len(), entries.len());
+    assert_eq!(
+        (start, end),
+        (3, 7),
+        "start = first selected row, end = the frozen logical end"
+    );
+    assert_eq!(
+        boundaries,
+        vec![0, 1, 2, 3, 3],
+        "the map runs to the frozen logical end: the unselected trailing row \
+         (seq 2, displayed last) maps to the final offset"
+    );
+    assert_eq!(cursor, Some(4), "cursor = the page's lowest physical seq");
+
+    // Follow the cursor: every seq is returned exactly once, none stranded.
+    let mut seen: Vec<i64> = vec![4, 5, 6];
+    let mut before = cursor;
+    while let Some(bound) = before {
+        // `load_older(bound)` returns the located rows below the bound and a
+        // cursor at the lowest seq it returned.
+        let page: Vec<i64> = keys
+            .iter()
+            .map(|(seq, _)| *seq)
+            .filter(|seq| *seq < bound)
+            .collect();
+        seen.extend(&page);
+        before = page.iter().copied().min();
+    }
+    seen.sort_unstable();
+    assert_eq!(
+        seen,
+        vec![0, 1, 2, 3, 4, 5, 6],
+        "no seq is lost between the page and the cursor"
+    );
+
+    // A row the physical selection SKIPPED inside the returned display span (an
+    // older seq displayed between two selected rows) consumes a logical boundary
+    // without adding a returned entry, so presentation offsets stay aligned.
+    let history: Vec<SessionEntry> = ["zero", "five", "one", "six", "two"]
+        .into_iter()
+        .map(user)
+        .collect();
+    let keys = [
+        (0i64, 1_000i64),
+        (5, 1_005),
+        (1, 1_001),
+        (6, 1_006),
+        (2, 9_000),
+    ];
+    let agent = located_agent(history.clone(), &keys);
+    let (entries, _, cursor, _, start, end, boundaries) = agent.web_head_page(2, false);
+    assert_eq!(
+        entries,
+        vec![history[1].clone(), history[3].clone()],
+        "the two highest keys, displayed in event-time order"
+    );
+    assert_eq!(
+        (start, end),
+        (1, 5),
+        "start = first selected row, end = the frozen logical end"
+    );
+    assert_eq!(
+        boundaries,
+        vec![0, 1, 1, 2, 2],
+        "seq 1 adds no entry; the trailing unselected row maps to the final offset"
+    );
+    assert_eq!(cursor, Some(5));
+
+    // The PREVIOUS compaction is identified by PHYSICAL SEQ, never by display
+    // position: display `[4, C2, 3, 5, C6]` puts the previous compaction (seq 2)
+    // between the segment's rows, so a display-index cutoff drops seq 4 from the
+    // page while the cursor still skips over it — stranding it below the cursor.
+    let compaction = |summary: &str| SessionEntry::Compaction {
+        summary: summary.into(),
+        retained: vec![],
+        current_prompt_at: None,
+        no_current_prompt: true,
+    };
+    let history = vec![
+        user("four"),
+        compaction("c2"),
+        user("three"),
+        user("five"),
+        compaction("c6"),
+    ];
+    let keys = [
+        (4i64, 1_004i64),
+        (2, 1_002),
+        (3, 1_003),
+        (5, 1_005),
+        (6, 1_006),
+    ];
+    let agent = located_agent(history.clone(), &keys);
+    let (entries, _, cursor, _, start, end, _) = agent.web_head_page(200, false);
+    assert_eq!(
+        entries,
+        vec![
+            history[0].clone(),
+            history[2].clone(),
+            history[3].clone(),
+            history[4].clone()
+        ],
+        "seqs 4, 3, 5, C6 in display order; the previous compaction is excluded"
+    );
+    assert_eq!(
+        (start, end),
+        (0, 5),
+        "seq 4 is at display index 0 even though its seq is above the previous compaction"
+    );
+    assert_eq!(cursor, Some(3), "the segment's lowest physical seq");
+    // Follow the cursor: seq 4 rides in the page instead of being stranded.
+    let mut seen: Vec<i64> = vec![4, 3, 5, 6];
+    let mut before = cursor;
+    while let Some(bound) = before {
+        let page: Vec<i64> = keys
+            .iter()
+            .map(|(seq, _)| *seq)
+            .filter(|seq| *seq < bound)
+            .collect();
+        seen.extend(&page);
+        before = page.iter().copied().min();
+    }
+    seen.sort_unstable();
+    assert_eq!(
+        seen,
+        vec![2, 3, 4, 5, 6],
+        "no seq is lost: the previous compaction row opens the older page"
+    );
+}
+
 /// The child's own messages still compact normally: once the newest
 /// compaction is the child's own, the projection no longer reaches into the
 /// inherited prefix and the snapshot carries only child-owned messages.

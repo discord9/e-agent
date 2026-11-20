@@ -5856,3 +5856,514 @@ async fn head_page_probe_finds_a_marker_beyond_a_sparse_seq() {
     assert!(page.locations[..2].iter().all(Option::is_none));
     assert!(page.locations[2..].iter().all(Option::is_some));
 }
+
+// --- `GET /api/sessions/{id}/history` head page: seq-interval widening ----
+//
+// A compaction's `retained` field is a PROVIDER projection (bounded request
+// copies, synthetic `INTERRUPTED` results, no `Error`/`GoalUpdated` rows), so
+// no row count derived from it names the original pre-compaction rows. The
+// head page is therefore widened into the CONTIGUOUS seq interval that starts
+// right after the PREVIOUS compaction row (never crossing it) and ends at the
+// newest row, trimmed by `limit` — the compaction + post rows are the newest
+// rows, so they keep their budget. The cursor is the MINIMUM included seq,
+// never the first displayed row: rows are displayed in event-time order.
+
+fn tail_user(content: &str) -> SessionEntry {
+    Message::User {
+        content: content.into(),
+        images: vec![],
+    }
+    .into()
+}
+
+fn tail_assistant(content: &str) -> SessionEntry {
+    Message::Assistant(AssistantMessage {
+        content: Some(content.into()),
+        tool_calls: vec![],
+        reasoning: None,
+    })
+    .into()
+}
+
+/// An assistant turn that REQUESTS `ids` (a tool batch).
+fn tail_tool_call(ids: &[&str]) -> SessionEntry {
+    Message::Assistant(AssistantMessage {
+        content: None,
+        tool_calls: ids
+            .iter()
+            .map(|id| crate::agent::ToolCall {
+                id: (*id).into(),
+                name: "bash".into(),
+                arguments: "{}".into(),
+            })
+            .collect(),
+        reasoning: None,
+    })
+    .into()
+}
+
+fn tail_tool_result(id: &str, content: &str) -> SessionEntry {
+    Message::Tool {
+        call_id: id.into(),
+        name: "bash".into(),
+        content: content.into(),
+        images: vec![],
+        is_error: false,
+        synthetic: false,
+    }
+    .into()
+}
+
+fn tail_compaction(summary: &str, retained: Vec<Message>) -> SessionEntry {
+    SessionEntry::Compaction {
+        summary: summary.into(),
+        retained,
+        current_prompt_at: None,
+        no_current_prompt: true,
+    }
+}
+
+/// A `retained` tail of `count` messages: its LENGTH must never size the head
+/// page (it is a provider projection, not a row count).
+fn synthetic_retained(count: usize) -> Vec<Message> {
+    (0..count)
+        .map(|i| Message::User {
+            content: format!("synthetic retained {i}"),
+            images: vec![],
+        })
+        .collect()
+}
+
+/// The seqs of one located page, in DISPLAY order.
+fn page_seqs(page: &crate::session_store::LocatedHistoryPage) -> Vec<i64> {
+    page.locations
+        .iter()
+        .map(|location| {
+            location
+                .as_ref()
+                .expect("every SQL row is located")
+                .key
+                .seq()
+        })
+        .collect()
+}
+
+/// Two compactions: the head page is the contiguous interval from just after
+/// the PREVIOUS compaction through the newest row, so the rows the latest
+/// compaction summarized are displayed next to their summary. The previous
+/// compaction row itself stays out (it opens the next older page), and the
+/// whole chain still covers every row exactly once.
+#[tokio::test]
+async fn head_page_widens_to_the_previous_compaction_boundary() {
+    use crate::session_store::SessionStore;
+
+    let (dir, path) = temp_db();
+    let root = dir.path();
+    let backend = crate::config::SessionBackend::Sqlite {
+        path: Some(path.to_string_lossy().into_owned()),
+    };
+    let sid = "history-widen-two-compactions";
+    let store = SessionStore::connect(&backend, root, sid).await.unwrap();
+
+    // seqs: 0 q0, 1 a0, 2 comp1, 3 q1, 4 a1, 5 comp2, 6 q2, 7 a2.
+    let entries = vec![
+        tail_user("q0"),
+        tail_assistant("a0"),
+        tail_compaction("c1", synthetic_retained(2)),
+        tail_user("q1"),
+        tail_assistant("a1"),
+        tail_compaction("c2", synthetic_retained(2)),
+        tail_user("q2"),
+        tail_assistant("a2"),
+    ];
+    store.append(root, sid, &entries).await.unwrap();
+
+    let head = store.load_head_page_located(root, sid, None).await.unwrap();
+    assert_eq!(
+        head.entries,
+        entries[3..].to_vec(),
+        "interval = (previous compaction, newest]: q1, a1, comp2, q2, a2"
+    );
+    assert_eq!(page_seqs(&head), vec![3, 4, 5, 6, 7]);
+    assert_eq!(
+        head.next_before_seq,
+        Some(3),
+        "cursor = minimum included seq"
+    );
+
+    // The previous compaction row opens the next older page (it is the
+    // interval's boundary, never part of the head), then the rows below it.
+    let opening = store.load_older_located(root, sid, 3, None).await.unwrap();
+    assert_eq!(opening.entries, vec![entries[2].clone()]);
+    assert_eq!(opening.next_before_seq, Some(2));
+    let oldest = store.load_older_located(root, sid, 2, None).await.unwrap();
+    assert_eq!(oldest.entries, entries[..2].to_vec());
+    assert_eq!(oldest.next_before_seq, None);
+
+    let mut seen = page_seqs(&head);
+    seen.extend(page_seqs(&opening));
+    seen.extend(page_seqs(&oldest));
+    seen.sort_unstable();
+    assert_eq!(seen, vec![0, 1, 2, 3, 4, 5, 6, 7], "no gap, no duplicate");
+}
+
+/// A marker-first zero-copy fork child that compacted on its OWN: the interval
+/// stops above its `ForkedFrom` marker (the rows below belong to the ancestor),
+/// the oversized synthetic `retained` tail never sizes the page, and the
+/// existing fork-aware older-page handoff still names the ancestor.
+#[tokio::test]
+async fn head_page_widening_stops_at_a_marker_first_fork_cut() {
+    use crate::session_store::SessionStore;
+
+    let (dir, path) = temp_db();
+    let root = dir.path();
+    let backend = crate::config::SessionBackend::Sqlite {
+        path: Some(path.to_string_lossy().into_owned()),
+    };
+    let parent = SessionStore::connect(&backend, root, "widen-parent")
+        .await
+        .unwrap();
+    parent
+        .append(
+            root,
+            "widen-parent",
+            &[tail_user("p0"), tail_assistant("p1")],
+        )
+        .await
+        .unwrap();
+
+    // The child's FIRST stored row is its zero-copy marker: nothing of its own
+    // exists below it, and its `seq` field is the ANCESTOR's cut.
+    let child = SessionStore::connect(&backend, root, "widen-child")
+        .await
+        .unwrap();
+    child
+        .append(
+            root,
+            "widen-child",
+            &[SessionEntry::ForkedFrom {
+                source: "widen-parent".into(),
+                at: None,
+                event_time: None,
+                seq: Some(1),
+            }],
+        )
+        .await
+        .unwrap();
+    let own = vec![
+        tail_user("c0"),
+        tail_assistant("c1"),
+        tail_tool_call(&["call_1"]),
+        tail_tool_result("call_1", "ok"),
+        // An oversized synthetic retained tail: 300 messages, five own rows.
+        tail_compaction("child summary", synthetic_retained(300)),
+        tail_user("c2"),
+        tail_assistant("c3"),
+    ];
+    child.append(root, "widen-child", &own).await.unwrap();
+
+    let head = child
+        .load_head_page_located(root, "widen-child", Some(200))
+        .await
+        .unwrap();
+    assert_eq!(
+        head.entries, own,
+        "own rows only: the marker and the ancestor rows stay out"
+    );
+    assert_eq!(page_seqs(&head), vec![1, 2, 3, 4, 5, 6, 7]);
+    assert_eq!(
+        head.next_before_seq,
+        Some(1),
+        "cursor = the child's own first seq, above the marker"
+    );
+
+    // The fork-aware handoff is unchanged: the marker row comes next and names
+    // the ancestor (the marker's `seq` is the ancestor's cut, +1 = inclusive).
+    let marker_page = child
+        .load_fork_older_located(root, "widen-child", 1, None)
+        .await
+        .unwrap();
+    assert_eq!(marker_page.entries.len(), 1);
+    assert!(matches!(
+        marker_page.entries[0],
+        SessionEntry::ForkedFrom { at: None, .. }
+    ));
+    assert_eq!(marker_page.next_before_seq, Some(2));
+    assert_eq!(
+        marker_page.next_older_session.as_deref(),
+        Some("widen-parent")
+    );
+
+    // The ancestor serves the rows below its cut — never the child's own rows
+    // again.
+    let ancestor = child
+        .load_fork_older_located(root, "widen-parent", 2, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        ancestor.entries,
+        vec![tail_user("p0"), tail_assistant("p1")]
+    );
+    assert_eq!(ancestor.next_before_seq, None);
+}
+
+/// An orphan tool result (a result whose call no assistant requested) sits in
+/// the widened interval like any other row: it neither hides the assistant turn
+/// before it nor shifts the cursor, because the window is a seq interval, not a
+/// count of message-shaped rows.
+#[tokio::test]
+async fn head_page_widening_keeps_orphan_tool_results_visible() {
+    use crate::session_store::SessionStore;
+
+    let (dir, path) = temp_db();
+    let root = dir.path();
+    let backend = crate::config::SessionBackend::Sqlite {
+        path: Some(path.to_string_lossy().into_owned()),
+    };
+    let sid = "history-widen-orphan";
+    let store = SessionStore::connect(&backend, root, sid).await.unwrap();
+
+    // seqs: 0 q0, 1 A (tool call), 2 ORPHAN tool result, 3 B, 4 compaction,
+    // 5 q1, 6 a1.
+    let entries = vec![
+        tail_user("q0"),
+        tail_tool_call(&["call_A"]),
+        tail_tool_result("call_never_requested", "orphan"),
+        tail_assistant("B"),
+        tail_compaction(
+            "summary",
+            vec![Message::User {
+                content: "q0".into(),
+                images: vec![],
+            }],
+        ),
+        tail_user("q1"),
+        tail_assistant("a1"),
+    ];
+    store.append(root, sid, &entries).await.unwrap();
+
+    let head = store
+        .load_head_page_located(root, sid, Some(6))
+        .await
+        .unwrap();
+    assert_eq!(head.entries.len(), 6, "the limit is not exceeded");
+    assert_eq!(
+        head.entries,
+        entries[1..].to_vec(),
+        "A stays visible in front of the orphan result, in display order"
+    );
+    assert_eq!(page_seqs(&head), vec![1, 2, 3, 4, 5, 6]);
+    assert_eq!(head.next_before_seq, Some(1));
+
+    let older = store.load_older_located(root, sid, 1, None).await.unwrap();
+    assert_eq!(older.entries, vec![tail_user("q0")]);
+    assert_eq!(older.next_before_seq, None);
+}
+
+/// The trimmed interval's cursor must not re-return an already displayed seq:
+/// with an out-of-order winning rewrite the page is displayed in event-time
+/// order (so the first displayed row is NOT the oldest seq), while the cursor
+/// stays the MINIMUM included seq.
+#[tokio::test]
+async fn head_page_widening_cursor_is_the_minimum_seq_not_the_first_displayed_row() {
+    use crate::session_store::SessionStore;
+
+    let (dir, path) = temp_db();
+    let root = dir.path();
+    let backend = crate::config::SessionBackend::Sqlite {
+        path: Some(path.to_string_lossy().into_owned()),
+    };
+    let sid = "history-widen-out-of-order";
+    let store = SessionStore::connect(&backend, root, sid).await.unwrap();
+
+    // seqs: 0 zero, 1 comp1, 2 two, 3 three, 4 comp2, 5 five, 6 six.
+    let entries = vec![
+        tail_user("zero"),
+        tail_compaction("one", vec![]),
+        tail_user("two"),
+        tail_user("three"),
+        tail_compaction("four", vec![]),
+        tail_user("five"),
+        tail_user("six"),
+    ];
+    store.append(root, sid, &entries).await.unwrap();
+
+    // A second physical version of seq 2 with a LATER event time wins the
+    // logical row, so its display position is unrelated to its seq.
+    let replacement = tail_user("two replacement");
+    rewrite_row(&store, 2, &replacement).await;
+
+    let head = store.load_head_page_located(root, sid, None).await.unwrap();
+    assert_eq!(
+        page_seqs(&head),
+        vec![3, 4, 5, 6, 2],
+        "event-time display order: the rewritten seq 2 sorts last"
+    );
+    assert_eq!(head.entries.last().unwrap(), &replacement);
+    assert_eq!(
+        head.next_before_seq,
+        Some(2),
+        "cursor = minimum included seq, not the first displayed row (seq 3)"
+    );
+
+    // The next page starts BELOW the cursor, so the displayed seq 2 is never
+    // returned twice (a cursor of 3 would return it again).
+    let older = store.load_older_located(root, sid, 2, None).await.unwrap();
+    assert_eq!(older.entries, vec![entries[1].clone()]);
+    assert_eq!(older.next_before_seq, Some(1));
+}
+
+/// Rewrite one physical row: same `seq`, a NEWER `event_time_us`, so the new
+/// version wins the logical row while its DISPLAY position moves to the end
+/// (event-time order is display order).
+async fn rewrite_row(store: &crate::session_store::SessionStore, seq: i64, entry: &SessionEntry) {
+    let crate::session_store::SessionStore::Sqlite { session, .. } = store else {
+        panic!("expected the sqlite backend");
+    };
+    let session = session.lock().await;
+    let conn = session.conn.lock().await;
+    conn.execute(
+        "INSERT INTO session_entries \
+         (workspace_id, session_id, seq, event_time_us, entry_kind, payload, \
+          schema_version, is_error) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, 0)",
+        (
+            session.workspace_id.as_str(),
+            session.session_id.as_str(),
+            seq,
+            crate::session_store::next_event_time_us(),
+            entry_kind(entry),
+            serde_json::to_string(entry).unwrap(),
+        ),
+    )
+    .await
+    .unwrap();
+}
+
+/// The widening decision is made on the page's OLDEST PHYSICAL row, never its
+/// first displayed one: a rewritten compaction (same seq, later winning event
+/// time) displays LAST while it still opens the head segment.
+#[tokio::test]
+async fn head_page_widening_follows_a_rewritten_compaction_row() {
+    use crate::session_store::SessionStore;
+
+    let (dir, path) = temp_db();
+    let root = dir.path();
+    let backend = crate::config::SessionBackend::Sqlite {
+        path: Some(path.to_string_lossy().into_owned()),
+    };
+    let sid = "history-widen-rewritten-compaction";
+    let store = SessionStore::connect(&backend, root, sid).await.unwrap();
+
+    // seqs: 0 q0, 1 a0, 2 comp1, 3 q1, 4 a1, 5 comp2, 6 q2.
+    let entries = vec![
+        tail_user("q0"),
+        tail_assistant("a0"),
+        tail_compaction("c1", synthetic_retained(2)),
+        tail_user("q1"),
+        tail_assistant("a1"),
+        tail_compaction("c2", synthetic_retained(50)),
+        tail_user("q2"),
+    ];
+    store.append(root, sid, &entries).await.unwrap();
+
+    // The head segment's OWN compaction (seq 5) is rewritten with the session's
+    // newest event time: the head page now displays `[6, 5]`, so its first
+    // DISPLAYED row is no longer the compaction.
+    let rewritten = tail_compaction("c2 rewritten", vec![]);
+    rewrite_row(&store, 5, &rewritten).await;
+
+    // limit 4: the two-row head segment (5, 6) keeps its budget, the remaining
+    // two slots widen down to seq 3 — never across the previous compaction (2).
+    let head = store
+        .load_head_page_located(root, sid, Some(4))
+        .await
+        .unwrap();
+    assert_eq!(head.entries.len(), 4, "the requested limit is preserved");
+    assert_eq!(page_seqs(&head), vec![3, 4, 6, 5]);
+    assert_eq!(
+        head.entries.last(),
+        Some(&rewritten),
+        "the rewritten compaction displays last"
+    );
+    assert_eq!(
+        head.next_before_seq,
+        Some(3),
+        "cursor = minimum included seq"
+    );
+
+    // The previous compaction row opens the next page, so the pre-compaction
+    // rows stay reachable in one step.
+    let older = store.load_older_located(root, sid, 3, None).await.unwrap();
+    assert_eq!(older.entries, vec![entries[2].clone()]);
+    assert_eq!(older.next_before_seq, Some(2));
+}
+
+/// `limit`: the compaction + post-compaction rows are the newest rows of the
+/// interval, so they keep their budget and only the remainder widens the page.
+/// A page truncated below the compaction is returned untouched; the rest stays
+/// reachable through the cursor.
+#[tokio::test]
+async fn head_page_widening_respects_the_limit() {
+    use crate::session_store::SessionStore;
+
+    let (dir, path) = temp_db();
+    let root = dir.path();
+    let backend = crate::config::SessionBackend::Sqlite {
+        path: Some(path.to_string_lossy().into_owned()),
+    };
+    let sid = "history-widen-limit";
+    let store = SessionStore::connect(&backend, root, sid).await.unwrap();
+
+    // seqs: 0 q0, 1 a0, 2 q1, 3 a1, 4 comp, 5 q2, 6 a2.
+    let entries = vec![
+        tail_user("q0"),
+        tail_assistant("a0"),
+        tail_user("q1"),
+        tail_assistant("a1"),
+        tail_compaction("summary", synthetic_retained(50)),
+        tail_user("q2"),
+        tail_assistant("a2"),
+    ];
+    store.append(root, sid, &entries).await.unwrap();
+
+    // No limit: the whole interval (no previous compaction) — the synthetic
+    // retained length does not grow it.
+    let head = store.load_head_page_located(root, sid, None).await.unwrap();
+    assert_eq!(head.entries, entries);
+    assert_eq!(
+        head.next_before_seq, None,
+        "seq 0 is the session's first row"
+    );
+
+    // limit 4 = compaction + 2 post rows + 1 widened row.
+    let head = store
+        .load_head_page_located(root, sid, Some(4))
+        .await
+        .unwrap();
+    assert_eq!(head.entries.len(), 4, "the requested limit is preserved");
+    assert_eq!(head.entries, entries[3..].to_vec());
+    assert_eq!(page_seqs(&head), vec![3, 4, 5, 6]);
+    assert_eq!(head.next_before_seq, Some(3));
+
+    // limit 2 does not reach the compaction: the newest rows stay, and the
+    // cursor walks down through the truncated interval without stranding a row.
+    let mut seen: Vec<i64> = Vec::new();
+    let mut page = store
+        .load_head_page_located(root, sid, Some(2))
+        .await
+        .unwrap();
+    assert_eq!(page.entries, entries[5..].to_vec(), "newest rows first");
+    loop {
+        assert!(page.entries.len() <= 2, "every page stays bounded");
+        seen.extend(page_seqs(&page));
+        let Some(before) = page.next_before_seq else {
+            break;
+        };
+        page = store
+            .load_older_located(root, sid, before, Some(2))
+            .await
+            .unwrap();
+    }
+    seen.sort_unstable();
+    assert_eq!(seen, vec![0, 1, 2, 3, 4, 5, 6], "the chain loses no row");
+}

@@ -1264,7 +1264,10 @@ impl ContextItem {
 /// `(entries, locations, next_before_seq, next_older_session, history_start,
 /// history_end, returned_boundaries)`: `next_older_session` names the session
 /// that owns the cursor when the older AUDIT rows live in a fork ANCESTOR
-/// (`None` = this session).
+/// (`None` = this session). `history_start` is the first DISPLAY index of the
+/// selection and `history_end` the frozen logical end (`history.len()`, not the
+/// last selected row), so `returned_boundaries` maps every logical boundary in
+/// `history_start..=history_end` — trailing unselected rows included.
 type WebHeadPage = (
     Vec<SessionEntry>,
     Vec<Option<EntryLocation>>,
@@ -1551,72 +1554,160 @@ impl Agent {
     /// Bounded authoritative head projection for a live Web attach.  The
     /// runner owns this projection; it is derived from the same located
     /// history that it just committed, never from the presentation log.
+    ///
+    /// The frozen interval ends at the newest row and starts just after the
+    /// PREVIOUS compaction (never crossing it), so the original rows the newest
+    /// compaction summarized are part of the head instead of only its
+    /// provider-projection `retained` tail. LIMITATION: resume loads HEAD-ONLY
+    /// (`SessionFactory` restores `load_fork_head_located`), so a resumed
+    /// session's in-memory history starts at its newest compaction and there is
+    /// nothing to widen into; those rows stay reachable through
+    /// `next_before_seq` (the `older_route`), and a historical session's
+    /// `/history` page widens in the store instead.
+    ///
+    /// The bound is chosen by PHYSICAL SEQ and the selected rows are then
+    /// emitted in display order: the cursor is a physical lower bound, so a
+    /// display-position bound would leave rows below the cursor that the page
+    /// never returned.
     pub(crate) fn web_head_page(&self, limit: usize, jsonl: bool) -> WebHeadPage {
-        // A zero-copy fork child's inherited prefix has no child physical
-        // rows, so neither a bounded tail nor a physical cursor can address
-        // it: the whole resolved history is the authoritative head, exactly
-        // like `SessionStore::load_head_page_located` (no cursor, no older
-        // page). A bounded tail here would strand the inherited prefix.
-        let history_start = if self.inherited > 0 {
-            0
+        let total = self.history.len();
+        let seq_of = |location: &EntryLocation| match &location.key {
+            crate::session_store::LocatedKey::Jsonl { ordinal } => *ordinal,
+            crate::session_store::LocatedKey::Sqlite { seq, .. }
+            | crate::session_store::LocatedKey::Greptime { seq, .. } => *seq,
+        };
+        // A zero-copy fork child's inherited prefix has no child physical rows,
+        // so neither a bounded tail nor a physical cursor can address it: the
+        // whole resolved history is the authoritative head, exactly like
+        // `SessionStore::load_head_page_located` (no cursor, no older page). A
+        // bounded tail here would strand the inherited prefix. `jsonl` has no
+        // seq paging, so it keeps the whole loaded history as well.
+        //
+        // Contiguous interval widening (same rule as
+        // `SessionStore::widen_head_page`): the head segment starts right AFTER
+        // the PREVIOUS compaction, never crossing it, so the original rows the
+        // newest compaction summarized stay in the head instead of surviving
+        // only as its provider-projection `retained` tail.
+        //
+        // Compactions are ordered by PHYSICAL SEQ, never by display position:
+        // display is event-time order, so the previous compaction can sit
+        // anywhere in the history (a rewritten compaction even displays last),
+        // and a display-index cutoff would exclude rows whose seqs belong to the
+        // segment — stranding every one of them below the cursor. The floor is
+        // therefore an exclusive PHYSICAL bound applied to all located rows.
+        // A row with no key can only be bounded by display position.
+        let (display_floor, seq_floor) = if self.inherited > 0 || jsonl {
+            (0, None)
         } else {
-            let segment_start = if jsonl {
-                0
-            } else {
-                self.history
+            let mut compaction_seqs: Vec<i64> = self
+                .history
+                .iter()
+                .zip(&self.entry_locations)
+                .filter(|(entry, _)| matches!(entry, SessionEntry::Compaction { .. }))
+                .filter_map(|(_, location)| location.as_ref().map(seq_of))
+                .collect();
+            compaction_seqs.sort_unstable();
+            let seq_floor = compaction_seqs
+                .len()
+                .checked_sub(2)
+                .map(|previous| compaction_seqs[previous]);
+            let display_floor = match self
+                .history
+                .iter()
+                .rposition(|entry| matches!(entry, SessionEntry::Compaction { .. }))
+            {
+                Some(latest) => self.history[..latest]
                     .iter()
                     .rposition(|entry| matches!(entry, SessionEntry::Compaction { .. }))
-                    .unwrap_or(0)
+                    .map_or(0, |previous| previous + 1),
+                None => 0,
             };
-            self.history.len().saturating_sub(limit).max(segment_start)
+            (display_floor, seq_floor)
         };
-        let history_end = self.history.len();
+        // Rank by the PHYSICAL key: a row without one has no seq to bound by,
+        // and its only stable order is its display position (which IS the JSONL
+        // cursor space) — a no-op for a fully located session.
+        let head_key = |index: usize| {
+            self.entry_locations[index]
+                .as_ref()
+                .map_or(index as i64, seq_of)
+        };
+        // Select the bounded interval by physical seq FIRST: display order can
+        // disagree with seq order (a rewritten same-seq winner, a sparse seq), so
+        // a display-position bound hands out a page whose lowest seq is NOT the
+        // cursor's floor — the rows between that floor and the display tail are
+        // then unreachable from either side. The page is therefore the top
+        // `limit` KEYS of the segment, ordered for display afterwards.
+        let in_segment = |index: usize| match self.entry_locations[index].as_ref() {
+            Some(location) => seq_floor.is_none_or(|floor| seq_of(location) > floor),
+            None => index >= display_floor,
+        };
+        let mut selected = vec![false; total];
+        if self.inherited > 0 {
+            selected.fill(true);
+        } else {
+            let mut ranked: Vec<(i64, usize)> = (0..total)
+                .filter(|&index| in_segment(index))
+                .map(|index| (head_key(index), index))
+                .collect();
+            // Newest keys first; `max(1)` keeps at least the segment's lowest row
+            // so the cursor can never strand it.
+            ranked.sort_unstable_by_key(|&(key, _)| std::cmp::Reverse(key));
+            for &(_, index) in ranked.iter().take(limit.max(1)) {
+                selected[index] = true;
+            }
+        }
+        let history_start = selected.iter().position(|&slot| slot).unwrap_or(total);
+        // The map below always runs to the FROZEN LOGICAL END (`total`), not to
+        // the last selected row: a presentation event emitted after the selected
+        // rows (its logical boundary is past them) must still replay once, at the
+        // final returned-entry offset, instead of being dropped as out of range.
+        let history_end = total;
         // A fork context has no child physical row below its first entry: its
         // older AUDIT rows live in the session that stores them, so the cursor
         // is that owner's position (never a child seq). An ordinary session
-        // keeps the historical child-space cursor: the first physical row in
-        // the logical head interval (an unlocated fallback Error must not move
-        // it).
-        let (cursor, cursor_session) = if self.inherited > 0 || history_start == 0 {
-            // A fork context has no child physical row below its first entry,
-            // and an ordinary head that IS the whole loaded history has no
-            // first row to point at either: both use the route recorded when
-            // the session was loaded (which also covers a head that begins at
-            // the session's own row zero).
+        // keeps the historical child-space cursor: the lowest physical row the
+        // page returned (an unlocated fallback Error must not move it).
+        let selected_min = selected
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| **slot)
+            .filter_map(|(index, _)| self.entry_locations[index].as_ref().map(seq_of))
+            .min();
+        let located_min = self.entry_locations.iter().flatten().map(seq_of).min();
+        let (cursor, cursor_session) = if self.inherited > 0 || selected_min == located_min {
+            // A fork context has no child physical row below its first entry, and
+            // a page that already reaches the lowest located row this history
+            // holds has no row of its own to point at: both use the route
+            // recorded when the session was loaded.
             match &self.older_route {
                 Some((owner, seq)) => (Some(*seq), Some(owner.clone())),
                 None => (None, None),
             }
         } else {
-            let cursor = self.entry_locations[history_start..history_end]
-                .iter()
-                .find_map(|location| location.as_ref())
-                .map(|location| match &location.key {
-                    crate::session_store::LocatedKey::Jsonl { ordinal } => *ordinal,
-                    crate::session_store::LocatedKey::Sqlite { seq, .. }
-                    | crate::session_store::LocatedKey::Greptime { seq, .. } => *seq,
-                });
-            (cursor, None)
+            (selected_min, None)
         };
         let mut entries = Vec::new();
         let mut locations = Vec::new();
-        // Map every logical insertion boundary in the frozen interval to the
-        // returned physical-entry offset. Unlocated fallback Errors consume a
-        // logical boundary but do not shift returned entry indices.
+        // Map every logical insertion boundary in `history_start..total` to the
+        // returned physical-entry offset. A row the physical selection skipped
+        // (or an unlocated fallback Error) consumes a logical boundary but does
+        // not shift returned entry indices, so trailing unselected rows all map
+        // to the final offset.
         let mut returned_boundaries = Vec::with_capacity(history_end - history_start + 1);
         returned_boundaries.push(0);
-        for (entry, location) in self.history[history_start..history_end]
-            .iter()
-            .cloned()
-            .zip(
-                self.entry_locations[history_start..history_end]
-                    .iter()
-                    .cloned(),
-            )
-        {
-            if !matches!(entry, SessionEntry::Error { .. }) || location.is_some() {
-                entries.push(entry);
-                locations.push(location);
+        for (&slot, (entry, location)) in selected[history_start..history_end].iter().zip(
+            self.history[history_start..history_end]
+                .iter()
+                .zip(&self.entry_locations[history_start..history_end]),
+        ) {
+            if slot {
+                let entry = entry.clone();
+                let location = location.clone();
+                if !matches!(entry, SessionEntry::Error { .. }) || location.is_some() {
+                    entries.push(entry);
+                    locations.push(location);
+                }
             }
             returned_boundaries.push(entries.len());
         }

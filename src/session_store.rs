@@ -570,6 +570,34 @@ pub(crate) fn format_conflict_error(
 /// the Greptime and SQLite backends (JSONL has no seq-based paging).
 const HEAD_OPEN_SENTINEL: i64 = i64::MAX;
 
+/// Sort one seq-backend page into the canonical DISPLAY order the backends
+/// themselves use (winning `event_time` ASC, then `seq` ASC), keeping each
+/// row's aligned location with it. A row without a physical location (only
+/// possible for JSONL lines or an inherited prefix, never for a stored seq
+/// row) sorts last in its existing relative order.
+fn sort_page_display_order(
+    entries: &mut Vec<SessionEntry>,
+    locations: &mut Vec<Option<EntryLocation>>,
+) {
+    let mut rows: Vec<(Option<EntryLocation>, SessionEntry)> =
+        locations.drain(..).zip(entries.drain(..)).collect();
+    rows.sort_by_key(|(location, _)| {
+        location
+            .as_ref()
+            .map_or((u8::MAX, i64::MAX, i64::MAX), |location| {
+                (
+                    u8::MIN,
+                    location.key.event_time_us().unwrap_or(i64::MAX),
+                    location.key.seq(),
+                )
+            })
+    });
+    for (location, entry) in rows {
+        locations.push(location);
+        entries.push(entry);
+    }
+}
+
 /// The exact physical key of one persisted `session_entries` row/line, as
 /// stored by the owning backend. Pinned (never "latest wins"): a receipt
 /// issued against this key reads exactly this physical version, so a
@@ -1297,6 +1325,14 @@ impl SessionStore {
     /// The same bounded head contract as [`Self::load_head_page`], retaining
     /// each selected row's physical identity for Web reconciliation.
     ///
+    /// On the seq backends a head page that reaches the compaction opening the
+    /// head segment is WIDENED to the contiguous seq interval that starts just
+    /// after the PREVIOUS compaction (see [`Self::widen_head_page`]), so a Web
+    /// client renders the original pre-compaction rows instead of trying to
+    /// reconstruct them from the compaction's provider-projection `retained`
+    /// tail. JSONL needs none: it loads the whole session, so those rows are
+    /// already in the page.
+    ///
     /// A zero-copy fork child is resolved first
     /// ([`Self::load_fork_located`]): its physical rows are only the marker
     /// and its own entries, so a physical page would hide the inherited
@@ -1396,7 +1432,7 @@ impl SessionStore {
                 let (rows, next_before_seq) = session
                     .load_older_located(HEAD_OPEN_SENTINEL, limit)
                     .await?;
-                Ok(LocatedHistoryPage {
+                let page = LocatedHistoryPage {
                     entries: rows.iter().map(|(_, entry)| entry.clone()).collect(),
                     locations: rows
                         .into_iter()
@@ -1404,7 +1440,8 @@ impl SessionStore {
                         .collect(),
                     next_before_seq,
                     next_older_session: None,
-                })
+                };
+                self.widen_head_page(root, name, page, limit).await
             }
             #[cfg(feature = "sqlite")]
             SessionStore::Sqlite { session, .. } => {
@@ -1414,7 +1451,7 @@ impl SessionStore {
                     .load_older_located(HEAD_OPEN_SENTINEL, limit)
                     .await
                     .map_err(anyhow::Error::msg)?;
-                Ok(LocatedHistoryPage {
+                let page = LocatedHistoryPage {
                     entries: rows.iter().map(|(_, entry)| entry.clone()).collect(),
                     locations: rows
                         .into_iter()
@@ -1422,9 +1459,128 @@ impl SessionStore {
                         .collect(),
                     next_before_seq,
                     next_older_session: None,
-                })
+                };
+                self.widen_head_page(root, name, page, limit).await
             }
         }
+    }
+
+    /// Widen a seq-backend head page into the CONTIGUOUS seq interval that
+    /// ends at the newest row and starts right after the row that bounds it:
+    /// the PREVIOUS compaction (never crossed — that row opens the next
+    /// `load_older` page), or, for a zero-copy fork child, above its
+    /// marker/ancestor cut.
+    ///
+    /// Why an interval instead of a `retained.len()` row count: `retained` is a
+    /// provider projection (bounded request copies, synthetic `INTERRUPTED`
+    /// results, no `Error`/`GoalUpdated` rows, and orphan tool results the
+    /// pairing repair drops), so NO count derived from it names the original
+    /// rows — it under- or over-shoots by however many rows repair added or
+    /// dropped. The interval is derived from physical seqs alone, so notices,
+    /// background completions, tool results and orphan tool results are
+    /// included or trimmed by seq, never by kind.
+    ///
+    /// `limit` is preserved: the compaction and the post-compaction rows are
+    /// the NEWEST rows of the interval, so they keep their budget and only the
+    /// remainder widens the page — a page truncated below the compaction is
+    /// returned untouched. Whether the page still opens the head segment is
+    /// decided by its OLDEST PHYSICAL row (minimum seq), never its first
+    /// displayed one: display is event-time order, so a rewritten compaction can
+    /// display last. The cursor is the MINIMUM included seq, never the
+    /// first displayed row, for the same reason: a cursor taken from a
+    /// later-displayed but older-seq row would re-return that seq next page.
+    async fn widen_head_page(
+        &self,
+        root: &Path,
+        name: &str,
+        page: LocatedHistoryPage,
+        limit: Option<usize>,
+    ) -> Result<LocatedHistoryPage> {
+        // Only a page whose OLDEST PHYSICAL row is the compaction that starts the
+        // head segment reached that boundary; a `limit`-truncated page below it
+        // keeps the compaction + post rows it already returned. The oldest
+        // physical row is NOT `entries.first()`: display order is event-time
+        // order, so a rewritten compaction (same seq, later winning event time)
+        // displays LAST, and the page still opens the head segment.
+        let Some((opening, compaction_seq)) = page
+            .locations
+            .iter()
+            .enumerate()
+            .filter_map(|(index, location)| {
+                location
+                    .as_ref()
+                    .map(|location| (index, location.key.seq()))
+            })
+            .min_by_key(|&(_, seq)| seq)
+        else {
+            return Ok(page);
+        };
+        let Some(SessionEntry::Compaction { .. }) = page.entries.get(opening) else {
+            return Ok(page);
+        };
+        let budget = match limit {
+            Some(limit) => match limit.checked_sub(page.entries.len()) {
+                Some(0) | None => return Ok(page),
+                Some(budget) => Some(budget),
+            },
+            // No limit: the whole bounded interval, which still never crosses
+            // the previous compaction.
+            None => None,
+        };
+        let interval = self
+            .load_older_located(root, name, compaction_seq, budget)
+            .await?;
+        // A zero-copy fork child's own rows start ABOVE its marker row (which
+        // carries the ANCESTOR's cut, not a child seq): the rows at or below it
+        // belong to the ancestor, so the interval stops there and the existing
+        // fork-aware older handoff keeps owning them.
+        let cut = interval
+            .entries
+            .iter()
+            .zip(&interval.locations)
+            .find(|(entry, _)| {
+                matches!(
+                    entry,
+                    SessionEntry::ForkedFrom {
+                        at: None,
+                        seq: Some(_),
+                        ..
+                    }
+                )
+            })
+            .and_then(|(_, location)| location.as_ref().map(|location| location.key.seq()));
+        let mut entries = Vec::with_capacity(interval.entries.len() + page.entries.len());
+        let mut locations = Vec::with_capacity(entries.capacity());
+        for (entry, location) in interval.entries.into_iter().zip(interval.locations) {
+            let Some(seq) = location.as_ref().map(|location| location.key.seq()) else {
+                continue;
+            };
+            // The interval starts AFTER the previous compaction row (it rides
+            // with the next older page) and never dips below the fork cut.
+            if cut.is_none_or(|cut| seq > cut) && !matches!(entry, SessionEntry::Compaction { .. })
+            {
+                entries.push(entry);
+                locations.push(location);
+            }
+        }
+        if entries.is_empty() {
+            return Ok(page);
+        }
+        entries.extend(page.entries);
+        locations.extend(page.locations);
+        sort_page_display_order(&mut entries, &mut locations);
+        let next_before_seq = locations
+            .iter()
+            .filter_map(|location| location.as_ref())
+            .map(|location| location.key.seq())
+            .min()
+            .filter(|&seq| seq > 0);
+        Ok(LocatedHistoryPage {
+            entries,
+            locations,
+            next_before_seq,
+            next_older_session: page.next_older_session,
+        })
     }
 
     /// The same older-page contract as [`Self::load_older`], retaining each

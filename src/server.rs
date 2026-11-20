@@ -2641,12 +2641,14 @@ struct WebBootstrap {
 }
 
 /// `GET /api/sessions/{id}/history` — the frontend's initial-render path.
-/// Returns the head segment (last compaction + everything after) without
-/// `before_seq`, or the entries immediately older than `before_seq` when
-/// paging (whole segment with no `limit`, or an intra-segment page of
-/// `limit` entries with one). `next_before_seq` is the cursor for the next
-/// older page (feed it back to page further back); `null` means the oldest
-/// segment/page or no compaction.
+/// Returns the head segment widened to the contiguous seq interval that starts
+/// right after the PREVIOUS compaction (so the original pre-compaction rows are
+/// displayed, never reconstructed from the compaction's provider-projection
+/// `retained` tail), or the entries immediately older than `before_seq` when
+/// paging (whole segment with no `limit`, or an intra-segment page of `limit`
+/// entries with one). `next_before_seq` is the cursor for the next older page
+/// (feed it back to page further back); `null` means the oldest segment/page or
+/// no compaction.
 ///
 /// Resolution: the live registry (and live subagent registries) first, then
 /// a historical fallback — a registry miss connects a store directly by id
