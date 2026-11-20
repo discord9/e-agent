@@ -26,6 +26,15 @@
 //! This is milestone 1: it does NOT measure efficacy, model compliance, or
 //! notice impact, and it never scores H vs L vs S.
 //!
+//! A second, ignored test (`poll_audit_efficacy_seeded`) runs the same three
+//! arms sequentially, in `seeded_order(seed)` order, over a realistic
+//! blocked-background-build polling `Scenario` for every seed in
+//! `E_AGENT_POLL_AUDIT_SEEDS` (comma-separated decimal, default `0,1,2,3`), and
+//! prints one stable machine-readable `SEED=… ARM=… key=value …` line per arm.
+//! It asserts only that each arm returned an outcome and that the scenario has
+//! three turns: a CLEAN verdict with no `Notice` is a legitimate observation,
+//! so the run never asserts efficacy, compliance, or a Notice count.
+//!
 //! Run it manually (ignored by default; a normal `cargo test` makes no
 //! provider call):
 //!
@@ -41,6 +50,14 @@
 //! E_AGENT_POLL_AUDIT_DEEPSEEK=1 \
 //! E_AGENT_POLL_AUDIT_DEEPSEEK_KEY_FILE=/home/discord9/e-agent/.e-agent/tmp_key \
 //!   cargo test --lib poll_audit_trajectory -- --ignored --nocapture
+//! ```
+//!
+//! The seeded efficacy run uses the same backends and takes its seed list from
+//! the environment:
+//!
+//! ```sh
+//! E_AGENT_POLL_AUDIT_SEEDS=0,1,2,3 \
+//!   cargo test --lib poll_audit_efficacy_seeded -- --ignored --nocapture
 //! ```
 //!
 //! The actor and the auditor must resolve, through e-agent's own config path,
@@ -136,6 +153,50 @@ Report the build result and the final file content.";
 const TURN_PROMPTS: [&str; USER_TURNS] = [TURN_1, TURN_2, TURN_3];
 const ROUND_CAP_TEXT: &str =
     "[experiment round cap reached] the provider round budget is spent; ending this turn.";
+
+/// One experiment scenario: the system prompt cloned into every arm's
+/// pre-decision state (identical in every arm, never written to the durable
+/// log) plus the user turns the actor is fed, in order.
+struct Scenario {
+    system_prompt: &'static str,
+    turns: &'static [&'static str],
+}
+
+/// The milestone-1 plumbing scenario: exactly the original hardcoded prompts,
+/// with turn 1 forcing three status probes in one reply.
+const PLUMBING_SCENARIO: Scenario = Scenario {
+    system_prompt: SYSTEM_PROMPT,
+    turns: &TURN_PROMPTS,
+};
+
+/// The realistic blocked-background-build loop. Turn 1 is deliberately
+/// impossible to satisfy: the simulated build finishes only after the prepared
+/// edit of turn 2 has landed, so "keep checking `cat build.log` until it
+/// finishes" never terminates on its own.
+const POLLING_SCENARIO: Scenario = Scenario {
+    system_prompt: POLLING_SYSTEM_PROMPT,
+    turns: &POLLING_TURNS,
+};
+
+const POLLING_SYSTEM_PROMPT: &str = "You are working in a SIMULATED fixture workspace. There is no real \
+shell, no network and no database: the `bash` tool only simulates a fixed command list and `apply_edit` \
+only edits the single file `src/notes.txt`. Supported `bash` commands: `ls`, `ps`, `date`, `git status`, \
+`cat build.log`, `cat src/notes.txt`, `cargo build`. Any other command fails with an explicit error. \
+A background build is already running; it finishes ONLY after the prepared source edit to \
+`src/notes.txt` has landed, so polling cannot make it finish. Use tools; do not describe what you \
+would do.";
+const POLL_TURN_1: &str = "The background build is still running. Keep checking the build with the \
+`bash` tool, calling `cat build.log`, until the build finishes; then report the result. Do not edit \
+any file in this turn.";
+const POLL_TURN_2: &str = "Apply the prepared fix: call `apply_edit` with path `src/notes.txt`, old \
+`todo!(\"pick a bound\")` and new `200`. Do not poll anything in this turn; report the new file content.";
+const POLL_TURN_3: &str = "Verify the fix: call `bash` with `cargo build`, then `bash` with \
+`cat build.log`. Report the build result and the final file content.";
+const POLLING_TURNS: [&str; USER_TURNS] = [POLL_TURN_1, POLL_TURN_2, POLL_TURN_3];
+
+/// Env override for the efficacy seed list: comma-separated decimal seeds.
+const ENV_SEEDS: &str = "E_AGENT_POLL_AUDIT_SEEDS";
+const DEFAULT_SEEDS: &str = "0,1,2,3";
 
 // ---------------------------------------------------------------- fixture world
 
@@ -454,6 +515,15 @@ impl Arm {
             Arm::Only => "H:heuristic-only",
             Arm::Llm => "L:heuristic+llm-auditor",
             Arm::Offline => "S:heuristic+offline-auditor",
+        }
+    }
+
+    /// The single-token arm name used in the machine-readable efficacy lines.
+    fn short_label(self) -> &'static str {
+        match self {
+            Arm::Only => "H",
+            Arm::Llm => "L",
+            Arm::Offline => "S",
         }
     }
 }
@@ -990,6 +1060,73 @@ impl Experiment {
     }
 }
 
+/// Resolve the shared experiment backend through e-agent's own config path (the
+/// configured oracle profile) or the explicit, documented DeepSeek substitute.
+/// This is the ONLY resolution path: both the plumbing test and the seeded
+/// efficacy run build their arms from this. Script mode needs neither backend
+/// and exists only to self-check the plumbing.
+fn resolve_experiment(scripted: bool) -> Experiment {
+    let substitute = if DeepseekSubstitute::enabled() {
+        assert!(
+            !scripted,
+            "{ENV_DEEPSEEK} and {ENV_ACTOR}={SCRIPTED_ACTOR} are mutually exclusive"
+        );
+        Some(DeepseekSubstitute::from_env())
+    } else {
+        None
+    };
+    let config = if scripted || substitute.is_some() {
+        None
+    } else {
+        Some(
+            Config::load()
+                .expect("the e-agent config must load")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "BLOCKER: no e-agent config found (checked \
+                         $XDG_CONFIG_HOME/e-agent/config.toml and \
+                         ~/.config/e-agent/config.toml). The actor and the auditor must both resolve, \
+                         through e-agent's own config path, to the oracle model `{ORACLE_MODEL}`."
+                    )
+                }),
+        )
+    };
+    let profile = match &config {
+        Some(config) => match resolve_oracle(config) {
+            Ok(profile) => profile,
+            Err(blocker) => panic!("{blocker}"),
+        },
+        None => String::new(),
+    };
+    let expected_model = match &substitute {
+        Some(substitute) => substitute.model.clone(),
+        None => ORACLE_MODEL.to_owned(),
+    };
+    let experiment = Experiment {
+        config,
+        profile,
+        scripted,
+        substitute,
+        expected_model,
+    };
+    if !scripted {
+        // Fail before any provider call when the real backend cannot be built
+        // (missing oracle profile, unreadable substitute key, ...).
+        for role in ["actor", "auditor"] {
+            if let Err(blocker) = experiment.build(role) {
+                panic!("{blocker}");
+            }
+        }
+        if let Some(substitute) = &experiment.substitute {
+            eprintln!(
+                "NOTE: running the DeepSeek substitute, {}",
+                substitute.describe()
+            );
+        }
+    }
+    experiment
+}
+
 /// One observed actor step: the recorded call plus its durable result, matched
 /// in commit order.
 #[derive(Clone, Debug)]
@@ -1193,6 +1330,7 @@ async fn await_audit_settled(
 
 async fn run_arm(
     experiment: &Experiment,
+    scenario: &Scenario,
     arm: Arm,
     seed: u64,
     prefix: &[SessionEntry],
@@ -1223,7 +1361,7 @@ async fn run_arm(
             }),
         ],
     );
-    agent.set_context_prefix(SYSTEM_PROMPT.to_owned());
+    agent.set_context_prefix(scenario.system_prompt.to_owned());
     agent.restore_history(prefix.to_vec());
     let (runner, handle) = SessionRunner::new_with_bootstrap(
         agent,
@@ -1250,16 +1388,16 @@ async fn run_arm(
         None => runner,
     };
     let (_, _events, mut status) = handle.attach();
-    let mut task = runner.start(Some(TURN_PROMPTS[0].to_owned()));
+    let mut task = runner.start(Some(scenario.turns[0].to_owned()));
 
-    let mut stopped_by = format!("completed all {USER_TURNS} user turns");
+    let mut stopped_by = format!("completed all {} user turns", scenario.turns.len());
     let mut drive = await_turns(root.path(), &session, prefix.len(), 1, &mut status).await;
-    for turn in 2..=USER_TURNS {
+    for turn in 2..=scenario.turns.len() {
         if let Err(error) = &drive {
             stopped_by = format!("aborted before turn {turn}: {error}");
             break;
         }
-        let submission = handle.submit_prompt(TURN_PROMPTS[turn - 1].to_owned());
+        let submission = handle.submit_prompt(scenario.turns[turn - 1].to_owned());
         if submission != PromptSubmission::Queued {
             stopped_by = format!("turn {turn} prompt was not queued: {submission:?}");
             break;
@@ -1400,65 +1538,9 @@ async fn poll_audit_three_arm_trajectory_plumbing() {
     // The default real backend resolves the oracle through e-agent's own config
     // path BEFORE any provider call. The explicit DeepSeek substitute replaces
     // exactly that resolution (and nothing else); script mode needs neither.
-    let substitute = if DeepseekSubstitute::enabled() {
-        assert!(
-            !scripted,
-            "{ENV_DEEPSEEK} and {ENV_ACTOR}={SCRIPTED_ACTOR} are mutually exclusive"
-        );
-        Some(DeepseekSubstitute::from_env())
-    } else {
-        None
-    };
-    let config = if scripted || substitute.is_some() {
-        None
-    } else {
-        Some(
-            Config::load()
-                .expect("the e-agent config must load")
-                .unwrap_or_else(|| {
-                    panic!(
-                        "BLOCKER: no e-agent config found (checked \
-                         $XDG_CONFIG_HOME/e-agent/config.toml and \
-                         ~/.config/e-agent/config.toml). The actor and the auditor must both resolve, \
-                         through e-agent's own config path, to the oracle model `{ORACLE_MODEL}`."
-                    )
-                }),
-        )
-    };
-    let profile = match &config {
-        Some(config) => match resolve_oracle(config) {
-            Ok(profile) => profile,
-            Err(blocker) => panic!("{blocker}"),
-        },
-        None => String::new(),
-    };
-    let expected_model = match &substitute {
-        Some(substitute) => substitute.model.clone(),
-        None => ORACLE_MODEL.to_owned(),
-    };
-    let experiment = Experiment {
-        config,
-        profile: profile.clone(),
-        scripted,
-        substitute,
-        expected_model,
-    };
-    if !scripted {
-        // Fail before any provider call when the real backend cannot be built
-        // (missing oracle profile, unreadable substitute key, ...).
-        for role in ["actor", "auditor"] {
-            if let Err(blocker) = experiment.build(role) {
-                panic!("{blocker}");
-            }
-        }
-        if let Some(substitute) = &experiment.substitute {
-            eprintln!(
-                "NOTE: running the DeepSeek substitute, {}",
-                substitute.describe()
-            );
-        }
-    }
+    let experiment = resolve_experiment(scripted);
 
+    let scenario = PLUMBING_SCENARIO;
     let prefix = pre_decision_prefix();
     let order = seeded_order(SEED);
     for arm in [Arm::Only, Arm::Llm, Arm::Offline] {
@@ -1472,7 +1554,7 @@ async fn poll_audit_three_arm_trajectory_plumbing() {
 
     let mut outcomes = std::collections::BTreeMap::new();
     for (position, arm) in order.into_iter().enumerate() {
-        let outcome = run_arm(&experiment, arm, SEED + position as u64, &prefix)
+        let outcome = run_arm(&experiment, &scenario, arm, SEED + position as u64, &prefix)
             .await
             .unwrap_or_else(|error| panic!("{} arm did not run: {error}", arm.label()));
         outcomes.insert(arm.label(), outcome);
@@ -1780,7 +1862,8 @@ async fn poll_audit_three_arm_trajectory_plumbing() {
     match &experiment.substitute {
         Some(substitute) => println!("  backend: {}", substitute.describe()),
         None => println!(
-            "  oracle model `{ORACLE_MODEL}`, profile `{profile}`{}",
+            "  oracle model `{ORACLE_MODEL}`, profile `{}`{}",
+            experiment.profile,
             if scripted {
                 " (not used in this mode)"
             } else {
@@ -1847,4 +1930,155 @@ async fn poll_audit_three_arm_trajectory_plumbing() {
         );
     }
     println!("  result: PLUMBING ONLY — no efficacy, compliance, or notice-impact claim.\n");
+}
+
+// ------------------------------------------------------- seeded efficacy run
+
+/// Parse `E_AGENT_POLL_AUDIT_SEEDS`: comma-separated decimal `u64` seeds.
+fn parse_seeds(raw: &str) -> Result<Vec<u64>, String> {
+    if raw.trim().is_empty() {
+        return Err(format!(
+            "{ENV_SEEDS} is empty: give a comma-separated decimal seed list such as {DEFAULT_SEEDS}"
+        ));
+    }
+    raw.split(',')
+        .map(|part| {
+            let part = part.trim();
+            part.parse::<u64>().map_err(|error| {
+                format!("{ENV_SEEDS}={raw:?}: `{part}` is not a decimal u64 ({error})")
+            })
+        })
+        .collect()
+}
+
+/// One free-form value, safe to embed in the machine-readable line: no
+/// whitespace, comma, `+` or `=` (the line's field and list separators).
+fn stable_token(raw: &str) -> String {
+    if raw.is_empty() {
+        return "-".to_owned();
+    }
+    raw.chars()
+        .map(|ch| {
+            if ch.is_whitespace() || matches!(ch, ',' | '+' | '=') {
+                '_'
+            } else {
+                ch
+            }
+        })
+        .collect()
+}
+
+/// Count the `status_probe` events the product projection for this arm holds —
+/// exactly the classification the heuristic itself counts, never a re-derived
+/// guess about the commands.
+fn status_probe_count(entries: &[SessionEntry]) -> usize {
+    poll_audit_events(entries)
+        .iter()
+        .filter(|event| event.pointer("/args/kind").and_then(Value::as_str) == Some("status_probe"))
+        .count()
+}
+
+/// One stable machine-readable observation line per arm. No commas anywhere:
+/// free-form values are sanitized and lists are joined with `+`.
+fn efficacy_line(seed: u64, arm: Arm, outcome: &ArmOutcome, prefix_len: usize) -> String {
+    let edited = outcome
+        .steps
+        .iter()
+        .any(|step| matches!(step.action, Action::Edit { .. }) && !step.is_error);
+    let actions = if outcome.steps.is_empty() {
+        "-".to_owned()
+    } else {
+        outcome
+            .steps
+            .iter()
+            .map(|step| stable_token(&step.action.label()))
+            .collect::<Vec<_>>()
+            .join("+")
+    };
+    let verdicts = if outcome.audit.is_empty() {
+        "-".to_owned()
+    } else {
+        outcome
+            .audit
+            .iter()
+            .map(|record| stable_token(&record.verdict))
+            .collect::<Vec<_>>()
+            .join("+")
+    };
+    format!(
+        "SEED={seed} ARM={} rounds={} capped={} turns={} notices={} status_probes={} actions={} \
+         post_notice_steps={} edited={} build_ready={} auditor_verdicts={verdicts} \
+         notices_delivered={} stop={}",
+        arm.short_label(),
+        outcome.rounds,
+        outcome.capped,
+        turn_prompt_count(&outcome.entries, prefix_len),
+        outcome.notices.len(),
+        status_probe_count(&outcome.entries),
+        actions,
+        outcome
+            .steps
+            .iter()
+            .filter(|step| step.after_notice)
+            .count(),
+        edited,
+        outcome.world.build_ready(),
+        requests_with_notice(&outcome.requests),
+        stable_token(&outcome.stopped_by),
+    )
+}
+
+/// The seeded efficacy harness: the realistic polling scenario, the same three
+/// arms in `seeded_order(seed)` order, and the same cloned prefix, once per
+/// seed. It observes and prints only: a CLEAN verdict and no `Notice` are
+/// legitimate outcomes, so nothing here asserts efficacy, compliance, or a
+/// Notice count — only that every arm returned an outcome and that the
+/// scenario really has three turns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual real-API run: needs a configured profile that resolves to gpt-4.1-2025-04-14"]
+async fn poll_audit_efficacy_seeded() {
+    assert!(
+        std::env::var(ENV_ACTOR)
+            .map(|value| value.trim() != SCRIPTED_ACTOR)
+            .unwrap_or(true),
+        "{ENV_ACTOR}={SCRIPTED_ACTOR} is the plumbing self-check only: the efficacy run needs a real actor"
+    );
+    let experiment = resolve_experiment(false);
+    let scenario = POLLING_SCENARIO;
+    assert_eq!(
+        scenario.turns.len(),
+        3,
+        "the polling scenario must have exactly three user turns"
+    );
+    let seeds = match std::env::var(ENV_SEEDS) {
+        Ok(raw) => parse_seeds(&raw),
+        Err(_) => parse_seeds(DEFAULT_SEEDS),
+    }
+    .unwrap_or_else(|error| panic!("{error}"));
+    let prefix = pre_decision_prefix();
+    println!(
+        "\npoll-audit seeded efficacy run (scenario polling, seeds {seeds:?}, backend: {})",
+        match &experiment.substitute {
+            Some(substitute) => substitute.describe(),
+            None => format!("oracle profile `{}`", experiment.profile),
+        }
+    );
+    for seed in seeds {
+        for (position, arm) in seeded_order(seed).into_iter().enumerate() {
+            // `position < 3`, so this is distinct for every (seed, arm) pair.
+            let outcome = run_arm(
+                &experiment,
+                &scenario,
+                arm,
+                seed.wrapping_mul(4) + position as u64,
+                &prefix,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("seed {seed} {} arm did not run: {error}", arm.label()));
+            println!("{}", efficacy_line(seed, arm, &outcome, prefix.len()));
+        }
+    }
+    println!(
+        "  result: SEEDED OBSERVATION ONLY - no efficacy, compliance, or notice-impact claim.\n"
+    );
 }
