@@ -22,7 +22,7 @@ use crate::codex::CodexModel;
 use crate::codex_auth::CodexAuth;
 use crate::config::{
     AuthMode, Config, ProjectSourceObservation, ResolvedModel, Sandbox, SandboxPolicy,
-    WebSearchProvider, resolve_sandbox,
+    WebSearchProvider,
 };
 use crate::delegate::{Delegate, Sessions};
 use crate::mcp;
@@ -448,8 +448,16 @@ impl SessionFactory {
         // the sandbox enabled, `workspace_writable = false` denies
         // file-tool writes inside the workspace too; with it disabled the
         // file tools keep the historical always-writable workspace.
-        // External roots stay active independently either way.
-        let resolved_policy = resolve_sandbox(config.as_ref(), &root)?;
+        // External roots stay active independently either way. The project
+        // `[sandbox]` overlay comes from the observation this load produced,
+        // never from a second read of the project file.
+        let project_overlay =
+            crate::config::project_sandbox_from_observation(observed_project(&project_source))?;
+        let resolved_policy = crate::config::resolve_sandbox_with_project(
+            config.as_ref(),
+            &root,
+            project_overlay.as_ref(),
+        )?;
         workspace = workspace
             .with_external_roots(&resolved_policy)
             .map_err(anyhow::Error::msg)?;
@@ -1887,16 +1895,43 @@ fn apply_reloaded_config(
     }
 }
 
+/// The project source a load actually observed (`None` = absent/unavailable).
+fn observed_project(observation: &ProjectSourceObservation) -> Option<&toml::Value> {
+    match observation {
+        ProjectSourceObservation::Observed(source) => Some(source),
+        ProjectSourceObservation::Absent | ProjectSourceObservation::Unavailable => None,
+    }
+}
+
+/// The RECOGNIZED `[sandbox]` inputs of one source table. Only keys the
+/// resolver consumes take part in the comparison, so an ignored unknown key
+/// (e.g. a TOML `nan`, which never compares equal to itself) cannot make an
+/// unchanged source look edited.
+fn sandbox_table(source: Option<&toml::Value>) -> Option<toml::Value> {
+    let table = source?.get("sandbox")?.as_table()?;
+    let mut kept = toml::map::Map::new();
+    for key in [
+        "enabled",
+        "network",
+        "workspace_writable",
+        "gpu",
+        "writable_paths",
+        "readable_paths",
+    ] {
+        if let Some(value) = table.get(key) {
+            kept.insert(key.to_owned(), value.clone());
+        }
+    }
+    Some(toml::Value::Table(kept))
+}
+
 /// The parsed `[sandbox]` inputs of one config source pair: any change here is
 /// what may re-resolve the installed policy.
-fn sandbox_inputs<'a>(
-    global: Option<&'a toml::Value>,
-    project: Option<&'a toml::Value>,
-) -> (Option<&'a toml::Value>, Option<&'a toml::Value>) {
-    (
-        global.and_then(|source| source.get("sandbox")),
-        project.and_then(|source| source.get("sandbox")),
-    )
+fn sandbox_inputs(
+    global: Option<&toml::Value>,
+    project: Option<&toml::Value>,
+) -> (Option<toml::Value>, Option<toml::Value>) {
+    (sandbox_table(global), sandbox_table(project))
 }
 
 /// Load the effective config for `root` and apply it through
@@ -1938,15 +1973,36 @@ fn reload_config_at(
         ProjectSourceObservation::Absent => None,
         ProjectSourceObservation::Unavailable => unreachable!("rejected above"),
     };
+    // The Windows write sandbox has no policy-file carve-out, so a project
+    // `[sandbox]` edit could be authored by the very shell it governs. Keep
+    // the last good config AND policy: project sandbox edits need a restart
+    // there (global ones still reload).
+    #[cfg(windows)]
+    if sandbox_table(old_project.as_ref()) != sandbox_table(new_project.as_ref()) {
+        return ReloadResult::Rejected(format!(
+            "a project [sandbox] edit cannot be hot-reloaded on Windows: the write sandbox cannot keep {} read-only, so the reloaded policy could be authored by a sandboxed command; restart to apply it",
+            root.join(".e-agent/config.toml").display()
+        ));
+    }
     // Re-resolve ONLY on a `[sandbox]` input change: an unrelated accepted
     // reload keeps the installed policy byte-identical, so a directory that
     // appeared in the meantime never becomes a grant through an edit that had
     // nothing to do with the sandbox. Validation happens here, before any
-    // swap, and installation after it.
+    // swap, and installation after it, and it uses the overlay parsed from
+    // THIS observation (never a second read of the project file).
     let policy = if sandbox_inputs(old_global.as_ref(), old_project.as_ref())
         != sandbox_inputs(new_global.as_ref(), new_project.as_ref())
     {
-        match resolve_sandbox(loaded.as_ref(), root) {
+        let project_overlay =
+            match crate::config::project_sandbox_from_observation(new_project.as_ref()) {
+                Ok(overlay) => overlay,
+                Err(error) => return ReloadResult::Rejected(format!("{error:#}")),
+            };
+        match crate::config::resolve_sandbox_with_project(
+            loaded.as_ref(),
+            root,
+            project_overlay.as_ref(),
+        ) {
             Ok(policy) => Some(policy.enabled.then_some(policy)),
             Err(error) => return ReloadResult::Rejected(format!("{error:#}")),
         }
@@ -3247,7 +3303,22 @@ network = true
         let project_dir = temp.path().join(".e-agent");
         std::fs::create_dir_all(&project_dir).unwrap();
         let project = project_dir.join("config.toml");
-        write_reload_fixture(&global, &project);
+        // An ENABLED policy, so the test proves preservation rather than only
+        // rejection.
+        std::fs::write(
+            &global,
+            r#"default = "p1/m1"
+[providers.p1]
+base_url = "http://one"
+api_key_env = "PATH"
+[models."p1/m1"]
+model = "m1"
+[sandbox]
+enabled = true
+"#,
+        )
+        .unwrap();
+        std::fs::write(&project, "").unwrap();
         unsafe {
             std::env::set_var("XDG_CONFIG_HOME", &xdg);
             std::env::set_var("HOME", &home);
@@ -3261,6 +3332,10 @@ network = true
         });
         let profiles = factory.model_profiles();
         let policy = factory.sandbox_policy().snapshot();
+        assert!(
+            policy.as_ref().is_some_and(|policy| policy.enabled),
+            "the fixture must install an enabled policy: {policy:?}"
+        );
 
         // Replace the global config DIRECTORY with a regular file: looking up
         // `<xdg>/e-agent/config.toml` now fails with ENOTDIR, which is not a
@@ -3277,6 +3352,63 @@ network = true
         assert!(capture.0.lock().unwrap().is_empty());
         assert_eq!(factory.model_profiles(), profiles);
         assert_eq!(factory.sandbox_policy().snapshot(), policy);
+
+        // A DIRECTORY at the candidate path is equally not a confirmed
+        // absence.
+        std::fs::remove_file(&global_dir).unwrap();
+        std::fs::create_dir_all(&global).unwrap();
+        capture_reload(&capture, || match factory.reload_config() {
+            ReloadResult::Rejected(reason) => assert!(
+                reason.contains("not a regular file") && reason.contains("config.toml"),
+                "{reason}"
+            ),
+            other => panic!("expected rejection, got {other:?}"),
+        });
+        assert_eq!(factory.model_profiles(), profiles);
+        assert_eq!(factory.sandbox_policy().snapshot(), policy);
+
+        // A DANGLING symlink at the candidate path is an error too (metadata
+        // would report NotFound, which must not read as "absent").
+        #[cfg(unix)]
+        {
+            std::fs::remove_dir_all(&global).unwrap();
+            std::os::unix::fs::symlink(temp.path().join("missing-config"), &global).unwrap();
+            capture_reload(&capture, || match factory.reload_config() {
+                ReloadResult::Rejected(reason) => assert!(
+                    reason.contains("dangling symlink") && reason.contains("config.toml"),
+                    "{reason}"
+                ),
+                other => panic!("expected rejection, got {other:?}"),
+            });
+            assert_eq!(factory.model_profiles(), profiles);
+            assert_eq!(factory.sandbox_policy().snapshot(), policy);
+            // A symlink to a REGULAR file still loads.
+            std::fs::remove_file(&global).unwrap();
+            let target = temp.path().join("real-config.toml");
+            std::fs::write(
+                &target,
+                r#"default = "p1/m1"
+[providers.p1]
+base_url = "http://one"
+api_key_env = "PATH"
+[models."p1/m1"]
+model = "m1"
+[sandbox]
+enabled = true
+network = false
+"#,
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(&target, &global).unwrap();
+            assert!(matches!(factory.reload_config(), ReloadResult::Reloaded));
+            assert!(
+                factory
+                    .sandbox_policy()
+                    .snapshot()
+                    .is_some_and(|policy| !policy.network),
+                "a symlinked global config is loaded normally"
+            );
+        }
         unsafe {
             std::env::remove_var("XDG_CONFIG_HOME");
             if let Some(home) = old_home {

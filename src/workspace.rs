@@ -493,14 +493,6 @@ impl Workspace {
         &self.policy_anchor
     }
 
-    pub fn policy_anchor_is_visible(&self) -> bool {
-        self.policy_anchor.starts_with(&self.root)
-            || self
-                .external
-                .iter()
-                .any(|root| self.policy_anchor.starts_with(&root.source))
-    }
-
     pub fn read(&self, input: &str) -> Result<Vec<u8>, String> {
         match self.resolve_path(input, false)? {
             Resolved::Workspace { remainder } => self

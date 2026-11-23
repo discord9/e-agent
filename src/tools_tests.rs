@@ -3082,9 +3082,10 @@ fn read_only_bash_narrows_the_live_policy_per_dispatch() {
 
 /// Background dispatch: a command already dispatched keeps the policy
 /// snapshot it captured (its running bwrap is unchanged), and a command
-/// dispatched after the reload uses the new one. Real bwrap processes, so it
-/// skips exactly where the other sandbox tests skip.
-#[cfg(unix)]
+/// dispatched after the reload uses the new one. It reads the live argv back
+/// through `/proc`, so it is Linux-only and skips where the other sandbox
+/// tests skip.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn background_dispatch_captures_the_sandbox_policy_at_dispatch() {
     if !bwrap_available() {
@@ -3165,8 +3166,9 @@ async fn background_dispatch_captures_the_sandbox_policy_at_dispatch() {
 /// `/proc/<process-group>/cmdline` of a live background task, as strings: the
 /// group leader is the `bwrap` process itself, so its argv IS the policy
 /// snapshot the dispatch captured. The registry entry exists before the spawn,
-/// so the pid is awaited.
-#[cfg(all(unix, target_os = "linux"))]
+/// so the pid is awaited. The caller is Linux-only, so no fallback reader
+/// exists (an empty argv would silently "pass" the negative assertion).
+#[cfg(target_os = "linux")]
 async fn background_cmdline(background: &BackgroundTasks, id: u64) -> Vec<String> {
     let mut pid = None;
     for _ in 0..200 {
@@ -3183,12 +3185,6 @@ async fn background_cmdline(background: &BackgroundTasks, id: u64) -> Vec<String
         .filter(|part| !part.is_empty())
         .map(|part| String::from_utf8_lossy(part).into_owned())
         .collect()
-}
-
-#[cfg(all(unix, not(target_os = "linux")))]
-async fn background_cmdline(background: &BackgroundTasks, id: u64) -> Vec<String> {
-    let _ = (background, id);
-    Vec::new()
 }
 
 #[tokio::test]
@@ -3919,14 +3915,21 @@ async fn sandbox_command_cannot_author_its_own_policy() {
         shell: Shell::detect().unwrap(),
         owner_session: None,
     };
+    // The marker write proves the COMMAND ran (a plan-time refusal would fail
+    // before `printf`), so the failure below is the policy write itself.
     let attempt = tool
         .execute(json!({
-            "command": "mkdir -p .e-agent && printf '[sandbox]\nenabled = false\n' > .e-agent/config.toml && cat .e-agent/config.toml"
+            "command": "printf ran > marker.txt; mkdir -p .e-agent && printf '[sandbox]\nenabled = false\n' > .e-agent/config.toml && cat .e-agent/config.toml"
         }))
         .await;
     assert!(
         attempt.is_err(),
         "a sandboxed command must not author the policy file: {attempt:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("marker.txt")).unwrap(),
+        "ran",
+        "the command itself must have run"
     );
     assert!(
         !temp.path().join(".e-agent/config.toml").exists(),
@@ -3935,12 +3938,14 @@ async fn sandbox_command_cannot_author_its_own_policy() {
     assert_eq!(policy.snapshot(), sandbox(), "the live policy is unchanged");
     // The same holds through a configured writable root that covers the
     // workspace: the policy subtree is still excluded from the generic mount
-    // loop, so it cannot be authored through that writable bind either.
+    // loop, so it cannot be authored through that writable bind either. A
+    // fresh workspace keeps this case independent of the one above.
+    let covered_dir = tempfile::tempdir().unwrap();
     let mut covered = sandbox().unwrap();
-    covered.writable_paths = vec![temp.path().to_string_lossy().into_owned()];
+    covered.writable_paths = vec![covered_dir.path().to_string_lossy().into_owned()];
     let covered_policy = SandboxPolicy::fixed(Some(covered));
     let covered_tool = Bash {
-        workspace: Workspace::new(temp.path()).unwrap(),
+        workspace: Workspace::new(covered_dir.path()).unwrap(),
         timeout: Some(Duration::from_secs(20)),
         sender: None,
         background: BackgroundTasks::new(Some(Duration::from_secs(30)), covered_policy.clone()),
@@ -3959,11 +3964,11 @@ async fn sandbox_command_cannot_author_its_own_policy() {
         covered_attempt.is_err(),
         "a covering writable root must not authorize the policy file: {covered_attempt:?}"
     );
-    assert!(!temp.path().join(".e-agent/config.toml").exists());
+    assert!(!covered_dir.path().join(".e-agent/config.toml").exists());
     assert_eq!(
         covered_policy.snapshot(),
         Some(crate::config::Sandbox {
-            writable_paths: vec![temp.path().to_string_lossy().into_owned()],
+            writable_paths: vec![covered_dir.path().to_string_lossy().into_owned()],
             ..sandbox().unwrap()
         }),
         "the live policy is unchanged"
@@ -3978,7 +3983,12 @@ fn sandbox_writable_dest_at_the_policy_parent_fails_closed() {
     // loop excludes that subtree, so nothing could restore it — plan
     // construction must fail closed instead of dropping the mount silently.
     let workspace_dir = tempfile::tempdir().unwrap();
-    let mut policy = sandbox().expect("enabled policy");
+    // Plan-level only: an enabled policy literal, so the test never depends on
+    // a working bwrap (it does not spawn anything).
+    let mut policy = crate::config::Sandbox {
+        enabled: true,
+        ..crate::config::Sandbox::default()
+    };
     policy.writable_paths = vec![
         workspace_dir
             .path()
@@ -3995,6 +4005,128 @@ fn sandbox_writable_dest_at_the_policy_parent_fails_closed() {
         "{error}"
     );
     assert!(!workspace_dir.path().join(".e-agent").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn sandbox_writable_alias_of_the_policy_dir_fails_closed() {
+    // Destination filtering is not enough: a writable MOUNT whose canonical
+    // source is (or contains) the policy directory exports the policy file
+    // writable at another destination. That is a self-relaxation vector, so
+    // the plan fails closed and names both paths.
+    let workspace_dir = tempfile::tempdir().unwrap();
+    let policy_dir = workspace_dir.path().join(".e-agent");
+    std::fs::create_dir(&policy_dir).unwrap();
+    std::fs::write(policy_dir.join("config.toml"), "[sandbox]\n").unwrap();
+    let policy = crate::config::Sandbox {
+        enabled: true,
+        writable_mounts: vec![(
+            workspace_dir.path().to_string_lossy().into_owned(),
+            "/tmp/policy-alias".to_owned(),
+        )],
+        ..crate::config::Sandbox::default()
+    };
+    let bash = policy_bash(Workspace::new(workspace_dir.path()).unwrap(), policy);
+    let error = bash
+        .dispatch_args("true")
+        .expect_err("a writable alias of the policy directory must fail closed");
+    assert!(
+        error.contains("writable mount /tmp/policy-alias"),
+        "{error}"
+    );
+    assert!(error.contains(".e-agent"), "{error}");
+    // The same source read-only is fine (a readable view cannot author it).
+    let readable = crate::config::Sandbox {
+        enabled: true,
+        readable_mounts: vec![(
+            workspace_dir.path().to_string_lossy().into_owned(),
+            "/tmp/policy-readonly".to_owned(),
+        )],
+        ..crate::config::Sandbox::default()
+    };
+    let bash = policy_bash(Workspace::new(workspace_dir.path()).unwrap(), readable);
+    assert!(bash.dispatch_args("true").is_ok());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sandbox_live_policy_covering_the_policy_parent_is_projected() {
+    // Rerooted workspace: the startup policy anchor lives OUTSIDE the session
+    // root, so the startup capabilities do not cover it. A LIVE policy that
+    // newly adds a covering writable root must still project the anchor
+    // read-only — the decision comes from this plan's mounts, not from startup
+    // state.
+    if !bwrap_available() {
+        eprintln!("bwrap unavailable; skipping sandbox test");
+        return;
+    }
+    let parent = tempfile::tempdir().unwrap();
+    let child = parent.path().join("child");
+    let policy_dir = parent.path().join(".e-agent");
+    std::fs::create_dir(&child).unwrap();
+    std::fs::create_dir(&policy_dir).unwrap();
+    let policy_path = policy_dir.join("config.toml");
+    std::fs::write(&policy_path, "[sandbox]\n").unwrap();
+    // Startup policy: nothing covers the anchor.
+    let startup = crate::config::Sandbox {
+        enabled: true,
+        ..crate::config::Sandbox::default()
+    };
+    let workspace = Workspace::new(parent.path())
+        .unwrap()
+        .with_external_roots(&startup)
+        .unwrap()
+        .reroot(&child)
+        .unwrap();
+    let live = SandboxPolicy::fixed(Some(startup));
+    let tool = Bash {
+        workspace,
+        timeout: Some(Duration::from_secs(10)),
+        sender: None,
+        background: BackgroundTasks::new(Some(Duration::from_secs(30)), live.clone()),
+        sandbox: live.clone(),
+        read_only: false,
+        protect_git: false,
+        shell: Shell::detect().unwrap(),
+        owner_session: None,
+    };
+    let anchor = crate::canonicalize_path(&policy_dir).unwrap();
+    let anchor_str = anchor.to_string_lossy().into_owned();
+    // Before: no bind covers the anchor, so nothing to project.
+    let before = tool.dispatch_args("true").unwrap().expect("policy on");
+    assert!(!before.iter().any(|arg| arg == &anchor_str), "{before:?}");
+    // The live policy adds a covering writable root (the parent of the anchor):
+    // its self-bind makes the policy directory reachable inside the sandbox.
+    live.replace(Some(crate::config::Sandbox {
+        enabled: true,
+        writable_paths: vec![parent.path().to_string_lossy().into_owned()],
+        ..crate::config::Sandbox::default()
+    }));
+    let after = tool.dispatch_args("true").unwrap().expect("policy on");
+    assert!(
+        after
+            .windows(2)
+            .any(|w| w[0] == "--tmpfs" && w[1] == anchor_str),
+        "the freshly covered policy parent must be projected: {after:?}"
+    );
+    assert!(
+        after
+            .windows(2)
+            .any(|w| w[0] == "--remount-ro" && w[1] == anchor_str),
+        "the projection must end read-only: {after:?}"
+    );
+    // And the sandboxed command cannot author the policy file through the
+    // newly granted root, while ordinary writes there still work.
+    let script = "set -e; printf ok > ../ordinary; if printf relaxed > ../.e-agent/config.toml; then exit 70; fi";
+    tool.execute(json!({"command": script})).await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&policy_path).unwrap(),
+        "[sandbox]\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(parent.path().join("ordinary")).unwrap(),
+        "ok"
+    );
 }
 
 #[cfg(unix)]

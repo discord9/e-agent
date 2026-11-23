@@ -680,6 +680,23 @@ pub(super) fn build_bwrap_plan(
         if dest_is_policy_subtree(dest, policy_parent.as_deref()) {
             filtered_policy_dests = true;
         } else if allow_mount(dest) {
+            // Destination filtering cannot see a writable view of the policy
+            // FILE that appears under another name: an alias whose SOURCE is
+            // or contains the policy directory exports `config.toml` writable
+            // at its own destination. A self entry (source == dest) is fine —
+            // the projection locks that subtree at its own path — but any
+            // other writable alias of it fails closed.
+            if source != dest
+                && let Some(parent) = &policy_parent
+                && parent.starts_with(Path::new(source))
+            {
+                return Err(format!(
+                    "fail closed: writable mount {} exposes the sandbox policy directory {} through its source {}; a sandboxed command could author its own [sandbox] policy there — remove that mount, narrow its source, or make it read-only",
+                    dest,
+                    parent.display(),
+                    source
+                ));
+            }
             mounts.push((source.as_str(), dest.as_str(), "--bind-try", false));
         }
     }
@@ -802,11 +819,20 @@ pub(super) fn build_bwrap_plan(
     }
     // Protect the startup policy anchor: a descriptor-pinned projection
     // applied after every other mount so no bind (workspace, alias or
-    // explicit descendant) can shadow it. Every destination filtered from
-    // the generic loop above must be restored here; a projection that
-    // cannot run fails the plan closed instead of hiding them silently.
+    // explicit descendant) can shadow it. Visibility is decided from THIS
+    // plan's mount list (the destinations actually installed), not from
+    // startup capabilities: a live policy that newly covers the policy parent
+    // must be projected too. Every destination filtered from the generic loop
+    // above must be restored here; a projection that cannot run fails the
+    // plan closed instead of hiding them silently.
+    let policy_visible = policy_parent.as_deref().is_some_and(|parent| {
+        parent.starts_with(root)
+            || mounts
+                .iter()
+                .any(|(_, dest, _, _)| parent.starts_with(Path::new(dest)))
+    });
     let mut fds: Vec<rustix::fd::OwnedFd> = Vec::new();
-    if workspace.policy_anchor_is_visible() {
+    if policy_visible {
         project_policy_parent(
             workspace,
             sandbox,
@@ -816,11 +842,10 @@ pub(super) fn build_bwrap_plan(
         )?;
     } else if filtered_policy_dests {
         return Err(format!(
-            "fail closed: sandbox policy destinations under {} are excluded from the generic mount loop, but the policy-anchor projection cannot run from workspace {} (policy anchor {} is not visible), so those destinations would be silently hidden",
+            "fail closed: sandbox policy destinations under {} are excluded from the generic mount loop, but no bind in this plan covers the policy parent (policy anchor {}), so the projection cannot restore them",
             policy_parent
                 .as_deref()
                 .map_or_else(|| "<policy parent>".into(), |p| p.display().to_string()),
-            root_str,
             workspace.policy_anchor().display()
         ));
     }

@@ -46,9 +46,15 @@ does not yet follow semantic versioning strictly.
   read-only roles re-derive their narrowing (and fail closed when the policy
   disappears), and `/btw` forks share the parent's policy. The policy is
   re-resolved only when the `[sandbox]` inputs change, and such edits are
-  reported `effective` instead of restart-only. Sandboxed commands can no
-  longer author the workspace policy file, even when `.e-agent/` does not
-  exist yet. File-tool roots and `run_rust`'s forced policy stay startup-fixed.
+  reported `effective` instead of restart-only (a global `[sandbox]` scalar a
+  project overlay overrides is `shadowed`). On Linux/bwrap a sandboxed command
+  can no longer author the workspace policy file through the paths the plan
+  mounts (an absent `.e-agent/` is created agent-side and projected read-only,
+  and a writable mount alias whose source contains the policy directory is
+  refused); the Windows write sandbox has no such carve-out, so a project
+  `[sandbox]` edit is rejected by the reload there and needs a restart.
+  File-tool roots and `run_rust`'s forced policy stay startup-fixed (a process
+  restart).
 - **Sandbox `/tmp` is the host's real `/tmp` again** — bubblewrap bash no
   longer mounts a private `/tmp` tmpfs, and the delegated-subagent
   read-only `/tmp` remount is gone: inside the sandbox `/tmp` is the host

@@ -504,13 +504,15 @@ running server or TUI session uses the new mounts and network setting without a
 restart. A command that is already running keeps the policy it started with
 until it exits, and the `bash` description is rebuilt when the tool list is
 assembled for a turn (so it can lag an edit by one turn). File-tool roots — and
-whether `workspace_writable = false` denies in-workspace writes — stay
-session-fixed, and `run_rust` keeps its startup policy, so those need a
-restart/new session.
+whether `workspace_writable = false` denies in-workspace writes — are opened at
+factory start, and `run_rust` keeps its startup policy, so those need a process
+restart.
 
 One authorization limit is deliberate: a delegate running in a different
-`workspace` keeps writing that workspace while `workspace_writable = true`,
-even if the external grant that admitted the workspace is later revoked.
+`workspace` is admitted against the STARTUP workspace and its authorized roots,
+so it keeps writing that workspace while `workspace_writable = true` even if
+the external grant that admitted it is later revoked — and a new delegate can
+still be admitted through those same startup roots after the revocation.
 
 `gpu` and the runtime installation are two separate halves of one policy.
 `gpu = true` grants the host GPU device nodes (`/dev/kfd`, `/dev/dri`, plus any
@@ -601,12 +603,17 @@ and read-only alias mounts inside a final writable root survive.
 
 The exact workspace-relative `.e-agent/config.toml` policy file is readable by
 file tools but write/edit protected and must be changed by the user outside the
-agent. Bash binds an existing policy over `/dev/null`; if only `.e-agent/`
-exists, that directory is mounted read-only so a writable child cannot create
-the policy. When `.e-agent/` itself is missing and the sandbox could create it
-through a writable bind, the agent creates that state directory outside the
-sandbox and mounts it read-only, so a sandboxed command can never author the
-policy that governs it (and the reload can never install such an edit).
+agent. On Linux, bash binds an existing policy over `/dev/null`; if only
+`.e-agent/` exists, that directory is mounted read-only so a writable child
+cannot create the policy. When `.e-agent/` itself is missing and the sandbox
+could create it through a writable bind, the agent creates that state directory
+outside the sandbox and mounts it read-only, and a writable mount alias whose
+source contains the policy directory is refused. That covers the paths this plan
+mounts: a sandboxed command cannot author the policy there (so a reload cannot
+install such an edit). A pre-existing hardlink to the policy file, an
+already-running command's own mounts, and the Windows write sandbox (which has
+no file-level carve-out, so project `[sandbox]` edits need a restart there) are
+outside that boundary.
 
 Note that the sandbox hides all of `$HOME` behind a fresh tmpfs and then binds
 in only the workspace and these extra paths — so personal files such as
@@ -1418,9 +1425,11 @@ environment once at startup, and `AGENTS.md`/skills instructions plus existing
 sessions' models stay as loaded (a session keeps its model until a `/model`
 switch). `[sandbox]` file-tool roots (the cap-std capabilities behind
 `read_file`/`write_file`/`edit_file`, including whether `workspace_writable =
-false` denies in-workspace writes) are wired per session, and `run_rust`'s
-forced policy at factory start: a sandbox edit reaches shell commands
-immediately, but those need a restart (or, for the file tools, a new session).
+false` denies in-workspace writes) and `run_rust`'s forced policy are opened at
+factory start: a sandbox edit reaches shell commands immediately, but those need
+a process restart. On Windows, a project `[sandbox]` edit is rejected by the
+reload (the write sandbox cannot protect the project policy file), so it needs a
+restart too; a global `[sandbox]` edit still reloads.
 
 ## MCP (local servers)
 
