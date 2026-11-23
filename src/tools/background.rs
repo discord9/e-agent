@@ -20,11 +20,8 @@ pub struct BackgroundTasks {
         Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>>>,
     /// Background bash timeout; `None` = no timeout (run forever).
     timeout: Option<Duration>,
-    /// LIVE `[sandbox]` policy cell (`None` inside = sandbox disabled).
-    /// Registry-origin spawns ([`BackgroundTasks::start`]) take one snapshot
-    /// at dispatch; bash facades pass their own per-dispatch snapshot, so a
-    /// `[sandbox]` hot reload applies to the next dispatch and never to a
-    /// command that is already running.
+    /// `[sandbox]` cell for registry-origin spawns ([`BackgroundTasks::start`]);
+    /// bash facades pass their own per-dispatch snapshot.
     sandbox: crate::config::SandboxPolicy,
 }
 
@@ -555,10 +552,7 @@ impl BackgroundTasks {
             .collect()
     }
 
-    pub(super) fn new(
-        timeout: Option<Duration>,
-        sandbox: impl Into<crate::config::SandboxPolicy>,
-    ) -> Self {
+    pub(super) fn new(timeout: Option<Duration>, sandbox: crate::config::SandboxPolicy) -> Self {
         Self {
             registry: Arc::new(BackgroundRegistry {
                 next_id: AtomicU64::new(1),
@@ -566,7 +560,7 @@ impl BackgroundTasks {
             }),
             sender: Arc::new(std::sync::Mutex::new(None)),
             timeout,
-            sandbox: sandbox.into(),
+            sandbox,
         }
     }
 
@@ -768,8 +762,7 @@ impl BackgroundTasks {
             command,
             protect_git,
             self.sender.lock().unwrap().clone(),
-            // One snapshot per dispatch: this command keeps it even if a
-            // reload swaps the live policy while it runs.
+            // One snapshot per dispatch; a running command keeps it.
             self.sandbox.snapshot(),
             None,
             None,
@@ -1484,6 +1477,7 @@ impl Drop for BackgroundRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::SandboxPolicy;
 
     #[test]
     fn foreground_cancellation_overrides_stored_success() {
@@ -1687,7 +1681,7 @@ mod tests {
 
     #[tokio::test]
     async fn receiver_close_does_not_stop_command() {
-        let background = BackgroundTasks::new(None, None);
+        let background = BackgroundTasks::new(None, SandboxPolicy::fixed(None));
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         let workspace = crate::workspace::Workspace::new(std::env::temp_dir()).unwrap();
         background

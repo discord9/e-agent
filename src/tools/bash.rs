@@ -33,14 +33,12 @@ use super::background::{BackgroundTasks, ExitSlot, OutputSlot, TaskExit, TaskSpo
 /// it is adopted into the background. `None` means no threshold (run to
 /// completion). Callers resolve it from config (`[bash]`), defaulting to 30s.
 /// Sandboxed Windows retains kill-on-timeout instead of adopting.
-/// `sandbox` is the LIVE policy cell: the tool re-reads it at every dispatch,
-/// so a `[sandbox]` hot reload applies to the next command of an
-/// already-running session. `read_only` applies the read-only role narrowing
-/// (and the fail-closed refusal to run without a policy) per dispatch.
+/// `sandbox` is the shared policy cell (read per dispatch); `read_only`
+/// narrows it and fails closed without a policy.
 pub fn bash_tool(
     workspace: Workspace,
     background: BackgroundTasks,
-    sandbox: impl Into<crate::config::SandboxPolicy>,
+    sandbox: crate::config::SandboxPolicy,
     protect_git: bool,
     read_only: bool,
     timeout: Option<Duration>,
@@ -52,7 +50,7 @@ pub fn bash_tool(
         timeout,
         background,
         sender: None,
-        sandbox: sandbox.into(),
+        sandbox,
         read_only,
         protect_git,
         shell,
@@ -86,13 +84,8 @@ pub(super) struct Bash {
     /// Completion delivery belongs to this bash facade's Agent, not the
     /// shared registry. Spawned tasks retain this origin sender.
     pub(super) sender: Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
-    /// LIVE `[sandbox]` policy cell: read once per dispatch, so a reload
-    /// applies to this session's next command (a running command keeps the
-    /// policy it was dispatched with).
+    /// Shared `[sandbox]` cell (read per dispatch); `read_only` narrows it.
     pub(super) sandbox: crate::config::SandboxPolicy,
-    /// Read-only role: every dispatch narrows the live policy (workspace
-    /// read-only, extra writable roots dropped) and refuses to run at all
-    /// when the live policy is disabled (fail closed).
     pub(super) read_only: bool,
     /// On non-Windows, bind `<workspace>/.git` read-only when sandboxed.
     /// Resolved from the role's frontmatter `protect_git` (default true).
@@ -106,12 +99,9 @@ pub(super) struct Bash {
 }
 
 impl Bash {
-    /// The policy THIS dispatch runs under: ONE live snapshot, narrowed for a
-    /// read-only facade. `Err` is the read-only fail-closed case — the live
-    /// `[sandbox]` policy is disabled (or was disabled by a hot reload), so
-    /// there is no sandbox to narrow and an unsandboxed shell would defeat
-    /// the role. Callers take this exactly once per invocation, so one command
-    /// is one consistent policy.
+    /// The policy THIS dispatch runs under: one snapshot, narrowed for a
+    /// read-only facade. `Err` is read-only fail-closed: there is no policy to
+    /// narrow, and an unsandboxed shell would defeat the role.
     fn dispatch_policy(&self) -> Result<Option<crate::config::Sandbox>, String> {
         let live = self.sandbox.snapshot();
         if !self.read_only {
@@ -167,10 +157,8 @@ impl Tool for Bash {
         // Tell the model which shell syntax to use (pwsh on Windows, bash
         // elsewhere).
         description.push_str(self.shell.syntax_hint);
-        // The description is rebuilt for every model request, so it reads the
-        // CURRENT policy: a `[sandbox]` hot reload is reflected here on the
-        // next turn instead of going stale for an already-running session.
-        // One snapshot for the whole description, exactly like one dispatch.
+        // Rebuilt whenever the tool list is assembled for a turn, from the
+        // policy of that moment (a reload can lag by up to one turn).
         let policy = self.dispatch_policy();
         if let Ok(Some(sandbox)) = &policy {
             #[cfg(windows)]
@@ -232,7 +220,7 @@ impl Tool for Bash {
                     );
                 }
                 description.push_str(
-                " Bash mounts and read_file/write_file/edit_file capabilities are independent boundaries sharing this resolved path policy.",
+                " These bash mounts follow the live `[sandbox]` policy; read_file/write_file/edit_file keep the readable roots the session was built with.",
             );
                 description.push_str(
                 " In a linked git worktree the main repository is mounted read-only (absolute path); bash can also reach it via relative traversal, but the file tools cannot — use the absolute path with them.",
@@ -280,9 +268,6 @@ impl Tool for Bash {
                     .into(),
             );
         }
-        // ONE snapshot per invocation (foreground or background): a command
-        // already dispatched keeps its policy even if a config reload swaps
-        // the live cell while it runs.
         let policy = self.dispatch_policy()?;
         if background {
             if detached {
@@ -1236,6 +1221,43 @@ fn pin_source(
     }
 }
 
+/// Whether a sandboxed command could CREATE the missing policy parent: some
+/// covering mount destination (the workspace bind or a configured root) is
+/// writable, and the deepest such destination decides, exactly like the mount
+/// loop (later entries win at equal depth, so the workspace bind wins ties).
+/// When nothing writable covers it, the parent cannot be created from inside
+/// the sandbox and no projection is needed.
+#[cfg(unix)]
+fn policy_parent_creatable(
+    workspace: &Workspace,
+    sandbox: &crate::config::Sandbox,
+    parent: &Path,
+) -> bool {
+    let mut best: Option<(usize, bool)> = None;
+    let mut consider = |dest: &Path, writable: bool| {
+        if parent.starts_with(dest) {
+            let depth = dest.components().count();
+            if best.is_none_or(|(best_depth, _)| depth >= best_depth) {
+                best = Some((depth, writable));
+            }
+        }
+    };
+    for (_, dest) in &sandbox.readable_mounts {
+        consider(Path::new(dest), false);
+    }
+    for (_, dest) in &sandbox.writable_mounts {
+        consider(Path::new(dest), true);
+    }
+    for path in &sandbox.readable_paths {
+        consider(Path::new(path), false);
+    }
+    for path in &sandbox.writable_paths {
+        consider(Path::new(path), true);
+    }
+    consider(workspace.root(), sandbox.workspace_writable);
+    best.is_some_and(|(_, writable)| writable)
+}
+
 /// Install the policy-parent protection: `--tmpfs P`, restore the allowed
 /// existing top-level ordinary entries (regular files/dirs only) and the
 /// explicit descendants via descriptor-pinned binds, then `--remount-ro P`
@@ -1257,18 +1279,25 @@ fn project_policy_parent(
     // are enumerated from it with getdents, which EBADFs on O_PATH fds.
     // RESOLVE_NO_SYMLINKS rejects a symlinked `.e-agent` outright (fail
     // closed — no symlink fallback is ever used).
-    let parent_fd = match openat2(
-        rustix::fs::CWD,
-        parent,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-        ResolveFlags::NO_SYMLINKS,
-    ) {
+    let open_parent = || {
+        openat2(
+            rustix::fs::CWD,
+            parent,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::NO_SYMLINKS,
+        )
+    };
+    let parent_fd = match open_parent() {
         Ok(fd) => fd,
-        // A missing policy parent (or a non-directory at that path) cannot
-        // be projected; the config stays ENOENT and the host gains nothing.
-        // If the generic loop excluded configured destinations under it,
-        // those would be silently hidden — fail closed instead.
+        // A missing policy parent (or a non-directory at that path) is a
+        // SELF-RELAXATION vector when the sandbox can create it through a
+        // writable bind: a command could author `.e-agent/config.toml` and the
+        // reload would install that policy for the next dispatch. Create the
+        // agent's own state directory here (host side, before the spawn) and
+        // project it like an existing one, so the config stays absent and
+        // uncreatable inside the sandbox. When nothing writable covers the
+        // parent, nothing can be created there and no projection is needed.
         Err(rustix::io::Errno::NOENT | rustix::io::Errno::NOTDIR) => {
             if filtered_policy_dests {
                 return Err(format!(
@@ -1277,7 +1306,25 @@ fn project_policy_parent(
                     parent.display()
                 ));
             }
-            return Ok(());
+            if !policy_parent_creatable(workspace, sandbox, parent) {
+                return Ok(());
+            }
+            std::fs::create_dir_all(parent).map_err(|error| {
+                format!(
+                    "fail closed: cannot create the policy parent {} to keep {} read-only: {error}",
+                    parent.display(),
+                    policy.display()
+                )
+            })?;
+            match open_parent() {
+                Ok(fd) => fd,
+                Err(error) => {
+                    return Err(format!(
+                        "fail closed: cannot pin policy parent {} after creating it: {error}",
+                        parent.display()
+                    ));
+                }
+            }
         }
         // An unreadable (execute-only) parent must NOT be skipped: the
         // sandbox — same user — could still open `config.toml` by known

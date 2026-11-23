@@ -5,6 +5,7 @@ use crossterm::event::{KeyEvent, KeyModifiers};
 
 use super::*;
 use crate::config::InputKeys;
+use crate::config::SandboxPolicy;
 use crate::tools::new_exit_slot;
 use ratatui::buffer::CellDiffOption;
 
@@ -301,7 +302,7 @@ async fn tasks_panel_selection_routes_bash_to_detail_and_delegate_to_attach() {
     let temp = tempfile::tempdir().unwrap();
     let (_, mut background) = crate::tools::builtins(
         crate::workspace::Workspace::new(temp.path()).unwrap(),
-        None,
+        SandboxPolicy::fixed(None),
         false,
         None,
     );
@@ -376,7 +377,7 @@ async fn open_task_detail_clears_attached_and_remembers_panel_state() {
     let temp = tempfile::tempdir().unwrap();
     let (_, mut background) = crate::tools::builtins(
         crate::workspace::Workspace::new(temp.path()).unwrap(),
-        None,
+        SandboxPolicy::fixed(None),
         false,
         None,
     );
@@ -447,7 +448,7 @@ async fn open_task_detail_from_main_view_esc_returns_to_main_view() {
     let temp = tempfile::tempdir().unwrap();
     let (_, mut background) = crate::tools::builtins(
         crate::workspace::Workspace::new(temp.path()).unwrap(),
-        None,
+        SandboxPolicy::fixed(None),
         false,
         None,
     );
@@ -944,7 +945,7 @@ async fn task_detail_cancel_by_id_keeps_the_spool_paged() {
     let temp = tempfile::tempdir().unwrap();
     let (_, mut background) = crate::tools::builtins(
         crate::workspace::Workspace::new(temp.path()).unwrap(),
-        None,
+        SandboxPolicy::fixed(None),
         false,
         None,
     );
@@ -2008,7 +2009,7 @@ async fn narrow_layout_goal_with_tasks_and_typed_input() {
     let temp = tempfile::tempdir().unwrap();
     let (_, mut background) = crate::tools::builtins(
         crate::workspace::Workspace::new(temp.path()).unwrap(),
-        None,
+        SandboxPolicy::fixed(None),
         false,
         None,
     );
@@ -2377,7 +2378,7 @@ async fn tasks_panel_tags_rows_with_the_agent_role() {
     let mut terminal = Terminal::new(backend).unwrap();
     let (_, mut background) = crate::tools::builtins(
         crate::workspace::Workspace::new(".").unwrap(),
-        None,
+        SandboxPolicy::fixed(None),
         false,
         None,
     );
@@ -2440,7 +2441,7 @@ async fn tasks_panel_selection_highlight_shows_on_non_attachable_task() {
     // highlighted attachable tasks).
     let (_, mut background) = crate::tools::builtins(
         crate::workspace::Workspace::new(".").unwrap(),
-        None,
+        SandboxPolicy::fixed(None),
         false,
         None,
     );
@@ -2509,7 +2510,7 @@ async fn cancel_selected_task_leaves_projection_to_runner() {
     let temp = tempfile::tempdir().unwrap();
     let (_, mut background) = crate::tools::builtins(
         crate::workspace::Workspace::new(temp.path()).unwrap(),
-        None,
+        SandboxPolicy::fixed(None),
         false,
         None,
     );
@@ -2579,7 +2580,7 @@ async fn cancel_selected_task_cancels_any_task_and_clamps_cursor() {
     // attachable probe returns true for that id, then clamp cursor.
     let (_, mut background) = crate::tools::builtins(
         crate::workspace::Workspace::new(".").unwrap(),
-        None,
+        SandboxPolicy::fixed(None),
         false,
         None,
     );

@@ -425,14 +425,13 @@ read-only, extra writable roots are dropped, and networking follows
 `[sandbox] network` (`--unshare-net` when it is false), so read-only network
 operations stay possible unless the config disables networking. Read tools stay
 available, including the network read tools (web search, and DeepSeek's page
-fetch), which deliberately still reach the network. The narrowing is derived
-from the LIVE `[sandbox]` policy at every dispatch, so a hot reload applies to
-a read-only session's next command, and a reload that disables the sandbox
-fails the read-only shell closed instead of unsandboxing it. Background bash
-commands started inside the subagent inherit the role's narrowed sandbox too
-(they never fall back to the parent's wider policy). If the sandbox is not
-enabled (or bwrap is unavailable), a read-only role gets **no `bash` tool at
-all** — fail closed rather than an unsandboxed shell.
+fetch), which deliberately still reach the network. The narrowing follows the
+live `[sandbox]` policy, and a reload that disables the sandbox fails the
+read-only shell closed instead of unsandboxing it. Background bash commands
+started inside the subagent inherit the role's narrowed sandbox too (they never
+fall back to the parent's wider policy). If the sandbox is not enabled (or
+bwrap is unavailable), a read-only role gets **no `bash` tool at all** — fail
+closed rather than an unsandboxed shell.
 
 Read-only is a tool boundary, not a host security framework: it constrains
 which tools the model may call, and the bash sandbox remains a best-effort
@@ -500,15 +499,18 @@ enabled = true
 `gpu` is global-config-only: a project `.e-agent/config.toml` that sets it is
 rejected at startup.
 
-The policy is live: editing `[sandbox]` in the global or project config makes
-the next `bash` / background command of a running server or TUI session run
-under the new mounts and network setting, without restarting. Each invocation
-takes one snapshot at dispatch (one command = one `bwrap` = one consistent
-policy), a background command already running keeps the policy it started with
-until it exits, and the `bash` description the model sees is rebuilt from the
-current policy on each request. The file tools' policy (readable/writable
-roots, and `workspace_writable = false` denying in-workspace writes) is still
-fixed when the session is built, so a new session is needed for those.
+Editing `[sandbox]` applies live: the next `bash` / background command of a
+running server or TUI session uses the new mounts and network setting without a
+restart. A command that is already running keeps the policy it started with
+until it exits, and the `bash` description is rebuilt when the tool list is
+assembled for a turn (so it can lag an edit by one turn). File-tool roots — and
+whether `workspace_writable = false` denies in-workspace writes — stay
+session-fixed, and `run_rust` keeps its startup policy, so those need a
+restart/new session.
+
+One authorization limit is deliberate: a delegate running in a different
+`workspace` keeps writing that workspace while `workspace_writable = true`,
+even if the external grant that admitted the workspace is later revoked.
 
 `gpu` and the runtime installation are two separate halves of one policy.
 `gpu = true` grants the host GPU device nodes (`/dev/kfd`, `/dev/dri`, plus any
@@ -601,7 +603,10 @@ The exact workspace-relative `.e-agent/config.toml` policy file is readable by
 file tools but write/edit protected and must be changed by the user outside the
 agent. Bash binds an existing policy over `/dev/null`; if only `.e-agent/`
 exists, that directory is mounted read-only so a writable child cannot create
-the policy. If neither exists, no mountpoint is needed or created.
+the policy. When `.e-agent/` itself is missing and the sandbox could create it
+through a writable bind, the agent creates that state directory outside the
+sandbox and mounts it read-only, so a sandboxed command can never author the
+policy that governs it (and the reload can never install such an edit).
 
 Note that the sandbox hides all of `$HOME` behind a fresh tmpfs and then binds
 in only the workspace and these extra paths — so personal files such as
@@ -1383,28 +1388,17 @@ runtime and emit no success diff.
   immediately available to the web `/model` autocomplete, `POST
   /api/sessions/{id}/model` and TUI `/model` switches, and newly built sessions
   start with the edited default and role routing.
-- `[sandbox]` — a winning edit (global section, or the project overlay that
-  startup would also apply) is re-resolved with the same workspace-aware
-  resolver startup uses, validated, and swapped into the live policy that
-  `bash` and background tasks read, so it applies to the **next** bash /
-  background dispatch of an **already-running** session — no new session and
-  no restart. One invocation is one `bwrap` invocation with one consistent
-  policy snapshot; a background command that is already running keeps the
-  policy it was dispatched with until it exits, and the `bash` tool
-  description is rebuilt from the live policy on the next model request. The
-  reload emits a sanitized summary naming the new keys and paths
-  (`enabled`, `network`, `workspace_writable`, `gpu`, `writable_paths`,
-  `readable_paths`) — paths are config, not secrets, and a reload that ADDS a
-  readable/writable path widens access immediately. Existing sessions' FILE
-  tools keep their build-time policy — the cap-std readable/writable roots and
-  whether `workspace_writable = false` denies in-workspace writes — so a
-  change to those that must constrain `read_file`/`write_file`/`edit_file`
-  needs a new session (shell commands follow immediately). `run_rust`'s forced
-  policy is startup-fixed too. `[sandbox]` validation failures (e.g. a project
-  path outside every globally authorized root) reject the whole reload and
-  keep the last good policy, and the bwrap/Windows availability preflight is
-  not re-run: an enabled policy on a host without `bwrap` fails the command
-  closed with its own error instead of rejecting unrelated config edits.
+- `[sandbox]` — a winning edit is re-resolved with the same workspace-aware
+  resolver startup uses, validated, and installed for the **next** bash /
+  background command of an **already-running** session (no restart; a command
+  already running keeps its own policy). `/btw` forks and subagents share the
+  same policy, so they follow the edit too, and the policy is re-resolved only
+  when the `[sandbox]` inputs themselves change — an unrelated edit never
+  installs a path that merely appeared on disk. Invalid input (e.g. a project
+  path outside every globally authorized root) rejects the whole reload and
+  keeps the last good policy; the bwrap/Windows availability preflight is not
+  re-run, so each command fails closed with its own error instead. File-tool
+  roots and `run_rust`'s forced policy are startup-fixed (see below).
 - `[mcp]`, the `[bash]` foreground residence threshold, and the `[background]`
   timeout — winning edits apply to sessions built after the reload; existing
   MCP connections are unchanged. `[bash] timeout_secs` defaults to 30 seconds:
@@ -1422,11 +1416,11 @@ Restart required: `[session]` connects at startup, a `[web_search]` backend
 change injects the resolved key or SearXNG `base_url` into the process
 environment once at startup, and `AGENTS.md`/skills instructions plus existing
 sessions' models stay as loaded (a session keeps its model until a `/model`
-switch). `[sandbox]` file-tool policy (the cap-std capabilities behind
+switch). `[sandbox]` file-tool roots (the cap-std capabilities behind
 `read_file`/`write_file`/`edit_file`, including whether `workspace_writable =
-false` denies in-workspace writes) and `run_rust`'s forced policy are wired at
-startup too: a sandbox edit reaches shell commands immediately, but the file
-tools keep their session's build-time policy.
+false` denies in-workspace writes) are wired per session, and `run_rust`'s
+forced policy at factory start: a sandbox edit reaches shell commands
+immediately, but those need a restart (or, for the file tools, a new session).
 
 ## MCP (local servers)
 
@@ -1825,12 +1819,12 @@ server initialization.
 It has one model seam and one tool seam. Main-agent tool rounds are unlimited
 unless `--max-rounds` sets an explicit cap; subagent tool rounds are unlimited.
 Config hot reload is deliberately scoped: `[models]`/`[providers]`/`[roles]`
-(and anything else read at session-build time) hot-reload in the server and
-TUI via mtime polling with validate-before-swap, and `[sandbox]` additionally
-hot-reloads the *shell* policy in place (next bash/background dispatch of an
-already-running session; a command already running keeps its policy, and
-file-tool roots still need a new session), but the `[session]` backend and the
-web-search backend env injection stay startup-fixed and require a restart. Reload emits sanitized per-source TOML leaf diagnostics;
+(and anything else read at session-build time) hot-reload in the server and TUI
+via mtime polling with validate-before-swap, and a `[sandbox]` edit additionally
+reaches the next shell command of an already-running session; there is no
+per-section policy engine, no second diagnostic formatter, and the `[session]`
+backend, web-search env injection, file-tool roots and `run_rust` policy stay
+startup-fixed. Reload emits sanitized per-source TOML leaf diagnostics;
 uncertain changes are `unknown`, and credential values are never compared.
 There is no reload HTTP endpoint, no watch(1)/inotify, and no per-section partial reload (a bad edit is rejected
 wholesale and the last good config is kept).

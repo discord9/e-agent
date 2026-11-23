@@ -1,5 +1,6 @@
 use super::*;
 use crate::agent::{AssistantMessage, Message, Model, ModelDeltaKind, Usage};
+use crate::config::SandboxPolicy;
 use crate::session::Session;
 use crate::tools::builtins;
 use std::sync::Barrier;
@@ -104,7 +105,7 @@ fn delegate_with_url(workspace: &std::path::Path, base_url: String) -> Delegate 
         crate::model::OpenAiModel::new(base_url, "test-key".into(), "test-model".into(), None)
             .unwrap(),
     );
-    let (_, background) = builtins(workspace.clone(), None, false, None);
+    let (_, background) = builtins(workspace.clone(), SandboxPolicy::fixed(None), false, None);
     // Tests assert JSONL file semantics (resume files, scrollback, labels);
     // pin the JSONL backend explicitly — production defaults to SQLite.
     Delegate::new(model, workspace, background)
@@ -235,7 +236,7 @@ async fn background_cancel_during_on_id_cleans_registration_without_completion()
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().to_path_buf();
     let workspace = Workspace::new(&root).unwrap();
-    let (_, mut background) = builtins(workspace, None, false, None);
+    let (_, mut background) = builtins(workspace, SandboxPolicy::fixed(None), false, None);
     let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
     background.set_event_sender(sender);
     let (handle, runner_task, signals) = probe_runner(&root, false);
@@ -313,7 +314,7 @@ async fn background_cancel_during_on_id_cleans_registration_without_completion()
 async fn background_cancel_before_first_yield_cleans_everything() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();
-    let (_, mut background) = builtins(workspace, None, false, None);
+    let (_, mut background) = builtins(workspace, SandboxPolicy::fixed(None), false, None);
     let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
     background.set_event_sender(sender);
     let (handle, runner_task, signals) = probe_runner(temp.path(), false);
@@ -374,7 +375,7 @@ async fn background_cancel_before_first_yield_cleans_everything() {
 async fn background_cancel_while_joining_aborts_inner_without_completion() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();
-    let (_, mut background) = builtins(workspace, None, false, None);
+    let (_, mut background) = builtins(workspace, SandboxPolicy::fixed(None), false, None);
     let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
     background.set_event_sender(sender);
     let (handle, runner_task, signals) = probe_runner(temp.path(), false);
@@ -436,7 +437,7 @@ async fn background_cancel_while_joining_aborts_inner_without_completion() {
 async fn panicking_inner_model_cleans_up_and_sends_one_failure_completion() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();
-    let (_, mut background) = builtins(workspace, None, false, None);
+    let (_, mut background) = builtins(workspace, SandboxPolicy::fixed(None), false, None);
     let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
     background.set_event_sender(sender);
     let (handle, runner_task, signals) = probe_runner(temp.path(), true);
@@ -1133,7 +1134,7 @@ fn resume_loads_the_previous_transcript_as_starting_context() {
 async fn spec_disallows_nested_delegation_by_design() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();
-    let (tools, _) = builtins(workspace, None, false, None);
+    let (tools, _) = builtins(workspace, SandboxPolicy::fixed(None), false, None);
     let names: Vec<String> = tools.iter().map(|tool| tool.spec().name).collect();
     assert!(!names.contains(&"delegate".to_owned()));
     assert!(names.contains(&"bash".to_owned()));
@@ -1451,7 +1452,7 @@ async fn run_subagent_and_capture(
     let (url, captured) = capturing_model().await;
     let mut tool = delegate_with_url(temp.path(), url).with_roles_root(temp.path().to_path_buf());
     if with_sandbox {
-        tool = tool.with_sandbox(Some(crate::config::Sandbox {
+        tool = tool.with_sandbox(SandboxPolicy::fixed(Some(crate::config::Sandbox {
             enabled: true,
             network: true,
             workspace_writable: true,
@@ -1460,7 +1461,7 @@ async fn run_subagent_and_capture(
             readable_paths: vec!["~/.rustup".into()],
             readable_mounts: Vec::new(),
             writable_mounts: Vec::new(),
-        }));
+        })));
     }
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     tool.set_event_sender(sender);
@@ -1677,7 +1678,8 @@ async fn shared_background_registry_completion_reaches_its_configured_channel() 
     // pin the runner wiring.
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();
-    let (_, mut parent_background) = builtins(workspace.clone(), None, false, None);
+    let (_, mut parent_background) =
+        builtins(workspace.clone(), SandboxPolicy::fixed(None), false, None);
     let (parent_sender, mut parent_receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
     parent_background.set_event_sender(parent_sender);
 
@@ -2210,7 +2212,7 @@ async fn btw_unwritable_record_root_does_not_abort_live_child() {
     crate::session::Session::append(&root, "web-main", &source_entries).unwrap();
 
     let workspace = Workspace::new(&root).unwrap();
-    let (_, mut background) = builtins(workspace.clone(), None, false, None);
+    let (_, mut background) = builtins(workspace.clone(), SandboxPolicy::fixed(None), false, None);
     let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
     background.set_event_sender(sender);
     let sessions = Sessions::default();
@@ -2237,7 +2239,7 @@ async fn btw_unwritable_record_root_does_not_abort_live_child() {
             model,
             context_window: None,
             workspace,
-            sandbox: None,
+            sandbox: SandboxPolicy::fixed(None),
             read_only: false,
             background: background.clone(),
             sessions: sessions.clone(),
@@ -2499,7 +2501,7 @@ async fn spawn_btw_subagent_forks_history_and_registers_persistent_subagent() {
     crate::session::Session::append(&root, "web-main", &source_entries).unwrap();
 
     let workspace = Workspace::new(&root).unwrap();
-    let (_, mut background) = builtins(workspace.clone(), None, false, None);
+    let (_, mut background) = builtins(workspace.clone(), SandboxPolicy::fixed(None), false, None);
     let (sender, _completions) = tokio::sync::mpsc::unbounded_channel();
     background.set_event_sender(sender);
     let sessions = Sessions::default();
@@ -2528,7 +2530,7 @@ async fn spawn_btw_subagent_forks_history_and_registers_persistent_subagent() {
             model,
             context_window: None,
             workspace,
-            sandbox: None,
+            sandbox: SandboxPolicy::fixed(None),
             read_only: false,
             background: background.clone(),
             sessions: sessions.clone(),
@@ -3542,7 +3544,7 @@ async fn btw_child_suspends_fresh_automatic_goal_until_completion_commits() {
     Session::append(&root, "btw-goal-main", &prior).unwrap();
 
     let workspace = Workspace::new(temp.path()).unwrap();
-    let (_, background) = builtins(workspace.clone(), None, false, None);
+    let (_, background) = builtins(workspace.clone(), SandboxPolicy::fixed(None), false, None);
     let calls = Arc::new(AtomicUsize::new(0));
     let contexts = Arc::new(Mutex::new(Vec::new()));
     let blocked = Arc::new(Notify::new());
@@ -3596,7 +3598,7 @@ async fn btw_child_suspends_fresh_automatic_goal_until_completion_commits() {
             ),
             context_window: None,
             workspace: workspace.clone(),
-            sandbox: None,
+            sandbox: SandboxPolicy::fixed(None),
             read_only: false,
             background: background.clone(),
             sessions: Sessions::default(),
@@ -3701,7 +3703,7 @@ fn send_message_spec_is_identical_for_parent_and_child() {
 fn fork_child_delegate_spec_matches_parent() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();
-    let (_, background) = builtins(workspace.clone(), None, false, None);
+    let (_, background) = builtins(workspace.clone(), SandboxPolicy::fixed(None), false, None);
     let model = ConfiguredModel::chat(
         crate::model::OpenAiModel::new(
             "http://localhost".into(),
@@ -3721,7 +3723,7 @@ fn fork_child_delegate_spec_matches_parent() {
             context_window: None,
             context_prefix: None,
             compaction_reminder: None,
-            sandbox: None,
+            rust_sandbox: None,
             read_only: false,
             protect_git: true,
             code_mode: false,
@@ -3784,7 +3786,7 @@ fn forking_delegate(
     head_model: ConfiguredModel,
 ) -> Delegate {
     let workspace = Workspace::new(root).unwrap();
-    let (_, background) = builtins(workspace.clone(), None, false, None);
+    let (_, background) = builtins(workspace.clone(), SandboxPolicy::fixed(None), false, None);
     let model = head_model.clone();
     Delegate::new(model, workspace, background)
         .with_persist_store(SessionBackend::Jsonl)
@@ -3795,7 +3797,7 @@ fn forking_delegate(
             context_window: None,
             context_prefix: None,
             compaction_reminder: None,
-            sandbox: None,
+            rust_sandbox: None,
             read_only: false,
             protect_git: false,
             code_mode: false,
@@ -4400,7 +4402,7 @@ fn fork_head(
         context_window: None,
         context_prefix: context_prefix.map(str::to_owned),
         compaction_reminder: None,
-        sandbox: None,
+        rust_sandbox: None,
         read_only: false,
         protect_git: false,
         code_mode: false,

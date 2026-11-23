@@ -41,19 +41,14 @@ does not yet follow semantic versioning strictly.
 ### Changed
 
 - **`[sandbox]` hot reloads (live shell policy)** — a winning `[sandbox]`
-  edit (global section or project overlay) is now re-resolved with the same
-  workspace-aware resolver startup uses, validated, and swapped into a
-  `SandboxPolicy` cell shared by the session factory, `bash` and background
-  tasks, so the next bash / background dispatch of an **already-running**
-  session runs under the new mounts and network setting without a restart.
-  One invocation = one `bwrap` = one policy snapshot; a background command
-  already running keeps the policy it was dispatched with until it exits,
-  and the `bash` description is rebuilt from the live policy on every
-  request. Read-only roles re-derive their narrowing per dispatch and fail
-  closed if the policy is disabled. Reloads log a sanitized summary naming
-  the new keys and paths, and `[sandbox]` source edits are reported
-  `effective` instead of restart-only. File-tool readable/writable
-  capabilities and `run_rust`'s forced policy still need a new session.
+  edit reaches the next `bash` / background command of an already-running
+  session without a restart; a command already running keeps its policy,
+  read-only roles re-derive their narrowing (and fail closed when the policy
+  disappears), and `/btw` forks share the parent's policy. The policy is
+  re-resolved only when the `[sandbox]` inputs change, and such edits are
+  reported `effective` instead of restart-only. Sandboxed commands can no
+  longer author the workspace policy file, even when `.e-agent/` does not
+  exist yet. File-tool roots and `run_rust`'s forced policy stay startup-fixed.
 - **Sandbox `/tmp` is the host's real `/tmp` again** — bubblewrap bash no
   longer mounts a private `/tmp` tmpfs, and the delegated-subagent
   read-only `/tmp` remount is gone: inside the sandbox `/tmp` is the host

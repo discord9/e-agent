@@ -205,9 +205,9 @@ pub(crate) struct TuiState {
     /// The workspace the main session works in; btw fork subagents inherit
     /// it.
     pub(crate) workspace: Option<crate::workspace::Workspace>,
-    /// bwrap policy inherited by btw fork subagents (`None` = sandbox
-    /// disabled, wired by `run_inner` together with the other components).
-    pub(crate) sandbox: Option<crate::config::Sandbox>,
+    /// The factory's `[sandbox]` cell, shared with btw fork subagents (wired
+    /// by `run_inner` together with the other components).
+    pub(crate) sandbox: Option<crate::config::SandboxPolicy>,
     /// Session backend configuration for btw fork subagent persistence.
     pub(crate) backend: Option<crate::config::SessionBackend>,
     /// Read-only policy inherited by btw fork subagents (a read-only parent

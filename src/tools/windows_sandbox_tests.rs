@@ -22,7 +22,10 @@ fn test_bash(workspace: Workspace, policy: crate::config::Sandbox) -> Bash {
         workspace,
         timeout: Some(Duration::from_secs(15)),
         sender: None,
-        background: BackgroundTasks::new(Some(Duration::from_secs(15)), Some(policy.clone())),
+        background: BackgroundTasks::new(
+            Some(Duration::from_secs(15)),
+            SandboxPolicy::fixed(Some(policy.clone())),
+        ),
         sandbox: SandboxPolicy::fixed(Some(policy)),
         read_only: false,
         protect_git: false,
@@ -527,9 +530,11 @@ async fn restricted_token_rejects_network_false_at_execution() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();
     let bash = test_bash(workspace, windows_policy(true, Vec::new()));
-    let mut policy = bash.sandbox.clone().unwrap();
+    // The facade reads the live cell at dispatch: `network = false` installed
+    // in place must reach the very next command (no tool rebuild).
+    let mut policy = bash.sandbox.snapshot().expect("sandbox cell is enabled");
     policy.network = false;
-    let bash = test_bash(bash.workspace, policy);
+    bash.sandbox.replace(Some(policy));
     let error = bash
         .execute(json!({"command": "exit 0"}))
         .await

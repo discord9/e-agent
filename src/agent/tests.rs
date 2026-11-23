@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::json;
 
 use super::*;
+use crate::config::SandboxPolicy;
 use crate::output_receipt::{PROJECTION_HEAD_BYTES, PROJECTION_TAIL_BYTES, PROJECTION_THRESHOLD};
 
 struct ScriptedModel {
@@ -1199,9 +1200,16 @@ async fn poll_guard_direct_agent_ends_turn_after_full_batch_and_resets_next_turn
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("x.txt"), "hello").unwrap();
     let workspace = crate::workspace::Workspace::new(temp.path()).unwrap();
-    let (_main_tools, background) = crate::tools::builtins(workspace.clone(), None, false, None);
-    let tools =
-        crate::tools::builtins_with_background(workspace, background, None, false, true, None);
+    let (_main_tools, background) =
+        crate::tools::builtins(workspace.clone(), SandboxPolicy::fixed(None), false, None);
+    let tools = crate::tools::builtins_with_background(
+        workspace,
+        background,
+        SandboxPolicy::fixed(None),
+        false,
+        true,
+        None,
+    );
 
     let events = Arc::new(Mutex::new(Vec::new()));
     let captured = events.clone();
@@ -1325,7 +1333,8 @@ async fn poll_guard_main_builtins_carry_the_guard() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("x.txt"), "hello").unwrap();
     let workspace = crate::workspace::Workspace::new(temp.path()).unwrap();
-    let (tools, _background) = crate::tools::builtins(workspace, None, false, None);
+    let (tools, _background) =
+        crate::tools::builtins(workspace, SandboxPolicy::fixed(None), false, None);
 
     let events = Arc::new(Mutex::new(Vec::new()));
     let captured = events.clone();

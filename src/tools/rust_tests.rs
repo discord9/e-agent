@@ -2,6 +2,7 @@
 //! authority under hostile swaps, the socketpair status protocol, cancellation
 //! and cleanup, and the sandbox policy surface.
 use super::*;
+use crate::config::SandboxPolicy;
 #[rustfmt::skip]
 use super::rust::{FAULT_CONFIRM, FAULT_KILL, KillGuard, RunRust, SOURCE_MAX_BYTES, COMPILE_TIMEOUT, ScratchGuard, base_dir, create_scratch, create_scratch_once, group_absent, kill_group, reap_confirmed, remove_scratch, resolve_rustc, run_rust_policy, validate_source};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -54,7 +55,7 @@ fn registration_and_preflight_gate_run_rust() {
     // default off; read-only without any sandbox fails closed; else registered
     assert!(!reg(false, false, None) && !reg(true, true, None));
     assert!(reg(true, true, Some(sb())) && reg(true, false, None));
-    let sub = builtins_with_background(ws.clone(), BackgroundTasks::new(None, None), Some(sb()), false, true, None);
+    let sub = builtins_with_background(ws.clone(), BackgroundTasks::new(None, SandboxPolicy::fixed(None)), SandboxPolicy::fixed(Some(sb())), false, true, None);
     assert!(!sub.iter().any(|t| t.spec().name == "run_rust"), "subagents never inherit run_rust");
     let path = std::env::var_os("PATH");
     let empty = tempfile::tempdir().unwrap();

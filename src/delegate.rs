@@ -320,9 +320,8 @@ pub struct Delegate {
     /// Workspace root used to resolve role templates across global, legacy
     /// project (`agents/`), and canonical project (`.e-agent/agents/`) layers.
     roles_root: Option<std::path::PathBuf>,
-    /// LIVE bwrap policy inherited by every subagent's bash tool (the session
-    /// factory's cell), so a `[sandbox]` hot reload applies to the next
-    /// command of a subagent spawned before or after the edit.
+    /// The session factory's `[sandbox]` cell, inherited by every subagent's
+    /// bash tool.
     sandbox: crate::config::SandboxPolicy,
     /// Parent session's background-task record (workspace root + session
     /// name + the store that owns the record), so subagent delegates are
@@ -379,9 +378,8 @@ struct DelegatedTask {
     role_prompt: Option<String>,
     compaction_reminder: Option<String>,
     /// True when the role's frontmatter declared `read_only = true` (or the
-    /// caller's policy demands it): the subagent gets no write/edit tools and
-    /// its bash narrows the live sandbox per dispatch (workspace read-only,
-    /// extra writable roots dropped, network per `[sandbox] network`).
+    /// caller's policy demands it): no write/edit tools, and bash narrows the
+    /// sandbox per dispatch.
     read_only: bool,
     /// True (the default, incl. roles without a `protect_git` frontmatter
     /// key) when the subagent's bash must bind `<workspace>/.git` read-only
@@ -489,7 +487,7 @@ impl Delegate {
             role_model_source: None,
             subagent_model_source: None,
             roles_root: None,
-            sandbox: crate::config::SandboxPolicy::default(),
+            sandbox: crate::config::SandboxPolicy::fixed(None),
             record_in: None,
             local_sessions: crate::session_factory::LocalSessionRegistry::default(),
             persist_backend: SessionBackend::default(),
@@ -559,12 +557,10 @@ impl Delegate {
         self
     }
 
-    /// Sandbox every subagent's bash tool with the same bwrap policy as the
-    /// main agent. The live cell is shared, so a `[sandbox]` hot reload
-    /// reaches subagents' next command too; the read-only narrowing is applied
-    /// per dispatch by the bash tool, exactly like the main session's.
-    pub fn with_sandbox(mut self, sandbox: impl Into<crate::config::SandboxPolicy>) -> Self {
-        self.sandbox = sandbox.into();
+    /// Share the session factory's `[sandbox]` cell with every subagent's bash
+    /// tool (a snapshot is never converted back into a cell here).
+    pub fn with_sandbox(mut self, sandbox: crate::config::SandboxPolicy) -> Self {
+        self.sandbox = sandbox;
         self
     }
 
@@ -854,8 +850,8 @@ impl Delegate {
             Some(session_id.clone()),
         );
         #[cfg(target_os = "linux")]
-        if head.code_mode && (!head.read_only || head.sandbox.is_some()) {
-            let rust = crate::tools::run_rust_tool(&workspace, head.sandbox.as_ref());
+        if head.code_mode && (!head.read_only || head.rust_sandbox.is_some()) {
+            let rust = crate::tools::run_rust_tool(&workspace, head.rust_sandbox.as_ref());
             tools.push(Box::new(DisabledTool {
                 inner: rust,
                 reason: "run_rust is unavailable in forked subagents",
@@ -1149,8 +1145,9 @@ pub struct BtwContext {
     pub context_window: Option<u64>,
     /// Workspace the subagent works in (the parent's).
     pub workspace: Workspace,
-    /// bwrap policy inherited from the parent (`None` = sandbox disabled).
-    pub sandbox: Option<crate::config::Sandbox>,
+    /// The parent's `[sandbox]` cell (a fork shares it, so a later reload
+    /// applies to the fork's next command too).
+    pub sandbox: crate::config::SandboxPolicy,
     /// Read-only policy inherited from the parent session.
     pub read_only: bool,
     /// Shared running-task registry: the btw task-panel entry and the
@@ -1310,9 +1307,7 @@ pub async fn spawn_btw_subagent(
             // btw fork has no role frontmatter: keep the historical
             // subagent default (protect .git).
             protect_git: true,
-            // The btw context carries a snapshot (the factory's policy as of
-            // fork time); the subagent's own bash cell starts from it.
-            sandbox: sandbox.into(),
+            sandbox,
             interactive: true,
         },
         persist,
@@ -1882,9 +1877,7 @@ impl Tool for Delegate {
         let meta_role = role.clone();
         let parent_session_id = self.record_in.as_ref().map(|record| record.session.clone());
         let persist_root = persist.root.clone();
-        // The LIVE policy reaches the subagent's bash tool, which narrows it
-        // per dispatch for a read-only role and fails closed if the policy is
-        // disabled (a reload can change either while the child runs).
+        // The subagent shares the parent's cell, so it follows reloads.
         let task_sandbox = self.sandbox.clone();
         let parent_endpoint = self.parent_endpoint.clone();
         // The same live parent endpoint registers this child's task id in the

@@ -308,7 +308,7 @@ async fn run(raw_arguments: Vec<String>) -> anyhow::Result<()> {
             built.store,
             factory.main_model().clone(),
             factory.workspace().clone(),
-            factory.sandbox(),
+            factory.sandbox_policy(),
             factory.backend().clone(),
             read_only,
             record_in,
