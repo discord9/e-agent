@@ -1367,6 +1367,14 @@ pub(crate) fn project_sandbox_from_observation(
     source: Option<&toml::Value>,
 ) -> anyhow::Result<Option<ProjectSandbox>> {
     match source.and_then(|source| source.get("sandbox")) {
+        // A present `[sandbox]` value must be a TABLE. serde would also accept
+        // a positional sequence for the struct fields, while the input
+        // comparison (`as_table`) would read that same value as absent — so
+        // startup and reload could disagree about whether it is an input.
+        Some(value) if !value.is_table() => Err(anyhow!(
+            "the project [sandbox] overlay must be a table, not {}",
+            value.type_str()
+        )),
         Some(value) => value
             .clone()
             .try_into()

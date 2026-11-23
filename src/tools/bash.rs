@@ -840,9 +840,19 @@ pub(super) fn build_bwrap_plan(
                 .chain(sandbox.readable_mounts.iter())
                 .any(|(_, dest)| Path::new(dest) == parent)
     });
+    // The implicit `/tmp` bind covers the anchor only when no ancestor-guard
+    // tmpfs (installed AFTER it) shadows that subtree: projecting under a guard
+    // would re-introduce `.e-agent` children the guard deliberately hid.
+    let tmp_covers = policy_parent.as_deref().is_some_and(|parent| {
+        host_tmp_bind
+            && parent.starts_with("/tmp")
+            && !ancestor_guards
+                .iter()
+                .any(|(_, guard)| parent.starts_with(guard))
+    });
     let policy_visible = policy_parent.as_deref().is_some_and(|parent| {
         parent.starts_with(root)
-            || (host_tmp_bind && parent.starts_with("/tmp"))
+            || tmp_covers
             || exact_parent_grant
             || mounts
                 .iter()
@@ -856,7 +866,7 @@ pub(super) fn build_bwrap_plan(
             &mut args,
             &mut fds,
             filtered_policy_dests,
-            host_tmp_bind,
+            tmp_covers,
         )?;
     } else if filtered_policy_dests {
         return Err(format!(
@@ -1296,7 +1306,7 @@ fn policy_parent_creatable(
     workspace: &Workspace,
     sandbox: &crate::config::Sandbox,
     parent: &Path,
-    host_tmp_bind: bool,
+    tmp_covers: bool,
 ) -> bool {
     let mut best: Option<(usize, bool)> = None;
     let mut consider = |dest: &Path, writable: bool| {
@@ -1307,6 +1317,12 @@ fn policy_parent_creatable(
             }
         }
     };
+    // The implicit `--bind /tmp /tmp` is mounted FIRST, so every later entry
+    // wins over it (an explicit read-only `/tmp` included): consider it before
+    // any configured destination.
+    if tmp_covers {
+        consider(Path::new("/tmp"), true);
+    }
     for (_, dest) in &sandbox.readable_mounts {
         consider(Path::new(dest), false);
     }
@@ -1320,11 +1336,6 @@ fn policy_parent_creatable(
         consider(Path::new(path), true);
     }
     consider(workspace.root(), sandbox.workspace_writable);
-    // The implicit `--bind /tmp /tmp` is a host-backed WRITABLE bind too (not a
-    // configured destination, so it never reaches the mount list).
-    if host_tmp_bind {
-        consider(Path::new("/tmp"), true);
-    }
     best.is_some_and(|(_, writable)| writable)
 }
 
@@ -1340,7 +1351,7 @@ fn project_policy_parent(
     args: &mut Vec<std::ffi::OsString>,
     fds: &mut Vec<rustix::fd::OwnedFd>,
     filtered_policy_dests: bool,
-    host_tmp_bind: bool,
+    tmp_covers: bool,
 ) -> Result<(), String> {
     use rustix::fs::{FileType, Mode, OFlags, RawDir, ResolveFlags, fstat, openat2};
     let policy = workspace.policy_anchor();
@@ -1376,7 +1387,7 @@ fn project_policy_parent(
             // create the parent through a writable bind. Neither: nothing is
             // visible or creatable there, so there is nothing to project.
             if !filtered_policy_dests
-                && !policy_parent_creatable(workspace, sandbox, parent, host_tmp_bind)
+                && !policy_parent_creatable(workspace, sandbox, parent, tmp_covers)
             {
                 return Ok(());
             }
@@ -1415,6 +1426,27 @@ fn project_policy_parent(
         }
     };
     let entries = policy_entries_under(sandbox, parent);
+    // A configured ALIAS whose destination is a direct child of the policy
+    // parent cannot be restored by the projection: top-level children are
+    // rebuilt from the host directory by name, so the configured source would
+    // be silently replaced by the host entry (or dropped when absent). Fail
+    // closed instead of binding the wrong inode.
+    for entry in &entries {
+        // The policy FILE itself is exempt: the projection deliberately
+        // overrides any configured view of it with the host file bound
+        // read-only.
+        if entry.dest.components().count() == parent_depth + 1
+            && entry.source != entry.dest
+            && entry.dest != policy
+        {
+            return Err(format!(
+                "fail closed: configured alias {} -> {} is a direct child of the sandbox policy parent {}; the projection cannot restore it there (use a deeper destination or a self entry)",
+                entry.source.display(),
+                entry.dest.display(),
+                parent.display()
+            ));
+        }
+    }
     args.push("--tmpfs".into());
     args.push(parent.as_os_str().into());
     // Top-level ordinary children of the policy parent, enumerated from the

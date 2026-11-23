@@ -3408,9 +3408,15 @@ network = true
             .unwrap_err()
             .to_string();
         assert!(error.contains("project config"), "{error}");
-        // The strict project schema applies to the observation: an unknown key
-        // or a non-table section is an error, not a silent ignore.
-        for bad in ["[sandbox]\nbogus = 1\n", "sandbox = 5\n"] {
+        // The strict project schema applies to the observation: an unknown key,
+        // a non-table section, or a POSITIONAL array (which serde would accept
+        // for the struct fields while the input comparison reads it as absent)
+        // is an error, not a silent ignore.
+        for bad in [
+            "[sandbox]\nbogus = 1\n",
+            "sandbox = 5\n",
+            "sandbox = [true, false, true, false, [], []]\n",
+        ] {
             assert!(
                 startup_project_overlay(root, &observed(project(bad))).is_err(),
                 "{bad}"
@@ -3420,8 +3426,13 @@ network = true
 
     /// D1 (reload half): the observed project `[sandbox]` overlay is validated
     /// strictly BEFORE the change gate, so an invalid overlay whose recognized
-    /// inputs look unchanged is still rejected (here: an unknown key added to
-    /// an otherwise identical table, with no global config to fall back on).
+    /// inputs look unchanged is still rejected.
+    ///
+    /// Platform-neutral by construction: the baseline has NO project `[sandbox]`
+    /// table, and the malformed value is a POSITIONAL array — the recognized
+    /// comparison reads it as absent (unchanged, so no re-resolution and no
+    /// Windows project-sandbox guard), which leaves strict validation as the
+    /// only thing that can reject it.
     #[test]
     fn reload_validates_the_project_sandbox_overlay_before_the_change_gate() {
         let _guard = crate::roles::XDG_TEST_LOCK.lock().unwrap();
@@ -3434,8 +3445,9 @@ network = true
         let project_dir = temp.path().join(".e-agent");
         std::fs::create_dir_all(&project_dir).unwrap();
         let project = project_dir.join("config.toml");
-        // No global config at all: the project file is the only source.
-        std::fs::write(&project, "[sandbox]\nnetwork = false\n").unwrap();
+        // No global config at all: the project file is the only source, and it
+        // starts without a `[sandbox]` table.
+        std::fs::write(&project, "[pet]\nspritesheet = \"pet.png\"\n").unwrap();
         unsafe {
             std::env::set_var("XDG_CONFIG_HOME", &xdg);
             std::env::set_var("HOME", &home);
@@ -3446,13 +3458,13 @@ network = true
         capture_reload(&capture, || {
             assert!(matches!(factory.reload_config(), ReloadResult::Reloaded));
         });
-        // Add an unknown key to the SAME table: the recognized inputs are
-        // unchanged, so only strict validation can reject it.
-        std::fs::write(&project, "[sandbox]\nnetwork = false\nbogus = 1\n").unwrap();
+        // A positional array: serde would accept it as the five struct fields,
+        // while the recognized comparison (`as_table`) sees no table at all.
+        std::fs::write(&project, "sandbox = [true, false, true, false, [], []]\n").unwrap();
         capture.0.lock().unwrap().clear();
         capture_reload(&capture, || match factory.reload_config() {
             ReloadResult::Rejected(reason) => assert!(
-                reason.contains("[sandbox]") || reason.contains("unknown field"),
+                reason.contains("[sandbox] overlay must be a table"),
                 "{reason}"
             ),
             other => panic!("expected rejection, got {other:?}"),
