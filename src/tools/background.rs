@@ -20,7 +20,12 @@ pub struct BackgroundTasks {
         Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>>>,
     /// Background bash timeout; `None` = no timeout (run forever).
     timeout: Option<Duration>,
-    sandbox: Option<crate::config::Sandbox>,
+    /// LIVE `[sandbox]` policy cell (`None` inside = sandbox disabled).
+    /// Registry-origin spawns ([`BackgroundTasks::start`]) take one snapshot
+    /// at dispatch; bash facades pass their own per-dispatch snapshot, so a
+    /// `[sandbox]` hot reload applies to the next dispatch and never to a
+    /// command that is already running.
+    sandbox: crate::config::SandboxPolicy,
 }
 
 struct BackgroundRegistry {
@@ -550,7 +555,10 @@ impl BackgroundTasks {
             .collect()
     }
 
-    pub(super) fn new(timeout: Option<Duration>, sandbox: Option<crate::config::Sandbox>) -> Self {
+    pub(super) fn new(
+        timeout: Option<Duration>,
+        sandbox: impl Into<crate::config::SandboxPolicy>,
+    ) -> Self {
         Self {
             registry: Arc::new(BackgroundRegistry {
                 next_id: AtomicU64::new(1),
@@ -558,7 +566,7 @@ impl BackgroundTasks {
             }),
             sender: Arc::new(std::sync::Mutex::new(None)),
             timeout,
-            sandbox,
+            sandbox: sandbox.into(),
         }
     }
 
@@ -578,6 +586,21 @@ impl BackgroundTasks {
             .unwrap()
             .as_ref()
             .is_some_and(|sender| !sender.is_closed())
+    }
+
+    /// Test hook: the process-group id of a live background task — the
+    /// sandboxed command's `bwrap` pid, whose `/proc/<pid>/cmdline` shows the
+    /// policy snapshot it was dispatched with.
+    #[cfg(test)]
+    pub(super) fn process_group_of(&self, id: u64) -> Option<i32> {
+        self.registry
+            .running
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|task| task.id == id)
+            .map(|task| task.process_group.load(Ordering::Acquire))
+            .filter(|pid| *pid != 0)
     }
 
     #[cfg(test)]
@@ -745,7 +768,9 @@ impl BackgroundTasks {
             command,
             protect_git,
             self.sender.lock().unwrap().clone(),
-            self.sandbox.clone(),
+            // One snapshot per dispatch: this command keeps it even if a
+            // reload swaps the live policy while it runs.
+            self.sandbox.snapshot(),
             None,
             None,
         )

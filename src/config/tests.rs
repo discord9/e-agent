@@ -3460,6 +3460,10 @@ backend = "jsonl"
             Some("global MCP enabled=false kill switch overrides the project server")
         )
     );
+    // `[sandbox]` is live since the hot-reload work: a winning edit applies
+    // to the next bash/background dispatch of every session (running
+    // background commands and file-tool roots are the documented exceptions),
+    // so it is effective rather than restart-only.
     assert_eq!(
         classify_source_edit(
             "project",
@@ -3467,9 +3471,18 @@ backend = "jsonl"
             Some(&global),
             Some(&project),
             None
-        )
-        .0,
-        "shadowed"
+        ),
+        ("effective", None)
+    );
+    assert_eq!(
+        classify_source_edit(
+            "global",
+            &["sandbox".into(), "network".into()],
+            Some(&global),
+            Some(&project),
+            None
+        ),
+        ("effective", None)
     );
     assert_eq!(
         classify_source_edit(

@@ -207,7 +207,7 @@ pub fn bwrap_available() -> bool {
 /// full global + workspace policy via [`builtins_with_bash_timeout`].
 pub fn builtins(
     workspace: Workspace,
-    sandbox: Option<crate::config::Sandbox>,
+    sandbox: impl Into<crate::config::SandboxPolicy>,
     read_only: bool,
     background_timeout: Option<Duration>,
 ) -> (Vec<Box<dyn Tool>>, BackgroundTasks) {
@@ -226,7 +226,7 @@ pub fn builtins(
 /// workspace override) via [`crate::config::resolve_bash_timeout`].
 pub fn builtins_with_bash_timeout(
     workspace: Workspace,
-    sandbox: Option<crate::config::Sandbox>,
+    sandbox: impl Into<crate::config::SandboxPolicy>,
     read_only: bool,
     background_timeout: Option<Duration>,
     bash_timeout: Option<Duration>,
@@ -258,7 +258,7 @@ pub fn builtins_with_bash_timeout(
 pub fn builtins_with_background(
     workspace: Workspace,
     background: BackgroundTasks,
-    sandbox: Option<crate::config::Sandbox>,
+    sandbox: impl Into<crate::config::SandboxPolicy>,
     read_only: bool,
     protect_git: bool,
     self_session_id: Option<String>,
@@ -273,7 +273,7 @@ pub fn builtins_with_background(
         workspace,
         background,
         web_search_source_from_env(),
-        sandbox,
+        sandbox.into(),
         protect_git,
         read_only,
         bash_timeout,
@@ -290,11 +290,12 @@ pub fn builtins_with_background(
 fn builtins_with_web_search(
     workspace: Workspace,
     web_search: Option<WebSearchSource>,
-    sandbox: Option<crate::config::Sandbox>,
+    sandbox: impl Into<crate::config::SandboxPolicy>,
     read_only: bool,
     background_timeout: Option<Duration>,
     bash_timeout: Option<Duration>,
 ) -> (Vec<Box<dyn Tool>>, BackgroundTasks) {
+    let sandbox: crate::config::SandboxPolicy = sandbox.into();
     let background = BackgroundTasks::new(background_timeout, sandbox.clone());
     // Main agent: protect_git = false so git worktree/add/commit work.
     let tools = tools_with_background_and_web_search(
@@ -341,7 +342,7 @@ fn tools_with_background_and_web_search(
     workspace: Workspace,
     background: BackgroundTasks,
     web_search: Option<WebSearchSource>,
-    sandbox: Option<crate::config::Sandbox>,
+    sandbox: crate::config::SandboxPolicy,
     protect_git: bool,
     read_only: bool,
     bash_timeout: Option<Duration>,
@@ -366,20 +367,19 @@ fn tools_with_background_and_web_search(
         background: background.clone(),
         self_session_id: self_session_id.clone(),
     }));
-    // Bash for read-only roles only exists inside a narrowed bwrap policy;
-    // without one (sandbox disabled / bwrap unavailable) there is no bash —
-    // fail closed rather than an unsandboxed shell.
-    let bash_sandbox = if read_only {
-        sandbox.as_ref().map(read_only_sandbox)
-    } else {
-        sandbox
-    };
-    if (!read_only || bash_sandbox.is_some())
+    // Bash for read-only roles only exists inside a bwrap policy; without one
+    // (sandbox disabled / bwrap unavailable) there is no bash — fail closed
+    // rather than an unsandboxed shell. The gate reads the CURRENT policy;
+    // each dispatch re-reads it and applies the read-only narrowing itself
+    // (so a reload applies to already-built tools, and a reload that drops
+    // the policy fails the read-only shell closed instead of unsandboxing it).
+    if (!read_only || sandbox.enabled())
         && let Ok(tool) = bash_tool(
             workspace,
             background,
-            bash_sandbox,
+            sandbox,
             protect_git,
+            read_only,
             bash_timeout,
             // 发起者会话：subagent 传自己的 session id（None = 主会话/未知），
             // bash 后台任务在共享 registry 里标注真正的发起者。GetBackgroundTasks

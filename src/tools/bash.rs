@@ -33,11 +33,16 @@ use super::background::{BackgroundTasks, ExitSlot, OutputSlot, TaskExit, TaskSpo
 /// it is adopted into the background. `None` means no threshold (run to
 /// completion). Callers resolve it from config (`[bash]`), defaulting to 30s.
 /// Sandboxed Windows retains kill-on-timeout instead of adopting.
+/// `sandbox` is the LIVE policy cell: the tool re-reads it at every dispatch,
+/// so a `[sandbox]` hot reload applies to the next command of an
+/// already-running session. `read_only` applies the read-only role narrowing
+/// (and the fail-closed refusal to run without a policy) per dispatch.
 pub fn bash_tool(
     workspace: Workspace,
     background: BackgroundTasks,
-    sandbox: Option<crate::config::Sandbox>,
+    sandbox: impl Into<crate::config::SandboxPolicy>,
     protect_git: bool,
+    read_only: bool,
     timeout: Option<Duration>,
     self_session_id: Option<String>,
 ) -> Result<Box<dyn Tool>, String> {
@@ -47,7 +52,8 @@ pub fn bash_tool(
         timeout,
         background,
         sender: None,
-        sandbox,
+        sandbox: sandbox.into(),
+        read_only,
         protect_git,
         shell,
         // 发起者会话：subagent 传自己的 session id（None = 主会话/未知）。
@@ -80,7 +86,14 @@ pub(super) struct Bash {
     /// Completion delivery belongs to this bash facade's Agent, not the
     /// shared registry. Spawned tasks retain this origin sender.
     pub(super) sender: Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
-    pub(super) sandbox: Option<crate::config::Sandbox>,
+    /// LIVE `[sandbox]` policy cell: read once per dispatch, so a reload
+    /// applies to this session's next command (a running command keeps the
+    /// policy it was dispatched with).
+    pub(super) sandbox: crate::config::SandboxPolicy,
+    /// Read-only role: every dispatch narrows the live policy (workspace
+    /// read-only, extra writable roots dropped) and refuses to run at all
+    /// when the live policy is disabled (fail closed).
+    pub(super) read_only: bool,
     /// On non-Windows, bind `<workspace>/.git` read-only when sandboxed.
     /// Resolved from the role's frontmatter `protect_git` (default true).
     /// The Windows write-sandbox MVP rejects this mode before side effects.
@@ -90,6 +103,58 @@ pub(super) struct Bash {
     /// 发起者会话 id（subagent 为它自己的 session id，主会话为 None）：
     /// 后台 bash 任务在共享 registry 里用它标注发起者。
     pub(super) owner_session: Option<String>,
+}
+
+impl Bash {
+    /// The policy THIS dispatch runs under: ONE live snapshot, narrowed for a
+    /// read-only facade. `Err` is the read-only fail-closed case — the live
+    /// `[sandbox]` policy is disabled (or was disabled by a hot reload), so
+    /// there is no sandbox to narrow and an unsandboxed shell would defeat
+    /// the role. Callers take this exactly once per invocation, so one command
+    /// is one consistent policy.
+    fn dispatch_policy(&self) -> Result<Option<crate::config::Sandbox>, String> {
+        let live = self.sandbox.snapshot();
+        if !self.read_only {
+            return Ok(live);
+        }
+        match live {
+            Some(policy) => Ok(Some(super::read_only_sandbox(&policy))),
+            None => Err(
+                "no shell: this read-only session runs commands only inside an enabled \
+                 [sandbox] policy, and the live [sandbox] policy is currently disabled. The \
+                 command was not run; re-enable the sandbox (or use a writable session) \
+                 instead of expecting an unsandboxed shell."
+                    .into(),
+            ),
+        }
+    }
+}
+
+/// Test hooks for the live-policy dispatch tests (`src/tools_tests.rs`).
+#[cfg(all(test, unix))]
+impl Bash {
+    /// The bwrap argv this facade would spawn for `command` right now. No
+    /// process is created: the descriptor-pinned plan is dropped (closing its
+    /// fds) on return, so the assertion sees exactly the mounts/network flags
+    /// the next dispatch would use.
+    pub(super) fn dispatch_args(&self, command: &str) -> Result<Option<Vec<String>>, String> {
+        let Some(policy) = self.dispatch_policy()? else {
+            return Ok(None);
+        };
+        let (cmd, _plan) = wrap_bash_command(
+            &self.shell,
+            &self.workspace,
+            command,
+            self.protect_git,
+            &policy,
+        )?;
+        Ok(Some(
+            cmd.as_std()
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect(),
+        ))
+    }
 }
 
 #[async_trait]
@@ -102,7 +167,12 @@ impl Tool for Bash {
         // Tell the model which shell syntax to use (pwsh on Windows, bash
         // elsewhere).
         description.push_str(self.shell.syntax_hint);
-        if let Some(sandbox) = &self.sandbox {
+        // The description is rebuilt for every model request, so it reads the
+        // CURRENT policy: a `[sandbox]` hot reload is reflected here on the
+        // next turn instead of going stale for an already-running session.
+        // One snapshot for the whole description, exactly like one dispatch.
+        let policy = self.dispatch_policy();
+        if let Ok(Some(sandbox)) = &policy {
             #[cfg(windows)]
             {
                 let ws_mode = if sandbox.workspace_writable {
@@ -175,6 +245,13 @@ impl Tool for Bash {
                 }
             }
         }
+        if policy.is_err() {
+            description.push_str(
+                " The `[sandbox]` policy is currently disabled, so this read-only session's \
+                 commands fail closed (no unsandboxed shell); no command runs until the sandbox \
+                 is enabled again.",
+            );
+        }
         ToolSpec {
             name: self.shell.tool_name.into(),
             description,
@@ -203,6 +280,10 @@ impl Tool for Bash {
                     .into(),
             );
         }
+        // ONE snapshot per invocation (foreground or background): a command
+        // already dispatched keeps its policy even if a config reload swaps
+        // the live cell while it runs.
+        let policy = self.dispatch_policy()?;
         if background {
             if detached {
                 // Daemon / long-lived service / watcher: runs in the shared
@@ -217,7 +298,7 @@ impl Tool for Bash {
                         command.to_owned(),
                         title,
                         self.protect_git,
-                        self.sandbox.clone(),
+                        policy.clone(),
                         self.owner_session.clone(),
                     )
                     .map(ToolOutput::text);
@@ -232,7 +313,7 @@ impl Tool for Bash {
                     command.to_owned(),
                     self.protect_git,
                     self.sender.clone(),
-                    self.sandbox.clone(),
+                    policy.clone(),
                     self.owner_session.clone(),
                     title,
                 )
@@ -250,7 +331,7 @@ impl Tool for Bash {
         }
         let threshold = self.timeout;
         #[cfg(windows)]
-        if self.sandbox.is_some() {
+        if policy.is_some() {
             return run_bash(
                 &self.shell,
                 &self.workspace,
@@ -260,7 +341,7 @@ impl Tool for Bash {
                 None,
                 None,
                 None,
-                self.sandbox.as_ref(),
+                policy.as_ref(),
                 None,
             )
             .await
@@ -273,7 +354,7 @@ impl Tool for Bash {
                 command.to_owned(),
                 self.protect_git,
                 self.sender.clone(),
-                self.sandbox.clone(),
+                policy,
                 self.owner_session.clone(),
                 title,
                 threshold,

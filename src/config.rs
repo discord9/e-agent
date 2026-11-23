@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
@@ -254,6 +255,47 @@ impl Default for Sandbox {
             readable_mounts: Vec::new(),
             writable_mounts: Vec::new(),
         }
+    }
+}
+
+/// Shared, live `[sandbox]` policy cell (`None` inside = sandbox disabled).
+///
+/// The session factory owns the cell and replaces its contents on a config
+/// hot reload ([`SandboxPolicy::replace`]); every tool that dispatches a
+/// shell command takes ONE [`SandboxPolicy::snapshot`] at dispatch, so an
+/// already-running session uses an edited policy for its next command while
+/// a command that is already running keeps the policy it started with.
+/// A tool built without a reload cell (tests, `run_rust`, a role's own
+/// narrowed policy) holds a [`SandboxPolicy::fixed`] cell instead.
+#[derive(Clone, Debug, Default)]
+pub struct SandboxPolicy(Arc<RwLock<Option<Sandbox>>>);
+
+impl SandboxPolicy {
+    /// A cell nobody reloads: the value is fixed for the tool's lifetime.
+    pub fn fixed(policy: Option<Sandbox>) -> Self {
+        Self(Arc::new(RwLock::new(policy)))
+    }
+
+    /// The policy in force right now. One dispatch uses one snapshot.
+    pub fn snapshot(&self) -> Option<Sandbox> {
+        self.0.read().unwrap().clone()
+    }
+
+    /// Whether a policy is in force right now.
+    pub fn enabled(&self) -> bool {
+        self.0.read().unwrap().is_some()
+    }
+
+    /// Install an already-validated policy (config reload). A rejected
+    /// reload never reaches here, so the last good policy stays.
+    pub fn replace(&self, policy: Option<Sandbox>) {
+        *self.0.write().unwrap() = policy;
+    }
+}
+
+impl From<Option<Sandbox>> for SandboxPolicy {
+    fn from(policy: Option<Sandbox>) -> Self {
+        Self::fixed(policy)
     }
 }
 
@@ -1237,6 +1279,18 @@ fn project_config(workspace: &Path) -> anyhow::Result<Option<ProjectConfig>> {
     Ok(Some(parsed))
 }
 
+/// Whether the project override file exists but cannot be read or parsed.
+/// The reload loader tolerates such a source as `Unavailable` (the global
+/// config still applies, so an editor mid-write never blocks unrelated
+/// edits), and the `[sandbox]` reload resolution treats it the same way
+/// instead of turning a broken project file into a sandbox error.
+pub(crate) fn project_source_unavailable(workspace: &Path) -> bool {
+    matches!(
+        observe_project_source_best_effort(workspace),
+        ProjectSourceObservation::Unavailable
+    )
+}
+
 /// Read `[background]` from `<workspace>/.e-agent/config.toml` (same
 /// pattern as `project_sandbox`); `None` when absent or unparseable-free.
 fn project_background(workspace: &Path) -> anyhow::Result<Option<BackgroundConfig>> {
@@ -1733,7 +1787,11 @@ fn classify_source_edit_with_snapshots(
     let has = |root: Option<&toml::Value>, keys: &[&str]| value_at(root, keys).is_some();
     let name = path.get(1).map(String::as_str);
     if section == "sandbox" {
-        return ("shadowed", Some("sandbox policy and paths require restart"));
+        // `[sandbox]` is live: the resolved policy is swapped on reload and
+        // every subsequent bash / background dispatch reads it. File-tool
+        // capabilities and running background processes keep theirs, which
+        // the reload summary line spells out.
+        return ("effective", None);
     }
     if origin == "project" {
         if section == "default" {

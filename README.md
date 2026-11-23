@@ -421,14 +421,18 @@ Audit the workspace and report findings; do not modify anything.
 
 A read-only role loses the write and edit tools. Its shell, when the sandbox is
 enabled, runs in a narrowed bubblewrap policy: the workspace is mounted
-read-only, extra writable roots are dropped, and the network is disabled
-(`--unshare-net`). Read tools stay available, including the network read tools
-(web search, and DeepSeek's page fetch), which deliberately still reach the
-network. Background bash commands started inside the subagent inherit the
-role's narrowed sandbox too (they never fall back to the parent's wider
-policy). If the sandbox is not enabled (or bwrap is unavailable), a read-only
-role gets **no `bash` tool at all** —
-fail closed rather than an unsandboxed shell.
+read-only, extra writable roots are dropped, and networking follows
+`[sandbox] network` (`--unshare-net` when it is false), so read-only network
+operations stay possible unless the config disables networking. Read tools stay
+available, including the network read tools (web search, and DeepSeek's page
+fetch), which deliberately still reach the network. The narrowing is derived
+from the LIVE `[sandbox]` policy at every dispatch, so a hot reload applies to
+a read-only session's next command, and a reload that disables the sandbox
+fails the read-only shell closed instead of unsandboxing it. Background bash
+commands started inside the subagent inherit the role's narrowed sandbox too
+(they never fall back to the parent's wider policy). If the sandbox is not
+enabled (or bwrap is unavailable), a read-only role gets **no `bash` tool at
+all** — fail closed rather than an unsandboxed shell.
 
 Read-only is a tool boundary, not a host security framework: it constrains
 which tools the model may call, and the bash sandbox remains a best-effort
@@ -495,6 +499,16 @@ enabled = true
 
 `gpu` is global-config-only: a project `.e-agent/config.toml` that sets it is
 rejected at startup.
+
+The policy is live: editing `[sandbox]` in the global or project config makes
+the next `bash` / background command of a running server or TUI session run
+under the new mounts and network setting, without restarting. Each invocation
+takes one snapshot at dispatch (one command = one `bwrap` = one consistent
+policy), a background command already running keeps the policy it started with
+until it exits, and the `bash` description the model sees is rebuilt from the
+current policy on each request. The file tools' policy (readable/writable
+roots, and `workspace_writable = false` denying in-workspace writes) is still
+fixed when the session is built, so a new session is needed for those.
 
 `gpu` and the runtime installation are two separate halves of one policy.
 `gpu = true` grants the host GPU device nodes (`/dev/kfd`, `/dev/dri`, plus any
@@ -1355,7 +1369,8 @@ atomically swap the effective config. Per-source TOML leaf edits are reported
 for `origin=global` and `origin=project`: each names its stable TOML path,
 add/remove or before/after values, and a status of `effective` (the source wins
 the overlay and feeds a reload-aware consumer for future/new sessions — it does
-not promise provider behavior or mutate existing sessions), `shadowed`
+not promise provider behavior or mutate existing sessions, with `[sandbox]`'s
+live shell policy as the one documented exception), `shadowed`
 (explaining the overriding or restart-only rule), or `unknown` (precedence wins,
 but resolution, canonicalization, clamping, or defer behavior prevents a
 stronger claim). Diagnostics use sanitized snapshots: credential values are
@@ -1368,6 +1383,28 @@ runtime and emit no success diff.
   immediately available to the web `/model` autocomplete, `POST
   /api/sessions/{id}/model` and TUI `/model` switches, and newly built sessions
   start with the edited default and role routing.
+- `[sandbox]` — a winning edit (global section, or the project overlay that
+  startup would also apply) is re-resolved with the same workspace-aware
+  resolver startup uses, validated, and swapped into the live policy that
+  `bash` and background tasks read, so it applies to the **next** bash /
+  background dispatch of an **already-running** session — no new session and
+  no restart. One invocation is one `bwrap` invocation with one consistent
+  policy snapshot; a background command that is already running keeps the
+  policy it was dispatched with until it exits, and the `bash` tool
+  description is rebuilt from the live policy on the next model request. The
+  reload emits a sanitized summary naming the new keys and paths
+  (`enabled`, `network`, `workspace_writable`, `gpu`, `writable_paths`,
+  `readable_paths`) — paths are config, not secrets, and a reload that ADDS a
+  readable/writable path widens access immediately. Existing sessions' FILE
+  tools keep their build-time policy — the cap-std readable/writable roots and
+  whether `workspace_writable = false` denies in-workspace writes — so a
+  change to those that must constrain `read_file`/`write_file`/`edit_file`
+  needs a new session (shell commands follow immediately). `run_rust`'s forced
+  policy is startup-fixed too. `[sandbox]` validation failures (e.g. a project
+  path outside every globally authorized root) reject the whole reload and
+  keep the last good policy, and the bwrap/Windows availability preflight is
+  not re-run: an enabled policy on a host without `bwrap` fails the command
+  closed with its own error instead of rejecting unrelated config edits.
 - `[mcp]`, the `[bash]` foreground residence threshold, and the `[background]`
   timeout — winning edits apply to sessions built after the reload; existing
   MCP connections are unchanged. `[bash] timeout_secs` defaults to 30 seconds:
@@ -1378,16 +1415,18 @@ runtime and emit no success diff.
   result is not lost), uses the facade's configured shell where supported, and
   is not bounded by `[background] timeout_secs`; sandboxed Windows commands keep
   the previous behavior and are killed when the threshold expires.
-- Existing sessions, startup file capabilities, TUI input mapping, and the
-  session backend are unchanged.
+- Existing sessions' file capabilities, TUI input mapping, and the session
+  backend are unchanged.
 
-Restart required: `[sandbox]` scalar policy and workspace/file capabilities are
-wired at startup (sandbox path edits are retained as unresolved source
-diagnostics), the `[session]` backend connects at startup, a `[web_search]`
-backend change injects the resolved key or SearXNG `base_url` into the process
+Restart required: `[session]` connects at startup, a `[web_search]` backend
+change injects the resolved key or SearXNG `base_url` into the process
 environment once at startup, and `AGENTS.md`/skills instructions plus existing
 sessions' models stay as loaded (a session keeps its model until a `/model`
-switch).
+switch). `[sandbox]` file-tool policy (the cap-std capabilities behind
+`read_file`/`write_file`/`edit_file`, including whether `workspace_writable =
+false` denies in-workspace writes) and `run_rust`'s forced policy are wired at
+startup too: a sandbox edit reaches shell commands immediately, but the file
+tools keep their session's build-time policy.
 
 ## MCP (local servers)
 
@@ -1787,9 +1826,11 @@ It has one model seam and one tool seam. Main-agent tool rounds are unlimited
 unless `--max-rounds` sets an explicit cap; subagent tool rounds are unlimited.
 Config hot reload is deliberately scoped: `[models]`/`[providers]`/`[roles]`
 (and anything else read at session-build time) hot-reload in the server and
-TUI via mtime polling with validate-before-swap, but `[sandbox]`, the
-`[session]` backend, and the web-search backend env injection stay
-startup-fixed and require a restart. Reload emits sanitized per-source TOML leaf diagnostics;
+TUI via mtime polling with validate-before-swap, and `[sandbox]` additionally
+hot-reloads the *shell* policy in place (next bash/background dispatch of an
+already-running session; a command already running keeps its policy, and
+file-tool roots still need a new session), but the `[session]` backend and the
+web-search backend env injection stay startup-fixed and require a restart. Reload emits sanitized per-source TOML leaf diagnostics;
 uncertain changes are `unknown`, and credential values are never compared.
 There is no reload HTTP endpoint, no watch(1)/inotify, and no per-section partial reload (a bad edit is rejected
 wholesale and the last good config is kept).

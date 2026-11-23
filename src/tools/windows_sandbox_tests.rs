@@ -2,6 +2,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::ptr::null_mut;
 
 use super::*;
+use crate::config::SandboxPolicy;
 
 fn windows_policy(workspace_writable: bool, writable_paths: Vec<String>) -> crate::config::Sandbox {
     crate::config::Sandbox {
@@ -22,7 +23,8 @@ fn test_bash(workspace: Workspace, policy: crate::config::Sandbox) -> Bash {
         timeout: Some(Duration::from_secs(15)),
         sender: None,
         background: BackgroundTasks::new(Some(Duration::from_secs(15)), Some(policy.clone())),
-        sandbox: Some(policy),
+        sandbox: SandboxPolicy::fixed(Some(policy)),
+        read_only: false,
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,

@@ -7,6 +7,7 @@ use tokio::net::TcpListener;
 
 use super::*;
 use crate::agent::BACKGROUND_REMINDER;
+use crate::config::SandboxPolicy;
 
 fn web_search(endpoint: String) -> WebSearch {
     WebSearch::for_test("test-api-key".into(), endpoint, Duration::from_secs(1))
@@ -1995,7 +1996,8 @@ async fn dropping_foreground_waiter_cancels_registered_command() {
         timeout: None,
         sender: Some(sender),
         background: background.clone(),
-        sandbox: None,
+        sandbox: SandboxPolicy::default(),
+        read_only: false,
         protect_git: false,
         shell: wrapper,
         owner_session: None,
@@ -2056,7 +2058,8 @@ async fn foreground_cancel_before_threshold_returns_error_without_event() {
         timeout: Some(Duration::from_secs(60)),
         sender: Some(sender),
         background: background.clone(),
-        sandbox: None,
+        sandbox: SandboxPolicy::default(),
+        read_only: false,
         protect_git: false,
         shell,
         owner_session: None,
@@ -2093,7 +2096,8 @@ async fn foreground_without_threshold_waits_for_command_result() {
         timeout: None,
         sender: Some(sender),
         background: background.clone(),
-        sandbox: None,
+        sandbox: SandboxPolicy::default(),
+        read_only: false,
         protect_git: false,
         shell,
         owner_session: None,
@@ -2134,7 +2138,8 @@ async fn foreground_adoption_then_cancel_kills_its_process_group() {
         timeout: Some(Duration::from_secs(1)),
         sender: Some(sender.clone()),
         background: BackgroundTasks::new(Some(Duration::from_secs(30 * 60)), None),
-        sandbox: None,
+        sandbox: SandboxPolicy::default(),
+        read_only: false,
         protect_git: false,
         shell,
         owner_session: None,
@@ -2179,7 +2184,8 @@ fn bash_description_explains_the_sandbox_only_when_enabled() {
         timeout: Some(Duration::from_secs(1)),
         sender: None,
         background: background.clone(),
-        sandbox: None,
+        sandbox: SandboxPolicy::default(),
+        read_only: false,
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
@@ -2199,7 +2205,7 @@ fn bash_description_explains_the_sandbox_only_when_enabled() {
         timeout: Some(Duration::from_secs(1)),
         sender: None,
         background: background.clone(),
-        sandbox: Some(crate::config::Sandbox {
+        sandbox: SandboxPolicy::fixed(Some(crate::config::Sandbox {
             enabled: true,
             network: false,
             workspace_writable: true,
@@ -2208,7 +2214,8 @@ fn bash_description_explains_the_sandbox_only_when_enabled() {
             readable_paths: vec!["~/.rustup".into()],
             readable_mounts: Vec::new(),
             writable_mounts: Vec::new(),
-        }),
+        })),
+        read_only: false,
         protect_git: true,
         shell: Shell::detect().unwrap(),
         owner_session: None,
@@ -2251,7 +2258,7 @@ fn bash_description_explains_the_sandbox_only_when_enabled() {
         timeout: Some(Duration::from_secs(1)),
         sender: None,
         background: background.clone(),
-        sandbox: Some(crate::config::Sandbox {
+        sandbox: SandboxPolicy::fixed(Some(crate::config::Sandbox {
             enabled: true,
             network: true,
             workspace_writable: false,
@@ -2260,7 +2267,8 @@ fn bash_description_explains_the_sandbox_only_when_enabled() {
             readable_paths: vec![],
             readable_mounts: Vec::new(),
             writable_mounts: Vec::new(),
-        }),
+        })),
+        read_only: false,
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
@@ -2286,7 +2294,7 @@ fn bash_description_explains_the_sandbox_only_when_enabled() {
         timeout: Some(Duration::from_secs(1)),
         sender: None,
         background,
-        sandbox: Some(crate::config::Sandbox {
+        sandbox: SandboxPolicy::fixed(Some(crate::config::Sandbox {
             enabled: true,
             network: true,
             workspace_writable: true,
@@ -2295,7 +2303,8 @@ fn bash_description_explains_the_sandbox_only_when_enabled() {
             readable_paths: vec![],
             readable_mounts: Vec::new(),
             writable_mounts: Vec::new(),
-        }),
+        })),
+        read_only: false,
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
@@ -2590,7 +2599,8 @@ async fn background_bash_uses_the_facade_sandbox_not_the_registry_one() {
             Some(Duration::from_secs(30 * 60)),
             Some(registry_sandbox),
         ),
-        sandbox: Some(narrowed),
+        sandbox: SandboxPolicy::fixed(Some(narrowed)),
+        read_only: false,
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
@@ -2649,7 +2659,8 @@ async fn foreground_zero_threshold_adopts_immediately_and_delivers_output_once()
         timeout: Some(Duration::ZERO),
         sender: Some(sender),
         background: background.clone(),
-        sandbox: None,
+        sandbox: SandboxPolicy::default(),
+        read_only: false,
         protect_git: false,
         shell,
         owner_session: None,
@@ -2718,7 +2729,8 @@ async fn foreground_zero_threshold_parking_command_is_adopted_once_with_output()
         timeout: Some(Duration::ZERO),
         sender: Some(sender),
         background: background.clone(),
-        sandbox: None,
+        sandbox: SandboxPolicy::default(),
+        read_only: false,
         protect_git: false,
         shell,
         owner_session: None,
@@ -2800,7 +2812,8 @@ fn background_bash(
         timeout: Some(Duration::from_secs(30)),
         sender: None,
         background: BackgroundTasks::new(Some(timeout), None),
-        sandbox: None,
+        sandbox: SandboxPolicy::default(),
+        read_only: false,
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
@@ -2826,6 +2839,292 @@ fn sandbox() -> Option<crate::config::Sandbox> {
     })
 }
 
+/// Sandbox A (live: workspace writable, network on, `extra` writable) and
+/// B (workspace read-only, no network, `extra` read-only), so every part of
+/// the argv and of the tool description changes between them.
+#[cfg(unix)]
+fn sandbox_a_and_b(extra: &std::path::Path) -> (crate::config::Sandbox, crate::config::Sandbox) {
+    let extra = extra.to_string_lossy().into_owned();
+    let a = crate::config::Sandbox {
+        enabled: true,
+        network: true,
+        workspace_writable: true,
+        gpu: false,
+        writable_paths: vec![extra.clone()],
+        readable_paths: Vec::new(),
+        readable_mounts: Vec::new(),
+        writable_mounts: Vec::new(),
+    };
+    let b = crate::config::Sandbox {
+        enabled: true,
+        network: false,
+        workspace_writable: false,
+        gpu: false,
+        writable_paths: Vec::new(),
+        readable_paths: vec![extra],
+        readable_mounts: Vec::new(),
+        writable_mounts: Vec::new(),
+    };
+    (a, b)
+}
+
+/// The bash facade a session build produces: bound to the factory's LIVE
+/// policy cell (not a copy), so a `[sandbox]` reload reaches its next
+/// dispatch.
+#[cfg(unix)]
+fn live_bash(workspace: &std::path::Path, policy: &SandboxPolicy, read_only: bool) -> Bash {
+    Bash {
+        workspace: Workspace::new(workspace).unwrap(),
+        timeout: Some(Duration::from_secs(10)),
+        sender: None,
+        background: BackgroundTasks::new(Some(Duration::from_secs(30)), policy.clone()),
+        sandbox: policy.clone(),
+        read_only,
+        protect_git: false,
+        shell: Shell::detect().unwrap(),
+        owner_session: None,
+    }
+}
+
+/// `--bind-try SRC DST` / `--ro-bind-try SRC DST` presence in a plan argv.
+#[cfg(unix)]
+fn has_mount(args: &[String], flag: &str, path: &str) -> bool {
+    args.windows(3)
+        .any(|w| w[0] == flag && w[1] == path && w[2] == path)
+}
+
+/// The workspace self-bind flag in a plan argv (`--bind` vs `--ro-bind`).
+#[cfg(unix)]
+fn workspace_bind(args: &[String], root: &str) -> &'static str {
+    args.windows(3)
+        .rposition(|w| (w[0] == "--bind" || w[0] == "--ro-bind") && w[1] == root && w[2] == root)
+        .map(|at| {
+            if args[at] == "--bind" {
+                "--bind"
+            } else {
+                "--ro-bind"
+            }
+        })
+        .expect("workspace bind missing")
+}
+
+/// Sandbox hot reload, execution level: the SAME already-built bash tool
+/// re-reads the live policy at each dispatch, so the next invocation's bwrap
+/// plan (mounts + network) and its model-facing description follow the edit —
+/// no session rebuild. Plan-only (no bwrap run, no bwrap required).
+#[cfg(unix)]
+#[test]
+fn bash_dispatch_follows_the_live_sandbox_policy() {
+    let extra = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let (a, b) = sandbox_a_and_b(extra.path());
+    let root = crate::canonicalize_path(workspace.path()).unwrap();
+    let root_str = root.to_string_lossy().into_owned();
+    let extra_str = extra.path().to_string_lossy().into_owned();
+    // The factory's cell, handed to the tool at build time.
+    let policy = SandboxPolicy::fixed(Some(a));
+    let bash = live_bash(workspace.path(), &policy, false);
+
+    let before = bash.dispatch_args("true").unwrap().expect("policy A");
+    assert!(
+        has_mount(&before, "--bind-try", &extra_str),
+        "policy A mounts the extra writable root: {before:?}"
+    );
+    assert_eq!(workspace_bind(&before, &root_str), "--bind", "{before:?}");
+    assert!(
+        !before.iter().any(|arg| arg == "--unshare-net"),
+        "{before:?}"
+    );
+    let description = bash.spec().description;
+    assert!(
+        description.contains(&format!("Extra writable paths: {extra_str}")),
+        "{description}"
+    );
+
+    // `[sandbox]` reload: same tool, new live policy.
+    policy.replace(Some(b));
+
+    let after = bash.dispatch_args("true").unwrap().expect("policy B");
+    assert!(
+        has_mount(&after, "--ro-bind-try", &extra_str),
+        "policy B mounts the same root read-only: {after:?}"
+    );
+    assert!(
+        !has_mount(&after, "--bind-try", &extra_str),
+        "the writable mount is gone after the reload: {after:?}"
+    );
+    assert_eq!(workspace_bind(&after, &root_str), "--ro-bind", "{after:?}");
+    assert!(
+        after.iter().any(|arg| arg == "--unshare-net"),
+        "policy B drops networking: {after:?}"
+    );
+    let description = bash.spec().description;
+    assert!(
+        description.contains(&format!("Extra read-only paths: {extra_str}"))
+            && description.contains("The network is disabled"),
+        "the tool description is refreshed from the live policy: {description}"
+    );
+    assert!(
+        !description.contains("Extra writable paths"),
+        "no stale writable-path claim survives the reload: {description}"
+    );
+}
+
+/// Read-only roles: the read-only narrowing is derived from the LIVE policy at
+/// every dispatch, and a reload that disables the sandbox fails the shell
+/// CLOSED (an unsandboxed shell would defeat the role).
+#[cfg(unix)]
+#[test]
+fn read_only_bash_narrows_the_live_policy_per_dispatch() {
+    let extra = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let (a, b) = sandbox_a_and_b(extra.path());
+    let root = crate::canonicalize_path(workspace.path()).unwrap();
+    let root_str = root.to_string_lossy().into_owned();
+    let extra_str = extra.path().to_string_lossy().into_owned();
+    let policy = SandboxPolicy::fixed(Some(a));
+    let bash = live_bash(workspace.path(), &policy, true);
+
+    // Policy A is workspace-writable with an extra writable root; the
+    // read-only facade narrows it (workspace read-only, extra writable root
+    // dropped) while keeping A's networking.
+    let narrowed_a = bash.dispatch_args("true").unwrap().expect("policy A");
+    assert_eq!(
+        workspace_bind(&narrowed_a, &root_str),
+        "--ro-bind",
+        "{narrowed_a:?}"
+    );
+    assert!(
+        !has_mount(&narrowed_a, "--bind-try", &extra_str),
+        "a read-only role never gains the live writable root: {narrowed_a:?}"
+    );
+    assert!(
+        !narrowed_a.iter().any(|arg| arg == "--unshare-net"),
+        "A keeps networking for read-only reads: {narrowed_a:?}"
+    );
+
+    // The reload's narrowing is derived from B, not from a build-time copy.
+    policy.replace(Some(b));
+    let narrowed_b = bash.dispatch_args("true").unwrap().expect("policy B");
+    assert!(
+        has_mount(&narrowed_b, "--ro-bind-try", &extra_str),
+        "{narrowed_b:?}"
+    );
+    assert!(
+        narrowed_b.iter().any(|arg| arg == "--unshare-net"),
+        "B's no-network setting reaches the read-only role: {narrowed_b:?}"
+    );
+
+    // A reload that disables the sandbox: no narrowed policy exists, so the
+    // invocation is refused instead of running unsandboxed.
+    policy.replace(None);
+    let error = bash
+        .dispatch_args("true")
+        .expect_err("disabled policy must fail closed");
+    assert!(error.contains("[sandbox]"), "{error}");
+    let description = bash.spec().description;
+    assert!(
+        description.contains("fail closed"),
+        "the description warns about the live disabled policy: {description}"
+    );
+}
+
+/// Background dispatch: a command already dispatched keeps the policy
+/// snapshot it captured (its running bwrap is unchanged), and a command
+/// dispatched after the reload uses the new one. Real bwrap processes, so it
+/// skips exactly where the other sandbox tests skip.
+#[cfg(unix)]
+#[tokio::test]
+async fn background_dispatch_captures_the_sandbox_policy_at_dispatch() {
+    if !bwrap_available() {
+        eprintln!("bwrap unavailable; skipping sandbox test");
+        return;
+    }
+    let extra = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let (a, b) = sandbox_a_and_b(extra.path());
+    let policy = SandboxPolicy::fixed(Some(a));
+    let mut bash = live_bash(workspace.path(), &policy, false);
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+    bash.set_event_sender(sender);
+    // The registry-origin path also reads the live cell, so keep it wired.
+    let mut registry = bash.background.clone();
+    let (registry_sender, _registry_receiver) = tokio::sync::mpsc::unbounded_channel();
+    registry.set_event_sender(registry_sender);
+
+    let before = bash
+        .execute(json!({"command": "sleep 30", "background": true, "title": "before"}))
+        .await
+        .expect("background dispatch under policy A");
+    let before_id = bash
+        .background
+        .running()
+        .last()
+        .map(|task| task.id)
+        .expect("policy A task registered");
+    assert!(before.content.contains("started background task"));
+
+    policy.replace(Some(b));
+
+    let after = bash
+        .execute(json!({"command": "sleep 30", "background": true, "title": "after"}))
+        .await
+        .expect("background dispatch under policy B");
+    let after_id = bash
+        .background
+        .running()
+        .last()
+        .map(|task| task.id)
+        .expect("policy B task registered");
+    assert!(after.content.contains("started background task"));
+    assert!(after_id > before_id);
+
+    let before_args = background_cmdline(&bash.background, before_id).await;
+    let after_args = background_cmdline(&bash.background, after_id).await;
+    assert!(
+        !before_args.iter().any(|arg| arg == "--unshare-net"),
+        "the running task keeps its dispatch-time policy: {before_args:?}"
+    );
+    assert!(
+        after_args.iter().any(|arg| arg == "--unshare-net"),
+        "the task dispatched after the reload uses the new policy: {after_args:?}"
+    );
+
+    for id in [before_id, after_id] {
+        bash.background
+            .cancel_with_source(id, crate::agent::CancellationSource::User);
+    }
+}
+
+/// `/proc/<process-group>/cmdline` of a live background task, as strings: the
+/// group leader is the `bwrap` process itself, so its argv IS the policy
+/// snapshot the dispatch captured. The registry entry exists before the spawn,
+/// so the pid is awaited.
+#[cfg(all(unix, target_os = "linux"))]
+async fn background_cmdline(background: &BackgroundTasks, id: u64) -> Vec<String> {
+    let mut pid = None;
+    for _ in 0..200 {
+        pid = background.process_group_of(id);
+        if pid.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let pid = pid.unwrap_or_else(|| panic!("task {id} never reported a process group"));
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline"))
+        .unwrap_or_else(|error| panic!("cannot read /proc/{pid}/cmdline: {error}"));
+    raw.split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| String::from_utf8_lossy(part).into_owned())
+        .collect()
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+async fn background_cmdline(background: &BackgroundTasks, id: u64) -> Vec<String> {
+    let _ = (background, id);
+    Vec::new()
+}
+
 #[tokio::test]
 async fn sandbox_allows_workspace_writes_but_not_outside() {
     let Some(sandbox) = sandbox() else {
@@ -2838,7 +3137,8 @@ async fn sandbox_allows_workspace_writes_but_not_outside() {
         timeout: Some(Duration::from_secs(10)),
         sender: None,
         background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
-        sandbox: Some(sandbox),
+        sandbox: SandboxPolicy::fixed(Some(sandbox)),
+        read_only: false,
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
@@ -2908,7 +3208,8 @@ async fn sandbox_mounts_configured_dests_at_their_configured_paths() {
         timeout: Some(Duration::from_secs(10)),
         sender: None,
         background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
-        sandbox: Some(sandbox),
+        sandbox: SandboxPolicy::fixed(Some(sandbox)),
+        read_only: false,
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
@@ -2954,7 +3255,8 @@ async fn sandbox_can_disable_network() {
         timeout: Some(Duration::from_secs(10)),
         sender: None,
         background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
-        sandbox: Some(sandbox),
+        sandbox: SandboxPolicy::fixed(Some(sandbox)),
+        read_only: false,
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
@@ -3018,7 +3320,8 @@ async fn sandbox_read_only_workspace_rejects_bash_and_file_tool_writes() {
         timeout: Some(Duration::from_secs(10)),
         sender: None,
         background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
-        sandbox: Some(sandbox),
+        sandbox: SandboxPolicy::fixed(Some(sandbox)),
+        read_only: false,
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
@@ -3165,7 +3468,8 @@ async fn sandbox_workspace_mount_wins_over_external_ancestor() {
         timeout: Some(Duration::from_secs(10)),
         sender: None,
         background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
-        sandbox: Some(sandbox.clone()),
+        sandbox: SandboxPolicy::fixed(Some(sandbox.clone())),
+        read_only: false,
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
@@ -3186,7 +3490,8 @@ async fn sandbox_workspace_mount_wins_over_external_ancestor() {
         timeout: Some(Duration::from_secs(10)),
         sender: None,
         background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
-        sandbox: Some(sandbox),
+        sandbox: SandboxPolicy::fixed(Some(sandbox)),
+        read_only: false,
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
@@ -3214,7 +3519,8 @@ async fn sandbox_read_only_workspace_allows_explicit_writable_child() {
         timeout: Some(Duration::from_secs(10)),
         sender: None,
         background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
-        sandbox: Some(sandbox),
+        sandbox: SandboxPolicy::fixed(Some(sandbox)),
+        read_only: false,
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
@@ -3256,7 +3562,8 @@ async fn sandbox_reroot_keeps_startup_policy_anchor_read_only() {
         timeout: Some(Duration::from_secs(10)),
         sender: None,
         background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
-        sandbox: Some(sandbox),
+        sandbox: SandboxPolicy::fixed(Some(sandbox)),
+        read_only: false,
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
@@ -3285,7 +3592,8 @@ async fn sandbox_missing_policy_cannot_be_created_through_writable_e_agent_child
         timeout: Some(Duration::from_secs(10)),
         sender: None,
         background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
-        sandbox: Some(sandbox),
+        sandbox: SandboxPolicy::fixed(Some(sandbox)),
+        read_only: false,
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
@@ -3307,7 +3615,8 @@ fn policy_bash(workspace: Workspace, sandbox: crate::config::Sandbox) -> Bash {
         timeout: Some(Duration::from_secs(20)),
         sender: None,
         background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
-        sandbox: Some(sandbox),
+        sandbox: SandboxPolicy::fixed(Some(sandbox)),
+        read_only: false,
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
@@ -3900,7 +4209,8 @@ async fn sandbox_policy_anchor_rerooted_worktree_git_stays_read_only() {
         timeout: Some(Duration::from_secs(20)),
         sender: None,
         background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
-        sandbox: Some(sandbox),
+        sandbox: SandboxPolicy::fixed(Some(sandbox)),
+        read_only: false,
         protect_git: true,
         shell: Shell::detect().unwrap(),
         owner_session: None,
@@ -3960,7 +4270,8 @@ async fn sandbox_policy_anchor_rerooted_worktree_git_pointer_stays_read_only() {
         timeout: Some(Duration::from_secs(20)),
         sender: None,
         background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
-        sandbox: Some(sandbox),
+        sandbox: SandboxPolicy::fixed(Some(sandbox)),
+        read_only: false,
         protect_git: true,
         shell: Shell::detect().unwrap(),
         owner_session: None,
@@ -4018,7 +4329,8 @@ async fn sandbox_policy_anchor_rerooted_worktree_git_read_only_background_bash()
         timeout: Some(Duration::from_secs(20)),
         sender: None,
         background: BackgroundTasks::new(Some(Duration::from_secs(30 * 60)), Some(sandbox.clone())),
-        sandbox: Some(sandbox),
+        sandbox: SandboxPolicy::fixed(Some(sandbox)),
+        read_only: false,
         protect_git: true,
         shell: Shell::detect().unwrap(),
         owner_session: None,
@@ -4257,7 +4569,8 @@ async fn sandbox_ro_parent_allows_rw_child_override() {
         timeout: Some(Duration::from_secs(10)),
         sender: None,
         background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
-        sandbox: Some(sandbox),
+        sandbox: SandboxPolicy::fixed(Some(sandbox)),
+        read_only: false,
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
@@ -4294,7 +4607,8 @@ async fn sandbox_extra_writable_and_readable_paths() {
         timeout: Some(Duration::from_secs(10)),
         sender: None,
         background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
-        sandbox: Some(sandbox),
+        sandbox: SandboxPolicy::fixed(Some(sandbox)),
+        read_only: false,
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
@@ -4338,7 +4652,8 @@ async fn sandbox_protects_workspace_git_directory() {
         timeout: Some(Duration::from_secs(10)),
         sender: None,
         background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
-        sandbox: Some(sandbox),
+        sandbox: SandboxPolicy::fixed(Some(sandbox)),
+        read_only: false,
         protect_git: true,
         shell: Shell::detect().unwrap(),
         owner_session: None,
@@ -4381,7 +4696,8 @@ async fn sandbox_protects_workspace_git_file_linked_worktree() {
         timeout: Some(Duration::from_secs(10)),
         sender: None,
         background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
-        sandbox: Some(sandbox),
+        sandbox: SandboxPolicy::fixed(Some(sandbox)),
+        read_only: false,
         protect_git: true,
         shell: Shell::detect().unwrap(),
         owner_session: None,
@@ -4422,7 +4738,8 @@ async fn sandbox_mounts_systemd_resolve_when_present() {
         timeout: Some(Duration::from_secs(10)),
         sender: None,
         background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
-        sandbox: Some(sandbox),
+        sandbox: SandboxPolicy::fixed(Some(sandbox)),
+        read_only: false,
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
@@ -4472,7 +4789,8 @@ async fn sandbox_cat_etc_resolv_conf_works() {
         timeout: Some(Duration::from_secs(10)),
         sender: None,
         background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
-        sandbox: Some(sandbox),
+        sandbox: SandboxPolicy::fixed(Some(sandbox)),
+        read_only: false,
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
@@ -4510,7 +4828,8 @@ async fn sandbox_dns_resolution_live_smoke() {
         timeout: Some(Duration::from_secs(15)),
         sender: None,
         background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
-        sandbox: Some(sandbox),
+        sandbox: SandboxPolicy::fixed(Some(sandbox)),
+        read_only: false,
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
@@ -4811,7 +5130,8 @@ async fn background_without_timeout_runs_to_completion() {
         // None = no timeout: a command sleeping past any small budget must
         // still complete normally instead of being killed.
         background: BackgroundTasks::new(None, None),
-        sandbox: None,
+        sandbox: SandboxPolicy::default(),
+        read_only: false,
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
@@ -5024,7 +5344,8 @@ async fn background_launch_failure_reports_no_started_flag() {
         timeout: Some(Duration::from_secs(10)),
         sender: None,
         background: BackgroundTasks::new(None, None),
-        sandbox: None,
+        sandbox: SandboxPolicy::default(),
+        read_only: false,
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
@@ -5876,7 +6197,8 @@ async fn sandbox_does_not_protect_git_when_protect_git_is_false() {
         timeout: Some(Duration::from_secs(10)),
         sender: None,
         background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
-        sandbox: Some(sandbox),
+        sandbox: SandboxPolicy::fixed(Some(sandbox)),
+        read_only: false,
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
@@ -5920,7 +6242,8 @@ async fn sandbox_does_not_protect_git_file_when_protect_git_is_false() {
         timeout: Some(Duration::from_secs(10)),
         sender: None,
         background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
-        sandbox: Some(sandbox),
+        sandbox: SandboxPolicy::fixed(Some(sandbox)),
+        read_only: false,
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
@@ -5959,7 +6282,8 @@ async fn background_bash_inherits_protect_git_from_parent_bash() {
         timeout: Some(Duration::from_secs(10)),
         sender: None,
         background: BackgroundTasks::new(Some(Duration::from_secs(30 * 60)), Some(sandbox.clone())),
-        sandbox: Some(sandbox),
+        sandbox: SandboxPolicy::fixed(Some(sandbox)),
+        read_only: false,
         protect_git: true,
         shell: Shell::detect().unwrap(),
         owner_session: None,
@@ -5997,7 +6321,8 @@ async fn shared_registry_clone_drop_does_not_kill_another_bash_origin() {
         timeout: Some(Duration::from_secs(30)),
         background: registry.clone(),
         sender: None,
-        sandbox: None,
+        sandbox: SandboxPolicy::default(),
+        read_only: false,
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
@@ -6026,7 +6351,8 @@ async fn shared_bash_facades_keep_completions_at_their_origins() {
         timeout: Some(Duration::from_secs(30)),
         background: registry.clone(),
         sender: None,
-        sandbox: None,
+        sandbox: SandboxPolicy::default(),
+        read_only: false,
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
@@ -6036,7 +6362,8 @@ async fn shared_bash_facades_keep_completions_at_their_origins() {
         timeout: Some(Duration::from_secs(30)),
         background: registry,
         sender: None,
-        sandbox: None,
+        sandbox: SandboxPolicy::default(),
+        read_only: false,
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
@@ -6701,7 +7028,8 @@ fn ancestor_bash(workspace_dir: &std::path::Path, sandbox: crate::config::Sandbo
         timeout: Some(Duration::from_secs(20)),
         sender: None,
         background: BackgroundTasks::new(Some(Duration::from_secs(30)), None),
-        sandbox: Some(sandbox),
+        sandbox: SandboxPolicy::fixed(Some(sandbox)),
+        read_only: false,
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,
@@ -6781,7 +7109,7 @@ async fn sandbox_workspace_parent_is_protected_background_and_detached() {
     let (bash, mut receiver) = background_bash(&parent, Duration::from_secs(30));
     let mut bash = bash;
     bash.workspace = Workspace::new(&workspace_dir).unwrap();
-    bash.sandbox = Some(sandbox.clone());
+    bash.sandbox = SandboxPolicy::fixed(Some(sandbox.clone()));
     let started = bash
         .execute(json!({
             "command": format!("touch {}/OUTSIDE_BG && echo ESCAPED || echo BLOCKED", parent.path().display()),
@@ -6807,7 +7135,7 @@ async fn sandbox_workspace_parent_is_protected_background_and_detached() {
     let (bash, _rx) = background_bash(&parent, Duration::from_secs(30));
     let mut bash = bash;
     bash.workspace = Workspace::new(&workspace_dir).unwrap();
-    bash.sandbox = Some(sandbox);
+    bash.sandbox = SandboxPolicy::fixed(Some(sandbox));
     let started = bash
         .execute(json!({
             "command": format!(
@@ -7628,6 +7956,7 @@ async fn gpu_acceptance_amd_rocm_sandbox() {
         BackgroundTasks::new(Some(Duration::from_secs(60)), Some(sandbox.clone())),
         Some(sandbox),
         false,
+        false,
         Some(Duration::from_secs(600)),
         None,
     )
@@ -7961,7 +8290,8 @@ async fn sandbox_facade_tmp_is_host_tmp_for_main_and_subagent() {
         timeout: Some(Duration::from_secs(10)),
         sender: None,
         background: BackgroundTasks::new(Some(Duration::from_secs(30)), Some(policy.clone())),
-        sandbox: Some(policy.clone()),
+        sandbox: SandboxPolicy::fixed(Some(policy.clone())),
+        read_only: false,
         protect_git: false,
         shell: Shell::detect().unwrap(),
         owner_session: None,

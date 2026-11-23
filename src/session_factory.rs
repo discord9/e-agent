@@ -21,8 +21,8 @@ use crate::agent::{Agent, GoalSnapshot, SessionEntry};
 use crate::codex::CodexModel;
 use crate::codex_auth::CodexAuth;
 use crate::config::{
-    AuthMode, Config, ProjectSourceObservation, ResolvedModel, Sandbox, WebSearchProvider,
-    resolve_sandbox,
+    AuthMode, Config, ProjectSourceObservation, ResolvedModel, Sandbox, SandboxPolicy,
+    WebSearchProvider, resolve_sandbox,
 };
 use crate::delegate::{Delegate, Sessions};
 use crate::mcp;
@@ -171,10 +171,12 @@ pub struct SessionFactory {
     /// profile's).
     model: Option<String>,
     local_sessions: LocalSessionRegistry,
-    /// Already-resolved bwrap policy (`None` = sandbox disabled). Fixed at
-    /// startup: `[sandbox]` changes require a restart (workspace roots and
-    /// file capabilities are wired at construction).
-    sandbox: Option<Sandbox>,
+    /// Live, already-resolved bwrap policy (`None` = sandbox disabled), shared
+    /// with every session's bash / background tools so an already-running
+    /// session picks up a `[sandbox]` hot reload on its next command. File
+    /// capabilities (`Workspace` roots) are still wired at construction and
+    /// need a new session.
+    sandbox: SandboxPolicy,
     /// User-level `[code_mode]` flag: registers the experimental run_rust tool.
     code_mode: bool,
     read_only: bool,
@@ -471,9 +473,9 @@ impl SessionFactory {
             })?),
             None => None,
         };
-        let sandbox = resolved_policy.enabled.then_some(resolved_policy.clone());
-        if let Some(policy) = &sandbox {
-            preflight_sandbox(policy, announce)?;
+        let sandbox = SandboxPolicy::fixed(resolved_policy.enabled.then_some(resolved_policy));
+        if let Some(policy) = sandbox.snapshot() {
+            preflight_sandbox(&policy, announce)?;
         }
         // run_rust is opt-in, user-level, and preflighted fail-closed.
         #[rustfmt::skip]
@@ -740,6 +742,7 @@ impl SessionFactory {
         reload_config_at(
             &self.reloadable,
             &self.root,
+            &self.sandbox,
             self.profile.as_deref(),
             &self.base_url,
             &self.model,
@@ -757,6 +760,7 @@ impl SessionFactory {
         let announce = self.announce;
         let root = self.root.clone();
         let reloadable = self.reloadable.clone();
+        let sandbox = self.sandbox.clone();
         let profile = self.profile.clone();
         let base_url = self.base_url.clone();
         let model = self.model.clone();
@@ -781,6 +785,7 @@ impl SessionFactory {
                 match reload_config_at(
                     &reloadable,
                     &root,
+                    &sandbox,
                     profile.as_deref(),
                     &base_url,
                     &model,
@@ -789,8 +794,8 @@ impl SessionFactory {
                     ReloadResult::Reloaded => {
                         if announce {
                             tracing::info!(
-                                "e-agent: config reloaded: new sessions and `/model` switches use the updated config; \
-                                 [sandbox] / [session] backend / web-search key changes still need a restart"
+                                "e-agent: config reloaded: new sessions, `/model` switches and the next bash/background dispatch use the updated config; \
+                                 the [session] backend and web-search key changes still need a restart"
                             );
                         }
                     }
@@ -813,10 +818,12 @@ impl SessionFactory {
         &self.workspace
     }
 
-    /// The resolved bwrap policy (`None` = sandbox disabled); btw fork
-    /// subagents inherit it.
-    pub fn sandbox(&self) -> Option<&Sandbox> {
-        self.sandbox.as_ref()
+    /// The CURRENT resolved bwrap policy (`None` = sandbox disabled), read
+    /// from the live cell: btw fork subagents inherit it. Tools use the live
+    /// cell itself ([`SandboxPolicy`]) so their dispatch is always current,
+    /// while a fork captures this snapshot when it is created.
+    pub fn sandbox(&self) -> Option<Sandbox> {
+        self.sandbox.snapshot()
     }
 
     /// The read-only policy every session builds with; btw fork subagents
@@ -1025,7 +1032,7 @@ impl SessionFactory {
         // run_rust is main-agent only; the read-only sandbox is narrowed like bash.
         #[cfg(target_os = "linux")]
         #[rustfmt::skip]
-        register_run_rust(&mut tools, &tools_workspace, self.code_mode, self.read_only, self.sandbox.clone());
+        register_run_rust(&mut tools, &tools_workspace, self.code_mode, self.read_only, self.sandbox.snapshot());
         // Only the root/main session can pause for Web human input.
         add_root_user_input_tool(&mut tools);
         // Main-agent only: `generate_image` (direct Codex image HTTP).
@@ -1163,7 +1170,7 @@ impl SessionFactory {
             context_window: main_context_window,
             context_prefix: head_prefix,
             compaction_reminder: head_reminder,
-            sandbox: self.sandbox.clone(),
+            sandbox: self.sandbox.snapshot(),
             read_only: self.read_only,
             protect_git: false,
             code_mode: self.code_mode,
@@ -1303,7 +1310,7 @@ impl SessionFactory {
             base_url: None,
             model: None,
             local_sessions: LocalSessionRegistry::default(),
-            sandbox: None,
+            sandbox: SandboxPolicy::default(),
             code_mode: false,
             read_only: false,
             agents_instructions: None,
@@ -1800,23 +1807,51 @@ fn build_runtime_models(
 }
 
 /// Validate a freshly loaded config and, when it is good, atomically swap it
-/// (plus its re-resolved models and needed ChatGPT auth) into the reloadable
-/// state. A config that fails to parse or resolve — a bad edit, a missing
-/// key file, a chatgpt-routed profile with no login — is rejected and the
-/// previous config stays, so a running server never breaks on a config edit.
+/// (plus its re-resolved models, needed ChatGPT auth and the `[sandbox]`
+/// policy) into the reloadable state. A config that fails to parse or
+/// resolve — a bad edit, a missing key file, a chatgpt-routed profile with no
+/// login, an unauthorized project sandbox path — is rejected and the previous
+/// config AND policy stay, so a running server never breaks on a config edit.
+///
+/// The `[sandbox]` policy is re-resolved with the same workspace-aware
+/// resolver startup uses (global `[sandbox]` + project overlay +
+/// `resolve_sandbox`'s path authorization) and written into the live
+/// `SandboxPolicy` cell only after every other validation passed: the next
+/// bash / background dispatch of an already-running session uses it, running
+/// background commands keep theirs, and file-tool roots still need a new
+/// session.
 fn apply_reloaded_config(
     state: &mut ReloadableState,
+    root: &Path,
+    sandbox: &SandboxPolicy,
     loaded: Option<Config>,
     profile: Option<&str>,
     base_url: &Option<String>,
     model: &Option<String>,
 ) -> ReloadResult {
+    // The policy is validated FIRST, so a bad `[sandbox]` edit never leaves
+    // the factory with a half-swapped state and never widens access on its
+    // own. `resolve_sandbox` also resolves the project `[sandbox]` overlay
+    // when there is no global config at all.
+    let live_policy = match resolve_sandbox(loaded.as_ref(), root) {
+        Ok(policy) => policy.enabled.then_some(policy),
+        // A project file that cannot be read or parsed is a tolerated
+        // `Unavailable` source for the rest of the reloader (an editor
+        // mid-write must not break unrelated edits), so the sandbox keeps the
+        // last good policy rather than rejecting the reload. A RESOLVED but
+        // invalid policy — e.g. a project path outside every globally
+        // authorized root — still rejects the whole reload.
+        Err(_) if crate::config::project_source_unavailable(root) => sandbox.snapshot(),
+        Err(error) => return ReloadResult::Rejected(format!("{error:#}")),
+    };
     let Some(config) = loaded else {
         // The global config was deleted (or never existed): fall back to the
-        // no-config behavior exactly like startup with no config file.
+        // no-config behavior exactly like startup with no config file. A
+        // project `[sandbox]` can still be enabled on its own.
         state.config = None;
         state.auth = None;
         state.models = None;
+        sandbox.replace(live_policy);
         return ReloadResult::Reloaded;
     };
     // Mirror the startup web-search gate: provider/base_url validation
@@ -1870,6 +1905,10 @@ fn apply_reloaded_config(
             state.config = Some(config);
             state.auth = auth;
             state.models = Some(models);
+            // Last, after every validation passed: the live cell is what
+            // already-built bash / background tools read on their next
+            // dispatch.
+            sandbox.replace(live_policy);
             ReloadResult::Reloaded
         }
         Err(error) => ReloadResult::Rejected(format!("{error:#}")),
@@ -1878,10 +1917,13 @@ fn apply_reloaded_config(
 
 /// Load the effective config for `root` and apply it through
 /// [`apply_reloaded_config`]. The shared core of [`SessionFactory::reload_config`]
-/// and the watcher task (which holds the reloadable cell, not the factory).
+/// and the watcher task (which holds the reloadable cell and the live sandbox
+/// cell, not the factory).
+#[allow(clippy::too_many_arguments)]
 fn reload_config_at(
     reloadable: &RwLock<ReloadableState>,
     root: &Path,
+    sandbox: &SandboxPolicy,
     profile: Option<&str>,
     base_url: &Option<String>,
     model: &Option<String>,
@@ -1892,7 +1934,9 @@ fn reload_config_at(
             let mut state = reloadable.write().unwrap();
             let old_global = state.source_global.clone();
             let old_project = state.source_project.clone();
-            let result = apply_reloaded_config(&mut state, loaded, profile, base_url, model);
+            let old_policy = sandbox.snapshot();
+            let result =
+                apply_reloaded_config(&mut state, root, sandbox, loaded, profile, base_url, model);
             if matches!(result, ReloadResult::Reloaded) {
                 let new_global = state
                     .config
@@ -1909,6 +1953,17 @@ fn reload_config_at(
                 if !announce {
                     return result;
                 }
+                // A successful reload may have replaced the live `[sandbox]`
+                // policy. Name the resulting keys/paths: paths are config,
+                // not secrets, and a reload that ADDS a readable/writable
+                // path widens access immediately, so it must be visible.
+                let new_policy = sandbox.snapshot();
+                if new_policy != old_policy {
+                    tracing::info!(
+                        "e-agent: [sandbox] policy reloaded: {}; the next bash/background dispatch of every session uses it, a command that is already running keeps its own policy, and file-tool roots need a new session",
+                        sandbox_policy_summary(new_policy.as_ref())
+                    );
+                }
                 let had_edits = crate::config::trace_reload_source_edits(
                     old_global.as_ref(),
                     old_project.as_ref(),
@@ -1924,6 +1979,24 @@ fn reload_config_at(
         }
         Err(error) => ReloadResult::Rejected(format!("{error:#}")),
     }
+}
+
+/// Sanitized one-line rendering of a live `[sandbox]` policy for the reload
+/// diagnostic: it names every key and path that decides access (paths are
+/// config, not secrets; `[sandbox]` carries no credentials). `None` means the
+/// sandbox is disabled.
+fn sandbox_policy_summary(policy: Option<&Sandbox>) -> String {
+    let Some(policy) = policy else {
+        return "enabled=false".to_owned();
+    };
+    format!(
+        "enabled=true network={} workspace_writable={} gpu={} writable_paths=[{}] readable_paths=[{}]",
+        policy.network,
+        policy.workspace_writable,
+        policy.gpu,
+        policy.writable_paths.join(", "),
+        policy.readable_paths.join(", ")
+    )
 }
 
 /// The config file's mtime, or `None` when the file does not exist (yet).
@@ -2256,7 +2329,15 @@ api_key_env = "PATH"
         );
         let result = {
             let mut state = factory.reloadable.write().unwrap();
-            apply_reloaded_config(&mut state, Some(second), None, &None, &None)
+            apply_reloaded_config(
+                &mut state,
+                factory.root(),
+                &factory.sandbox,
+                Some(second),
+                None,
+                &None,
+                &None,
+            )
         };
         assert!(matches!(result, ReloadResult::Reloaded), "{result:?}");
 
@@ -2320,7 +2401,15 @@ api_key_env = "PATH"
         let broken = test_config("nope/nope", "");
         let result = {
             let mut state = factory.reloadable.write().unwrap();
-            apply_reloaded_config(&mut state, Some(broken), None, &None, &None)
+            apply_reloaded_config(
+                &mut state,
+                factory.root(),
+                &factory.sandbox,
+                Some(broken),
+                None,
+                &None,
+                &None,
+            )
         };
         assert!(
             matches!(result, ReloadResult::Rejected(_)),
@@ -2340,7 +2429,15 @@ api_key_env = "PATH"
         );
         let result = {
             let mut state = factory.reloadable.write().unwrap();
-            apply_reloaded_config(&mut state, None, None, &None, &None)
+            apply_reloaded_config(
+                &mut state,
+                factory.root(),
+                &factory.sandbox,
+                None,
+                None,
+                &None,
+                &None,
+            )
         };
         assert!(matches!(result, ReloadResult::Reloaded));
         assert!(factory.current_config().is_none());
@@ -2389,6 +2486,8 @@ api_key_env = "PATH"
             let mut state = factory.reloadable.write().unwrap();
             apply_reloaded_config(
                 &mut state,
+                factory.root(),
+                &factory.sandbox,
                 Some(second),
                 factory.profile.as_deref(),
                 &None,
@@ -2497,7 +2596,7 @@ TOKEN = "new-secret"
 [pet]
 spritesheet = "pet.png"
 [sandbox]
-readable_paths = ["./read-only"]
+network = false
 "#,
         )
         .unwrap();
@@ -2519,7 +2618,10 @@ readable_paths = ["./read-only"]
             .expect("pet diagnostic");
         assert!(pet_line.contains("INFO"), "{pet_line}");
         assert!(pet_line.contains("status=effective"), "{pet_line}");
-        assert!(output.contains("path=sandbox.readable_paths"), "{output}");
+        // `[sandbox]` leaves are effective now (live shell policy), and a
+        // project path that the resolver would reject is a rejected reload —
+        // this fixture therefore uses a scalar, which resolves on its own.
+        assert!(output.contains("path=sandbox.network"), "{output}");
         assert!(!output.contains("old-secret"), "{output}");
         assert!(!output.contains("new-secret"), "{output}");
         // Secret-only env value changes collapse after sanitization, so no
@@ -2671,7 +2773,15 @@ fixer = "{role_profile}"
         };
         {
             let mut state = factory.reloadable.write().unwrap();
-            apply_reloaded_config(&mut state, Some(with_role("p1/m1")), None, &None, &None);
+            apply_reloaded_config(
+                &mut state,
+                factory.root(),
+                &factory.sandbox,
+                Some(with_role("p1/m1")),
+                None,
+                &None,
+                &None,
+            );
         }
         let resolver = factory.role_models_resolver();
         // Startup config routes fixer to p1/m1 (display name "m1").
@@ -2683,7 +2793,15 @@ fixer = "{role_profile}"
         // so a resident Delegate picks the new model up at spawn.
         {
             let mut state = factory.reloadable.write().unwrap();
-            apply_reloaded_config(&mut state, Some(with_role("p2/m2")), None, &None, &None);
+            apply_reloaded_config(
+                &mut state,
+                factory.root(),
+                &factory.sandbox,
+                Some(with_role("p2/m2")),
+                None,
+                &None,
+                &None,
+            );
         }
         let (model, _) = resolver("fixer").expect("fixer still routed");
         assert_eq!(model.display_name(), "m2");
@@ -2937,6 +3055,8 @@ model = "m2"
             let mut state = factory.reloadable.write().unwrap();
             apply_reloaded_config(
                 &mut state,
+                factory.root(),
+                &factory.sandbox,
                 Some(with_subagent(Some("p1/m1"))),
                 None,
                 &None,
@@ -2957,6 +3077,8 @@ model = "m2"
             let mut state = factory.reloadable.write().unwrap();
             apply_reloaded_config(
                 &mut state,
+                factory.root(),
+                &factory.sandbox,
                 Some(with_subagent(Some("p2/m2"))),
                 None,
                 &None,
@@ -2971,7 +3093,15 @@ model = "m2"
         // uses, so a resident Delegate and a fresh session agree.
         {
             let mut state = factory.reloadable.write().unwrap();
-            apply_reloaded_config(&mut state, Some(with_subagent(None)), None, &None, &None);
+            apply_reloaded_config(
+                &mut state,
+                factory.root(),
+                &factory.sandbox,
+                Some(with_subagent(None)),
+                None,
+                &None,
+                &None,
+            );
         }
         let (model, context_window) = resolver().expect("main fallback");
         assert_eq!(model.display_name(), "m1");
@@ -3041,7 +3171,15 @@ context_window = 3000
         };
         let apply = |config: Config| {
             let mut state = factory.reloadable.write().unwrap();
-            apply_reloaded_config(&mut state, Some(config), None, &None, &None);
+            apply_reloaded_config(
+                &mut state,
+                factory.root(),
+                &factory.sandbox,
+                Some(config),
+                None,
+                &None,
+                &None,
+            );
         };
         let resolver = factory.subagent_model_resolver();
 
@@ -3062,6 +3200,112 @@ context_window = 3000
         let (model, context_window) = resolver().expect("main fallback");
         assert_eq!(model.display_name(), "m1");
         assert_eq!(context_window, Some(1000));
+    }
+
+    /// Sandbox hot reload, factory level: the winning `[sandbox]` edit is
+    /// re-resolved with the SAME workspace-aware resolver startup uses (global
+    /// section + project overlay) and swapped into the live policy cell, so an
+    /// already-built session's next bash dispatch sees it. A rejected edit
+    /// keeps the last good policy, exactly like the rest of the reload.
+    #[test]
+    fn reload_swaps_the_live_sandbox_policy_and_keeps_it_on_rejection() {
+        let _guard = crate::roles::XDG_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let xdg = temp.path().join("xdg");
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let old_home = std::env::var_os("HOME");
+        let global_dir = xdg.join("e-agent");
+        std::fs::create_dir_all(&global_dir).unwrap();
+        let global = global_dir.join("config.toml");
+        let project_dir = temp.path().join(".e-agent");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let project = project_dir.join("config.toml");
+        std::fs::write(
+            &global,
+            r#"default = "p1/m1"
+[providers.p1]
+base_url = "http://one"
+api_key_env = "PATH"
+[models."p1/m1"]
+model = "m1"
+[sandbox]
+enabled = true
+network = true
+"#,
+        )
+        .unwrap();
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &xdg);
+            std::env::set_var("HOME", &home);
+        };
+
+        let mut factory = SessionFactory::test_factory(temp.path().to_path_buf());
+        factory.announce = true;
+        // A test factory starts with the live cell empty (no sandbox).
+        assert!(factory.sandbox().is_none());
+
+        // Policy A: the global `[sandbox]` section, enabled with networking.
+        let capture = ReloadCapture::default();
+        capture_reload(&capture, || {
+            assert!(matches!(factory.reload_config(), ReloadResult::Reloaded));
+        });
+        let policy_a = factory.sandbox().expect("policy A");
+        assert!(policy_a.enabled && policy_a.network && policy_a.workspace_writable);
+        // Both the per-leaf source edit and the resolved-policy summary are
+        // reported as effective, not as a restart.
+        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.contains("path=sandbox.enabled") && output.contains("status=effective"),
+            "{output}"
+        );
+        assert!(!output.contains("require restart"), "{output}");
+
+        // Policy B: a project `[sandbox]` scalar overlay wins through the same
+        // resolver startup uses. The summary names the changed keys.
+        std::fs::write(&project, "[sandbox]\nnetwork = false\n").unwrap();
+        capture.0.lock().unwrap().clear();
+        capture_reload(&capture, || {
+            assert!(matches!(factory.reload_config(), ReloadResult::Reloaded));
+        });
+        let policy_b = factory.sandbox().expect("policy B");
+        assert!(policy_b.enabled, "the global switch still applies");
+        assert!(!policy_b.network, "the project overlay wins");
+        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.contains("path=sandbox.network") && output.contains("status=effective"),
+            "{output}"
+        );
+        assert!(
+            output.contains("[sandbox] policy reloaded: enabled=true network=false"),
+            "the reload summary names the new keys: {output}"
+        );
+
+        // A project path with no globally authorized ancestor is a rejected
+        // reload: the policy stays at the last good value.
+        let outside = temp.path().join("project-outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(
+            &project,
+            "[sandbox]\nwritable_paths = [\"project-outside\"]\n",
+        )
+        .unwrap();
+        match factory.reload_config() {
+            ReloadResult::Rejected(reason) => assert!(
+                reason.contains("not within any globally authorized writable root"),
+                "{reason}"
+            ),
+            other => panic!("expected rejection, got {other:?}"),
+        }
+        assert_eq!(factory.sandbox(), Some(policy_b.clone()));
+        unsafe {
+            std::env::remove_var("XDG_CONFIG_HOME");
+            if let Some(home) = old_home {
+                std::env::set_var("HOME", home);
+            } else {
+                std::env::remove_var("HOME");
+            }
+        }
     }
 }
 
