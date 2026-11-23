@@ -276,7 +276,7 @@ pub async fn run(
     store: crate::session_store::SessionStore,
     model: crate::model::ConfiguredModel,
     workspace: crate::workspace::Workspace,
-    sandbox: Option<crate::config::Sandbox>,
+    sandbox: crate::config::SandboxPolicy,
     session_backend: crate::config::SessionBackend,
     read_only: bool,
     record_in: Option<crate::session_store::BackgroundRecord>,
@@ -371,7 +371,7 @@ async fn run_inner(
     store: crate::session_store::SessionStore,
     model: crate::model::ConfiguredModel,
     workspace: crate::workspace::Workspace,
-    sandbox: Option<crate::config::Sandbox>,
+    sandbox: crate::config::SandboxPolicy,
     backend: crate::config::SessionBackend,
     read_only: bool,
     record_in: Option<crate::session_store::BackgroundRecord>,
@@ -412,7 +412,7 @@ async fn run_inner(
     // session's model, workspace, sandbox, read-only policy and backend.
     state.model = Some(model);
     state.workspace = Some(workspace);
-    state.sandbox = sandbox;
+    state.sandbox = Some(sandbox);
     state.backend = Some(backend);
     state.read_only = read_only;
     state.record_in = record_in;
@@ -1244,7 +1244,7 @@ fn btw_context(
         model: state.model.clone()?,
         context_window: state.context_window,
         workspace: state.workspace.clone()?,
-        sandbox: state.sandbox.clone(),
+        sandbox: state.sandbox.clone()?,
         read_only: state.read_only,
         background: state.background.clone()?,
         sessions: state.sessions.clone()?,

@@ -434,6 +434,7 @@ mod tests {
     use super::*;
     use crate::agent::*;
     use crate::codex_auth::CodexAuth;
+    use crate::config::SandboxPolicy;
     use crate::runner::{IdlePolicy, SessionResult, SessionRunner, SessionStatus};
     use crate::session_store::SessionStore;
     use crate::tools::BackgroundTasks;
@@ -862,13 +863,18 @@ mod tests {
     fn generate_image_is_not_in_common_builtins() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = Workspace::new(temp.path()).unwrap();
-        let (main, _) =
-            crate::tools::builtins_with_bash_timeout(workspace.clone(), None, false, None, None);
+        let (main, _) = crate::tools::builtins_with_bash_timeout(
+            workspace.clone(),
+            SandboxPolicy::fixed(None),
+            false,
+            None,
+            None,
+        );
         assert!(!main.iter().any(|tool| tool.spec().name == "generate_image"));
         let child = crate::tools::builtins_with_background(
             workspace,
-            BackgroundTasks::new(None, None),
-            None,
+            BackgroundTasks::new(None, SandboxPolicy::fixed(None)),
+            SandboxPolicy::fixed(None),
             false,
             true,
             Some("sub".into()),

@@ -33,11 +33,14 @@ use super::background::{BackgroundTasks, ExitSlot, OutputSlot, TaskExit, TaskSpo
 /// it is adopted into the background. `None` means no threshold (run to
 /// completion). Callers resolve it from config (`[bash]`), defaulting to 30s.
 /// Sandboxed Windows retains kill-on-timeout instead of adopting.
+/// `sandbox` is the shared policy cell (read per dispatch); `read_only`
+/// narrows it and fails closed without a policy.
 pub fn bash_tool(
     workspace: Workspace,
     background: BackgroundTasks,
-    sandbox: Option<crate::config::Sandbox>,
+    sandbox: crate::config::SandboxPolicy,
     protect_git: bool,
+    read_only: bool,
     timeout: Option<Duration>,
     self_session_id: Option<String>,
 ) -> Result<Box<dyn Tool>, String> {
@@ -48,6 +51,7 @@ pub fn bash_tool(
         background,
         sender: None,
         sandbox,
+        read_only,
         protect_git,
         shell,
         // 发起者会话：subagent 传自己的 session id（None = 主会话/未知）。
@@ -80,7 +84,9 @@ pub(super) struct Bash {
     /// Completion delivery belongs to this bash facade's Agent, not the
     /// shared registry. Spawned tasks retain this origin sender.
     pub(super) sender: Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
-    pub(super) sandbox: Option<crate::config::Sandbox>,
+    /// Shared `[sandbox]` cell (read per dispatch); `read_only` narrows it.
+    pub(super) sandbox: crate::config::SandboxPolicy,
+    pub(super) read_only: bool,
     /// On non-Windows, bind `<workspace>/.git` read-only when sandboxed.
     /// Resolved from the role's frontmatter `protect_git` (default true).
     /// The Windows write-sandbox MVP rejects this mode before side effects.
@@ -90,6 +96,55 @@ pub(super) struct Bash {
     /// 发起者会话 id（subagent 为它自己的 session id，主会话为 None）：
     /// 后台 bash 任务在共享 registry 里用它标注发起者。
     pub(super) owner_session: Option<String>,
+}
+
+impl Bash {
+    /// The policy THIS dispatch runs under: one snapshot, narrowed for a
+    /// read-only facade. `Err` is read-only fail-closed: there is no policy to
+    /// narrow, and an unsandboxed shell would defeat the role.
+    fn dispatch_policy(&self) -> Result<Option<crate::config::Sandbox>, String> {
+        let live = self.sandbox.snapshot();
+        if !self.read_only {
+            return Ok(live);
+        }
+        match live {
+            Some(policy) => Ok(Some(super::read_only_sandbox(&policy))),
+            None => Err(
+                "no shell: this read-only session runs commands only inside an enabled \
+                 [sandbox] policy, and the live [sandbox] policy is currently disabled. The \
+                 command was not run; re-enable the sandbox (or use a writable session) \
+                 instead of expecting an unsandboxed shell."
+                    .into(),
+            ),
+        }
+    }
+}
+
+/// Test hooks for the live-policy dispatch tests (`src/tools_tests.rs`).
+#[cfg(all(test, unix))]
+impl Bash {
+    /// The bwrap argv this facade would spawn for `command` right now. No
+    /// process is created: the descriptor-pinned plan is dropped (closing its
+    /// fds) on return, so the assertion sees exactly the mounts/network flags
+    /// the next dispatch would use.
+    pub(super) fn dispatch_args(&self, command: &str) -> Result<Option<Vec<String>>, String> {
+        let Some(policy) = self.dispatch_policy()? else {
+            return Ok(None);
+        };
+        let (cmd, _plan) = wrap_bash_command(
+            &self.shell,
+            &self.workspace,
+            command,
+            self.protect_git,
+            &policy,
+        )?;
+        Ok(Some(
+            cmd.as_std()
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect(),
+        ))
+    }
 }
 
 #[async_trait]
@@ -102,7 +157,10 @@ impl Tool for Bash {
         // Tell the model which shell syntax to use (pwsh on Windows, bash
         // elsewhere).
         description.push_str(self.shell.syntax_hint);
-        if let Some(sandbox) = &self.sandbox {
+        // Rebuilt whenever the tool list is assembled for a turn, from the
+        // policy of that moment (a reload can lag by up to one turn).
+        let policy = self.dispatch_policy();
+        if let Ok(Some(sandbox)) = &policy {
             #[cfg(windows)]
             {
                 let ws_mode = if sandbox.workspace_writable {
@@ -162,7 +220,7 @@ impl Tool for Bash {
                     );
                 }
                 description.push_str(
-                " Bash mounts and read_file/write_file/edit_file capabilities are independent boundaries sharing this resolved path policy.",
+                " These bash mounts follow the live `[sandbox]` policy; read_file/write_file/edit_file keep the readable roots the session was built with.",
             );
                 description.push_str(
                 " In a linked git worktree the main repository is mounted read-only (absolute path); bash can also reach it via relative traversal, but the file tools cannot — use the absolute path with them.",
@@ -174,6 +232,13 @@ impl Tool for Bash {
                     );
                 }
             }
+        }
+        if policy.is_err() {
+            description.push_str(
+                " The `[sandbox]` policy is currently disabled, so this read-only session's \
+                 commands fail closed (no unsandboxed shell); no command runs until the sandbox \
+                 is enabled again.",
+            );
         }
         ToolSpec {
             name: self.shell.tool_name.into(),
@@ -203,6 +268,7 @@ impl Tool for Bash {
                     .into(),
             );
         }
+        let policy = self.dispatch_policy()?;
         if background {
             if detached {
                 // Daemon / long-lived service / watcher: runs in the shared
@@ -217,7 +283,7 @@ impl Tool for Bash {
                         command.to_owned(),
                         title,
                         self.protect_git,
-                        self.sandbox.clone(),
+                        policy.clone(),
                         self.owner_session.clone(),
                     )
                     .map(ToolOutput::text);
@@ -232,7 +298,7 @@ impl Tool for Bash {
                     command.to_owned(),
                     self.protect_git,
                     self.sender.clone(),
-                    self.sandbox.clone(),
+                    policy.clone(),
                     self.owner_session.clone(),
                     title,
                 )
@@ -250,7 +316,7 @@ impl Tool for Bash {
         }
         let threshold = self.timeout;
         #[cfg(windows)]
-        if self.sandbox.is_some() {
+        if policy.is_some() {
             return run_bash(
                 &self.shell,
                 &self.workspace,
@@ -260,7 +326,7 @@ impl Tool for Bash {
                 None,
                 None,
                 None,
-                self.sandbox.as_ref(),
+                policy.as_ref(),
                 None,
             )
             .await
@@ -273,7 +339,7 @@ impl Tool for Bash {
                 command.to_owned(),
                 self.protect_git,
                 self.sender.clone(),
-                self.sandbox.clone(),
+                policy,
                 self.owner_session.clone(),
                 title,
                 threshold,
@@ -595,6 +661,18 @@ pub(super) fn build_bwrap_plan(
             .as_ref()
             .is_none_or(|metadata| !Path::new(dest).starts_with(metadata))
     };
+    // Every configured WRITABLE view is checked against the policy FILE before
+    // any destination filtering: filtering works on destinations, so it cannot
+    // see a writable alias of the file (or of a tree containing it) at another
+    // destination, including the destinations the projection restores deeper
+    // from these same sources.
+    let anchor = workspace.policy_anchor();
+    for path in &sandbox.writable_paths {
+        writable_policy_view_guard(anchor, path, path)?;
+    }
+    for (source, dest) in &sandbox.writable_mounts {
+        writable_policy_view_guard(anchor, source, dest)?;
+    }
     let mut mounts = Vec::new();
     // Any configured destination at or under the policy parent is excluded
     // from the generic pathname mount loop: that subtree is owned by the
@@ -736,25 +814,66 @@ pub(super) fn build_bwrap_plan(
     }
     // Protect the startup policy anchor: a descriptor-pinned projection
     // applied after every other mount so no bind (workspace, alias or
-    // explicit descendant) can shadow it. Every destination filtered from
-    // the generic loop above must be restored here; a projection that
-    // cannot run fails the plan closed instead of hiding them silently.
+    // explicit descendant) can shadow it. Visibility is decided from THIS
+    // plan's mount list (the destinations actually installed), not from
+    // startup capabilities: a live policy that newly covers the policy parent
+    // must be projected too. Every destination filtered from the generic loop
+    // above must be restored here; a projection that cannot run fails the
+    // plan closed instead of hiding them silently.
+    // The host `/tmp` bind is pushed straight into `args` (see above), so it is
+    // not in `mounts`: a workspace under `/tmp` — including a rerooted
+    // delegate whose startup policy anchor is outside the session root — keeps
+    // the policy file visible through it and must still be projected.
+    let host_tmp_bind = scratch_bind.is_none();
+    // An exact authorization of the policy PARENT itself is filtered from the
+    // generic loop (its subtree is owned by the projection), so it is not in
+    // `mounts` either; it is projectable, not "uncovered".
+    let exact_parent_grant = policy_parent.as_deref().is_some_and(|parent| {
+        sandbox
+            .writable_paths
+            .iter()
+            .chain(sandbox.readable_paths.iter())
+            .any(|path| Path::new(path) == parent)
+            || sandbox
+                .writable_mounts
+                .iter()
+                .chain(sandbox.readable_mounts.iter())
+                .any(|(_, dest)| Path::new(dest) == parent)
+    });
+    // The implicit `/tmp` bind covers the anchor only when no ancestor-guard
+    // tmpfs (installed AFTER it) shadows that subtree: projecting under a guard
+    // would re-introduce `.e-agent` children the guard deliberately hid.
+    let tmp_covers = policy_parent.as_deref().is_some_and(|parent| {
+        host_tmp_bind
+            && parent.starts_with("/tmp")
+            && !ancestor_guards
+                .iter()
+                .any(|(_, guard)| parent.starts_with(guard))
+    });
+    let policy_visible = policy_parent.as_deref().is_some_and(|parent| {
+        parent.starts_with(root)
+            || tmp_covers
+            || exact_parent_grant
+            || mounts
+                .iter()
+                .any(|(_, dest, _, _)| parent.starts_with(Path::new(dest)))
+    });
     let mut fds: Vec<rustix::fd::OwnedFd> = Vec::new();
-    if workspace.policy_anchor_is_visible() {
+    if policy_visible {
         project_policy_parent(
             workspace,
             sandbox,
             &mut args,
             &mut fds,
             filtered_policy_dests,
+            tmp_covers,
         )?;
     } else if filtered_policy_dests {
         return Err(format!(
-            "fail closed: sandbox policy destinations under {} are excluded from the generic mount loop, but the policy-anchor projection cannot run from workspace {} (policy anchor {} is not visible), so those destinations would be silently hidden",
+            "fail closed: sandbox policy destinations under {} are excluded from the generic mount loop, but no bind in this plan covers the policy parent (policy anchor {}), so the projection cannot restore them",
             policy_parent
                 .as_deref()
                 .map_or_else(|| "<policy parent>".into(), |p| p.display().to_string()),
-            root_str,
             workspace.policy_anchor().display()
         ));
     }
@@ -1155,6 +1274,71 @@ fn pin_source(
     }
 }
 
+/// A writable view of the policy FILE (itself, or a tree containing it) lets a
+/// sandboxed command author the very policy that governs it. Only two shapes
+/// are safe, and both are locked in place by the descriptor-pinned projection:
+/// a SELF entry (`source == dest`, by path) at or above the policy parent, and
+/// a source that merely sits under the policy directory (a sibling such as
+/// `worktrees/`). Everything else — an alias of the file or of a containing
+/// tree, and a writable path equal to the file itself — fails closed.
+#[cfg(unix)]
+fn writable_policy_view_guard(anchor: &Path, source: &str, dest: &str) -> Result<(), String> {
+    let source = Path::new(source);
+    let self_entry = source == Path::new(dest);
+    if source == anchor || (anchor.starts_with(source) && !self_entry) {
+        return Err(format!(
+            "fail closed: writable mount {dest} exposes the sandbox policy file {} through its source {}; a sandboxed command could author its own [sandbox] policy there — remove that mount, narrow its source, or make it read-only",
+            anchor.display(),
+            source.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a sandboxed command could CREATE the missing policy parent: some
+/// covering mount destination (the workspace bind or a configured root) is
+/// writable, and the deepest such destination decides, exactly like the mount
+/// loop (later entries win at equal depth, so the workspace bind wins ties).
+/// When nothing writable covers it, the parent cannot be created from inside
+/// the sandbox and no projection is needed.
+#[cfg(unix)]
+fn policy_parent_creatable(
+    workspace: &Workspace,
+    sandbox: &crate::config::Sandbox,
+    parent: &Path,
+    tmp_covers: bool,
+) -> bool {
+    let mut best: Option<(usize, bool)> = None;
+    let mut consider = |dest: &Path, writable: bool| {
+        if parent.starts_with(dest) {
+            let depth = dest.components().count();
+            if best.is_none_or(|(best_depth, _)| depth >= best_depth) {
+                best = Some((depth, writable));
+            }
+        }
+    };
+    // The implicit `--bind /tmp /tmp` is mounted FIRST, so every later entry
+    // wins over it (an explicit read-only `/tmp` included): consider it before
+    // any configured destination.
+    if tmp_covers {
+        consider(Path::new("/tmp"), true);
+    }
+    for (_, dest) in &sandbox.readable_mounts {
+        consider(Path::new(dest), false);
+    }
+    for (_, dest) in &sandbox.writable_mounts {
+        consider(Path::new(dest), true);
+    }
+    for path in &sandbox.readable_paths {
+        consider(Path::new(path), false);
+    }
+    for path in &sandbox.writable_paths {
+        consider(Path::new(path), true);
+    }
+    consider(workspace.root(), sandbox.workspace_writable);
+    best.is_some_and(|(_, writable)| writable)
+}
+
 /// Install the policy-parent protection: `--tmpfs P`, restore the allowed
 /// existing top-level ordinary entries (regular files/dirs only) and the
 /// explicit descendants via descriptor-pinned binds, then `--remount-ro P`
@@ -1167,6 +1351,7 @@ fn project_policy_parent(
     args: &mut Vec<std::ffi::OsString>,
     fds: &mut Vec<rustix::fd::OwnedFd>,
     filtered_policy_dests: bool,
+    tmp_covers: bool,
 ) -> Result<(), String> {
     use rustix::fs::{FileType, Mode, OFlags, RawDir, ResolveFlags, fstat, openat2};
     let policy = workspace.policy_anchor();
@@ -1176,27 +1361,52 @@ fn project_policy_parent(
     // are enumerated from it with getdents, which EBADFs on O_PATH fds.
     // RESOLVE_NO_SYMLINKS rejects a symlinked `.e-agent` outright (fail
     // closed — no symlink fallback is ever used).
-    let parent_fd = match openat2(
-        rustix::fs::CWD,
-        parent,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-        ResolveFlags::NO_SYMLINKS,
-    ) {
+    let open_parent = || {
+        openat2(
+            rustix::fs::CWD,
+            parent,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::NO_SYMLINKS,
+        )
+    };
+    let parent_fd = match open_parent() {
         Ok(fd) => fd,
-        // A missing policy parent (or a non-directory at that path) cannot
-        // be projected; the config stays ENOENT and the host gains nothing.
-        // If the generic loop excluded configured destinations under it,
-        // those would be silently hidden — fail closed instead.
+        // A missing policy parent (or a non-directory at that path) is a
+        // SELF-RELAXATION vector when the sandbox can create it through a
+        // writable bind: a command could author `.e-agent/config.toml` and the
+        // reload would install that policy for the next dispatch. Create the
+        // agent's own state directory here (host side, before the spawn) and
+        // project it like an existing one, so the config stays absent and
+        // uncreatable inside the sandbox. When nothing writable covers the
+        // parent, nothing can be created there and no projection is needed.
         Err(rustix::io::Errno::NOENT | rustix::io::Errno::NOTDIR) => {
-            if filtered_policy_dests {
-                return Err(format!(
-                    "fail closed: policy destinations under {} are excluded from the generic mount loop, but the policy parent {} does not exist, so the projection cannot restore them",
-                    parent.display(),
-                    parent.display()
-                ));
+            // Projection is needed when a configured destination was filtered
+            // from the generic loop (an exact authorization of the parent is
+            // restored by the projection's own tmpfs) or when the sandbox could
+            // create the parent through a writable bind. Neither: nothing is
+            // visible or creatable there, so there is nothing to project.
+            if !filtered_policy_dests
+                && !policy_parent_creatable(workspace, sandbox, parent, tmp_covers)
+            {
+                return Ok(());
             }
-            return Ok(());
+            std::fs::create_dir_all(parent).map_err(|error| {
+                format!(
+                    "fail closed: cannot create the policy parent {} to keep {} read-only: {error}",
+                    parent.display(),
+                    policy.display()
+                )
+            })?;
+            match open_parent() {
+                Ok(fd) => fd,
+                Err(error) => {
+                    return Err(format!(
+                        "fail closed: cannot pin policy parent {} after creating it: {error}",
+                        parent.display()
+                    ));
+                }
+            }
         }
         // An unreadable (execute-only) parent must NOT be skipped: the
         // sandbox — same user — could still open `config.toml` by known
@@ -1216,6 +1426,27 @@ fn project_policy_parent(
         }
     };
     let entries = policy_entries_under(sandbox, parent);
+    // A configured ALIAS whose destination is a direct child of the policy
+    // parent cannot be restored by the projection: top-level children are
+    // rebuilt from the host directory by name, so the configured source would
+    // be silently replaced by the host entry (or dropped when absent). Fail
+    // closed instead of binding the wrong inode.
+    for entry in &entries {
+        // The policy FILE itself is exempt: the projection deliberately
+        // overrides any configured view of it with the host file bound
+        // read-only.
+        if entry.dest.components().count() == parent_depth + 1
+            && entry.source != entry.dest
+            && entry.dest != policy
+        {
+            return Err(format!(
+                "fail closed: configured alias {} -> {} is a direct child of the sandbox policy parent {}; the projection cannot restore it there (use a deeper destination or a self entry)",
+                entry.source.display(),
+                entry.dest.display(),
+                parent.display()
+            ));
+        }
+    }
     args.push("--tmpfs".into());
     args.push(parent.as_os_str().into());
     // Top-level ordinary children of the policy parent, enumerated from the

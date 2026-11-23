@@ -15,8 +15,8 @@ does not yet follow semantic versioning strictly.
   switches immediately and to newly built sessions; `[mcp]`, `[bash]` and
   `[background]` apply to sessions built after the reload. A reload that
   fails to parse or resolve is rejected and logged, keeping the last good
-  config. `[sandbox]`, the `[session]` backend and web-search key changes
-  remain restart-only.
+  config. The `[session]` backend and web-search key changes remain
+  restart-only; `[sandbox]` reloads live (see below).
 - **`/help <command>` per-command details (TUI + web)** — the TUI's `/help`
   now accepts an optional command name and shows a 2–4 line usage detail
   (`/help fork`); unknown names print a hint pointing back at the list. The
@@ -40,6 +40,21 @@ does not yet follow semantic versioning strictly.
 
 ### Changed
 
+- **`[sandbox]` hot reloads (live shell policy)** — a winning `[sandbox]`
+  edit reaches the next `bash` / background command of an already-running
+  session without a restart; a command already running keeps its policy,
+  read-only roles re-derive their narrowing (and fail closed when the policy
+  disappears), and `/btw` forks share the parent's policy. The policy is
+  re-resolved only when the `[sandbox]` inputs change, and such edits are
+  reported `effective` instead of restart-only (a global `[sandbox]` scalar a
+  project overlay overrides is `shadowed`). On Linux/bwrap a sandboxed command
+  can no longer author the workspace policy file through the paths the plan
+  mounts (an absent `.e-agent/` is created agent-side and projected read-only,
+  and a writable mount alias whose source contains the policy directory is
+  refused); the Windows write sandbox has no such carve-out, so a project
+  `[sandbox]` edit is rejected by the reload there and needs a restart.
+  File-tool roots and `run_rust`'s forced policy stay startup-fixed (a process
+  restart).
 - **Sandbox `/tmp` is the host's real `/tmp` again** — bubblewrap bash no
   longer mounts a private `/tmp` tmpfs, and the delegated-subagent
   read-only `/tmp` remount is gone: inside the sandbox `/tmp` is the host

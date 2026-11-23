@@ -320,8 +320,9 @@ pub struct Delegate {
     /// Workspace root used to resolve role templates across global, legacy
     /// project (`agents/`), and canonical project (`.e-agent/agents/`) layers.
     roles_root: Option<std::path::PathBuf>,
-    /// Optional bwrap sandbox inherited by every subagent's bash tool.
-    sandbox: Option<crate::config::Sandbox>,
+    /// The session factory's `[sandbox]` cell, inherited by every subagent's
+    /// bash tool.
+    sandbox: crate::config::SandboxPolicy,
     /// Parent session's background-task record (workspace root + session
     /// name + the store that owns the record), so subagent delegates are
     /// recorded alongside bash background tasks and trigger the "killed on
@@ -377,8 +378,8 @@ struct DelegatedTask {
     role_prompt: Option<String>,
     compaction_reminder: Option<String>,
     /// True when the role's frontmatter declared `read_only = true` (or the
-    /// caller's policy demands it): the subagent gets no write/edit tools and
-    /// its bash runs in a narrowed read-only sandbox with network disabled.
+    /// caller's policy demands it): no write/edit tools, and bash narrows the
+    /// sandbox per dispatch.
     read_only: bool,
     /// True (the default, incl. roles without a `protect_git` frontmatter
     /// key) when the subagent's bash must bind `<workspace>/.git` read-only
@@ -386,7 +387,7 @@ struct DelegatedTask {
     /// for any bash at all under the Windows write-sandbox MVP, which cannot
     /// enforce the protection and fails closed instead.
     protect_git: bool,
-    sandbox: Option<crate::config::Sandbox>,
+    sandbox: crate::config::SandboxPolicy,
     /// True for a btw fork: an interactive side conversation, not a one-shot
     /// delegated task. Swaps the system instructions (no "return a concise
     /// final answer" — the user keeps replying) and pairs with a
@@ -486,7 +487,7 @@ impl Delegate {
             role_model_source: None,
             subagent_model_source: None,
             roles_root: None,
-            sandbox: None,
+            sandbox: crate::config::SandboxPolicy::fixed(None),
             record_in: None,
             local_sessions: crate::session_factory::LocalSessionRegistry::default(),
             persist_backend: SessionBackend::default(),
@@ -556,19 +557,11 @@ impl Delegate {
         self
     }
 
-    /// Sandbox every subagent's bash tool with the same bwrap policy as the
-    /// main agent.
-    pub fn with_sandbox(mut self, sandbox: Option<crate::config::Sandbox>) -> Self {
+    /// Share the session factory's `[sandbox]` cell with every subagent's bash
+    /// tool (a snapshot is never converted back into a cell here).
+    pub fn with_sandbox(mut self, sandbox: crate::config::SandboxPolicy) -> Self {
         self.sandbox = sandbox;
         self
-    }
-
-    /// Narrow the inherited bwrap policy for a read-only role: workspace
-    /// read-only, extra writable roots dropped, network disabled. `None`
-    /// (sandbox disabled / bwrap unavailable) stays `None` — a read-only
-    /// role then gets no bash tool at all (fail closed).
-    fn read_only_sandbox(&self) -> Option<crate::config::Sandbox> {
-        self.sandbox.as_ref().map(crate::tools::read_only_sandbox)
     }
 
     /// Bind the parent session name used as the delegate/btw session's
@@ -848,14 +841,17 @@ impl Delegate {
         let mut tools = crate::tools::builtins_with_background(
             workspace.clone(),
             self.background.clone(),
-            head.sandbox.clone(),
+            // The LIVE cell, not the head's snapshot: a fork is a session
+            // built from a running parent, so its next command follows the
+            // same policy a `/model`-switched or reloaded parent would.
+            self.sandbox.clone(),
             head.read_only,
             head.protect_git,
             Some(session_id.clone()),
         );
         #[cfg(target_os = "linux")]
-        if head.code_mode && (!head.read_only || head.sandbox.is_some()) {
-            let rust = crate::tools::run_rust_tool(&workspace, head.sandbox.as_ref());
+        if head.code_mode && (!head.read_only || head.rust_sandbox.is_some()) {
+            let rust = crate::tools::run_rust_tool(&workspace, head.rust_sandbox.as_ref());
             tools.push(Box::new(DisabledTool {
                 inner: rust,
                 reason: "run_rust is unavailable in forked subagents",
@@ -1149,8 +1145,9 @@ pub struct BtwContext {
     pub context_window: Option<u64>,
     /// Workspace the subagent works in (the parent's).
     pub workspace: Workspace,
-    /// bwrap policy inherited from the parent (`None` = sandbox disabled).
-    pub sandbox: Option<crate::config::Sandbox>,
+    /// The parent's `[sandbox]` cell (a fork shares it, so a later reload
+    /// applies to the fork's next command too).
+    pub sandbox: crate::config::SandboxPolicy,
     /// Read-only policy inherited from the parent session.
     pub read_only: bool,
     /// Shared running-task registry: the btw task-panel entry and the
@@ -1880,13 +1877,8 @@ impl Tool for Delegate {
         let meta_role = role.clone();
         let parent_session_id = self.record_in.as_ref().map(|record| record.session.clone());
         let persist_root = persist.root.clone();
-        // Read-only roles run under a narrowed bwrap policy: the workspace is
-        // read-only, extra writable roots are dropped, network is disabled.
-        let task_sandbox = if read_only {
-            self.read_only_sandbox()
-        } else {
-            self.sandbox.clone()
-        };
+        // The subagent shares the parent's cell, so it follows reloads.
+        let task_sandbox = self.sandbox.clone();
         let parent_endpoint = self.parent_endpoint.clone();
         // The same live parent endpoint registers this child's task id in the
         // parent's Goal-admission set from the `on_id` hook below — before the

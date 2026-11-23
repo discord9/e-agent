@@ -3064,6 +3064,39 @@ fn sandbox_project_scalars_can_enable_without_global_sandbox() {
     assert!(sandbox.writable_paths.is_empty());
 }
 
+/// R1: a caller that already observed the project file resolves from THAT
+/// overlay, not from a second read of the file (startup and reload do this, so
+/// one reload can never install a policy from a different project revision
+/// than the config it accepted).
+#[test]
+fn resolve_sandbox_with_project_uses_the_observed_overlay_not_the_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("ws");
+    std::fs::create_dir_all(workspace.join(".e-agent")).unwrap();
+    let path = write_config(temp.path(), "");
+    // The file on disk disables networking...
+    std::fs::write(
+        workspace.join(".e-agent/config.toml"),
+        "[sandbox]\nenabled = true\nnetwork = false\n",
+    )
+    .unwrap();
+    // ...while the observation says it is on: the observation wins, proving
+    // the resolver never reopens the file.
+    let observed = crate::config::ProjectSandbox {
+        enabled: Some(true),
+        network: Some(true),
+        ..Default::default()
+    };
+    let config = Config::from_path(&path).unwrap();
+    let sandbox =
+        crate::config::resolve_sandbox_with_project(Some(&config), &workspace, Some(&observed))
+            .unwrap();
+    assert!(sandbox.enabled && sandbox.network, "{sandbox:?}");
+    // Without the overlay argument the file is read (the documented wrapper).
+    let from_file = crate::config::resolve_sandbox(Some(&config), &workspace).unwrap();
+    assert!(from_file.enabled && !from_file.network, "{from_file:?}");
+}
+
 #[test]
 fn sandbox_gpu_is_global_only() {
     let temp = tempfile::tempdir().unwrap();
@@ -3395,6 +3428,19 @@ fn reload_source_sanitization_redacts_structured_credentials_and_escapes_lines()
     assert!(rendered.contains("<redacted>"));
     assert!(quote_toml_key("bad\nkey").contains("\\n"));
     assert!(escape_single_line("a\n\r\t\\\u{0007}").contains("\\n\\r\\t"));
+
+    // R1 depends on the observation keeping `[sandbox]` verbatim: the
+    // sanitizer redacts by key path and no `[sandbox]` key is sensitive, so
+    // the parsed overlay must survive unchanged (paths included).
+    let sandbox_source: toml::Value = toml::from_str(
+        "[sandbox]\nenabled = true\nnetwork = false\nwritable_paths = [\"/mnt/cache\"]\nreadable_paths = [\"~/.rustup\"]\n",
+    )
+    .unwrap();
+    assert_eq!(
+        sanitize_diagnostic_source(sandbox_source.clone()),
+        sandbox_source,
+        "the project [sandbox] overlay must survive sanitization verbatim"
+    );
 }
 
 #[test]
@@ -3460,6 +3506,10 @@ backend = "jsonl"
             Some("global MCP enabled=false kill switch overrides the project server")
         )
     );
+    // `[sandbox]` is live since the hot-reload work: a winning edit applies
+    // to the next bash/background dispatch of every session (running
+    // background commands and file-tool roots are the documented exceptions),
+    // so it is effective rather than restart-only.
     assert_eq!(
         classify_source_edit(
             "project",
@@ -3467,9 +3517,50 @@ backend = "jsonl"
             Some(&global),
             Some(&project),
             None
+        ),
+        ("effective", None)
+    );
+    assert_eq!(
+        classify_source_edit(
+            "global",
+            &["sandbox".into(), "network".into()],
+            Some(&global),
+            Some(&project),
+            None
+        ),
+        ("effective", None)
+    );
+    // A global scalar the project overlay sets is shadowed by it (paths keep
+    // accumulating, so those stay effective).
+    let project_sandbox: toml::Value = toml::from_str(
+        r#"[sandbox]
+network = false
+writable_paths = ["./p"]
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        classify_source_edit(
+            "global",
+            &["sandbox".into(), "network".into()],
+            Some(&global),
+            Some(&project_sandbox),
+            None
+        ),
+        (
+            "shadowed",
+            Some("project [sandbox] overrides the global key")
         )
-        .0,
-        "shadowed"
+    );
+    assert_eq!(
+        classify_source_edit(
+            "global",
+            &["sandbox".into(), "writable_paths".into()],
+            Some(&global),
+            Some(&project_sandbox),
+            None
+        ),
+        ("effective", None)
     );
     assert_eq!(
         classify_source_edit(

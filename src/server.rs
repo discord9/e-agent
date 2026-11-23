@@ -1688,7 +1688,7 @@ async fn session_btw(
             model: state.factory.main_model().clone(),
             context_window: state.factory.main_context_window(),
             workspace: state.factory.workspace().clone(),
-            sandbox: state.factory.sandbox().cloned(),
+            sandbox: state.factory.sandbox_policy(),
             read_only: state.factory.read_only(),
             background: session.background.clone(),
             sessions: session.sessions.clone(),
@@ -4163,6 +4163,7 @@ async fn serve_font(Path(name): Path<String>) -> Result<impl IntoResponse, Statu
 mod tests {
     use super::*;
     use crate::agent::Tool;
+    use crate::config::SandboxPolicy;
     use crate::tools::TaskDisplayMeta;
 
     fn test_state_dir() -> PathBuf {
@@ -6033,7 +6034,8 @@ model = "deepseek-chat"
         );
         let runner_task = runner.start(None);
         let workspace = crate::workspace::Workspace::new(std::env::temp_dir()).unwrap();
-        let (_tools, background) = crate::tools::builtins(workspace, None, false, None);
+        let (_tools, background) =
+            crate::tools::builtins(workspace, SandboxPolicy::fixed(None), false, None);
         state.registry.insert(
             "web-goal".into(),
             Arc::new(LiveSession {
@@ -6273,7 +6275,8 @@ model = "deepseek-chat"
         );
         let runner_task = runner.start(None);
         let workspace = crate::workspace::Workspace::new(std::env::temp_dir()).unwrap();
-        let (_tools, background) = crate::tools::builtins(workspace, None, false, None);
+        let (_tools, background) =
+            crate::tools::builtins(workspace, SandboxPolicy::fixed(None), false, None);
         state.registry.insert(
             "web-goal-strict".into(),
             Arc::new(LiveSession {
@@ -6414,7 +6417,8 @@ model = "deepseek-chat"
             status.changed().await.unwrap();
         }
         let workspace = crate::workspace::Workspace::new(std::env::temp_dir()).unwrap();
-        let (_tools, background) = crate::tools::builtins(workspace, None, false, None);
+        let (_tools, background) =
+            crate::tools::builtins(workspace, SandboxPolicy::fixed(None), false, None);
         state.registry.insert(
             "web-goal-finished".into(),
             Arc::new(LiveSession {
@@ -6760,7 +6764,8 @@ model = "deepseek-chat"
     /// emitter so it can push events into the broadcast channel).
     fn live_session_with_handle(handle: crate::runner::SessionHandle) -> Arc<LiveSession> {
         let workspace = crate::workspace::Workspace::new(std::env::temp_dir()).unwrap();
-        let (_tools, background) = crate::tools::builtins(workspace, None, false, None);
+        let (_tools, background) =
+            crate::tools::builtins(workspace, SandboxPolicy::fixed(None), false, None);
         Arc::new(LiveSession {
             handle,
             task: crate::runner::SessionTask::from_join_handle(tokio::spawn(async {})),
@@ -6789,7 +6794,8 @@ model = "deepseek-chat"
     ) {
         let (handle, _emitter, _commands) = crate::runner::session_test_channel();
         let workspace = crate::workspace::Workspace::new(std::env::temp_dir()).unwrap();
-        let (_tools, mut background) = crate::tools::builtins(workspace, None, false, None);
+        let (_tools, mut background) =
+            crate::tools::builtins(workspace, SandboxPolicy::fixed(None), false, None);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         background.set_event_sender(tx);
         (
@@ -8974,7 +8980,8 @@ model = "deepseek-chat"
         // does (real task, not the fake `session_test_channel` spawn).
         let runner_task = runner.start(Some("initial".into()));
         let workspace = crate::workspace::Workspace::new(std::env::temp_dir()).unwrap();
-        let (_tools, background) = crate::tools::builtins(workspace, None, false, None);
+        let (_tools, background) =
+            crate::tools::builtins(workspace, SandboxPolicy::fixed(None), false, None);
         let session = Arc::new(LiveSession {
             handle: handle.clone(),
             task: runner_task,
@@ -11407,7 +11414,13 @@ model = "deepseek-chat"
         let mut delegate = crate::delegate::Delegate::new(
             factory.main_model(),
             factory.workspace().clone(),
-            crate::tools::builtins(factory.workspace().clone(), None, false, None).1,
+            crate::tools::builtins(
+                factory.workspace().clone(),
+                SandboxPolicy::fixed(None),
+                false,
+                None,
+            )
+            .1,
         )
         .persist_sessions(temp.path().to_path_buf())
         .with_persist_store(crate::config::SessionBackend::Jsonl)
@@ -11450,7 +11463,13 @@ model = "deepseek-chat"
         let mut delegate = crate::delegate::Delegate::new(
             factory.main_model(),
             factory.workspace().clone(),
-            crate::tools::builtins(factory.workspace().clone(), None, false, None).1,
+            crate::tools::builtins(
+                factory.workspace().clone(),
+                SandboxPolicy::fixed(None),
+                false,
+                None,
+            )
+            .1,
         )
         .persist_sessions(temp.path().to_path_buf())
         .with_persist_store(crate::config::SessionBackend::Jsonl)

@@ -3,6 +3,7 @@ use crate::agent::{
     AssistantMessage, Model, ModelDeltaKind, POLL_GUARD_ERROR, Tool, ToolOutput, Usage,
     repair_tool_pairs,
 };
+use crate::config::SandboxPolicy;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::{
@@ -7516,7 +7517,8 @@ async fn detached_daemon_does_not_block_finish_when_idle() {
     // in the registry until explicitly cancelled.
     let temp = tempfile::tempdir().unwrap();
     let workspace = crate::workspace::Workspace::new(temp.path()).unwrap();
-    let (tools, background) = crate::tools::builtins(workspace, None, false, None);
+    let (tools, background) =
+        crate::tools::builtins(workspace, SandboxPolicy::fixed(None), false, None);
     let agent = Agent::new(
         Box::new(ScriptedAssistantModel {
             replies: vec![
@@ -7878,7 +7880,7 @@ async fn background_reminder_reaches_the_next_request_once_without_waking_the_tu
     // is auto-adopted, exactly like a production long-running build.
     let (tools, background) = crate::tools::builtins_with_bash_timeout(
         workspace,
-        None,
+        SandboxPolicy::fixed(None),
         false,
         None,
         Some(std::time::Duration::from_millis(200)),
@@ -9566,7 +9568,8 @@ async fn steer_cancel_while_idle_waiting_on_blocking_background_finalizes_cancel
     // path, rather than remaining indefinitely blocked on the background task.
     let temp = tempfile::tempdir().unwrap();
     let workspace = crate::workspace::Workspace::new(temp.path()).unwrap();
-    let (tools, background) = crate::tools::builtins(workspace, None, false, None);
+    let (tools, background) =
+        crate::tools::builtins(workspace, SandboxPolicy::fixed(None), false, None);
     let agent = Agent::new(
         Box::new(ScriptedAssistantModel {
             replies: vec![
@@ -11221,11 +11224,12 @@ async fn poll_guard_finish_when_idle_waits_for_owned_completion_and_resets() {
     // safe-point/follow-up starts a fresh turn with a reset guard.
     let temp = tempfile::tempdir().unwrap();
     let workspace = crate::workspace::Workspace::new(temp.path()).unwrap();
-    let (_main_tools, background) = crate::tools::builtins(workspace.clone(), None, false, None);
+    let (_main_tools, background) =
+        crate::tools::builtins(workspace.clone(), SandboxPolicy::fixed(None), false, None);
     let tools = crate::tools::builtins_with_background(
         workspace,
         background.clone(),
-        None,
+        SandboxPolicy::fixed(None),
         false,
         true,
         None,
@@ -11314,9 +11318,16 @@ async fn poll_guard_runner_repeated_empty_polls_never_terminate_the_turn() {
     // the runner's last_answer None).
     let temp = tempfile::tempdir().unwrap();
     let workspace = crate::workspace::Workspace::new(temp.path()).unwrap();
-    let (_main_tools, background) = crate::tools::builtins(workspace.clone(), None, false, None);
-    let tools =
-        crate::tools::builtins_with_background(workspace, background, None, false, true, None);
+    let (_main_tools, background) =
+        crate::tools::builtins(workspace.clone(), SandboxPolicy::fixed(None), false, None);
+    let tools = crate::tools::builtins_with_background(
+        workspace,
+        background,
+        SandboxPolicy::fixed(None),
+        false,
+        true,
+        None,
+    );
     let agent = Agent::new(
         Box::new(ScriptedAssistantModel {
             replies: vec![
@@ -11401,9 +11412,16 @@ async fn poll_guard_runner_durable_batch_safe_point_and_next_turn_reset() {
     // following turn observes an empty snapshot with a reset guard.
     let temp = tempfile::tempdir().unwrap();
     let workspace = crate::workspace::Workspace::new(temp.path()).unwrap();
-    let (_main_tools, background) = crate::tools::builtins(workspace.clone(), None, false, None);
-    let mut tools =
-        crate::tools::builtins_with_background(workspace, background, None, false, true, None);
+    let (_main_tools, background) =
+        crate::tools::builtins(workspace.clone(), SandboxPolicy::fixed(None), false, None);
+    let mut tools = crate::tools::builtins_with_background(
+        workspace,
+        background,
+        SandboxPolicy::fixed(None),
+        false,
+        true,
+        None,
+    );
     tools.push(Box::new(SlowTool { millis: 2500 }));
     let agent = Agent::new(
         Box::new(ScriptedAssistantModel {
@@ -11606,7 +11624,7 @@ async fn oracle449_runner_persists_notice_before_completion_and_keeps_owner_unti
     // completion itself, exactly like a real bash task would.
     let (_, background) = crate::tools::builtins(
         crate::workspace::Workspace::new(temp.path()).unwrap(),
-        None,
+        SandboxPolicy::fixed(None),
         false,
         None,
     );
@@ -11793,7 +11811,7 @@ async fn background_projection_row_follows_the_live_registry_lifecycle() {
     let temp = tempfile::tempdir().unwrap();
     let (_, background) = crate::tools::builtins(
         crate::workspace::Workspace::new(temp.path()).unwrap(),
-        None,
+        SandboxPolicy::fixed(None),
         false,
         None,
     );
@@ -13263,9 +13281,16 @@ async fn goal_continue_poll_guard_safe_point_remounts_after_committed_completion
     // point must still remount the armed driver for its next Goal call.
     let temp = tempfile::tempdir().unwrap();
     let workspace = crate::workspace::Workspace::new(temp.path()).unwrap();
-    let (_main_tools, background) = crate::tools::builtins(workspace.clone(), None, false, None);
-    let mut tools =
-        crate::tools::builtins_with_background(workspace, background, None, false, true, None);
+    let (_main_tools, background) =
+        crate::tools::builtins(workspace.clone(), SandboxPolicy::fixed(None), false, None);
+    let mut tools = crate::tools::builtins_with_background(
+        workspace,
+        background,
+        SandboxPolicy::fixed(None),
+        false,
+        true,
+        None,
+    );
     tools.push(Box::new(SlowTool { millis: 2500 }));
     let entered = Arc::new(Notify::new());
     let agent = Agent::new(
@@ -17692,7 +17717,8 @@ async fn parent_with_delegate_child(
         arm_goal,
     } = fixture;
     let workspace = crate::workspace::Workspace::new(root).unwrap();
-    let (_, background) = crate::tools::builtins(workspace.clone(), None, false, None);
+    let (_, background) =
+        crate::tools::builtins(workspace.clone(), SandboxPolicy::fixed(None), false, None);
     let child_model = crate::model::ConfiguredModel::chat(
         crate::model::OpenAiModel::new(
             hanging_child_provider().await,
@@ -18241,7 +18267,8 @@ async fn a_shared_registry_task_this_session_did_not_start_does_not_suspend_the_
     let calls = Arc::new(Mutex::new(Vec::new()));
     let fresh_goal = Arc::new(Notify::new());
     let workspace = crate::workspace::Workspace::new(temp.path()).unwrap();
-    let (_, mut background) = crate::tools::builtins(workspace, None, false, None);
+    let (_, mut background) =
+        crate::tools::builtins(workspace, SandboxPolicy::fixed(None), false, None);
     // A registry only accepts spawns while completion delivery is wired; the
     // sink here belongs to another (unrelated) session.
     let (other_sender, _other_completions) = mpsc::unbounded_channel::<AgentEvent>();

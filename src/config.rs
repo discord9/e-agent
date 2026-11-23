@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
@@ -257,6 +258,29 @@ impl Default for Sandbox {
     }
 }
 
+/// Shared `[sandbox]` policy cell (`None` inside = sandbox disabled). The
+/// session factory owns one cell and reloads it in place; shell tools take a
+/// snapshot per dispatch.
+#[derive(Clone, Debug)]
+pub struct SandboxPolicy(Arc<RwLock<Option<Sandbox>>>);
+
+impl SandboxPolicy {
+    /// A cell nobody reloads (tests, `run_rust`, `RequestHead`).
+    pub fn fixed(policy: Option<Sandbox>) -> Self {
+        Self(Arc::new(RwLock::new(policy)))
+    }
+
+    /// The policy in force right now.
+    pub fn snapshot(&self) -> Option<Sandbox> {
+        self.0.read().unwrap().clone()
+    }
+
+    /// Install an already-validated policy (config reload).
+    pub fn replace(&self, policy: Option<Sandbox>) {
+        *self.0.write().unwrap() = policy;
+    }
+}
+
 /// Backend selection for session persistence.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(tag = "backend", rename_all = "lowercase")]
@@ -422,9 +446,45 @@ impl Config {
 
     pub fn load() -> anyhow::Result<Option<Self>> {
         for path in config_paths() {
-            if path.is_file() {
-                return Self::from_path(&path).map(Some);
+            // ONLY a confirmed absence (`NotFound`, i.e. no entry at all) may
+            // read as "no global config" and try the next candidate. A
+            // candidate that exists as something other than a regular file — a
+            // directory, a device, or a symlink that dangles or resolves to a
+            // directory — is an error: silently skipping it would clear the
+            // effective config (and, through a reload, an enabled sandbox
+            // policy).
+            let metadata = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("cannot inspect {}", path.display()));
+                }
+            };
+            let resolved = if metadata.file_type().is_symlink() {
+                match std::fs::metadata(&path) {
+                    Ok(resolved) => resolved,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(anyhow!(
+                            "config candidate {} is a dangling symlink",
+                            path.display()
+                        ));
+                    }
+                    Err(error) => {
+                        return Err(error)
+                            .with_context(|| format!("cannot resolve {}", path.display()));
+                    }
+                }
+            } else {
+                metadata
+            };
+            if !resolved.is_file() {
+                return Err(anyhow!(
+                    "config candidate {} is not a regular file",
+                    path.display()
+                ));
             }
+            return Self::from_path(&path).map(Some);
         }
         Ok(None)
     }
@@ -904,14 +964,14 @@ pub fn config_dir() -> Option<PathBuf> {
 
 // `gpu` is deliberately absent (global-config-only): a project `[sandbox]
 // gpu = true` is a parse error here.
-#[derive(Default, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ProjectSandbox {
+pub(crate) struct ProjectSandbox {
     /// Per-key scalar overrides: a project key replaces the global key;
     /// absent project keys keep the global value. Paths below keep the
     /// narrowing merge (project subpaths of global roots replace them).
     enabled: Option<bool>,
-    network: Option<bool>,
+    pub(crate) network: Option<bool>,
     workspace_writable: Option<bool>,
     writable_paths: Option<Vec<String>>,
     readable_paths: Option<Vec<String>>,
@@ -940,6 +1000,19 @@ struct ProjectSandbox {
 /// the removed authority, while unrelated global mounts and independent RO
 /// alias mounts whose source lies inside a final writable root survive.
 pub fn resolve_sandbox(config: Option<&Config>, workspace: &Path) -> anyhow::Result<Sandbox> {
+    resolve_sandbox_with_project(config, workspace, project_sandbox(workspace)?.as_ref())
+}
+
+/// [`resolve_sandbox`] against an ALREADY OBSERVED project `[sandbox]` overlay
+/// instead of reopening `<workspace>/.e-agent/config.toml`: the caller installs
+/// a policy from exactly the project revision it loaded (startup and config
+/// reload pass the table parsed out of their own observation). `project` is
+/// `None` when the project file was absent.
+pub(crate) fn resolve_sandbox_with_project(
+    config: Option<&Config>,
+    workspace: &Path,
+    project: Option<&ProjectSandbox>,
+) -> anyhow::Result<Sandbox> {
     let mut result = config.and_then(|c| c.sandbox.clone()).unwrap_or_default();
     // Collect configured (canonical source, configured dest) mount pairs
     // from the RAW canonical_roots output, before merge/normalize narrowing.
@@ -954,7 +1027,7 @@ pub fn resolve_sandbox(config: Option<&Config>, workspace: &Path) -> anyhow::Res
     writable_mounts.extend(global_writable.iter().cloned());
     readable_mounts.extend(global_readable.iter().cloned());
 
-    let local = project_sandbox(workspace)?;
+    let local = project;
     if let Some(local) = &local {
         if let Some(enabled) = local.enabled {
             result.enabled = enabled;
@@ -1283,6 +1356,32 @@ fn project_bash(workspace: &Path) -> anyhow::Result<Option<BashConfig>> {
     let parsed: ProjectConfig = toml::from_str(&source)
         .with_context(|| format!("cannot parse project config {}", path.display()))?;
     Ok(parsed.bash)
+}
+
+/// Parse the `[sandbox]` overlay out of an ALREADY OBSERVED project source
+/// (`Config::load_for_workspace_with_sources`). The diagnostic sanitizer
+/// redacts by key path and `[sandbox]` carries no sensitive key, so the table
+/// survives verbatim; `None` means the file had no `[sandbox]` section, and a
+/// field the loader would have rejected is still an error.
+pub(crate) fn project_sandbox_from_observation(
+    source: Option<&toml::Value>,
+) -> anyhow::Result<Option<ProjectSandbox>> {
+    match source.and_then(|source| source.get("sandbox")) {
+        // A present `[sandbox]` value must be a TABLE. serde would also accept
+        // a positional sequence for the struct fields, while the input
+        // comparison (`as_table`) would read that same value as absent — so
+        // startup and reload could disagree about whether it is an input.
+        Some(value) if !value.is_table() => Err(anyhow!(
+            "the project [sandbox] overlay must be a table, not {}",
+            value.type_str()
+        )),
+        Some(value) => value
+            .clone()
+            .try_into()
+            .map(Some)
+            .with_context(|| "cannot use the project [sandbox] overlay".to_owned()),
+        None => Ok(None),
+    }
 }
 
 fn project_sandbox(workspace: &Path) -> anyhow::Result<Option<ProjectSandbox>> {
@@ -1733,7 +1832,20 @@ fn classify_source_edit_with_snapshots(
     let has = |root: Option<&toml::Value>, keys: &[&str]| value_at(root, keys).is_some();
     let name = path.get(1).map(String::as_str);
     if section == "sandbox" {
-        return ("shadowed", Some("sandbox policy and paths require restart"));
+        // `[sandbox]` is live (the shell policy reloads), but a global SCALAR
+        // the project overlay sets is overridden by it. Configured paths keep
+        // accumulating/narrowing, so those leaves stay effective.
+        if origin == "global"
+            && matches!(name, Some("enabled" | "network" | "workspace_writable"))
+            && let Some(key) = name
+            && has(project, &["sandbox", key])
+        {
+            return (
+                "shadowed",
+                Some("project [sandbox] overrides the global key"),
+            );
+        }
+        return ("effective", None);
     }
     if origin == "project" {
         if section == "default" {
