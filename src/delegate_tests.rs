@@ -3400,12 +3400,24 @@ async fn send_message_routes_only_to_live_registered_child_or_parent() {
         child.snapshot().is_empty(),
         "receipt is queued, not delivered"
     );
+    // A background task number is not a session id: the rejection must say so
+    // and keep the resume placeholder literal, never echoing the caller's own
+    // target back as `resume: "16101"` (which would fail again).
+    let rejection = parent_tool
+        .execute(json!({"target":"16101","message":"no"}))
+        .await
+        .unwrap_err();
     assert!(
-        parent_tool
-            .execute(json!({"target":"missing","message":"no"}))
-            .await
-            .unwrap_err()
-            .contains("not a live child")
+        rejection.contains("is not a live child session")
+            && rejection.contains("is not a session id")
+            && rejection.contains("`#123`")
+            && rejection.contains("`resume: \"<session id>\"`")
+            && rejection.contains("`sub-...`"),
+        "{rejection}"
+    );
+    assert!(
+        !rejection.contains("resume: \"16101\""),
+        "the caller's own target must not be echoed into resume advice: {rejection}"
     );
     let mut child_tool = SendMessage::child(parent.downgrade());
     child_tool.set_session_handle("sub-live", child);
