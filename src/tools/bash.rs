@@ -661,6 +661,18 @@ pub(super) fn build_bwrap_plan(
             .as_ref()
             .is_none_or(|metadata| !Path::new(dest).starts_with(metadata))
     };
+    // Every configured WRITABLE view is checked against the policy FILE before
+    // any destination filtering: filtering works on destinations, so it cannot
+    // see a writable alias of the file (or of a tree containing it) at another
+    // destination, including the destinations the projection restores deeper
+    // from these same sources.
+    let anchor = workspace.policy_anchor();
+    for path in &sandbox.writable_paths {
+        writable_policy_view_guard(anchor, path, path)?;
+    }
+    for (source, dest) in &sandbox.writable_mounts {
+        writable_policy_view_guard(anchor, source, dest)?;
+    }
     let mut mounts = Vec::new();
     // Any configured destination at or under the policy parent is excluded
     // from the generic pathname mount loop: that subtree is owned by the
@@ -680,23 +692,6 @@ pub(super) fn build_bwrap_plan(
         if dest_is_policy_subtree(dest, policy_parent.as_deref()) {
             filtered_policy_dests = true;
         } else if allow_mount(dest) {
-            // Destination filtering cannot see a writable view of the policy
-            // FILE that appears under another name: an alias whose SOURCE is
-            // or contains the policy directory exports `config.toml` writable
-            // at its own destination. A self entry (source == dest) is fine —
-            // the projection locks that subtree at its own path — but any
-            // other writable alias of it fails closed.
-            if source != dest
-                && let Some(parent) = &policy_parent
-                && parent.starts_with(Path::new(source))
-            {
-                return Err(format!(
-                    "fail closed: writable mount {} exposes the sandbox policy directory {} through its source {}; a sandboxed command could author its own [sandbox] policy there — remove that mount, narrow its source, or make it read-only",
-                    dest,
-                    parent.display(),
-                    source
-                ));
-            }
             mounts.push((source.as_str(), dest.as_str(), "--bind-try", false));
         }
     }
@@ -825,8 +820,30 @@ pub(super) fn build_bwrap_plan(
     // must be projected too. Every destination filtered from the generic loop
     // above must be restored here; a projection that cannot run fails the
     // plan closed instead of hiding them silently.
+    // The host `/tmp` bind is pushed straight into `args` (see above), so it is
+    // not in `mounts`: a workspace under `/tmp` — including a rerooted
+    // delegate whose startup policy anchor is outside the session root — keeps
+    // the policy file visible through it and must still be projected.
+    let host_tmp_bind = scratch_bind.is_none();
+    // An exact authorization of the policy PARENT itself is filtered from the
+    // generic loop (its subtree is owned by the projection), so it is not in
+    // `mounts` either; it is projectable, not "uncovered".
+    let exact_parent_grant = policy_parent.as_deref().is_some_and(|parent| {
+        sandbox
+            .writable_paths
+            .iter()
+            .chain(sandbox.readable_paths.iter())
+            .any(|path| Path::new(path) == parent)
+            || sandbox
+                .writable_mounts
+                .iter()
+                .chain(sandbox.readable_mounts.iter())
+                .any(|(_, dest)| Path::new(dest) == parent)
+    });
     let policy_visible = policy_parent.as_deref().is_some_and(|parent| {
         parent.starts_with(root)
+            || (host_tmp_bind && parent.starts_with("/tmp"))
+            || exact_parent_grant
             || mounts
                 .iter()
                 .any(|(_, dest, _, _)| parent.starts_with(Path::new(dest)))
@@ -839,6 +856,7 @@ pub(super) fn build_bwrap_plan(
             &mut args,
             &mut fds,
             filtered_policy_dests,
+            host_tmp_bind,
         )?;
     } else if filtered_policy_dests {
         return Err(format!(
@@ -1246,6 +1264,27 @@ fn pin_source(
     }
 }
 
+/// A writable view of the policy FILE (itself, or a tree containing it) lets a
+/// sandboxed command author the very policy that governs it. Only two shapes
+/// are safe, and both are locked in place by the descriptor-pinned projection:
+/// a SELF entry (`source == dest`, by path) at or above the policy parent, and
+/// a source that merely sits under the policy directory (a sibling such as
+/// `worktrees/`). Everything else — an alias of the file or of a containing
+/// tree, and a writable path equal to the file itself — fails closed.
+#[cfg(unix)]
+fn writable_policy_view_guard(anchor: &Path, source: &str, dest: &str) -> Result<(), String> {
+    let source = Path::new(source);
+    let self_entry = source == Path::new(dest);
+    if source == anchor || (anchor.starts_with(source) && !self_entry) {
+        return Err(format!(
+            "fail closed: writable mount {dest} exposes the sandbox policy file {} through its source {}; a sandboxed command could author its own [sandbox] policy there — remove that mount, narrow its source, or make it read-only",
+            anchor.display(),
+            source.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Whether a sandboxed command could CREATE the missing policy parent: some
 /// covering mount destination (the workspace bind or a configured root) is
 /// writable, and the deepest such destination decides, exactly like the mount
@@ -1257,6 +1296,7 @@ fn policy_parent_creatable(
     workspace: &Workspace,
     sandbox: &crate::config::Sandbox,
     parent: &Path,
+    host_tmp_bind: bool,
 ) -> bool {
     let mut best: Option<(usize, bool)> = None;
     let mut consider = |dest: &Path, writable: bool| {
@@ -1280,6 +1320,11 @@ fn policy_parent_creatable(
         consider(Path::new(path), true);
     }
     consider(workspace.root(), sandbox.workspace_writable);
+    // The implicit `--bind /tmp /tmp` is a host-backed WRITABLE bind too (not a
+    // configured destination, so it never reaches the mount list).
+    if host_tmp_bind {
+        consider(Path::new("/tmp"), true);
+    }
     best.is_some_and(|(_, writable)| writable)
 }
 
@@ -1295,6 +1340,7 @@ fn project_policy_parent(
     args: &mut Vec<std::ffi::OsString>,
     fds: &mut Vec<rustix::fd::OwnedFd>,
     filtered_policy_dests: bool,
+    host_tmp_bind: bool,
 ) -> Result<(), String> {
     use rustix::fs::{FileType, Mode, OFlags, RawDir, ResolveFlags, fstat, openat2};
     let policy = workspace.policy_anchor();
@@ -1324,14 +1370,14 @@ fn project_policy_parent(
         // uncreatable inside the sandbox. When nothing writable covers the
         // parent, nothing can be created there and no projection is needed.
         Err(rustix::io::Errno::NOENT | rustix::io::Errno::NOTDIR) => {
-            if filtered_policy_dests {
-                return Err(format!(
-                    "fail closed: policy destinations under {} are excluded from the generic mount loop, but the policy parent {} does not exist, so the projection cannot restore them",
-                    parent.display(),
-                    parent.display()
-                ));
-            }
-            if !policy_parent_creatable(workspace, sandbox, parent) {
+            // Projection is needed when a configured destination was filtered
+            // from the generic loop (an exact authorization of the parent is
+            // restored by the projection's own tmpfs) or when the sandbox could
+            // create the parent through a writable bind. Neither: nothing is
+            // visible or creatable there, so there is nothing to project.
+            if !filtered_policy_dests
+                && !policy_parent_creatable(workspace, sandbox, parent, host_tmp_bind)
+            {
                 return Ok(());
             }
             std::fs::create_dir_all(parent).map_err(|error| {

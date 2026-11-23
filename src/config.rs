@@ -964,14 +964,14 @@ pub fn config_dir() -> Option<PathBuf> {
 
 // `gpu` is deliberately absent (global-config-only): a project `[sandbox]
 // gpu = true` is a parse error here.
-#[derive(Default, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ProjectSandbox {
     /// Per-key scalar overrides: a project key replaces the global key;
     /// absent project keys keep the global value. Paths below keep the
     /// narrowing merge (project subpaths of global roots replace them).
     enabled: Option<bool>,
-    network: Option<bool>,
+    pub(crate) network: Option<bool>,
     workspace_writable: Option<bool>,
     writable_paths: Option<Vec<String>>,
     readable_paths: Option<Vec<String>>,

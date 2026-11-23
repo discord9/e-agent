@@ -3977,11 +3977,13 @@ async fn sandbox_command_cannot_author_its_own_policy() {
 
 #[cfg(unix)]
 #[test]
-fn sandbox_writable_dest_at_the_policy_parent_fails_closed() {
-    // The reverse shape: a configured writable destination AT the policy
-    // parent (or under it) while the parent does not exist. The generic mount
-    // loop excludes that subtree, so nothing could restore it — plan
-    // construction must fail closed instead of dropping the mount silently.
+fn sandbox_writable_dest_at_the_policy_parent_is_projected() {
+    // A configured writable destination exactly AT the policy parent is
+    // filtered from the generic mount loop, so it never appears in the mount
+    // list — but it is still an authorization of that directory, and the
+    // descriptor-pinned projection can lock it. It must therefore be
+    // projected (parent created agent-side, policy file absent/unwritable),
+    // not reported as "uncovered".
     let workspace_dir = tempfile::tempdir().unwrap();
     // Plan-level only: an enabled policy literal, so the test never depends on
     // a working bwrap (it does not spawn anything).
@@ -3989,22 +3991,83 @@ fn sandbox_writable_dest_at_the_policy_parent_fails_closed() {
         enabled: true,
         ..crate::config::Sandbox::default()
     };
-    policy.writable_paths = vec![
-        workspace_dir
-            .path()
-            .join(".e-agent")
-            .to_string_lossy()
-            .into_owned(),
-    ];
+    let policy_parent = workspace_dir.path().join(".e-agent");
+    policy.writable_paths = vec![policy_parent.to_string_lossy().into_owned()];
+    let bash = policy_bash(Workspace::new(workspace_dir.path()).unwrap(), policy);
+    let args = bash
+        .dispatch_args("true")
+        .unwrap()
+        .expect("an exact parent authorization is projectable");
+    let parent_str = policy_parent.to_string_lossy().into_owned();
+    assert!(
+        args.windows(2)
+            .any(|w| w[0] == "--tmpfs" && w[1] == parent_str),
+        "the authorized policy parent must be projected: {args:?}"
+    );
+    assert!(
+        args.windows(2)
+            .any(|w| w[0] == "--remount-ro" && w[1] == parent_str),
+        "the projection must end read-only: {args:?}"
+    );
+    // The directory is created by the AGENT (host side); the policy file is
+    // still absent.
+    assert!(policy_parent.is_dir());
+    assert!(!policy_parent.join("config.toml").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn sandbox_writable_policy_file_and_descendant_aliases_fail_closed() {
+    // The protected FILE itself: a writable path/mount whose source IS
+    // `.e-agent/config.toml` (equality included) would expose the policy
+    // writable, whether at its own path or restored deeper under `.e-agent`.
+    let workspace_dir = tempfile::tempdir().unwrap();
+    let policy_dir = workspace_dir.path().join(".e-agent");
+    std::fs::create_dir(&policy_dir).unwrap();
+    let policy_file = policy_dir.join("config.toml");
+    std::fs::write(&policy_file, "[sandbox]\n").unwrap();
+    let canonical = crate::canonicalize_path(&policy_file).unwrap();
+    let canonical = canonical.to_string_lossy().into_owned();
+    // (1) a writable PATH equal to the policy file.
+    let policy = crate::config::Sandbox {
+        enabled: true,
+        writable_paths: vec![canonical.clone()],
+        ..crate::config::Sandbox::default()
+    };
     let bash = policy_bash(Workspace::new(workspace_dir.path()).unwrap(), policy);
     let error = bash
         .dispatch_args("true")
-        .expect_err("a covering writable destination must fail closed");
-    assert!(
-        error.contains("excluded from the generic mount loop"),
-        "{error}"
-    );
-    assert!(!workspace_dir.path().join(".e-agent").exists());
+        .expect_err("a writable path equal to the policy file must fail closed");
+    assert!(error.contains("policy file"), "{error}");
+    assert!(error.contains("config.toml"), "{error}");
+    // (2) a writable MOUNT of the policy file whose destination is a restored
+    //     DESCENDANT of `.e-agent` (destination filtering cannot see it).
+    let deep_dest = policy_dir.join("copy/config.toml");
+    let policy = crate::config::Sandbox {
+        enabled: true,
+        writable_mounts: vec![(canonical.clone(), deep_dest.to_string_lossy().into_owned())],
+        ..crate::config::Sandbox::default()
+    };
+    let bash = policy_bash(Workspace::new(workspace_dir.path()).unwrap(), policy);
+    let error = bash
+        .dispatch_args("true")
+        .expect_err("a writable alias of the policy file inside .e-agent must fail closed");
+    assert!(error.contains("policy file"), "{error}");
+    // (3) a writable grant of a SIBLING under `.e-agent` stays allowed (and is
+    //     the documented `worktrees/` workflow).
+    std::fs::create_dir_all(policy_dir.join("worktrees")).unwrap();
+    let policy = crate::config::Sandbox {
+        enabled: true,
+        writable_paths: vec![
+            crate::canonicalize_path(policy_dir.join("worktrees"))
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        ],
+        ..crate::config::Sandbox::default()
+    };
+    let bash = policy_bash(Workspace::new(workspace_dir.path()).unwrap(), policy);
+    assert!(bash.dispatch_args("true").is_ok());
 }
 
 #[cfg(unix)]
@@ -4050,12 +4113,12 @@ fn sandbox_writable_alias_of_the_policy_dir_fails_closed() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn sandbox_live_policy_covering_the_policy_parent_is_projected() {
-    // Rerooted workspace: the startup policy anchor lives OUTSIDE the session
-    // root, so the startup capabilities do not cover it. A LIVE policy that
-    // newly adds a covering writable root must still project the anchor
-    // read-only — the decision comes from this plan's mounts, not from startup
-    // state.
+async fn sandbox_rerooted_workspace_under_tmp_projects_the_policy() {
+    // Rerooted workspace with the startup policy anchor OUTSIDE the session
+    // root and NO configured grant covering it. The implicit host `/tmp` bind
+    // (`--bind /tmp /tmp`) still makes the policy file reachable, so the
+    // plan must project it — visibility is decided from the effective binds,
+    // not only from the configured mount list.
     if !bwrap_available() {
         eprintln!("bwrap unavailable; skipping sandbox test");
         return;
@@ -4092,29 +4155,27 @@ async fn sandbox_live_policy_covering_the_policy_parent_is_projected() {
     };
     let anchor = crate::canonicalize_path(&policy_dir).unwrap();
     let anchor_str = anchor.to_string_lossy().into_owned();
-    // Before: no bind covers the anchor, so nothing to project.
+    let projected = |args: &[String]| {
+        args.windows(2)
+            .any(|w| w[0] == "--tmpfs" && w[1] == anchor_str)
+            && args
+                .windows(2)
+                .any(|w| w[0] == "--remount-ro" && w[1] == anchor_str)
+    };
     let before = tool.dispatch_args("true").unwrap().expect("policy on");
-    assert!(!before.iter().any(|arg| arg == &anchor_str), "{before:?}");
-    // The live policy adds a covering writable root (the parent of the anchor):
-    // its self-bind makes the policy directory reachable inside the sandbox.
+    assert!(
+        projected(&before),
+        "the `/tmp` bind alone exposes the anchor, so it must be projected: {before:?}"
+    );
+    // A live grant covering the same parent keeps it projected (the decision
+    // never regresses to startup state).
     live.replace(Some(crate::config::Sandbox {
         enabled: true,
         writable_paths: vec![parent.path().to_string_lossy().into_owned()],
         ..crate::config::Sandbox::default()
     }));
     let after = tool.dispatch_args("true").unwrap().expect("policy on");
-    assert!(
-        after
-            .windows(2)
-            .any(|w| w[0] == "--tmpfs" && w[1] == anchor_str),
-        "the freshly covered policy parent must be projected: {after:?}"
-    );
-    assert!(
-        after
-            .windows(2)
-            .any(|w| w[0] == "--remount-ro" && w[1] == anchor_str),
-        "the projection must end read-only: {after:?}"
-    );
+    assert!(projected(&after), "{after:?}");
     // And the sandboxed command cannot author the policy file through the
     // newly granted root, while ordinary writes there still work.
     let script = "set -e; printf ok > ../ordinary; if printf relaxed > ../.e-agent/config.toml; then exit 70; fi";
@@ -4814,22 +4875,21 @@ async fn sandbox_policy_anchor_descendant_source_swapped_to_fifo_fails_closed() 
 
 #[cfg(unix)]
 #[tokio::test]
-async fn sandbox_policy_anchor_filtered_alias_without_projection_fails_closed() {
+async fn sandbox_policy_anchor_filtered_alias_is_projected_and_restored() {
     // A configured alias (canonical source != configured dest) whose dest
-    // lies under the policy parent is filtered from the generic mount loop.
-    // When the projection cannot run — the anchor is not visible from a
-    // workspace rerooted into a descendant of the alias SOURCE — the
-    // filtered destination would be silently hidden; the plan must fail
-    // closed instead.
-    if !bwrap_available() {
-        eprintln!("bwrap unavailable; skipping sandbox test");
-        return;
-    }
+    // lies under the policy parent is filtered from the generic mount loop and
+    // must be restored by the projection. The implicit host `/tmp` bind makes
+    // the anchor reachable here even though the workspace is rerooted away
+    // from it, so the projection runs, the alias is restored, and the policy
+    // file stays locked (the "uncovered" error no longer applies to anchors
+    // under the host `/tmp` bind).
     let parent = tempfile::tempdir().unwrap();
     let src = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(src.path().join("sub")).unwrap();
     std::fs::write(src.path().join("sub/data.txt"), "data\n").unwrap();
-    std::fs::create_dir_all(parent.path().join(".e-agent")).unwrap();
+    std::fs::create_dir_all(parent.path().join(".e-agent/cache")).unwrap();
+    let policy_path = parent.path().join(".e-agent/config.toml");
+    std::fs::write(&policy_path, "[sandbox]\n").unwrap();
     let mut sandbox = sandbox().unwrap();
     sandbox.writable_mounts = vec![(
         src.path().to_str().unwrap().to_owned(),
@@ -4840,9 +4900,6 @@ async fn sandbox_policy_anchor_filtered_alias_without_projection_fails_closed() 
             .unwrap()
             .to_owned(),
     )];
-    // Reroot into a descendant of the canonical SOURCE: the startup anchor
-    // (`parent/.e-agent/config.toml`) is visible from neither the new root
-    // nor any external canonical source, so the projection cannot run.
     let workspace = Workspace::new(parent.path())
         .unwrap()
         .with_external_roots(&sandbox)
@@ -4850,16 +4907,29 @@ async fn sandbox_policy_anchor_filtered_alias_without_projection_fails_closed() 
         .reroot(src.path().join("sub"))
         .unwrap();
     let tool = policy_bash(workspace, sandbox);
-    let result = tool.execute(json!({"command": "echo ok"})).await;
-    let err = match result {
-        Ok(_) => {
-            panic!("a filtered policy-subtree alias without a projection must fail closed");
-        }
-        Err(err) => err,
-    };
+    let anchor = crate::canonicalize_path(parent.path().join(".e-agent")).unwrap();
+    let anchor_str = anchor.to_string_lossy().into_owned();
+    let args = tool
+        .dispatch_args("true")
+        .unwrap()
+        .expect("the plan builds");
     assert!(
-        err.contains("fail closed") && err.contains("policy"),
-        "the refusal must explain the fail-closed policy conflict: {err}"
+        args.windows(2)
+            .any(|w| w[0] == "--tmpfs" && w[1] == anchor_str)
+            && args
+                .windows(2)
+                .any(|w| w[0] == "--remount-ro" && w[1] == anchor_str),
+        "the filtered alias's parent must be projected: {args:?}"
+    );
+    // The projection really locks the file inside the sandbox.
+    tool.execute(
+        json!({"command": "set -e; if printf relaxed > ../.e-agent/config.toml; then exit 70; fi"}),
+    )
+    .await
+    .expect("the policy file must not be writable through the projected parent");
+    assert_eq!(
+        std::fs::read_to_string(&policy_path).unwrap(),
+        "[sandbox]\n"
     );
 }
 

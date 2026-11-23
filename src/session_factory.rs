@@ -451,8 +451,7 @@ impl SessionFactory {
         // External roots stay active independently either way. The project
         // `[sandbox]` overlay comes from the observation this load produced,
         // never from a second read of the project file.
-        let project_overlay =
-            crate::config::project_sandbox_from_observation(observed_project(&project_source))?;
+        let project_overlay = startup_project_overlay(&root, &project_source)?;
         let resolved_policy = crate::config::resolve_sandbox_with_project(
             config.as_ref(),
             &root,
@@ -1895,11 +1894,24 @@ fn apply_reloaded_config(
     }
 }
 
-/// The project source a load actually observed (`None` = absent/unavailable).
-fn observed_project(observation: &ProjectSourceObservation) -> Option<&toml::Value> {
+/// The STARTUP project `[sandbox]` overlay, taken from the observation the
+/// load produced. An unavailable source is an error, not "no overlay": with no
+/// global config it is the only place a policy can come from, and silently
+/// dropping it would start an unsandboxed session where the file-reading
+/// resolver used to fail.
+fn startup_project_overlay(
+    root: &Path,
+    observation: &ProjectSourceObservation,
+) -> anyhow::Result<Option<crate::config::ProjectSandbox>> {
     match observation {
-        ProjectSourceObservation::Observed(source) => Some(source),
-        ProjectSourceObservation::Absent | ProjectSourceObservation::Unavailable => None,
+        ProjectSourceObservation::Observed(source) => {
+            crate::config::project_sandbox_from_observation(Some(source))
+        }
+        ProjectSourceObservation::Absent => Ok(None),
+        ProjectSourceObservation::Unavailable => Err(anyhow!(
+            "cannot use the project config {}: it cannot be read or parsed",
+            root.join(".e-agent/config.toml").display()
+        )),
     }
 }
 
@@ -1973,6 +1985,15 @@ fn reload_config_at(
         ProjectSourceObservation::Absent => None,
         ProjectSourceObservation::Unavailable => unreachable!("rejected above"),
     };
+    // Parse the observed project `[sandbox]` overlay STRICTLY before the change
+    // gate: the comparison only looks at recognized keys, so an invalid scalar
+    // or an unknown key inside an otherwise unchanged table would otherwise be
+    // accepted without ever being validated against the project schema.
+    let project_overlay =
+        match crate::config::project_sandbox_from_observation(new_project.as_ref()) {
+            Ok(overlay) => overlay,
+            Err(error) => return ReloadResult::Rejected(format!("{error:#}")),
+        };
     // The Windows write sandbox has no policy-file carve-out, so a project
     // `[sandbox]` edit could be authored by the very shell it governs. Keep
     // the last good config AND policy: project sandbox edits need a restart
@@ -1993,11 +2014,6 @@ fn reload_config_at(
     let policy = if sandbox_inputs(old_global.as_ref(), old_project.as_ref())
         != sandbox_inputs(new_global.as_ref(), new_project.as_ref())
     {
-        let project_overlay =
-            match crate::config::project_sandbox_from_observation(new_project.as_ref()) {
-                Ok(overlay) => overlay,
-                Err(error) => return ReloadResult::Rejected(format!("{error:#}")),
-            };
         match crate::config::resolve_sandbox_with_project(
             loaded.as_ref(),
             root,
@@ -2619,78 +2635,126 @@ network = false
 "#,
         )
         .unwrap();
-        run_with_capture(&capture, || {
-            assert!(matches!(factory.reload_config(), ReloadResult::Reloaded));
-        });
-        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
-        assert!(output.contains(" WARN"), "{output}");
-        assert!(output.contains("origin=project"), "{output}");
-        assert!(output.contains("path=mcp.server.command"), "{output}");
-        assert!(
-            output.contains("before=[\"project-server\"] after=[\"project-server-2\"]"),
-            "{output}"
-        );
-        assert!(output.contains("status=shadowed"), "{output}");
-        let pet_line = output
-            .lines()
-            .find(|line| line.contains("path=pet.spritesheet"))
-            .expect("pet diagnostic");
-        assert!(pet_line.contains("INFO"), "{pet_line}");
-        assert!(pet_line.contains("status=effective"), "{pet_line}");
-        // `[sandbox]` leaves are effective now (live shell policy), and a
-        // project path that the resolver would reject is a rejected reload —
-        // this fixture therefore uses a scalar, which resolves on its own.
-        assert!(output.contains("path=sandbox.network"), "{output}");
-        assert!(!output.contains("old-secret"), "{output}");
-        assert!(!output.contains("new-secret"), "{output}");
-        // Secret-only env value changes collapse after sanitization, so no
-        // env edit is emitted; the key-preserving shape is tested directly.
-        assert!(!output.contains("mcp.server.env.TOKEN"), "{output}");
-        assert!(output.lines().count() >= 3, "{output}");
-        capture.0.lock().unwrap().clear();
+        // An accepted project edit is inspected below. On Windows the project
+        // `[sandbox]` leaf makes the whole edit restart-only, so the
+        // platform-appropriate expectation there is a rejection that keeps
+        // both states (checked in the `cfg(windows)` block at the end).
+        #[cfg(not(windows))]
+        {
+            run_with_capture(&capture, || {
+                assert!(matches!(factory.reload_config(), ReloadResult::Reloaded));
+            });
+            let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+            assert!(output.contains(" WARN"), "{output}");
+            assert!(output.contains("origin=project"), "{output}");
+            assert!(output.contains("path=mcp.server.command"), "{output}");
+            assert!(
+                output.contains("before=[\"project-server\"] after=[\"project-server-2\"]"),
+                "{output}"
+            );
+            assert!(output.contains("status=shadowed"), "{output}");
+            let pet_line = output
+                .lines()
+                .find(|line| line.contains("path=pet.spritesheet"))
+                .expect("pet diagnostic");
+            assert!(pet_line.contains("INFO"), "{pet_line}");
+            assert!(pet_line.contains("status=effective"), "{pet_line}");
+            // `[sandbox]` leaves are effective now (live shell policy), and a
+            // project path that the resolver would reject is a rejected reload —
+            // this fixture therefore uses a scalar, which resolves on its own.
+            assert!(output.contains("path=sandbox.network"), "{output}");
+            assert!(!output.contains("old-secret"), "{output}");
+            assert!(!output.contains("new-secret"), "{output}");
+            // Secret-only env value changes collapse after sanitization, so no
+            // env edit is emitted; the key-preserving shape is tested directly.
+            assert!(!output.contains("mcp.server.env.TOKEN"), "{output}");
+            assert!(output.lines().count() >= 3, "{output}");
+            capture.0.lock().unwrap().clear();
 
-        // The same validated state is refreshed without either success form.
-        run_with_capture(&capture, || {
-            assert!(matches!(
-                factory.reload_config(),
-                ReloadResult::ReloadedNoSource
-            ));
-        });
-        assert!(capture.0.lock().unwrap().is_empty());
+            // The same validated state is refreshed without either success form.
+            run_with_capture(&capture, || {
+                assert!(matches!(
+                    factory.reload_config(),
+                    ReloadResult::ReloadedNoSource
+                ));
+            });
+            assert!(capture.0.lock().unwrap().is_empty());
 
-        // Removing the global kill switch is an effective global source edit,
-        // not a falsely shadowed project removal.
-        std::fs::write(&global, global_text(true)).unwrap();
-        run_with_capture(&capture, || {
-            assert!(matches!(factory.reload_config(), ReloadResult::Reloaded));
-        });
-        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
-        assert!(output.contains("origin=global"), "{output}");
-        assert!(output.contains("mcp.server.enabled"), "{output}");
-        assert!(output.contains("status=effective"), "{output}");
-        capture.0.lock().unwrap().clear();
+            // Removing the global kill switch is an effective global source edit,
+            // not a falsely shadowed project removal.
+            std::fs::write(&global, global_text(true)).unwrap();
+            run_with_capture(&capture, || {
+                assert!(matches!(factory.reload_config(), ReloadResult::Reloaded));
+            });
+            let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+            assert!(output.contains("origin=global"), "{output}");
+            assert!(output.contains("mcp.server.enabled"), "{output}");
+            assert!(output.contains("status=effective"), "{output}");
+            capture.0.lock().unwrap().clear();
 
-        // A rejected file does not emit source-success records or replace the
-        // prior validated runtime/snapshot.
-        std::fs::write(&global, "default = \"missing/profile\"\n").unwrap();
-        run_with_capture(&capture, || {
-            assert!(matches!(factory.reload_config(), ReloadResult::Rejected(_)));
-        });
-        assert!(capture.0.lock().unwrap().is_empty());
-        assert_eq!(factory.model_profiles(), vec!["p1/m1"]);
-        let state = factory.reloadable.read().unwrap();
-        assert!(state.source_global.is_some());
-        drop(state);
+            // A rejected file does not emit source-success records or replace the
+            // prior validated runtime/snapshot.
+            std::fs::write(&global, "default = \"missing/profile\"\n").unwrap();
+            run_with_capture(&capture, || {
+                assert!(matches!(factory.reload_config(), ReloadResult::Rejected(_)));
+            });
+            assert!(capture.0.lock().unwrap().is_empty());
+            assert_eq!(factory.model_profiles(), vec!["p1/m1"]);
+            let state = factory.reloadable.read().unwrap();
+            assert!(state.source_global.is_some());
+            drop(state);
 
-        // TUI mode suppresses diagnostics while still accepting the edit.
-        let mut quiet = SessionFactory::test_factory(temp.path().to_path_buf());
-        quiet.announce = false;
-        std::fs::write(&global, global_text(true)).unwrap();
-        capture.0.lock().unwrap().clear();
-        run_with_capture(&capture, || {
-            assert!(matches!(quiet.reload_config(), ReloadResult::Reloaded));
-        });
-        assert!(capture.0.lock().unwrap().is_empty());
+            // TUI mode suppresses diagnostics while still accepting the edit.
+            let mut quiet = SessionFactory::test_factory(temp.path().to_path_buf());
+            quiet.announce = false;
+            std::fs::write(&global, global_text(true)).unwrap();
+            capture.0.lock().unwrap().clear();
+            run_with_capture(&capture, || {
+                assert!(matches!(quiet.reload_config(), ReloadResult::Reloaded));
+            });
+            assert!(capture.0.lock().unwrap().is_empty());
+        }
+        // Windows: the same project edit (it carries `[sandbox] network =
+        // false`) is rejected and keeps BOTH the config and the policy; a
+        // global-only edit still reloads.
+        #[cfg(windows)]
+        {
+            let before_cfg = factory.model_profiles();
+            let before_policy = factory.sandbox_policy().snapshot();
+            run_with_capture(&capture, || match factory.reload_config() {
+                ReloadResult::Rejected(reason) => {
+                    assert!(reason.contains("project [sandbox]"), "{reason}")
+                }
+                other => panic!("expected rejection, got {other:?}"),
+            });
+            assert!(capture.0.lock().unwrap().is_empty());
+            assert_eq!(factory.model_profiles(), before_cfg);
+            assert_eq!(factory.sandbox_policy().snapshot(), before_policy);
+            // Global-only edit: still reloads (the project sandbox input did
+            // not change).
+            std::fs::write(
+                &project,
+                r#"[mcp.server]
+command = ["project-server"]
+[mcp.server.env]
+TOKEN = "old-secret"
+"#,
+            )
+            .unwrap();
+            run_with_capture(&capture, || {
+                assert!(matches!(
+                    factory.reload_config(),
+                    ReloadResult::Reloaded | ReloadResult::ReloadedNoSource
+                ));
+            });
+            std::fs::write(&global, global_text(true)).unwrap();
+            run_with_capture(&capture, || {
+                assert!(matches!(
+                    factory.reload_config(),
+                    ReloadResult::Reloaded | ReloadResult::ReloadedNoSource
+                ));
+            });
+        }
         unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
     }
 
@@ -3244,20 +3308,47 @@ network = true
         assert!(!output.contains("require restart"), "{output}");
 
         // Policy B: a project `[sandbox]` scalar overlay wins through the same
-        // resolver startup uses.
+        // resolver startup uses — on Linux. Windows has no policy-file
+        // carve-out, so the same edit is rejected and both states are kept.
         std::fs::write(&project, "[sandbox]\nnetwork = false\n").unwrap();
         capture.0.lock().unwrap().clear();
-        capture_reload(&capture, || {
-            assert!(matches!(factory.reload_config(), ReloadResult::Reloaded));
-        });
-        let policy_b = factory.sandbox_policy().snapshot().expect("policy B");
-        assert!(policy_b.enabled, "the global switch still applies");
-        assert!(!policy_b.network, "the project overlay wins");
-        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
-        assert!(
-            output.contains("path=sandbox.network") && output.contains("status=effective"),
-            "{output}"
-        );
+        let last_good = {
+            #[cfg(not(windows))]
+            {
+                capture_reload(&capture, || {
+                    assert!(matches!(factory.reload_config(), ReloadResult::Reloaded));
+                });
+                let policy_b = factory.sandbox_policy().snapshot().expect("policy B");
+                assert!(policy_b.enabled, "the global switch still applies");
+                assert!(!policy_b.network, "the project overlay wins");
+                let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+                assert!(
+                    output.contains("path=sandbox.network") && output.contains("status=effective"),
+                    "{output}"
+                );
+                policy_b
+            }
+            #[cfg(windows)]
+            {
+                capture_reload(&capture, || match factory.reload_config() {
+                    ReloadResult::Rejected(reason) => {
+                        assert!(reason.contains("project [sandbox]"), "{reason}")
+                    }
+                    other => panic!("expected rejection, got {other:?}"),
+                });
+                assert!(capture.0.lock().unwrap().is_empty());
+                let kept = factory.sandbox_policy().snapshot().expect("policy A kept");
+                assert_eq!(kept, policy_a, "the last good policy is preserved");
+                assert_eq!(
+                    factory
+                        .current_config()
+                        .map(|config| config.model_profiles()),
+                    Some(vec!["p1/m1".to_owned()]),
+                    "the last good config is preserved"
+                );
+                kept
+            }
+        };
 
         // A project path with no globally authorized ancestor is a rejected
         // reload: the policy stays at the last good value.
@@ -3269,13 +3360,104 @@ network = true
         )
         .unwrap();
         match factory.reload_config() {
+            ReloadResult::Rejected(reason) => {
+                #[cfg(not(windows))]
+                assert!(
+                    reason.contains("not within any globally authorized writable root"),
+                    "{reason}"
+                );
+                #[cfg(windows)]
+                assert!(reason.contains("project [sandbox]"), "{reason}");
+            }
+            other => panic!("expected rejection, got {other:?}"),
+        }
+        assert_eq!(factory.sandbox_policy().snapshot(), Some(last_good));
+        unsafe {
+            std::env::remove_var("XDG_CONFIG_HOME");
+            if let Some(home) = old_home {
+                std::env::set_var("HOME", home);
+            } else {
+                std::env::remove_var("HOME");
+            }
+        }
+    }
+
+    /// D1: the STARTUP mapping distinguishes an absent project source (no
+    /// overlay) from an unavailable one (an error, not a silently unsandboxed
+    /// session) and parses the observed overlay with the strict project schema.
+    #[test]
+    fn startup_project_overlay_is_strict_and_rejects_unavailable_sources() {
+        let root = Path::new("/workspace");
+        let observed = |value: toml::Value| ProjectSourceObservation::Observed(value);
+        let project = |text: &str| toml::from_str(text).unwrap();
+        // Valid overlay: parsed, not ignored.
+        let overlay =
+            startup_project_overlay(root, &observed(project("[sandbox]\nnetwork = false\n")))
+                .unwrap()
+                .expect("overlay");
+        assert_eq!(overlay.network, Some(false));
+        // Absent source: no overlay at all.
+        assert!(
+            startup_project_overlay(root, &ProjectSourceObservation::Absent)
+                .unwrap()
+                .is_none()
+        );
+        // Unavailable source: an error (the old file-reading resolver used to
+        // fail startup here; it must not become "unsandboxed").
+        let error = startup_project_overlay(root, &ProjectSourceObservation::Unavailable)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("project config"), "{error}");
+        // The strict project schema applies to the observation: an unknown key
+        // or a non-table section is an error, not a silent ignore.
+        for bad in ["[sandbox]\nbogus = 1\n", "sandbox = 5\n"] {
+            assert!(
+                startup_project_overlay(root, &observed(project(bad))).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    /// D1 (reload half): the observed project `[sandbox]` overlay is validated
+    /// strictly BEFORE the change gate, so an invalid overlay whose recognized
+    /// inputs look unchanged is still rejected (here: an unknown key added to
+    /// an otherwise identical table, with no global config to fall back on).
+    #[test]
+    fn reload_validates_the_project_sandbox_overlay_before_the_change_gate() {
+        let _guard = crate::roles::XDG_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let xdg = temp.path().join("xdg");
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::fs::create_dir_all(xdg.join("e-agent")).unwrap();
+        let project_dir = temp.path().join(".e-agent");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let project = project_dir.join("config.toml");
+        // No global config at all: the project file is the only source.
+        std::fs::write(&project, "[sandbox]\nnetwork = false\n").unwrap();
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &xdg);
+            std::env::set_var("HOME", &home);
+        };
+        let mut factory = SessionFactory::test_factory(temp.path().to_path_buf());
+        factory.announce = true;
+        let capture = ReloadCapture::default();
+        capture_reload(&capture, || {
+            assert!(matches!(factory.reload_config(), ReloadResult::Reloaded));
+        });
+        // Add an unknown key to the SAME table: the recognized inputs are
+        // unchanged, so only strict validation can reject it.
+        std::fs::write(&project, "[sandbox]\nnetwork = false\nbogus = 1\n").unwrap();
+        capture.0.lock().unwrap().clear();
+        capture_reload(&capture, || match factory.reload_config() {
             ReloadResult::Rejected(reason) => assert!(
-                reason.contains("not within any globally authorized writable root"),
+                reason.contains("[sandbox]") || reason.contains("unknown field"),
                 "{reason}"
             ),
             other => panic!("expected rejection, got {other:?}"),
-        }
-        assert_eq!(factory.sandbox_policy().snapshot(), Some(policy_b.clone()));
+        });
+        assert!(capture.0.lock().unwrap().is_empty());
         unsafe {
             std::env::remove_var("XDG_CONFIG_HOME");
             if let Some(home) = old_home {
