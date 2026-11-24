@@ -163,14 +163,14 @@ async fn read_request(stream: &mut TcpStream) -> (String, (Value, String)) {
     )
 }
 
-/// Wrap elements the way the service frames them: `[\n{..}\n,\n{..}\n]`.
-fn array_stream(elements: &[Value]) -> String {
-    let body = elements
+/// Frame elements the way `?alt=sse` does (verified live): one `data: {json}`
+/// line per event, compact JSON, CRLF line endings, one blank line between
+/// events — and nothing after the last blank line, not even a terminator.
+fn sse_body(elements: &[Value]) -> String {
+    elements
         .iter()
-        .map(|element| serde_json::to_string_pretty(element).unwrap())
-        .collect::<Vec<_>>()
-        .join("\n,\n");
-    format!("[\n{body}\n]")
+        .map(|element| format!("data: {}\r\n\r\n", serde_json::to_string(element).unwrap()))
+        .collect()
 }
 
 fn write_agy_token(dir: &Path, access: &str, expiry: DateTime<Utc>, refresh: &str) -> PathBuf {
@@ -221,7 +221,10 @@ fn model_for(fake: &Fake, token_file: PathBuf, cache_file: PathBuf) -> Antigravi
             .unwrap(),
         model: "gemini-3.8-flash-tiered".into(),
         reasoning_effort: None,
-        stream_url: format!("http://{}/v1internal:streamGenerateContent", fake.address),
+        stream_url: format!(
+            "http://{}/v1internal:streamGenerateContent?alt=sse",
+            fake.address
+        ),
         token_endpoint: format!("http://{}/token", fake.address),
         token_file,
         cache_file,
@@ -262,7 +265,7 @@ async fn streams_text_deltas_and_maps_usage() {
         Utc::now() + ChronoDuration::hours(1),
         "refresh-token",
     );
-    let body = array_stream(&[
+    let body = sse_body(&[
         json!({"response": {"candidates": [{"content": {"role": "model", "parts": [{"text": "O"}]}}]}}),
         // A later element settles the counts; the trailing signature part and
         // the empty text it carries are not content.
@@ -326,7 +329,7 @@ async fn streams_text_deltas_and_maps_usage() {
     let requests = fake.requests();
     assert_eq!(requests.len(), 1);
     let (path, headers, body) = &requests[0];
-    assert_eq!(path, "/v1internal:streamGenerateContent");
+    assert_eq!(path, "/v1internal:streamGenerateContent?alt=sse");
     let lower = headers.to_ascii_lowercase();
     assert!(
         lower.contains("authorization: bearer test-token"),
@@ -360,7 +363,7 @@ async fn function_call_carries_thought_signature() {
         Utc::now() + ChronoDuration::hours(1),
         "refresh-token",
     );
-    let body = array_stream(&[json!({"response": {
+    let body = sse_body(&[json!({"response": {
         "candidates": [{"content": {"role": "model", "parts": [{
             "thoughtSignature": "sig-call",
             "functionCall": {"name": "bash", "args": {"command": "echo hi"}, "id": "call_1"},
@@ -406,7 +409,7 @@ async fn signed_call_survives_store_and_load_and_replays_at_its_part_position() 
         "refresh-token",
     );
     let signature = "SENTINEL-SIGNATURE-FIRST";
-    let body = array_stream(&[json!({"response": {
+    let body = sse_body(&[json!({"response": {
         "candidates": [{"content": {"role": "model", "parts": [{
             "thoughtSignature": signature,
             "functionCall": {"name": "bash", "args": {"command": "echo hi"}, "id": "call_1"},
@@ -414,7 +417,7 @@ async fn signed_call_survives_store_and_load_and_replays_at_its_part_position() 
     }})]);
     let fake = spawn_fake(2, move |index, _| match index {
         0 => (200, body.clone()),
-        _ => (200, array_stream(&[text_element("done")])),
+        _ => (200, sse_body(&[text_element("done")])),
     })
     .await;
     let mut model = model_for(&fake, token_file, dir.path().join("cache/token.json"));
@@ -474,7 +477,7 @@ async fn parallel_calls_keep_each_signature_at_its_own_part_position() {
         Utc::now() + ChronoDuration::hours(1),
         "refresh-token",
     );
-    let body = array_stream(&[json!({"response": {
+    let body = sse_body(&[json!({"response": {
         "candidates": [{"content": {"role": "model", "parts": [
             {
                 "thoughtSignature": "SENTINEL-SIG-A",
@@ -486,7 +489,7 @@ async fn parallel_calls_keep_each_signature_at_its_own_part_position() {
     }})]);
     let fake = spawn_fake(2, move |index, _| match index {
         0 => (200, body.clone()),
-        _ => (200, array_stream(&[text_element("both done")])),
+        _ => (200, sse_body(&[text_element("both done")])),
     })
     .await;
     let mut model = model_for(&fake, token_file, dir.path().join("cache/token.json"));
@@ -558,7 +561,7 @@ async fn signature_less_tool_history_is_refused_locally() {
         Utc::now() + ChronoDuration::hours(1),
         "refresh-token",
     );
-    let fake = spawn_fake(1, move |_, _| (200, array_stream(&[text_element("ok")]))).await;
+    let fake = spawn_fake(1, move |_, _| (200, sse_body(&[text_element("ok")]))).await;
     let mut model = model_for(&fake, token_file, dir.path().join("cache/token.json"));
     let history = vec![
         Message::User {
@@ -811,7 +814,7 @@ async fn closed_tool_batch_does_not_block_a_new_turn() {
         Utc::now() + ChronoDuration::hours(1),
         "refresh-token",
     );
-    let fake = spawn_fake(1, move |_, _| (200, array_stream(&[text_element("ok")]))).await;
+    let fake = spawn_fake(1, move |_, _| (200, sse_body(&[text_element("ok")]))).await;
     let mut model = model_for(&fake, token_file, dir.path().join("cache/token.json"));
     let history = vec![
         Message::User {
@@ -890,7 +893,7 @@ async fn invalid_grant_clears_the_dead_cache_and_uses_the_cli_credential_next() 
         "rotated-refresh",
         "cli-refresh",
     );
-    let body = array_stream(&[text_element("ok")]);
+    let body = sse_body(&[text_element("ok")]);
     let fake = spawn_fake(3, move |index, path| match (index, path) {
         (0, "/token") => (
             400,
@@ -963,7 +966,7 @@ async fn unsigned_old_history_is_replayed_as_recorded() {
         Utc::now() + ChronoDuration::hours(1),
         "refresh-token",
     );
-    let fake = spawn_fake(1, move |_, _| (200, array_stream(&[text_element("done")]))).await;
+    let fake = spawn_fake(1, move |_, _| (200, sse_body(&[text_element("done")]))).await;
     let mut model = model_for(&fake, token_file, dir.path().join("cache/token.json"));
     let history = vec![
         Message::User {
@@ -1033,7 +1036,7 @@ async fn signed_text_part_keeps_text_and_delta() {
         Utc::now() + ChronoDuration::hours(1),
         "refresh-token",
     );
-    let body = array_stream(&[json!({"response": {
+    let body = sse_body(&[json!({"response": {
         "candidates": [{"content": {"role": "model", "parts": [
             {"text": "the answer", "thoughtSignature": "SENTINEL-SIG-TEXT"},
         ]}, "finishReason": "STOP"}],
@@ -1072,7 +1075,7 @@ async fn signature_only_part_after_a_call_attaches() {
         Utc::now() + ChronoDuration::hours(1),
         "refresh-token",
     );
-    let body = array_stream(&[json!({"response": {
+    let body = sse_body(&[json!({"response": {
         "candidates": [{"content": {"role": "model", "parts": [
             {"functionCall": {"name": "bash", "args": {"command": "echo a"}, "id": "call_a"}},
             {"thoughtSignature": "SENTINEL-SIG-LATE", "text": ""},
@@ -1118,7 +1121,7 @@ async fn thought_text_with_a_signature_does_not_sign_the_call() {
         Utc::now() + ChronoDuration::hours(1),
         "refresh-token",
     );
-    let body = array_stream(&[json!({"response": {
+    let body = sse_body(&[json!({"response": {
         "candidates": [{"content": {"role": "model", "parts": [
             {"functionCall": {"name": "bash", "args": {"command": "echo a"}, "id": "call_a"}},
             {
@@ -1171,7 +1174,7 @@ async fn empty_text_part_breaks_the_signature_adjacency() {
         Utc::now() + ChronoDuration::hours(1),
         "refresh-token",
     );
-    let body = array_stream(&[json!({"response": {
+    let body = sse_body(&[json!({"response": {
         "candidates": [{"content": {"role": "model", "parts": [
             {"functionCall": {"name": "bash", "args": {"command": "echo a"}, "id": "call_a"}},
             {"text": ""},
@@ -1211,7 +1214,7 @@ async fn signature_only_part_after_intervening_text_does_not_attach() {
         Utc::now() + ChronoDuration::hours(1),
         "refresh-token",
     );
-    let body = array_stream(&[json!({"response": {
+    let body = sse_body(&[json!({"response": {
         "candidates": [{"content": {"role": "model", "parts": [
             {"functionCall": {"name": "bash", "args": {"command": "echo a"}, "id": "call_a"}},
             {"text": "let me check"},
@@ -1316,7 +1319,7 @@ async fn unauthorized_refreshes_once_then_retries() {
     );
     let cache_file = dir.path().join("cache/antigravity-token.json");
     let cli_bytes_before = std::fs::read(&token_file).unwrap();
-    let body = array_stream(&[text_element("ok")]);
+    let body = sse_body(&[text_element("ok")]);
     // Six connections: 401 -> refresh -> retry (ok), then a SECOND turn whose
     // refreshed token is rejected too: 401 -> refresh -> 401 -> stop.
     let fake = spawn_fake(6, move |index, path| match (index, path) {
@@ -1438,7 +1441,7 @@ async fn expired_token_refreshes_before_the_request() {
         Utc::now() - ChronoDuration::minutes(5),
         "refresh-token",
     );
-    let body = array_stream(&[text_element("ok")]);
+    let body = sse_body(&[text_element("ok")]);
     let fake = spawn_fake(2, move |index, _| match index {
         0 => (
             200,
@@ -1479,7 +1482,7 @@ async fn valid_token_is_reused_without_refreshing() {
         Utc::now() + ChronoDuration::minutes(50),
         "refresh-token",
     );
-    let body = array_stream(&[text_element("ok")]);
+    let body = sse_body(&[text_element("ok")]);
     let fake = spawn_fake(2, move |_, _| (200, body.clone())).await;
     let mut model = model_for(&fake, token_file, dir.path().join("cache/token.json"));
     for _ in 0..2 {
@@ -1498,7 +1501,10 @@ async fn valid_token_is_reused_without_refreshing() {
     let requests = fake.requests();
     assert_eq!(requests.len(), 2, "two requests, no token refresh");
     for (path, headers, _) in requests {
-        assert!(path.ends_with(":streamGenerateContent"), "{path}");
+        assert!(
+            path.ends_with(":streamGenerateContent?alt=sse"),
+            "the SSE form is what is requested: {path}"
+        );
         assert!(
             headers
                 .to_ascii_lowercase()
@@ -1519,7 +1525,7 @@ async fn valid_cli_token_needs_no_client_credentials() {
         Utc::now() + ChronoDuration::minutes(50),
         "refresh-token",
     );
-    let body = array_stream(&[text_element("ok")]);
+    let body = sse_body(&[text_element("ok")]);
     let fake = spawn_fake(1, move |_, _| (200, body.clone())).await;
     let mut model = model_for(&fake, token_file, dir.path().join("cache/token.json"));
     model.client_id = None;
@@ -1624,91 +1630,143 @@ fn cli_token_expiry_is_parsed_and_time_relative() {
     assert!(usable(None), "an unknown expiry defers to the API's 401");
 }
 
+/// The SSE reader reassembles frames split at arbitrary byte boundaries: the
+/// longest fixture is cut every 7 bytes, through `data:` lines, JSON payloads
+/// and the CRLF pairs between events.
 #[tokio::test]
-async fn array_stream_reassembles_split_elements() {
-    let element = serde_json::to_string(&text_element("hello")).unwrap();
-    let body = format!("[\n{element}\n,\n{element}\n]");
-    let mut scanner = ArrayStream::default();
-    let mut elements = Vec::new();
-    for chunk in body.as_bytes().chunks(17) {
-        elements.extend(scanner.push(chunk).unwrap());
+async fn sse_stream_reassembles_frames_split_across_reads() {
+    let body = sse_body(&[text_element("hello"), text_element("world")]);
+    let mut scanner = SseStream::default();
+    let mut events = Vec::new();
+    for chunk in body.as_bytes().chunks(7) {
+        events.extend(scanner.push(chunk).unwrap());
     }
     scanner.finish().unwrap();
-    assert_eq!(elements.len(), 2);
+    assert_eq!(events.len(), 2);
     assert_eq!(
-        elements[1]["response"]["candidates"][0]["content"]["parts"][0]["text"],
-        "hello"
+        events[1]["response"]["candidates"][0]["content"]["parts"][0]["text"],
+        "world"
     );
 }
+
+/// The SSE reader at its edges: one byte per read, escaped Unicode carried as
+/// real `\uXXXX` wire text, a `data:` field SPLIT OVER MULTIPLE LINES (joined
+/// with `\n` per the SSE spec), LF-only line endings, ignored `event:`/`:`
+/// lines, an empty keep-alive payload, and a `[DONE]` terminator.
 #[test]
-fn array_stream_decodes_a_byte_at_a_time_escaped_unicode_element() {
-    // Raw JSON text, so the wire bytes really carry \uXXXX escapes (a
-    // `json!` literal would arrive already decoded).
-    let body = r#"[{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"caf\u00e9 \ud83d\ude00"}]}}]}}]"#;
+fn sse_stream_decodes_byte_at_a_time_and_multiline_data() {
+    // Raw JSON text, so the wire bytes really carry \uXXXX escapes (a `json!`
+    // literal would arrive already decoded). The payload is split over two
+    // `data:` lines, which the SSE spec joins with a newline.
+    let body = concat!(
+        ": keep-alive\n",
+        "event: message\n",
+        "data: {\"response\":{\"candidates\":[{\"content\":\n",
+        "data: {\"role\":\"model\",\"parts\":[{\"text\":\"caf\\u00e9 \\ud83d\\ude00\"}]}}]}}\n",
+        "\n",
+        "data:\n",
+        "\n",
+        "data: [DONE]\n",
+        "\n",
+    );
     assert!(body.contains(r"\u00e9"), "{body}");
-    assert!(body.contains(r"\ud83d"), "{body}");
-    let mut scanner = ArrayStream::default();
-    let mut elements = Vec::new();
+    let mut scanner = SseStream::default();
+    let mut events = Vec::new();
     for byte in body.as_bytes() {
-        elements.extend(scanner.push(std::slice::from_ref(byte)).unwrap());
+        events.extend(scanner.push(std::slice::from_ref(byte)).unwrap());
     }
-    assert!(
-        scanner.finish().is_ok(),
-        "a complete array must be accepted at EOF"
+    scanner
+        .finish()
+        .expect("a complete stream is accepted at EOF");
+    assert_eq!(
+        events.len(),
+        1,
+        "one event; the keep-alive and [DONE] carry no element"
     );
     assert_eq!(
-        elements[0]["response"]["candidates"][0]["content"]["parts"][0]["text"],
+        events[0]["response"]["candidates"][0]["content"]["parts"][0]["text"],
         "caf\u{e9} \u{1f600}"
     );
 }
 
-/// H1: the framing rules that make a short read an error. Each case is
-/// something the service could send when a stream is cut.
+/// A stream cut mid-event is an error, NEVER a shorter successful turn: a
+/// half-read line, an undispatched event (no blank line yet), and a payload
+/// whose terminator never arrived all fail at EOF.
 #[test]
-fn array_stream_rejects_bad_framing() {
-    let element = serde_json::to_string(&text_element("hello")).unwrap();
-    let truncated_second = format!("[\n{element}\n,\n{{\"response\": {{\"candidates\": [");
-    const FORM_FEED: char = '\u{0c}';
+fn sse_stream_rejects_a_truncated_event() {
+    let event = serde_json::to_string(&text_element("hello")).unwrap();
     let cases = [
-        // A cut mid-object: the prefix's own element decoded already.
-        truncated_second,
-        // Missing the closing `]`.
-        format!("[\n{element}\n"),
-        // Trailing garbage after the array.
-        format!("[\n{element}\n]\nnot-json"),
-        // A leading separator / missing `[`.
-        format!("\n{element}\n]"),
-        // A trailing comma: after `,` an element (never `]`) must come.
-        format!("[{element},]"),
-        // A double close.
-        format!("[{element}]]"),
-        // A leading separator.
-        format!("[,{element}]"),
-        // A form feed is not JSON whitespace, at the tail...
-        format!("[{element}]{}", FORM_FEED),
-        // ...nor inside the framing.
-        format!("[{FORM_FEED}{element}]"),
+        // A cut inside the JSON payload: the blank line never follows.
+        format!("data: {}\r\n\r\ndata: {}", event, &event[..20]),
+        // Nothing but the payload.
+        format!("data: {event}"),
+        // A complete payload whose blank line is missing.
+        format!("data: {event}\r\n"),
+        // A half-read CRLF at the very end.
+        format!("data: {event}\r\n\r\n\r"),
+        // A cut inside the `data:` prefix itself.
+        format!("data: {event}\r\n\r\ndat"),
     ];
     for body in &cases {
-        let mut scanner = ArrayStream::default();
+        let mut scanner = SseStream::default();
         let error = scanner
             .push(body.as_bytes())
             .and_then(|_| scanner.finish())
             .expect_err(&format!("must be rejected: {body}"));
-        assert!(!format!("{error:#}").is_empty());
+        let message = format!("{error:#}");
+        assert!(message.contains("truncated"), "{message}");
     }
-    // The accepting neighbours: a single-element array, and an EOF immediately
-    // after `]` with (and without) JSON whitespace around the framing.
+    // The accepting neighbours: the live CRLF framing, and LF-only framing.
     for body in [
-        format!("[{element}]"),
-        format!("[\n{element}\n]"),
-        format!("[\t{element}\r\n,\r\n{element}\t]"),
+        format!("data: {event}\r\n\r\n"),
+        format!("data: {event}\r\n\r\ndata: {event}\n\n"),
     ] {
-        let mut scanner = ArrayStream::default();
-        let elements = scanner.push(body.as_bytes()).expect(body.as_str());
+        let mut scanner = SseStream::default();
+        let events = scanner.push(body.as_bytes()).expect(body.as_str());
         scanner.finish().expect(body.as_str());
-        assert!(!elements.is_empty(), "{body}");
+        assert!(!events.is_empty(), "{body}");
     }
+}
+
+/// The exact shape ONE live `?alt=sse` call returned (model
+/// `gemini-3.8-flash-tiered`): a text event carrying `usageMetadata`, then a
+/// signature-only event, CRLF framing, and NO `finishReason` anywhere. That
+/// turn must still be a successful TEXT answer — it is what the provider sends
+/// for a plain prompt — while a CALL batch still requires a terminal reason.
+#[tokio::test]
+async fn live_sse_text_turn_without_finish_reason_is_a_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let token_file = write_agy_token(
+        dir.path(),
+        "test-token",
+        Utc::now() + ChronoDuration::hours(1),
+        "refresh-token",
+    );
+    let body = concat!(
+        "data: {\"response\": {\"candidates\": [{\"content\": {\"role\": \"model\",\"parts\": [{\"text\": \"pong\"}]}}],",
+        "\"usageMetadata\": {\"promptTokenCount\": 8,\"candidatesTokenCount\": 1,\"totalTokenCount\": 62,\"thoughtsTokenCount\": 53},",
+        "\"modelVersion\": \"gemini-3.8-flash-tiered\",\"responseId\": \"KmoFa-bDKaW7odAPke_v4Ac\"},\"traceId\": \"f90cf29b38465ada\",\"metadata\": {}}\r\n\r\n",
+        "data: {\"response\": {\"candidates\": [{\"content\": {\"role\": \"model\",\"parts\": [{\"thoughtSignature\": \"EqIDCp8DAWkUfRNk5GXF\"}]}}],\"modelVersion\": \"gemini-3.8-flash-tiered\"},\"traceId\": \"f90cf29b38465ada\",\"metadata\": {}}\r\n\r\n",
+    );
+    let fake = spawn_fake(1, move |_, _| (200, body.to_owned())).await;
+    let mut model = model_for(&fake, token_file, dir.path().join("cache/token.json"));
+    let (assistant, usage) = model
+        .complete(
+            &[Message::User {
+                content: "Reply with the single word: pong".into(),
+                images: Vec::new(),
+            }],
+            &[],
+            None,
+        )
+        .await
+        .expect("the live text turn shape is a completed turn");
+    assert_eq!(assistant.content.as_deref(), Some("pong"));
+    assert!(assistant.tool_calls.is_empty());
+    let usage = usage.expect("usage arrives in the first event");
+    assert_eq!(usage.input_tokens, 8);
+    assert_eq!(usage.output_tokens, 54, "candidates + thoughts");
+    assert_eq!(usage.finish_reason, None, "the live stream sent none");
 }
 
 /// H1 end-to-end: a clean EOF in the middle of an element is NOT a
@@ -1727,7 +1785,7 @@ async fn truncated_stream_is_not_a_successful_turn() {
         "functionCall": {"name": "bash", "args": {"command": "echo hi"}, "id": "call_1"},
     }]}, "finishReason": "STOP"}], "usageMetadata": {"promptTokenCount": 3}}});
     let body = format!(
-        "[\n{}\n,\n{{\"response\": {{\"candidates\": [{{\"content\": ",
+        "data: {}\r\n\r\ndata: {{\"response\": {{\"candidates\": [{{\"content\": ",
         serde_json::to_string(&first).unwrap()
     );
     let fake = spawn_fake(1, move |_, _| (200, body.clone())).await;
@@ -1761,7 +1819,7 @@ async fn failure_finish_after_a_valid_call_prefix_is_not_a_turn() {
         "refresh-token",
     );
     for failure in ["MALFORMED_FUNCTION_CALL", "SAFETY"] {
-        let body = array_stream(&[
+        let body = sse_body(&[
             // A complete, signed, replayable-looking call...
             json!({"response": {"candidates": [{"content": {"role": "model", "parts": [{
                 "thoughtSignature": "sig-call",
@@ -1795,7 +1853,7 @@ async fn failure_finish_after_a_valid_call_prefix_is_not_a_turn() {
     // An unrecognized finish value is provider-controlled text: it is not
     // evidence of success and is never echoed into a persisted message.
     const SENTINEL: &str = "SENTINEL-FINISH-9f2c";
-    let unknown = array_stream(&[json!({"response": {"candidates": [{
+    let unknown = sse_body(&[json!({"response": {"candidates": [{
         "content": {"role": "model", "parts": [{"text": "ok"}]},
         "finishReason": SENTINEL,
     }]}})]);
@@ -1830,7 +1888,7 @@ async fn closed_array_without_a_terminal_candidate_is_not_a_turn() {
         Utc::now() + ChronoDuration::hours(1),
         "refresh-token",
     );
-    let body = array_stream(&[json!({"response": {
+    let body = sse_body(&[json!({"response": {
         "candidates": [{"content": {"role": "model", "parts": [{
             "thoughtSignature": "sig-call",
             "functionCall": {"name": "bash", "args": {"command": "echo hi"}, "id": "call_1"},
@@ -1867,7 +1925,7 @@ async fn length_limited_text_is_displayable_and_length_limited_calls_are_not() {
         Utc::now() + ChronoDuration::hours(1),
         "refresh-token",
     );
-    let text = array_stream(&[json!({"response": {"candidates": [{
+    let text = sse_body(&[json!({"response": {"candidates": [{
         "content": {"role": "model", "parts": [{"text": "the answer is 4"}]},
         "finishReason": "MAX_TOKENS",
     }],
@@ -1897,7 +1955,7 @@ async fn length_limited_text_is_displayable_and_length_limited_calls_are_not() {
         "the truncation is reported, not hidden"
     );
 
-    let calls = array_stream(&[json!({"response": {"candidates": [{
+    let calls = sse_body(&[json!({"response": {"candidates": [{
         "content": {"role": "model", "parts": [{
             "thoughtSignature": "sig-call",
             "functionCall": {"name": "bash", "args": {"command": "echo hi"}, "id": "call_1"},
@@ -1938,7 +1996,7 @@ async fn unsigned_fresh_batch_is_refused_before_any_call_runs() {
         Utc::now() + ChronoDuration::hours(1),
         "refresh-token",
     );
-    let body = array_stream(&[json!({"response": {"candidates": [{
+    let body = sse_body(&[json!({"response": {"candidates": [{
         "content": {"role": "model", "parts": [
             {"functionCall": {"name": TOOL, "args": {"command": "echo hi"}, "id": CALL_ID}},
             // An unsigned sibling is fine on its own; the FIRST call is what
@@ -1980,7 +2038,7 @@ async fn signature_only_part_in_the_next_element_signs_the_call_before_it() {
         Utc::now() + ChronoDuration::hours(1),
         "refresh-token",
     );
-    let body = array_stream(&[
+    let body = sse_body(&[
         json!({"response": {"candidates": [{"content": {"role": "model", "parts": [
             {"functionCall": {"name": "bash", "args": {"command": "echo a"}, "id": "call_a"}},
         ]}}]}}),
@@ -2026,7 +2084,7 @@ async fn refresh_replaces_a_permissive_cache_with_an_owner_only_file() {
     std::fs::create_dir_all(cache_file.parent().unwrap()).unwrap();
     std::fs::write(&cache_file, b"{\"token\":{\"access_token\":\"stale\"}}").unwrap();
     std::fs::set_permissions(&cache_file, std::fs::Permissions::from_mode(0o644)).unwrap();
-    let body = array_stream(&[text_element("ok")]);
+    let body = sse_body(&[text_element("ok")]);
     let fake = spawn_fake(2, move |index, _| match index {
         0 => (
             200,
@@ -2076,7 +2134,7 @@ async fn refresh_does_not_write_through_a_symlink_at_the_cache_path() {
     let cache_file = dir.path().join("cache/antigravity-token.json");
     std::fs::create_dir_all(cache_file.parent().unwrap()).unwrap();
     std::os::unix::fs::symlink(&victim, &cache_file).unwrap();
-    let body = array_stream(&[text_element("ok")]);
+    let body = sse_body(&[text_element("ok")]);
     let fake = spawn_fake(2, move |index, _| match index {
         0 => (
             200,
@@ -2173,7 +2231,7 @@ async fn provider_error_bodies_are_never_surfaced() {
     assert!(!message.contains("SENTINEL"), "{message}");
 
     // In-stream error element: allowlisted `status`, sentinel everywhere else.
-    let stream_body = array_stream(&[json!({"error": {
+    let stream_body = sse_body(&[json!({"error": {
         "code": SENTINEL,
         "type": SENTINEL,
         "status": "INTERNAL",
@@ -2200,7 +2258,7 @@ async fn provider_error_bodies_are_never_surfaced() {
     let bare_stream = spawn_fake(1, move |_, _| {
         (
             200,
-            array_stream(&[json!({"error": {"status": SENTINEL, "type": SENTINEL}})]),
+            sse_body(&[json!({"error": {"status": SENTINEL, "type": SENTINEL}})]),
         )
     })
     .await;
@@ -2328,7 +2386,7 @@ async fn cli_relogin_invalidates_the_bound_cache() {
         "refresh-old",
         "refresh-old",
     );
-    let body = array_stream(&[text_element("ok")]);
+    let body = sse_body(&[text_element("ok")]);
     let fake = spawn_fake(1, move |_, _| (200, body.clone())).await;
     let mut model = model_for(&fake, token_file, cache_file);
     model
@@ -2369,7 +2427,7 @@ async fn stale_fingerprint_forces_a_refresh_with_the_cli_credential() {
         "refresh-old",
         "refresh-old",
     );
-    let body = array_stream(&[text_element("ok")]);
+    let body = sse_body(&[text_element("ok")]);
     let fake = spawn_fake(2, move |index, _| match index {
         0 => (
             200,
@@ -2418,7 +2476,7 @@ async fn malformed_cli_file_is_not_masked_by_a_valid_cache() {
         "refresh-old",
         "refresh-old",
     );
-    let fake = spawn_fake(1, move |_, _| (200, array_stream(&[text_element("ok")]))).await;
+    let fake = spawn_fake(1, move |_, _| (200, sse_body(&[text_element("ok")]))).await;
     let mut model = model_for(&fake, token_file, cache_file);
     let error = model
         .complete(
@@ -2451,7 +2509,7 @@ async fn synthetic_ids_are_unique_and_duplicate_ids_are_rejected() {
     let idless = json!({"response": {"candidates": [{"content": {"role": "model", "parts": [
         {"thoughtSignature": "sig-a", "functionCall": {"name": "bash", "args": {"command": "a"}}},
     ]}, "finishReason": "STOP"}]}});
-    let body = array_stream(std::slice::from_ref(&idless));
+    let body = sse_body(std::slice::from_ref(&idless));
     let fake = spawn_fake(2, move |_, _| (200, body.clone())).await;
     let mut model = model_for(
         &fake,
@@ -2481,7 +2539,7 @@ async fn synthetic_ids_are_unique_and_duplicate_ids_are_rejected() {
         {"thoughtSignature": "sig-b", "functionCall": {"name": "bash", "args": {}, "id": "call_1"}},
     ]}}]}});
     let dup_fake = spawn_fake(1, move |_, _| {
-        (200, array_stream(std::slice::from_ref(&duplicate)))
+        (200, sse_body(std::slice::from_ref(&duplicate)))
     })
     .await;
     let mut dup_model = model_for(&dup_fake, token_file, dir.path().join("cache/token.json"));
@@ -2513,7 +2571,7 @@ async fn request_pacing_spaces_consecutive_turns() {
         Utc::now() + ChronoDuration::hours(1),
         "refresh-token",
     );
-    let body = array_stream(&[text_element("ok")]);
+    let body = sse_body(&[text_element("ok")]);
     // A warm-up turn first, so the measured requests share the pooled
     // connection: an arrival stamp includes the client's own dispatch latency,
     // and a cold connect would cut into the FIRST measured gap for reasons the
@@ -2567,7 +2625,7 @@ async fn zero_min_interval_sends_immediately() {
         Utc::now() + ChronoDuration::hours(1),
         "refresh-token",
     );
-    let body = array_stream(&[text_element("ok")]);
+    let body = sse_body(&[text_element("ok")]);
     let fake = spawn_fake(2, move |_, _| (200, body.clone())).await;
     let mut model = model_for(&fake, token_file, dir.path().join("cache/token.json"));
     model.min_interval = std::time::Duration::ZERO;
@@ -2602,7 +2660,7 @@ async fn refresh_and_retry_are_paced_too() {
         Utc::now() + ChronoDuration::hours(1),
         "refresh-token",
     );
-    let body = array_stream(&[text_element("ok")]);
+    let body = sse_body(&[text_element("ok")]);
     // Connection warm-up (see `request_pacing_spaces_consecutive_turns`), then
     // the 401 -> refresh -> retry sequence on the same pooled connection.
     let fake = spawn_fake(4, move |index, path| match (index, path) {
@@ -2820,5 +2878,233 @@ async fn live_builtin_toolset_and_parallel_round_trip() {
     println!(
         "LIVE H6 parallel verdict: two-call round trip accepted; follow-up content={:?}",
         follow_up.content
+    );
+}
+
+/// A: the body carries the CLI's own envelope — `requestType = agent`, a fresh
+/// `requestId` per request, and `request.sessionId` DERIVED from the
+/// conversation: the same transcript always hashes to the same id, and a
+/// changed transcript does not.
+#[test]
+fn request_metadata_carries_type_id_and_derived_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = AntigravityModel {
+        client: reqwest::Client::new(),
+        model: "gemini-3.8-flash-tiered".into(),
+        reasoning_effort: None,
+        stream_url: "http://127.0.0.1:1/stream".into(),
+        token_endpoint: "http://127.0.0.1:1/token".into(),
+        token_file: dir.path().join("agy.json"),
+        cache_file: dir.path().join("cache.json"),
+        client_id: None,
+        client_secret: None,
+        min_interval: std::time::Duration::ZERO,
+        last_request: Default::default(),
+    };
+    let user = Message::User {
+        content: "hi".into(),
+        images: Vec::new(),
+    };
+    let first = model
+        .request_body(std::slice::from_ref(&user), &[])
+        .unwrap();
+    let again = model
+        .request_body(std::slice::from_ref(&user), &[])
+        .unwrap();
+    assert_eq!(first["requestType"], "agent");
+    let request_id = first["requestId"].as_str().expect("requestId");
+    assert_eq!(request_id.len(), 32, "32 hex chars: {request_id}");
+    assert_ne!(
+        request_id, again["requestId"],
+        "a request id identifies ONE request"
+    );
+    let session = first["request"]["sessionId"].as_str().expect("sessionId");
+    assert_eq!(session.len(), 32, "16 bytes of hex: {session}");
+    assert_eq!(
+        session,
+        again["request"]["sessionId"].as_str().unwrap(),
+        "the same transcript derives the same session id"
+    );
+
+    // A different transcript (one more turn, no other change) derives another.
+    let longer = vec![
+        user,
+        Message::Assistant(AssistantMessage {
+            content: Some("hello".into()),
+            tool_calls: Vec::new(),
+            reasoning: None,
+        }),
+    ];
+    let changed = model.request_body(&longer, &[]).unwrap();
+    assert_ne!(
+        session,
+        changed["request"]["sessionId"].as_str().unwrap(),
+        "a changed transcript changes the derived id"
+    );
+}
+
+/// B: a 404 for a bare flash model is retried ONCE against that family's
+/// shared `-tiered` endpoint, and the RETRIED BODY carries the new model.
+#[tokio::test]
+async fn not_found_retries_once_with_the_tiered_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let token_file = write_agy_token(
+        dir.path(),
+        "test-token",
+        Utc::now() + ChronoDuration::hours(1),
+        "refresh-token",
+    );
+    let body = sse_body(&[text_element("ok")]);
+    let fake = spawn_fake(2, move |index, _| match index {
+        0 => (
+            404,
+            json!([{"error": {"code": 404, "status": "NOT_FOUND"}}]).to_string(),
+        ),
+        _ => (200, body.clone()),
+    })
+    .await;
+    let mut model = model_for(&fake, token_file, dir.path().join("cache/token.json"));
+    // The bare family id: what this client version is refused.
+    model.model = "gemini-3.8-flash".into();
+    let (assistant, _) = model
+        .complete(
+            &[Message::User {
+                content: "say ok".into(),
+                images: Vec::new(),
+            }],
+            &[],
+            None,
+        )
+        .await
+        .expect("the tiered fallback answers");
+    assert_eq!(assistant.content.as_deref(), Some("ok"));
+    let requests = fake.requests();
+    assert_eq!(requests.len(), 2, "one 404, then exactly one retry");
+    assert_eq!(requests[0].2["model"], "gemini-3.8-flash");
+    assert_eq!(
+        requests[1].2["model"], "gemini-3.8-flash-tiered",
+        "the retried body carries the tiered model"
+    );
+}
+
+/// B, the boundaries: a model that already IS the tiered id, and a family that
+/// is not a Gemini flash (no shared tier endpoint), answer the 404 as a plain
+/// failure — one request, never a loop.
+#[tokio::test]
+async fn not_found_without_a_tiered_variant_is_not_retried() {
+    for model_name in ["gemini-3.8-flash-tiered", "claude-sonnet-4-5"] {
+        let dir = tempfile::tempdir().unwrap();
+        let token_file = write_agy_token(
+            dir.path(),
+            "test-token",
+            Utc::now() + ChronoDuration::hours(1),
+            "refresh-token",
+        );
+        let fake = spawn_fake(1, move |_, _| {
+            (
+                404,
+                json!([{"error": {"code": 404, "status": "NOT_FOUND"}}]).to_string(),
+            )
+        })
+        .await;
+        let mut model = model_for(&fake, token_file, dir.path().join("cache/token.json"));
+        model.model = model_name.into();
+        let error = model
+            .complete(
+                &[Message::User {
+                    content: "say ok".into(),
+                    images: Vec::new(),
+                }],
+                &[],
+                None,
+            )
+            .await
+            .expect_err("a 404 with no fallback is a failure");
+        let message = format!("{error:#}");
+        assert!(message.contains("404"), "{message}");
+        assert_eq!(fake.requests().len(), 1, "no retry for {model_name}");
+    }
+}
+
+/// C: the request is REPAIRED rather than refused — the empty part disappears,
+/// a missing `functionCall` id is filled and its result REUSES it, a drifted
+/// `functionResponse.name` is aligned with its call, and a declaration without
+/// a schema gets an object schema. Signatures are never invented.
+#[test]
+fn request_repair_fills_ids_aligns_names_and_drops_empty_parts() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = AntigravityModel {
+        client: reqwest::Client::new(),
+        model: "gemini-3.8-flash-tiered".into(),
+        reasoning_effort: None,
+        stream_url: "http://127.0.0.1:1/stream".into(),
+        token_endpoint: "http://127.0.0.1:1/token".into(),
+        token_file: dir.path().join("agy.json"),
+        cache_file: dir.path().join("cache.json"),
+        client_id: None,
+        client_secret: None,
+        min_interval: std::time::Duration::ZERO,
+        last_request: Default::default(),
+    };
+    let messages = vec![
+        // An empty prompt part would be an empty `text` part on the wire.
+        Message::User {
+            content: String::new(),
+            images: Vec::new(),
+        },
+        Message::User {
+            content: "run it".into(),
+            images: Vec::new(),
+        },
+        // A call with a signature (so the batch is replayable) but NO id, and
+        // a result whose name drifted from the call's.
+        Message::Assistant(AssistantMessage {
+            content: None,
+            tool_calls: vec![ToolCall {
+                id: String::new(),
+                name: "bash".into(),
+                arguments: r#"{"command":"ls"}"#.into(),
+                provider_meta: Some("sig-call".into()),
+            }],
+            reasoning: None,
+        }),
+        Message::Tool {
+            call_id: String::new(),
+            name: "Shell".into(),
+            content: "a.txt".into(),
+            images: Vec::new(),
+            is_error: false,
+            synthetic: false,
+        },
+    ];
+    let spec = ToolSpec {
+        name: "bash".into(),
+        description: "run a command".into(),
+        // A tool without a schema: the wire expects an object schema.
+        parameters: Value::Null,
+    };
+    let body = model.request_body(&messages, &[spec]).unwrap();
+    let contents = body["request"]["contents"].as_array().unwrap();
+    assert_eq!(
+        contents.len(),
+        3,
+        "the emptied content is gone: {contents:?}"
+    );
+    let prompt = contents[0]["parts"].as_array().unwrap();
+    assert_eq!(prompt.len(), 1, "the empty part is gone: {prompt:?}");
+    assert_eq!(prompt[0]["text"], "run it");
+    let call = &contents[1]["parts"][0]["functionCall"];
+    let call_id = call["id"].as_str().expect("a filled call id");
+    assert!(!call_id.is_empty());
+    let response = &contents[2]["parts"][0]["functionResponse"];
+    assert_eq!(response["id"], call_id, "the result reuses the filled id");
+    assert_eq!(
+        response["name"], call["name"],
+        "the drifted response name is aligned with its call"
+    );
+    assert_eq!(
+        body["request"]["tools"][0]["functionDeclarations"][0]["parametersJsonSchema"],
+        json!({"type": "object"}),
+        "a missing schema is defaulted, not sent as null"
     );
 }

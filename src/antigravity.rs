@@ -12,15 +12,25 @@
 //! [`ToolCall::provider_meta`] of THAT call; tool results are
 //! `{"role":"user","parts":[{"functionResponse":{...}}]}`.
 //!
-//! The stream is framed as a JSON array: an opened-but-unclosed array, a bad
-//! separator, trailing garbage, or an unfinished element is an error, never a
-//! shorter successful turn (a truncated turn's tool calls must not run). A
-//! closed array is not a completed generation either: the selected candidate
-//! must also report a terminal `finishReason`, and only a `STOP` candidate may
-//! return executable calls — a `MAX_TOKENS` answer is still displayed as TEXT
-//! (a truncated answer is visible as one), while a truncated or provider-marked
-//! FAILED call batch is refused, as is a batch whose first call carries no
-//! `thoughtSignature` (it could never be replayed, so no call in it is run).
+//! The stream is Server-Sent Events (`?alt=sse`): `data: {json}` events, one
+//! blank line between them, the same `{"response": ..}` envelope either way
+//! (verified live). An EOF with a half-read line or an undispatched event is an
+//! error, never a shorter successful turn (a truncated turn's tool calls must
+//! not run). A complete stream is not a completed generation either: a batch of
+//! executable calls needs a terminal `STOP` — a `MAX_TOKENS` answer is still
+//! displayed as TEXT (a truncated answer is visible as one), while a truncated
+//! or provider-marked FAILED batch is refused, as is a batch whose first call
+//! carries no `thoughtSignature` (it could never be replayed, so no call in it
+//! is run). A TEXT-only turn may end without a `finishReason` at all: the live
+//! stream does not always send one, and text has no side effect — truncation is
+//! caught by the framing instead.
+//!
+//! A request carries the CLI's own envelope (`requestType`, `requestId`, and a
+//! conversation-derived `request.sessionId`), is repaired rather than refused
+//! where the wire tolerates it (empty parts, missing call/response ids, a
+//! drifted response name, a missing tool schema), and a 404 for a bare flash
+//! model is retried ONCE against that family's shared `-tiered` endpoint: a
+//! pinned client version is only allowed to reach that one.
 //! Error messages carry the HTTP status, an allowlisted provider error code,
 //! and allowlisted `finishReason` constants only: a provider body can quote the
 //! submitted credentials and those messages are persisted in the session log.
@@ -35,7 +45,8 @@
 //!
 //! Non-goals: model listing (`fetchAvailableModels`), image input
 //! (`supports_vision` is false), a retry framework (one 401 -> refresh ->
-//! retry), and any `generationConfig` reasoning mapping (a `thinkingConfig` is
+//! retry, and one 404 -> `-tiered` fallback, never a loop), and any
+//! `generationConfig` reasoning mapping (a `thinkingConfig` is
 //! accepted with HTTP 200 but changed nothing observable, so
 //! `reasoning_effort`/`thinking` are inert on this wire).
 
@@ -54,13 +65,21 @@ use std::time::{Duration, Instant};
 use crate::agent::{AssistantMessage, Message, Model, ModelDeltaKind, ToolCall, ToolSpec, Usage};
 use crate::model::IncompleteToolCall;
 
-/// Streaming generation endpoint on the Cloud Code "daily" host.
+/// Streaming generation endpoint on the Cloud Code "daily" host, in its SSE
+/// form (`alt=sse`): one `data: {json}` event per chunk instead of the
+/// default JSON-array framing, which needs no state machine of ours. Same
+/// envelope either way (verified live).
 pub(crate) const STREAM_URL: &str =
-    "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent";
+    "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse";
 /// Google OAuth refresh endpoint.
 pub(crate) const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 /// The only project id this endpoint accepts.
 pub(crate) const PROJECT: &str = "aicode-consumers";
+/// `requestType` every CLI generation request carries.
+pub(crate) const REQUEST_TYPE: &str = "agent";
+/// The shared tier endpoint suffix: what a pinned client version is allowed to
+/// reach when the backend refuses the bare/`-high|-medium|-low` flash id.
+pub(crate) const TIERED_SUFFIX: &str = "-tiered";
 /// Byte-exact CLI user agent. `x-goog-api-client` must NOT be sent: it routes
 /// the request into a "version no longer supported" canned reply.
 pub(crate) const USER_AGENT: &str = "antigravity/cli/1.5.14 (aidev_client; os_type=linux; arch=amd64; cl=1026970498; auth_method=consumer)";
@@ -470,7 +489,9 @@ impl AntigravityModel {
                 _ => contents.push(json!({"role": role, "parts": parts})),
             }
         }
-        let mut request = json!({"contents": contents, "generationConfig": {}});
+        let session_id = derive_session_id(&contents);
+        let mut request =
+            json!({"contents": contents, "generationConfig": {}, "sessionId": session_id});
         if !system.is_empty() {
             request["systemInstruction"] = json!({"parts": [{"text": system}]});
         }
@@ -492,7 +513,18 @@ impl AntigravityModel {
                 .collect::<Vec<_>>();
             request["tools"] = json!([{"functionDeclarations": declarations}]);
         }
-        Ok(json!({"project": PROJECT, "model": self.model, "request": request}))
+        repair_request(&mut request);
+        // Per-request metadata the CLI sends: `requestType` marks an agent
+        // turn and `requestId` is fresh per request, while `request.sessionId`
+        // identifies the CONVERSATION (see `derive_session_id`) so the backend
+        // can group one transcript's turns.
+        Ok(json!({
+            "project": PROJECT,
+            "model": self.model,
+            "requestType": REQUEST_TYPE,
+            "requestId": request_id(),
+            "request": request,
+        }))
     }
 
     async fn send(&self, token: &str, request: &Value) -> anyhow::Result<reqwest::Response> {
@@ -531,6 +563,17 @@ impl Model for AntigravityModel {
             let token = self.refresh().await?;
             response = self.send(&token, &request).await?;
         }
+        if response.status() == reqwest::StatusCode::NOT_FOUND
+            && let Some(tiered) = tiered_fallback(&self.model)
+        {
+            // One bounded fallback, never a loop: this client version is only
+            // allowed to reach the shared `-tiered` endpoint for the family,
+            // so the same turn is re-sent once with that model. The NEXT turn
+            // starts from the configured id again (a 404 costs one request).
+            let mut retried = request.clone();
+            retried["model"] = json!(tiered);
+            response = self.send(&token, &retried).await?;
+        }
         let status = response.status();
         // A redirect is a status-only failure here too: the body names another
         // URL, and this request carries the whole conversation.
@@ -557,7 +600,7 @@ impl Model for AntigravityModel {
             Some(callback) => callback,
             None => &mut discard,
         };
-        let mut scanner = ArrayStream::default();
+        let mut scanner = SseStream::default();
         let mut turn = Turn::default();
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
@@ -740,39 +783,55 @@ impl Turn {
         Ok(())
     }
 
-    /// Assemble, then validate: the whole selected candidate is finished
-    /// BEFORE anything is returned, so a batch that could never be replayed is
-    /// refused before the caller runs a single call from it.
+    /// Validate, then assemble: the whole selected candidate is finished BEFORE
+    /// anything is returned, so a batch that could never be replayed is refused
+    /// before the caller runs a single call from it.
     fn finish(self) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
-        // A closed array with no terminal candidate is an incomplete turn, not
-        // a success: no candidate ever said it was done.
-        let Some(reported) = self.finish_reason.as_deref() else {
-            bail!("Antigravity stream ended without a finishReason, so this turn is incomplete");
-        };
-        // An unrecognized value is not evidence of success, and the value is
-        // provider-controlled text: it is never echoed.
-        let Some(finish) = allowed_finish(reported) else {
-            bail!(
-                "Antigravity stream finished with an unrecognized finishReason (incomplete turn)"
-            );
-        };
         let calls = self.tool_calls.len();
-        match finish {
+        match self.finish_reason.as_deref().map(allowed_finish) {
+            // A TEXT-only turn may end without a `finishReason`: the live stream
+            // does not always send one (verified — a complete "pong" answer
+            // carried usage and a signature part but no finishReason), text has
+            // no side effect, and transport truncation is caught by the framer's
+            // EOF check. A CALL batch has no such excuse: without a terminal
+            // reason nothing proves the batch was complete.
+            None if calls == 0 => {}
+            None => {
+                bail!("Antigravity stream ended without a finishReason, so this turn is incomplete")
+            }
+            // An unrecognized value is not evidence of success, and the value
+            // is provider-controlled text: it is never echoed.
+            Some(None) => bail!(
+                "Antigravity stream finished with an unrecognized finishReason (incomplete turn)"
+            ),
             // The one verified success: the candidate stopped on its own.
-            "STOP" => {}
+            Some(Some("STOP")) => {}
             // Length-limited TEXT is still displayable: a truncated answer is
             // shown as the partial answer it is, with the reason in the usage.
             // A length-limited CALL BATCH is not: its arguments can be cut
             // mid-call, so none of it runs.
-            "MAX_TOKENS" if calls == 0 => {}
-            "MAX_TOKENS" => bail!(
+            Some(Some("MAX_TOKENS")) if calls == 0 => {}
+            Some(Some("MAX_TOKENS")) => bail!(
                 "Antigravity stream stopped at its token limit while asking for {calls} tool call(s); they were not run"
             ),
             // MALFORMED_FUNCTION_CALL, SAFETY, RECITATION, ... : the parts are
             // fragments of a generation the provider itself rejected.
-            failure => bail!("Antigravity stream finished with {failure}, not a completed turn"),
+            Some(Some(failure)) => {
+                bail!("Antigravity stream finished with {failure}, not a completed turn")
+            }
         }
-        if self.content.is_empty() && calls == 0 {
+        let finish = self.finish_reason.as_deref().and_then(allowed_finish);
+        self.assemble(finish)
+    }
+
+    /// The shared tail: an empty turn is not a turn, a batch whose first call
+    /// carries no signature cannot be replayed, and the usage/finish mapping is
+    /// the same whichever transport delivered it.
+    fn assemble(
+        self,
+        finish: Option<&'static str>,
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        if self.content.is_empty() && self.tool_calls.is_empty() {
             bail!("Antigravity stream ended without content or tool calls (incomplete turn)");
         }
         // Live evidence: the FIRST call of a batch carries the signature and
@@ -785,7 +844,8 @@ impl Turn {
             .is_some_and(|call| call.provider_meta.as_deref().unwrap_or_default().is_empty())
         {
             bail!(
-                "Antigravity returned {calls} tool call(s) but the first one carries no thoughtSignature, so this batch cannot be replayed on this wire; they were not run"
+                "Antigravity returned {} tool call(s) but the first one carries no thoughtSignature, so this batch cannot be replayed on this wire; they were not run",
+                self.tool_calls.len()
             );
         }
         let usage = self.usage.map(|metadata| Usage {
@@ -796,7 +856,7 @@ impl Turn {
             cache_miss_tokens: None,
             reasoning_tokens: metadata.thoughts,
             // The vetted constant, never the body's own text.
-            finish_reason: Some(finish.to_owned()),
+            finish_reason: finish.map(str::to_owned),
         });
         Ok((
             AssistantMessage {
@@ -809,121 +869,96 @@ impl Turn {
     }
 }
 
-/// Incremental reader for a JSON ARRAY stream (`[{"response":..}\n,{..}]`):
-/// keeps the undecoded tail and yields each complete top-level object as soon
-/// as its closing brace arrives. The framing itself is checked as it arrives —
-/// an opened array, `,` between elements, a closing `]`, whitespace after it —
-/// because the service also closes an ABORTED stream cleanly: a bare
-/// "count balanced braces" scan would hand a truncated turn back as a success
-/// and the runner would execute its tool calls.
+/// Incremental reader for the `?alt=sse` stream: `data: {json}` lines, one
+/// blank line between events, CRLF or LF (the service sends CRLF, verified
+/// live). A multi-line `data:` field is joined with `\n` per the SSE spec, so a
+/// JSON object split across lines still decodes. Only `data:` counts; other
+/// fields (`event:`, `id:`, `retry:`, `:` comments) are ignored, and an empty
+/// payload (a keep-alive) is skipped.
+///
+/// The truncation rule is the security-relevant half: the service also closes
+/// an ABORTED stream, so an EOF with a half-read line or an undispatched event
+/// is an error, never a shorter successful turn — a truncated turn's tool calls
+/// must not run.
 #[derive(Default)]
-struct ArrayStream {
+struct SseStream {
+    /// Bytes of a line still waiting for its terminator.
     pending: Vec<u8>,
-    pos: usize,
-    depth: usize,
-    in_string: bool,
-    escape: bool,
-    start: Option<usize>,
-    frame: Frame,
+    /// Accumulated `data:` payload of the event being read.
+    data: Option<String>,
+    /// A terminator (`[DONE]`) was seen: everything after it is ignored.
+    done: bool,
 }
 
-/// Framing state BETWEEN elements.
-#[derive(Clone, Copy, Default, PartialEq)]
-enum Frame {
-    /// Before the opening `[`.
-    #[default]
-    Opened,
-    /// Directly after `[`: `]` (empty array) or an element.
-    AfterOpen,
-    /// After `,`: an element must come (a trailing `,` is not JSON).
-    Element,
-    /// After an element: `,` or `]`.
-    Separator,
-    /// After `]`: whitespace only.
-    Closed,
-}
+/// The SSE terminator some proxies append. This wire ends its last event with
+/// a blank line and sends no terminator (verified live); accepting one costs a
+/// comparison and keeps a proxy in front of it from breaking the turn.
+const SSE_DONE: &str = "[DONE]";
 
-/// The four bytes JSON allows between tokens (space, tab, CR, LF). Notably not
-/// `is_ascii_whitespace()`, which also admits a form feed.
-fn is_json_whitespace(byte: u8) -> bool {
-    matches!(byte, b' ' | b'\t' | b'\n' | b'\r')
-}
-
-impl ArrayStream {
+impl SseStream {
     fn push(&mut self, chunk: &[u8]) -> anyhow::Result<Vec<Value>> {
         self.pending.extend_from_slice(chunk);
-        let mut elements = Vec::new();
-        while self.pos < self.pending.len() {
-            let byte = self.pending[self.pos];
-            if self.in_string {
-                if self.escape {
-                    self.escape = false;
-                } else if byte == b'\\' {
-                    self.escape = true;
-                } else if byte == b'"' {
-                    self.in_string = false;
-                }
-            } else if self.depth > 0 {
-                match byte {
-                    b'"' => self.in_string = true,
-                    b'{' => self.depth += 1,
-                    b'}' => {
-                        self.depth -= 1;
-                        if self.depth == 0
-                            && let Some(start) = self.start.take()
-                        {
-                            elements.push(
-                                serde_json::from_slice(&self.pending[start..=self.pos])
-                                    .context("cannot decode an Antigravity stream element")?,
-                            );
-                            self.frame = Frame::Separator;
-                        }
-                    }
-                    _ => {}
-                }
-            } else {
-                match byte {
-                    whitespace if is_json_whitespace(whitespace) => {}
-                    b'[' if self.frame == Frame::Opened => self.frame = Frame::AfterOpen,
-                    b'{' if matches!(self.frame, Frame::AfterOpen | Frame::Element) => {
-                        self.start = Some(self.pos);
-                        self.depth = 1;
-                    }
-                    b',' if self.frame == Frame::Separator => self.frame = Frame::Element,
-                    // `[]` is the only state that may close without an
-                    // element; after a `,` a `]` is a trailing comma.
-                    b']' if matches!(self.frame, Frame::AfterOpen | Frame::Separator) => {
-                        self.frame = Frame::Closed
-                    }
-                    // The offset only: the byte may be part of a credential-
-                    // bearing body and this message is persisted.
-                    _ => bail!("Antigravity stream framing is invalid at byte {}", self.pos),
-                }
+        let mut events = Vec::new();
+        let mut consumed = 0;
+        while let Some(offset) = self.pending[consumed..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+        {
+            let line_end = consumed + offset;
+            let mut line = &self.pending[consumed..line_end];
+            if line.last() == Some(&b'\r') {
+                line = &line[..line.len() - 1];
             }
-            self.pos += 1;
+            let line = String::from_utf8_lossy(line).into_owned();
+            self.line(&line, &mut events)?;
+            consumed = line_end + 1;
         }
-        // Keep the undecoded tail, starting at the open element's `{`.
-        let consumed = self.start.unwrap_or(self.pos);
         self.pending.drain(..consumed);
-        self.pos -= consumed;
-        if let Some(start) = self.start.as_mut() {
-            *start -= consumed;
-        }
-        Ok(elements)
+        Ok(events)
     }
 
-    /// Called once at a clean EOF: the array must have opened AND closed, with
-    /// no unfinished element and nothing but whitespace behind it.
+    /// One complete line: a blank line dispatches the event, `data:` accumulates
+    /// into it, anything else is not payload.
+    fn line(&mut self, line: &str, events: &mut Vec<Value>) -> anyhow::Result<()> {
+        if line.is_empty() {
+            return self.dispatch(events);
+        }
+        let Some(payload) = line.strip_prefix("data:") else {
+            return Ok(());
+        };
+        let payload = payload.strip_prefix(' ').unwrap_or(payload);
+        let data = self.data.get_or_insert_with(String::new);
+        if !data.is_empty() {
+            data.push('\n');
+        }
+        data.push_str(payload);
+        Ok(())
+    }
+
+    /// A blank line ends the event. An empty payload, anything after a
+    /// terminator, and the terminator itself yield no element.
+    fn dispatch(&mut self, events: &mut Vec<Value>) -> anyhow::Result<()> {
+        let Some(data) = self.data.take() else {
+            return Ok(());
+        };
+        if self.done || data.trim().is_empty() {
+            return Ok(());
+        }
+        if data.trim() == SSE_DONE {
+            self.done = true;
+            return Ok(());
+        }
+        events.push(
+            serde_json::from_str(&data).context("cannot decode an Antigravity stream event")?,
+        );
+        Ok(())
+    }
+
+    /// Called once at a clean EOF: no line may be half-read and no event may be
+    /// waiting for its blank line.
     fn finish(&mut self) -> anyhow::Result<()> {
-        let clean = self.frame == Frame::Closed
-            && self.depth == 0
-            && self.start.is_none()
-            && !self.in_string
-            && self.pending.iter().copied().all(is_json_whitespace);
-        if !clean {
-            bail!(
-                "Antigravity response stream ended before its JSON array closed (truncated turn)"
-            );
+        if self.data.is_some() || !self.pending.is_empty() {
+            bail!("Antigravity response stream ended mid-event (truncated turn)");
         }
         Ok(())
     }
@@ -939,11 +974,149 @@ fn call_arguments(arguments: &str) -> Value {
     }
 }
 
+/// Pre-send REPAIR, in the spirit of the mature implementation of this wire:
+/// a repairable request is sent instead of refused. Empty parts are dropped
+/// (and a content left with no parts at all goes with them), a missing
+/// `functionCall` id is filled and the matching `functionResponse` reuses it, a
+/// `functionResponse` whose `name` drifted from its `functionCall` is aligned,
+/// and a tool declaration without a schema gets an object schema. Signatures
+/// are NEVER invented: the unsigned-first-call refusal already happened in
+/// [`AntigravityModel::request_body`], which is the one 400 we verified live.
+fn repair_request(request: &mut Value) {
+    let Some(contents) = request["contents"].as_array_mut() else {
+        return;
+    };
+    // Calls first: the id filled here is the one the matching result must use.
+    let mut call_names: std::collections::HashMap<String, String> = Default::default();
+    let mut unanswered: Vec<String> = Vec::new();
+    for content in contents.iter_mut() {
+        let Some(parts) = content["parts"].as_array_mut() else {
+            continue;
+        };
+        parts.retain(|part| !is_empty_part(part));
+        for part in parts.iter_mut() {
+            let Some(call) = part.get_mut("functionCall") else {
+                continue;
+            };
+            if call["id"].as_str().is_none_or(str::is_empty) {
+                call["id"] = json!(local_call_id());
+            }
+            let id = call["id"].as_str().unwrap_or_default().to_owned();
+            if let Some(name) = call["name"].as_str() {
+                call_names.insert(id.clone(), name.to_owned());
+            }
+            unanswered.push(id);
+        }
+    }
+    for content in contents.iter_mut() {
+        let Some(parts) = content["parts"].as_array_mut() else {
+            continue;
+        };
+        for part in parts.iter_mut() {
+            let Some(response) = part.get_mut("functionResponse") else {
+                continue;
+            };
+            let mut id = response["id"].as_str().unwrap_or_default().to_owned();
+            if id.is_empty() {
+                // The next call still waiting for its result.
+                id = unanswered.first().cloned().unwrap_or_else(local_call_id);
+                response["id"] = json!(id);
+            }
+            if let Some(position) = unanswered.iter().position(|open| *open == id) {
+                unanswered.remove(position);
+            }
+            if let Some(name) = call_names.get(&id) {
+                response["name"] = json!(name);
+            }
+        }
+    }
+    contents.retain(|content| {
+        content["parts"]
+            .as_array()
+            .is_some_and(|parts| !parts.is_empty())
+    });
+    // `pointer_mut`, not `request["tools"][0]`: a request with no tools has a
+    // JSON null there, and indexing a null panics.
+    for declaration in request
+        .pointer_mut("/tools/0/functionDeclarations")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+    {
+        if declaration["parametersJsonSchema"].is_null() {
+            declaration["parametersJsonSchema"] = json!({"type": "object"});
+        }
+    }
+}
+
+/// A part with nothing the wire can use: no call, no response, no nonempty
+/// text, no signature. A signature-only part is kept — it belongs to the call
+/// beside it and dropping it would make the batch unreplayable.
+fn is_empty_part(part: &Value) -> bool {
+    if part.get("functionCall").is_some() || part.get("functionResponse").is_some() {
+        return false;
+    }
+    !part["text"].as_str().is_some_and(|text| !text.is_empty())
+        && !part["thoughtSignature"]
+            .as_str()
+            .is_some_and(|signature| !signature.is_empty())
+}
+
 /// A unique, persisted id for a call the wire did not identify itself: pending
 /// questions are keyed by call id, so a per-turn counter would repeat across
 /// turns.
 fn local_call_id() -> String {
     format!("e-agent-call-{:016x}", rand::random::<u64>())
+}
+
+/// A fresh opaque id for one request (32 hex chars, UUID-ish): the wire wants a
+/// per-request id, and nothing derives from it, so randomness is enough.
+fn request_id() -> String {
+    format!(
+        "{:016x}{:016x}",
+        rand::random::<u64>(),
+        rand::random::<u64>()
+    )
+}
+
+/// The conversation id for these contents: SHA-256 over the role and the
+/// serialized parts of every content, hex, first 16 bytes. Deterministic on
+/// purpose — the same transcript always yields the same id, while a compaction,
+/// a fork, or any added turn changes the digest. Derived BEFORE repair fills in
+/// generated ids, so an unchanged transcript cannot produce a new id.
+fn derive_session_id(contents: &[Value]) -> String {
+    let mut hasher = Sha256::new();
+    for content in contents {
+        hasher.update(content["role"].as_str().unwrap_or_default().as_bytes());
+        hasher.update([0]);
+        for part in content["parts"].as_array().into_iter().flatten() {
+            hasher.update(part.to_string().as_bytes());
+            hasher.update([0]);
+        }
+    }
+    Sha256::digest(hasher.finalize())
+        .iter()
+        .take(16)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// The `-tiered` retry target for `model`, if this backend is known to serve
+/// the family that way: a pinned client version (our `agy` 1.5.14 too) is
+/// refused for the bare and per-tier flash ids with 404 while the SHARED tier
+/// endpoint answers 200. Only Gemini **flash** families take part, an id that
+/// already ends in `-tiered` has no second chance, and the caller retries ONCE.
+fn tiered_fallback(model: &str) -> Option<String> {
+    if model.ends_with(TIERED_SUFFIX) {
+        return None;
+    }
+    let base = ["-high", "-medium", "-low"]
+        .iter()
+        .find_map(|tier| model.strip_suffix(tier))
+        .unwrap_or(model);
+    base.strip_prefix("gemini-")
+        .filter(|family| family.ends_with("-flash"))?;
+    Some(format!("{base}{TIERED_SUFFIX}"))
 }
 
 /// A short digest standing in for a provider-controlled identifier (a call id,
