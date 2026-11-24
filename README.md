@@ -211,11 +211,10 @@ api_key_file = "kimi-key" # absolute or relative to this config file
 model = "k3"
 # Optional: Kimi Coding k3 accepts "low", "high", or "max".
 reasoning_effort = "high"
-# Optional: set true when the model accepts image input (attached via the
-# `read_image` tool or the REPL `/image <path>` command). Defaults to false;
-# a user message with images on a model without `vision = true` fails with
-# "model X does not support image input". kimi/k3 and ChatGPT/Codex vision
-# models should set it; deepseek-style models keep the default false.
+# Optional: whether the model accepts image input (attached via the
+# `read_image` tool or the REPL `/image <path>` command). Defaults to TRUE;
+# a text-only model must say `vision = false`, and a user message with images
+# then fails with "model X does not support image input".
 vision = true
 ```
 
@@ -353,7 +352,6 @@ that batch has none, instead of borrowing one. History a later assistant
 answer already closed replays exactly as recorded, so resuming or forking a
 conversation is never refused for what it merely carries.
 `--base-url` is rejected on every path, including a runtime `/model` switch;
-`vision` is ignored (the wire is text-only), and
 `reasoning_effort`/`thinking` are accepted but inert (the `generationConfig`
 mapping could not be verified against the live service). A truncated or badly
 framed stream is an error, never a shorter successful turn, and provider error
@@ -1609,11 +1607,11 @@ persisted), while the Responses wire returns the image inside that tool result's
 output parts. A missing cache file degrades to a `[image missing: <hash>]` text
 placeholder instead of failing.
 
-A model only receives images when its profile sets `vision = true` (see
-[Run](#run)). On a non-vision model the request copy strips image parts from
-user and tool messages with a text-degradation note, while the persisted
-history keeps them — switching back to a vision model restores the images on
-the next request. An explicit `/image` prompt on a non-vision model fails
+A model receives images unless its profile says `vision = false` (the key
+defaults to true; see [Run](#run)). On a text-only model the request copy strips
+image parts from user and tool messages with a text-degradation note, while the
+persisted history keeps them — switching back to a vision model restores the
+images on the next request. An explicit `/image` prompt on a non-vision model fails
 with a clear `model X does not support image input` error before any request
 is sent.
 
