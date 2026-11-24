@@ -4134,6 +4134,26 @@ fn session_entry_to_lines_maps_persisted_entry_kinds() {
     assert_eq!(out[0].text, "[background task 7 completed: demo]");
     assert!(out.iter().all(|line| line.kind == LineKind::Dim));
 
+    // A delegate completion names the child's session id (the
+    // `send_message` target) in the header, untruncated; a bash one does not.
+    let child = "sub-0123456789abcdef0123456789abcdef";
+    let out = lines(&SessionEntry::BackgroundCompletion {
+        id: 8,
+        output: format!("subagent session: {child}\nanswer"),
+        label: Some("demo".into()),
+        started_at_ms: None,
+        duration_ms: None,
+        exit_code: None,
+        signal: None,
+        status: None,
+        kind: Some("delegate".into()),
+        cancellation_source: None,
+    });
+    assert_eq!(
+        out[0].text,
+        format!("[background task 8 completed: demo] [session: {child}]")
+    );
+
     // ForkedFrom → dim provenance notice.
     let out = lines(&SessionEntry::ForkedFrom {
         source: "abc".into(),

@@ -6117,6 +6117,67 @@ async fn get_background_tasks_shows_roled_delegate_with_role_name() {
 }
 
 #[tokio::test]
+async fn get_background_tasks_tags_delegate_session_id_not_bash() {
+    let temp = tempfile::tempdir().unwrap();
+    let (bash, mut receiver) = background_bash(&temp, Duration::from_secs(30));
+    let background = bash.background.clone();
+    let tool = GetBackgroundTasks::new(background.clone(), None, None);
+
+    // A deliberately long child id: the listing must carry it verbatim so it
+    // stays copy-pasteable as `send_message`'s target.
+    let child = "sub-0123456789abcdef0123456789abcdef";
+    assert!(child.len() > 32, "test id must be long enough to matter");
+    background
+        .spawn_with_id(
+            "refactor the parser".into(),
+            Some("fixer".into()),
+            None,
+            Some(TaskDisplayMeta {
+                background: true,
+                workspace: Some("/w".into()),
+                subagent_session_id: Some(child.into()),
+                resume: None,
+            }),
+            new_exit_slot(),
+            |_| {},
+            || async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                "done".into()
+            },
+        )
+        .unwrap();
+    // A bash task has no child session and keeps today's format exactly.
+    bash.execute(json!({"command": "sleep 30", "background": true}))
+        .await
+        .unwrap();
+
+    let output = tool.execute(json!({})).await.unwrap().content;
+    let lines: Vec<&str> = output.lines().collect();
+    assert_eq!(lines[0], "2 background task(s) running:");
+    // The `#<id>: <label> (<role>)` prefix stays byte-identical; the session
+    // tag follows the existing `[background]` / `[workspace: …]` tags.
+    assert_eq!(
+        lines[1],
+        format!("#1: refactor the parser (fixer) [background] [workspace: /w] [session: {child}]")
+    );
+    assert!(
+        lines[1].contains(child),
+        "session id verbatim: {}",
+        lines[1]
+    );
+    assert_eq!(lines[2], "#2: sleep 30 (bash)");
+    assert!(
+        !lines[2].contains("[session:"),
+        "bash task must not gain a session tag: {}",
+        lines[2]
+    );
+
+    background.cancel_with_source(1, crate::agent::CancellationSource::System);
+    background.cancel_with_source(2, crate::agent::CancellationSource::System);
+    let _ = tokio::time::timeout(Duration::from_millis(200), receiver.recv()).await;
+}
+
+#[tokio::test]
 async fn subagent_background_tasks_are_scoped_for_listing_and_cancel() {
     let temp = tempfile::tempdir().unwrap();
     let (mut bash, mut receiver) = background_bash(&temp, Duration::from_secs(30));

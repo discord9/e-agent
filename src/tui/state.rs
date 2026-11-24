@@ -684,8 +684,12 @@ impl TuiState {
         id: u64,
         output: &str,
         label: Option<&str>,
+        kind: Option<&str>,
     ) {
-        self.push_line(background_completion_header(id, label), LineKind::Dim);
+        self.push_line(
+            background_completion_header(id, label, kind, output),
+            LineKind::Dim,
+        );
         let truncated = truncate_background_output(output);
         for line in truncated.lines() {
             self.push_line(line.to_owned(), LineKind::Dim);
@@ -1794,7 +1798,7 @@ impl TuiState {
                 // the next delta (the body would merge into the Dim line
                 // and lose its markdown rendering). Same as Notice/Error.
                 self.active_lane = None;
-                self.push_background_completion(id, &output, label.as_deref());
+                self.push_background_completion(id, &output, label.as_deref(), kind.as_deref());
                 // Finished section: newest first, capped. The notice fires
                 // only after the durable entry is committed, so this is a
                 // projection of `session_entries`, not a second store.
@@ -1932,14 +1936,22 @@ impl TuiState {
 
 /// Header line for a background-task completion, shared by the live event
 /// path (`push_background_completion`) and the persisted-entry replay
-/// (`session_entry_to_lines`) so the two can never drift apart.
-fn background_completion_header(id: u64, label: Option<&str>) -> String {
+/// (`session_entry_to_lines`) so the two can never drift apart. Delegate
+/// completions end with the child's untruncated session id tag, matching the
+/// model-facing notice.
+fn background_completion_header(
+    id: u64,
+    label: Option<&str>,
+    kind: Option<&str>,
+    output: &str,
+) -> String {
+    let tag = crate::agent::background_session_tag(kind, output).unwrap_or_default();
     match label.filter(|l| !l.trim().is_empty()) {
         Some(l) => {
             let previewed = crate::agent::preview(l, 60);
-            format!("[background task {id} completed: {previewed}]")
+            format!("[background task {id} completed: {previewed}]{tag}")
         }
-        None => format!("[background task {id} completed]"),
+        None => format!("[background task {id} completed]{tag}"),
     }
 }
 
@@ -2007,10 +2019,14 @@ pub(crate) fn session_entry_to_lines(entry: &SessionEntry) -> Vec<DisplayLine> {
             collapsed_summary: None,
         }],
         SessionEntry::BackgroundCompletion {
-            id, output, label, ..
+            id,
+            output,
+            label,
+            kind,
+            ..
         } => {
             let mut lines = vec![DisplayLine {
-                text: background_completion_header(*id, label.as_deref()),
+                text: background_completion_header(*id, label.as_deref(), kind.as_deref(), output),
                 kind: LineKind::Dim,
                 collapsed_summary: None,
             }];

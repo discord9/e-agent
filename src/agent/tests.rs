@@ -2370,6 +2370,68 @@ fn context_formats_background_completion_with_label_variants() {
 }
 
 #[test]
+fn context_tags_delegate_completion_notice_with_session_id() {
+    // A delegate completion notice names the child's session id — the exact
+    // `send_message` target — right after the existing header, untruncated.
+    // A bash completion carries no child session, so its header stays
+    // byte-identical to before.
+    const CHILD: &str = "sub-0123456789abcdef0123456789abcdef";
+    let cases: [(Option<&str>, String, String); 2] = [
+        (
+            Some("delegate"),
+            format!("subagent session: {CHILD}\nanswer"),
+            format!(
+                "[background task 7 completed: review] [session: {CHILD}]\nsubagent session: {CHILD}\nanswer"
+            ),
+        ),
+        (
+            Some("bash"),
+            "exit code: 0\nok".to_string(),
+            "[background task 7 completed: review]\nexit code: 0\nok".to_string(),
+        ),
+    ];
+    for (kind, output, expected) in cases {
+        let mut agent = Agent::new(
+            Box::new(ScriptedModel {
+                replies: vec![],
+                requests: Arc::new(Mutex::new(Vec::new())),
+                delays: Default::default(),
+            }),
+            vec![],
+        );
+        agent.restore_history(vec![SessionEntry::BackgroundCompletion {
+            id: 7,
+            output,
+            label: Some("review".into()),
+            started_at_ms: None,
+            duration_ms: None,
+            exit_code: None,
+            signal: None,
+            status: None,
+            kind: kind.map(str::to_string),
+            cancellation_source: None,
+        }]);
+        let msgs = agent.context();
+        assert_eq!(msgs.len(), 1);
+        let content = match &msgs[0] {
+            Message::User { content, .. } => content,
+            _ => panic!("expected a user-shaped completion notice"),
+        };
+        assert_eq!(content, &expected, "kind={kind:?}");
+        match kind {
+            Some("delegate") => assert!(
+                content.contains(&format!("[session: {CHILD}]")),
+                "delegate notice must carry the untruncated session id: {content}"
+            ),
+            _ => assert!(
+                !content.contains("[session:"),
+                "bash notice must not gain a session tag: {content}"
+            ),
+        }
+    }
+}
+
+#[test]
 fn background_completion_and_notice_coexist_in_context() {
     // Old Notice entries must still work alongside new BackgroundCompletion.
     let mut agent = Agent::new(
