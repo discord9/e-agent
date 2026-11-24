@@ -1746,13 +1746,15 @@ fn configured_model(
         // Antigravity authenticates from the CLI's own token file, read
         // lazily on first use, so no auth handle is threaded here; the OAuth
         // consumer client needed to refresh comes from the profile's
-        // provider (`client_id` / `client_secret`).
+        // provider (`client_id` / `client_secret`), as does the request
+        // pacing override (`min_interval_ms`).
         AuthMode::Antigravity => {
             let mut cm = ConfiguredModel::antigravity(AntigravityModel::new(
                 model.unwrap_or(resolved.model),
                 resolved.reasoning_effort,
                 resolved.client_id,
                 resolved.client_secret,
+                resolved.min_interval_ms,
             )?);
             cm.display = display;
             Ok(cm)

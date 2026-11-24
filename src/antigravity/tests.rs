@@ -24,6 +24,9 @@ struct Fake {
     /// Undecoded request bodies, index-aligned with `requests` (a form-encoded
     /// token refresh is not JSON, so it would otherwise be lost).
     raw: Arc<Mutex<Vec<String>>>,
+    /// Arrival time of each request, index-aligned with `requests`: the
+    /// pacing tests measure these, not the client's own clock.
+    instants: Arc<Mutex<Vec<Instant>>>,
 }
 
 impl Fake {
@@ -34,6 +37,31 @@ impl Fake {
     fn raw_bodies(&self) -> Vec<String> {
         self.raw.lock().unwrap().clone()
     }
+
+    /// Gaps between consecutive request arrivals.
+    fn gaps(&self) -> Vec<std::time::Duration> {
+        let instants = self.instants.lock().unwrap().clone();
+        instants.windows(2).map(|pair| pair[1] - pair[0]).collect()
+    }
+}
+
+/// The interval the pacing tests configure: far below the 1000 ms default, so
+/// the tests stay fast, and far above any unpaced gap (~0.2 ms).
+const PACING_TEST_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Assert one measured arrival gap is paced. An arrival stamp carries the
+/// client's per-request DISPATCH latency (wake-up after the sleep, request
+/// build, pooled socket write), which the pacer neither observes nor controls:
+/// under a loaded test runtime that jitter reaches tens of milliseconds, so the
+/// floor is 60% of the interval. It still sits ~300x above an UNPACED gap —
+/// what this discriminates against — and the exact wait is checked separately
+/// on the client's own clock, where no jitter exists.
+fn assert_paced(gap: std::time::Duration, interval: std::time::Duration, seen: &str) {
+    let floor = interval * 3 / 5;
+    assert!(
+        gap >= floor,
+        "gap {gap:?} < {floor:?} of {interval:?}: {seen}"
+    );
 }
 
 /// Serve exactly `expected` one-shot HTTP connections on a local port,
@@ -65,11 +93,14 @@ where
     let recorded = requests.clone();
     let raw: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let raw_bodies = raw.clone();
+    let instants: Arc<Mutex<Vec<Instant>>> = Arc::new(Mutex::new(Vec::new()));
+    let arrivals = instants.clone();
     tokio::spawn(async move {
         for index in 0..expected {
             let Ok((mut stream, _)) = listener.accept().await else {
                 return;
             };
+            arrivals.lock().unwrap().push(Instant::now());
             let (headers, body) = read_request(&mut stream).await;
             let path = headers
                 .lines()
@@ -90,6 +121,7 @@ where
         address,
         requests,
         raw,
+        instants,
     }
 }
 
@@ -195,6 +227,10 @@ fn model_for(fake: &Fake, token_file: PathBuf, cache_file: PathBuf) -> Antigravi
         cache_file,
         client_id: Some(TEST_CLIENT_ID.into()),
         client_secret: Some(TEST_CLIENT_SECRET.into()),
+        // Unpaced by default so the other tests keep their timing; the pacing
+        // tests set a real interval on the model.
+        min_interval: std::time::Duration::ZERO,
+        last_request: Default::default(),
     }
 }
 
@@ -1226,6 +1262,8 @@ fn tool_result_body_echoes_signature_and_function_response() {
         cache_file: dir.path().join("cache.json"),
         client_id: None,
         client_secret: None,
+        min_interval: std::time::Duration::ZERO,
+        last_request: Default::default(),
     };
     let messages = vec![
         Message::User {
@@ -2463,6 +2501,150 @@ async fn synthetic_ids_are_unique_and_duplicate_ids_are_rejected() {
     assert!(!message.contains("call_1"), "{message}");
 }
 
+/// Pacing: consecutive turns are at least `min_interval` apart, measured on
+/// the FAKE LISTENER's arrival times (not the client's clock), and the default
+/// when the provider says nothing is the documented 1000 ms.
+#[tokio::test]
+async fn request_pacing_spaces_consecutive_turns() {
+    let dir = tempfile::tempdir().unwrap();
+    let token_file = write_agy_token(
+        dir.path(),
+        "test-token",
+        Utc::now() + ChronoDuration::hours(1),
+        "refresh-token",
+    );
+    let body = array_stream(&[text_element("ok")]);
+    // A warm-up turn first, so the measured requests share the pooled
+    // connection: an arrival stamp includes the client's own dispatch latency,
+    // and a cold connect would cut into the FIRST measured gap for reasons the
+    // pacer cannot observe.
+    let fake = spawn_fake(3, move |_, _| (200, body.clone())).await;
+    let mut model = model_for(&fake, token_file, dir.path().join("cache/token.json"));
+    model.min_interval = PACING_TEST_INTERVAL;
+    let user = Message::User {
+        content: "say ok".into(),
+        images: Vec::new(),
+    };
+    let started = Instant::now();
+    for _ in 0..3 {
+        model
+            .complete(std::slice::from_ref(&user), &[], None)
+            .await
+            .unwrap();
+    }
+    // On the CLIENT's own clock nothing can shrink the wait: the two paced
+    // requests slept a full interval each, so the sequence cannot be shorter
+    // than 2 x interval (no dispatch or scheduler jitter is involved here).
+    assert!(
+        started.elapsed() >= PACING_TEST_INTERVAL * 2,
+        "two paced requests waited at least two intervals: {:?}",
+        started.elapsed()
+    );
+    let gaps = fake.gaps();
+    assert_eq!(gaps.len(), 2, "three requests were made");
+    for gap in &gaps {
+        assert_paced(*gap, PACING_TEST_INTERVAL, &format!("{gaps:?}"));
+    }
+
+    // The default is the documented 1000 ms (60 RPM).
+    let default =
+        AntigravityModel::new("gemini-3.8-flash-tiered".into(), None, None, None, None).unwrap();
+    assert_eq!(
+        default.min_interval,
+        std::time::Duration::from_millis(DEFAULT_MIN_INTERVAL_MS)
+    );
+    assert_eq!(DEFAULT_MIN_INTERVAL_MS, 1000);
+}
+
+/// Pacing: `min_interval_ms = 0` disables it explicitly — the second request
+/// goes out at once, far below the 1000 ms default.
+#[tokio::test]
+async fn zero_min_interval_sends_immediately() {
+    let dir = tempfile::tempdir().unwrap();
+    let token_file = write_agy_token(
+        dir.path(),
+        "test-token",
+        Utc::now() + ChronoDuration::hours(1),
+        "refresh-token",
+    );
+    let body = array_stream(&[text_element("ok")]);
+    let fake = spawn_fake(2, move |_, _| (200, body.clone())).await;
+    let mut model = model_for(&fake, token_file, dir.path().join("cache/token.json"));
+    model.min_interval = std::time::Duration::ZERO;
+    let user = Message::User {
+        content: "say ok".into(),
+        images: Vec::new(),
+    };
+    for _ in 0..2 {
+        model
+            .complete(std::slice::from_ref(&user), &[], None)
+            .await
+            .unwrap();
+    }
+    let gaps = fake.gaps();
+    assert_eq!(gaps.len(), 1);
+    assert!(
+        gaps[0] < PACING_TEST_INTERVAL,
+        "unpaced requests are not delayed: {:?}",
+        gaps[0]
+    );
+}
+
+/// Pacing: a 401 -> refresh -> retry is three requests, and every one of them
+/// waits its turn — the refresh is paced like any other request and the
+/// retried generation does not overtake it.
+#[tokio::test]
+async fn refresh_and_retry_are_paced_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let token_file = write_agy_token(
+        dir.path(),
+        "stale-token",
+        Utc::now() + ChronoDuration::hours(1),
+        "refresh-token",
+    );
+    let body = array_stream(&[text_element("ok")]);
+    // Connection warm-up (see `request_pacing_spaces_consecutive_turns`), then
+    // the 401 -> refresh -> retry sequence on the same pooled connection.
+    let fake = spawn_fake(4, move |index, path| match (index, path) {
+        (0, _) => (200, body.clone()),
+        (2, "/token") => (
+            200,
+            json!({"access_token": "fresh-token", "expires_in": 3599}).to_string(),
+        ),
+        (1, _) => (
+            401,
+            json!([{"error": {"code": 401, "status": "UNAUTHENTICATED"}}]).to_string(),
+        ),
+        _ => (200, body.clone()),
+    })
+    .await;
+    let mut model = model_for(&fake, token_file, dir.path().join("cache/token.json"));
+    model.min_interval = PACING_TEST_INTERVAL;
+    let user = Message::User {
+        content: "say ok".into(),
+        images: Vec::new(),
+    };
+    model
+        .complete(std::slice::from_ref(&user), &[], None)
+        .await
+        .expect("warm-up turn");
+    let (assistant, _) = model
+        .complete(std::slice::from_ref(&user), &[], None)
+        .await
+        .unwrap();
+    assert_eq!(assistant.content.as_deref(), Some("ok"));
+    let requests = fake.requests();
+    assert_eq!(requests.len(), 4, "warm-up, 401, refresh, retry");
+    assert!(requests[2].0.ends_with("/token"));
+    // The LAST TWO gaps are the refresh and the retried generation: both are
+    // requests, so both wait their turn.
+    let gaps = fake.gaps();
+    assert_eq!(gaps.len(), 3);
+    for gap in &gaps {
+        assert_paced(*gap, PACING_TEST_INTERVAL, &format!("{gaps:?}"));
+    }
+}
+
 /// H5: the real builtin toolset — including `history`'s `oneOf`/`const` schema
 /// and `bash` — rides the JSON-Schema field, not the Schema-proto
 /// `parameters` field that rejects `const` (verified live: HTTP 400
@@ -2481,6 +2663,8 @@ fn history_tool_schema_rides_the_wire() {
         cache_file: dir.path().join("cache.json"),
         client_id: None,
         client_secret: None,
+        min_interval: std::time::Duration::ZERO,
+        last_request: Default::default(),
     };
     let specs = builtin_specs(dir.path());
     assert!(specs.iter().any(|spec| spec.name == "history"));
@@ -2555,6 +2739,7 @@ async fn live_builtin_toolset_and_parallel_round_trip() {
         None,
         std::env::var("E_AGENT_ANTIGRAVITY_CLIENT_ID").ok(),
         std::env::var("E_AGENT_ANTIGRAVITY_CLIENT_SECRET").ok(),
+        None,
     )
     .unwrap();
 

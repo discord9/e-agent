@@ -1816,6 +1816,82 @@ model = "gemini-3.8-flash-tiered"
     }
 }
 
+/// Request pacing is a provider key on the Antigravity provider: it
+/// round-trips onto the resolved model (`0` included — it disables pacing
+/// explicitly), is absent when unset (the adapter's 1000 ms default applies),
+/// and is rejected on every other auth mode, exactly like the consumer client.
+#[test]
+fn min_interval_ms_round_trips_and_is_antigravity_only() {
+    let temp = tempfile::tempdir().unwrap();
+    let resolved_with = |extra: &str| {
+        let path = write_config(
+            temp.path(),
+            &format!(
+                r#"
+[providers.antigravity]
+auth = "antigravity"
+{extra}
+
+[models."antigravity/gemini"]
+model = "gemini-3.8-flash-tiered"
+"#
+            ),
+        );
+        Config::from_path(&path)
+            .unwrap()
+            .resolve(Some("antigravity/gemini"))
+            .unwrap()
+    };
+    assert_eq!(
+        resolved_with("min_interval_ms = 250").min_interval_ms,
+        Some(250)
+    );
+    assert_eq!(
+        resolved_with("min_interval_ms = 0").min_interval_ms,
+        Some(0),
+        "0 is a real value: pacing explicitly off, not the default"
+    );
+    assert_eq!(resolved_with("").min_interval_ms, None);
+
+    // Rejected on a non-antigravity auth mode, like `client_id`/`client_secret`.
+    for (source, profile, expected) in [
+        (
+            r#"
+[providers.cg]
+auth = "chatgpt"
+min_interval_ms = 100
+
+[models."cg/gpt"]
+model = "gpt"
+"#,
+            "cg/gpt",
+            "cannot set",
+        ),
+        (
+            r#"
+[providers.p1]
+base_url = "http://one"
+api_key_env = "PATH"
+min_interval_ms = 100
+
+[models."p1/m1"]
+model = "m1"
+"#,
+            "p1/m1",
+            "only auth = \"antigravity\" accepts",
+        ),
+    ] {
+        let path = write_config(temp.path(), source);
+        let error = Config::from_path(&path)
+            .unwrap()
+            .resolve(Some(profile))
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("min_interval_ms"), "{message}");
+        assert!(message.contains(expected), "{message}");
+    }
+}
+
 #[test]
 fn global_config_rejects_unknown_top_level_fields_and_sections() {
     let temp = tempfile::tempdir().unwrap();

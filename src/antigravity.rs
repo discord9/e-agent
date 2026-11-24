@@ -49,7 +49,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::agent::{AssistantMessage, Message, Model, ModelDeltaKind, ToolCall, ToolSpec, Usage};
 use crate::model::IncompleteToolCall;
@@ -67,6 +67,13 @@ pub(crate) const USER_AGENT: &str = "antigravity/cli/1.5.14 (aidev_client; os_ty
 
 /// Refresh this long before the recorded expiry.
 const EXPIRY_MARGIN: ChronoDuration = ChronoDuration::minutes(1);
+
+/// Default minimum spacing between request STARTS on one model: 1 request per
+/// second. This is a TERMS-RISK mitigation, not a quota guarantee: prolonged
+/// machine-speed use of an interactive OAuth session is what gets accounts
+/// suspended, and 60 RPM is the upper bound a third-party routing project calls
+/// defensible for sustained use. `min_interval_ms = 0` disables it.
+pub(crate) const DEFAULT_MIN_INTERVAL_MS: u64 = 1000;
 
 /// One OAuth token set. `agy`'s file and e-agent's own cache share this
 /// shape, so one reader serves both.
@@ -123,6 +130,12 @@ pub struct AntigravityModel {
     /// default is assumed (a valid access token needs neither).
     client_id: Option<String>,
     client_secret: Option<String>,
+    /// Minimum spacing between request STARTS (zero = pacing disabled), from
+    /// the provider's `min_interval_ms`.
+    min_interval: Duration,
+    /// Start time of the last request, shared by clones: the pacer's only
+    /// state. Never held across a network call (see [`Self::pace`]).
+    last_request: std::sync::Arc<tokio::sync::Mutex<Option<Instant>>>,
 }
 
 impl AntigravityModel {
@@ -142,6 +155,7 @@ impl AntigravityModel {
         reasoning_effort: Option<String>,
         client_id: Option<String>,
         client_secret: Option<String>,
+        min_interval_ms: Option<u64>,
     ) -> anyhow::Result<Self> {
         let home = crate::home_dir().ok_or_else(|| anyhow!("cannot locate the home directory"))?;
         let config_dir = crate::config::config_dir()
@@ -158,7 +172,35 @@ impl AntigravityModel {
             cache_file: config_dir.join("antigravity-token.json"),
             client_id,
             client_secret,
+            min_interval: Duration::from_millis(min_interval_ms.unwrap_or(DEFAULT_MIN_INTERVAL_MS)),
+            last_request: Default::default(),
         })
+    }
+
+    /// Reserve the next request slot: read the previous start under the lock,
+    /// store this one, and RELEASE the lock before sleeping, so the network
+    /// call never holds it. Taking the decision under the lock is what makes
+    /// concurrent callers serialize — two parallel rounds cannot both pass at
+    /// once, and each one waits its own remainder. Every request (the
+    /// generation POST, a refresh, the post-401 retry) goes through here.
+    async fn pace(&self) {
+        if self.min_interval.is_zero() {
+            return;
+        }
+        let slot = {
+            let mut last = self.last_request.lock().await;
+            let now = Instant::now();
+            // The interval is measured from the previous request's START, and
+            // that start may still be in the future (another caller already
+            // reserved it): take the first slot at least one interval later.
+            let slot = last.map_or(now, |previous| now.max(previous + self.min_interval));
+            *last = Some(slot);
+            slot
+        };
+        let wait = slot.saturating_duration_since(Instant::now());
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+        }
     }
 
     /// Model slug (the `fetchAvailableModels` id), used for display.
@@ -229,6 +271,9 @@ impl AntigravityModel {
                 "Antigravity cannot refresh the login: set `client_id` and `client_secret` on the provider in the config, copied from the `agy` install (its OAuth consumer client); a still-valid access token from `agy` works without them"
             ),
         };
+        // A refresh is a request too: it is paced like any other, not
+        // differently and not around.
+        self.pace().await;
         let response = self
             .client
             .post(&self.token_endpoint)
@@ -451,6 +496,7 @@ impl AntigravityModel {
     }
 
     async fn send(&self, token: &str, request: &Value) -> anyhow::Result<reqwest::Response> {
+        self.pace().await;
         self.client
             .post(&self.stream_url)
             .header(reqwest::header::USER_AGENT, USER_AGENT)

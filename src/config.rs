@@ -355,6 +355,10 @@ struct Provider {
     /// still-valid access token works without either key.
     client_id: Option<String>,
     client_secret: Option<String>,
+    /// `auth = "antigravity"` only: minimum spacing between request starts in
+    /// milliseconds (absent = 1000, `0` = no pacing). A terms-risk mitigation
+    /// for this OAuth session, not a quota guarantee.
+    min_interval_ms: Option<u64>,
 }
 
 /// One configured provider with its resolved credential, as returned by
@@ -424,6 +428,9 @@ pub struct ResolvedModel {
     /// every other auth mode.
     pub client_id: Option<String>,
     pub client_secret: Option<String>,
+    /// `auth = "antigravity"`: request pacing override (`min_interval_ms`);
+    /// `None` means the adapter's default. `None` for every other auth mode.
+    pub min_interval_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -941,10 +948,12 @@ impl Config {
                 );
             }
             if mode != AuthMode::Antigravity
-                && (provider.client_id.is_some() || provider.client_secret.is_some())
+                && (provider.client_id.is_some()
+                    || provider.client_secret.is_some()
+                    || provider.min_interval_ms.is_some())
             {
                 bail!(
-                    "provider `{provider_name}` with auth = `{auth}` cannot set `client_id` or `client_secret`"
+                    "provider `{provider_name}` with auth = `{auth}` cannot set `client_id`, `client_secret`, or `min_interval_ms`"
                 );
             }
             return Ok(ResolvedModel {
@@ -960,11 +969,15 @@ impl Config {
                 vision: model_profile.vision.unwrap_or(false),
                 client_id: provider.client_id.clone(),
                 client_secret: provider.client_secret.clone(),
+                min_interval_ms: provider.min_interval_ms,
             });
         }
-        if provider.client_id.is_some() || provider.client_secret.is_some() {
+        if provider.client_id.is_some()
+            || provider.client_secret.is_some()
+            || provider.min_interval_ms.is_some()
+        {
             bail!(
-                "provider `{provider_name}` sets `client_id`/`client_secret`, which only auth = \"antigravity\" accepts"
+                "provider `{provider_name}` sets `client_id`/`client_secret`/`min_interval_ms`, which only auth = \"antigravity\" accepts"
             );
         }
         let base_url = provider
@@ -1007,6 +1020,7 @@ impl Config {
             vision: model_profile.vision.unwrap_or(false),
             client_id: None,
             client_secret: None,
+            min_interval_ms: None,
         })
     }
 
