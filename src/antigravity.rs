@@ -169,6 +169,10 @@ pub struct AntigravityModel {
     /// Start time of the last request, shared by clones: the pacer's only
     /// state. Never held across a network call (see [`Self::pace`]).
     last_request: std::sync::Arc<tokio::sync::Mutex<Option<Instant>>>,
+    /// `<conversation>` of every `requestId`: derived from the FIRST turn's
+    /// contents and then frozen, so each turn of the session — and every clone
+    /// of this model — sends the same conversation segment.
+    conversation: std::sync::Arc<std::sync::OnceLock<String>>,
 }
 
 impl AntigravityModel {
@@ -207,7 +211,22 @@ impl AntigravityModel {
             client_secret,
             min_interval: Duration::from_millis(min_interval_ms.unwrap_or(DEFAULT_MIN_INTERVAL_MS)),
             last_request: Default::default(),
+            conversation: Default::default(),
         })
+    }
+
+    /// The two ids a `requestId` carries: the session's CONVERSATION id
+    /// (UUID-shaped, derived from the first turn's contents and then frozen for
+    /// this model instance) and this TURN's trajectory id (derived from this
+    /// turn's contents, so a retry reuses it and the next turn does not).
+    fn turn_ids(&self, request: &Value) -> (String, String) {
+        let contents = request["request"]["contents"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let digest = conversation_digest(contents);
+        let conversation = self.conversation.get_or_init(|| uuid_like(digest)).clone();
+        (conversation, uuid_like(digest))
     }
 
     /// Reserve the next request slot: read the previous start under the lock,
@@ -528,15 +547,14 @@ impl AntigravityModel {
             request["tools"] = json!([{"functionDeclarations": declarations}]);
         }
         repair_request(&mut request);
-        // Per-request metadata the CLI sends: `requestType` marks an agent
-        // turn and `requestId` is fresh per request, while `request.sessionId`
-        // identifies the CONVERSATION (see `derive_session_id`) so the backend
-        // can group one transcript's turns.
+        // `requestType` marks an agent turn and `request.sessionId` identifies
+        // the CONVERSATION (see `derive_session_id`). `requestId` is stamped
+        // PER REQUEST by `complete`, not here: its step counts the requests of
+        // one turn, and the retries are made there.
         Ok(json!({
             "project": PROJECT,
             "model": self.model,
             "requestType": REQUEST_TYPE,
-            "requestId": request_id(),
             "userAgent": REQUEST_USER_AGENT,
             "request": request,
         }))
@@ -570,12 +588,22 @@ impl Model for AntigravityModel {
         on_delta: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
     ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
         crate::agent::ensure_vision_supported(&self.model, false, messages)?;
-        let request = self.request_body(messages, tools)?;
+        let mut request = self.request_body(messages, tools)?;
+        // The ids a `requestId` is built from, and the STEP counter: every
+        // request of THIS turn advances the step (the 401 retry and the 404
+        // fallback included), and the next turn starts again at 0. The counter
+        // is a local because every retry of a turn is made here — no state has
+        // to be threaded through a call path that lacks it.
+        let (conversation, trajectory) = self.turn_ids(&request);
+        let mut step = 0;
+        set_request_id(&mut request, &conversation, &trajectory, step);
         let token = self.access_token().await?;
         let mut response = self.send(&token, &request).await?;
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
             // One bounded recovery: refresh once, then retry the same body.
             let token = self.refresh().await?;
+            step += 1;
+            set_request_id(&mut request, &conversation, &trajectory, step);
             response = self.send(&token, &request).await?;
         }
         if response.status() == reqwest::StatusCode::NOT_FOUND
@@ -587,6 +615,8 @@ impl Model for AntigravityModel {
             // starts from the configured id again (a 404 costs one request).
             let mut retried = request.clone();
             retried["model"] = json!(tiered);
+            step += 1;
+            set_request_id(&mut retried, &conversation, &trajectory, step);
             response = self.send(&token, &retried).await?;
         }
         let status = response.status();
@@ -1084,22 +1114,32 @@ fn local_call_id() -> String {
     format!("e-agent-call-{:016x}", rand::random::<u64>())
 }
 
-/// A fresh opaque id for one request (32 hex chars, UUID-ish): the wire wants a
-/// per-request id, and nothing derives from it, so randomness is enough.
-fn request_id() -> String {
-    format!(
-        "{:016x}{:016x}",
-        rand::random::<u64>(),
-        rand::random::<u64>()
-    )
+/// The `requestId` the official client sends:
+/// `agent/<conversation>/<millis>/<trajectory>/<step>` — the shape 9router
+/// validates as `/^agent\/[^/]+\/\d+\/[^/]+\/\d+$/` and its hardening
+/// notes name as a cause of 403s, so a plain opaque token cannot stand in.
+fn request_id(conversation: &str, millis: i64, trajectory: &str, step: u64) -> String {
+    format!("agent/{conversation}/{millis}/{trajectory}/{step}")
 }
 
-/// The conversation id for these contents: SHA-256 over the role and the
-/// serialized parts of every content, hex, first 16 bytes. Deterministic on
-/// purpose — the same transcript always yields the same id, while a compaction,
-/// a fork, or any added turn changes the digest. Derived BEFORE repair fills in
-/// generated ids, so an unchanged transcript cannot produce a new id.
-fn derive_session_id(contents: &[Value]) -> String {
+/// Stamp the next request's id: the current time is read HERE, so a retry
+/// carries its own `<millis>` with the same conversation and trajectory.
+fn set_request_id(request: &mut Value, conversation: &str, trajectory: &str, step: u64) {
+    request["requestId"] = json!(request_id(
+        conversation,
+        Utc::now().timestamp_millis(),
+        trajectory,
+        step
+    ));
+}
+
+/// SHA-256 over the role and the serialized parts of every content, first 16
+/// bytes: the shared input of `sessionId`, `<conversation>`, and
+/// `<trajectory>`. Deterministic on purpose — the same transcript always yields
+/// the same digest, while a compaction, a fork, or any added turn changes it.
+/// Taken BEFORE repair fills in generated ids, so an unchanged transcript cannot
+/// produce a new one.
+fn conversation_digest(contents: &[Value]) -> [u8; 16] {
     let mut hasher = Sha256::new();
     for content in contents {
         hasher.update(content["role"].as_str().unwrap_or_default().as_bytes());
@@ -1109,11 +1149,39 @@ fn derive_session_id(contents: &[Value]) -> String {
             hasher.update([0]);
         }
     }
-    Sha256::digest(hasher.finalize())
+    let digest = Sha256::digest(hasher.finalize());
+    let mut truncated = [0u8; 16];
+    truncated.copy_from_slice(&digest[..16]);
+    truncated
+}
+
+/// `request.sessionId`: the digest as 32 hex characters. Its shape is not
+/// load-bearing (only `requestId`'s is), so it stays exactly as it was.
+fn derive_session_id(contents: &[Value]) -> String {
+    conversation_digest(contents)
         .iter()
-        .take(16)
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+/// A UUID-shaped (version 4, RFC 4122 variant) rendering of a digest: 8-4-4-4-12
+/// hex, so `requestId`'s segments look like the client's UUIDs without pulling
+/// in a uuid crate.
+fn uuid_like(mut digest: [u8; 16]) -> String {
+    digest[6] = (digest[6] & 0x0f) | 0x40;
+    digest[8] = (digest[8] & 0x3f) | 0x80;
+    let hex = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
 
 /// The `-tiered` retry target for `model`, if this backend is known to serve

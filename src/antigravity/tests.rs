@@ -233,6 +233,7 @@ fn model_for(fake: &Fake, token_file: PathBuf, cache_file: PathBuf) -> Antigravi
         // Unpaced by default so the other tests keep their timing; the pacing
         // tests set a real interval on the model.
         min_interval: std::time::Duration::ZERO,
+        conversation: Default::default(),
         last_request: Default::default(),
     }
 }
@@ -1267,6 +1268,7 @@ fn tool_result_body_echoes_signature_and_function_response() {
         client_secret: None,
         min_interval: std::time::Duration::ZERO,
         last_request: Default::default(),
+        conversation: Default::default(),
     };
     let messages = vec![
         Message::User {
@@ -2723,6 +2725,7 @@ fn history_tool_schema_rides_the_wire() {
         client_secret: None,
         min_interval: std::time::Duration::ZERO,
         last_request: Default::default(),
+        conversation: Default::default(),
     };
     let specs = builtin_specs(dir.path());
     assert!(specs.iter().any(|spec| spec.name == "history"));
@@ -2900,6 +2903,7 @@ fn request_metadata_carries_type_id_and_derived_session() {
         client_secret: None,
         min_interval: std::time::Duration::ZERO,
         last_request: Default::default(),
+        conversation: Default::default(),
     };
     let user = Message::User {
         content: "hi".into(),
@@ -2917,11 +2921,10 @@ fn request_metadata_carries_type_id_and_derived_session() {
         "the CLI sends both a body-level userAgent and the HTTP header"
     );
     assert_eq!(again["userAgent"], "antigravity");
-    let request_id = first["requestId"].as_str().expect("requestId");
-    assert_eq!(request_id.len(), 32, "32 hex chars: {request_id}");
-    assert_ne!(
-        request_id, again["requestId"],
-        "a request id identifies ONE request"
+    assert!(
+        first.get("requestId").is_none(),
+        "`requestId` is stamped per REQUEST in `complete` (its step counts the \
+         requests of one turn), not by the body builder"
     );
     let session = first["request"]["sessionId"].as_str().expect("sessionId");
     assert_eq!(session.len(), 32, "16 bytes of hex: {session}");
@@ -2945,6 +2948,123 @@ fn request_metadata_carries_type_id_and_derived_session() {
         session,
         changed["request"]["sessionId"].as_str().unwrap(),
         "a changed transcript changes the derived id"
+    );
+}
+
+/// The `requestId` shape the official client sends, spelled out because the
+/// crate has no regex dependency: `/^agent\/[^/]+\/\d+\/[^/]+\/\d+$/`, with the
+/// two id segments UUID-shaped.
+fn assert_request_id_shape(id: &str) {
+    let parts: Vec<&str> = id.split('/').collect();
+    assert_eq!(
+        parts.len(),
+        5,
+        "agent/<conversation>/<millis>/<trajectory>/<step>: {id}"
+    );
+    assert_eq!(parts[0], "agent", "{id}");
+    for digit in [parts[2], parts[4]] {
+        assert!(
+            !digit.is_empty() && digit.chars().all(|c| c.is_ascii_digit()),
+            "`{digit}` must be pure digits: {id}"
+        );
+    }
+    for segment in [parts[1], parts[3]] {
+        assert!(!segment.is_empty(), "{id}");
+        let groups: Vec<usize> = segment.split('-').map(str::len).collect();
+        assert_eq!(groups, vec![8, 4, 4, 4, 12], "UUID-shaped: {id}");
+        assert!(
+            segment.chars().all(|c| c == '-' || c.is_ascii_hexdigit()),
+            "{id}"
+        );
+    }
+}
+
+/// The `requestId` is `agent/<conversation>/<millis>/<trajectory>/<step>`: the
+/// step counts the requests of ONE turn (a 401 refresh + retry are further
+/// steps) and resets for the next turn, while the conversation segment stays
+/// the same for every turn of the session and the trajectory follows the turn.
+#[tokio::test]
+async fn request_id_matches_the_cli_shape_and_counts_steps() {
+    let dir = tempfile::tempdir().unwrap();
+    let token_file = write_agy_token(
+        dir.path(),
+        "stale-token",
+        Utc::now() + ChronoDuration::hours(1),
+        "refresh-token",
+    );
+    let body = sse_body(&[text_element("ok")]);
+    let fake = spawn_fake(4, move |index, path| match (index, path) {
+        (1, "/token") => (
+            200,
+            json!({"access_token": "fresh-token", "expires_in": 3599}).to_string(),
+        ),
+        (0, _) => (
+            401,
+            json!([{"error": {"code": 401, "status": "UNAUTHENTICATED"}}]).to_string(),
+        ),
+        _ => (200, body.clone()),
+    })
+    .await;
+    let mut model = model_for(&fake, token_file, dir.path().join("cache/token.json"));
+    let user = Message::User {
+        content: "one".into(),
+        images: Vec::new(),
+    };
+    // Turn one: 401 -> refresh -> retry, i.e. two REQUESTS of one turn.
+    model
+        .complete(std::slice::from_ref(&user), &[], None)
+        .await
+        .expect("turn one");
+    // Turn two: the transcript grew, and the step counter starts over.
+    let longer = vec![
+        user,
+        Message::Assistant(AssistantMessage {
+            content: Some("ok".into()),
+            tool_calls: Vec::new(),
+            reasoning: None,
+        }),
+        Message::User {
+            content: "two".into(),
+            images: Vec::new(),
+        },
+    ];
+    model.complete(&longer, &[], None).await.expect("turn two");
+
+    let ids: Vec<String> = fake
+        .requests()
+        .into_iter()
+        .filter(|(path, _, _)| path.contains("streamGenerateContent"))
+        .map(|(_, _, body)| body["requestId"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert_eq!(
+        ids.len(),
+        3,
+        "two requests in turn one (401 + retry), one in turn two: {ids:?}"
+    );
+    for id in &ids {
+        assert_request_id_shape(id);
+    }
+    let segments = |id: &String| id.split('/').map(str::to_owned).collect::<Vec<_>>();
+    let first = segments(&ids[0]);
+    let retry = segments(&ids[1]);
+    let next = segments(&ids[2]);
+    assert_eq!(first[4], "0", "the first request of a turn is step 0");
+    assert_eq!(retry[4], "1", "the 401 retry is a further step");
+    assert_eq!(next[4], "0", "a new turn starts over at step 0");
+    assert_eq!(first[1], retry[1], "one conversation for the session");
+    assert_eq!(
+        first[1], next[1],
+        "the conversation segment is stable across turns"
+    );
+    assert_eq!(first[3], retry[3], "a retry keeps the turn's trajectory");
+    assert_ne!(first[3], next[3], "a new turn has a new trajectory");
+    let millis: Vec<i64> = [&first, &retry, &next]
+        .iter()
+        .map(|parts| parts[2].parse().expect("millis parse"))
+        .collect();
+    assert!(
+        millis.windows(2).all(|pair| pair[0] <= pair[1]),
+        "millis are wall-clock: {millis:?}"
     );
 }
 
@@ -3050,6 +3170,7 @@ fn request_repair_fills_ids_aligns_names_and_drops_empty_parts() {
         client_secret: None,
         min_interval: std::time::Duration::ZERO,
         last_request: Default::default(),
+        conversation: Default::default(),
     };
     let messages = vec![
         // An empty prompt part would be an empty `text` part on the wire.
