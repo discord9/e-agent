@@ -594,6 +594,7 @@ mod tests {
                         id: format!("call_{index}"),
                         name: (*name).into(),
                         arguments: (*arguments).into(),
+                        provider_meta: None,
                     })
                     .collect(),
                 reasoning: None,

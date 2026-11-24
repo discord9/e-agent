@@ -10,18 +10,20 @@ use std::time::Duration;
 use crate::agent::{
     AssistantMessage, ImagePart, Message, Model, ModelDeltaKind, ToolCall, ToolSpec, Usage, preview,
 };
+use crate::antigravity::AntigravityModel;
 use crate::codex::{
     CONNECT_RETRY_ATTEMPTS, CONNECT_RETRY_BASE_BACKOFF_MS, CodexModel, DeltaSink,
     HTTP_RETRY_ATTEMPTS, HTTP_RETRY_BASE_BACKOFF_MS, is_retryable_http_status,
     is_stream_decode_error, retry_backoff_ms,
 };
 
-/// The two concrete model wires e-agent supports. Keeping this enum concrete
+/// The concrete model wires e-agent supports. Keeping this enum concrete
 /// preserves the existing `Model` seam while making delegated clones exact.
 #[derive(Clone)]
 pub enum ConfiguredModelKind {
     Chat(OpenAiModel),
     Codex(CodexModel),
+    Antigravity(AntigravityModel),
 }
 
 /// A configured model with an optional display name (profile key) for UI
@@ -45,6 +47,13 @@ impl ConfiguredModel {
     pub fn codex(model: CodexModel) -> Self {
         Self {
             kind: ConfiguredModelKind::Codex(model),
+            display: None,
+        }
+    }
+
+    pub fn antigravity(model: AntigravityModel) -> Self {
+        Self {
+            kind: ConfiguredModelKind::Antigravity(model),
             display: None,
         }
     }
@@ -82,6 +91,7 @@ impl Model for ConfiguredModel {
         match &self.kind {
             ConfiguredModelKind::Chat(model) => model.name(),
             ConfiguredModelKind::Codex(model) => model.name(),
+            ConfiguredModelKind::Antigravity(model) => model.name(),
         }
     }
 
@@ -89,6 +99,7 @@ impl Model for ConfiguredModel {
         match &self.kind {
             ConfiguredModelKind::Chat(model) => model.supports_vision(),
             ConfiguredModelKind::Codex(model) => model.supports_vision(),
+            ConfiguredModelKind::Antigravity(model) => model.supports_vision(),
         }
     }
     async fn complete(
@@ -100,6 +111,9 @@ impl Model for ConfiguredModel {
         match &mut self.kind {
             ConfiguredModelKind::Chat(model) => model.complete(messages, tools, on_delta).await,
             ConfiguredModelKind::Codex(model) => model.complete(messages, tools, on_delta).await,
+            ConfiguredModelKind::Antigravity(model) => {
+                model.complete(messages, tools, on_delta).await
+            }
         }
     }
 }
@@ -964,6 +978,7 @@ fn build_assistant(
                 id: call.id,
                 name: call.name,
                 arguments: call.arguments,
+                provider_meta: None,
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;

@@ -240,6 +240,7 @@ fn converts_internal_messages_and_function_schemas() {
                     id: "call-1".into(),
                     name: "read_file".into(),
                     arguments: r#"{"path":"a.txt"}"#.into(),
+                    provider_meta: None,
                 }],
                 reasoning: None,
             }),
@@ -847,6 +848,7 @@ fn tool_call_assistant(content: Option<&str>, reasoning: Option<&str>) -> Messag
             id: "call-1".into(),
             name: "bash".into(),
             arguments: r#"{"command":"pwd"}"#.into(),
+            provider_meta: None,
         }],
         reasoning: reasoning.map(str::to_owned),
     })
@@ -1183,6 +1185,7 @@ fn is_poisoned_assistant_detects_only_empty_content_and_tool_calls() {
                 id: "call-1".into(),
                 name: "bash".into(),
                 arguments: "{}".into(),
+                provider_meta: None,
             }],
             reasoning: None,
         }
@@ -1968,11 +1971,13 @@ fn chat_wire_aggregates_one_temporary_user_image_message_per_tool_batch() {
                         id: "call-1".into(),
                         name: "read_image".into(),
                         arguments: r#"{"path":"a.png"}"#.into(),
+                        provider_meta: None,
                     },
                     ToolCall {
                         id: "call-2".into(),
                         name: "read_image".into(),
                         arguments: r#"{"path":"b.png"}"#.into(),
+                        provider_meta: None,
                     },
                 ],
                 reasoning: None,
@@ -2204,4 +2209,45 @@ async fn chat_wire_sends_image_url_parts_over_http() {
         .await
         .unwrap();
     assert_eq!(message.content.as_deref(), Some("seen it"));
+}
+
+/// `provider_meta` is provider-owned: the Antigravity wire round-trips it, and
+/// the chat wire must neither serialize it nor let it perturb the call. A
+/// sentinel in the ACTUAL serialized body proves both directions.
+#[test]
+fn chat_wire_never_serializes_another_providers_call_blob() {
+    const SENTINEL: &str = "SENTINEL-ANTIGRAVITY-SIGNATURE";
+    let request = ChatRequest::from_internal(
+        "test-model",
+        None,
+        false,
+        false,
+        &[
+            Message::Assistant(AssistantMessage {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "call-1".into(),
+                    name: "bash".into(),
+                    arguments: r#"{"command":"ls"}"#.into(),
+                    provider_meta: Some(SENTINEL.into()),
+                }],
+                reasoning: None,
+            }),
+            Message::Tool {
+                call_id: "call-1".into(),
+                name: "bash".into(),
+                content: "a.txt".into(),
+                is_error: false,
+                synthetic: false,
+                images: vec![],
+            },
+        ],
+        &[],
+        None,
+    );
+    let wire = serde_json::to_string(&serde_json::to_value(request).unwrap()).unwrap();
+    assert!(!wire.contains(SENTINEL), "{wire}");
+    assert!(!wire.contains("provider_meta"), "{wire}");
+    assert!(!wire.contains("thoughtSignature"), "{wire}");
+    assert!(wire.contains("call-1"), "{wire}");
 }

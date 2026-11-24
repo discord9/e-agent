@@ -4459,6 +4459,7 @@ async fn fork_rejects_a_mid_turn_compaction_with_an_unanswered_tool_call() {
         id: "call-mid-turn".into(),
         name: "bash".into(),
         arguments: "{}".into(),
+        provider_meta: None,
     };
     let pending = Message::Assistant(AssistantMessage {
         content: None,

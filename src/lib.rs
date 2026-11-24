@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod antigravity;
 pub mod codex;
 pub mod codex_auth;
 pub mod config;

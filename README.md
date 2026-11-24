@@ -289,6 +289,85 @@ usual. `e-agent logout` removes only `$XDG_CONFIG_HOME/e-agent/auth.json` (or
 workspace session. `--model` is allowed for these profiles; `--base-url` is
 rejected because the Codex endpoint is fixed.
 
+Antigravity profiles speak the Cloud Code streaming endpoint natively with the
+Antigravity CLI's own OAuth login — no CLI subprocess, no API key, no base URL:
+
+```toml
+[providers.antigravity]
+auth = "antigravity"
+# The `agy` install's own OAuth consumer client, copied from that install.
+# Needed only to refresh an expired login (see below); no default ships in
+# e-agent.
+client_id = "<client id from the agy install>"
+client_secret = "<client secret from the agy install>"
+
+[models."antigravity/gemini-flash"]
+model = "gemini-3.8-flash-tiered"   # a slug from the CLI's model list
+context_window = 65536
+```
+
+Credentials come from
+`~/.gemini/antigravity-cli/antigravity-oauth-token`, which stays READ-ONLY: an
+expired access token (or a request rejected with 401 — one refresh, then one
+retry, never a loop) is exchanged — with the provider's `client_id` /
+`client_secret`, the CLI install's own OAuth consumer client; a still-valid
+access token needs neither, and a refresh without them fails with a message
+naming both keys — and the result cached in
+`$XDG_CONFIG_HOME/e-agent/antigravity-token.json`, never written back to the
+CLI's file. That cache is owner-only (0600, a Unix promise; on Windows the file
+inherits the directory ACL), is replaced atomically (private temp file in the
+destination directory, fsync, rename — so an interrupted write cannot truncate
+it and a symlink at that path is replaced, never written through), and is BOUND
+to the CLI login: it records a hash of the CLI refresh credential it was
+written for and is ignored once `agy` logs into another account, so a re-login
+can never keep spending the old one. A malformed CLI file is reported (path,
+line, column) rather than masked by the cache: without it e-agent cannot tell
+which account the cache belongs to. A refresh rejected with `invalid_grant` is
+definitive: the cached entry is removed — only when it still holds the very
+credential that was rejected, compared and unlinked under the same process-wide
+lock that replacement takes, so a newer entry another refresh installed is
+never thrown away (cross-process races are out of scope: replacement is an
+atomic rename, so a second e-agent process can at worst lose its cache entry,
+never a login) — and the next request starts over from `agy`'s own
+credential, with the error saying to run `agy` (the failed turn itself is not
+retried again). Replacement is atomic, but the rename is not followed by
+a directory fsync — durability across a power loss is the filesystem's job, a
+documented limit rather than a promise. A relative or empty `XDG_CONFIG_HOME`
+is ignored (the XDG spec requires an absolute path) and `~/.config/e-agent` is
+used instead.
+
+Tool declarations ride `parametersJsonSchema`: the Schema-proto `parameters`
+field rejects `const`, which the builtin `history` tool's schema uses (verified
+live — `parameters` answers 400 INVALID_ARGUMENT, `parametersJsonSchema`
+accepts the whole builtin toolset and the model invokes `history` with the
+arguments the schema declares). Tool calls are native `functionCall` parts whose
+`thoughtSignature` must ride back on the next request; e-agent keeps it in an
+opaque per-call `provider_meta` blob that only this wire reads and isolates it
+at its own part position. A parallel batch is signed by the provider on its
+first call only, and that is exactly what is replayed (a sibling that arrived
+unsigned stays unsigned — verified live: as-received replay 200, duplicated
+signature 200, signature-less replay 400). Only the tool batch being continued
+now — the trailing run of tool results and the assistant turn that asked for
+them — must carry its signature: it is refused locally, naming the call, when
+that batch has none, instead of borrowing one. History a later assistant
+answer already closed replays exactly as recorded, so resuming or forking a
+conversation is never refused for what it merely carries.
+`--base-url` is rejected on every path, including a runtime `/model` switch;
+`vision` is ignored (the wire is text-only), and
+`reasoning_effort`/`thinking` are accepted but inert (the `generationConfig`
+mapping could not be verified against the live service). A truncated or badly
+framed stream is an error, never a shorter successful turn, and provider error
+bodies are never surfaced: the message carries the HTTP status plus, only when
+the body's value is exactly one of a fixed set of known codes
+(`INVALID_ARGUMENT`, `UNAUTHENTICATED`, `invalid_grant`, …), that constant —
+never the body's own text, whatever shape it takes, because these messages are
+persisted in the session log. Any part with nonempty text is text: it emits
+its delta (provider thinking as a reasoning delta, never as assistant content
+and never replayed) even when a `thoughtSignature` is stamped on it, so that
+signature can never sign the call before it. A signature-only part — no text at
+all — signs the call it directly follows, and any intervening part breaks that
+adjacency, an empty text part included.
+
 The default delegated model can be routed with `[roles] subagent`; named
 role templates can also be routed by role name. Role templates are discovered from three layers, in increasing priority:
 `$XDG_CONFIG_HOME/e-agent/agents/<role>.md` (falling back to
@@ -1784,7 +1863,13 @@ framework, permission framework, plugin host, generic provider/auth framework,
 parallel tool executor, task scheduler, priority system, or concurrency pool.
 It deliberately does not fetch provider/model catalogs (including
 models.dev), generate configuration, cache provider metadata, or infer
-context windows; TOML profiles are local static settings only. `AGENTS.md`
+context windows; TOML profiles are local static settings only. The native
+Antigravity provider does not list models (`fetchAvailableModels`) and never
+shells out to the `agy` CLI: the model slug is a static profile field, the wire
+is text-only, and no reasoning control is mapped. It also does not project or
+downgrade the builtin tool schemas to a smaller dialect — the declarations use
+the endpoint's JSON-Schema field instead — and it never rewrites `agy`'s own
+token file. `AGENTS.md`
 loading is workspace-root-only: there is no parent/nested discovery or merging.
 Subagents exist but are deliberately minimal: no arbitrary agent-to-agent messaging (only direct live parent/child `send_message`),
 no delegation deeper than 1 level, and no process-level isolation yet

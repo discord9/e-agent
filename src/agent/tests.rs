@@ -488,7 +488,27 @@ fn call(id: &str, name: &str, arguments: &str) -> ToolCall {
         id: id.into(),
         name: name.into(),
         arguments: arguments.into(),
+        provider_meta: None,
     }
+}
+
+/// `provider_meta` is an optional, provider-owned round-trip blob: sessions
+/// written before it existed still load, and a call without it stays clean.
+#[test]
+fn tool_call_provider_meta_is_optional_on_the_wire_and_in_sessions() {
+    let stored: ToolCall =
+        serde_json::from_str(r#"{"id":"call_1","name":"bash","arguments":"{\"command\":\"ls\"}"}"#)
+            .unwrap();
+    assert_eq!(stored.provider_meta, None);
+    assert_eq!(call("call_1", "bash", "{}").provider_meta, None);
+    let signed = ToolCall {
+        provider_meta: Some("sig".into()),
+        ..stored
+    };
+    assert_eq!(
+        serde_json::to_value(&signed).unwrap()["provider_meta"],
+        "sig"
+    );
 }
 
 #[tokio::test]
@@ -3591,6 +3611,7 @@ fn fork_prefix_rejects_mid_turn_at() {
                 id: "call-1".into(),
                 name: "bash".into(),
                 arguments: "{}".into(),
+                provider_meta: None,
             }],
             reasoning: None,
         })
@@ -3705,6 +3726,7 @@ fn fork_prefix_complete_rejects_a_mid_turn_compaction_with_an_unanswered_tool_ca
         id: "call-mid-turn".into(),
         name: "bash".into(),
         arguments: "{}".into(),
+        provider_meta: None,
     };
     let pending = Message::Assistant(AssistantMessage {
         content: None,
@@ -3769,6 +3791,7 @@ fn fork_prefix_complete_accepts_a_superseded_synthetic_placeholder() {
         id: "call-raced".into(),
         name: "bash".into(),
         arguments: "{}".into(),
+        provider_meta: None,
     };
     let entries = vec![
         Message::User {
@@ -3832,6 +3855,7 @@ fn fork_prefix_complete_rejects_a_dangling_call_before_a_later_answer() {
                 id: "call-dangling".into(),
                 name: "bash".into(),
                 arguments: "{}".into(),
+                provider_meta: None,
             }],
             reasoning: None,
         })
@@ -3861,6 +3885,7 @@ fn fork_prefix_complete_rejects_an_unpaired_trailing_tool_call() {
                 id: "call-open".into(),
                 name: "bash".into(),
                 arguments: "{}".into(),
+                provider_meta: None,
             }],
             reasoning: None,
         })
@@ -6496,6 +6521,7 @@ async fn image_rejection_omissions_are_request_only_and_cleared_by_set_model() {
                 id: "call-1".into(),
                 name: "read_image".into(),
                 arguments: "{}".into(),
+                provider_meta: None,
             }],
             reasoning: None,
         })
@@ -7657,6 +7683,7 @@ fn latest_read_output_result_stays_full_in_request_context() {
                         id: "id".into(),
                         name: "read_output".into(),
                         arguments: "{}".into(),
+                        provider_meta: None,
                     }],
                     reasoning: None,
                 }),

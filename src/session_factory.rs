@@ -18,6 +18,7 @@ use std::time::SystemTime;
 use anyhow::{Context, anyhow};
 
 use crate::agent::{Agent, GoalSnapshot, SessionEntry};
+use crate::antigravity::AntigravityModel;
 use crate::codex::CodexModel;
 use crate::codex_auth::CodexAuth;
 use crate::config::{
@@ -392,9 +393,10 @@ impl SessionFactory {
                 // profile; checked before auth load so this message wins
                 // over an auth error. Also enforced by reload validation
                 // (`apply_reloaded_config`).
-                if matches!(resolved.main.auth, AuthMode::ChatGpt) && base_url.is_some() {
+                if resolved.main.auth != AuthMode::ApiKey && base_url.is_some() {
                     return Err(anyhow!(
-                        "--base-url cannot be used with a provider using auth = `chatgpt`"
+                        "--base-url cannot be used with a provider using auth = `{}`",
+                        auth_label(resolved.main.auth)
                     ));
                 }
                 let needs_chatgpt = resolved.main.auth == AuthMode::ChatGpt
@@ -1714,6 +1716,15 @@ fn configured_model(
     base_url: Option<String>,
     model: Option<String>,
 ) -> anyhow::Result<ConfiguredModel> {
+    // Every path that builds a wire model passes through here, including the
+    // runtime `/model` switch, so a fixed-endpoint provider rejects
+    // `--base-url` even when startup used an api_key profile.
+    if base_url.is_some() && resolved.auth != AuthMode::ApiKey {
+        return Err(anyhow!(
+            "--base-url cannot be used with a provider using auth = `{}`",
+            auth_label(resolved.auth)
+        ));
+    }
     let display = Some(resolved.display);
     match resolved.auth {
         AuthMode::ApiKey => {
@@ -1749,6 +1760,29 @@ fn configured_model(
             cm.display = display;
             Ok(cm)
         }
+        // Antigravity authenticates from the CLI's own token file, read
+        // lazily on first use, so no auth handle is threaded here; the OAuth
+        // consumer client needed to refresh comes from the profile's
+        // provider (`client_id` / `client_secret`).
+        AuthMode::Antigravity => {
+            let mut cm = ConfiguredModel::antigravity(AntigravityModel::new(
+                model.unwrap_or(resolved.model),
+                resolved.reasoning_effort,
+                resolved.client_id,
+                resolved.client_secret,
+            )?);
+            cm.display = display;
+            Ok(cm)
+        }
+    }
+}
+
+/// Config name of an alternate auth mode, for the `--base-url` rejection.
+fn auth_label(auth: AuthMode) -> &'static str {
+    match auth {
+        AuthMode::ApiKey => "api_key",
+        AuthMode::ChatGpt => "chatgpt",
+        AuthMode::Antigravity => "antigravity",
     }
 }
 
@@ -1783,9 +1817,10 @@ fn build_runtime_models(
     base_url: &Option<String>,
     model: &Option<String>,
 ) -> anyhow::Result<RuntimeModels> {
-    if matches!(resolved.main.auth, AuthMode::ChatGpt) && base_url.is_some() {
+    if resolved.main.auth != AuthMode::ApiKey && base_url.is_some() {
         return Err(anyhow!(
-            "--base-url cannot be used with a provider using auth = `chatgpt`"
+            "--base-url cannot be used with a provider using auth = `{}`",
+            auth_label(resolved.main.auth)
         ));
     }
     // A `--model` override replaces the wire model, so the profile's
@@ -2099,6 +2134,9 @@ model = "m1"
         match &model.kind {
             crate::model::ConfiguredModelKind::Chat(model) => model.reasoning_effort.as_deref(),
             crate::model::ConfiguredModelKind::Codex(model) => model.reasoning_effort.as_deref(),
+            crate::model::ConfiguredModelKind::Antigravity(model) => {
+                model.reasoning_effort.as_deref()
+            }
         }
     }
 
@@ -2148,6 +2186,42 @@ deepseek_compat = true
                 _ => panic!("expected Chat profile"),
             }
         }
+    }
+
+    /// M2: `--base-url` is rejected on EVERY path that builds a wire model.
+    /// Startup and reload check an api_key main profile, but a runtime
+    /// `/model` switch to a fixed-endpoint provider must not sneak the
+    /// override in — the guard lives in the shared construction path.
+    #[test]
+    fn runtime_switch_to_a_fixed_endpoint_profile_rejects_base_url() {
+        let temp = tempfile::tempdir().unwrap();
+        let config: Config = toml::from_str(
+            r#"default = "p1/m1"
+[providers.p1]
+base_url = "http://one"
+api_key_env = "PATH"
+[models."p1/m1"]
+model = "m1"
+
+[providers.ag]
+auth = "antigravity"
+[models."ag/gemini"]
+model = "gemini-3.8-flash-tiered"
+"#,
+        )
+        .expect("test config parses");
+        let mut factory =
+            SessionFactory::test_factory_with_config(temp.path().to_path_buf(), Some(config));
+        // The profile that started the process carries an override.
+        factory.base_url = Some("http://proxy".into());
+        let Err(error) = factory.resolve_profile("ag/gemini", None) else {
+            panic!("a fixed-endpoint provider cannot take --base-url");
+        };
+        let message = format!("{error:#}");
+        assert!(message.contains("--base-url"), "{message}");
+        assert!(message.contains("antigravity"), "{message}");
+        // The api_key profile keeps accepting the override.
+        assert!(factory.resolve_profile("p1/m1", None).is_ok());
     }
 
     #[derive(Clone, Default)]

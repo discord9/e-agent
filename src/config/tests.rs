@@ -1735,6 +1735,86 @@ model = "codex"
 }
 
 #[test]
+fn resolves_antigravity_and_rejects_mixed_credentials() {
+    let temp = tempfile::tempdir().unwrap();
+    let good = write_config(
+        temp.path(),
+        r#"
+[providers.antigravity]
+auth = "antigravity"
+
+[models."antigravity/gemini"]
+model = "gemini-3.8-flash-tiered"
+context_window = 65536
+"#,
+    );
+    let resolved = Config::from_path(&good)
+        .unwrap()
+        .resolve(Some("antigravity/gemini"))
+        .unwrap();
+    assert_eq!(resolved.auth, AuthMode::Antigravity);
+    assert_eq!(resolved.model, "gemini-3.8-flash-tiered");
+    assert_eq!(resolved.context_window, Some(65536));
+    // Fixed endpoint and no API key: neither comes from the config.
+    assert!(resolved.base_url.is_empty());
+    assert!(resolved.api_key.is_empty());
+    // The refresh-only consumer client is absent here (no default in code)...
+    assert!(resolved.client_id.is_none() && resolved.client_secret.is_none());
+    // ...and resolves verbatim onto the provider when it is configured.
+    let keyed = write_config(
+        temp.path(),
+        r#"
+[providers.antigravity]
+auth = "antigravity"
+client_id = "test-client.apps.googleusercontent.com"
+client_secret = "GOCSPX-test"
+
+[models."antigravity/gemini"]
+model = "gemini-3.8-flash-tiered"
+"#,
+    );
+    let resolved = Config::from_path(&keyed)
+        .unwrap()
+        .resolve(Some("antigravity/gemini"))
+        .unwrap();
+    assert_eq!(
+        (
+            resolved.client_id.as_deref(),
+            resolved.client_secret.as_deref()
+        ),
+        (
+            Some("test-client.apps.googleusercontent.com"),
+            Some("GOCSPX-test")
+        )
+    );
+    for field in [
+        "base_url = \"https://example.test\"",
+        "api_key_file = \"key\"",
+        "api_key_env = \"KEY\"",
+    ] {
+        let path = write_config(
+            temp.path(),
+            &format!(
+                r#"
+[providers.antigravity]
+auth = "antigravity"
+{field}
+
+[models."antigravity/gemini"]
+model = "gemini-3.8-flash-tiered"
+"#
+            ),
+        );
+        let error = Config::from_path(&path)
+            .unwrap()
+            .resolve(Some("antigravity/gemini"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("auth = `antigravity` cannot set"), "{error}");
+    }
+}
+
+#[test]
 fn global_config_rejects_unknown_top_level_fields_and_sections() {
     let temp = tempfile::tempdir().unwrap();
     for source in [
@@ -3584,4 +3664,36 @@ writable_paths = ["./p"]
         .0,
         "unknown"
     );
+}
+
+/// A relative or empty `XDG_CONFIG_HOME` is ignored (the XDG spec requires an
+/// absolute path), so a bogus value can never place e-agent's credential cache
+/// relative to the current directory.
+///
+/// The test never points `XDG_CONFIG_HOME` at a temp directory: the fallback it
+/// asserts is `$HOME/.config/e-agent`, so a concurrent non-locking reader (role
+/// discovery) keeps seeing the same config tree it sees with the variable
+/// unset. The absolute-value case is covered end-to-end by the roles and
+/// session-factory tests.
+#[test]
+fn config_dir_ignores_a_non_absolute_xdg_config_home() {
+    let _guard = crate::roles::XDG_TEST_LOCK.lock().unwrap();
+    let Some(home) = crate::home_dir() else {
+        return;
+    };
+    let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
+    for bogus in ["", "relative/dir", "./e-agent", "../e-agent"] {
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", bogus) };
+        assert_eq!(
+            crate::config::config_dir(),
+            Some(home.join(".config/e-agent")),
+            "XDG_CONFIG_HOME={bogus:?} must fall back to $HOME"
+        );
+    }
+    unsafe {
+        match old_xdg {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+    }
 }

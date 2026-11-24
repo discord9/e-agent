@@ -470,6 +470,16 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: String,
+    /// Opaque, provider-owned round-trip blob for ONE call. Only the wire
+    /// that produced it may read it back; every other provider wire ignores
+    /// it (their request builders never serialize this field).
+    /// The Antigravity wire stores the `thoughtSignature` that accompanied
+    /// the `functionCall` part here, because echoing it back with that call
+    /// on the next request is mandatory (the API 400s with INVALID_ARGUMENT
+    /// otherwise). Persisted with the session like any other call field;
+    /// absent everywhere else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_meta: Option<String>,
 }
 
 /// Lifecycle status of the session's current goal. Serialized as the

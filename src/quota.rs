@@ -1115,6 +1115,20 @@ mod tests {
         assert!(targets[0].api_key.is_empty());
     }
 
+    /// A provider with no `base_url` and no quota source (the native
+    /// Antigravity provider) is skipped, not an error: its endpoint lives in
+    /// the model adapter, not in the config.
+    #[test]
+    fn antigravity_account_without_base_url_is_skipped() {
+        let accounts = [ProviderAccount {
+            name: "antigravity".to_owned(),
+            base_url: None,
+            auth: Some("antigravity".to_owned()),
+            api_key: String::new(),
+        }];
+        assert!(targets(&accounts).is_empty());
+    }
+
     /// Every field is serialized, including the `null` ones; `kind` is one of
     /// `balance` / `quota` / `error`.
     #[test]

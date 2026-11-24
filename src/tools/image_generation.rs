@@ -1276,6 +1276,7 @@ mod tests {
                     id: id.into(),
                     name: "generate_image".into(),
                     arguments: json!({"prompt": LOOP_PROMPT, "path": path}).to_string(),
+                    provider_meta: None,
                 };
                 let tool_calls = vec![
                     call("call-image", "art/pixel.png"),

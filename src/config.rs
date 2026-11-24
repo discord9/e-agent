@@ -341,10 +341,20 @@ pub enum WebSearchProvider {
 
 #[derive(Clone, Debug, Deserialize)]
 struct Provider {
+    /// How this provider authenticates: absent = OpenAI-compatible
+    /// (`base_url` plus an optional key), `"chatgpt"` = the ChatGPT login
+    /// (codex Responses wire), `"antigravity"` = the Antigravity CLI's own
+    /// OAuth token file (`~/.gemini/antigravity-cli/antigravity-oauth-token`,
+    /// read-only; e-agent caches refreshes in its own config dir).
     auth: Option<String>,
     base_url: Option<String>,
     api_key_file: Option<PathBuf>,
     api_key_env: Option<String>,
+    /// `auth = "antigravity"` only: the OAuth consumer client of the `agy`
+    /// install, needed to refresh an expired login. No default exists, and a
+    /// still-valid access token works without either key.
+    client_id: Option<String>,
+    client_secret: Option<String>,
 }
 
 /// One configured provider with its resolved credential, as returned by
@@ -409,12 +419,20 @@ pub struct ResolvedModel {
     pub display: String,
     pub context_window: Option<u64>,
     pub vision: bool,
+    /// `auth = "antigravity"`: the `agy` install's OAuth consumer client
+    /// (`client_id` / `client_secret`), needed only to refresh. `None` for
+    /// every other auth mode.
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthMode {
     ApiKey,
     ChatGpt,
+    /// Antigravity CLI OAuth token file, native
+    /// `v1internal:streamGenerateContent` wire.
+    Antigravity,
 }
 
 #[derive(Debug)]
@@ -868,15 +886,26 @@ impl Config {
             anyhow!("provider `{provider_name}` for profile `{profile}` is not defined")
         })?;
         if let Some(auth) = provider.auth.as_deref() {
-            if auth != "chatgpt" {
-                bail!("provider `{provider_name}` has unsupported auth `{auth}`");
-            }
+            // Neither alternate-auth provider takes a URL or a key from the
+            // config: their endpoint and credentials are fixed.
+            let mode = match auth {
+                "chatgpt" => AuthMode::ChatGpt,
+                "antigravity" => AuthMode::Antigravity,
+                _ => bail!("provider `{provider_name}` has unsupported auth `{auth}`"),
+            };
             if provider.base_url.is_some()
                 || provider.api_key_file.is_some()
                 || provider.api_key_env.is_some()
             {
                 bail!(
-                    "provider `{provider_name}` with auth = `chatgpt` cannot set `base_url`, `api_key_file`, or `api_key_env`"
+                    "provider `{provider_name}` with auth = `{auth}` cannot set `base_url`, `api_key_file`, or `api_key_env`"
+                );
+            }
+            if mode != AuthMode::Antigravity
+                && (provider.client_id.is_some() || provider.client_secret.is_some())
+            {
+                bail!(
+                    "provider `{provider_name}` with auth = `{auth}` cannot set `client_id` or `client_secret`"
                 );
             }
             return Ok(ResolvedModel {
@@ -886,11 +915,18 @@ impl Config {
                 reasoning_effort,
                 thinking,
                 deepseek_compat: model_profile.deepseek_compat.unwrap_or(false),
-                auth: AuthMode::ChatGpt,
+                auth: mode,
                 display: profile.to_owned(),
                 context_window: model_profile.context_window,
                 vision: model_profile.vision.unwrap_or(false),
+                client_id: provider.client_id.clone(),
+                client_secret: provider.client_secret.clone(),
             });
+        }
+        if provider.client_id.is_some() || provider.client_secret.is_some() {
+            bail!(
+                "provider `{provider_name}` sets `client_id`/`client_secret`, which only auth = \"antigravity\" accepts"
+            );
         }
         let base_url = provider
             .base_url
@@ -930,6 +966,8 @@ impl Config {
             display: profile.to_owned(),
             context_window: model_profile.context_window,
             vision: model_profile.vision.unwrap_or(false),
+            client_id: None,
+            client_secret: None,
         })
     }
 
@@ -955,9 +993,17 @@ impl Config {
 /// The user-level config directory (`$XDG_CONFIG_HOME/e-agent` or
 /// `~/.config/e-agent`), without requiring a `config.toml` to exist. Used by
 /// roles.rs to locate the global agents directory.
+///
+/// `XDG_CONFIG_HOME` is honored only when it is a NON-EMPTY ABSOLUTE path (the
+/// XDG Base Directory spec). An empty or relative value is ignored and the
+/// `$HOME` fallback applies, so a bogus value can never place e-agent's
+/// credential cache relative to the current directory.
 pub fn config_dir() -> Option<PathBuf> {
-    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
-        return Some(PathBuf::from(xdg).join("e-agent"));
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    {
+        return Some(xdg.join("e-agent"));
     }
     crate::home_dir().map(|home| home.join(".config/e-agent"))
 }

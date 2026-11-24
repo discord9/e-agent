@@ -9342,6 +9342,7 @@ model = "deepseek-chat"
                     id: "call_1".into(),
                     name: "bash".into(),
                     arguments: "ls".into(),
+                    provider_meta: None,
                 }],
                 reasoning: None,
             }),

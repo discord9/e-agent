@@ -622,6 +622,7 @@ async fn history_query_search_is_literal_and_ignores_unselected_bad_json() {
                 id: "call_1".into(),
                 name: "write_file".into(),
                 arguments: r#"{"path":"/tmp/x","content":"toolneedle"}"#.into(),
+                provider_meta: None,
             }],
             reasoning: Some(r#"reasononly "quoted reasoning""#.into()),
         }),
@@ -887,6 +888,7 @@ async fn history_query_separates_assistant_content_from_tool_call_name() {
                     id: "call_bar".into(),
                     name: "bar".into(),
                     arguments: r#"{"path":"barargs"}"#.into(),
+                    provider_meta: None,
                 }],
                 reasoning: None,
             })
@@ -897,6 +899,7 @@ async fn history_query_separates_assistant_content_from_tool_call_name() {
                     id: "call_baz".into(),
                     name: "baz".into(),
                     arguments: r#"{"path":"bazargs"}"#.into(),
+                    provider_meta: None,
                 }],
                 reasoning: None,
             })
@@ -5895,6 +5898,7 @@ fn tail_tool_call(ids: &[&str]) -> SessionEntry {
                 id: (*id).into(),
                 name: "bash".into(),
                 arguments: "{}".into(),
+                provider_meta: None,
             })
             .collect(),
         reasoning: None,
