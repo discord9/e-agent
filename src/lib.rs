@@ -7,6 +7,7 @@ pub mod markdown;
 pub mod mcp;
 pub mod model;
 pub mod output_receipt;
+mod poll_score;
 pub mod quota;
 pub mod roles;
 pub mod runner;

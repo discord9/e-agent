@@ -1,0 +1,849 @@
+[
+  {
+    "id": "p-counter-echo",
+    "label": "positive",
+    "variant": "B",
+    "note": "counter polling: three echo commands that differ only by a number",
+    "calls": [
+      {
+        "name": "bash",
+        "args": {
+          "command": "echo wait1"
+        },
+        "result": "wait1"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "echo wait2"
+        },
+        "result": "wait2"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "echo wait3"
+        },
+        "result": "wait3"
+      }
+    ]
+  },
+  {
+    "id": "p-counter-curl-page",
+    "label": "positive",
+    "variant": "B",
+    "note": "paging by counter: the model assumes a new page will show the finished task",
+    "calls": [
+      {
+        "name": "bash",
+        "args": {
+          "command": "curl -s 'https://api.test/items?page=1'"
+        },
+        "result": "{\"items\": [],\"running\": true}"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "curl -s 'https://api.test/items?page=2'"
+        },
+        "result": "{\"items\": [],\"running\": true}"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "curl -s 'https://api.test/items?page=3'"
+        },
+        "result": "{\"items\": [],\"running\": true}"
+      }
+    ]
+  },
+  {
+    "id": "p-changing-limit",
+    "label": "positive",
+    "variant": "B",
+    "note": "same tail of a static log, re-read with a growing --limit",
+    "calls": [
+      {
+        "name": "bash",
+        "args": {
+          "command": "tail -n 50 build.log"
+        },
+        "result": "…50 lines…"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "tail -n 60 build.log"
+        },
+        "result": "…60 lines…"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "tail -n 70 build.log"
+        },
+        "result": "…70 lines…"
+      }
+    ]
+  },
+  {
+    "id": "p-sleep-then-poll",
+    "label": "positive",
+    "variant": "C",
+    "note": "the live transcript shape: poll, sleep, poll, sleep with a git check",
+    "calls": [
+      {
+        "name": "get_background_tasks",
+        "args": {},
+        "result": "2 background task(s) running:\n#19886: wreck (bash)\n#19887: build (bash)"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "cd wt-wreck && sleep 30; echo ok"
+        },
+        "result": "ok"
+      },
+      {
+        "name": "get_background_tasks",
+        "args": {},
+        "result": "2 background task(s) running:\n#19886: wreck (bash)\n#19887: build (bash)"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "cd wt-wreck && sleep 30; git log -1 --oneline"
+        },
+        "result": "abc1234 fix the thing"
+      }
+    ]
+  },
+  {
+    "id": "p-double-sleep",
+    "label": "positive",
+    "variant": "C",
+    "note": "two bare sleeps in a row to wait for a background task",
+    "calls": [
+      {
+        "name": "bash",
+        "args": {
+          "command": "sleep 20"
+        },
+        "result": "ok"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "sleep 40"
+        },
+        "result": "ok"
+      }
+    ]
+  },
+  {
+    "id": "p-alternating-noops",
+    "label": "positive",
+    "variant": "D",
+    "note": "alternating no-op commands: no shape repeats, but nothing happens either",
+    "calls": [
+      {
+        "name": "bash",
+        "args": {
+          "command": "date -u +%H:%M:%S"
+        },
+        "result": "20:15:01"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "echo noop"
+        },
+        "result": "noop"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "date -u +%H:%M:%S"
+        },
+        "result": "20:15:09"
+      }
+    ]
+  },
+  {
+    "id": "p-printf-noop",
+    "label": "positive",
+    "variant": "D",
+    "note": "printf without a redirect changes nothing observable",
+    "calls": [
+      {
+        "name": "bash",
+        "args": {
+          "command": "printf 'waiting\\n'"
+        },
+        "result": "waiting"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "printf 'still waiting\\n'"
+        },
+        "result": "still waiting"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "printf 'waiting\\n'"
+        },
+        "result": "waiting"
+      }
+    ]
+  },
+  {
+    "id": "p-true-colon-noop",
+    "label": "positive",
+    "variant": "D",
+    "note": "true and : are pure no-ops",
+    "calls": [
+      {
+        "name": "bash",
+        "args": {
+          "command": "true"
+        },
+        "result": ""
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": ":"
+        },
+        "result": ""
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "true"
+        },
+        "result": ""
+      }
+    ]
+  },
+  {
+    "id": "p-same-error-different-paths",
+    "label": "positive",
+    "variant": "F",
+    "note": "the real #9-#22 family: a different path every time, the same failure every time - changing the input did not change the reason",
+    "calls": [
+      {
+        "name": "read_file",
+        "args": {
+          "path": "~/src/main.rs"
+        },
+        "result": "read failed: No such file or directory (os error 2)",
+        "error": true
+      },
+      {
+        "name": "read_file",
+        "args": {
+          "path": "/workspace/src/lib.rs"
+        },
+        "result": "read failed: No such file or directory (os error 2)",
+        "error": true
+      },
+      {
+        "name": "read_file",
+        "args": {
+          "path": "../src/agent.rs"
+        },
+        "result": "read failed: No such file or directory (os error 2)",
+        "error": true
+      },
+      {
+        "name": "read_file",
+        "args": {
+          "path": "src/agent.rs"
+        },
+        "result": "fn main() {}",
+        "error": false
+      }
+    ]
+  },
+  {
+    "id": "p-poll-while-running",
+    "label": "positive",
+    "variant": "A",
+    "note": "get_background_tasks with an unchanged task list",
+    "calls": [
+      {
+        "name": "get_background_tasks",
+        "args": {},
+        "result": "1 background task(s) running:\n#1: build (bash)"
+      },
+      {
+        "name": "get_background_tasks",
+        "args": {},
+        "result": "1 background task(s) running:\n#1: build (bash)"
+      },
+      {
+        "name": "get_background_tasks",
+        "args": {},
+        "result": "1 background task(s) running:\n#1: build (bash)"
+      }
+    ]
+  },
+  {
+    "id": "p-two-identical-polls",
+    "label": "positive",
+    "variant": "A",
+    "note": "the minimum repeat: one identical poll is already redundant",
+    "calls": [
+      {
+        "name": "get_background_tasks",
+        "args": {},
+        "result": "No background tasks running."
+      },
+      {
+        "name": "get_background_tasks",
+        "args": {},
+        "result": "No background tasks running."
+      }
+    ]
+  },
+  {
+    "id": "p-tail-static-log",
+    "label": "positive",
+    "variant": "A",
+    "note": "tail of a log that is not growing",
+    "calls": [
+      {
+        "name": "bash",
+        "args": {
+          "command": "tail -n 20 build.log"
+        },
+        "result": "line 1\nline 2\nline 3"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "tail -n 20 build.log"
+        },
+        "result": "line 1\nline 2\nline 3"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "tail -n 20 build.log"
+        },
+        "result": "line 1\nline 2\nline 3"
+      }
+    ]
+  },
+  {
+    "id": "p-ls-unchanged-dir",
+    "label": "positive",
+    "variant": "A",
+    "note": "ls of a directory that did not change",
+    "calls": [
+      {
+        "name": "bash",
+        "args": {
+          "command": "ls -la out"
+        },
+        "result": "total 0\n-rw-r--r-- 1 build"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "ls -la out"
+        },
+        "result": "total 0\n-rw-r--r-- 1 build"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "ls -la out"
+        },
+        "result": "total 0\n-rw-r--r-- 1 build"
+      }
+    ]
+  },
+  {
+    "id": "p-cat-same-file",
+    "label": "positive",
+    "variant": "A",
+    "note": "cat of the same unchanged file",
+    "calls": [
+      {
+        "name": "bash",
+        "args": {
+          "command": "cat notes.md"
+        },
+        "result": "# notes\nnothing yet"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "cat notes.md"
+        },
+        "result": "# notes\nnothing yet"
+      }
+    ]
+  },
+  {
+    "id": "p-wait-talk",
+    "label": "positive",
+    "variant": "E",
+    "note": "the reasoning itself keeps announcing that it will wait",
+    "reasoning": [
+      "Wait. I need to wait for the completion notice.",
+      "Wait. I will wait for the notice again."
+    ],
+    "calls": [
+      {
+        "name": "bash",
+        "args": {
+          "command": "date -u"
+        },
+        "result": "Tue Aug 13 20:15:01 UTC 2026"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "echo noop"
+        },
+        "result": "noop"
+      }
+    ]
+  },
+  {
+    "id": "p-mixed-wait",
+    "label": "positive",
+    "variant": "E",
+    "note": "mixed episode: sleep, poll, no-op and wait-talk in one turn",
+    "reasoning": [
+      "",
+      "Wait. I will wait for the completion notice.",
+      "Wait. Still waiting."
+    ],
+    "calls": [
+      {
+        "name": "bash",
+        "args": {
+          "command": "sleep 30; echo ok"
+        },
+        "result": "ok"
+      },
+      {
+        "name": "get_background_tasks",
+        "args": {},
+        "result": "1 background task(s) running:\n#7: wreck (bash)"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "echo noop"
+        },
+        "result": "noop"
+      }
+    ]
+  },
+  {
+    "id": "n-read-many-files",
+    "label": "negative",
+    "variant": "none",
+    "note": "reading five different files in a row is ordinary work",
+    "calls": [
+      {
+        "name": "read_file",
+        "args": {
+          "path": "src/a.rs"
+        },
+        "result": "fn a() {}"
+      },
+      {
+        "name": "read_file",
+        "args": {
+          "path": "src/b.rs"
+        },
+        "result": "fn b() {}"
+      },
+      {
+        "name": "read_file",
+        "args": {
+          "path": "src/c.rs"
+        },
+        "result": "fn c() {}"
+      },
+      {
+        "name": "read_file",
+        "args": {
+          "path": "src/d.rs"
+        },
+        "result": "fn d() {}"
+      },
+      {
+        "name": "read_file",
+        "args": {
+          "path": "src/e.rs"
+        },
+        "result": "fn e() {}"
+      }
+    ]
+  },
+  {
+    "id": "n-build-after-each-edit",
+    "label": "negative",
+    "variant": "none",
+    "note": "the same build command, but a real edit separates the runs",
+    "calls": [
+      {
+        "name": "edit_file",
+        "args": {
+          "path": "src/lib.rs"
+        },
+        "result": "edited src/lib.rs"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "cargo build"
+        },
+        "result": "Finished dev profile"
+      },
+      {
+        "name": "edit_file",
+        "args": {
+          "path": "src/agent.rs"
+        },
+        "result": "edited src/agent.rs"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "cargo build"
+        },
+        "result": "Finished dev profile"
+      }
+    ]
+  },
+  {
+    "id": "n-test-loop-changing-files",
+    "label": "negative",
+    "variant": "none",
+    "note": "a red-green loop: every test run follows a write that changed the code",
+    "calls": [
+      {
+        "name": "bash",
+        "args": {
+          "command": "cargo test"
+        },
+        "result": "3 passed"
+      },
+      {
+        "name": "write_file",
+        "args": {
+          "path": "src/a.rs",
+          "content": "fn a() { 1 }"
+        },
+        "result": "wrote src/a.rs"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "cargo test"
+        },
+        "result": "3 passed"
+      },
+      {
+        "name": "write_file",
+        "args": {
+          "path": "src/b.rs",
+          "content": "fn b() { 2 }"
+        },
+        "result": "wrote src/b.rs"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "cargo test"
+        },
+        "result": "3 passed"
+      }
+    ]
+  },
+  {
+    "id": "n-single-sleep-curl",
+    "label": "negative",
+    "variant": "none",
+    "note": "one short sleep in front of a real check is legitimate pacing",
+    "calls": [
+      {
+        "name": "bash",
+        "args": {
+          "command": "sleep 2 && curl -s https://example.test/health"
+        },
+        "result": "{\"status\":\"ok\"}"
+      }
+    ]
+  },
+  {
+    "id": "n-make-then-sleep",
+    "label": "negative",
+    "variant": "none",
+    "note": "sleep is not the first command: a real build runs in front of it",
+    "calls": [
+      {
+        "name": "bash",
+        "args": {
+          "command": "make app && sleep 1"
+        },
+        "result": "built app"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "make test && sleep 1"
+        },
+        "result": "tests passed"
+      }
+    ]
+  },
+  {
+    "id": "n-task-completes-mid-episode",
+    "label": "negative",
+    "variant": "none",
+    "note": "a completion is injected between the polls and the task list changes every time",
+    "calls": [
+      {
+        "name": "get_background_tasks",
+        "args": {},
+        "result": "2 background task(s) running:\n#1: build (bash)\n#2: test (bash)"
+      },
+      {
+        "name": "get_background_tasks",
+        "args": {},
+        "result": "1 background task(s) running:\n#2: test (bash)",
+        "completion": true
+      },
+      {
+        "name": "get_background_tasks",
+        "args": {},
+        "result": "No background tasks running."
+      }
+    ]
+  },
+  {
+    "id": "n-rg-different-patterns",
+    "label": "negative",
+    "variant": "none",
+    "note": "searching three different patterns is three different steps",
+    "calls": [
+      {
+        "name": "bash",
+        "args": {
+          "command": "rg foo"
+        },
+        "result": "src/a.rs:1: foo"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "rg bar src"
+        },
+        "result": "src/b.rs:4: bar"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "rg baz -n"
+        },
+        "result": "src/c.rs:9: baz"
+      }
+    ]
+  },
+  {
+    "id": "n-git-status-diff-log",
+    "label": "negative",
+    "variant": "none",
+    "note": "three genuinely different git commands",
+    "calls": [
+      {
+        "name": "bash",
+        "args": {
+          "command": "git status"
+        },
+        "result": "nothing to commit"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "git diff"
+        },
+        "result": "+1 -1"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "git log -1 --oneline"
+        },
+        "result": "abc1234 fix"
+      }
+    ]
+  },
+  {
+    "id": "n-long-single-command",
+    "label": "negative",
+    "variant": "none",
+    "note": "one long, genuinely useful command",
+    "calls": [
+      {
+        "name": "bash",
+        "args": {
+          "command": "cargo build --release --workspace --all-targets --features sqlite,greptime --message-format=json-render-diagnostics 2>&1 | tee build.log"
+        },
+        "result": "Finished release profile"
+      }
+    ]
+  },
+  {
+    "id": "n-read-offset-advancing",
+    "label": "negative",
+    "variant": "none",
+    "note": "legitimate paging: the same file read with an advancing offset",
+    "calls": [
+      {
+        "name": "read_file",
+        "args": {
+          "path": "build.log",
+          "offset": 0
+        },
+        "result": "log lines 0-99"
+      },
+      {
+        "name": "read_file",
+        "args": {
+          "path": "build.log",
+          "offset": 100
+        },
+        "result": "log lines 100-199"
+      },
+      {
+        "name": "read_file",
+        "args": {
+          "path": "build.log",
+          "offset": 200
+        },
+        "result": "log lines 200-299"
+      }
+    ]
+  },
+  {
+    "id": "n-two-different-bash",
+    "label": "negative",
+    "variant": "none",
+    "note": "two different commands that look alike",
+    "calls": [
+      {
+        "name": "bash",
+        "args": {
+          "command": "ls"
+        },
+        "result": "a b c"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "pwd"
+        },
+        "result": "/work"
+      }
+    ]
+  },
+  {
+    "id": "n-poll-then-new-work",
+    "label": "negative",
+    "variant": "none",
+    "note": "a poll, real work, then a poll that sees a new task",
+    "calls": [
+      {
+        "name": "get_background_tasks",
+        "args": {},
+        "result": "1 background task(s) running:\n#1: build (bash)"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "cargo build"
+        },
+        "result": "Finished dev profile"
+      },
+      {
+        "name": "get_background_tasks",
+        "args": {},
+        "result": "2 background task(s) running:\n#1: build (bash)\n#2: test (bash)"
+      }
+    ]
+  },
+  {
+    "id": "n-single-wait-thought",
+    "label": "negative",
+    "variant": "none",
+    "note": "one stray wait per message is a thought, not a habit",
+    "reasoning": [
+      "I'll wait.",
+      "Wait.",
+      "Just wait."
+    ],
+    "calls": [
+      {
+        "name": "bash",
+        "args": {
+          "command": "cat a.txt"
+        },
+        "result": "aa"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "cat b.txt"
+        },
+        "result": "bb"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "cat c.txt"
+        },
+        "result": "cc"
+      }
+    ]
+  },
+  {
+    "id": "n-same-file-growing",
+    "label": "negative",
+    "variant": "none",
+    "note": "the same file re-read while it actually grows",
+    "calls": [
+      {
+        "name": "read_file",
+        "args": {
+          "path": "run.log"
+        },
+        "result": "line 1"
+      },
+      {
+        "name": "read_file",
+        "args": {
+          "path": "run.log"
+        },
+        "result": "line 1\nline 2"
+      },
+      {
+        "name": "read_file",
+        "args": {
+          "path": "run.log"
+        },
+        "result": "line 1\nline 2\nline 3"
+      }
+    ]
+  }
+]

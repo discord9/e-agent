@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 
 use crate::model::ImageRejection;
 use crate::output_receipt::{FieldId, bound_field};
+use crate::poll_score::{self, PollWatch};
 use crate::session_store::EntryLocation;
 
 /// Content of the synthetic error result inserted for every tool call left
@@ -33,12 +34,64 @@ pub(crate) const POLL_GUARD_SENTINEL: &str = "\u{0}poll-guard-terminate";
 pub(crate) const POLL_GUARD_TERMINATION_NOTICE: &str =
     "repeated get_background_tasks calls with an unchanged task list; ending this turn";
 
+// Advisory notices for a turn spent waiting instead of ending. Each one is
+// armed by exactly one detector in [`crate::poll_score`], at most once per
+// turn, and delivered as ONE `SessionEntry::Notice` on the NEXT provider
+// request — never a tool error, never a `UserPrompt`, never a turn end. The
+// text names what was actually observed.
+
+/// Detector A: an identical tool call repeated (same tool, same canonical
+/// arguments, byte-identical result).
+pub(crate) const REPEAT_CALL_NOTICE: &str = "This call returned exactly the same text as the identical call before it, so repeating it cannot change the answer. Do not call it again. Use the result already in context, or end the turn and wait for the automatic [background task N completed] injection.";
+
+/// Detector B: three consecutive calls of the same digit-normalised shape.
+pub(crate) const REPEAT_SHAPE_NOTICE: &str = "Three calls in a row differ only by an incrementing number, so repeating the shape cannot change the answer. Do not poll with a counter: use the result already in context, or end the turn and wait for the automatic [background task N completed] injection.";
+
+/// Detectors C and D: shell-only waiting (`sleep`, `echo`, `date`, …). Both
+/// observe the same thing — a command that cannot advance the task — so they
+/// share one text.
+pub(crate) const WAIT_COMMAND_NOTICE: &str = "Waiting in the shell does not advance the background task: sleeping or echoing changes nothing it can observe. The completion is injected automatically at the next model call, so end the turn and wait for it, or do other work instead.";
+
+/// Detector E: the reasoning of a second assistant message in the turn keeps
+/// saying it will wait.
+pub(crate) const WAIT_TALK_NOTICE: &str = "Your reasoning keeps saying you will wait, but nothing advances while the turn stays open. The background completion is injected automatically at the next model call: end the turn and wait for it instead of narrating another wait.";
+
+/// Detector F: the same tool keeps failing with the same error, whatever the
+/// arguments were changed to.
+pub(crate) const SAME_ERROR_NOTICE: &str = "The same error came back again: a different path or argument does not change the reason, so retrying with another input cannot succeed. Act on the error, or stop and report it.";
+
+impl poll_score::Notice {
+    /// The constant text for what this detector actually observed.
+    pub(crate) fn text(self) -> &'static str {
+        match self {
+            poll_score::Notice::Repeat => REPEAT_CALL_NOTICE,
+            poll_score::Notice::Shape => REPEAT_SHAPE_NOTICE,
+            poll_score::Notice::Sleep | poll_score::Notice::Noop => WAIT_COMMAND_NOTICE,
+            poll_score::Notice::WaitTalk => WAIT_TALK_NOTICE,
+            poll_score::Notice::SameError => SAME_ERROR_NOTICE,
+        }
+    }
+}
+
 /// True when a tool result is the poll-guard termination result (an
 /// unchanged-snapshot poll at the configured termination threshold: 3rd for
 /// subagents, 5th for the main agent). Batch loops use this to set a local
 /// latch while retaining the complete result in history/UI.
 pub(crate) fn is_poll_guard_terminate(result: &Result<ToolOutput, String>) -> bool {
     matches!(result, Err(error) if error.ends_with(POLL_GUARD_SENTINEL))
+}
+
+/// True when the shipped `get_background_tasks` snapshot guard already
+/// answered this result — with its reminder text or its termination notice.
+/// The repeat detector must not add its own notice on that call: the shipped
+/// guard wins, so one call never produces two messages in one request.
+fn poll_guard_fired(result: &Result<ToolOutput, String>) -> bool {
+    let Err(error) = result else {
+        return false;
+    };
+    is_poll_guard_terminate(result)
+        || error.contains(POLL_GUARD_ERROR)
+        || error.contains(POLL_GUARD_TERMINATION_NOTICE)
 }
 
 /// Map a legacy sentinel to model-facing text and remove one current terminal
@@ -1347,6 +1400,10 @@ pub struct Agent {
     /// from history, and cleared only when the model is replaced
     /// ([`Self::set_model`]).
     omitted_images: HashSet<String>,
+    /// Wait-thrash detectors behind [`REPEAT_CALL_NOTICE`] and friends:
+    /// consecutive-call chains plus per-turn wait counters. Pure session state:
+    /// never persisted, never reconstructed from history.
+    poll_watch: PollWatch,
 }
 
 impl Agent {
@@ -1385,6 +1442,7 @@ impl Agent {
             older_route: None,
             compaction_mode: CompactionMode::Main,
             omitted_images: HashSet::new(),
+            poll_watch: PollWatch::default(),
         }
     }
 
@@ -1544,6 +1602,9 @@ impl Agent {
         for tool in &mut self.tools {
             tool.on_turn_start();
         }
+        // The per-turn wait counters and the once-per-turn notice latch start
+        // over; the cross-call repeat/shape chains deliberately do not.
+        self.poll_watch.start_turn();
     }
 
     /// Full append-only history (what is persisted and shown in the TUI).
@@ -2690,6 +2751,11 @@ impl Agent {
             {
                 self.emit(AgentEvent::AssistantText(content.into()));
             }
+            // Detector E: this round's reasoning is in scope right here, before
+            // the message is committed and its tool calls run, so the wait-talk
+            // signal needs no extra field. A message with no tool calls ends
+            // the turn instead (checked above): there is nothing to advise on.
+            let mut poll_notice = self.poll_watch.reasoning(assistant.reasoning.as_deref());
             self.push_message(Message::Assistant(assistant.clone()));
             // Poll guard: the terminating unchanged-snapshot
             // get_background_tasks poll (3rd for subagents, 5th for the
@@ -2729,6 +2795,23 @@ impl Agent {
                     Ok(output) => (output.content.clone(), output.images.clone()),
                     Err(error) => (tool_error_content(error).to_owned(), Vec::new()),
                 };
+                // Detectors A-D see the committed result text. A result the
+                // shipped snapshot guard already answered is not observed: that
+                // guard wins, so one call never produces two messages in the
+                // same request.
+                if !poll_guard_fired(&result) {
+                    let started = result
+                        .as_ref()
+                        .is_ok_and(|output| output.background_started);
+                    let armed = self.poll_watch.observe(
+                        &call.name,
+                        &call.arguments,
+                        &content,
+                        started,
+                        result.is_err(),
+                    );
+                    poll_notice = poll_notice.or(armed);
+                }
                 let is_error = result.is_err();
                 self.emit(AgentEvent::ToolResult {
                     is_error,
@@ -2752,6 +2835,15 @@ impl Agent {
                 // model call, no turn end).
                 self.apply_entry(SessionEntry::Notice {
                     text: BACKGROUND_REMINDER.to_owned(),
+                });
+            }
+            if let Some(notice) = poll_notice {
+                // Same delivery as the reminder above: one advisory,
+                // user-shaped context entry on the NEXT request. The turn keeps
+                // running — no tool error, no `UserPrompt`, no extra model
+                // call, no turn end.
+                self.apply_entry(SessionEntry::Notice {
+                    text: notice.text().to_owned(),
                 });
             }
             if poll_terminate {
@@ -2786,6 +2878,12 @@ impl Agent {
     async fn inject_pending_background(&mut self) -> anyhow::Result<()> {
         while !self.pending_background.is_empty() {
             let entry = self.peek_background_entry().expect("pending entry");
+            if matches!(entry, SessionEntry::BackgroundCompletion { .. }) {
+                // Waiting did produce something: the per-turn wait counters
+                // start over (a second sleep after a completion is legitimate
+                // pacing for the NEXT task).
+                self.poll_watch.background_completed();
+            }
             self.apply_entry(entry);
             self.ack_background_entry();
         }

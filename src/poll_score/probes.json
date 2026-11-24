@@ -1,0 +1,398 @@
+[
+  {
+    "id": "u-param-sweep-bench",
+    "label": "negative",
+    "variant": "B",
+    "note": "scored: a numeric parameter sweep is real work - the full benchmark report differs per size, so B's result requirement keeps it silent",
+    "calls": [
+      {
+        "name": "bash",
+        "args": {
+          "command": "./bench --size 100"
+        },
+        "result": "size=100\n  iterations: 1000\n  mean: 12.4ms\n  stddev: 0.8ms\n  p50: 12.1ms\n  p99: 14.8ms\n  throughput: 8.1 Mops/s\n  allocations: 3\n  peak memory: 1.2MB\n  status: ok"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "./bench --size 200"
+        },
+        "result": "size=200\n  iterations: 500\n  mean: 48.2ms\n  stddev: 2.1ms\n  p50: 47.0ms\n  p99: 53.6ms\n  throughput: 4.0 Mops/s\n  allocations: 7\n  peak memory: 4.8MB\n  status: ok"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "./bench --size 300"
+        },
+        "result": "size=300\n  iterations: 200\n  mean: 130.9ms\n  stddev: 6.4ms\n  p50: 128.2ms\n  p99: 149.1ms\n  throughput: 1.5 Mops/s\n  allocations: 0\n  peak memory: 11.3MB\n  status: ok"
+      }
+    ]
+  },
+  {
+    "id": "u-cargo-test-numbered",
+    "label": "negative",
+    "variant": "B",
+    "note": "scored: three numbered test suites are three real runs - each run prints its own test names and result line, so B's result requirement keeps it silent",
+    "calls": [
+      {
+        "name": "bash",
+        "args": {
+          "command": "cargo test --test suite1"
+        },
+        "result": "    Finished `test` profile in 2.1s\n     Running tests/suite1.rs\n\nrunning 1 test\ntest smoke ... ok\n\ntest result: ok. 1 passed; 0 failed; finished in 0.01s"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "cargo test --test suite2"
+        },
+        "result": "    Finished `test` profile in 1.8s\n     Running tests/suite2.rs\n\nrunning 1 test\ntest roundtrip ... ok\n\ntest result: ok. 1 passed; 0 failed; finished in 0.04s"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "cargo test --test suite3"
+        },
+        "result": "    Finished `test` profile in 2.4s\n     Running tests/suite3.rs\n\nrunning 2 tests\ntest slow ... ok\ntest fast ... ok\n\ntest result: ok. 2 passed; 0 failed; finished in 0.31s"
+      }
+    ]
+  },
+  {
+    "id": "u-write-same-content",
+    "label": "unclear",
+    "variant": "A",
+    "note": "JUDGEMENT: borderline — a repeated identical write is redundant only if nothing changed the file underneath, which the detectors cannot see",
+    "calls": [
+      {
+        "name": "write_file",
+        "args": {
+          "path": "config.toml",
+          "content": "retries = 3"
+        },
+        "result": "wrote 11 bytes to config.toml"
+      },
+      {
+        "name": "write_file",
+        "args": {
+          "path": "config.toml",
+          "content": "retries = 3"
+        },
+        "result": "wrote 11 bytes to config.toml"
+      }
+    ]
+  },
+  {
+    "id": "u-wait-interjection-reset",
+    "label": "negative",
+    "variant": "E",
+    "note": "scored: an interjection plus a real cargo build between the two messages - real work ends E's streak",
+    "reasoning": [
+      "Wait, that is the wrong borrow. I will not wait for the task; I need to fix src/a.rs first.",
+      "Wait, the fix is wrong too. I will not wait for the task."
+    ],
+    "calls": [
+      {
+        "name": "bash",
+        "args": {
+          "command": "cargo build"
+        },
+        "result": "error[E0502] borrow conflict"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "cargo build"
+        },
+        "result": "error[E0382] moved value"
+      }
+    ]
+  },
+  {
+    "id": "u-echo-piped-confirm",
+    "label": "negative",
+    "variant": "D",
+    "note": "scored: the pipeline runs a real program, so an unquoted '|' takes the command out of D's no-op set",
+    "calls": [
+      {
+        "name": "bash",
+        "args": {
+          "command": "echo y | ./scripts/confirm.sh"
+        },
+        "result": "confirmed"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "echo n | ./scripts/confirm.sh"
+        },
+        "result": "cancelled"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "echo y | ./scripts/confirm.sh"
+        },
+        "result": "confirmed"
+      }
+    ]
+  },
+  {
+    "id": "u-git-log-depth",
+    "label": "unclear",
+    "variant": "B",
+    "note": "JUDGEMENT: borderline — reading progressively deeper history is a lookup, not a poll",
+    "calls": [
+      {
+        "name": "bash",
+        "args": {
+          "command": "git log -1 --oneline"
+        },
+        "result": "abc1234 fix"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "git log -2 --oneline"
+        },
+        "result": "abc1234 fix\ndef5678 more"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "git log -3 --oneline"
+        },
+        "result": "abc1234 fix\ndef5678 more\n0123456 init"
+      }
+    ]
+  },
+  {
+    "id": "u-distinct-state-lookups",
+    "label": "unclear",
+    "variant": "none",
+    "note": "known FALSE NEGATIVE, kept on purpose: three distinct-shape lookups of unchanged state are thrash, but no shape repeats - out of scope for shape-based detectors",
+    "calls": [
+      {
+        "name": "bash",
+        "args": {
+          "command": "git show HEAD"
+        },
+        "result": "commit abc1234"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "git rev-parse HEAD"
+        },
+        "result": "abc1234"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "git branch --show-current"
+        },
+        "result": "main"
+      }
+    ]
+  },
+  {
+    "id": "u-read-unchanged-control",
+    "label": "unclear",
+    "variant": "A",
+    "note": "CONTROL: should fire — re-reading an unchanged file returns what the model already has",
+    "calls": [
+      {
+        "name": "read_file",
+        "args": {
+          "path": "src/lib.rs"
+        },
+        "result": "pub mod agent;"
+      },
+      {
+        "name": "read_file",
+        "args": {
+          "path": "src/lib.rs"
+        },
+        "result": "pub mod agent;"
+      }
+    ]
+  },
+  {
+    "id": "u-linters-control",
+    "label": "unclear",
+    "variant": "none",
+    "note": "CONTROL: should stay silent — three linters on three different files look alike but are different work",
+    "calls": [
+      {
+        "name": "bash",
+        "args": {
+          "command": "ruff check a.py"
+        },
+        "result": "All checks passed"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "ruff check b.py"
+        },
+        "result": "All checks passed"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "ruff check c.py"
+        },
+        "result": "All checks passed"
+      }
+    ]
+  },
+  {
+    "id": "u-wait-interjection-reads",
+    "label": "negative",
+    "variant": "E",
+    "note": "scored: 'Wait, that is the wrong borrow' is reasoning about a mistake, not waiting - E now requires the turn to be doing nothing but polling and shell no-ops, and this turn is reading code",
+    "reasoning": [
+      "Wait, that is the wrong borrow. Wait, the fix belongs in agent.rs.",
+      "Wait, the call site is the problem. Wait, no, the borrow checker is right."
+    ],
+    "calls": [
+      {
+        "name": "read_file",
+        "args": {
+          "path": "src/a.rs"
+        },
+        "result": "fn a() { let x = 1; }"
+      },
+      {
+        "name": "read_file",
+        "args": {
+          "path": "src/b.rs"
+        },
+        "result": "fn b() { let y = 2; }"
+      }
+    ]
+  },
+  {
+    "id": "u-terse-sweep-output",
+    "label": "unclear",
+    "variant": "B",
+    "note": "residual risk, documented not fixed: a numeric sweep whose result is a terse single line that only differs in its digits is indistinguishable from `echo wait1/2/3`, so B still fires",
+    "calls": [
+      {
+        "name": "bash",
+        "args": {
+          "command": "./bench --size 100"
+        },
+        "result": "12ms"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "./bench --size 200"
+        },
+        "result": "48ms"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "./bench --size 300"
+        },
+        "result": "130ms"
+      }
+    ]
+  },
+  {
+    "id": "n-echo-then-cat",
+    "label": "negative",
+    "variant": "none",
+    "note": "scored from real traffic: the head word is echo, but `cat -n <file>` does the work - D only counts ONE bare simple command",
+    "calls": [
+      {
+        "name": "bash",
+        "args": {
+          "command": "echo start; cat -n a.py"
+        },
+        "result": "start\n1 import os"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "echo start; cat -n b.py"
+        },
+        "result": "start\n1 import sys"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "echo start; cat -n c.py"
+        },
+        "result": "start\n1 import re"
+      }
+    ]
+  },
+  {
+    "id": "n-duplicated-reasoning",
+    "label": "negative",
+    "variant": "none",
+    "note": "scored from real traffic: the same reasoning string delivered twice because rounds are batched is ONE message, not two",
+    "reasoning": [
+      "Wait. I will wait for the completion notice.",
+      "Wait. I will wait for the completion notice."
+    ],
+    "calls": [
+      {
+        "name": "bash",
+        "args": {
+          "command": "echo noop"
+        },
+        "result": "noop"
+      },
+      {
+        "name": "bash",
+        "args": {
+          "command": "date"
+        },
+        "result": "20:15"
+      }
+    ]
+  },
+  {
+    "id": "n-same-error-two-families",
+    "label": "negative",
+    "variant": "none",
+    "note": "from real #20: two error families of two calls each - different errnos are different failures and neither family reaches three",
+    "calls": [
+      {
+        "name": "read_file",
+        "args": {
+          "path": "/root/a.rs"
+        },
+        "result": "read failed: No such file or directory (os error 2)",
+        "error": true
+      },
+      {
+        "name": "read_file",
+        "args": {
+          "path": "/root/b.rs"
+        },
+        "result": "read failed: No such file or directory (os error 2)",
+        "error": true
+      },
+      {
+        "name": "read_file",
+        "args": {
+          "path": "a.rs"
+        },
+        "result": "read failed: No such file or directory (os error 3)",
+        "error": true
+      },
+      {
+        "name": "read_file",
+        "args": {
+          "path": "b.rs"
+        },
+        "result": "read failed: No such file or directory (os error 3)",
+        "error": true
+      }
+    ]
+  }
+]
