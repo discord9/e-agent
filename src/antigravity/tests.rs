@@ -2912,6 +2912,11 @@ fn request_metadata_carries_type_id_and_derived_session() {
         .request_body(std::slice::from_ref(&user), &[])
         .unwrap();
     assert_eq!(first["requestType"], "agent");
+    assert_eq!(
+        first["userAgent"], "antigravity",
+        "the CLI sends both a body-level userAgent and the HTTP header"
+    );
+    assert_eq!(again["userAgent"], "antigravity");
     let request_id = first["requestId"].as_str().expect("requestId");
     assert_eq!(request_id.len(), 32, "32 hex chars: {request_id}");
     assert_ne!(

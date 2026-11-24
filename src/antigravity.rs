@@ -77,6 +77,9 @@ pub(crate) const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 pub(crate) const PROJECT: &str = "aicode-consumers";
 /// `requestType` every CLI generation request carries.
 pub(crate) const REQUEST_TYPE: &str = "agent";
+/// Body-level `userAgent` field the CLI sends beside `requestType` (the HTTP
+/// header is separate): reference clients send the short string `antigravity`.
+pub(crate) const REQUEST_USER_AGENT: &str = "antigravity";
 /// The shared tier endpoint suffix: what a pinned client version is allowed to
 /// reach when the backend refuses the bare/`-high|-medium|-low` flash id.
 pub(crate) const TIERED_SUFFIX: &str = "-tiered";
@@ -523,6 +526,7 @@ impl AntigravityModel {
             "model": self.model,
             "requestType": REQUEST_TYPE,
             "requestId": request_id(),
+            "userAgent": REQUEST_USER_AGENT,
             "request": request,
         }))
     }
