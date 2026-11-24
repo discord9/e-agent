@@ -54,6 +54,9 @@
 //! hazard; header order and body field order are what other clients align,
 //! but no source shows a 429 flipping on those alone.
 //!
+//! The account quota card is the ONE extra call ([`quota_summary`]):
+//! read-only, only when the quota surface asks, never during a turn.
+//!
 //! Non-goals: model listing (`fetchAvailableModels`), image input
 //! (`supports_vision` is false), a retry framework (one 401 -> refresh ->
 //! retry, and one 404 -> `-tiered` fallback, never a loop), and any
@@ -84,6 +87,11 @@ pub(crate) const STREAM_URL: &str =
     "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse";
 /// Google OAuth refresh endpoint.
 pub(crate) const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+/// Account quota summary: a `POST` with `{"project": PROJECT}` answers
+/// `groups[].buckets[]` of `{bucketId, window, remainingFraction, resetTime,
+/// disabled}` for the logged-in account. Read-only.
+pub(crate) const QUOTA_URL: &str =
+    "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
 /// The only project id this endpoint accepts.
 pub(crate) const PROJECT: &str = "aicode-consumers";
 /// `requestType` every CLI generation request carries.
@@ -658,6 +666,107 @@ impl Model for AntigravityModel {
         scanner.finish()?;
         turn.finish()
     }
+}
+
+/// Bucket-id families whose ids split as `<family>-<window>` (`3p` is the
+/// Claude/GPT family); any other family keeps its raw id.
+const BUCKET_FAMILIES: &[&str] = &["gemini", "3p", "argon"];
+
+/// One bucket of [`quota_summary`]: the two halves of its id (`gemini-5h` ->
+/// `gemini` + `5h`), or the raw id alone when the family is unknown.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct QuotaBucket {
+    pub family: String,
+    /// `5h` / `weekly`; empty when the id was not split.
+    pub window: String,
+    /// `remainingFraction` (0..=1), when the response carries a number.
+    pub remaining: Option<f64>,
+    /// `resetTime`, verbatim.
+    pub resets_at: Option<String>,
+}
+
+impl QuotaBucket {
+    /// `gemini weekly`, or the raw id: an unknown bucket is shown, never lost.
+    pub(crate) fn label(&self) -> String {
+        if self.window.is_empty() {
+            self.family.clone()
+        } else {
+            format!("{} {}", self.family, self.window)
+        }
+    }
+}
+
+/// The account's remaining quota, one row per bucket: one fresh read per call,
+/// nothing cached or polled, and never part of a turn. With no
+/// `client_id`/`client_secret` here it cannot refresh, so an expired login is
+/// an error and the next turn refreshes it as usual.
+pub(crate) async fn quota_summary() -> anyhow::Result<Vec<QuotaBucket>> {
+    let mut model = AntigravityModel::new(String::new(), None, None, None, None)?;
+    let token = model.access_token().await?;
+    quota_summary_at(&model.client, QUOTA_URL, &token).await
+}
+
+/// The one POST behind [`quota_summary`], split out so a fake server can drive
+/// it with a fixed URL and token. Status only on failure: no upstream body
+/// reaches an error.
+pub(crate) async fn quota_summary_at(
+    client: &reqwest::Client,
+    url: &str,
+    token: &str,
+) -> anyhow::Result<Vec<QuotaBucket>> {
+    let response = client
+        .post(url)
+        .header(reqwest::header::USER_AGENT, USER_AGENT)
+        .bearer_auth(token)
+        .json(&json!({"project": PROJECT}))
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .context("Antigravity quota request failed")?;
+    let value = response
+        .json()
+        .await
+        .context("cannot decode the Antigravity quota response")?;
+    parse_quota_summary(&value)
+}
+
+/// `{"groups":[{"buckets":[{"bucketId":"gemini-5h","remainingFraction":0.42,
+/// "resetTime":"2026-11-27T00:00:00Z","disabled":false}]}]}`; a bucket with no
+/// readable fraction keeps its row, and a body with no bucket is an error.
+fn parse_quota_summary(value: &Value) -> anyhow::Result<Vec<QuotaBucket>> {
+    let groups = value
+        .get("groups")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("the Antigravity quota response has no groups"))?;
+    let mut buckets = Vec::new();
+    for bucket in groups
+        .iter()
+        .flat_map(|group| group.get("buckets").and_then(Value::as_array))
+        .flatten()
+    {
+        let Some(id) = bucket.get("bucketId").and_then(Value::as_str) else {
+            continue;
+        };
+        let (family, window) = match id.split_once('-') {
+            Some((family, window)) if !window.is_empty() && BUCKET_FAMILIES.contains(&family) => {
+                (family.to_owned(), window.to_owned())
+            }
+            _ => (id.to_owned(), String::new()),
+        };
+        buckets.push(QuotaBucket {
+            family,
+            window,
+            remaining: bucket.get("remainingFraction").and_then(Value::as_f64),
+            resets_at: bucket
+                .get("resetTime")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        });
+    }
+    if buckets.is_empty() {
+        bail!("the Antigravity quota response has no bucket");
+    }
+    Ok(buckets)
 }
 
 #[derive(Clone, Copy, Default, Deserialize)]
