@@ -374,10 +374,10 @@ struct ModelProfile {
     /// auto-compacts when usage exceeds 80% of this value, and the TUI
     /// shows a percentage alongside the token count.
     context_window: Option<u64>,
-    /// Whether the model accepts image input. Defaults to false: user
-    /// messages with attached images fail the vision gate with a clear
-    /// error on non-vision models. kimi/k3 profiles should set
-    /// `vision = true`; deepseek defaults to false.
+    /// Whether the model accepts image input. Defaults to true: user
+    /// messages with attached images are sent to the model. A text-only
+    /// model must opt out explicitly with `vision = false`; otherwise its
+    /// image-bearing turns fail the vision gate with a clear error.
     #[serde(default)]
     vision: Option<bool>,
     /// DeepSeek Chat wire compatibility (default false). Solely for
@@ -889,7 +889,7 @@ impl Config {
                 auth: AuthMode::ChatGpt,
                 display: profile.to_owned(),
                 context_window: model_profile.context_window,
-                vision: model_profile.vision.unwrap_or(false),
+                vision: model_profile.vision.unwrap_or(true),
             });
         }
         let base_url = provider
@@ -929,7 +929,7 @@ impl Config {
             auth: AuthMode::ApiKey,
             display: profile.to_owned(),
             context_window: model_profile.context_window,
-            vision: model_profile.vision.unwrap_or(false),
+            vision: model_profile.vision.unwrap_or(true),
         })
     }
 

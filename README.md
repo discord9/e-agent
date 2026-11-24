@@ -52,7 +52,7 @@ api_key_file = "kimi-key"          # or api_key_env = "KIMI_API_KEY"
 [models."kimi/k3"]
 model = "k3"
 reasoning_effort = "high"          # provider-specific pass-through
-vision = true                      # set only for image-capable models
+vision = true                      # default; a text-only model sets false
 ```
 
 A provider needs exactly one of `api_key_file` or `api_key_env`; with neither it
@@ -73,7 +73,7 @@ The keys most configurations touch:
 | `reasoning_effort` | optional pass-through (`low`/`high`/`max` are common) |
 | `thinking` | enable provider thinking mode where supported |
 | `context_window` | token budget used for compaction |
-| `vision` | allow image input for this profile |
+| `vision` | allow image input (default true; a text-only model sets false) |
 | `deepseek_compat` | DeepSeek Chat reasoning-replay contract |
 | `[sandbox].enabled` | run bash inside bubblewrap |
 | `[sandbox].network` / `workspace_writable` | defaults for that sandbox |
@@ -443,9 +443,10 @@ credential and profile values instead of `OPENAI_*`; see [Run](#run).
 `read_image` (tool) and the REPL `/image <path>` command attach png/jpeg/webp/gif
 images up to 10 MiB; bytes are stored once in a content-addressed cache under
 `$XDG_STATE_HOME/e-agent/images/`. Sessions persist only the reference, never
-base64, and the wire re-reads the file when sending. The profile needs
-`vision = true`, otherwise the turn fails with a model-does-not-support-images
-error. `generate_image` (main session only, ChatGPT login) writes a PNG.
+base64, and the wire re-reads the file when sending. Profiles are
+vision-capable by default; a text-only model must set `vision = false`,
+otherwise the turn fails with a model-does-not-support-images error.
+`generate_image` (main session only, ChatGPT login) writes a PNG.
 
 ## SQLite session backend
 

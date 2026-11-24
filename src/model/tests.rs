@@ -2205,3 +2205,62 @@ async fn chat_wire_sends_image_url_parts_over_http() {
         .unwrap();
     assert_eq!(message.content.as_deref(), Some("seen it"));
 }
+
+#[tokio::test]
+async fn config_profile_without_vision_accepts_image_input_end_to_end() {
+    use crate::session_factory::SessionFactory;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let store = temp.path().join("image-store");
+    let bytes = b"\x89PNG\r\n\x1a\nprofile-default";
+    let hash = crate::agent::store_image_bytes(&store, bytes).unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut stream).await;
+        let parts = request["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(parts[1]["type"], "image_url");
+        reply_sse(
+            &mut stream,
+            &[
+                json!({"choices":[{"delta":{"content":"seen it"},"finish_reason":null}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+            ],
+        )
+        .await;
+    });
+    // The profile omits `vision`: the default is vision-capable, so the
+    // resolved model passes the gate and the image reaches the wire.
+    let config: crate::config::Config = toml::from_str(&format!(
+        r#"
+[providers.p]
+base_url = "http://{address}"
+
+[models."p/m"]
+model = "m"
+"#
+    ))
+    .unwrap();
+    let factory = SessionFactory::test_factory_with_config(temp.path().to_path_buf(), Some(config));
+    let (configured, _) = factory.resolve_profile("p/m", None).unwrap();
+    let ConfiguredModelKind::Chat(model) = configured.kind else {
+        panic!("expected Chat model");
+    };
+    let mut model = model.with_image_store(store);
+    let (message, _) = model
+        .complete(
+            &[Message::User {
+                content: "what is this?".into(),
+                images: vec![ImagePart {
+                    hash,
+                    mime: "image/png".into(),
+                }],
+            }],
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(message.content.as_deref(), Some("seen it"));
+}
