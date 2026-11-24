@@ -1428,6 +1428,8 @@ fn project_sandbox_rejects_unknown_fields() {
         .unwrap();
         let error = config.sandbox(&workspace).unwrap_err().to_string();
         assert!(error.contains("cannot parse project config"), "{error}");
+        // B4: no decoder excerpt / quoted value in the message.
+        assert!(!error.contains("future_policy"), "{error}");
     }
 }
 
@@ -1823,7 +1825,12 @@ fn global_config_rejects_unknown_top_level_fields_and_sections() {
     ] {
         let error = Config::from_path(&write_config(temp.path(), source)).unwrap_err();
         let error = format!("{error:#}");
-        assert!(error.contains("unknown field"), "{error}");
+        // B4: the path and the POSITION, never the decoder's excerpt (a config
+        // line can hold a credential) and never its quoted value.
+        assert!(error.contains("cannot parse config file"), "{error}");
+        assert!(error.contains("line "), "{error}");
+        assert!(!error.contains("spritesheet"), "{error}");
+        assert!(!error.contains("unexpected"), "{error}");
     }
 }
 
@@ -1954,10 +1961,10 @@ loop_ms = 1200
         "[pet]\nspritesheet = \"/tmp/maid.webp\"\ncolumns = 8\n",
     ))
     .unwrap_err();
-    assert!(
-        format!("{error:#}").contains("unknown field `columns`"),
-        "{error:#}"
-    );
+    let message = format!("{error:#}");
+    assert!(message.contains("cannot parse config file"), "{message}");
+    assert!(message.contains("line "), "{message}");
+    assert!(!message.contains("columns"), "{message}");
 }
 
 #[test]
@@ -2001,7 +2008,10 @@ fn merged_with_project_pet_replaces_global_wholesale() {
 
     std::fs::write(ws.join(".e-agent/config.toml"), "[pet]\nunknown = 1\n").unwrap();
     let error = global.merged_with_project(&ws).unwrap_err();
-    assert!(format!("{error:#}").contains("unknown field"), "{error:#}");
+    let message = format!("{error:#}");
+    assert!(message.contains("cannot parse project config"), "{message}");
+    assert!(message.contains("line "), "{message}");
+    assert!(!message.contains("unknown = 1"), "{message}");
 }
 
 #[test]
@@ -2173,7 +2183,10 @@ finalize_wait_secs = 1
 "#,
     );
     let error = Config::from_path(&path).unwrap_err();
-    assert!(format!("{error:#}").contains("unknown field"), "{error:#}");
+    let message = format!("{error:#}");
+    assert!(message.contains("cannot parse config file"), "{message}");
+    assert!(message.contains("line "), "{message}");
+    assert!(!message.contains("finalize_wait_secs"), "{message}");
 }
 
 #[test]
@@ -2868,7 +2881,10 @@ model = "k3"
             .unwrap_err();
         let error = format!("{error:#}");
         assert!(error.contains("cannot parse project config"), "{error}");
-        assert!(error.contains("unknown field"), "{error}");
+        // B4: the position, never the decoder's excerpt or its quoted value.
+        assert!(error.contains("line "), "{error}");
+        assert!(!error.contains("commad"), "{error}");
+        assert!(!error.contains("futur ="), "{error}");
     }
 }
 
@@ -3203,7 +3219,8 @@ fn sandbox_gpu_is_global_only() {
         .unwrap_err();
     let chain = format!("{error:#}");
     assert!(chain.contains("cannot parse project config"), "{chain}");
-    assert!(chain.contains("gpu"), "{chain}");
+    assert!(chain.contains("line "), "{chain}");
+    assert!(!chain.contains("gpu"), "{chain}");
 }
 
 #[test]

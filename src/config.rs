@@ -442,6 +442,47 @@ pub(crate) enum ProjectSourceObservation {
     Unavailable,
 }
 
+/// Decode one config source, reporting the file path and the POSITION of the
+/// error only. The TOML decoder's own message quotes the offending line, and a
+/// config line can hold `client_secret` / an api key (or a token in a value the
+/// decoder echoes back), so neither the excerpt nor the message is repeated
+/// here: the message is persisted (a rejected reload is logged and an error
+/// event is written to the session) and `path (line L, column C)` is what tells
+/// the user where to look. `what` names the source being decoded.
+fn parse_config<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    source: &str,
+    what: &str,
+) -> anyhow::Result<T> {
+    toml::from_str(source).map_err(|error| match error.span() {
+        Some(span) => {
+            let (line, column) = source_position(source, span.start);
+            anyhow!(
+                "cannot parse {what} {} (line {line}, column {column})",
+                path.display()
+            )
+        }
+        None => anyhow!(
+            "cannot parse {what} {} (no position reported)",
+            path.display()
+        ),
+    })
+}
+
+/// 1-based line and column of a byte offset, i.e. the position the TOML
+/// decoder would have pointed at.
+fn source_position(source: &str, offset: usize) -> (usize, usize) {
+    // `offset` is a decoder-reported byte offset; a mid-character one falls
+    // back to the whole source rather than panicking.
+    let upto = source.get(..offset.min(source.len())).unwrap_or(source);
+    let line = upto.matches('\n').count() + 1;
+    let column = upto
+        .rsplit('\n')
+        .next()
+        .map_or(1, |tail| tail.chars().count() + 1);
+    (line, column)
+}
+
 fn observe_project_source_best_effort(workspace: &Path) -> ProjectSourceObservation {
     let path = workspace.join(".e-agent/config.toml");
     match std::fs::read_to_string(path) {
@@ -637,10 +678,8 @@ impl Config {
     fn from_path(path: &Path) -> anyhow::Result<Self> {
         let source = std::fs::read_to_string(path)
             .with_context(|| format!("cannot read config file {}", path.display()))?;
-        let mut config: Self = toml::from_str(&source)
-            .with_context(|| format!("cannot parse config file {}", path.display()))?;
-        let diagnostic: toml::Value = toml::from_str(&source)
-            .with_context(|| format!("cannot parse config diagnostics {}", path.display()))?;
+        let mut config: Self = parse_config(path, &source, "config file")?;
+        let diagnostic: toml::Value = parse_config(path, &source, "config diagnostics")?;
         config.path = path.to_path_buf();
         config.diagnostic_global = Some(sanitize_diagnostic_source(diagnostic));
         Ok(config)
@@ -1348,10 +1387,8 @@ fn project_config(workspace: &Path) -> anyhow::Result<Option<ProjectConfig>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).with_context(|| format!("cannot read {}", path.display())),
     };
-    let mut parsed: ProjectConfig = toml::from_str(&source)
-        .with_context(|| format!("cannot parse project config {}", path.display()))?;
-    let diagnostic: toml::Value = toml::from_str(&source)
-        .with_context(|| format!("cannot parse project diagnostics {}", path.display()))?;
+    let mut parsed: ProjectConfig = parse_config(&path, &source, "project config")?;
+    let diagnostic: toml::Value = parse_config(&path, &source, "project diagnostics")?;
     parsed.diagnostic_source = Some(sanitize_diagnostic_source(diagnostic));
     Ok(Some(parsed))
 }
@@ -1365,8 +1402,7 @@ fn project_background(workspace: &Path) -> anyhow::Result<Option<BackgroundConfi
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).with_context(|| format!("cannot read {}", path.display())),
     };
-    let parsed: ProjectConfig = toml::from_str(&source)
-        .with_context(|| format!("cannot parse project config {}", path.display()))?;
+    let parsed: ProjectConfig = parse_config(&path, &source, "project config")?;
     Ok(parsed.background)
 }
 
@@ -1399,8 +1435,7 @@ fn project_bash(workspace: &Path) -> anyhow::Result<Option<BashConfig>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).with_context(|| format!("cannot read {}", path.display())),
     };
-    let parsed: ProjectConfig = toml::from_str(&source)
-        .with_context(|| format!("cannot parse project config {}", path.display()))?;
+    let parsed: ProjectConfig = parse_config(&path, &source, "project config")?;
     Ok(parsed.bash)
 }
 
@@ -1437,8 +1472,7 @@ fn project_sandbox(workspace: &Path) -> anyhow::Result<Option<ProjectSandbox>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).with_context(|| format!("cannot read {}", path.display())),
     };
-    let parsed: ProjectConfig = toml::from_str(&source)
-        .with_context(|| format!("cannot parse project config {}", path.display()))?;
+    let parsed: ProjectConfig = parse_config(&path, &source, "project config")?;
     Ok(parsed.sandbox)
 }
 

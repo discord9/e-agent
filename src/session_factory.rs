@@ -796,7 +796,7 @@ impl SessionFactory {
                 if !watch_paths_changed(&mut mtimes) {
                     continue;
                 }
-                match reload_config_at(
+                let result = reload_config_at(
                     &reloadable,
                     &root,
                     &sandbox,
@@ -804,25 +804,8 @@ impl SessionFactory {
                     &base_url,
                     &model,
                     announce,
-                ) {
-                    ReloadResult::Reloaded => {
-                        if announce {
-                            tracing::info!(
-                                "e-agent: config reloaded: new sessions, `/model` switches and the next bash/background dispatch use the updated config; \
-                                 the [session] backend and web-search key changes still need a restart"
-                            );
-                        }
-                    }
-                    ReloadResult::ReloadedNoSource => {}
-                    ReloadResult::Rejected(reason) => {
-                        if announce {
-                            tracing::warn!(
-                                "e-agent: config reload rejected (keeping the previous config): {reason}"
-                            );
-                        }
-                    }
-                    ReloadResult::NoChange => {}
-                }
+                );
+                announce_reload_result(&result, announce);
             }
         });
     }
@@ -1981,6 +1964,30 @@ fn sandbox_inputs(
     (sandbox_table(global), sandbox_table(project))
 }
 
+/// Render one reload outcome as the user-facing announcement the config
+/// watcher writes (`announce` gates it there). Extracted so the RENDERED text
+/// is testable without the poll loop — in particular that a rejected reload
+/// never quotes the config line the decoder pointed at.
+fn announce_reload_result(result: &ReloadResult, announce: bool) {
+    if !announce {
+        return;
+    }
+    match result {
+        ReloadResult::Reloaded => {
+            tracing::info!(
+                "e-agent: config reloaded: new sessions, `/model` switches and the next bash/background dispatch use the updated config; \
+                 the [session] backend and web-search key changes still need a restart"
+            );
+        }
+        ReloadResult::Rejected(reason) => {
+            tracing::warn!(
+                "e-agent: config reload rejected (keeping the previous config): {reason}"
+            );
+        }
+        ReloadResult::ReloadedNoSource | ReloadResult::NoChange => {}
+    }
+}
+
 /// Load the effective config for `root` and apply it through
 /// [`apply_reloaded_config`], then swap the `[sandbox]` policy when (and only
 /// when) its parsed inputs changed. The shared core of
@@ -2896,6 +2903,57 @@ model = "m2"
         assert_eq!(factory.model_profiles(), vec!["p1/m1", "p2/m2"]);
 
         unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+    }
+
+    /// B4: a config file whose PARSE ERROR lands on a credential line must not
+    /// put that line — or any part of it — into the reload warning the server
+    /// renders. The warning reports the path and the position only: the TOML
+    /// decoder's own excerpt quotes the line, and a line can be
+    /// `client_secret = "..."`.
+    #[test]
+    fn reload_parse_error_warning_never_quotes_a_credential_line() {
+        const SENTINEL: &str = "GOCSPX-SENTINEL-CLIENT-SECRET-5b7e";
+        let _guard = crate::roles::XDG_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let env = XdgEnv::new(temp.path());
+        std::fs::create_dir_all(env.xdg.join("e-agent")).unwrap();
+        std::fs::write(
+            env.xdg.join("e-agent/config.toml"),
+            format!(
+                r#"default = "p1/m1"
+[providers.p1]
+auth = "antigravity"
+client_id = "id"
+client_secret = "{SENTINEL}" trailing-garbage
+"#
+            ),
+        )
+        .unwrap();
+        let mut factory = SessionFactory::test_factory(temp.path().to_path_buf());
+        factory.announce = true;
+        let result = factory.reload_config();
+        let ReloadResult::Rejected(reason) = &result else {
+            panic!("expected rejection, got {result:?}");
+        };
+        // The reason names the file and the POSITION, and quotes neither the
+        // offending line nor anything on it.
+        assert!(reason.contains("config.toml"), "{reason}");
+        assert!(reason.contains("line 5"), "{reason}");
+        assert!(!reason.contains("client_secret"), "{reason}");
+        assert!(!reason.contains(SENTINEL), "{reason}");
+        assert!(!reason.contains("trailing-garbage"), "{reason}");
+        // ...and the rendered warning (the exact line the watcher writes) is
+        // that same text.
+        let capture = ReloadCapture::default();
+        capture_reload(&capture, || {
+            announce_reload_result(&result, factory.announce)
+        });
+        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("config reload rejected"), "{output}");
+        assert!(output.contains("line 5"), "{output}");
+        assert!(!output.contains("client_secret"), "{output}");
+        assert!(!output.contains(SENTINEL), "{output}");
+        assert!(!output.contains("trailing-garbage"), "{output}");
     }
 
     #[test]

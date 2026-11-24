@@ -42,6 +42,23 @@ async fn spawn_fake<F>(expected: usize, handler: F) -> Fake
 where
     F: Fn(usize, &str) -> (u16, String) + Send + 'static,
 {
+    spawn_responder(expected, move |index, path| {
+        let (status, payload) = handler(index, path);
+        let reason = if status == 200 { "OK" } else { "Error" };
+        format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+            payload.len()
+        )
+    })
+    .await
+}
+
+/// [`spawn_fake`] with the whole response text under the caller's control (a
+/// redirect status and its `Location` header, for one).
+async fn spawn_responder<F>(expected: usize, respond: F) -> Fake
+where
+    F: Fn(usize, &str) -> String + Send + 'static,
+{
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let requests: Recorded = Arc::new(Mutex::new(Vec::new()));
@@ -65,12 +82,7 @@ where
                 .unwrap()
                 .push((path.clone(), headers, body.0.clone()));
             raw_bodies.lock().unwrap().push(body.1.clone());
-            let (status, payload) = handler(index, &path);
-            let reason = if status == 200 { "OK" } else { "Error" };
-            let response = format!(
-                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
-                payload.len()
-            );
+            let response = respond(index, &path);
             let _ = stream.write_all(response.as_bytes()).await;
         }
     });
@@ -168,7 +180,9 @@ fn write_cache(path: &Path, access: &str, expiry: DateTime<Utc>, refresh: &str, 
 
 fn model_for(fake: &Fake, token_file: PathBuf, cache_file: PathBuf) -> AntigravityModel {
     AntigravityModel {
-        client: reqwest::Client::builder()
+        // The production client shape (redirect policy included), only with
+        // the local test endpoint reachable directly and a short timeout.
+        client: AntigravityModel::client_builder()
             .no_proxy()
             .timeout(std::time::Duration::from_secs(10))
             .build()
@@ -314,7 +328,11 @@ async fn function_call_carries_thought_signature() {
         "candidates": [{"content": {"role": "model", "parts": [{
             "thoughtSignature": "sig-call",
             "functionCall": {"name": "bash", "args": {"command": "echo hi"}, "id": "call_1"},
-        }]}}],
+        }]},
+        // Deliberate: a call batch is only executed from a candidate that
+        // reported a TERMINAL finish reason (B1). An array that closed after a
+        // call-shaped prefix used to be accepted; it is an incomplete turn.
+        "finishReason": "STOP"}],
         "usageMetadata": {"promptTokenCount": 85, "candidatesTokenCount": 15, "thoughtsTokenCount": 37},
     }})]);
     let fake = spawn_fake(1, move |_, _| (200, body.clone())).await;
@@ -553,8 +571,12 @@ async fn signature_less_tool_history_is_refused_locally() {
         .await
         .expect_err("a signature-less open batch is refused");
     let message = format!("{error:#}");
-    assert!(message.contains("call_1"), "{message}");
+    // The ordinal, never the provider-supplied id or name: the runner persists
+    // this text (B4).
+    assert!(message.contains("1 of 2"), "{message}");
     assert!(message.contains("thoughtSignature"), "{message}");
+    assert!(!message.contains("call_1"), "{message}");
+    assert!(!message.contains("call_2"), "{message}");
     assert_eq!(fake.requests().len(), 0, "no doomed request is sent");
 }
 
@@ -1048,7 +1070,9 @@ async fn signature_only_part_after_a_call_attaches() {
 /// carries a `thoughtSignature` — its delta is emitted and the signature never
 /// signs the call before it. On the previous code the thought text was
 /// filtered out of the "visible text" test, so the part looked signature-only
-/// and stamped the preceding call.
+/// and stamped the preceding call. B3 makes non-attachment OBSERVABLE: the call
+/// stays unsigned, so the batch is refused instead of run (a borrowed
+/// signature would have satisfied the check and returned `Ok`).
 #[tokio::test]
 async fn thought_text_with_a_signature_does_not_sign_the_call() {
     let dir = tempfile::tempdir().unwrap();
@@ -1072,7 +1096,7 @@ async fn thought_text_with_a_signature_does_not_sign_the_call() {
     let mut model = model_for(&fake, token_file, dir.path().join("cache/token.json"));
     let mut deltas: Vec<(ModelDeltaKind, String)> = Vec::new();
     let mut sink = |kind: ModelDeltaKind, text: &str| deltas.push((kind, text.to_owned()));
-    let (assistant, _) = model
+    let error = model
         .complete(
             &[Message::User {
                 content: "run".into(),
@@ -1082,16 +1106,13 @@ async fn thought_text_with_a_signature_does_not_sign_the_call() {
             Some(&mut sink),
         )
         .await
-        .unwrap();
-    assert_eq!(assistant.tool_calls.len(), 1);
-    assert_eq!(
-        assistant.tool_calls[0].provider_meta, None,
-        "thinking text is text: its signature must not sign the call"
+        .expect_err("thinking text is text: its signature must not sign the call");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("no thoughtSignature"),
+        "the call is still unsigned: {message}"
     );
-    assert_eq!(
-        assistant.content, None,
-        "provider thinking is never the assistant content"
-    );
+    assert!(!message.contains("thinking about the command"), "{message}");
     assert_eq!(
         deltas,
         [(
@@ -1103,7 +1124,8 @@ async fn thought_text_with_a_signature_does_not_sign_the_call() {
 }
 
 /// Z3: an EMPTY text part is still an intervening part: a signature-only part
-/// after it does not attach backwards to the call before it.
+/// after it does not attach backwards to the call before it, so that call stays
+/// unsigned and (B3) the batch is refused rather than run.
 #[tokio::test]
 async fn empty_text_part_breaks_the_signature_adjacency() {
     let dir = tempfile::tempdir().unwrap();
@@ -1122,7 +1144,7 @@ async fn empty_text_part_breaks_the_signature_adjacency() {
     }})]);
     let fake = spawn_fake(1, move |_, _| (200, body.clone())).await;
     let mut model = model_for(&fake, token_file, dir.path().join("cache/token.json"));
-    let (assistant, _) = model
+    let error = model
         .complete(
             &[Message::User {
                 content: "run".into(),
@@ -1132,17 +1154,18 @@ async fn empty_text_part_breaks_the_signature_adjacency() {
             None,
         )
         .await
-        .unwrap();
-    assert_eq!(assistant.tool_calls.len(), 1);
-    assert_eq!(
-        assistant.tool_calls[0].provider_meta, None,
-        "the empty text part broke the adjacency"
+        .expect_err("the empty text part broke the adjacency, so the call is unsigned");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("no thoughtSignature"),
+        "the late signature did not reach the call: {message}"
     );
-    assert_eq!(assistant.content, None, "an empty text is not content");
+    assert!(!message.contains("SENTINEL-SIG-AFTER-EMPTY"), "{message}");
 }
 
 /// B2: an intervening text part breaks the adjacency — a signature part that
-/// follows it is not attached backwards to the call.
+/// follows it is not attached backwards to the call, so that call stays
+/// unsigned and (B3) the batch is refused rather than run.
 #[tokio::test]
 async fn signature_only_part_after_intervening_text_does_not_attach() {
     let dir = tempfile::tempdir().unwrap();
@@ -1161,21 +1184,29 @@ async fn signature_only_part_after_intervening_text_does_not_attach() {
     }})]);
     let fake = spawn_fake(1, move |_, _| (200, body.clone())).await;
     let mut model = model_for(&fake, token_file, dir.path().join("cache/token.json"));
-    let (assistant, _) = model
+    let mut deltas: Vec<(ModelDeltaKind, String)> = Vec::new();
+    let mut sink = |kind: ModelDeltaKind, text: &str| deltas.push((kind, text.to_owned()));
+    let error = model
         .complete(
             &[Message::User {
                 content: "run".into(),
                 images: Vec::new(),
             }],
             &[],
-            None,
+            Some(&mut sink),
         )
         .await
-        .unwrap();
-    assert_eq!(assistant.content.as_deref(), Some("let me check"));
+        .expect_err("a non-adjacent signature must not be borrowed");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("no thoughtSignature"),
+        "the call is still unsigned: {message}"
+    );
+    assert!(!message.contains("SENTINEL-SIG-FAR"), "{message}");
     assert_eq!(
-        assistant.tool_calls[0].provider_meta, None,
-        "a non-adjacent signature must not be borrowed"
+        deltas,
+        [(ModelDeltaKind::Content, "let me check".to_owned())],
+        "the intervening text is still content"
     );
 }
 
@@ -1678,6 +1709,268 @@ async fn truncated_stream_is_not_a_successful_turn() {
     assert!(message.contains("truncated"), "{message}");
 }
 
+/// B1: a call-shaped prefix is not a completed generation. The candidate that
+/// carries the calls must terminate too, and only a SUCCESSFUL terminal may
+/// hand executable calls back: `MALFORMED_FUNCTION_CALL` / `SAFETY` parts are
+/// fragments of a generation the provider itself rejected.
+#[tokio::test]
+async fn failure_finish_after_a_valid_call_prefix_is_not_a_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let token_file = write_agy_token(
+        dir.path(),
+        "test-token",
+        Utc::now() + ChronoDuration::hours(1),
+        "refresh-token",
+    );
+    for failure in ["MALFORMED_FUNCTION_CALL", "SAFETY"] {
+        let body = array_stream(&[
+            // A complete, signed, replayable-looking call...
+            json!({"response": {"candidates": [{"content": {"role": "model", "parts": [{
+                "thoughtSignature": "sig-call",
+                "functionCall": {"name": "bash", "args": {"command": "rm -rf /"}, "id": "call_1"},
+            }]}}]}}),
+            // ...followed by the terminal candidate the provider rejected.
+            json!({"response": {"candidates": [{"content": {"role": "model", "parts": []},
+                "finishReason": failure}]}}),
+        ]);
+        let fake = spawn_fake(1, move |_, _| (200, body.clone())).await;
+        let mut model = model_for(
+            &fake,
+            token_file.clone(),
+            dir.path().join("cache/token.json"),
+        );
+        let error = model
+            .complete(
+                &[Message::User {
+                    content: "run".into(),
+                    images: Vec::new(),
+                }],
+                &[],
+                None,
+            )
+            .await
+            .expect_err("a failed candidate must not return executable calls");
+        let message = format!("{error:#}");
+        assert!(message.contains(failure), "{message}");
+    }
+
+    // An unrecognized finish value is provider-controlled text: it is not
+    // evidence of success and is never echoed into a persisted message.
+    const SENTINEL: &str = "SENTINEL-FINISH-9f2c";
+    let unknown = array_stream(&[json!({"response": {"candidates": [{
+        "content": {"role": "model", "parts": [{"text": "ok"}]},
+        "finishReason": SENTINEL,
+    }]}})]);
+    let fake = spawn_fake(1, move |_, _| (200, unknown.clone())).await;
+    let mut model = model_for(&fake, token_file, dir.path().join("cache/token.json"));
+    let error = model
+        .complete(
+            &[Message::User {
+                content: "say ok".into(),
+                images: Vec::new(),
+            }],
+            &[],
+            None,
+        )
+        .await
+        .expect_err("an unrecognized finish is not a completed turn");
+    let message = format!("{error:#}");
+    assert!(!message.contains(SENTINEL), "{message}");
+    assert!(message.contains("finishReason"), "{message}");
+}
+
+/// B1: an array that closed cleanly after a call-shaped prefix, with no
+/// candidate ever reporting a terminal `finishReason`, is an INCOMPLETE turn.
+/// The old rule (`finishReason` was optional usage metadata) returned those
+/// calls as soon as the array closed.
+#[tokio::test]
+async fn closed_array_without_a_terminal_candidate_is_not_a_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let token_file = write_agy_token(
+        dir.path(),
+        "test-token",
+        Utc::now() + ChronoDuration::hours(1),
+        "refresh-token",
+    );
+    let body = array_stream(&[json!({"response": {
+        "candidates": [{"content": {"role": "model", "parts": [{
+            "thoughtSignature": "sig-call",
+            "functionCall": {"name": "bash", "args": {"command": "echo hi"}, "id": "call_1"},
+        }]}}],
+        "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 2},
+    }})]);
+    let fake = spawn_fake(1, move |_, _| (200, body.clone())).await;
+    let mut model = model_for(&fake, token_file, dir.path().join("cache/token.json"));
+    let error = model
+        .complete(
+            &[Message::User {
+                content: "run echo hi".into(),
+                images: Vec::new(),
+            }],
+            &[],
+            None,
+        )
+        .await
+        .expect_err("no terminal candidate means no completed turn");
+    let message = format!("{error:#}");
+    assert!(message.contains("finishReason"), "{message}");
+}
+
+/// B1, DECIDED RULE: a length-limited (`MAX_TOKENS`) answer is still
+/// DISPLAYABLE as text — the caller sees the partial answer it is, with the
+/// reason in the usage — but a length-limited CALL BATCH is refused: its
+/// arguments can be cut mid-call, and a truncated call must never run.
+#[tokio::test]
+async fn length_limited_text_is_displayable_and_length_limited_calls_are_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let token_file = write_agy_token(
+        dir.path(),
+        "test-token",
+        Utc::now() + ChronoDuration::hours(1),
+        "refresh-token",
+    );
+    let text = array_stream(&[json!({"response": {"candidates": [{
+        "content": {"role": "model", "parts": [{"text": "the answer is 4"}]},
+        "finishReason": "MAX_TOKENS",
+    }],
+    "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 5}}})]);
+    let fake = spawn_fake(1, move |_, _| (200, text.clone())).await;
+    let mut model = model_for(
+        &fake,
+        token_file.clone(),
+        dir.path().join("cache/token.json"),
+    );
+    let (assistant, usage) = model
+        .complete(
+            &[Message::User {
+                content: "compute".into(),
+                images: Vec::new(),
+            }],
+            &[],
+            None,
+        )
+        .await
+        .expect("length-limited text is a partial answer, not a failure");
+    assert_eq!(assistant.content.as_deref(), Some("the answer is 4"));
+    assert!(assistant.tool_calls.is_empty());
+    assert_eq!(
+        usage.expect("usage").finish_reason.as_deref(),
+        Some("MAX_TOKENS"),
+        "the truncation is reported, not hidden"
+    );
+
+    let calls = array_stream(&[json!({"response": {"candidates": [{
+        "content": {"role": "model", "parts": [{
+            "thoughtSignature": "sig-call",
+            "functionCall": {"name": "bash", "args": {"command": "echo hi"}, "id": "call_1"},
+        }]},
+        "finishReason": "MAX_TOKENS",
+    }]}})]);
+    let fake = spawn_fake(1, move |_, _| (200, calls.clone())).await;
+    let mut model = model_for(&fake, token_file, dir.path().join("cache/token.json"));
+    let error = model
+        .complete(
+            &[Message::User {
+                content: "run".into(),
+                images: Vec::new(),
+            }],
+            &[],
+            None,
+        )
+        .await
+        .expect_err("a truncated call batch must not run");
+    let message = format!("{error:#}");
+    assert!(message.contains("token limit"), "{message}");
+    assert!(message.contains("not run"), "{message}");
+}
+
+/// B3: a fresh batch whose first call carries no signature can never be
+/// replayed (400 INVALID_ARGUMENT), so it is refused WHILE assembling the turn
+/// — before the caller runs a single call it could not send. The message is
+/// the one the runner persists, so the provider-supplied id and tool name are
+/// not in it.
+#[tokio::test]
+async fn unsigned_fresh_batch_is_refused_before_any_call_runs() {
+    const CALL_ID: &str = "SENTINEL-CALL-ID-7d1f";
+    const TOOL: &str = "SENTINEL-TOOL-NAME";
+    let dir = tempfile::tempdir().unwrap();
+    let token_file = write_agy_token(
+        dir.path(),
+        "test-token",
+        Utc::now() + ChronoDuration::hours(1),
+        "refresh-token",
+    );
+    let body = array_stream(&[json!({"response": {"candidates": [{
+        "content": {"role": "model", "parts": [
+            {"functionCall": {"name": TOOL, "args": {"command": "echo hi"}, "id": CALL_ID}},
+            // An unsigned sibling is fine on its own; the FIRST call is what
+            // must carry the batch signature.
+            {"functionCall": {"name": TOOL, "args": {}, "id": "second"}},
+        ]},
+        "finishReason": "STOP",
+    }]}})]);
+    let fake = spawn_fake(1, move |_, _| (200, body.clone())).await;
+    let mut model = model_for(&fake, token_file, dir.path().join("cache/token.json"));
+    let error = model
+        .complete(
+            &[Message::User {
+                content: "run".into(),
+                images: Vec::new(),
+            }],
+            &[],
+            None,
+        )
+        .await
+        .expect_err("an unreplayable batch is refused before it is returned");
+    let message = format!("{error:#}");
+    assert!(message.contains("thoughtSignature"), "{message}");
+    assert!(message.contains("2 tool call(s)"), "{message}");
+    assert!(message.contains("not run"), "{message}");
+    assert!(!message.contains(CALL_ID), "{message}");
+    assert!(!message.contains(TOOL), "{message}");
+}
+
+/// B3, DECIDED RULE: adjacency is preserved ACROSS elements. The wire may send
+/// the call in one element and its signature-only part in the next; the
+/// signature signs the immediately preceding call rather than being lost.
+#[tokio::test]
+async fn signature_only_part_in_the_next_element_signs_the_call_before_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let token_file = write_agy_token(
+        dir.path(),
+        "test-token",
+        Utc::now() + ChronoDuration::hours(1),
+        "refresh-token",
+    );
+    let body = array_stream(&[
+        json!({"response": {"candidates": [{"content": {"role": "model", "parts": [
+            {"functionCall": {"name": "bash", "args": {"command": "echo a"}, "id": "call_a"}},
+        ]}}]}}),
+        json!({"response": {"candidates": [{"content": {"role": "model", "parts": [
+            {"thoughtSignature": "SENTINEL-SIG-NEXT-ELEMENT", "text": ""},
+        ]}, "finishReason": "STOP"}]}}),
+    ]);
+    let fake = spawn_fake(1, move |_, _| (200, body.clone())).await;
+    let mut model = model_for(&fake, token_file, dir.path().join("cache/token.json"));
+    let (assistant, _) = model
+        .complete(
+            &[Message::User {
+                content: "run".into(),
+                images: Vec::new(),
+            }],
+            &[],
+            None,
+        )
+        .await
+        .expect("the batch is replayable once its signature arrives");
+    assert_eq!(assistant.tool_calls.len(), 1);
+    assert_eq!(
+        assistant.tool_calls[0].provider_meta.as_deref(),
+        Some("SENTINEL-SIG-NEXT-ELEMENT")
+    );
+    assert_eq!(assistant.content, None, "the empty text is not content");
+}
+
 /// H2: an existing permissive cache is REPLACED, not reopened — the refresh
 /// leaves an owner-only file behind.
 #[cfg(unix)]
@@ -1910,6 +2203,73 @@ fn malformed_credential_file_reports_position_only() {
     assert!(message.contains("column"), "{message}");
 }
 
+/// B2: a 3xx is a STATUS-ONLY failure. The refresh POST puts `client_secret`
+/// and `refresh_token` in a replayable form body (and the generation POST the
+/// whole conversation), so the client must not follow a `Location`: the
+/// redirect target is never contacted, and neither the body nor the URL
+/// reaches the message the runner persists.
+#[tokio::test]
+async fn redirects_are_not_followed_and_the_form_body_is_not_replayed() {
+    const SENTINEL: &str = "SENTINEL-REFRESH-TOKEN-9c31";
+    let dir = tempfile::tempdir().unwrap();
+    // An expired login forces the refresh POST, whose form body carries the
+    // credential a followed redirect would replay.
+    let token_file = write_agy_token(
+        dir.path(),
+        "expired-token",
+        Utc::now() - ChronoDuration::minutes(5),
+        SENTINEL,
+    );
+    // Where a followed redirect WOULD land: nothing may ever connect here.
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_address = target.local_addr().unwrap();
+    let location = format!("http://{target_address}/captured");
+    let fake = spawn_responder(1, move |_, _| {
+        let payload = json!({"error": "invalid_grant"}).to_string();
+        format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+            payload.len()
+        )
+    })
+    .await;
+    let mut model = model_for(&fake, token_file, dir.path().join("cache/token.json"));
+    let error = model
+        .complete(
+            &[Message::User {
+                content: "hi".into(),
+                images: Vec::new(),
+            }],
+            &[],
+            None,
+        )
+        .await
+        .expect_err("a 3xx refresh is a failure");
+    let message = format!("{error:#}");
+    assert!(message.contains("307"), "{message}");
+    assert!(!message.contains(SENTINEL), "{message}");
+    assert!(
+        !message.to_ascii_lowercase().contains("location"),
+        "{message}"
+    );
+    assert!(
+        !message.contains(&target_address.to_string()),
+        "the redirect target is not even logged: {message}"
+    );
+    assert!(
+        !message.contains("invalid_grant"),
+        "a redirect body carries no verdict: {message}"
+    );
+    // The form body was sent exactly once, to the configured endpoint.
+    assert_eq!(fake.requests().len(), 1);
+    assert!(fake.raw_bodies()[0].contains("refresh_token="));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), target.accept())
+            .await
+            .is_err(),
+        "the redirect target must never be contacted"
+    );
+}
+
 /// H4: a cache bound to a PREVIOUS `agy` login is ignored, so a re-login
 /// switches accounts instead of silently spending the old one.
 #[tokio::test]
@@ -2091,7 +2451,16 @@ async fn synthetic_ids_are_unique_and_duplicate_ids_are_rejected() {
         .complete(std::slice::from_ref(&user), &[], None)
         .await
         .expect_err("a repeated id corrupts result routing");
-    assert!(format!("{error:#}").contains("call_1"), "{error:#}");
+    // The runner persists this text, so the provider-supplied id is replaced
+    // by its ordinal and a short digest (B4). The digest still identifies
+    // WHICH id repeated, without quoting it.
+    let message = format!("{error:#}");
+    assert!(message.contains("call 2 of this turn"), "{message}");
+    assert!(
+        message.contains(&short_digest("call_1")),
+        "the digest names the repeated id: {message}"
+    );
+    assert!(!message.contains("call_1"), "{message}");
 }
 
 /// H5: the real builtin toolset — including `history`'s `oneOf`/`const` schema

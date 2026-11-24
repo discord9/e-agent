@@ -14,10 +14,19 @@
 //!
 //! The stream is framed as a JSON array: an opened-but-unclosed array, a bad
 //! separator, trailing garbage, or an unfinished element is an error, never a
-//! shorter successful turn (a truncated turn's tool calls must not run). Error
-//! messages carry the HTTP status and an allowlisted provider error code only:
-//! a provider body can quote the submitted credentials and those messages are
-//! persisted in the session log.
+//! shorter successful turn (a truncated turn's tool calls must not run). A
+//! closed array is not a completed generation either: the selected candidate
+//! must also report a terminal `finishReason`, and only a `STOP` candidate may
+//! return executable calls — a `MAX_TOKENS` answer is still displayed as TEXT
+//! (a truncated answer is visible as one), while a truncated or provider-marked
+//! FAILED call batch is refused, as is a batch whose first call carries no
+//! `thoughtSignature` (it could never be replayed, so no call in it is run).
+//! Error messages carry the HTTP status, an allowlisted provider error code,
+//! and allowlisted `finishReason` constants only: a provider body can quote the
+//! submitted credentials and those messages are persisted in the session log.
+//! No redirect is ever followed, on either POST: the refresh body (client
+//! secret and refresh token) is replayable and the generation body carries the
+//! conversation.
 //!
 //! Tool declarations carry their raw JSON Schema in `parametersJsonSchema`,
 //! not in the Schema-proto `parameters` field: the latter rejects `const`,
@@ -117,6 +126,17 @@ pub struct AntigravityModel {
 }
 
 impl AntigravityModel {
+    /// The one client shape for both POSTs: the generation request and the
+    /// OAuth refresh. Redirects are DISABLED — a 3xx is a status-only failure.
+    /// The refresh sends `client_secret` and `refresh_token` in a replayable
+    /// form body and the generation POST carries the conversation, so neither
+    /// may be re-sent to a URL that a response names.
+    fn client_builder() -> reqwest::ClientBuilder {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(600))
+    }
+
     pub fn new(
         model: String,
         reasoning_effort: Option<String>,
@@ -127,8 +147,7 @@ impl AntigravityModel {
         let config_dir = crate::config::config_dir()
             .ok_or_else(|| anyhow!("cannot locate the e-agent config directory"))?;
         Ok(Self {
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(600))
+            client: Self::client_builder()
                 .build()
                 .context("cannot create HTTP client")?,
             model,
@@ -223,6 +242,15 @@ impl AntigravityModel {
             .await
             .context("Antigravity token refresh request failed")?;
         let status = response.status();
+        // A redirect is a status-only failure: the redirect policy is off, so
+        // this is the status the endpoint itself answered with, and its body
+        // (which names another URL) is not read for meaning — nothing is
+        // evicted on a 3xx and no `Location` is logged or followed.
+        if status.is_redirection() {
+            bail!(
+                "Antigravity token refresh was redirected (HTTP {status}); redirects are not followed"
+            );
+        }
         // The body is never surfaced: a rejected refresh echoes account
         // material and must not reach logs or tool output.
         let body = response.text().await.unwrap_or_default();
@@ -335,16 +363,18 @@ impl AntigravityModel {
                     // call that arrived unsigned stays unsigned: one call's
                     // signature is never copied onto another.
                     if Some(index) == active_batch
-                        && !message
-                            .tool_calls
-                            .iter()
-                            .any(|call| call.provider_meta.is_some())
+                        && !message.tool_calls.iter().any(|call| {
+                            call.provider_meta
+                                .as_deref()
+                                .is_some_and(|sig| !sig.is_empty())
+                        })
                     {
-                        let first = &message.tool_calls[0];
+                        // The ordinal only: a call id and a tool name are
+                        // provider-controlled text and this message is
+                        // persisted in the session log.
                         return Err(anyhow!(
-                            "Antigravity tool call `{}` ({}) and its siblings carry no thoughtSignature, so this history cannot be replayed on this wire; start a new session or switch back to the model that produced it",
-                            first.id,
-                            first.name
+                            "Antigravity tool call 1 of {} in the pending batch carries no thoughtSignature, so this history cannot be replayed on this wire; start a new session or switch back to the model that produced it",
+                            message.tool_calls.len()
                         ));
                     }
                     for call in &message.tool_calls {
@@ -456,6 +486,14 @@ impl Model for AntigravityModel {
             response = self.send(&token, &request).await?;
         }
         let status = response.status();
+        // A redirect is a status-only failure here too: the body names another
+        // URL, and this request carries the whole conversation.
+        if status.is_redirection() {
+            bail!(
+                "Antigravity redirected the request (HTTP {status}, model={}); redirects are not followed",
+                self.model
+            );
+        }
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             // Never the body: a provider error can quote the submitted
@@ -498,15 +536,57 @@ struct UsageMetadata {
     thoughts: Option<u64>,
 }
 
-/// The accumulated turn plus the two wire quirks worth naming: usage settles
-/// on the LAST element (earlier ones repeat partial counts) and a
-/// `thoughtSignature` may be its own part immediately after its call.
+/// The `finishReason` values this wire is known to report. A value is matched
+/// against these EXACT constants and the constant is what gets printed — never
+/// the body's own text, exactly like [`error_code`]: these messages are
+/// persisted in the session log.
+const FINISH_REASONS: &[&str] = &[
+    // Terminal: the candidate stopped on its own.
+    "STOP",
+    // Terminal: the output limit was reached (the answer/calls are truncated).
+    "MAX_TOKENS",
+    // Terminal failures: no part of the turn is a usable answer.
+    "MALFORMED_FUNCTION_CALL",
+    "SAFETY",
+    "RECITATION",
+    "BLOCKLIST",
+    "PROHIBITED_CONTENT",
+    "SPII",
+    "IMAGE_SAFETY",
+    "UNEXPECTED_TOOL_CALL",
+    "LANGUAGE",
+    "OTHER",
+    "FINISH_REASON_UNSPECIFIED",
+];
+
+/// The [`FINISH_REASONS`] constant equal to `candidate`, if any. An unknown
+/// value yields `None` and is never echoed; it is not evidence of success.
+fn allowed_finish(candidate: &str) -> Option<&'static str> {
+    FINISH_REASONS
+        .iter()
+        .copied()
+        .find(|reason| *reason == candidate)
+}
+
+/// The accumulated turn plus the wire quirks worth naming: usage settles on
+/// the LAST element (earlier ones repeat partial counts), only the terminal
+/// `finishReason` decides whether the turn may be used at all, and a
+/// `thoughtSignature` may be its own part immediately after its call — even in
+/// the NEXT element.
 #[derive(Default)]
 struct Turn {
     content: String,
     tool_calls: Vec<ToolCall>,
     usage: Option<UsageMetadata>,
+    /// The last `finishReason` any candidate reported: untrusted text, vetted
+    /// by [`allowed_finish`] before it is printed or acted on. Recorded apart
+    /// from [`Turn::usage`] on purpose — a turn can carry usage and still have
+    /// terminated badly (or not at all).
     finish_reason: Option<String>,
+    /// Index of the call a signature-only part may still sign. An intervening
+    /// part clears it; it SURVIVES into the following element, because the wire
+    /// splits a call and its signature part across elements.
+    pending_call: Option<usize>,
 }
 
 impl Turn {
@@ -539,10 +619,10 @@ impl Turn {
                 .cloned()
                 .unwrap_or_default();
             // A signature belongs to the part it arrived with: the call
-            // itself, or a signature-only part sitting DIRECTLY after its call
-            // in the same element. Nothing is copied across parts, and any
-            // intervening part breaks the association.
-            let mut signed_call: Option<usize> = None;
+            // itself, or a signature-only part sitting DIRECTLY after its call.
+            // Nothing is copied across parts, and any intervening part breaks
+            // the association — but the association outlives the element, so a
+            // signature part in the next chunk still signs the call it follows.
             for part in parts {
                 if let Some(call) = part.get("functionCall") {
                     let name = call["name"].as_str().unwrap_or_default();
@@ -555,7 +635,14 @@ impl Turn {
                         .map(str::to_owned)
                         .unwrap_or_else(local_call_id);
                     if self.tool_calls.iter().any(|existing| existing.id == id) {
-                        bail!("Antigravity stream repeated tool call id `{id}` in one turn");
+                        // The ordinal and a short digest, never the id itself:
+                        // provider-controlled text is not echoed into a
+                        // message the runner persists.
+                        bail!(
+                            "Antigravity stream repeated a tool call id (digest {}) at call {} of this turn, so two results would route to one call",
+                            short_digest(&id),
+                            self.tool_calls.len() + 1
+                        );
                     }
                     self.tool_calls.push(ToolCall {
                         id,
@@ -566,7 +653,7 @@ impl Turn {
                             .unwrap_or_else(|| "{}".into()),
                         provider_meta: part["thoughtSignature"].as_str().map(str::to_owned),
                     });
-                    signed_call = Some(self.tool_calls.len() - 1);
+                    self.pending_call = Some(self.tool_calls.len() - 1);
                     continue;
                 }
                 // Text is text, whatever else the part carries: a nonempty
@@ -581,33 +668,79 @@ impl Turn {
                         self.content.push_str(text);
                         on_delta(ModelDeltaKind::Content, text);
                     }
-                    signed_call = None;
+                    self.pending_call = None;
                     continue;
                 }
                 // Signature-only: no text AT ALL (absent or empty) and no
                 // call. This is the shape the wire uses when the signature is
                 // its own part rather than a field of the call.
                 if let Some(signature) = part["thoughtSignature"].as_str() {
-                    if let Some(call) = signed_call.and_then(|index| self.tool_calls.get_mut(index))
+                    if let Some(call) = self
+                        .pending_call
+                        .take()
+                        .and_then(|index| self.tool_calls.get_mut(index))
                     {
                         call.provider_meta
                             .get_or_insert_with(|| signature.to_owned());
                     }
-                    signed_call = None;
                     continue;
                 }
                 // Any other part — an empty text, an unknown field —
                 // INTERVENES: a signature part after it no longer sits
                 // directly after its call.
-                signed_call = None;
+                self.pending_call = None;
             }
         }
         Ok(())
     }
 
+    /// Assemble, then validate: the whole selected candidate is finished
+    /// BEFORE anything is returned, so a batch that could never be replayed is
+    /// refused before the caller runs a single call from it.
     fn finish(self) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
-        if self.content.is_empty() && self.tool_calls.is_empty() {
+        // A closed array with no terminal candidate is an incomplete turn, not
+        // a success: no candidate ever said it was done.
+        let Some(reported) = self.finish_reason.as_deref() else {
+            bail!("Antigravity stream ended without a finishReason, so this turn is incomplete");
+        };
+        // An unrecognized value is not evidence of success, and the value is
+        // provider-controlled text: it is never echoed.
+        let Some(finish) = allowed_finish(reported) else {
+            bail!(
+                "Antigravity stream finished with an unrecognized finishReason (incomplete turn)"
+            );
+        };
+        let calls = self.tool_calls.len();
+        match finish {
+            // The one verified success: the candidate stopped on its own.
+            "STOP" => {}
+            // Length-limited TEXT is still displayable: a truncated answer is
+            // shown as the partial answer it is, with the reason in the usage.
+            // A length-limited CALL BATCH is not: its arguments can be cut
+            // mid-call, so none of it runs.
+            "MAX_TOKENS" if calls == 0 => {}
+            "MAX_TOKENS" => bail!(
+                "Antigravity stream stopped at its token limit while asking for {calls} tool call(s); they were not run"
+            ),
+            // MALFORMED_FUNCTION_CALL, SAFETY, RECITATION, ... : the parts are
+            // fragments of a generation the provider itself rejected.
+            failure => bail!("Antigravity stream finished with {failure}, not a completed turn"),
+        }
+        if self.content.is_empty() && calls == 0 {
             bail!("Antigravity stream ended without content or tool calls (incomplete turn)");
+        }
+        // Live evidence: the FIRST call of a batch carries the signature and
+        // its siblings stay unsigned. A batch whose first call has none can
+        // never be replayed (400 INVALID_ARGUMENT), so it is rejected HERE —
+        // a signature is never borrowed from a text part or another candidate.
+        if self
+            .tool_calls
+            .first()
+            .is_some_and(|call| call.provider_meta.as_deref().unwrap_or_default().is_empty())
+        {
+            bail!(
+                "Antigravity returned {calls} tool call(s) but the first one carries no thoughtSignature, so this batch cannot be replayed on this wire; they were not run"
+            );
         }
         let usage = self.usage.map(|metadata| Usage {
             input_tokens: metadata.prompt,
@@ -616,7 +749,8 @@ impl Turn {
             cache_hit_tokens: None,
             cache_miss_tokens: None,
             reasoning_tokens: metadata.thoughts,
-            finish_reason: self.finish_reason,
+            // The vetted constant, never the body's own text.
+            finish_reason: Some(finish.to_owned()),
         });
         Ok((
             AssistantMessage {
@@ -764,6 +898,19 @@ fn call_arguments(arguments: &str) -> Value {
 /// turns.
 fn local_call_id() -> String {
     format!("e-agent-call-{:016x}", rand::random::<u64>())
+}
+
+/// A short digest standing in for a provider-controlled identifier (a call id,
+/// a tool name) in an error message. Those messages are persisted in the
+/// session log and such a value can be token-shaped, so the value itself is
+/// never repeated: the digest is enough to correlate two lines, and not enough
+/// to quote one.
+fn short_digest(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    format!(
+        "{:08x}",
+        u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]])
+    )
 }
 
 /// The only provider codes e-agent will ever repeat: the gRPC canonical status
