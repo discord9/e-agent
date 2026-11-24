@@ -43,6 +43,17 @@
 //! which the builtin `history` schema uses (400 INVALID_ARGUMENT, verified
 //! live), and no downgrade of the builtin schemas is attempted.
 //!
+//! If this wire ever answers a bare 429 with no explanation, look at the
+//! `systemInstruction` text FIRST. A sibling implementation bisected seven
+//! verbatim prompt lines that produced `429 RESOURCE_EXHAUSTED` while the
+//! account still had quota (9router, 2026-11-18), and it probed that the same
+//! text sent as a user turn passes — the identity is fingerprinted where it
+//! sits in `systemInstruction`, and everything this session sends goes there.
+//! None of those seven lines occurs in e-agent's prompt today (checked
+//! verbatim, not by resemblance), so this is a diagnostic hint, not a known
+//! hazard; header order and body field order are what other clients align,
+//! but no source shows a 429 flipping on those alone.
+//!
 //! Non-goals: model listing (`fetchAvailableModels`), image input
 //! (`supports_vision` is false), a retry framework (one 401 -> refresh ->
 //! retry, and one 404 -> `-tiered` fallback, never a loop), and any
