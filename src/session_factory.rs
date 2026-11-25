@@ -317,6 +317,7 @@ fn resolve_profile_from(
         AuthSource::Lazy(reloadable),
         base_url,
         model_override,
+        config.images_max_inline(),
     )?;
     Ok((model, context_window))
 }
@@ -438,6 +439,7 @@ impl SessionFactory {
                     AuthSource::Fixed(auth.as_ref()),
                     &base_url,
                     &model,
+                    config.images_max_inline(),
                 )?;
                 (Some(models), auth)
             }
@@ -1743,6 +1745,9 @@ fn configured_model(
     auth: AuthSource<'_>,
     base_url: Option<String>,
     model: Option<String>,
+    // `[images] max_inline`: the inline-image cap every wire model built here
+    // applies (see `crate::images`).
+    max_inline: usize,
 ) -> anyhow::Result<ConfiguredModel> {
     let display = Some(resolved.display);
     match resolved.auth {
@@ -1756,7 +1761,8 @@ fn configured_model(
                 )?
                 .with_vision(resolved.vision)
                 .with_thinking(resolved.thinking)
-                .with_deepseek_compat(resolved.deepseek_compat),
+                .with_deepseek_compat(resolved.deepseek_compat)
+                .with_max_inline(max_inline),
             );
             cm.display = display;
             Ok(cm)
@@ -1774,7 +1780,8 @@ fn configured_model(
                     model.unwrap_or(resolved.model),
                     resolved.reasoning_effort,
                 )?
-                .with_vision(resolved.vision),
+                .with_vision(resolved.vision)
+                .with_max_inline(max_inline),
             );
             cm.display = display;
             Ok(cm)
@@ -1812,6 +1819,7 @@ fn build_runtime_models(
     auth: AuthSource<'_>,
     base_url: &Option<String>,
     model: &Option<String>,
+    max_inline: usize,
 ) -> anyhow::Result<RuntimeModels> {
     if matches!(resolved.main.auth, AuthMode::ChatGpt) && base_url.is_some() {
         return Err(anyhow!(
@@ -1825,17 +1833,26 @@ fn build_runtime_models(
     } else {
         resolved.main.context_window
     };
-    let main = configured_model(resolved.main, auth, base_url.clone(), model.clone())?;
+    let main = configured_model(
+        resolved.main,
+        auth,
+        base_url.clone(),
+        model.clone(),
+        max_inline,
+    )?;
     let subagent_context_window = resolved.subagent.as_ref().and_then(|r| r.context_window);
     let subagent = resolved
         .subagent
-        .map(|resolved| configured_model(resolved, auth, None, None))
+        .map(|resolved| configured_model(resolved, auth, None, None, max_inline))
         .transpose()?;
     let mut roles = HashMap::new();
     let mut role_context_windows = HashMap::new();
     for (role, resolved) in resolved.roles {
         role_context_windows.insert(role.clone(), resolved.context_window);
-        roles.insert(role, configured_model(resolved, auth, None, None)?);
+        roles.insert(
+            role,
+            configured_model(resolved, auth, None, None, max_inline)?,
+        );
     }
     Ok(RuntimeModels {
         main,
@@ -1922,7 +1939,14 @@ fn apply_reloaded_config(
     } else {
         None
     };
-    match build_runtime_models(resolved, AuthSource::Fixed(auth.as_ref()), base_url, model) {
+    let max_inline = config.images_max_inline();
+    match build_runtime_models(
+        resolved,
+        AuthSource::Fixed(auth.as_ref()),
+        base_url,
+        model,
+        max_inline,
+    ) {
         Ok(models) => {
             state.config = Some(config);
             state.auth = auth;
