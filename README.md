@@ -114,6 +114,12 @@ as a process group; on non-Unix platforms only the direct child is killed.
 stdout and stderr are each captured up to 64 KiB, then drained and marked as
 truncated.
 
+`web_fetch` (the default `fetch_provider = "local"`) performs its HTTP GET in
+this process, so it has exactly the same network reach as `bash`. There is no
+public-only destination filter: filtering one tool while the shell it sits next
+to can reach the same hosts is theatre, so the fetch reaches whatever the
+process reaches.
+
 Optional shell restriction is available when `[sandbox] enabled = true` is set.
 On Linux/macOS this uses `bubblewrap` (`bwrap`) as described below. On Windows,
 the **write-sandbox MVP is an accident-prevention mechanism**, using a restricted
@@ -411,7 +417,8 @@ stable across runs and a forked child can reuse the parent's prompt cache.
 - `OPENAI_MODEL` — model name, default: `gpt-4o-mini`.
 - `EXA_API_KEY` — optional; a non-whitespace value enables `web_search` through
   Exa Context. `[web_search] provider = "searxng"` needs no environment
-  variable: its `base_url` comes from the config file only.
+  variable: its `base_url` comes from the config file only. See
+  [Web tools](#web-tools).
 - `RUST_BACKTRACE=1` — optional; appends a backtrace to ordinary `anyhow` error
   chains (and enables their full Rust verbosity). Rust panics always print a
   forced stack regardless of this setting.
@@ -437,6 +444,44 @@ panics.
 
 TOML config is optional. When present, it supplies the selected provider
 credential and profile values instead of `OPENAI_*`; see [Run](#run).
+
+## Web tools
+
+`web_search` and `web_fetch` are registered together as soon as one web-search
+source is usable: `EXA_API_KEY`, `[web_search] provider = "searxng"` plus a
+`base_url`, or `provider = "deepseek"` plus a credential. With no usable source
+neither tool exists, and a blank credential registers nothing.
+
+`web_fetch` is a single-URL fetch performed by this process: it GETs the URL
+over the network this process already has, follows at most 5 redirects, and
+accepts `text/html`, `application/xhtml+xml`, `text/plain` and `text/markdown`
+bodies up to 2 MiB. Bytes are decoded with the `Content-Type` charset, else a
+`<meta charset>` sniff, else UTF-8 (lossy, so GBK/Big5 pages are readable).
+HTML goes through Mozilla Readability (`dom_smoothie`) and comes back as the
+article title plus Markdown; a page with no readable article is an error, not
+a dump of tags and navigation. `text/plain` and `text/markdown` are returned
+as they are. It never follows links found in the page, so it is not a crawler.
+Because it runs in this process it reaches whatever the process reaches — the
+same network `bash` has, not only public hosts (see
+[Safety boundaries](#safety-boundaries)).
+
+`[web_search] fetch_provider` selects the fetch transport:
+
+```toml
+[web_search]
+provider = "searxng"
+base_url = "http://127.0.0.1:8088"
+fetch_provider = "deepseek"      # optional: "local" (default) or "deepseek"
+api_key_env = "DEEPSEEK_API_KEY" # allowed here only because the fetch needs it
+```
+
+`"local"` (the default when the field is absent) uses this process.
+`fetch_provider = "deepseek"` keeps the remote `tools/fetch` — DeepSeek's
+servers do the fetching, so a page they cannot reach fails — and requires a
+credential. The two choices are independent: a SearXNG search can pair with a
+DeepSeek fetch. `provider` still rejects a `base_url` for `"deepseek"`, and
+`api_key_file` / `api_key_env` are rejected for a SearXNG search unless
+`fetch_provider = "deepseek"` needs them.
 
 ## Image input (multimodal)
 
