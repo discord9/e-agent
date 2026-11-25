@@ -906,6 +906,105 @@ reference-counted or garbage-collected design.</p>
     assert!(!head.to_lowercase().contains("authorization"), "{head}");
 }
 
+/// A server that answers 403 unless the request carries a `User-Agent` — what
+/// Wikipedia and much of the web do to a UA-less client. Returns the request
+/// head it saw.
+async fn user_agent_gate_server() -> (String, tokio::task::JoinHandle<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/page", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let head = read_request_head(&mut socket).await;
+        // Header names arrive lowercase from reqwest's `HeaderMap`, so the
+        // whole head is lowercased before the comparison.
+        let response = if head.to_lowercase().contains(&format!(
+            "user-agent: {}\r\n",
+            WEB_FETCH_USER_AGENT.to_lowercase()
+        )) {
+            typed_http_response(
+                "200 OK",
+                "text/html",
+                "<title>Fetched</title><p>body text</p>",
+            )
+        } else {
+            typed_http_response("403 Forbidden", "text/plain", "no user agent")
+        };
+        let _ = socket.write_all(&response).await;
+        head
+    });
+    (url, task)
+}
+
+#[tokio::test]
+async fn web_fetch_sends_a_user_agent_and_so_passes_a_ua_gate() {
+    let (url, server) = user_agent_gate_server().await;
+    let result = WebFetch::local()
+        .execute(json!({"url": url}))
+        .await
+        .unwrap();
+    assert_eq!(result.content, "Fetched\n\nbody text");
+    // Still credential-free: the two browser headers are the only additions.
+    let head = server.await.unwrap();
+    assert!(!head.to_lowercase().contains("authorization"), "{head}");
+}
+
+#[tokio::test]
+async fn web_fetch_sends_the_browser_accept_header() {
+    let (url, server) = fetch_server(typed_http_response(
+        "200 OK",
+        "text/plain; charset=utf-8",
+        "ok",
+    ))
+    .await;
+    WebFetch::local()
+        .execute(json!({"url": url}))
+        .await
+        .unwrap();
+    let head = server.await.unwrap();
+    assert!(
+        head.contains(&format!("accept: {WEB_FETCH_ACCEPT}\r\n")),
+        "{head}"
+    );
+    // One value, not a second one appended by the client or the tool.
+    assert_eq!(head.matches("\r\naccept: ").count(), 1, "{head}");
+}
+
+#[tokio::test]
+async fn web_fetch_reports_the_transport_reason() {
+    // Port 0 can never be listened on, so this connect is always refused —
+    // unlike a released ephemeral port, which another test could re-bind. The
+    // model is told why instead of seeing a bare "request failed".
+    let error = WebFetch::local()
+        .execute(json!({"url": "http://127.0.0.1:0/page"}))
+        .await
+        .unwrap_err();
+    assert!(error.starts_with("web fetch request failed: "), "{error}");
+    assert!(!error.contains('\n'), "{error}");
+    let reason = error.to_lowercase();
+    assert!(reason.contains("connect"), "{error}");
+    assert!(reason.contains("refused"), "{error}");
+}
+
+#[tokio::test]
+async fn web_fetch_reports_the_body_read_reason() {
+    // A body shorter than its declared length: the read fails mid-body, and
+    // the cause reaches the model.
+    let (url, _server) = fetch_server(
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 100\r\nConnection: close\r\n\r\nshort"
+            .to_vec(),
+    )
+    .await;
+    let error = WebFetch::local()
+        .execute(json!({"url": url}))
+        .await
+        .unwrap_err();
+    assert!(
+        error.starts_with("web fetch response body failed: "),
+        "{error}"
+    );
+    assert!(!error.contains('\n'), "{error}");
+}
+
 #[tokio::test]
 async fn web_fetch_keeps_markdown_headings_lists_and_resolved_links() {
     let html = br#"<html><head><title>Notes</title></head><body>

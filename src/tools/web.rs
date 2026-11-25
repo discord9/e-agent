@@ -3,7 +3,7 @@ use super::*;
 use async_trait::async_trait;
 use dom_smoothie::{Article, Config as ReadabilityConfig, Readability, TextMode};
 use encoding_rs::Encoding;
-use reqwest::header::HeaderValue;
+use reqwest::header::{HeaderMap, HeaderValue};
 use serde::Deserialize;
 
 pub(super) const WEB_SEARCH_ENDPOINT: &str = "https://api.exa.ai/context";
@@ -30,6 +30,20 @@ pub(super) const WEB_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 pub(super) const WEB_FETCH_BODY_LIMIT: usize = 2 * 1024 * 1024;
 /// Redirect hops `web_fetch` follows before failing.
 pub(super) const WEB_FETCH_REDIRECT_LIMIT: usize = 5;
+/// The local fetcher's `User-Agent`. `reqwest` sends none by default, and a
+/// UA-less client is answered with 403 by Wikipedia and much of the web, so
+/// this is a fixed, ordinary desktop-browser string — honest about being a
+/// generic browser, and carrying no version, contact or credential.
+pub(super) const WEB_FETCH_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+/// What the local fetcher says it accepts: the shape a browser sends, so a
+/// server that negotiates on `Accept` returns the HTML this tool parses
+/// instead of JSON or an image.
+pub(super) const WEB_FETCH_ACCEPT: &str =
+    "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8";
+/// How much of a failed request's reason reaches the model. `reqwest` repeats
+/// the URL in its `Display`, and the URL alone may be `WEB_FETCH_URL_LIMIT`
+/// bytes.
+pub(super) const WEB_FETCH_ERROR_REASON_LIMIT: usize = 512;
 
 /// The resolved web backend: each variant owns the credential and URL(s) it
 /// needs. Exactly three concrete shapes, so this is an enum rather than a
@@ -227,12 +241,46 @@ pub(super) fn web_search_client() -> reqwest::Client {
 /// The `web_fetch` client: pages redirect (canonical URLs, short links), so
 /// this one follows up to 5 hops and still never retries. A 6-hop chain is
 /// an error rather than an unbounded walk.
+///
+/// It is also the only client that sends `User-Agent` and `Accept`: the
+/// header-less requests of `web_search_client` are API calls whose servers do
+/// not care, while a fetched page's server usually does (see
+/// `WEB_FETCH_USER_AGENT`). Both are client defaults, so every redirect hop
+/// carries them, and no credential is ever added here.
 pub(super) fn web_fetch_client() -> reqwest::Client {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        reqwest::header::ACCEPT,
+        HeaderValue::from_static(WEB_FETCH_ACCEPT),
+    );
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::limited(WEB_FETCH_REDIRECT_LIMIT))
         .retry(reqwest::retry::never())
+        .user_agent(WEB_FETCH_USER_AGENT)
+        .default_headers(headers)
         .build()
         .expect("web fetch client configuration is valid")
+}
+
+/// `{prefix}: {reason}` for a failed request or body read. `reqwest`'s own
+/// `Display` is only the error kind plus the URL (`error sending request for
+/// url (...)`), so the cause chain is appended too — a refused connection, a
+/// DNS failure, a TLS rejection and a timeout are otherwise one message, and
+/// the reason is what tells them apart. Bounded and flattened to one line so
+/// the model gets a single readable line.
+fn transport_error(prefix: &str, error: &reqwest::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    let text = truncate_utf8(text, WEB_FETCH_ERROR_REASON_LIMIT);
+    format!(
+        "{prefix}: {}",
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    )
 }
 
 /// `{base}{path}` with any trailing slash on the base removed, so a test base
@@ -363,7 +411,7 @@ async fn execute_local_fetch(
         .timeout(timeout)
         .send()
         .await
-        .map_err(|_| "web fetch request failed".to_string())?;
+        .map_err(|error| transport_error("web fetch request failed", &error))?;
     if !response.status().is_success() {
         // No credential: this fetch carries none, so nothing to redact.
         return Err(status_error(&mut response, "web fetch", "").await?);
@@ -397,7 +445,7 @@ async fn execute_local_fetch(
 
     let (body, truncated) = read_response_prefix(&mut response, WEB_FETCH_BODY_LIMIT)
         .await
-        .map_err(|_| "web fetch response body failed".to_string())?;
+        .map_err(|error| transport_error("web fetch response body failed", &error))?;
     if truncated {
         return Err(format!(
             "web fetch response body exceeds {WEB_FETCH_BODY_LIMIT} bytes"
