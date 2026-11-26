@@ -48,7 +48,6 @@ pub(crate) struct RequestHead {
     /// policy.
     pub rust_sandbox: Option<crate::config::Sandbox>,
     pub read_only: bool,
-    pub protect_git: bool,
     pub code_mode: bool,
     pub mcp_servers: HashMap<String, crate::mcp::McpServerConfig>,
     /// The parent's goal projection at build time (folded from the restored
@@ -1212,7 +1211,6 @@ impl SessionFactory {
             compaction_reminder: head_reminder,
             rust_sandbox: self.rust_sandbox.clone(),
             read_only: self.read_only,
-            protect_git: false,
             code_mode: self.code_mode,
             mcp_servers: mcp_servers_for_fork.clone(),
             goal: head_goal,

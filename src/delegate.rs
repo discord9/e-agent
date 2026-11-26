@@ -853,7 +853,12 @@ impl Delegate {
             // same policy a `/model`-switched or reloaded parent would.
             self.sandbox.clone(),
             head.read_only,
-            head.protect_git,
+            // A fork gets the SUBAGENT default, never the parent's
+            // main-session value: main's own bash may write `.git`, a
+            // delegated child may not, and forking must not be a way around
+            // that boundary. Nothing about the inherited prefix needs the
+            // parent's shell policy, so this is a plain subagent constant.
+            true,
             Some(session_id.clone()),
         );
         #[cfg(target_os = "linux")]
