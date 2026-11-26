@@ -277,6 +277,8 @@ fn tool_images_count_towards_the_same_window() {
             name: "read_image".into(),
             content: "read".into(),
             is_error: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![ImagePart {
                 hash: format!("t{index}"),
                 mime: "image/png".into(),

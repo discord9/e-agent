@@ -7,7 +7,14 @@
 //! accumulated.
 
 use super::*;
+use crate::agent::{Agent, AssistantMessage, Message, Model, ModelDeltaKind, ToolCall, Usage};
 use crate::config::DEFAULT_ACP_ALLOW_KINDS;
+use crate::runner::{
+    IdlePolicy, PromptSubmission, SessionResult, SessionRunner, SessionStatus, UserInputRequest,
+    session_test_channel,
+};
+use crate::session_store::SessionStore;
+use async_trait::async_trait;
 
 /// Happy-path stub: answers `initialize` / `session/new` / `session/load` /
 /// `session/set_model`, then on `session/prompt` streams two
@@ -143,6 +150,7 @@ async fn tool_with(root: &Path, config: AcpConfig, session: &str) -> Box<dyn Too
         root: root.to_path_buf(),
         session: session.to_owned(),
         cached: StdMutex::new(HashMap::new()),
+        handle: None,
     })
 }
 
@@ -709,4 +717,324 @@ fn summaries_prefer_the_title_then_the_command() {
     let command = json!({"kind": "execute", "rawInput": {"command": "ls -la"}});
     assert_eq!(tool_call_summary(Some(&command)), "ls -la");
     assert_eq!(tool_call_summary(None), "unknown tool call");
+}
+
+// ---------------------------------------------------------------------------
+// Permission requests become questions for the human when the session has a
+// frontend; the chosen option id is what ACP receives back.
+// ---------------------------------------------------------------------------
+
+/// One model round that calls `acp_prompt`, then a final answer: a real runner
+/// drives the tool, so the question path under test is the production one.
+struct AcpCallModel {
+    calls: usize,
+}
+
+#[async_trait]
+impl Model for AcpCallModel {
+    async fn complete(
+        &mut self,
+        _: &[Message],
+        _: &[ToolSpec],
+        _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        self.calls += 1;
+        let reply = if self.calls == 1 {
+            AssistantMessage {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "call-acp".into(),
+                    name: "acp_prompt".into(),
+                    arguments: json!({"prompt": "review the notes"}).to_string(),
+                }],
+                reasoning: None,
+            }
+        } else {
+            AssistantMessage {
+                content: Some("reviewed".into()),
+                tool_calls: Vec::new(),
+                reasoning: None,
+            }
+        };
+        Ok((reply, None))
+    }
+}
+
+/// Wait for the next blocking question the runner surfaces. The request the
+/// test just answered (`after`) can still be the published status for a
+/// moment, so it is skipped instead of being read twice.
+async fn next_question(
+    status: &mut tokio::sync::watch::Receiver<SessionStatus>,
+    after: &str,
+) -> UserInputRequest {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let SessionStatus::WaitingInput(request) = &*status.borrow()
+                && request.call_id != after
+            {
+                return request.clone();
+            }
+            status.changed().await.expect("the runner keeps its status");
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no question was asked; status={:?}", *status.borrow()))
+}
+
+/// Wait for the runner to finalize.
+async fn finished(status: &mut tokio::sync::watch::Receiver<SessionStatus>) -> SessionResult {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let SessionStatus::Finished(result) = &*status.borrow() {
+                return result.clone();
+            }
+            status.changed().await.expect("the runner keeps its status");
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the session never finished; status={:?}", *status.borrow()))
+}
+
+/// The durable model-facing result of `call_id`, as the model would read it.
+async fn tool_result(root: &Path, session: &str, call_id: &str) -> String {
+    let entries = SessionStore::Jsonl
+        .load(root, session)
+        .await
+        .unwrap()
+        .entries;
+    entries
+        .iter()
+        .find_map(|entry| match entry {
+            crate::agent::SessionEntry::Message {
+                message:
+                    Message::Tool {
+                        call_id: id,
+                        content,
+                        ..
+                    },
+            } if id == call_id => Some(content.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no tool result for {call_id}"))
+}
+
+/// The runner with `acp_prompt` registered, and its status receiver.
+fn runner_with_acp(
+    root: &Path,
+    session: &str,
+    tool: Box<dyn Tool>,
+    user_input_allowed: bool,
+) -> (
+    SessionRunner,
+    crate::runner::SessionHandle,
+    tokio::sync::watch::Receiver<SessionStatus>,
+) {
+    let agent = Agent::new(Box::new(AcpCallModel { calls: 0 }), vec![tool]);
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        root.to_path_buf(),
+        session.to_owned(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let (_, _events, status) = handle.attach();
+    let runner = if user_input_allowed {
+        runner.with_user_input_allowed()
+    } else {
+        runner
+    };
+    (runner, handle, status)
+}
+
+#[tokio::test]
+async fn a_permission_request_asks_the_user_and_sends_the_chosen_option_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let log = temp.path().join("frames.log");
+    let root = Workspace::new(temp.path()).unwrap().root().to_path_buf();
+    let session = "session-ask";
+    let tool = tool_with(&root, stub_config(STUB, &log, "ok"), session).await;
+    let (runner, handle, mut status) = runner_with_acp(&root, session, tool, true);
+    let task = runner.start(Some("go".into()));
+
+    // Request 9001 (a `read`): ACP's own options become the question's
+    // options, one-to-one, and the question names what the agent wants to do.
+    let read = next_question(&mut status, "").await;
+    assert_eq!(read.call_id, "acp-permission-9001");
+    assert_eq!(read.questions.len(), 1);
+    assert_eq!(read.questions[0].prompt, "read notes.md");
+    assert_eq!(
+        read.questions[0].options,
+        vec![
+            crate::runner::UserOption {
+                id: "allow-1".into(),
+                label: "Allow once".into(),
+                description: Some("allow_once".into()),
+            },
+            crate::runner::UserOption {
+                id: "reject-1".into(),
+                label: "Reject".into(),
+                description: Some("reject_once".into()),
+            },
+        ]
+    );
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some(read.call_id.clone()), "allow-1".into()),
+        PromptSubmission::Answered
+    );
+
+    // Request 9002 (an `execute`): the title plus the raw command.
+    let run = next_question(&mut status, &read.call_id).await;
+    assert_eq!(run.call_id, "acp-permission-9002");
+    assert_eq!(run.questions[0].prompt, "run ls: ls -la");
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some(run.call_id.clone()), "reject-1".into()),
+        PromptSubmission::Answered
+    );
+
+    assert!(
+        matches!(
+            finished(&mut status).await,
+            SessionResult::Completed(Some(_))
+        ),
+        "the turn must finish normally"
+    );
+    drop(task);
+
+    // The exact frames the client sent back: the human's chosen ids.
+    let frames = logged_frames(&log);
+    assert_eq!(
+        frames[3],
+        r#"{"jsonrpc":"2.0","id":9001,"result":{"outcome":{"outcome":"selected","optionId":"allow-1"}}}"#
+    );
+    assert_eq!(
+        frames[4],
+        r#"{"jsonrpc":"2.0","id":9002,"result":{"outcome":{"outcome":"selected","optionId":"reject-1"}}}"#
+    );
+    let content = tool_result(&root, session, "call-acp").await;
+    assert!(content.contains("alpha beta"), "{content}");
+    assert!(content.contains("stopReason: end_turn"), "{content}");
+    // Both requests were answered with ACP's own options, so neither is
+    // reported as a denial by e-agent: the agent reports its own outcome.
+    assert!(!content.contains("denied"), "{content}");
+    assert!(!content.contains("read notes.md"), "{content}");
+}
+
+#[tokio::test]
+async fn a_child_session_keeps_the_kind_policy_and_asks_nobody() {
+    let temp = tempfile::tempdir().unwrap();
+    let log = temp.path().join("frames.log");
+    let root = Workspace::new(temp.path()).unwrap().root().to_path_buf();
+    let session = "session-child";
+    let tool = tool_with(&root, stub_config(STUB, &log, "ok"), session).await;
+    // No `with_user_input_allowed`: a delegate/btw/fork child, i.e. a session
+    // with no frontend. Asking would park the turn forever.
+    let (runner, _handle, mut status) = runner_with_acp(&root, session, tool, false);
+    let watched = status.clone();
+    let seen = Arc::new(StdMutex::new(Vec::new()));
+    let recorder = {
+        let seen = seen.clone();
+        tokio::spawn(async move {
+            let mut watched = watched;
+            loop {
+                let current = watched.borrow().clone();
+                seen.lock().unwrap().push(format!("{current:?}"));
+                if matches!(current, SessionStatus::Finished(_)) || watched.changed().await.is_err()
+                {
+                    break;
+                }
+            }
+        })
+    };
+    let task = runner.start(Some("go".into()));
+
+    assert!(
+        matches!(
+            finished(&mut status).await,
+            SessionResult::Completed(Some(_))
+        ),
+        "a child turn must finish without asking anyone"
+    );
+    drop(task);
+    recorder.await.unwrap();
+    let seen = seen.lock().unwrap().clone();
+    assert!(
+        !seen.iter().any(|status| status.contains("WaitingInput")),
+        "a child session must never surface a question: {seen:?}"
+    );
+
+    // Exactly today's kind policy: `read` allowed, `execute` denied, and no
+    // question in between.
+    let frames = logged_frames(&log);
+    assert_eq!(
+        frames[3],
+        r#"{"jsonrpc":"2.0","id":9001,"result":{"outcome":{"outcome":"selected","optionId":"allow-1"}}}"#
+    );
+    assert_eq!(
+        frames[4],
+        r#"{"jsonrpc":"2.0","id":9002,"result":{"outcome":{"outcome":"cancelled"}}}"#
+    );
+    let content = tool_result(&root, session, "call-acp").await;
+    assert!(content.contains("denied execute: run ls"), "{content}");
+}
+
+/// Pump the tool's question channel the way the runner does, answering with
+/// `answer` (`None` = cancelled / aborted).
+async fn answer_next_ask(
+    commands: &mut tokio::sync::mpsc::UnboundedReceiver<crate::runner::SessionCommand>,
+    answer: Option<String>,
+) -> UserInputRequest {
+    let ask = tokio::time::timeout(Duration::from_secs(30), commands.recv())
+        .await
+        .expect("the tool must ask the user")
+        .expect("the session command channel stays open");
+    match ask {
+        crate::runner::SessionCommand::AskUser { request, reply } => {
+            reply.send(answer).expect("the tool is still waiting");
+            request
+        }
+        _ => panic!("expected a tool question"),
+    }
+}
+
+#[tokio::test]
+async fn an_answer_outside_the_offered_ids_and_an_abort_are_both_cancelled() {
+    let temp = tempfile::tempdir().unwrap();
+    let log = temp.path().join("frames.log");
+    let root = Workspace::new(temp.path()).unwrap().root().to_path_buf();
+    let session = "session-bogus";
+    let mut tool = tool_with(&root, stub_config(STUB, &log, "ok"), session).await;
+    let (handle, emitter, mut commands) = session_test_channel();
+    emitter.allow_user_input();
+    tool.set_session_handle(session, handle);
+    let call = tokio::spawn(async move { tool.execute(json!({"prompt": "hi"})).await });
+
+    // A value that names none of the offered options (the runner rejects
+    // those, so this is the defensive branch): never select an invented id.
+    let bogus = answer_next_ask(&mut commands, Some("selected".into())).await;
+    assert_eq!(bogus.call_id, "acp-permission-9001");
+    // An aborted ask (`None`) is the same outcome.
+    let aborted = answer_next_ask(&mut commands, None).await;
+    assert_eq!(aborted.call_id, "acp-permission-9002");
+
+    let output = tokio::time::timeout(Duration::from_secs(30), call)
+        .await
+        .expect("an unanswerable question must not hang the call")
+        .unwrap()
+        .expect("the stub resolves the prompt");
+    let frames = logged_frames(&log);
+    assert_eq!(
+        frames[3],
+        r#"{"jsonrpc":"2.0","id":9001,"result":{"outcome":{"outcome":"cancelled"}}}"#
+    );
+    assert_eq!(
+        frames[4],
+        r#"{"jsonrpc":"2.0","id":9002,"result":{"outcome":{"outcome":"cancelled"}}}"#
+    );
+    assert!(
+        output
+            .content
+            .contains("denied read by the user: read notes.md"),
+        "{}",
+        output.content
+    );
 }
