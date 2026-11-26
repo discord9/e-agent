@@ -91,6 +91,41 @@ pub struct LocalSessionKey {
     pub session: String,
 }
 
+/// Typed admission conflict: this session id is already reserved in this
+/// process (a live runner, or a build that is still reserving it).
+///
+/// This exists so a caller can tell an EXPECTED conflict from a genuine
+/// failure by TYPE instead of matching the English wording (the HTTP layer
+/// answers `409 CONFLICT` for this type and `500` for everything else).
+/// `Display` renders the plain message the pre-typing `anyhow!` produced, so
+/// logs and non-HTTP callers (TUI/REPL) are unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionAlreadyLive(String);
+
+impl SessionAlreadyLive {
+    /// The one place the client-visible wording lives. It is deliberately
+    /// NOT part of the classification: reword it and every conflicted
+    /// request still answers `409`.
+    pub(crate) fn already_live(session: &str) -> Self {
+        Self(format!("session {session} is already live locally"))
+    }
+
+    /// Same type, arbitrary wording: proves the conflict status comes from
+    /// the type and never from this text.
+    #[cfg(test)]
+    pub(crate) fn reworded(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+}
+
+impl std::fmt::Display for SessionAlreadyLive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SessionAlreadyLive {}
+
 /// Shared process-local admission registry. Persisted rows are deliberately
 /// not consulted; a permit only represents a live local runner.
 #[derive(Clone, Default)]
@@ -104,11 +139,13 @@ pub struct LocalSessionPermit {
 }
 
 impl LocalSessionRegistry {
-    #[allow(clippy::result_unit_err)]
-    pub fn reserve(&self, key: LocalSessionKey) -> Result<LocalSessionPermit, ()> {
+    /// Reserve `key` for the caller's lifetime. A duplicate reservation is
+    /// [`SessionAlreadyLive`], not a `()`: callers that must answer over HTTP
+    /// classify it by type.
+    pub fn reserve(&self, key: LocalSessionKey) -> Result<LocalSessionPermit, SessionAlreadyLive> {
         let mut live = self.live.lock().unwrap();
         if !live.insert(key.clone()) {
-            return Err(());
+            return Err(SessionAlreadyLive::already_live(&key.session));
         }
         Ok(LocalSessionPermit {
             registry: self.clone(),
@@ -928,11 +965,14 @@ impl SessionFactory {
         fork_target: Option<&str>,
     ) -> anyhow::Result<SessionBuild> {
         let mut session = id.to_owned();
+        // The admission rejection is propagated UNWRAPPED: a typed
+        // [`SessionAlreadyLive`] must stay downcastable for the HTTP layer,
+        // so no `anyhow!`/`.context()` is put on top of it (its `Display`
+        // already carries the human message).
         let mut local_permit = if fork_target.is_some() || fork_from.is_none() {
             Some(
                 self.local_sessions
-                    .reserve(self.local_session_key(&session))
-                    .map_err(|_| anyhow!("session {session} is already live locally"))?,
+                    .reserve(self.local_session_key(&session))?,
             )
         } else {
             None
@@ -1007,10 +1047,11 @@ impl SessionFactory {
             eprintln!("e-agent: forked session: {new_id}");
             session = new_id;
             if local_permit.is_none() {
+                // Fork target reservation: same typed conflict as above,
+                // propagated unwrapped for the same reason.
                 local_permit = Some(
                     self.local_sessions
-                        .reserve(self.local_session_key(&session))
-                        .map_err(|_| anyhow!("session {session} is already live locally"))?,
+                        .reserve(self.local_session_key(&session))?,
                 );
             }
         }
@@ -4677,5 +4718,62 @@ mod generate_image_registration_tests {
             )
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod admission_conflict_tests {
+    use super::*;
+
+    /// A non-HTTP caller (the CLI/TUI/REPL `factory.build(..)?` path in
+    /// `main.rs`) still gets a readable message: the typed conflict renders
+    /// through `Display` exactly like the old `anyhow!` text, while `anyhow`
+    /// keeps it downcastable for the HTTP layer. Both properties are load
+    /// bearing, so both are asserted here.
+    #[tokio::test]
+    async fn a_second_build_reads_as_a_plain_conflict_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let factory = SessionFactory::test_factory(temp.path().to_path_buf());
+        let live = factory
+            .build(
+                "dup",
+                None,
+                None,
+                IdlePolicy::WaitForInput,
+                UnfinishedPolicy::Consume,
+            )
+            .await
+            .expect("the first build owns the reservation");
+        let error = match factory
+            .build(
+                "dup",
+                None,
+                None,
+                IdlePolicy::WaitForInput,
+                UnfinishedPolicy::Consume,
+            )
+            .await
+        {
+            Ok(_) => panic!("the id is already live in this process"),
+            Err(error) => error,
+        };
+        // Unchanged human wording — the log line / TUI failure text.
+        assert_eq!(format!("{error:#}"), "session dup is already live locally");
+        assert!(
+            error.downcast_ref::<SessionAlreadyLive>().is_some(),
+            "the conflict survives `anyhow` as a type: {error:#}"
+        );
+        drop(live);
+        // The permit is released with the build, so the id frees up again.
+        factory
+            .build(
+                "dup",
+                None,
+                None,
+                IdlePolicy::WaitForInput,
+                UnfinishedPolicy::Consume,
+            )
+            .await
+            .expect("the released id can be built again");
     }
 }

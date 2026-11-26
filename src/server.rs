@@ -63,7 +63,9 @@ use crate::runner::{
     IdlePolicy, PromptSubmission, SessionHandle, SessionStatus, SessionTask, UserInputRequest,
     WeakSessionHandle,
 };
-use crate::session_factory::{EffortOverride, SessionBuild, SessionFactory, UnfinishedPolicy};
+use crate::session_factory::{
+    EffortOverride, SessionAlreadyLive, SessionBuild, SessionFactory, UnfinishedPolicy,
+};
 use crate::session_store::{
     FinishedTask, ListMetaDiagnostics, SessionStore, UsageDashboardMetadata, UsageDashboardRow,
 };
@@ -1568,14 +1570,21 @@ async fn build_session(
             UnfinishedPolicy::Consume,
         )
         .await
-        .map_err(|e| {
-            let message = format!("{e:#}");
-            if message.contains("already live locally") {
-                error(StatusCode::CONFLICT, message)
-            } else {
-                error(StatusCode::INTERNAL_SERVER_ERROR, message)
-            }
-        })
+        .map_err(|e| error(session_status(&e), format!("{e:#}")))
+}
+
+/// HTTP status for one failed session build/fork: the typed admission
+/// rejection is the only expected conflict, everything else is a genuine
+/// server failure. The rendered message is never inspected, so rewording an
+/// error (or adding one) cannot flip a `409` into a `500` or vice versa.
+fn session_status(e: &anyhow::Error) -> StatusCode {
+    if e.chain()
+        .any(|cause| cause.downcast_ref::<SessionAlreadyLive>().is_some())
+    {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
 }
 
 /// Resolve a session id to something the web can attach to: the main
@@ -2917,9 +2926,12 @@ async fn session_fork(
         .await
         .map_err(|e| {
             let message = format!("{e:#}");
-            if message.contains("fork point")
+            // The admission conflict is typed (`session_status`); the two
+            // remaining clauses are the fork-boundary rejections, which are
+            // still classified by text and keep their existing status.
+            if session_status(&e) == StatusCode::CONFLICT
+                || message.contains("fork point")
                 || message.contains("no completed turn")
-                || message.contains("already live locally")
             {
                 error(StatusCode::CONFLICT, format!("无法 fork：{message}"))
             } else {
@@ -5692,6 +5704,147 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// An `AppState` around `factory`, for handler tests that really build
+    /// sessions (admission conflicts, store failures).
+    fn rooted_state(factory: crate::session_factory::SessionFactory) -> Arc<AppState> {
+        Arc::new(AppState {
+            factory,
+            registry: Arc::new(SessionRegistry::default()),
+            token: "sekrit".to_owned(),
+            meta_store: SessionStore::Jsonl,
+            summaries: Arc::new(Mutex::new(HashMap::new())),
+            summary_pending: Arc::new(SummaryPending(Mutex::new(HashSet::new()))),
+            shutdown: watch::channel(()).0,
+        })
+    }
+
+    /// `POST /api/sessions {id}` on an id the process-local admission registry
+    /// already holds: `409 CONFLICT`, with exactly the plain-text body the
+    /// message-matching code produced (nothing about the conflict changes
+    /// except how it is classified).
+    #[tokio::test]
+    async fn create_session_live_reservation_conflict_is_409() {
+        use tower::util::ServiceExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let state = rooted_state(crate::session_factory::SessionFactory::test_factory(
+            root.clone(),
+        ));
+        let app = router(state.clone());
+        let post = |app: Router| async move {
+            app.oneshot(
+                Request::builder()
+                    .uri("/api/sessions")
+                    .method("POST")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"id":"web-taken"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        };
+
+        // A live runner holds the permit for this id (an already-built
+        // session and an in-flight build look the same to the registry).
+        let permit = state
+            .factory
+            .local_sessions()
+            .reserve(state.factory.local_session_key("web-taken"))
+            .unwrap();
+        let response = post(app.clone()).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(body.to_vec()).unwrap(),
+            "session web-taken is already live locally"
+        );
+
+        // Releasing the permit frees the id: the same request now builds.
+        drop(permit);
+        let response = post(app).await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    /// The regression this guards: the status comes from the error TYPE, never
+    /// from its English wording. A deliberately reworded conflict still
+    /// answers `409`, and a plain error that merely contains the old marker
+    /// answers `500`.
+    #[test]
+    fn session_build_status_is_typed_not_textual() {
+        let produced = anyhow::Error::new(
+            crate::session_factory::SessionAlreadyLive::already_live("web-1"),
+        );
+        assert_eq!(
+            format!("{produced:#}"),
+            "session web-1 is already live locally"
+        );
+        assert_eq!(session_status(&produced), StatusCode::CONFLICT);
+        // Context on top does not hide the type.
+        assert_eq!(
+            session_status(&produced.context("cannot resume web-1")),
+            StatusCode::CONFLICT
+        );
+
+        // Rewording the conflict message — the whole point of the type — must
+        // not demote it to a `500`.
+        let reworded = anyhow::Error::new(crate::session_factory::SessionAlreadyLive::reworded(
+            "那个会话仍在运行，请稍后再试",
+        ));
+        assert_eq!(session_status(&reworded), StatusCode::CONFLICT);
+
+        // And the inverse: the old marker as plain text decides nothing now.
+        let old_marker = anyhow!("session web-1 is already live locally");
+        assert_eq!(
+            session_status(&old_marker),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    /// A genuine failure at the same call site keeps its `500`: the store
+    /// cannot be opened (the backend path is a directory), which is not a
+    /// conflict. Nothing here edits a message to fake the failure.
+    #[tokio::test]
+    #[cfg(feature = "sqlite")]
+    async fn create_session_store_failure_is_500() {
+        use tower::util::ServiceExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let blocked = root.join("db-is-a-directory");
+        std::fs::create_dir_all(&blocked).unwrap();
+        let state = rooted_state(
+            crate::session_factory::SessionFactory::test_factory_with_backend(
+                root,
+                crate::config::SessionBackend::Sqlite {
+                    path: Some(blocked.display().to_string()),
+                },
+            ),
+        );
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions")
+                    .method("POST")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"id":"web-broken"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("SQLite"), "{body}");
     }
 
     /// A surviving `running_tasks` record does not act as a cross-process
