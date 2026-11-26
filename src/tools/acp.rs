@@ -40,22 +40,35 @@
 //! the reviewer still remembers earlier turns when it does not. Starting over
 //! is fine; pretending is not.
 //!
-//! **Permission policy: read freely, never edit silently.** A
-//! `session/request_permission` request is allowed ("allow once") only when
-//! its `toolCall.kind` is in `[acp] allow_kinds` (default `read`, `search`,
-//! `fetch`, `think`); everything else (edit / delete / move / execute /
-//! anything unknown) is denied with `cancelled` and reported in the result. As
-//! an oracle this agent should read and search freely, but a reviewer that
-//! silently edits the workspace is not a reviewer. `[acp] danger = true`
-//! allows every kind instead and says so once in the result.
+//! **Permission policy: ask the human when there is one, never edit
+//! silently.** A `session/request_permission` request is answered by the human
+//! whenever this session has a user-facing frontend: it becomes ONE blocking
+//! question (through `SessionHandle::ask_user`, so the runner parks the turn
+//! exactly as it does for `request_user_input`) whose options ARE the ACP
+//! options — `optionId` → `id`, `name` → `label`, `kind` → `description`,
+//! nothing added — and the chosen id is sent back as the selected `optionId`.
+//! An unanswered, cancelled or aborted question, and an id ACP did not offer,
+//! all resolve as `cancelled`, so the agent is never left waiting.
+//!
+//! A session with NO frontend (a delegate / btw / fork child, or a tool bound
+//! outside the runner) keeps the kind-based policy: the request is allowed
+//! ("allow once") only when its `toolCall.kind` is in `[acp] allow_kinds`
+//! (default `read`, `search`, `fetch`, `think`); everything else (edit /
+//! delete / move / execute / anything unknown) is denied with `cancelled` and
+//! reported in the result. As an oracle this agent should read and search
+//! freely, but a reviewer that silently edits the workspace is not a reviewer.
+//! `[acp] danger = true` allows every kind instead and says so once in the
+//! result. A child never asks: suspending there would park a turn nobody can
+//! answer.
 //!
 //! Non-goals (deliberately not implemented): a session/process pool, streaming
 //! `session/update` notifications to the UI (they are accumulated and returned
-//! as one result), MCP injection (`mcpServers` is always `[]`), a permission
-//! UI or any human-in-the-loop approval, `session/close`, `session/cancel`,
-//! `session/set_mode`, several prompts inside one call, and any `session/list`
-//! based discovery (it cannot tell two concurrent e-agent sessions in one
-//! workspace apart).
+//! as one result), MCP injection (`mcpServers` is always `[]`), a permission UI
+//! of its own (the request reuses the existing `WaitingInput` question
+//! frontends), remembered grants (every request is answered on its own),
+//! `session/close`, `session/cancel`, `session/set_mode`, several prompts
+//! inside one call, and any `session/list` based discovery (it cannot tell two
+//! concurrent e-agent sessions in one workspace apart).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -73,6 +86,7 @@ use tokio::sync::{Mutex, oneshot};
 use super::spec;
 use crate::agent::{Tool, ToolOutput, ToolSpec};
 use crate::config::AcpConfig;
+use crate::runner::{SessionHandle, UserInputRequest, UserOption, UserQuestion};
 use crate::session_store::SessionStore;
 use crate::workspace::Workspace;
 
@@ -93,6 +107,10 @@ const STDERR_LIMIT: usize = 4 * 1024;
 const TEXT_LIMIT: usize = 64 * 1024;
 /// Cap on a `toolCall` summary quoted in a permission line.
 const SUMMARY_LIMIT: usize = 120;
+/// Cap on the `rawInput.command` quoted in a permission question.
+const COMMAND_LIMIT: usize = 200;
+/// The question id every permission ask uses (one question per request).
+const PERMISSION_QUESTION: &str = "permission";
 /// Cache bucket of a tool that was never bound to an e-agent session (direct
 /// `Agent::run`, tests): process-local only, never written to disk.
 const UNBOUND_SESSION: &str = "<unbound>";
@@ -114,6 +132,7 @@ pub(crate) fn acp_tool(
         root,
         session: session.to_owned(),
         cached: StdMutex::new(HashMap::new()),
+        handle: None,
     })
 }
 
@@ -123,9 +142,10 @@ const DESCRIPTION: &str = "Run ONE prompt through an external ACP (Agent Client 
      agent remembers earlier calls in the same workspace; a changed workspace or `fresh: true` \
      starts a new conversation, and the result says so. Each call still starts and kills its own \
      agent process, and the agent works with the same ambient authority as `bash` without the \
-     sandbox — its file changes are NOT cap-std confined. Permission requests are allowed only for \
-     read-only tool kinds (read/search/fetch/think); edits, deletes, moves and command execution \
-     are denied and reported in the result.";
+     sandbox — its file changes are NOT cap-std confined. A permission request is forwarded to the \
+     user as one question carrying the agent's own options when this session has a frontend; from a \
+     session without one (a subagent) only read-only tool kinds (read/search/fetch/think) are \
+     allowed, and edits, deletes, moves and command execution are denied and reported in the result.";
 
 struct AcpPrompt {
     workspace: Workspace,
@@ -144,6 +164,12 @@ struct AcpPrompt {
     /// used for it, plus the workspace that id is bound to. The store is the
     /// durable copy; this only skips the read within one process.
     cached: StdMutex<HashMap<String, Cached>>,
+    /// The e-agent session this call belongs to (bound by the runner's
+    /// `set_session_handle`). `None` (a tool built outside a runner), or a
+    /// session whose `ask_user` refuses, means there is no frontend to ask:
+    /// permission requests then keep the kind-based policy. A child
+    /// (delegate/btw/fork) session refuses because it has no frontend.
+    handle: Option<SessionHandle>,
 }
 
 #[derive(Clone)]
@@ -208,7 +234,8 @@ impl Tool for AcpPrompt {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let plan = self.plan(&cwd, fresh).await;
-        match tokio::time::timeout(PROMPT_TIMEOUT, self.run(plan, prompt, &cwd)).await {
+        let run = self.run(plan, prompt, &cwd, self.handle.clone());
+        match tokio::time::timeout(PROMPT_TIMEOUT, run).await {
             Ok(result) => result.map(ToolOutput::text),
             // The deadline drops `run`, which drops the client and thereby
             // kills the agent's process group.
@@ -219,8 +246,9 @@ impl Tool for AcpPrompt {
         }
     }
 
-    fn set_session_handle(&mut self, session_id: &str, _handle: crate::runner::SessionHandle) {
+    fn set_session_handle(&mut self, session_id: &str, handle: crate::runner::SessionHandle) {
         self.session = session_id.to_owned();
+        self.handle = Some(handle);
     }
 }
 
@@ -333,8 +361,14 @@ impl AcpPrompt {
 
     /// One process, one prompt: handshake (new or loaded session), remember
     /// the id, `session/prompt`, receipt.
-    async fn run(&self, plan: Plan, prompt: &str, cwd: &Path) -> Result<String, String> {
-        let client = Client::connect(&self.config, cwd, &plan).await?;
+    async fn run(
+        &self,
+        plan: Plan,
+        prompt: &str,
+        cwd: &Path,
+        handle: Option<SessionHandle>,
+    ) -> Result<String, String> {
+        let client = Client::connect(&self.config, cwd, &plan, handle).await?;
         // Remembered BEFORE the prompt: a failed prompt must not orphan a
         // freshly created session id.
         self.remember(cwd, &client.session_id).await;
@@ -377,8 +411,13 @@ struct Client {
 }
 
 impl Client {
-    async fn connect(config: &AcpConfig, cwd: &Path, plan: &Plan) -> Result<Self, String> {
-        let mut client = Self::spawn(config, cwd, plan)?;
+    async fn connect(
+        config: &AcpConfig,
+        cwd: &Path,
+        plan: &Plan,
+        handle: Option<SessionHandle>,
+    ) -> Result<Self, String> {
+        let mut client = Self::spawn(config, cwd, plan, handle)?;
         if let Err(error) = client.handshake(config, cwd, &plan.open).await {
             // The child dies with `client` on this early return.
             return Err(client.describe(error));
@@ -387,7 +426,12 @@ impl Client {
     }
 
     /// Spawn the configured agent, wire the pipes, and start the reader task.
-    fn spawn(config: &AcpConfig, cwd: &Path, plan: &Plan) -> Result<Self, String> {
+    fn spawn(
+        config: &AcpConfig,
+        cwd: &Path,
+        plan: &Plan,
+        handle: Option<SessionHandle>,
+    ) -> Result<Self, String> {
         let mut command = Command::new(&config.binary);
         command
             .args(&config.args)
@@ -417,6 +461,7 @@ impl Client {
             state: StdMutex::new(State::default()),
             allow_kinds: config.allow_kinds.clone(),
             danger: config.danger,
+            handle,
         });
         tokio::spawn(read_loop(shared.clone(), stdout));
         Ok(Self {
@@ -610,6 +655,9 @@ struct Shared {
     allow_kinds: Vec<String>,
     /// `[acp] danger`: answer every permission request "allow once".
     danger: bool,
+    /// The e-agent session handle used to forward a permission request to the
+    /// human as a question. `None` keeps the kind-based policy.
+    handle: Option<SessionHandle>,
 }
 
 impl Shared {
@@ -671,7 +719,8 @@ impl Shared {
             // agent, so anything unimplemented is refused with -32601.
             (Some(id), Some(method)) => {
                 let reply = if method == "session/request_permission" {
-                    self.answer_permission(value.get("params"), &id)
+                    self.answer_permission_request(value.get("params"), &id)
+                        .await
                 } else {
                     json!({
                         "jsonrpc": "2.0",
@@ -699,13 +748,69 @@ impl Shared {
         }
     }
 
+    /// Answer one `session/request_permission` with the human when this
+    /// session has a frontend, and by tool kind otherwise.
+    ///
+    /// With a frontend the request is forwarded through `ask_user` as ONE
+    /// question whose options ARE the ACP options (one-to-one: `optionId` →
+    /// `id`, `name` → `label`, `kind` → `description`); the chosen id is what
+    /// ACP receives back. Nothing is invented: a request that offers no usable
+    /// option, an unanswerable one (no frontend, a child session, a dead
+    /// session), and an answer that names no offered id all fall back to
+    /// `cancelled`/the kind policy rather than guessing.
+    async fn answer_permission_request(&self, params: Option<&Value>, id: &Value) -> Value {
+        let tool_call = params.and_then(|params| params.get("toolCall"));
+        let Some(handle) = &self.handle else {
+            return self.answer_permission(params, id);
+        };
+        let Some(options) = question_options(params) else {
+            // ACP offered no usable option: there is nothing to ask.
+            return self.answer_permission(params, id);
+        };
+        let request = UserInputRequest {
+            call_id: format!("acp-permission-{id}"),
+            questions: vec![UserQuestion {
+                id: PERMISSION_QUESTION.to_owned(),
+                prompt: permission_prompt(tool_call),
+                options: options.clone(),
+            }],
+        };
+        // `ask_user` refuses (no frontend / not live): the kind policy owns
+        // this request, and a child session never surfaces a question.
+        let Ok(answer) = handle.ask_user(request) else {
+            return self.answer_permission(params, id);
+        };
+        let chosen = answer.await.unwrap_or(None);
+        let kind = text_field(tool_call, "kind").unwrap_or("unknown");
+        let summary = clip(&tool_call_summary(tool_call));
+        let mut state = self.state.lock().unwrap();
+        // A selection needs no receipt line: ACP's own option (allow or
+        // reject) decides what happens, and the agent reports that itself.
+        // `cancelled` is different — the request was never decided, so the
+        // model is told a human (or the end of the question) stopped it.
+        let outcome = match chosen.filter(|chosen| options.iter().any(|o| o.id == *chosen)) {
+            Some(option_id) => json!({"outcome": {"outcome": "selected", "optionId": option_id}}),
+            None => {
+                // No answer, a cancellation/abort, or an id outside the
+                // offered options (the runner already rejects those): ACP is
+                // told `cancelled` and the receipt names the blocker.
+                state
+                    .permissions
+                    .push(format!("denied {kind} by the user: {summary}"));
+                json!({"outcome": {"outcome": "cancelled"}})
+            }
+        };
+        drop(state);
+        json!({"jsonrpc": "2.0", "id": id.clone(), "result": outcome})
+    }
+
     /// Answer one `session/request_permission` by tool kind: the kinds in
     /// `[acp] allow_kinds` (and every kind under `danger`) get the agent's
     /// "allow once" option, everything else is denied with `cancelled` and
     /// recorded for the receipt.
     fn answer_permission(&self, params: Option<&Value>, id: &Value) -> Value {
         let tool_call = params.and_then(|params| params.get("toolCall"));
-        let kind = tool_call_field(tool_call, "kind").unwrap_or("unknown");
+        let kind = text_field(tool_call, "kind").unwrap_or("unknown");
         let summary = clip(&tool_call_summary(tool_call));
         let allowed_kind =
             !kind.is_empty() && self.allow_kinds.iter().any(|allowed| allowed == kind);
@@ -943,22 +1048,72 @@ fn tool_call_summary(tool_call: Option<&Value>) -> String {
     let Some(tool_call) = tool_call else {
         return "unknown tool call".into();
     };
-    let command = tool_call
-        .get("rawInput")
-        .and_then(|input| input.get("command"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|command| !command.is_empty());
-    tool_call_field(Some(tool_call), "title")
-        .or(command)
-        .or_else(|| tool_call_field(Some(tool_call), "toolCallId"))
+    text_field(Some(tool_call), "title")
+        .or_else(|| command_of(Some(tool_call)))
+        .or_else(|| text_field(Some(tool_call), "toolCallId"))
         .unwrap_or("unknown tool call")
         .to_owned()
 }
 
-fn tool_call_field<'a>(tool_call: Option<&'a Value>, name: &str) -> Option<&'a str> {
+/// The question a permission request becomes: what the agent wants to do —
+/// `toolCall.title` plus, when present, the raw command (cut to
+/// [`COMMAND_LIMIT`] characters). Exactly one question per request.
+fn permission_prompt(tool_call: Option<&Value>) -> String {
+    let title = text_field(tool_call, "title").unwrap_or("an unknown tool call");
+    match command_of(tool_call) {
+        Some(command) => format!("{title}: {}", truncate_command(command)),
+        None => title.to_owned(),
+    }
+}
+
+/// The ACP options of one permission request, mapped one-to-one to question
+/// options (`optionId` → `id`, `name` → `label`, `kind` → `description`).
+/// `None` when the request offers no usable option id: there is then nothing
+/// to ask, and the kind policy answers instead of inventing choices.
+fn question_options(params: Option<&Value>) -> Option<Vec<UserOption>> {
+    let offered = params?
+        .get("options")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(|option| {
+            let id = option_id(option)?;
+            let label = text_field(Some(option), "name").map(str::to_owned);
+            let description = text_field(Some(option), "kind").map(str::to_owned);
+            Some(UserOption {
+                label: label.unwrap_or_else(|| id.clone()),
+                id,
+                description,
+            })
+        })
+        .collect::<Vec<_>>();
+    (!offered.is_empty()).then_some(offered)
+}
+
+/// `toolCall.rawInput.command`, trimmed and non-empty.
+fn command_of(tool_call: Option<&Value>) -> Option<&str> {
     tool_call
-        .and_then(|tool_call| tool_call.get(name))
+        .and_then(|tool_call| tool_call.get("rawInput"))
+        .and_then(|input| input.get("command"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+}
+
+/// Cut a command to [`COMMAND_LIMIT`] CHARACTERS on a char boundary, marking
+/// the cut so a truncated command is never mistaken for the whole one.
+fn truncate_command(command: &str) -> String {
+    match command.char_indices().nth(COMMAND_LIMIT) {
+        Some((cut, _)) => format!("{}…", &command[..cut]),
+        None => command.to_owned(),
+    }
+}
+
+/// One trimmed, non-empty string field of an optional JSON object: a
+/// `toolCall` field (`title`/`kind`/`toolCallId`) or an option's
+/// `name`/`kind`.
+fn text_field<'a>(object: Option<&'a Value>, name: &str) -> Option<&'a str> {
+    object
+        .and_then(|object| object.get(name))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())

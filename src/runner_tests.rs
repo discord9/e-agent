@@ -585,6 +585,209 @@ async fn request_user_input_waits_answers_and_resumes_same_turn() {
     drop(task);
 }
 
+/// A tool that asks the human ONE option question mid-call, exactly as the
+/// ACP tool does, and records the id it got back.
+struct AskTool {
+    handle: Option<SessionHandle>,
+    answer: Arc<Mutex<Option<Option<String>>>>,
+}
+
+#[async_trait]
+impl Tool for AskTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "ask_tool".into(),
+            description: "test only".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+    async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
+        let handle = self.handle.as_ref().expect("the runner binds a handle");
+        let request = UserInputRequest {
+            call_id: "tool-ask".into(),
+            questions: vec![UserQuestion {
+                id: "permission".into(),
+                prompt: "Allow the tool to run?".into(),
+                options: vec![
+                    UserOption {
+                        id: "allow".into(),
+                        label: "Allow".into(),
+                        description: None,
+                    },
+                    UserOption {
+                        id: "deny".into(),
+                        label: "Deny".into(),
+                        description: Some("reject_once".into()),
+                    },
+                ],
+            }],
+        };
+        // No frontend must mean `Err` (the tool then applies its own policy),
+        // never a parked turn.
+        let answer = match handle.ask_user(request) {
+            Ok(answer) => answer.await.ok().flatten(),
+            Err(_) => None,
+        };
+        *self.answer.lock().unwrap() = Some(answer.clone());
+        Ok(ToolOutput::text(format!("answer: {answer:?}")))
+    }
+    fn set_session_handle(&mut self, _session_id: &str, handle: SessionHandle) {
+        self.handle = Some(handle);
+    }
+}
+
+/// The next `WaitingInput` request, or a failure naming the status actually
+/// observed (a parked turn that never reaches `WaitingInput` fails here).
+async fn wait_for_question(status: &mut watch::Receiver<SessionStatus>) -> UserInputRequest {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let SessionStatus::WaitingInput(request) = &*status.borrow() {
+                return request.clone();
+            }
+            status.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no question surfaced; status={:?}", *status.borrow()))
+}
+
+/// Wait for the committed tool result event of `call_id`. The durable row is
+/// already written when it is emitted, so the store can be read right after.
+async fn wait_for_tool_result(events: &mut broadcast::Receiver<AgentEvent>, call_id: &str) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let AgentEvent::ToolResult {
+                call_id: Some(id), ..
+            } = events.recv().await.expect("the session emits events")
+                && id == call_id
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the tool result must be emitted")
+}
+
+fn ask_tool_agent(answer: Arc<Mutex<Option<Option<String>>>>) -> Agent {
+    Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: VecDeque::from(vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call-ask".into(),
+                        name: "ask_tool".into(),
+                        arguments: "{}".into(),
+                    }],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("done".into()),
+                    tool_calls: Vec::new(),
+                    reasoning: None,
+                },
+            ]),
+        }),
+        vec![Box::new(AskTool {
+            handle: None,
+            answer,
+        })],
+    )
+}
+
+/// A tool's mid-call question parks the turn through the SAME frontend as
+/// `request_user_input`, and the tool gets the chosen option id back.
+#[tokio::test]
+async fn a_tool_question_parks_the_turn_and_returns_the_chosen_option_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let answer = Arc::new(Mutex::new(None));
+    let (runner, handle) = SessionRunner::new(
+        ask_tool_agent(answer.clone()),
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "tool-ask".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let runner = runner.with_user_input_allowed();
+    let (_, mut events, mut status) = handle.attach();
+    let task = runner.start(Some("start".into()));
+
+    let request = wait_for_question(&mut status).await;
+    assert_eq!(request.call_id, "tool-ask");
+    assert_eq!(request.questions[0].prompt, "Allow the tool to run?");
+    assert_eq!(
+        request.questions[0]
+            .options
+            .iter()
+            .map(|option| option.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["allow", "deny"]
+    );
+    // An id the question does not offer is refused and leaves it answerable.
+    assert!(matches!(
+        handle.submit_prompt_with_call_id(Some("tool-ask".into()), "bogus".into()),
+        PromptSubmission::Invalid(_)
+    ));
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("tool-ask".into()), "deny".into()),
+        PromptSubmission::Answered
+    );
+
+    wait_for_tool_result(&mut events, "call-ask").await;
+    drop(task);
+    assert_eq!(*answer.lock().unwrap(), Some(Some("deny".to_owned())));
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "tool-ask")
+        .await
+        .unwrap()
+        .entries;
+    let result = tool_entries(&entries)
+        .into_iter()
+        .find_map(|message| match message {
+            Message::Tool {
+                call_id, content, ..
+            } if call_id == "call-ask" => Some(content.clone()),
+            _ => None,
+        })
+        .expect("the tool result is committed");
+    assert_eq!(result, r#"answer: Some("deny")"#);
+}
+
+/// Without a frontend a tool's ask is refused outright: no `WaitingInput`, no
+/// parked turn — the tool applies its own policy on the next line.
+#[tokio::test]
+async fn a_tool_question_without_a_frontend_is_refused_instead_of_parking() {
+    let temp = tempfile::tempdir().unwrap();
+    let answer = Arc::new(Mutex::new(None));
+    let (runner, handle) = SessionRunner::new(
+        ask_tool_agent(answer.clone()),
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "tool-ask-child".into(),
+        IdlePolicy::WaitForInput,
+    );
+    // A delegate/btw/fork child: no `with_user_input_allowed`.
+    let (_, mut events, _status) = handle.attach();
+    let task = runner.start(Some("start".into()));
+    wait_for_tool_result(&mut events, "call-ask").await;
+    drop(task);
+    assert_eq!(*answer.lock().unwrap(), Some(None));
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "tool-ask-child")
+        .await
+        .unwrap()
+        .entries;
+    assert!(
+        tool_entries(&entries).iter().any(|message| matches!(
+            message,
+            Message::Tool { call_id, content, .. }
+                if call_id == "call-ask" && content == "answer: None"
+        )),
+        "the tool ran without asking"
+    );
+}
+
 /// End-to-end blocking path with fixed options: an invalid id is rejected
 /// while the turn stays parked, and the accepted option reaches the model as
 /// `Selected option: {id} ({label})` inside the tool result.
