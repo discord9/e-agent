@@ -3810,7 +3810,6 @@ fn fork_child_delegate_spec_matches_parent() {
             compaction_reminder: None,
             rust_sandbox: None,
             read_only: false,
-            protect_git: true,
             code_mode: false,
             mcp_servers: std::collections::HashMap::new(),
             goal: None,
@@ -3895,7 +3894,6 @@ fn forking_delegate(
             compaction_reminder: None,
             rust_sandbox: None,
             read_only: false,
-            protect_git: false,
             code_mode: false,
             mcp_servers: std::collections::HashMap::new(),
             goal: None,
@@ -5027,7 +5025,6 @@ fn fork_head(
         compaction_reminder: None,
         rust_sandbox: None,
         read_only: false,
-        protect_git: false,
         code_mode: false,
         mcp_servers: std::collections::HashMap::new(),
         goal,
@@ -5236,6 +5233,87 @@ async fn fork_accepts_an_omitted_workspace_and_uses_the_parent_root() {
     assert!(
         output.contains("omitted workspace answer"),
         "the fork must run in the parent workspace, got: {output}"
+    );
+}
+
+/// A fork's bash keeps the SUBAGENT `.git` protection even though the main
+/// session's own bash may write `.git`: forking the main session must not
+/// hand a child a wider shell than an ordinary subagent gets. Mirrors
+/// `protect_git_role_flag_reaches_the_subagent_bash_tool`: the assertion reads
+/// the protection marker out of the fork's own wire request (the marker comes
+/// from the resolved policy, so it holds without a working bwrap).
+#[tokio::test]
+async fn fork_bash_keeps_the_subagent_git_protection() {
+    // Marker text the sandboxed bash description carries exactly when
+    // protect_git = true (Linux: the .git ro-bind note; Windows: the
+    // fail-closed guidance).
+    #[cfg(windows)]
+    let protect_marker = "protect_git = false";
+    #[cfg(not(windows))]
+    let protect_marker = "prevent accidental corruption by fixer subagents";
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    seed_fork_parent(&root, "parent");
+    let sandbox = SandboxPolicy::fixed(Some(crate::config::Sandbox {
+        enabled: true,
+        network: true,
+        workspace_writable: true,
+        gpu: false,
+        writable_paths: Vec::new(),
+        readable_paths: Vec::new(),
+        readable_mounts: Vec::new(),
+        writable_mounts: Vec::new(),
+    }));
+    let (url, captured) = capturing_model().await;
+    let mut delegate = forking_delegate(
+        &root,
+        &fork_record(&root, "parent"),
+        chat_model(url, "fork-protect-model"),
+    )
+    .with_sandbox(sandbox.clone());
+    let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
+    delegate.set_event_sender(sender);
+    delegate.set_session_handle("parent", live_parent_endpoint());
+
+    delegate
+        .execute(json!({
+            "task": "git-backed work",
+            "fork": true,
+            "workspace": root.display().to_string()
+        }))
+        .await
+        .expect("the fork spawns");
+    let (status, output) = await_background_status(&mut completions).await;
+    assert_eq!(status.as_deref(), Some("completed"), "{output}");
+
+    let body = captured_request_body(&captured);
+    let bash_description = body["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .find(|tool| tool["function"]["name"] == "bash")
+        .and_then(|tool| tool["function"]["description"].as_str())
+        .expect("the fork exposes bash")
+        .to_owned();
+    assert!(
+        bash_description.contains(protect_marker),
+        "a forked child's bash must keep the subagent .git protection: {bash_description}"
+    );
+
+    // Main keeps its own policy: the same sandbox cell with the main-session
+    // `protect_git = false` never claims the protection, so the fork is
+    // strictly narrower than the parent that spawned it.
+    let workspace = Workspace::new(&root).unwrap();
+    let (main_tools, _background) = builtins(workspace, sandbox, false, None);
+    let main_bash = main_tools
+        .iter()
+        .find(|tool| tool.spec().name == "bash")
+        .expect("main exposes bash");
+    let main_description = main_bash.spec().description;
+    assert!(
+        !main_description.contains(protect_marker),
+        "main's own bash must keep writing .git: {main_description}"
     );
 }
 
