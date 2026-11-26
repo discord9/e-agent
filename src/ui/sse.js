@@ -667,7 +667,10 @@ function applyLiveEvent(name, payload) {
       let content = p.content;
       if (content && typeof content === "object") content = JSON.stringify(content);
       else content = pickText(p, ["content", "text", "result", "error"]);
-      appendToolResult(isErr, content, acc, p.call_id, p.images);
+      // delegate 启动回执的任务 id / 子代理会话 id 是事件里的结构化字段
+      // （started_task_id / subagent_session_id）；其余工具没有，渲染层照旧。
+      appendToolResult(isErr, content, acc, p.call_id, p.images,
+        p.started_task_id, p.subagent_session_id);
       break;
     }
     case "Display":

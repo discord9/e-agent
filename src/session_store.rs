@@ -4858,6 +4858,8 @@ mod shared_helpers {
                 content: "ok".into(),
                 is_error: false,
                 synthetic: false,
+                started_task_id: None,
+                subagent_session_id: None,
                 images: vec![],
             }
             .into(),
@@ -4867,6 +4869,8 @@ mod shared_helpers {
                 content: "boom".into(),
                 is_error: true,
                 synthetic: false,
+                started_task_id: None,
+                subagent_session_id: None,
                 images: vec![],
             }
             .into(),

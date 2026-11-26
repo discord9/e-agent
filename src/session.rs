@@ -1562,6 +1562,8 @@ mod tests {
                 images: vec![],
                 is_error: false,
                 synthetic: false,
+                started_task_id: None,
+                subagent_session_id: None,
             },
         }];
         let two = vec![SessionEntry::Message {
@@ -1572,6 +1574,8 @@ mod tests {
                 images: vec![],
                 is_error: false,
                 synthetic: false,
+                started_task_id: None,
+                subagent_session_id: None,
             },
         }];
         Session::append(temp.path(), "one", &one).unwrap();

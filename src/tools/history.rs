@@ -755,6 +755,8 @@ mod tests {
                 images: vec![],
                 is_error: false,
                 synthetic: false,
+                started_task_id: None,
+                subagent_session_id: None,
             },
         });
         entries.push(SessionEntry::Compaction {

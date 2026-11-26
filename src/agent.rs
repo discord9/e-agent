@@ -117,6 +117,8 @@ pub(crate) fn repair_tool_pairs(messages: Vec<Message>) -> Vec<Message> {
                 images: vec![],
                 is_error: true,
                 synthetic: true,
+                started_task_id: None,
+                subagent_session_id: None,
             });
         }
     }
@@ -186,6 +188,8 @@ fn repair_item_pairs(items: Vec<ContextItem>) -> Vec<ContextItem> {
                     images: vec![],
                     is_error: true,
                     synthetic: true,
+                    started_task_id: None,
+                    subagent_session_id: None,
                 },
                 prefix: String::new(),
                 location: None,
@@ -265,6 +269,12 @@ pub struct ToolOutput {
     /// registry). The id also appears in `content`, but that text is written
     /// for the model and must never be parsed back into machine state.
     pub started_task_id: Option<u64>,
+    /// The child subagent's own session id when this call STARTED a delegated
+    /// subagent (or fork). `None` for every other tool. Like
+    /// `started_task_id`, the id also appears in `content`, but that receipt
+    /// text is for the model only — this field is the machine fact the UI
+    /// jumps to a transcript with.
+    pub subagent_session_id: Option<String>,
 }
 
 impl ToolOutput {
@@ -275,6 +285,7 @@ impl ToolOutput {
             images: Vec::new(),
             background_started: false,
             started_task_id: None,
+            subagent_session_id: None,
         }
     }
 
@@ -287,7 +298,15 @@ impl ToolOutput {
             images: Vec::new(),
             background_started: false,
             started_task_id: Some(id),
+            subagent_session_id: None,
         }
+    }
+
+    /// Attach the child subagent's session id: a delegate/fork spawn knows it
+    /// from its own spawn result, never from the receipt text it writes.
+    pub fn subagent_session(mut self, session_id: impl Into<String>) -> Self {
+        self.subagent_session_id = Some(session_id.into());
+        self
     }
 }
 
@@ -468,6 +487,18 @@ pub enum Message {
         /// mistaken for it.
         #[serde(default)]
         synthetic: bool,
+        /// The background task this call STARTED (see
+        /// [`ToolOutput::started_task_id`]). Structured so no frontend has to
+        /// recover the id from `content`; `#[serde(default)]` keeps rows
+        /// persisted before the field existed loadable, and `None` is skipped
+        /// so other tool results serialize byte-identically.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        started_task_id: Option<u64>,
+        /// The child subagent session a delegate/fork call STARTED (see
+        /// [`ToolOutput::subagent_session_id`]); `None` for every other
+        /// tool.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent_session_id: Option<String>,
     },
 }
 
@@ -766,6 +797,15 @@ pub enum AgentEvent {
         images: Vec<ImagePart>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         call_id: Option<String>,
+        /// The background task this call STARTED, when the tool result
+        /// carries one (see [`Message::Tool`]). Omitted when absent so a bash
+        /// result payload stays byte-identical.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        started_task_id: Option<u64>,
+        /// The delegate/fork child session this call STARTED, when the tool
+        /// result carries one. Omitted when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent_session_id: Option<String>,
     },
     /// A durable, model-facing system notice (background completion or task
     /// report). Fresh background ingress commits it as a `SessionEntry::Notice`,
@@ -2224,6 +2264,8 @@ impl Agent {
                 images,
                 is_error,
                 synthetic,
+                started_task_id,
+                subagent_session_id,
             } => {
                 debug_assert!(item.prefix.is_empty());
                 Message::Tool {
@@ -2233,6 +2275,8 @@ impl Agent {
                     images: images.clone(),
                     is_error: *is_error,
                     synthetic: *synthetic,
+                    started_task_id: *started_task_id,
+                    subagent_session_id: subagent_session_id.clone(),
                 }
             }
             Message::System { .. } => item.message.clone(),
@@ -2766,12 +2810,18 @@ impl Agent {
                     Ok(output) => (output.content.clone(), output.images.clone()),
                     Err(error) => (tool_error_content(error).to_owned(), Vec::new()),
                 };
+                let (started_task_id, subagent_session_id) = match &result {
+                    Ok(output) => (output.started_task_id, output.subagent_session_id.clone()),
+                    Err(_) => (None, None),
+                };
                 let is_error = result.is_err();
                 self.emit(AgentEvent::ToolResult {
                     is_error,
                     content: content.clone(),
                     images: images.clone(),
                     call_id: Some(call.id.clone()),
+                    started_task_id,
+                    subagent_session_id: subagent_session_id.clone(),
                 });
                 self.push_message(Message::Tool {
                     call_id: call.id.clone(),
@@ -2780,6 +2830,8 @@ impl Agent {
                     images,
                     is_error,
                     synthetic: false,
+                    started_task_id,
+                    subagent_session_id,
                 });
             }
             if background_started {

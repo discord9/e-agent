@@ -292,6 +292,7 @@ impl Tool for BackgroundStartingTool {
             images: vec![],
             background_started: true,
             started_task_id: Some(1),
+            subagent_session_id: None,
         })
     }
 }
@@ -394,6 +395,8 @@ async fn background_reminder_notice_is_never_the_compaction_current_prompt() {
             images: vec![],
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
         }
         .into(),
         Message::Assistant(AssistantMessage {
@@ -659,6 +662,8 @@ fn repair_tool_pairs_drops_orphan_results_after_a_synthetic_answer() {
             content: "[turn interrupted before a tool result was produced]".into(),
             is_error: true,
             synthetic: true,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         },
         Message::Tool {
@@ -667,6 +672,8 @@ fn repair_tool_pairs_drops_orphan_results_after_a_synthetic_answer() {
             content: "real result".into(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         },
     ];
@@ -740,6 +747,8 @@ fn repair_tool_pairs_keeps_real_result_matching_placeholder_text() {
             content: "[turn interrupted before a tool result was produced]".into(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         },
     ];
@@ -797,6 +806,8 @@ fn repair_tool_pairs_keeps_image_bearing_tool_results() {
             content: "[image read: a.png] (hash deadbeef, image/png, 4 bytes)".into(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![image.clone()],
         },
         Message::User {
@@ -959,6 +970,8 @@ fn restore_history_migrates_legacy_placeholders_end_to_end() {
             content: "real result".into(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         }
         .into(),
@@ -1028,6 +1041,8 @@ fn context_pairs_real_result_across_a_compaction_snapshot() {
                     content: INTERRUPTED.into(),
                     is_error: true,
                     synthetic: true,
+                    started_task_id: None,
+                    subagent_session_id: None,
                     images: vec![],
                 },
             ],
@@ -1040,6 +1055,8 @@ fn context_pairs_real_result_across_a_compaction_snapshot() {
             content: "real result".into(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         }
         .into(),
@@ -1140,6 +1157,8 @@ async fn main_pending_batch_boundary_keeps_late_result_after_repair() {
                 images: vec![],
                 is_error: false,
                 synthetic: false,
+                started_task_id: None,
+                subagent_session_id: None,
             }
             .into(),
         );
@@ -1643,6 +1662,8 @@ async fn emits_assistant_tool_and_result_events_in_order() {
                 content: "\"ok\"".into(),
                 images: vec![],
                 call_id: Some("call-1".into()),
+                started_task_id: None,
+                subagent_session_id: None,
             },
         ]
     );
@@ -1670,6 +1691,8 @@ async fn emits_deltas_without_duplicate_assistant_text() {
                 content: "\"ok\"".into(),
                 images: vec![],
                 call_id: Some("call-1".into()),
+                started_task_id: None,
+                subagent_session_id: None,
             },
         ]
     );
@@ -1837,6 +1860,8 @@ fn tool_loop(prefix: &str, n: usize) -> Vec<Message> {
                     content: format!("result {i}"),
                     is_error: false,
                     synthetic: false,
+                    started_task_id: None,
+                    subagent_session_id: None,
                     images: vec![],
                 },
             ]
@@ -1876,6 +1901,8 @@ async fn compacts_everything_before_the_bounded_tail() {
             content: "building".into(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         },
         Message::Tool {
@@ -1884,6 +1911,8 @@ async fn compacts_everything_before_the_bounded_tail() {
             content: "still building".into(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         },
         Message::Assistant(AssistantMessage {
@@ -1909,6 +1938,8 @@ async fn compacts_everything_before_the_bounded_tail() {
             content: "old result".into(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         },
         Message::User {
@@ -2057,6 +2088,8 @@ async fn context_repairs_unanswered_tool_calls_from_interrupted_turns() {
             content: "built".into(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         },
     ];
@@ -2850,6 +2883,8 @@ fn context_request_bounds_oversized_tool_content_with_receipt() {
             content: content.clone(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         },
     };
@@ -3038,6 +3073,8 @@ fn context_request_keeps_goal_tool_calls_and_reasoning_exact() {
             content: "ok".into(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         },
     };
@@ -3184,6 +3221,8 @@ async fn compaction_retained_stays_full_and_request_is_bounded() {
             content: "first result".into(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         }
         .into(),
@@ -3205,6 +3244,8 @@ async fn compaction_retained_stays_full_and_request_is_bounded() {
             content: "current result".into(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         }
         .into(),
@@ -3647,6 +3688,8 @@ async fn context_request_retained_receipt_binds_the_full_retained_array() {
             content: huge.clone(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         },
     ];
@@ -3981,6 +4024,8 @@ fn fork_prefix_complete_accepts_a_superseded_synthetic_placeholder() {
             images: vec![],
             is_error: true,
             synthetic: true,
+            started_task_id: None,
+            subagent_session_id: None,
         }
         .into(),
         Message::Tool {
@@ -3990,6 +4035,8 @@ fn fork_prefix_complete_accepts_a_superseded_synthetic_placeholder() {
             images: vec![],
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
         }
         .into(),
         Message::User {
@@ -4192,6 +4239,8 @@ fn tool_images_serde_round_trips_and_old_sessions_load_without_images() {
         }],
         is_error: false,
         synthetic: false,
+        started_task_id: None,
+        subagent_session_id: None,
     };
     let json = serde_json::to_string(&message).unwrap();
     let back: Message = serde_json::from_str(&json).unwrap();
@@ -4212,6 +4261,8 @@ fn tool_images_serde_round_trips_and_old_sessions_load_without_images() {
             images: vec![],
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
         }
     );
     // And serialize back without the images key when empty.
@@ -4231,6 +4282,8 @@ fn tool_marker_like_text_is_plain_content_no_parsing() {
         images: vec![],
         is_error: false,
         synthetic: false,
+        started_task_id: None,
+        subagent_session_id: None,
     };
     let json = serde_json::to_string(&message).unwrap();
     let back: Message = serde_json::from_str(&json).unwrap();
@@ -4272,6 +4325,7 @@ impl Tool for ImageTool {
             }],
             background_started: false,
             started_task_id: None,
+            subagent_session_id: None,
         })
     }
 }
@@ -5036,6 +5090,8 @@ async fn compaction_clamp_is_not_shifted_by_a_dropped_own_tool_result() {
             content: "orphan".into(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         }
         .into(),
@@ -5938,6 +5994,8 @@ async fn single_user_session_compacts_tool_history() {
                 content: format!("result {i}"),
                 is_error: false,
                 synthetic: false,
+                started_task_id: None,
+                subagent_session_id: None,
                 images: vec![],
             }
             .into(),
@@ -6025,6 +6083,8 @@ async fn single_user_retained_tail_adjusts_onto_an_assistant_boundary() {
                 content: format!("result {i}"),
                 is_error: false,
                 synthetic: false,
+                started_task_id: None,
+                subagent_session_id: None,
                 images: vec![],
             }
             .into(),
@@ -6405,6 +6465,8 @@ async fn single_task_compacts_twice_consecutively() {
                 content: format!("result {i}"),
                 is_error: false,
                 synthetic: false,
+                started_task_id: None,
+                subagent_session_id: None,
                 images: vec![],
             }
             .into(),
@@ -6450,6 +6512,8 @@ async fn single_task_compacts_twice_consecutively() {
                 content: format!("result {i}"),
                 is_error: false,
                 synthetic: false,
+                started_task_id: None,
+                subagent_session_id: None,
                 images: vec![],
             }
             .into(),
@@ -6524,6 +6588,8 @@ fn single_task_retained_background_completion_is_not_the_current_prompt() {
             content: "result".into(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         },
         // A background completion projected as a user message INSIDE the
@@ -6703,6 +6769,8 @@ async fn image_rejection_omissions_are_request_only_and_cleared_by_set_model() {
             }],
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
         }
         .into(),
     ]);
@@ -6857,6 +6925,8 @@ fn strip_images_clears_user_and_tool_images_with_text_degradation() {
             content: "[image read: a.png]".into(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![ImagePart {
                 hash: "beef".into(),
                 mime: "image/png".into(),
@@ -6889,6 +6959,8 @@ fn strip_images_clears_user_and_tool_images_with_text_degradation() {
                 content: "[image read: a.png]（当前模型不支持图片，已跳过附加）".into(),
                 is_error: false,
                 synthetic: false,
+                started_task_id: None,
+                subagent_session_id: None,
                 images: vec![],
             },
             Message::User {
@@ -7862,6 +7934,8 @@ fn latest_read_output_result_stays_full_in_request_context() {
                     images: vec![],
                     is_error: false,
                     synthetic: false,
+                    started_task_id: None,
+                    subagent_session_id: None,
                 },
             },
         ],

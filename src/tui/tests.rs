@@ -1071,6 +1071,8 @@ fn attached_view_replays_snapshot_and_marks_finished_on_completion() {
         content: "files".into(),
         images: vec![],
         call_id: None,
+        started_task_id: None,
+        subagent_session_id: None,
     });
     attach_test(&mut state, 7, "demo task", handle);
     let lines: Vec<_> = state
@@ -3842,6 +3844,8 @@ fn scrolling_is_bounded_and_events_append_echo_lines() {
         content: "done".into(),
         images: vec![],
         call_id: None,
+        started_task_id: None,
+        subagent_session_id: None,
     });
     assert_eq!(state.lines.last().unwrap().text, "  ok: done");
     assert_eq!(state.lines.last().unwrap().kind, LineKind::ToolResult);
@@ -3854,6 +3858,8 @@ fn scrolling_is_bounded_and_events_append_echo_lines() {
         content: "failed".into(),
         images: vec![],
         call_id: None,
+        started_task_id: None,
+        subagent_session_id: None,
     });
     assert_eq!(state.lines.last().unwrap().text, "  error: failed");
     assert_eq!(state.lines.last().unwrap().kind, LineKind::ToolError);
@@ -3906,6 +3912,8 @@ fn edit_file_tool_calls_render_as_a_numbered_diff_on_result() {
         content: "file edited (line 7)".into(),
         images: vec![],
         call_id: None,
+        started_task_id: None,
+        subagent_session_id: None,
     });
     let lines: Vec<_> = state
         .lines
@@ -4147,6 +4155,8 @@ fn session_entry_to_lines_maps_persisted_entry_kinds() {
             content: "done".into(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         },
     });
@@ -4160,6 +4170,8 @@ fn session_entry_to_lines_maps_persisted_entry_kinds() {
             content: "boom".into(),
             is_error: true,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         },
     });
@@ -4655,6 +4667,8 @@ fn fork_session_entries() -> Vec<SessionEntry> {
             content: "ok".into(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         }
         .into(),

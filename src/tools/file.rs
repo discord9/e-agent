@@ -163,6 +163,7 @@ impl Tool for ReadImage {
             }],
             background_started: false,
             started_task_id: None,
+            subagent_session_id: None,
         })
     }
 }

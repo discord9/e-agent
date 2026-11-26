@@ -3234,6 +3234,8 @@ mod tests {
                 content: "exit code: 0\nstdout:\nok\n".into(),
                 is_error: false,
                 synthetic: false,
+                started_task_id: None,
+                subagent_session_id: None,
                 images: vec![],
             }
             .into(),
@@ -3243,6 +3245,8 @@ mod tests {
                 content: "command not found".into(),
                 is_error: true,
                 synthetic: false,
+                started_task_id: None,
+                subagent_session_id: None,
                 images: vec![],
             }
             .into(),
@@ -4695,6 +4699,8 @@ mod tests {
                 images: vec![],
                 is_error: false,
                 synthetic: false,
+                started_task_id: None,
+                subagent_session_id: None,
             },
         })
         .unwrap();
@@ -5103,6 +5109,8 @@ mod tests {
                     content: format!("{marker} {name_marker} {escaped_needle} {verbatim_needle}"),
                     is_error: false,
                     synthetic: false,
+                    started_task_id: None,
+                    subagent_session_id: None,
                     images: vec![],
                 },
             },

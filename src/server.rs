@@ -3904,12 +3904,25 @@ fn event_payload(event: &AgentEvent) -> serde_json::Value {
             content,
             images,
             call_id,
+            started_task_id,
+            subagent_session_id,
         } => {
-            if images.is_empty() {
+            let mut payload = if images.is_empty() {
                 json!({ "is_error": is_error, "content": content, "call_id": call_id })
             } else {
                 json!({ "is_error": is_error, "content": content, "call_id": call_id, "images": images })
+            };
+            // The ids a `delegate` result STARTED (task + child session) are
+            // fields, so the web UI never re-parses the receipt prose. Both
+            // are omitted when absent: a bash result payload stays
+            // byte-identical.
+            if let Some(id) = started_task_id {
+                payload["started_task_id"] = json!(id);
             }
+            if let Some(session_id) = subagent_session_id {
+                payload["subagent_session_id"] = json!(session_id);
+            }
+            payload
         }
         AgentEvent::BackgroundCompleted {
             id,
@@ -4957,6 +4970,8 @@ mod tests {
             content: "ok".into(),
             images: vec![],
             call_id: Some("call-2".into()),
+            started_task_id: None,
+            subagent_session_id: None,
         })
         .unwrap();
         assert_eq!(some_result["data"]["call_id"], "call-2");
@@ -4969,6 +4984,8 @@ mod tests {
                 mime: "image/png".into(),
             }],
             call_id: Some("call-image".into()),
+            started_task_id: None,
+            subagent_session_id: None,
         })
         .unwrap();
         assert_eq!(image_result["data"]["is_error"], false);
@@ -5020,6 +5037,8 @@ mod tests {
                 content: "o".into(),
                 images: vec![],
                 call_id: None,
+                started_task_id: None,
+                subagent_session_id: None,
             }),
             "ToolResult"
         );
@@ -5109,6 +5128,8 @@ mod tests {
                 content: "boom".into(),
                 images: vec![],
                 call_id: None,
+                started_task_id: None,
+                subagent_session_id: None,
             }),
             json!({"is_error": true, "content": "boom", "call_id": null})
         );
@@ -5121,8 +5142,39 @@ mod tests {
                     mime: "image/png".into()
                 }],
                 call_id: Some("c".into()),
+                started_task_id: None,
+                subagent_session_id: None,
             }),
             json!({"is_error": false, "content": "image result", "call_id": "c", "images": [{"hash": "abc", "mime": "image/png"}]})
+        );
+        // A bash result carries neither structured id, so its payload keeps the
+        // exact old key set (absent, not null): the wire shape did not change.
+        assert_eq!(
+            event_payload(&AgentEvent::ToolResult {
+                is_error: false,
+                content: "bash ok".into(),
+                images: vec![],
+                call_id: Some("b".into()),
+                started_task_id: None,
+                subagent_session_id: None,
+            }),
+            json!({"is_error": false, "content": "bash ok", "call_id": "b"})
+        );
+        // A delegate result carries the started task id and the child session
+        // id as fields: the web UI jumps to the subagent without re-parsing the
+        // receipt prose.
+        assert_eq!(
+            event_payload(&AgentEvent::ToolResult {
+                is_error: false,
+                content: "started background task 7: 看图\nsubagent session: sub-chat".into(),
+                images: vec![],
+                call_id: Some("d".into()),
+                started_task_id: Some(7),
+                subagent_session_id: Some("sub-chat".into()),
+            }),
+            json!({"is_error": false,
+                   "content": "started background task 7: 看图\nsubagent session: sub-chat",
+                   "call_id": "d", "started_task_id": 7, "subagent_session_id": "sub-chat"})
         );
         assert_eq!(
             event_payload(&AgentEvent::Notice("hi".into())),
@@ -5230,6 +5282,8 @@ mod tests {
                 content: "ok".into(),
                 images: vec![],
                 call_id: None,
+                started_task_id: None,
+                subagent_session_id: None,
             },
             AgentEvent::ReasoningDelta("思考".into()),
             AgentEvent::Notice("后台任务完成".into()),
@@ -9394,6 +9448,8 @@ model = "deepseek-chat"
                 content: content.to_owned(),
                 is_error: false,
                 synthetic: false,
+                started_task_id: None,
+                subagent_session_id: None,
                 images: vec![],
             },
         }
@@ -10316,6 +10372,8 @@ model = "deepseek-chat"
                     content: "no".into(),
                     images: vec![],
                     call_id: None,
+                    started_task_id: None,
+                    subagent_session_id: None,
                 },
                 "ToolResult",
                 json!({"is_error": true, "content": "no", "call_id": null}),

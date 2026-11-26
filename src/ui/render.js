@@ -432,28 +432,69 @@ function renderSearchResult(resEl, content) {
   resEl.innerHTML = renderMarkdown(String(content == null ? "" : content));
 }
 
+/* delegate 后台启动回执的标题块：「后台运行 任务 #N label」+「子代理会话 id」。
+   机器事实（任务 id、子代理会话 id）来自 ToolResult 的 started_task_id /
+   subagent_session_id 字段；body 是正文里除回执行之外剩下的部分（启动回执
+   没有 body，长答案同步结果走下面的折叠形态）。两行各自按字段是否存在渲染，
+   所以只有会话 id 的旧形态也不会被硬塞一个 "任务 #?"。 */
+function delegateReceiptBlock(resEl, taskId, label, sessionId, body) {
+  resEl.classList.add("delegate-result");
+  const wrap = el("div", "delegate-result-wrap");
+  if (taskId != null) {
+    const line = el("div", "delegate-bg-line");
+    line.appendChild(el("span", "delegate-chip", "后台运行"));
+    line.appendChild(el("span", "delegate-label",
+      "任务 #" + taskId + (label ? " " + label : "")));
+    wrap.appendChild(line);
+  }
+  if (sessionId != null) {
+    wrap.appendChild(el("div", "delegate-session", "子代理会话 " + sessionId));
+  }
+  if (body) {
+    const md = el("div", "tool-markdown");
+    md.innerHTML = renderMarkdown(body);
+    wrap.appendChild(md);
+  }
+  resEl.appendChild(wrap);
+}
+
 /* delegate 结果：
-   - 后台启动回执 "started background task N: label\nsubagent session: sub-…" →
-     「后台运行 任务 #N label」+ 「子代理会话 sub-…」
+   - 后台启动回执 → 「后台运行 任务 #N label」+ 「子代理会话 sub-…」（结构化
+     字段优先，见下；旧持久化行回退正文正则）
    - 同步完成 "subagent session: sub-…\n<答案>" → 「子代理会话 sub-…」+ 答案 markdown
    - 不匹配回退原文（错误正文由 isError 分支走 renderPlainResult，保持完整可复制）。
    长答案（>DELEGATE_COLLAPSE_THRESHOLD）默认折叠进 details.delegate-collapse
    （与 appendBackgroundCompletion 的 delegate 完成 notice 同一折叠形态）：
    markdown 答案整体隐藏、summary 「查看完整答案（N 字符）」点击展开；
    短答案直接显示，避免「已完成」这类短回复也要点开。 */
-function renderDelegateResult(resEl, content) {
+function renderDelegateResult(resEl, content, startedTaskId, subagentSessionId) {
   const s = String(content == null ? "" : content);
+  if (startedTaskId != null || subagentSessionId != null) {
+    // 结构化路径：id 与会话 id 已是字段，正文里的回执行按「已知 id 的精确
+    // 前缀/整行」剥离（得到给人看的任务标签），不再用正则从正文回收机器状态。
+    const head = startedTaskId == null ? null : "started background task " + startedTaskId + ": ";
+    const receiptLines = new Set();
+    if (subagentSessionId != null) {
+      const sid = String(subagentSessionId);
+      receiptLines.add("subagent session: " + sid);
+      receiptLines.add("fork session: " + sid);
+      receiptLines.add(sid);        // fork 的工具结果正文只有裸会话 id
+    }
+    const lines = s.split("\n");
+    let label = "";
+    if (head && lines.length && String(lines[0]).startsWith(head)) {
+      label = lines.shift().slice(head.length);
+    }
+    const body = lines.filter(line => !receiptLines.has(line)).join("\n").trim();
+    delegateReceiptBlock(resEl, startedTaskId, label, subagentSessionId, body);
+    return;
+  }
+  // 旧持久化行（字段出现之前写下的 ToolResult / Message::Tool）回退正文正则。
+  // 该回退要等一次持久化格式迁移（回填旧行的 started_task_id /
+  // subagent_session_id）之后才能删。
   const bg = /^started background task (\d+): ([^\n]*)\nsubagent session: ([^\n]+)$/.exec(s);
   if (bg) {
-    resEl.classList.add("delegate-result");
-    const wrap = el("div", "delegate-result-wrap");
-    const line = el("div", "delegate-bg-line");
-    line.appendChild(el("span", "delegate-chip", "后台运行"));
-    line.appendChild(el("span", "delegate-label",
-      "任务 #" + bg[1] + (bg[2] ? " " + bg[2] : "")));
-    wrap.appendChild(line);
-    wrap.appendChild(el("div", "delegate-session", "子代理会话 " + bg[3]));
-    resEl.appendChild(wrap);
+    delegateReceiptBlock(resEl, bg[1], bg[2], bg[3], "");
     return;
   }
   const done = /^subagent session: ([^\n]+)\n?([\s\S]*)$/.exec(s);
@@ -531,8 +572,11 @@ function renderImageReceipt(resEl, content, images) {
 }
 
 /* 统一结果入口：isError → 纯文本（保持完整可复制）；否则按工具名分派。
-   args 只对文件工具传入（diff 渲染需要）；其余工具结果渲染只依赖 content。 */
-function renderToolResult(resEl, name, args, content, isError, images) {
+   args 只对文件工具传入（diff 渲染需要）；其余工具结果渲染只依赖 content。
+   startedTaskId / subagentSessionId 是 ToolResult 的结构化字段（delegate 启动
+   回执）：有字段时渲染不再从正文正则回收机器事实，其余工具两者都是 undefined。 */
+function renderToolResult(resEl, name, args, content, isError, images,
+                          startedTaskId, subagentSessionId) {
   resEl.textContent = "";
   resEl.classList.remove("expandable", "expanded");
   if (isError) { renderPlainResult(resEl, content, "(无错误信息)"); return; }
@@ -546,7 +590,7 @@ function renderToolResult(resEl, name, args, content, isError, images) {
       renderSearchResult(resEl, content);
       return;
     case "delegate":
-      renderDelegateResult(resEl, content);
+      renderDelegateResult(resEl, content, startedTaskId, subagentSessionId);
       return;
     case "get_background_tasks":
       renderBackgroundTaskList(resEl, content);
@@ -1033,7 +1077,10 @@ function appendToolCall(name, args, acc, callId) {
   pruneMessages();      // 卡片是「执行中…」：进行中，不折叠
 }
 
-function appendToolResult(isError, content, acc, callId, images) {
+/* startedTaskId / subagentSessionId：ToolResult 的结构化字段（delegate 启动
+   回执的任务 id 与子代理会话 id）。除了 delegate 之外的工具都没有这两项。 */
+function appendToolResult(isError, content, acc, callId, images,
+                          startedTaskId, subagentSessionId) {
   let card = null;
   if (callId && acc.pendingByCall.has(callId)) {
     card = acc.pendingByCall.get(callId);
@@ -1058,7 +1105,8 @@ function appendToolResult(isError, content, acc, callId, images) {
     const tArgs = (name === "edit_file" || name === "read_file" || name === "write_file")
       ? cardArgs(card) : null;
     const isFileTool = tArgs !== null;
-    renderToolResult(resEl, name, tArgs, content, isError, images);
+    renderToolResult(resEl, name, tArgs, content, isError, images,
+      startedTaskId, subagentSessionId);
     if ((isFileTool || (name === "read_image" && resEl.querySelector("img.attached-image"))) && !isError) {
       card.setAttribute("open", "");
     } else {
@@ -1511,7 +1559,8 @@ function renderMessage(m, acc, pendingCards) {
         ? cardArgs(card) : null;
       // 与 live 路径同一 renderToolResult：特殊结果（web_search / delegate /
       // get_background_tasks / 文件 diff）在 history 重放时渲染一致
-      renderToolResult(resEl, name, tArgs, t.content, t.is_error, t.images);
+      renderToolResult(resEl, name, tArgs, t.content, t.is_error, t.images,
+        t.started_task_id, t.subagent_session_id);
       const isFileTool = tArgs !== null;
       if ((isFileTool || (name === "read_image" && resEl.querySelector("img.attached-image"))) && !t.is_error) {
         card.setAttribute("open", "");

@@ -317,6 +317,7 @@ impl Tool for Bash {
                         // The machine fact the scheduler tracks; the receipt's
                         // prose is for the model only.
                         started_task_id: Some(id),
+                        subagent_session_id: None,
                     }
                 });
         }
@@ -363,6 +364,7 @@ impl Tool for Bash {
                     images: Vec::new(),
                     background_started: true,
                     started_task_id: Some(id),
+                    subagent_session_id: None,
                 })
             }
         }

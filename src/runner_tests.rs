@@ -32,13 +32,155 @@ fn entry_event_projects_tool_images_for_durable_replay() {
             images: images.clone(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
         },
     };
     assert!(matches!(
         entry_event(&entry),
-        Some(AgentEvent::ToolResult { is_error: false, content, images: projected, call_id: Some(call_id) })
+        Some(AgentEvent::ToolResult { is_error: false, content, images: projected, call_id: Some(call_id), started_task_id: None, subagent_session_id: None })
             if content == "persisted image result" && call_id == "call-image-replay" && projected == images
     ));
+}
+
+/// The model-facing receipt text of a delegate start: what the model sees and
+/// what old rows only have. It must keep working as display text, never as the
+/// source of the machine facts.
+const DELEGATE_START_RECEIPT: &str = "started background task 7: 看图\nsubagent session: sub-chat";
+
+/// A delegate-shaped tool: it STARTED a delegated subagent, so its output
+/// carries BOTH the registry task id and the child session id as fields.
+struct StartingDelegateMock;
+
+#[async_trait]
+impl Tool for StartingDelegateMock {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "delegate".into(),
+            description: "delegate metadata test".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+    async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
+        Ok(ToolOutput::started_task(DELEGATE_START_RECEIPT, 7).subagent_session("sub-chat"))
+    }
+}
+
+/// A delegate tool result carries the started task id and the child session id
+/// as FIELDS, on the live event and on the durable `Tool` row, so no frontend
+/// has to recover them from the receipt prose.
+#[tokio::test]
+async fn delegate_tool_result_carries_task_and_child_session_fields() {
+    let temp = tempfile::tempdir().unwrap();
+    let agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: VecDeque::from(vec![
+                blocking_tool_call("call-delegate", "delegate"),
+                assistant_reply("delegated"),
+            ]),
+        }),
+        vec![Box::new(StartingDelegateMock)],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "delegate-metadata".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let task = runner.start(Some("start".into()));
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "delegated"),
+    )
+    .await;
+    assert!(
+        handle.snapshot().iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolResult {
+                call_id: Some(call_id),
+                content,
+                started_task_id: Some(7),
+                subagent_session_id: Some(session_id),
+                ..
+            } if call_id == "call-delegate" && session_id == "sub-chat"
+                && content == DELEGATE_START_RECEIPT
+        )),
+        "the live delegate result must carry both ids as fields: {:?}",
+        handle.snapshot()
+    );
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "delegate-metadata")
+        .await
+        .unwrap()
+        .entries;
+    assert!(
+        tool_entries(&entries).iter().any(|message| matches!(
+            message,
+            Message::Tool {
+                name,
+                content,
+                started_task_id: Some(7),
+                subagent_session_id: Some(session_id),
+                ..
+            } if name == "delegate" && session_id == "sub-chat"
+                && content == DELEGATE_START_RECEIPT
+        )),
+        "the durable Tool row must carry both ids as fields: {entries:?}"
+    );
+    drop(task);
+}
+
+/// A `Tool` row persisted BEFORE the structured ids existed deserialises (both
+/// fields default to `None`) and projects to a `ToolResult` with both absent —
+/// which is exactly what makes the web UI take its legacy prose fallback.
+#[test]
+fn old_tool_row_without_structured_ids_still_loads_and_projects() {
+    let old = r#"{"Tool":{"call_id":"call-old","name":"delegate","content":"started background task 7: 看图\nsubagent session: sub-old","is_error":false,"synthetic":false}}"#;
+    let message: Message = serde_json::from_str(old).expect("old Tool rows must stay loadable");
+    assert!(matches!(
+        &message,
+        Message::Tool {
+            started_task_id: None,
+            subagent_session_id: None,
+            ..
+        }
+    ));
+    assert!(matches!(
+        entry_event(&SessionEntry::Message { message }),
+        Some(AgentEvent::ToolResult {
+            call_id: Some(call_id),
+            started_task_id: None,
+            subagent_session_id: None,
+            ..
+        }) if call_id == "call-old"
+    ));
+}
+
+/// A bash result carries neither id, and its serialized entry keeps exactly the
+/// old shape (both fields skipped when absent).
+#[test]
+fn bash_tool_row_serializes_without_the_structured_ids() {
+    let message = Message::Tool {
+        call_id: "call-bash".into(),
+        name: "bash".into(),
+        content: "started background task 7: build".into(),
+        images: Vec::new(),
+        is_error: false,
+        synthetic: false,
+        started_task_id: None,
+        subagent_session_id: None,
+    };
+    assert_eq!(
+        serde_json::to_value(&message).unwrap(),
+        serde_json::json!({"Tool": {
+            "call_id": "call-bash",
+            "name": "bash",
+            "content": "started background task 7: build",
+            "is_error": false,
+            "synthetic": false,
+        }})
+    );
 }
 
 struct IdentityCaptureModel(Arc<Mutex<Option<String>>>);
@@ -2210,6 +2352,7 @@ impl Tool for MarkerTool {
             }],
             background_started: false,
             started_task_id: None,
+            subagent_session_id: None,
         })
     }
 }
@@ -2278,6 +2421,7 @@ impl Tool for BlockingMarkerTool {
             }],
             background_started: false,
             started_task_id: None,
+            subagent_session_id: None,
         })
     }
 }
@@ -5433,6 +5577,8 @@ async fn requested_compaction_singletask_resume_keeps_pair_and_summary_constrain
                 images: vec![],
                 is_error: false,
                 synthetic: false,
+                started_task_id: None,
+                subagent_session_id: None,
             }
             .into(),
         );
@@ -7627,6 +7773,7 @@ impl Tool for StartingBashMock {
             images: Vec::new(),
             background_started: true,
             started_task_id: Some(id as u64),
+            subagent_session_id: None,
         })
     }
 }

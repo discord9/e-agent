@@ -2099,6 +2099,10 @@ impl SessionRunner {
             Ok(output) => (output.content.clone(), output.images.clone()),
             Err(error) => (error.clone(), Vec::new()),
         };
+        let (started_task_id, subagent_session_id) = match &result {
+            Ok(output) => (output.started_task_id, output.subagent_session_id.clone()),
+            Err(_) => (None, None),
+        };
         let is_error = result.is_err();
         let event_images = images.clone();
         let entry = Message::Tool {
@@ -2108,6 +2112,8 @@ impl SessionRunner {
             images,
             is_error,
             synthetic: false,
+            started_task_id,
+            subagent_session_id: subagent_session_id.clone(),
         }
         .into();
         self.commit(entry).await?;
@@ -2119,6 +2125,8 @@ impl SessionRunner {
                 content: tool_text,
                 images: event_images,
                 call_id: Some(call.id.clone()),
+                started_task_id,
+                subagent_session_id,
             });
         let steering = self.intake_after_operation(Vec::new());
         if steering != Steering::None {
@@ -3692,6 +3700,8 @@ impl SessionRunner {
                                     images: Vec::new(),
                                     is_error: true,
                                     synthetic: false,
+                                    started_task_id: None,
+                                    subagent_session_id: None,
                                 }
                                 .into();
                                 if let Err(error) = self.commit(entry).await {
@@ -3710,6 +3720,8 @@ impl SessionRunner {
                                         content: error,
                                         images: Vec::new(),
                                         call_id: Some(call.id.clone()),
+                                        started_task_id: None,
+                                        subagent_session_id: None,
                                     });
                                 continue;
                             }
@@ -3776,6 +3788,8 @@ impl SessionRunner {
                                     images: Vec::new(),
                                     is_error: false,
                                     synthetic: false,
+                                    started_task_id: None,
+                                    subagent_session_id: None,
                                 }
                                 .into();
                                 if let Err(error) = self.commit(entry).await {
@@ -3796,6 +3810,8 @@ impl SessionRunner {
                                         content,
                                         images: Vec::new(),
                                         call_id: Some(call.id.clone()),
+                                        started_task_id: None,
+                                        subagent_session_id: None,
                                     });
                                 let steering = self.intake_after_operation(waited.pending);
                                 if steering != Steering::None {
@@ -3998,6 +4014,14 @@ impl SessionRunner {
                         Ok(output) => (output.content.clone(), output.images.clone()),
                         Err(error) => (tool_error_content(error).to_owned(), Vec::new()),
                     };
+                    // The started-task / child-session ids are structured
+                    // fields on the tool OUTPUT; they ride onto the durable
+                    // Tool entry and the live event so no frontend has to
+                    // recover them from the receipt prose.
+                    let (started_task_id, subagent_session_id) = match &result {
+                        Ok(output) => (output.started_task_id, output.subagent_session_id.clone()),
+                        Err(_) => (None, None),
+                    };
                     let is_error = result.is_err();
                     let entry = Message::Tool {
                         call_id: call.id.clone(),
@@ -4006,6 +4030,8 @@ impl SessionRunner {
                         images: images.clone(),
                         is_error,
                         synthetic: false,
+                        started_task_id,
+                        subagent_session_id: subagent_session_id.clone(),
                     }
                     .into();
                     if let Err(error) = self.commit(entry).await {
@@ -4026,6 +4052,8 @@ impl SessionRunner {
                             content: tool_text,
                             images,
                             call_id: Some(call.id.clone()),
+                            started_task_id,
+                            subagent_session_id,
                         });
                     // A release that raced the tool's own completion: the
                     // tool result was committed above (contract: completed
@@ -4313,6 +4341,8 @@ fn entry_event(entry: &SessionEntry) -> Option<AgentEvent> {
                     content,
                     images,
                     is_error,
+                    started_task_id,
+                    subagent_session_id,
                     ..
                 },
         } => Some(AgentEvent::ToolResult {
@@ -4320,6 +4350,8 @@ fn entry_event(entry: &SessionEntry) -> Option<AgentEvent> {
             content: content.clone(),
             images: images.clone(),
             call_id: Some(call_id.clone()),
+            started_task_id: *started_task_id,
+            subagent_session_id: subagent_session_id.clone(),
         }),
         SessionEntry::Compaction { summary, .. } => {
             Some(AgentEvent::Display(format!("compacted: {summary}")))

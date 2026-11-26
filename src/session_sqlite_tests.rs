@@ -52,6 +52,8 @@ fn test_entries() -> Vec<SessionEntry> {
             content: "exit code: 0\nstdout:\nok\n".into(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         }
         .into(),
@@ -61,6 +63,8 @@ fn test_entries() -> Vec<SessionEntry> {
             content: "command not found".into(),
             is_error: true,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         }
         .into(),
@@ -637,6 +641,8 @@ async fn history_query_search_is_literal_and_ignores_unselected_bad_json() {
             images: vec![],
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
         },
     })
     .unwrap();
@@ -5919,6 +5925,8 @@ fn tail_tool_result(id: &str, content: &str) -> SessionEntry {
         images: vec![],
         is_error: false,
         synthetic: false,
+        started_task_id: None,
+        subagent_session_id: None,
     }
     .into()
 }

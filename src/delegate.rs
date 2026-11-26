@@ -1701,7 +1701,12 @@ impl Tool for Delegate {
                     workspace,
                 )
                 .await
-                .map(|(task_id, session_id)| ToolOutput::started_task(session_id, task_id));
+                .map(|(task_id, session_id)| {
+                    // The child session id rides as a FIELD (its own spawn
+                    // result), never parsed back out of the receipt text.
+                    ToolOutput::started_task(session_id.clone(), task_id)
+                        .subagent_session(session_id)
+                });
         }
         let role = arguments
             .as_object()
@@ -2058,7 +2063,8 @@ impl Tool for Delegate {
         Ok(ToolOutput::started_task(
             format!("{started}\nsubagent session: {session_id}"),
             task_id,
-        ))
+        )
+        .subagent_session(session_id))
     }
 
     fn set_event_sender(&mut self, sender: tokio::sync::mpsc::UnboundedSender<AgentEvent>) {
