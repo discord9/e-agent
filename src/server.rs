@@ -1642,6 +1642,9 @@ async fn session_prompt(
             StatusCode::CONFLICT,
             format!("session {id} has finished"),
         )),
+        // Plain text naming the allowed option ids: the question stays
+        // answerable, so this is a client-side 400, not a conflict.
+        PromptSubmission::Invalid(detail) => Err(error(StatusCode::BAD_REQUEST, detail)),
     }
 }
 
@@ -4769,6 +4772,7 @@ mod tests {
             questions: vec![crate::runner::UserQuestion {
                 id: "confirm".into(),
                 prompt: "Continue?".into(),
+                options: Vec::new(),
             }],
         };
         assert_eq!(
@@ -4776,6 +4780,71 @@ mod tests {
             json!({"status": "WaitingInput", "call_id": "call-7",
                    "questions": [{"id": "confirm", "prompt": "Continue?"}],
                    "pending_questions": []})
+        );
+    }
+
+    /// The wire shape the web JS reads: a question with options carries them
+    /// (both as the blocking `WaitingInput` questions and inside
+    /// `pending_questions`), while a question without options keeps exactly
+    /// the old shape — no `options` key at all.
+    #[test]
+    fn status_json_carries_question_options_only_when_present() {
+        use serde_json::json;
+        let optioned = crate::runner::UserQuestion {
+            id: "perm".into(),
+            prompt: "Allow?".into(),
+            options: vec![
+                crate::runner::UserOption {
+                    id: "allow-once".into(),
+                    label: "允许一次".into(),
+                    description: Some("仅此一次".into()),
+                },
+                crate::runner::UserOption {
+                    id: "deny".into(),
+                    label: "拒绝".into(),
+                    description: None,
+                },
+            ],
+        };
+        let request = UserInputRequest {
+            call_id: "call-perm".into(),
+            questions: vec![optioned],
+        };
+        assert_eq!(
+            status_json(&SessionStatus::WaitingInput(request.clone()), &[]),
+            json!({"status": "WaitingInput", "call_id": "call-perm",
+                   "questions": [{"id": "perm", "prompt": "Allow?", "options": [
+                       {"id": "allow-once", "label": "允许一次", "description": "仅此一次"},
+                       {"id": "deny", "label": "拒绝"}
+                   ]}],
+                   "pending_questions": []})
+        );
+        assert_eq!(
+            status_json(&SessionStatus::Idle, std::slice::from_ref(&request)),
+            json!({"status": "Idle", "pending_questions": [
+                {"call_id": "call-perm", "questions": [{"id": "perm", "prompt": "Allow?",
+                   "options": [
+                       {"id": "allow-once", "label": "允许一次", "description": "仅此一次"},
+                       {"id": "deny", "label": "拒绝"}
+                   ]}]}
+            ]})
+        );
+        // Old sessions (and free-text questions) never grow an empty key.
+        assert_eq!(
+            status_json(
+                &SessionStatus::Idle,
+                &[UserInputRequest {
+                    call_id: "call-text".into(),
+                    questions: vec![crate::runner::UserQuestion {
+                        id: "name".into(),
+                        prompt: "Your name?".into(),
+                        options: Vec::new(),
+                    }],
+                }]
+            ),
+            json!({"status": "Idle", "pending_questions": [
+                {"call_id": "call-text", "questions": [{"id": "name", "prompt": "Your name?"}]}
+            ]})
         );
     }
 
@@ -4791,6 +4860,7 @@ mod tests {
             questions: vec![crate::runner::UserQuestion {
                 id: "name".into(),
                 prompt: "Your name?".into(),
+                options: Vec::new(),
             }],
         };
         assert!(handle.pending_questions().is_empty());
@@ -4834,6 +4904,7 @@ mod tests {
             questions: vec![crate::runner::UserQuestion {
                 id: "q".into(),
                 prompt: "?".into(),
+                options: Vec::new(),
             }],
         }));
         state.registry.insert(
