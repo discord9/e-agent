@@ -632,9 +632,11 @@ impl SessionFactory {
     /// when there is no config or the profile is unknown — the caller turns
     /// that into a 400. A chatgpt-routed profile loads the login credentials
     /// lazily on first use ([`AuthSource::Lazy`]), so a login that happened
-    /// after start works without a restart. The context window accompanies
-    /// the concrete model so a runtime switch updates both runner
-    /// observations together.
+    /// after start works without a restart. The concrete model and its
+    /// context window are BOTH handed to the runner, which snapshots them as
+    /// the switch's live identity: a later `fork` inherits that resolution
+    /// instead of re-resolving it here against a config that may have
+    /// hot-reloaded (or lost the profile) since.
     pub fn resolve_profile(
         &self,
         profile: &str,
@@ -647,30 +649,6 @@ impl SessionFactory {
             profile,
             effort,
         )
-    }
-
-    /// Resolve a model profile at FORK time — the `fork` delegate's child runs
-    /// on the parent's current EFFECTIVE model, so a parent `/model <profile>
-    /// [effort]` switch (which only updates the live agent) must not leave the
-    /// child on the build-time model, and an explicit effort override must not
-    /// be dropped. This is the same resolution `/model` itself uses
-    /// ([`Self::resolve_profile`]), so there is one rule for both. `None` when
-    /// the profile cannot be resolved (no config, unknown profile); the fork
-    /// then fails closed instead of silently using the stale model.
-    pub fn fork_model_resolver(&self) -> crate::delegate::ForkModelSource {
-        let reloadable = self.reloadable.clone();
-        let base_url = self.base_url.clone();
-        let model = self.model.clone();
-        Arc::new(move |profile: &str, effort: Option<EffortOverride>| {
-            resolve_profile_from(
-                &reloadable,
-                base_url.clone(),
-                model.clone(),
-                profile,
-                effort,
-            )
-            .ok()
-        })
     }
 
     /// Every switchable model profile name (`[models]` keys + `[roles]`
@@ -1158,10 +1136,6 @@ impl SessionFactory {
                 .expect("main request head initialized")
                 .clone()
         }));
-        // A forked child runs on the parent's CURRENT model: after a runtime
-        // `/model` switch the request head above is stale, so the fork asks
-        // the runner for its live identity and re-resolves that profile here.
-        delegate = delegate.with_fork_model_source(self.fork_model_resolver());
         let subagent_sessions = delegate.sessions();
         tools.push(Box::new(crate::delegate::SendMessage::parent(
             subagent_sessions.clone(),

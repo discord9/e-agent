@@ -161,19 +161,6 @@ pub type SubagentModelSource =
 pub type RoleModelSource =
     Arc<dyn Fn(&str) -> Option<(ConfiguredModel, Option<u64>)> + Send + Sync>;
 
-/// Live model resolver used by `fork`: resolves the parent's current routing
-/// identity — profile key AND the effort override it resolved with — to a
-/// concrete model plus context window, or `None` when the profile cannot be
-/// resolved (the fork then fails closed).
-pub type ForkModelSource = Arc<
-    dyn Fn(
-            &str,
-            Option<crate::session_factory::EffortOverride>,
-        ) -> Option<(ConfiguredModel, Option<u64>)>
-        + Send
-        + Sync,
->;
-
 /// Direct, live-only parent/child agent messaging. Endpoints are bound by a
 /// runner at construction time and are deliberately never reconstructed.
 pub struct SendMessage {
@@ -349,12 +336,6 @@ pub struct Delegate {
     /// Current live parent runner endpoint, installed after runner creation.
     parent_endpoint: Option<WeakSessionHandle>,
     fork_head: Option<Arc<dyn Fn() -> crate::session_factory::RequestHead + Send + Sync>>,
-    /// Live model resolver installed by the session factory: resolves a model
-    /// profile name at fork time, so a forked child runs on the parent's
-    /// CURRENT model after a runtime `/model` switch. `None` (a Delegate
-    /// constructed directly, e.g. in tests) can only fork on the request
-    /// head's model and fails closed otherwise.
-    fork_model_source: Option<ForkModelSource>,
     /// This tool's OWN background-completion sink (the pattern `Bash` uses):
     /// both delegate spawn paths deliver through it, so a fork's child
     /// delegate can never overwrite the parent's registered sender.
@@ -462,7 +443,6 @@ impl Delegate {
             persist_backend: self.persist_backend.clone(),
             parent_endpoint: self.parent_endpoint.clone(),
             fork_head: self.fork_head.clone(),
-            fork_model_source: self.fork_model_source.clone(),
             // Inherited, never re-registered: the child delegate is inert
             // (`fork_child` rejects delegation) and its already-set sink is
             // what keeps `Agent::new` from installing one over the parent's.
@@ -507,7 +487,6 @@ impl Delegate {
             persist_backend: SessionBackend::default(),
             parent_endpoint: None,
             fork_head: None,
-            fork_model_source: None,
             sender: None,
             fork_child: false,
         }
@@ -624,13 +603,6 @@ impl Delegate {
         head: Arc<dyn Fn() -> crate::session_factory::RequestHead + Send + Sync>,
     ) -> Self {
         self.fork_head = Some(head);
-        self
-    }
-
-    /// Resolve the fork's model from the parent's LIVE routing identity at
-    /// fork time (see [`ForkModelSource`]).
-    pub(crate) fn with_fork_model_source(mut self, source: ForkModelSource) -> Self {
-        self.fork_model_source = Some(source);
         self
     }
 
@@ -774,10 +746,12 @@ impl Delegate {
     /// switch installs a new model on the parent's live agent only, so the
     /// head's model is stale from then on — even when the profile NAME is
     /// unchanged (an effort override, or a profile definition edited and
-    /// reselected since the build). Hence: whenever a live identity exists,
-    /// re-resolve it — profile plus the effort the switch actually used — and
-    /// never fall back to the head object because the names match. Resolution
-    /// fails closed rather than silently forking on a stale model.
+    /// reselected since the build). The switch therefore snapshots the
+    /// RESOLVED model plus its installed window, and this clones that
+    /// snapshot: it never reads config and never re-resolves, so a reload
+    /// between the switch and the fork cannot reroute the child. A model
+    /// installed programmatically has no snapshot and fails closed rather
+    /// than silently forking on a stale head.
     fn fork_model(
         &self,
         head: &crate::session_factory::RequestHead,
@@ -790,10 +764,10 @@ impl Delegate {
             // No runtime switch: the head still describes the live model.
             return Ok((head.model.clone(), head.context_window));
         };
-        self.fork_model_source
-            .as_ref()
-            .and_then(|source| source(&live.profile, live.effort))
-            .ok_or_else(|| "fork requires the parent's current model".to_string())
+        match live.model {
+            Some(model) => Ok((model, live.context_window)),
+            None => Err("fork requires the parent's current model".to_string()),
+        }
     }
 
     /// Spawn a forked child. `prefix` is the parent's materialized context
@@ -1453,12 +1427,14 @@ pub async fn spawn_btw_subagent(
 impl Tool for Delegate {
     fn spec(&self) -> ToolSpec {
         let mut description =
-            "The first argument MUST be workspace: emit its path (absolute, or relative to \
-                your own workspace root — e.g. `.e-agent/worktrees/wt-x`) before writing task. \
-                Spawn a subagent with a fresh context to work on a task. Use this for \
-                self-contained subtasks (searching, reading many files, focused edits) whose \
-                intermediate steps would clutter your own context. The subagent has the file and \
-                bash tools and, when configured, public web search, but cannot delegate further."
+            "For a non-`fork` delegate the first argument MUST be workspace: emit its path \
+                (absolute, or relative to your own workspace root — e.g. \
+                `.e-agent/worktrees/wt-x`) before writing task; only a `fork` omits it, to \
+                inherit the parent's root. Spawn a subagent with a fresh context to work on a \
+                task. Use this for self-contained subtasks (searching, reading many files, \
+                focused edits) whose intermediate steps would clutter your own context. The \
+                subagent has the file and bash tools and, when configured, public web search, \
+                but cannot delegate further."
                 .to_owned();
         let model = self.subagent_model.display_name();
         description.push_str(&format!(" The subagent runs on the `{model}` model."));
@@ -1505,8 +1481,9 @@ impl Tool for Delegate {
         // A fork defaults its workspace to the parent's root, so `workspace`
         // is only unconditionally required by a delegate that cannot fork
         // (and, inside a fork-capable delegate, for a non-fork call such as
-        // `resume`). The property description states that split; the
-        // `required` list can only name the unconditional case.
+        // `resume`: there is no `.` fallback, `execute` rejects it). The
+        // property description states that split; the `required` list can
+        // only name the unconditional case.
         //
         // Keyed on the head, not on `fork_child`: a forked child's own
         // `delegate` must stay byte-identical to its parent's spec (its
@@ -1812,7 +1789,11 @@ impl Tool for Delegate {
         let label = task_label(raw_label, role.as_deref(), &task);
 
         // Resolve the (required) workspace: the subagent's working directory
-        // is an explicit parameter — there is no parent-workspace fallback.
+        // is an explicit parameter — there is no parent-workspace fallback,
+        // and `resume` is no exception: defaulting it to `.` would reroot the
+        // resumed transcript to the CALLER (a child that worked in a worktree
+        // would silently resume in the parent root). Only `fork` may omit it,
+        // and it does so deliberately to inherit the parent's root.
         // Absolute paths are used as-is; relative paths are resolved against
         // the CALLER's workspace root before reroot() canonicalizes and
         // enforces authorization (the resolved path must stay inside the
@@ -1826,13 +1807,17 @@ impl Tool for Delegate {
             .filter(|s| !s.is_empty());
         let workspace_arg = match workspace_arg {
             Some(path) => path,
-            None if resume_id_arg.is_some() => ".".to_owned(),
             None => {
-                return Err(
-                    "delegate requires a workspace parameter: path of the working directory \
-                     (absolute, or relative to this workspace's root)"
+                return Err(match resume_id_arg.as_deref() {
+                    Some(id) => format!(
+                        "`resume` requires a workspace parameter for session `{id}`: pass \
+                         the working directory it ran in (absolute, or relative to this \
+                         workspace's root)"
+                    ),
+                    None => "delegate requires a workspace parameter: path of the working \
+                             directory (absolute, or relative to this workspace's root)"
                         .into(),
-                );
+                });
             }
         };
         // Join relative inputs with the caller's root up front; reroot's

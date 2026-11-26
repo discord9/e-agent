@@ -1886,11 +1886,14 @@ async fn session_model(
             )
         })?;
     let name = configured.profile_key();
-    // The same override the resolution used travels with the live identity,
-    // so a `fork` child reproduces this session's effective model.
-    session
-        .handle()
-        .switch_model(&name, Box::new(configured), context_window, effort);
+    // The RESOLVED model travels with the live identity, so a `fork` child
+    // inherits this session's effective model (wire model, endpoint, effort)
+    // instead of re-resolving it against a config that may change later.
+    session.handle().switch_model(
+        Box::new(configured.clone()),
+        context_window,
+        Some(configured),
+    );
     // Mirror the new model into the registry metadata so `GET /api/sessions`
     // (sidebar / composer meta) reflects the switch immediately. Subagent
     // sessions keep their spawn-time display name (the delegate entry is

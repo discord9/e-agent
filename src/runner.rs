@@ -249,19 +249,20 @@ where
 }
 
 /// A session's live routing identity, installed by a runtime `/model` switch:
-/// exactly what the switch resolved against the config, so a `fork` can
-/// reproduce the parent's EFFECTIVE model instead of re-deriving it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// the model the switch actually installed (already resolved against the
+/// config at that instant) plus its context window, so a `fork` reproduces the
+/// parent's EFFECTIVE model by CLONING it rather than re-resolving it — a
+/// config reload after the switch must not reroute the child.
+#[derive(Clone)]
 pub struct LiveModel {
-    /// The resolved profile key (`provider/model`).
-    pub profile: String,
+    /// The resolved model the switch installed, carried whole (wire model,
+    /// endpoint, effort, thinking switches). `None` when the caller installed
+    /// a model programmatically, i.e. there is no config snapshot to inherit:
+    /// such a session has no forkable model and a `fork` fails closed.
+    pub model: Option<crate::model::ConfiguredModel>,
     /// The context window the switch installed (`None` when the profile
     /// declares none, or a `--model` override replaced the wire model).
     pub context_window: Option<u64>,
-    /// The effort override the switch resolved with, verbatim — `None` when
-    /// the profile's own configured effort applied, and [`EffortOverride::Omit`]
-    /// when the switch explicitly omitted the field. Never folded into `None`.
-    pub effort: Option<crate::session_factory::EffortOverride>,
 }
 
 /// Steering commands accepted by a session's command channel. Not
@@ -279,13 +280,15 @@ pub enum SessionCommand {
     /// Runtime model switch (web/TUI `/model <profile>`): the caller
     /// resolves the profile (with its effort override) to a concrete model
     /// and its context window; the runner installs both on the agent together
-    /// and remembers the whole identity — profile, window and override — as
-    /// the session's live routing identity.
+    /// and snapshots the SAME window plus a clone of the resolved model
+    /// (`fork_snapshot`) as the session's live routing identity.
     SwitchModel {
-        profile: String,
         model: Box<dyn Model>,
         context_window: Option<u64>,
-        effort: Option<crate::session_factory::EffortOverride>,
+        /// The resolved model the switch was built from, cloned so a `fork`
+        /// inherits it (never re-resolved against a reloaded config). `None`
+        /// for a programmatically installed model.
+        fork_snapshot: Option<crate::model::ConfiguredModel>,
     },
     /// Human-issued goal mutation (`/goal` commands, web API). The model
     /// never creates goals; its `update_goal` tool is intercepted by the
@@ -590,12 +593,12 @@ impl WeakSessionHandle {
         true
     }
 
-    /// The session's live routing identity — profile key, context window and
-    /// the effort override it resolved with — installed by the last runtime
-    /// `/model` switch, or `None` while the startup model still applies. A
-    /// `fork` delegate reads it so the child runs and reports the parent's
-    /// CURRENT EFFECTIVE model, never the one captured when the parent was
-    /// built: its presence alone is the "build-time head is stale" signal.
+    /// The session's live routing identity — the resolved model the last
+    /// runtime `/model` switch installed plus its context window — or `None`
+    /// while the startup model still applies. A `fork` delegate clones it so
+    /// the child runs the parent's CURRENT EFFECTIVE model, never the one
+    /// captured when the parent was built: its presence alone is the
+    /// "build-time head is stale" signal.
     pub fn live_model(&self) -> Option<LiveModel> {
         self.shared.upgrade()?.lock().unwrap().live_model.clone()
     }
@@ -839,15 +842,14 @@ impl SessionHandle {
         }
     }
     /// Switch the session's model and context window at runtime. The caller
-    /// resolves the profile (web/TUI `/model`) and passes the SAME effort
-    /// override it resolved with; the runner installs both from its next call
-    /// on and records the identity a fork reproduces.
+    /// resolves the profile (web/TUI `/model`) and passes the resolved model
+    /// again as `fork_snapshot`: the runner installs the model and snapshots
+    /// the clone with the SAME window as the identity a fork inherits.
     pub fn switch_model(
         &self,
-        profile: &str,
         model: Box<dyn Model>,
         context_window: Option<u64>,
-        effort: Option<crate::session_factory::EffortOverride>,
+        fork_snapshot: Option<crate::model::ConfiguredModel>,
     ) {
         let mut shared = self.shared.lock().unwrap();
         if shared.commands_open
@@ -855,10 +857,9 @@ impl SessionHandle {
             && self
                 .commands
                 .send(SessionCommand::SwitchModel {
-                    profile: profile.to_owned(),
                     model,
                     context_window,
-                    effort,
+                    fork_snapshot,
                 })
                 .is_err()
         {
@@ -2467,10 +2468,9 @@ impl SessionRunner {
                 Steering::None
             }
             SessionCommand::SwitchModel {
-                profile,
                 model,
                 context_window,
-                effort,
+                fork_snapshot,
             } => {
                 // Instant, not queued: the new model applies to the next
                 // model call (a call already in flight keeps its model).
@@ -2479,9 +2479,8 @@ impl SessionRunner {
                 // The live routing identity a fork child must inherit; the
                 // request head captured at build time is stale from here on.
                 shared.live_model = Some(LiveModel {
-                    profile,
+                    model: fork_snapshot,
                     context_window,
-                    effort,
                 });
                 // `Agent::set_model` clears the request-copy image omissions;
                 // the fork-visible mirror follows the same rule.
@@ -2696,17 +2695,15 @@ impl SessionRunner {
         for command in pending {
             match command {
                 SessionCommand::SwitchModel {
-                    profile,
                     model,
                     context_window,
-                    effort,
+                    fork_snapshot,
                 } => {
                     self.agent.set_model(model, context_window);
                     let mut shared = self.shared.lock().unwrap();
                     shared.live_model = Some(LiveModel {
-                        profile,
+                        model: fork_snapshot,
                         context_window,
-                        effort,
                     });
                     // Matches `Agent::set_model`: a replacement model gets the
                     // untouched request again.
