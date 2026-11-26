@@ -1829,6 +1829,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
                 status,
                 kind,
                 cancellation_source,
+                subagent_session_id,
                 ..
             } = entry
             else {
@@ -1848,6 +1849,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
                 status,
                 kind,
                 cancellation_source,
+                subagent_session_id,
             });
         }
         Ok(out)
@@ -3274,6 +3276,7 @@ mod tests {
                 status: None,
                 kind: None,
                 cancellation_source: None,
+                subagent_session_id: None,
             },
             // Entry with a label to verify serde roundtrip with label.
             SessionEntry::BackgroundCompletion {
@@ -3287,6 +3290,7 @@ mod tests {
                 status: None,
                 kind: None,
                 cancellation_source: None,
+                subagent_session_id: None,
             },
             Message::User {
                 content: "你好世界👋\n多行".into(),
@@ -3344,6 +3348,7 @@ mod tests {
                 status: None,
                 kind: None,
                 cancellation_source: None,
+                subagent_session_id: None,
             },
             SessionEntry::BackgroundCompletion {
                 id: 2,
@@ -3356,6 +3361,7 @@ mod tests {
                 status: Some("failed".into()),
                 kind: Some("bash".into()),
                 cancellation_source: None,
+                subagent_session_id: None,
             },
         ];
         session.append(&entries).await.unwrap();
@@ -3400,6 +3406,7 @@ mod tests {
             status: Some("completed".into()),
             kind: Some("bash".into()),
             cancellation_source: None,
+            subagent_session_id: None,
         })
         .unwrap();
         let retried = serde_json::to_string(&SessionEntry::BackgroundCompletion {
@@ -3413,6 +3420,7 @@ mod tests {
             status: Some("failed".into()),
             kind: Some("bash".into()),
             cancellation_source: None,
+            subagent_session_id: None,
         })
         .unwrap();
         let second = serde_json::to_string(&SessionEntry::BackgroundCompletion {
@@ -3426,6 +3434,7 @@ mod tests {
             status: Some("completed".into()),
             kind: Some("bash".into()),
             cancellation_source: None,
+            subagent_session_id: None,
         })
         .unwrap();
         let _ = &first;
@@ -5130,6 +5139,7 @@ mod tests {
                 status: None,
                 kind: None,
                 cancellation_source: None,
+                subagent_session_id: None,
             },
             SessionEntry::Message {
                 message: Message::User {

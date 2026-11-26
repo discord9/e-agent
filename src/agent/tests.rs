@@ -43,7 +43,7 @@ impl Tool for ReceiptTool {
         }
     }
     async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
-        Ok(ToolOutput::text("started background task 7: x"))
+        Ok(ToolOutput::started_task("started background task 7: x", 7))
     }
 }
 
@@ -118,12 +118,16 @@ impl Tool for ScriptedBackgroundTool {
                 status: None,
                 kind: None,
                 cancellation_source: None,
+                subagent_session_id: None,
             });
             if let Some(sent) = completion_sent {
                 sent.notify_one();
             }
         });
-        Ok(ToolOutput::text("started background task 1: echo done"))
+        Ok(ToolOutput::started_task(
+            "started background task 1: echo done",
+            1,
+        ))
     }
 
     fn set_event_sender(&mut self, sender: mpsc::UnboundedSender<AgentEvent>) {
@@ -167,10 +171,14 @@ impl Tool for NoticeBackgroundTool {
                     status: None,
                     kind: None,
                     cancellation_source: None,
+                    subagent_session_id: None,
                 });
             }
         });
-        Ok(ToolOutput::text("started background task 1: cmd"))
+        Ok(ToolOutput::started_task(
+            "started background task 1: cmd",
+            1,
+        ))
     }
     fn set_event_sender(&mut self, sender: mpsc::UnboundedSender<AgentEvent>) {
         self.sender = Some(sender);
@@ -283,6 +291,7 @@ impl Tool for BackgroundStartingTool {
             content: "started background task 1: build".into(),
             images: vec![],
             background_started: true,
+            started_task_id: Some(1),
         })
     }
 }
@@ -504,7 +513,7 @@ async fn receipt_without_background_argument_registers_blocking_task_and_detache
     };
     let mut agent = Agent::new(Box::new(model), vec![Box::new(ReceiptTool)]);
     // Directly exercise the tool-result hook so no second model reply is needed.
-    let receipt = Ok(ToolOutput::text("started background task 7: x"));
+    let receipt = Ok(ToolOutput::started_task("started background task 7: x", 7));
     agent
         .after_tool_entry(&call("a", "bash", r#"{"command":"x"}"#), &receipt)
         .await
@@ -521,6 +530,112 @@ async fn receipt_without_background_argument_registers_blocking_task_and_detache
     assert_eq!(agent.background_task_ids().len(), 1);
     assert!(agent.background_task_ids().contains(&7));
     assert!(!agent.background_task_ids().contains(&8));
+}
+
+/// The background-start id is a STRUCTURED field, so a receipt whose
+/// model-facing prose is reworded (or translated) still registers the task.
+/// Under the old prefix parser this test registered nothing.
+#[tokio::test]
+async fn reworded_background_receipt_still_registers_the_structured_id() {
+    let model = ScriptedModel {
+        replies: vec![],
+        requests: Arc::new(Mutex::new(Vec::new())),
+        delays: Default::default(),
+    };
+    let mut agent = Agent::new(Box::new(model), vec![Box::new(ReceiptTool)]);
+    let receipt = Ok(ToolOutput::started_task(
+        "已在后台启动任务 #42（build）；完成时会自动通知。",
+        42,
+    ));
+    agent
+        .after_tool_entry(&call("a", "bash", r#"{"command":"x"}"#), &receipt)
+        .await
+        .unwrap();
+    assert!(agent.background_task_ids().contains(&42));
+    assert!(agent.has_blocking_background());
+}
+
+/// ...and the reverse: a receipt whose TEXT looks like a background start but
+/// carries no id field is just prose. It must not enter the blocking set.
+#[tokio::test]
+async fn prose_only_background_receipt_does_not_register() {
+    let model = ScriptedModel {
+        replies: vec![],
+        requests: Arc::new(Mutex::new(Vec::new())),
+        delays: Default::default(),
+    };
+    let mut agent = Agent::new(Box::new(model), vec![Box::new(ReceiptTool)]);
+    let receipt = Ok(ToolOutput::text("started background task 99: x"));
+    agent
+        .after_tool_entry(&call("a", "bash", r#"{"command":"x"}"#), &receipt)
+        .await
+        .unwrap();
+    assert!(agent.background_task_ids().is_empty());
+    assert!(!agent.has_blocking_background());
+}
+
+/// The delegate session tag comes from the structured field: a fork child
+/// (`fork session:` prose) is tagged exactly like a `subagent session:` one,
+/// and reworded prose still tags because the field wins. `output` is only the
+/// legacy fallback for rows persisted before the field existed.
+#[test]
+fn background_session_tag_prefers_the_structured_session_id() {
+    let id = "sub-0123456789abcdef0123456789abcdef";
+    let expected = format!(" [session: {id}]");
+    // A `subagent session:` completion (fresh spawn or resume).
+    assert_eq!(
+        background_session_tag(
+            Some("delegate"),
+            Some(id),
+            &format!("subagent session: {id}\nanswer")
+        )
+        .as_deref(),
+        Some(expected.as_str())
+    );
+    // A `fork session:` completion: the web UI used to hide these entirely.
+    assert_eq!(
+        background_session_tag(
+            Some("delegate"),
+            Some(id),
+            &format!("fork session: {id}\nanswer")
+        )
+        .as_deref(),
+        Some(expected.as_str())
+    );
+    // Reworded prose: only the field can produce the tag.
+    assert_eq!(
+        background_session_tag(
+            Some("delegate"),
+            Some(id),
+            "child session: whatever\nanswer"
+        )
+        .as_deref(),
+        Some(expected.as_str())
+    );
+    // Old persisted row: no field, so the first-line fallback still applies.
+    assert_eq!(
+        background_session_tag(
+            Some("delegate"),
+            None,
+            "subagent session: sub-legacy\nanswer"
+        )
+        .as_deref(),
+        Some(" [session: sub-legacy]")
+    );
+    assert_eq!(
+        background_session_tag(
+            Some("delegate"),
+            None,
+            "fork session: sub-legacy-fork\nanswer"
+        )
+        .as_deref(),
+        Some(" [session: sub-legacy-fork]")
+    );
+    // bash completions stay byte-identical (no tag, no parsing).
+    assert_eq!(
+        background_session_tag(Some("bash"), None, "exit code: 0\nok"),
+        None
+    );
 }
 
 #[test]
@@ -2200,6 +2315,7 @@ fn background_completion_entry_serde_old_and_new() {
         status: None,
         kind: None,
         cancellation_source: None,
+        subagent_session_id: None,
     };
     let json = serde_json::to_string(&entry).unwrap();
     assert!(
@@ -2220,6 +2336,7 @@ fn background_completion_entry_serde_old_and_new() {
         status: None,
         kind: None,
         cancellation_source: None,
+        subagent_session_id: None,
     };
     let json_none = serde_json::to_string(&entry_none).unwrap();
     assert!(
@@ -2276,6 +2393,7 @@ fn background_completion_trace_fields_serde_roundtrip() {
         status: Some("killed".into()),
         kind: Some("bash".into()),
         cancellation_source: Some(CancellationSource::User),
+        subagent_session_id: None,
     };
     let json = serde_json::to_value(&full).unwrap();
     let obj = json.as_object().unwrap();
@@ -2301,6 +2419,7 @@ fn background_completion_trace_fields_serde_roundtrip() {
         status: None,
         kind: None,
         cancellation_source: None,
+        subagent_session_id: None,
     };
     let json_min = serde_json::to_string(&minimal).unwrap();
     for field in [
@@ -2354,6 +2473,7 @@ fn context_formats_background_completion_with_label_variants() {
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         }]);
         let msgs = agent.context();
         assert_eq!(msgs.len(), 1);
@@ -2410,6 +2530,7 @@ fn context_tags_delegate_completion_notice_with_session_id() {
             status: None,
             kind: kind.map(str::to_string),
             cancellation_source: None,
+            subagent_session_id: None,
         }]);
         let msgs = agent.context();
         assert_eq!(msgs.len(), 1);
@@ -2457,6 +2578,7 @@ fn background_completion_and_notice_coexist_in_context() {
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         },
     ]);
     let msgs = agent.context();
@@ -2522,6 +2644,7 @@ fn context_is_full_and_lossless_for_background_completions() {
         status: None,
         kind: None,
         cancellation_source: None,
+        subagent_session_id: None,
     }]);
     let msgs = agent.context();
     assert_eq!(msgs.len(), 1);
@@ -2594,6 +2717,7 @@ fn context_request_passes_small_outputs_through_byte_identical() {
         status: None,
         kind: None,
         cancellation_source: None,
+        subagent_session_id: None,
     })
     .unwrap();
     location.entry_hash = crate::session_store::entry_payload_hash(&payload);
@@ -2609,6 +2733,7 @@ fn context_request_passes_small_outputs_through_byte_identical() {
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         }],
         vec![Some(location)],
     );
@@ -2652,6 +2777,7 @@ fn context_request_bounds_oversized_background_completion_with_receipt() {
         status: None,
         kind: None,
         cancellation_source: None,
+        subagent_session_id: None,
     })
     .unwrap();
     location.entry_hash = crate::session_store::entry_payload_hash(&payload);
@@ -2667,6 +2793,7 @@ fn context_request_bounds_oversized_background_completion_with_receipt() {
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         }],
         vec![Some(location.clone())],
     );
@@ -3031,6 +3158,7 @@ async fn compaction_retained_stays_full_and_request_is_bounded() {
         status: None,
         kind: None,
         cancellation_source: None,
+        subagent_session_id: None,
     };
     loc.entry_hash =
         crate::session_store::entry_payload_hash(&serde_json::to_string(&completion).unwrap());
@@ -3220,6 +3348,7 @@ async fn main_compaction_provenance_ignores_background_completion() {
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         },
     ]);
     let history_len = history.len();
@@ -3611,6 +3740,7 @@ fn fork_prefix_default_cuts_at_last_completed_turn_and_drops_tail() {
         status: None,
         kind: None,
         cancellation_source: None,
+        subagent_session_id: None,
     });
     entries.push(SessionEntry::ForkedFrom {
         source: "other".into(),
@@ -4141,6 +4271,7 @@ impl Tool for ImageTool {
                 mime: "image/png".into(),
             }],
             background_started: false,
+            started_task_id: None,
         })
     }
 }

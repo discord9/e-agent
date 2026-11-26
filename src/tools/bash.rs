@@ -286,7 +286,10 @@ impl Tool for Bash {
                         policy.clone(),
                         self.owner_session.clone(),
                     )
-                    .map(ToolOutput::text);
+                    // Detached work never reaches `after_tool_entry`: no
+                    // completion is promised, so the id stays out of the
+                    // session's blocking set.
+                    .map(|(_id, receipt)| ToolOutput::text(receipt));
             }
             // Background commands run under THIS facade's sandbox (possibly a
             // read-only role's narrowed policy), never the shared registry's
@@ -302,7 +305,7 @@ impl Tool for Bash {
                     self.owner_session.clone(),
                     title,
                 )
-                .map(|receipt| {
+                .map(|(id, receipt)| {
                     // The receipt is all the model needs here: the do-not-wait
                     // guidance is delivered by the runner as a separate
                     // user-shaped Notice on the next provider request, so a
@@ -311,6 +314,9 @@ impl Tool for Bash {
                         content: receipt,
                         images: Vec::new(),
                         background_started: true,
+                        // The machine fact the scheduler tracks; the receipt's
+                        // prose is for the model only.
+                        started_task_id: Some(id),
                     }
                 });
         }
@@ -348,7 +354,7 @@ impl Tool for Bash {
             .await?
         {
             super::background::ForegroundOutcome::Done(result) => result.map(ToolOutput::text),
-            super::background::ForegroundOutcome::Adopted(receipt) => {
+            super::background::ForegroundOutcome::Adopted(id, receipt) => {
                 let seconds = threshold.map(|value| value.as_secs()).unwrap_or_default();
                 Ok(ToolOutput {
                     content: format!(
@@ -356,6 +362,7 @@ impl Tool for Bash {
                     ),
                     images: Vec::new(),
                     background_started: true,
+                    started_task_id: Some(id),
                 })
             }
         }

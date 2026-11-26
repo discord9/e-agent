@@ -1503,6 +1503,7 @@ mod tests {
                 status: None,
                 kind: None,
                 cancellation_source: None,
+                subagent_session_id: None,
             },
         ]
     }
@@ -1732,6 +1733,7 @@ mod tests {
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         };
         let more = Session::append_located(temp.path(), "loc", &[entry]).unwrap();
         let receipt = issue_legacy_for_test(&more[0], FieldId::BgOutput, output.len());
@@ -1845,6 +1847,7 @@ mod tests {
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         };
         let locations =
             Session::append_located(dir_a.path(), session, std::slice::from_ref(&entry)).unwrap();

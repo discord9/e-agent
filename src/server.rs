@@ -3922,6 +3922,7 @@ fn event_payload(event: &AgentEvent) -> serde_json::Value {
             status,
             kind,
             cancellation_source,
+            subagent_session_id,
         }
         | AgentEvent::BackgroundCompletionNotice {
             id,
@@ -3934,6 +3935,7 @@ fn event_payload(event: &AgentEvent) -> serde_json::Value {
             status,
             kind,
             cancellation_source,
+            subagent_session_id,
         } => {
             let mut payload = json!({
                 "id": id,
@@ -3948,6 +3950,13 @@ fn event_payload(event: &AgentEvent) -> serde_json::Value {
             });
             if let Some(source) = cancellation_source {
                 payload["cancellation_source"] = json!(source);
+            }
+            // Structured child session id: the web UI jumps to the subagent
+            // (or fork) transcript with it instead of re-parsing the output's
+            // first line. Omitted for bash tasks, so their payload stays
+            // byte-identical.
+            if let Some(session_id) = subagent_session_id {
+                payload["subagent_session_id"] = json!(session_id);
             }
             payload
         }
@@ -5029,6 +5038,7 @@ mod tests {
                 status: None,
                 kind: None,
                 cancellation_source: None,
+                subagent_session_id: None,
             }),
             "BackgroundCompleted"
         );
@@ -5044,6 +5054,7 @@ mod tests {
                 status: None,
                 kind: None,
                 cancellation_source: None,
+                subagent_session_id: None,
             }),
             "BackgroundCompletionNotice"
         );
@@ -5137,6 +5148,7 @@ mod tests {
                 status: None,
                 kind: None,
                 cancellation_source: Some(CancellationSource::User),
+                subagent_session_id: None,
             }),
             json!({"id": 7, "output": "ok", "label": "cargo",
                    "started_at_ms": null, "duration_ms": null, "exit_code": null,
@@ -5155,10 +5167,34 @@ mod tests {
                 status: Some("completed".into()),
                 kind: Some("bash".into()),
                 cancellation_source: None,
+                subagent_session_id: None,
             }),
             json!({"id": 7, "output": "ok", "label": null,
                    "started_at_ms": 1_700_000_000_000u64, "duration_ms": 42, "exit_code": 0,
                    "signal": null, "status": "completed", "kind": "bash"})
+        );
+        // A delegate/fork completion carries the structured child session id:
+        // that is the field the web UI jumps to the subagent transcript with,
+        // so a `fork session:` child is no longer invisible there. The key is
+        // absent (not null) for bash tasks, keeping their payload unchanged.
+        assert_eq!(
+            event_payload(&AgentEvent::BackgroundCompletionNotice {
+                id: 8,
+                output: "fork session: sub-fork\nanswer".into(),
+                label: Some("fork".into()),
+                started_at_ms: None,
+                duration_ms: None,
+                exit_code: None,
+                signal: None,
+                status: Some("completed".into()),
+                kind: Some("delegate".into()),
+                cancellation_source: None,
+                subagent_session_id: Some("sub-fork".into()),
+            }),
+            json!({"id": 8, "output": "fork session: sub-fork\nanswer", "label": "fork",
+                   "started_at_ms": null, "duration_ms": null, "exit_code": null,
+                   "signal": null, "status": "completed", "kind": "delegate",
+                   "subagent_session_id": "sub-fork"})
         );
         assert_eq!(
             event_payload(&AgentEvent::Usage {
@@ -5208,6 +5244,7 @@ mod tests {
                 status: None,
                 kind: None,
                 cancellation_source: None,
+                subagent_session_id: None,
             },
             AgentEvent::Usage {
                 context_input: 1,

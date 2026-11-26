@@ -162,6 +162,7 @@ impl Tool for ReadImage {
                 mime: mime.into(),
             }],
             background_started: false,
+            started_task_id: None,
         })
     }
 }

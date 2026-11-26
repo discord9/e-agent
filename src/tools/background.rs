@@ -30,8 +30,9 @@ struct BackgroundRegistry {
     running: std::sync::Mutex<Vec<RunningTask>>,
 }
 
-type Completion =
-    Arc<std::sync::Mutex<Option<Box<dyn FnOnce(u64, String, BackgroundTrace) + Send>>>>;
+type Completion = Arc<
+    std::sync::Mutex<Option<Box<dyn FnOnce(u64, String, BackgroundTrace, Option<String>) + Send>>>,
+>;
 type ForegroundResult = Arc<std::sync::Mutex<Option<Result<String, String>>>>;
 
 enum ForegroundRoute {
@@ -60,7 +61,9 @@ impl Drop for ForegroundWaitGuard {
 
 pub(crate) enum ForegroundOutcome {
     Done(Result<String, String>),
-    Adopted(String),
+    /// The command outlived the foreground threshold and is now a background
+    /// task: its registry id plus the "started" receipt.
+    Adopted(u64, String),
 }
 
 /// Structured exit metadata of a finished background task's underlying run,
@@ -135,6 +138,16 @@ impl RunningTask {
                 .or_else(|| Some("delegate".to_owned())),
             cancellation_source: self.cancellation_source.or(exit.cancellation_source),
         }
+    }
+
+    /// The child session id this task runs, read from the structured task
+    /// display metadata (`Some` for delegate/fork/btw tasks, `None` for
+    /// bash). Completing tasks carry it outward as a field, so no consumer
+    /// ever re-parses the completion prose.
+    fn subagent_session_id(&self) -> Option<String> {
+        self.display_meta
+            .as_ref()
+            .and_then(|meta| meta.subagent_session_id.clone())
     }
 }
 
@@ -716,6 +729,9 @@ impl BackgroundTasks {
             return Some(label);
         }
         let task = task.expect("ordinary task was removed");
+        // Registry-derived, from the same display metadata the label comes
+        // from — never from the work closure's formatted output.
+        let subagent_session_id = task.subagent_session_id();
         task.handle.abort();
         if let Some(done) = task.completion.lock().unwrap().take() {
             let mut exit = task.exit.lock().unwrap();
@@ -742,13 +758,19 @@ impl BackgroundTasks {
                 cancellation_source: task.cancellation_source.or(exit.cancellation_source),
             };
             drop(exit);
-            done(id, "background task cancelled".into(), trace);
+            done(
+                id,
+                "background task cancelled".into(),
+                trace,
+                subagent_session_id,
+            );
         }
         Some(task.label)
     }
 
-    /// Start a background bash command. Returns a human-readable "started"
-    /// message containing the task id.
+    /// Start a background bash command. Returns the allocated task id and the
+    /// human-readable "started" receipt (which also names the id in prose,
+    /// for the model).
     /// `protect_git` controls whether `<workspace>/.git` is bound read-only
     /// inside the sandbox (subagent = true, main agent = false).
     pub fn start(
@@ -756,7 +778,7 @@ impl BackgroundTasks {
         workspace: Workspace,
         command: String,
         protect_git: bool,
-    ) -> Result<String, String> {
+    ) -> Result<(u64, String), String> {
         self.start_with_sender(
             workspace,
             command,
@@ -804,7 +826,7 @@ impl BackgroundTasks {
         let route_done = route.clone();
         let result_done = result_slot.clone();
         let completion_label = label.clone();
-        let receipt = self.spawn_bash_command(
+        let (task_id, receipt) = self.spawn_bash_command(
             Some(shell),
             label,
             workspace,
@@ -815,7 +837,7 @@ impl BackgroundTasks {
             None,
             Some(result_slot),
             move |id| registered_id_for_hook.store(id, Ordering::Release),
-            move |id, output, trace| match std::mem::replace(
+            move |id, output, trace, subagent_session_id| match std::mem::replace(
                 &mut *route_done.lock().unwrap(),
                 ForegroundRoute::Delivered,
             ) {
@@ -839,6 +861,7 @@ impl BackgroundTasks {
                         status: trace.status,
                         kind: trace.kind,
                         cancellation_source: trace.cancellation_source,
+                        subagent_session_id,
                     });
                 }
                 ForegroundRoute::Delivered => {}
@@ -872,7 +895,7 @@ impl BackgroundTasks {
                         {
                             task.visible = true;
                         }
-                        Ok(ForegroundOutcome::Adopted(receipt))
+                        Ok(ForegroundOutcome::Adopted(task_id, receipt))
                     } else {
                         Ok(ForegroundOutcome::Done(rx.await.unwrap_or_else(|_| {
                             Err("foreground command result channel closed".into())
@@ -895,6 +918,8 @@ impl BackgroundTasks {
     /// subagent's bash, `None` for the main session / unknown): the registry
     /// is shared, so the task panel needs it to show the true initiator
     /// instead of the registry owner.
+    ///
+    /// Returns the allocated task id and the model-facing "started" receipt.
     #[allow(clippy::too_many_arguments)]
     pub fn start_with_sender(
         &self,
@@ -905,7 +930,7 @@ impl BackgroundTasks {
         sandbox: Option<crate::config::Sandbox>,
         owner_session: Option<String>,
         title: Option<String>,
-    ) -> Result<String, String> {
+    ) -> Result<(u64, String), String> {
         let sender = sender
             .filter(|sender| !sender.is_closed())
             .ok_or("background task delivery is unavailable")?;
@@ -922,7 +947,7 @@ impl BackgroundTasks {
             owner_session.as_ref().map(|_| sender.clone()),
             None,
             |_| {},
-            move |id, output, trace| {
+            move |id, output, trace, subagent_session_id| {
                 let _ = sender.send(AgentEvent::BackgroundCompleted {
                     id,
                     output,
@@ -934,6 +959,7 @@ impl BackgroundTasks {
                     status: trace.status,
                     kind: trace.kind,
                     cancellation_source: trace.cancellation_source,
+                    subagent_session_id,
                 });
             },
         )
@@ -958,7 +984,7 @@ impl BackgroundTasks {
         protect_git: bool,
         sandbox: Option<crate::config::Sandbox>,
         owner_session: Option<String>,
-    ) -> Result<String, String> {
+    ) -> Result<(u64, String), String> {
         let label = title.unwrap_or_else(|| preview(&command, 100));
         self.spawn_bash_command(
             None,
@@ -973,7 +999,7 @@ impl BackgroundTasks {
             |_| {},
             // Detached: on_complete is a no-op, so no completion entry is
             // ever produced for this task.
-            |_, _, _| {},
+            |_, _, _, _| {},
         )
     }
 
@@ -995,8 +1021,8 @@ impl BackgroundTasks {
         stall_sender: Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
         foreground_result: Option<ForegroundResult>,
         on_id: impl FnOnce(u64) + Send + 'static,
-        on_complete: impl FnOnce(u64, String, BackgroundTrace) + Send + 'static,
-    ) -> Result<String, String> {
+        on_complete: impl FnOnce(u64, String, BackgroundTrace, Option<String>) + Send + 'static,
+    ) -> Result<(u64, String), String> {
         let shell = match shell_override {
             Some(shell) => shell,
             None => Shell::detect()?,
@@ -1109,7 +1135,7 @@ impl BackgroundTasks {
         role: Option<String>,
         process_group: Option<Arc<AtomicI32>>,
         work: F,
-    ) -> Result<String, String>
+    ) -> Result<(u64, String), String>
     where
         F: FnOnce() -> Fut + Send + 'static,
         Fut: std::future::Future<Output = String> + Send + 'static,
@@ -1141,7 +1167,7 @@ impl BackgroundTasks {
         exit_slot: ExitSlot,
         on_id: impl FnOnce(u64),
         work: F,
-    ) -> Result<String, String>
+    ) -> Result<(u64, String), String>
     where
         F: FnOnce() -> Fut + Send + 'static,
         Fut: std::future::Future<Output = String> + Send + 'static,
@@ -1170,7 +1196,7 @@ impl BackgroundTasks {
         exit_slot: ExitSlot,
         on_id: impl FnOnce(u64),
         work: F,
-    ) -> Result<String, String>
+    ) -> Result<(u64, String), String>
     where
         F: FnOnce() -> Fut + Send + 'static,
         Fut: std::future::Future<Output = String> + Send + 'static,
@@ -1200,7 +1226,7 @@ impl BackgroundTasks {
         cancel_target: Option<tokio::task::AbortHandle>,
         on_id: impl FnOnce(u64),
         work: F,
-    ) -> Result<String, String>
+    ) -> Result<(u64, String), String>
     where
         F: FnOnce() -> Fut + Send + 'static,
         Fut: std::future::Future<Output = String> + Send + 'static,
@@ -1220,7 +1246,7 @@ impl BackgroundTasks {
             true,
             on_id,
             work,
-            move |id, output, trace| {
+            move |id, output, trace, subagent_session_id| {
                 let _ = sender.send(AgentEvent::BackgroundCompleted {
                     id,
                     output,
@@ -1232,6 +1258,7 @@ impl BackgroundTasks {
                     status: trace.status,
                     kind: trace.kind,
                     cancellation_source: trace.cancellation_source,
+                    subagent_session_id,
                 });
             },
         )
@@ -1279,8 +1306,8 @@ impl BackgroundTasks {
         visible: bool,
         on_id: impl FnOnce(u64),
         work: F,
-        on_complete: impl FnOnce(u64, String, BackgroundTrace) + Send + 'static,
-    ) -> Result<String, String>
+        on_complete: impl FnOnce(u64, String, BackgroundTrace, Option<String>) + Send + 'static,
+    ) -> Result<(u64, String), String>
     where
         F: FnOnce() -> Fut + Send + 'static,
         Fut: std::future::Future<Output = String> + Send + 'static,
@@ -1313,24 +1340,27 @@ impl BackgroundTasks {
             // with the merged trace. `completed` is false when the task was
             // cancelled (removed from the registry) while the work was
             // still in flight — the cancel path owns the completion then.
-            let trace = if let Some(running) = running.upgrade() {
+            let finished = if let Some(running) = running.upgrade() {
                 let mut running = running.running.lock().unwrap();
                 if let Some(index) = running.iter().position(|task| task.id == id) {
                     let task = running.remove(index);
                     if let Some(state) = &task.monitored {
                         state.lock().unwrap().eligible = false;
                     }
-                    Some(task.completion_trace())
+                    // Both facts are read from the registry row itself: the
+                    // label-equivalent display metadata (child session id)
+                    // travels as a field, not as parsed prose.
+                    Some((task.completion_trace(), task.subagent_session_id()))
                 } else {
                     None
                 }
             } else {
                 None
             };
-            if let Some(trace) = trace
+            if let Some((trace, subagent_session_id)) = finished
                 && let Some(done) = task_completion.lock().unwrap().take()
             {
-                done(id, output, trace);
+                done(id, output, trace, subagent_session_id);
             }
         });
         self.registry.running.lock().unwrap().push(RunningTask {
@@ -1358,7 +1388,7 @@ impl BackgroundTasks {
         if let Err(work) = work_tx.send(work) {
             drop(work);
         }
-        Ok(started)
+        Ok((id, started))
     }
 }
 

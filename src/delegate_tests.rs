@@ -1683,7 +1683,7 @@ async fn shared_background_registry_completion_reaches_its_configured_channel() 
     let (parent_sender, mut parent_receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
     parent_background.set_event_sender(parent_sender);
 
-    let started = parent_background
+    let (_id, started) = parent_background
         .start(workspace, "echo shared".into(), false)
         .unwrap();
     assert!(started.starts_with("started background task"));

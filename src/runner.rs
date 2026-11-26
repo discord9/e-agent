@@ -1604,6 +1604,7 @@ impl SessionRunner {
                 status,
                 kind,
                 cancellation_source,
+                subagent_session_id,
             } => Some(AgentEvent::BackgroundCompletionNotice {
                 id: *id,
                 output: output.clone(),
@@ -1615,6 +1616,7 @@ impl SessionRunner {
                 status: status.clone(),
                 kind: kind.clone(),
                 cancellation_source: *cancellation_source,
+                subagent_session_id: subagent_session_id.clone(),
             }),
             SessionEntry::Notice { text } => Some(AgentEvent::Notice(text.clone())),
             // Goal updates fan out as one live event after durable commit
@@ -2566,6 +2568,7 @@ impl SessionRunner {
                     status,
                     kind,
                     cancellation_source,
+                    subagent_session_id,
                 } => AgentEvent::BackgroundCompletionNotice {
                     id: *id,
                     output: output.clone(),
@@ -2577,6 +2580,7 @@ impl SessionRunner {
                     status: status.clone(),
                     kind: kind.clone(),
                     cancellation_source: *cancellation_source,
+                    subagent_session_id: subagent_session_id.clone(),
                 },
                 _ => unreachable!("peek_background_entry returns a background entry"),
             };
@@ -4332,6 +4336,7 @@ fn entry_event(entry: &SessionEntry) -> Option<AgentEvent> {
             status,
             kind,
             cancellation_source,
+            subagent_session_id,
         } => Some(AgentEvent::BackgroundCompletionNotice {
             id: *id,
             output: output.clone(),
@@ -4343,6 +4348,7 @@ fn entry_event(entry: &SessionEntry) -> Option<AgentEvent> {
             status: status.clone(),
             kind: kind.clone(),
             cancellation_source: *cancellation_source,
+            subagent_session_id: subagent_session_id.clone(),
         }),
         SessionEntry::ForkedFrom { .. } => {
             Some(AgentEvent::Display(entry.forked_from_text().expect(

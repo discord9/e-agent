@@ -774,6 +774,7 @@ mod tests {
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         });
         entries.push(SessionEntry::Error {
             text: "needle excluded".into(),

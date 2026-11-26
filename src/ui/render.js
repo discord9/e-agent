@@ -1213,12 +1213,21 @@ function appendNoticeLong(prefix, text) {
 }
 
 /* 后台任务最终完成（live BackgroundCompleted 事件与 history background_completion
-   条目共用）：output 以 "subagent session: " 开头 → delegate 完成（子代理会话 +
-   markdown 答案）；否则走现有 bash 路径（appendNoticeLong）。 */
-function appendBackgroundCompletion(id, label, output) {
+   条目共用）：携带结构化 subagent_session_id → delegate 完成（子代理会话 +
+   markdown 答案）；否则走现有 bash 路径（appendNoticeLong）。
+   旧持久化行没有该字段：只有它们才回退到 output 首行的旧式前缀解析
+   （"subagent session: "）。该回退要等一次持久化格式迁移（回填旧行）之后
+   才能删除——仅仅因为新事件都带字段并不够。 */
+const BG_SESSION_LINE_RE = /^(?:subagent|fork) session: ([^\n]+)\n?([\s\S]*)$/;
+function appendBackgroundCompletion(id, label, output, subagentSessionId) {
   const s = String(output == null ? "" : output);
-  const m = /^subagent session: ([^\n]+)\n?([\s\S]*)$/.exec(s);
-  if (!m) {
+  const legacy = BG_SESSION_LINE_RE.exec(s);
+  // 优先结构化字段（fork 子会话同样可见）；无字段时才用旧文本回退。
+  const sessionId = subagentSessionId || (legacy ? legacy[1] : "");
+  // 首行是旧式会话行时，正文在其后；否则（新事件，首行可能是任意文案）
+  // 整段 output 就是答案正文。
+  const body = legacy ? legacy[2] : s;
+  if (!sessionId) {
     return appendNoticeLong("⌛ 后台任务 #" + (id ?? "?") + " 完成"
       + (label ? "（" + label + "）" : "") + "\n", s);
   }
@@ -1229,20 +1238,20 @@ function appendBackgroundCompletion(id, label, output) {
   line.appendChild(el("span", "delegate-label",
     "任务 #" + (id ?? "?") + (label ? " " + label : "")));
   n.appendChild(line);
-  n.appendChild(el("div", "delegate-session", "子代理会话 " + m[1]));
-  if (m[2]) {
+  n.appendChild(el("div", "delegate-session", "子代理会话 " + sessionId));
+  if (body) {
     const md = el("div", "tool-markdown");
-    md.innerHTML = renderMarkdown(m[2]);
+    md.innerHTML = renderMarkdown(body);
     // delegate 答案：长答案（>200 字符）默认折叠——包进 details.delegate-collapse
     // （不 open），summary 显示字符数，点击展开；短答案直接展开显示，避免
     // 「已完成」这类短回复也要点开。与 renderDelegateResult（delegate 工具
     // 结果）同一折叠形态（details.delegate-collapse + 相同 summary 文案）。
-    if (m[2].length <= DELEGATE_COLLAPSE_THRESHOLD) {
+    if (body.length <= DELEGATE_COLLAPSE_THRESHOLD) {
       n.appendChild(md);
     } else {
       const det = el("details", "delegate-collapse");
       det.open = false;                       // 默认折叠
-      const sum = el("summary", "", "查看完整答案（" + m[2].length + " 字符）");
+      const sum = el("summary", "", "查看完整答案（" + body.length + " 字符）");
       det.append(sum, md);
       n.appendChild(det);
     }
@@ -1415,7 +1424,8 @@ function renderEntry(entry, acc, pendingCards) {
     case "display": return appendNotice(entry.text);
     case "error": return appendError(entry.text);
     case "background_completion":
-      return appendBackgroundCompletion(entry.id ?? "?", entry.label, entry.output || "");
+      return appendBackgroundCompletion(entry.id ?? "?", entry.label,
+        entry.output || "", entry.subagent_session_id);
     case "forked_from":
       // 新标记按「物理行」pin 切点（没有位置 at），旧标记才有 1-based at。
       els.messages.appendChild(el("div", "forked",

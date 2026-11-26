@@ -7175,7 +7175,7 @@ async fn completion_delivery_available_requires_an_open_receiver() {
 
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     background.set_event_sender(sender);
-    let started = background
+    let (id, started) = background
         .spawn_with_id(
             "starts now".into(),
             None,
@@ -7186,13 +7186,100 @@ async fn completion_delivery_available_requires_an_open_receiver() {
             || async { "done".into() },
         )
         .unwrap();
-    // spawn_with_id is the raw registry receipt (also reused by delegate/
-    // detached); Bash::execute adds only the `background_started` flag.
+    // spawn_with_id returns the allocated id plus the raw registry receipt
+    // (also reused by delegate/detached); Bash::execute adds only the
+    // `background_started` / `started_task_id` fields.
+    assert_eq!(id, 1);
     assert_eq!(started, "started background task 1: starts now");
     assert!(matches!(
         receiver.recv().await,
         Some(AgentEvent::BackgroundCompleted { id: 1, .. })
     ));
+}
+
+/// The registry derives a task's child session id from its DISPLAY METADATA
+/// (the same structured place the task-panel label comes from), not from the
+/// work closure's formatted output: a delegate completion whose text has no
+/// `subagent session:` / `fork session:` line still carries the id. Both the
+/// ordinary completion path and the cancellation path must deliver it.
+#[tokio::test]
+async fn background_completion_carries_the_display_session_id_on_both_paths() {
+    let background = BackgroundTasks::new(None, SandboxPolicy::fixed(None));
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let meta = |session_id: &str| {
+        Some(TaskDisplayMeta {
+            background: true,
+            workspace: None,
+            subagent_session_id: Some(session_id.to_owned()),
+            resume: None,
+        })
+    };
+
+    // Ordinary completion: the work returns plain text.
+    let (task_id, _receipt) = background
+        .spawn_with_id_to(
+            Some(sender.clone()),
+            "fork task".into(),
+            None,
+            None,
+            meta("sub-fork"),
+            new_exit_slot(),
+            |_| {},
+            || async { "answer without any session line".to_string() },
+        )
+        .expect("spawn");
+    let event = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+        .await
+        .expect("completion arrives")
+        .expect("channel open");
+    assert!(
+        matches!(
+            &event,
+            AgentEvent::BackgroundCompleted {
+                id,
+                subagent_session_id: Some(session_id),
+                ..
+            } if *id == task_id && session_id.as_str() == "sub-fork"
+        ),
+        "{event:?}"
+    );
+
+    // Cancellation path: the completion the registry emits itself.
+    let (task_id, _receipt) = background
+        .spawn_with_id_to(
+            Some(sender.clone()),
+            "held fork".into(),
+            None,
+            None,
+            meta("sub-cancel"),
+            new_exit_slot(),
+            |_| {},
+            || async { std::future::pending::<String>().await },
+        )
+        .expect("spawn");
+    assert!(
+        background
+            .cancel_with_source(task_id, crate::agent::CancellationSource::User)
+            .is_some()
+    );
+    let event = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+        .await
+        .expect("cancel completion arrives")
+        .expect("channel open");
+    assert!(
+        matches!(
+            &event,
+            AgentEvent::BackgroundCompleted {
+                id,
+                output,
+                subagent_session_id: Some(session_id),
+                ..
+            } if *id == task_id
+                && output.as_str() == "background task cancelled"
+                && session_id.as_str() == "sub-cancel"
+        ),
+        "{event:?}"
+    );
 }
 
 #[tokio::test]
@@ -7221,7 +7308,7 @@ async fn panicking_on_id_removes_registration_without_work_or_completion() {
                 work_runs_in_task.fetch_add(1, Ordering::SeqCst);
                 "unexpected".into()
             },
-            move |_, _, _| {
+            move |_, _, _, _| {
                 completions_in_task.fetch_add(1, Ordering::SeqCst);
             },
         );
@@ -7274,7 +7361,7 @@ async fn cancel_during_on_id_suppresses_work_and_completion() {
                 spawn_work_runs.fetch_add(1, Ordering::SeqCst);
                 "unexpected".into()
             },
-            move |_, _, _| {
+            move |_, _, _, _| {
                 spawn_completions.fetch_add(1, Ordering::SeqCst);
             },
         )
@@ -7290,7 +7377,10 @@ async fn cancel_during_on_id_suppresses_work_and_completion() {
     release.wait();
     assert_eq!(
         spawn.await.unwrap().unwrap(),
-        "started background task 1: blocked registration"
+        (
+            1,
+            "started background task 1: blocked registration".to_string()
+        )
     );
     tokio::task::yield_now().await;
     assert!(background.running().is_empty());
@@ -8018,7 +8108,7 @@ async fn first_cancel_source_latches_for_live_wrapper() {
                 let _ = release_rx.await;
                 "wrapper exited".into()
             },
-            move |_, _, trace| {
+            move |_, _, trace, _| {
                 let _ = trace_tx.send(trace);
             },
         )
@@ -8103,7 +8193,7 @@ async fn cancel_overrides_stale_completed_trace_with_killed() {
                 let _ = release_rx.await;
                 "done".into()
             },
-            move |id, output, trace| {
+            move |id, output, trace, subagent_session_id| {
                 let _ = sender.send(AgentEvent::BackgroundCompleted {
                     id,
                     output,
@@ -8115,12 +8205,14 @@ async fn cancel_overrides_stale_completed_trace_with_killed() {
                     status: trace.status,
                     kind: trace.kind,
                     cancellation_source: trace.cancellation_source,
+                    subagent_session_id,
                 });
             },
         )
         .expect("spawn_inner succeeds");
     let id = background.running()[0].id;
-    assert!(started.contains(&id.to_string()));
+    assert_eq!(started.0, id);
+    assert!(started.1.contains(&id.to_string()));
 
     // Wait until the stale trace is in the slot, then cancel: the cancel
     // path removes the task and must override the stale completed trace.

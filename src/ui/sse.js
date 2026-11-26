@@ -695,10 +695,11 @@ function applyLiveEvent(name, payload) {
     case "BackgroundCompleted":
     case "BackgroundCompletionNotice": {
       const p = (payload && typeof payload === "object") ? payload : {};
-      // delegate 后台完成（output 以 "subagent session: " 开头）走专门渲染，
-      // 其余（bash 等）保持 appendNoticeLong 路径
+      // delegate 后台完成（事件携带结构化 subagent_session_id；旧持久化行只有
+      // output 首行的 "subagent session: " 前缀）走专门渲染，其余（bash 等）
+      // 保持 appendNoticeLong 路径
       appendBackgroundCompletion(p.id ?? "?", p.label,
-        pickText(p, ["output", "text", "content"]) || "");
+        pickText(p, ["output", "text", "content"]) || "", p.subagent_session_id);
       break;
     }
     case "Usage":

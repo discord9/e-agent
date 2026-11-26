@@ -1940,6 +1940,7 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
                 status,
                 kind,
                 cancellation_source,
+                subagent_session_id,
                 ..
             } = entry
             else {
@@ -1968,6 +1969,7 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
                 status,
                 kind,
                 cancellation_source,
+                subagent_session_id,
             });
         }
         Ok(out)

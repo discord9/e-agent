@@ -259,6 +259,12 @@ pub struct ToolOutput {
     /// do-not-wait guidance reaches the NEXT provider request as a
     /// user-shaped entry instead of trailing text in the tool result.
     pub background_started: bool,
+    /// The registry id of the background task this output just STARTED, for
+    /// the agent's own bookkeeping (the live background-task set). `None`
+    /// means "no task was started by this call" (or the tool has no
+    /// registry). The id also appears in `content`, but that text is written
+    /// for the model and must never be parsed back into machine state.
+    pub started_task_id: Option<u64>,
 }
 
 impl ToolOutput {
@@ -268,6 +274,19 @@ impl ToolOutput {
             content: content.into(),
             images: Vec::new(),
             background_started: false,
+            started_task_id: None,
+        }
+    }
+
+    /// Text result of a call that STARTED a background task: the model-facing
+    /// receipt plus the registry id the scheduler tracks. The receipt text is
+    /// for the model only; `started_task_id` is the machine fact.
+    pub fn started_task(content: impl Into<String>, id: u64) -> Self {
+        Self {
+            content: content.into(),
+            images: Vec::new(),
+            background_started: false,
+            started_task_id: Some(id),
         }
     }
 }
@@ -781,6 +800,12 @@ pub enum AgentEvent {
         kind: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cancellation_source: Option<CancellationSource>,
+        /// The delegate/fork/btw child's own session id, from the registry's
+        /// task display metadata (`None` for bash tasks). A fork child is
+        /// identified by this field, never by the completion text's first
+        /// line.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent_session_id: Option<String>,
     },
     /// A structured background completion notice for TUI scrollback display.
     /// Unlike `BackgroundCompleted` (the transient arrival/drain signal),
@@ -805,6 +830,10 @@ pub enum AgentEvent {
         kind: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cancellation_source: Option<CancellationSource>,
+        /// The delegate/fork/btw child's own session id (see
+        /// [`AgentEvent::BackgroundCompleted::subagent_session_id`]).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent_session_id: Option<String>,
     },
     Usage {
         /// Input tokens of the most recent regular turn, approximating the
@@ -971,6 +1000,13 @@ pub enum SessionEntry {
         /// entries persisted before cancellation provenance existed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cancellation_source: Option<CancellationSource>,
+        /// The child session id a delegate/fork/btw task ran (the
+        /// `send_message` target), read from the registry's structured task
+        /// display metadata. `None` for bash tasks and for rows persisted
+        /// before this field existed; display code may then fall back to the
+        /// old first-line prose of `output`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent_session_id: Option<String>,
     },
     /// A new session forked from an existing one (provenance only; never
     /// sent to the provider). Two marker generations share this shape:
@@ -2092,11 +2128,17 @@ impl Agent {
                     output,
                     label,
                     kind,
+                    subagent_session_id,
                     ..
                 } => {
                     // Delegate completions also name the child's session id
                     // (the `send_message` target); bash stays unchanged.
-                    let tag = background_session_tag(kind.as_deref(), output).unwrap_or_default();
+                    let tag = background_session_tag(
+                        kind.as_deref(),
+                        subagent_session_id.as_deref(),
+                        output,
+                    )
+                    .unwrap_or_default();
                     let header = match label.as_ref().map(|l| l.trim()).filter(|l| !l.is_empty()) {
                         Some(l) => format!("[background task {id} completed: {l}]{tag}"),
                         None => format!("[background task {id} completed]{tag}"),
@@ -2535,15 +2577,10 @@ impl Agent {
         call: &ToolCall,
         result: &Result<ToolOutput, String>,
     ) -> Result<(), String> {
-        if result.is_ok()
+        if let Ok(output) = result
             && (call.name == "bash" || call.name == "pwsh")
             && !is_detached_background_call(call)
-            && let Some(id) = started_task_id(
-                result
-                    .as_ref()
-                    .map(|output| output.content.as_str())
-                    .unwrap_or_default(),
-            )
+            && let Some(id) = output.started_task_id
         {
             self.running_background.insert(id);
         }
@@ -2820,6 +2857,7 @@ impl Agent {
                 status,
                 kind,
                 cancellation_source,
+                subagent_session_id,
             } => {
                 self.pending_background
                     .push_back(SessionEntry::BackgroundCompletion {
@@ -2833,6 +2871,7 @@ impl Agent {
                         status: status.clone(),
                         kind: kind.clone(),
                         cancellation_source,
+                        subagent_session_id: subagent_session_id.clone(),
                     });
                 if fanout && let Some(subscriber) = &self.subscriber {
                     let _ = subscriber.send(AgentEvent::BackgroundCompleted {
@@ -2846,6 +2885,7 @@ impl Agent {
                         status: status.clone(),
                         kind: kind.clone(),
                         cancellation_source,
+                        subagent_session_id,
                     });
                 }
                 Some((
@@ -2944,33 +2984,43 @@ fn is_detached_background_call(call: &ToolCall) -> bool {
         .unwrap_or(false)
 }
 
-fn started_task_id(output: &str) -> Option<u64> {
-    output
-        .strip_prefix("started background task ")?
-        .split_once(':')?
-        .0
-        .parse()
-        .ok()
-}
-
 /// The trailing `[session: <id>]` tag a delegate completion notice carries:
 /// the child subagent's own session id, exactly what `send_message`'s
-/// `target` expects. The id is the one the delegate wrapper already writes on
-/// the completion output's first line (`subagent session: …` on a fresh
-/// spawn/continuation, `fork session: …` on a fork), so no extra event field
-/// has to be threaded through the session schema. `kind` gates the tag to
-/// delegate tasks: bash completions have a shell `kind`, so their notice text
-/// stays byte-identical. The id is returned verbatim (never truncated) — it
-/// must stay copy-pasteable.
-pub(crate) fn background_session_tag(kind: Option<&str>, output: &str) -> Option<String> {
+/// `target` expects.
+///
+/// The id comes from the STRUCTURED `subagent_session_id` field (the
+/// registry's task display metadata), never from the completion prose —
+/// that is why a `fork session:` child is tagged exactly like a `subagent
+/// session:` one. `kind` gates the tag to delegate tasks: bash completions
+/// have a shell `kind`, so their notice text stays byte-identical. The id is
+/// returned verbatim (never truncated) — it must stay copy-pasteable.
+///
+/// `output` is only the LEGACY fallback: rows persisted before
+/// `subagent_session_id` existed carry the id in their first line only. It
+/// can be removed once a persisted-format migration backfills the field on
+/// those old `SessionEntry::BackgroundCompletion` rows — not merely because
+/// the live registry always sets it now.
+pub(crate) fn background_session_tag(
+    kind: Option<&str>,
+    subagent_session_id: Option<&str>,
+    output: &str,
+) -> Option<String> {
     if kind != Some("delegate") {
         return None;
     }
-    let first = output.lines().next()?;
-    let id = first
-        .strip_prefix("subagent session: ")
-        .or_else(|| first.strip_prefix("fork session: "))?
-        .trim();
+    let id = match subagent_session_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        Some(id) => id,
+        None => {
+            let first = output.lines().next()?;
+            first
+                .strip_prefix("subagent session: ")
+                .or_else(|| first.strip_prefix("fork session: "))?
+                .trim()
+        }
+    };
     (!id.is_empty()).then(|| format!(" [session: {id}]"))
 }
 

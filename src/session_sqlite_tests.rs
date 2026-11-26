@@ -94,6 +94,7 @@ fn test_entries() -> Vec<SessionEntry> {
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         },
         // Entry with a label to verify serde roundtrip with label.
         SessionEntry::BackgroundCompletion {
@@ -107,6 +108,7 @@ fn test_entries() -> Vec<SessionEntry> {
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         },
         Message::User {
             content: "你好世界👋\n多行".into(),
@@ -3241,6 +3243,7 @@ async fn finished_tasks_reads_background_completion_entries_newest_first() {
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         },
         SessionEntry::BackgroundCompletion {
             id: 2,
@@ -3253,6 +3256,7 @@ async fn finished_tasks_reads_background_completion_entries_newest_first() {
             status: Some("failed".into()),
             kind: Some("bash".into()),
             cancellation_source: None,
+            subagent_session_id: None,
         },
         SessionEntry::BackgroundCompletion {
             id: 3,
@@ -3265,6 +3269,7 @@ async fn finished_tasks_reads_background_completion_entries_newest_first() {
             status: Some("completed".into()),
             kind: Some("delegate".into()),
             cancellation_source: None,
+            subagent_session_id: Some("sub-1".into()),
         },
     ];
     session
@@ -3290,6 +3295,10 @@ async fn finished_tasks_reads_background_completion_entries_newest_first() {
     assert_eq!(task2.started_at_ms, Some(1_700_000_000_000));
     assert_eq!(task2.duration_ms, Some(500));
     assert_eq!(task2.signal, None);
+    // The persisted row exposes the structured child session id, so the
+    // finished-tasks API never has to parse the output's first line.
+    assert_eq!(finished[0].subagent_session_id.as_deref(), Some("sub-1"));
+    assert_eq!(task2.subagent_session_id, None);
     assert!(
         task2.finished_at_us >= 1_700_000_000_000_000,
         "finished_at is the row's event_time_us (µs clock), got {}",

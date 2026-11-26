@@ -817,7 +817,7 @@ impl Delegate {
         cut: (String, crate::session_store::LocatedKey),
         head: crate::session_factory::RequestHead,
         workspace: Workspace,
-    ) -> Result<String, String> {
+    ) -> Result<(u64, String), String> {
         // Admission preflight: `execute` checked delivery before the awaited
         // parent-history load, so re-check here — nothing has been spawned
         // yet, and a closed channel must not leave an orphan runner/session.
@@ -1014,7 +1014,10 @@ impl Delegate {
         // resolved child workspace in the same string form the delegate path
         // passes, so the task panel says where this child is running.
         let display_workspace = workspace.root().display().to_string();
-        self.background
+        // The fork's tool result stays the bare child session id; the
+        // registry task id rides as a field for the scheduler's bookkeeping.
+        let (task_id, _) = self
+            .background
             .spawn_with_id_target(
                 self.sender.clone(),
                 title,
@@ -1076,7 +1079,7 @@ impl Delegate {
                 },
             )
             .map_err(|e| e.to_string())?;
-        Ok(session_id)
+        Ok((task_id, session_id))
     }
 
     async fn runner_result(
@@ -1698,7 +1701,7 @@ impl Tool for Delegate {
                     workspace,
                 )
                 .await
-                .map(ToolOutput::text);
+                .map(|(task_id, session_id)| ToolOutput::started_task(session_id, task_id));
         }
         let role = arguments
             .as_object()
@@ -1997,7 +2000,7 @@ impl Tool for Delegate {
         // registry derives it from the absent shell name).
         let exit_slot = new_exit_slot();
         let work_exit = exit_slot.clone();
-        let started = self.background.spawn_with_id_target(
+        let (task_id, started) = self.background.spawn_with_id_target(
             self.sender.clone(),
             label,
             role,
@@ -2052,9 +2055,10 @@ impl Tool for Delegate {
                 }
             },
         )?;
-        Ok(ToolOutput::text(format!(
-            "{started}\nsubagent session: {session_id}"
-        )))
+        Ok(ToolOutput::started_task(
+            format!("{started}\nsubagent session: {session_id}"),
+            task_id,
+        ))
     }
 
     fn set_event_sender(&mut self, sender: tokio::sync::mpsc::UnboundedSender<AgentEvent>) {
