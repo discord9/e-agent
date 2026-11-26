@@ -57,6 +57,12 @@ pub(crate) struct RequestHead {
     /// explicit clear tombstone from "never set".
     pub goal: Option<GoalSnapshot>,
     pub goal_cleared: bool,
+    /// Image hashes the parent's provider already rejected in this live
+    /// session (the fork takes this from the live parent, not from the
+    /// build-time snapshot). A fork installs them on its agent before its
+    /// first request, so it skips the same attachments under the same
+    /// omission notice instead of re-sending them.
+    pub omitted_images: Vec<String>,
 }
 
 /// What to do with background-task records left behind by a previous run
@@ -643,19 +649,27 @@ impl SessionFactory {
         )
     }
 
-    /// Resolve a model profile by name at FORK time — the `fork` delegate's
-    /// child runs on the parent's current model, so a parent `/model <profile>`
-    /// switch (which only updates the live agent) must not leave the child on
-    /// the build-time model. `None` when the profile cannot be resolved (no
-    /// config, unknown profile); the fork then fails closed instead of
-    /// silently using the stale model. The effort level is the profile's own
-    /// configured default: the live identity carries the profile name only.
+    /// Resolve a model profile at FORK time — the `fork` delegate's child runs
+    /// on the parent's current EFFECTIVE model, so a parent `/model <profile>
+    /// [effort]` switch (which only updates the live agent) must not leave the
+    /// child on the build-time model, and an explicit effort override must not
+    /// be dropped. This is the same resolution `/model` itself uses
+    /// ([`Self::resolve_profile`]), so there is one rule for both. `None` when
+    /// the profile cannot be resolved (no config, unknown profile); the fork
+    /// then fails closed instead of silently using the stale model.
     pub fn fork_model_resolver(&self) -> crate::delegate::ForkModelSource {
         let reloadable = self.reloadable.clone();
         let base_url = self.base_url.clone();
         let model = self.model.clone();
-        Arc::new(move |profile: &str| {
-            resolve_profile_from(&reloadable, base_url.clone(), model.clone(), profile, None).ok()
+        Arc::new(move |profile: &str, effort: Option<EffortOverride>| {
+            resolve_profile_from(
+                &reloadable,
+                base_url.clone(),
+                model.clone(),
+                profile,
+                effort,
+            )
+            .ok()
         })
     }
 
@@ -1217,6 +1231,9 @@ impl SessionFactory {
             mcp_servers: mcp_servers_for_fork.clone(),
             goal: head_goal,
             goal_cleared: head_goal_cleared,
+            // A main session starts with no rejected images; the fork path
+            // overwrites this from the parent's live state.
+            omitted_images: Vec::new(),
         };
         *head_cell.lock().unwrap() = Some(head_value);
         let recovery_labels = if matches!(unfinished, UnfinishedPolicy::Consume) {

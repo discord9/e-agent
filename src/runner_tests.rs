@@ -2703,6 +2703,7 @@ async fn switch_model_applies_to_the_next_turn() {
             calls: calls.clone(),
         }),
         Some(32_000),
+        None,
     );
     handle.prompt("second");
     loop {
@@ -6806,7 +6807,7 @@ async fn switch_to_non_vision_during_read_image_strips_request() {
     );
     let task = runner.start(Some("look".into()));
     entered.notified().await;
-    handle.switch_model("non-vision", Box::new(non_vision), None);
+    handle.switch_model("non-vision", Box::new(non_vision), None, None);
     release.notify_one();
     let mut status = handle.status();
     let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
@@ -6919,7 +6920,7 @@ async fn switch_to_vision_during_read_image_keeps_history_image_and_serves_it() 
     );
     let task = runner.start(Some("look".into()));
     entered.notified().await;
-    handle.switch_model("vision", Box::new(vision), None);
+    handle.switch_model("vision", Box::new(vision), None, None);
     release.notify_one();
     let mut status = handle.status();
     let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
@@ -12042,12 +12043,17 @@ fn switch_model_command_carries_context_window() {
             calls: Arc::new(Mutex::new(Vec::new())),
         }),
         Some(32_000),
+        // The effort override travels with the command: a fork reproduces the
+        // parent's EFFECTIVE model from this identity, and `Omit` is a real
+        // choice that must not be folded into `None`.
+        Some(crate::session_factory::EffortOverride::Omit),
     );
     assert!(matches!(
         commands.try_recv(),
         Ok(SessionCommand::SwitchModel {
             context_window: Some(32_000),
             profile,
+            effort: Some(crate::session_factory::EffortOverride::Omit),
             ..
         }) if profile == "model-b"
     ));

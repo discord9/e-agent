@@ -173,6 +173,12 @@ fn recover_image_rejection(
         let mut shared = shared.lock().unwrap();
         shared.emit_presentation(AgentEvent::Error(rejection.to_string()));
         shared.emit_presentation(AgentEvent::Display(IMAGE_RETRY_NOTICE.into()));
+        // Mirror the agent's sticky omission set so a `fork` child inherits
+        // it: the child's first request must skip exactly the attachments the
+        // parent already knows its provider rejects.
+        shared
+            .omitted_images
+            .extend(rejection.hashes.iter().cloned());
     }
     agent.omit_images(rejection.hashes.iter().cloned());
 }
@@ -242,6 +248,22 @@ where
     }
 }
 
+/// A session's live routing identity, installed by a runtime `/model` switch:
+/// exactly what the switch resolved against the config, so a `fork` can
+/// reproduce the parent's EFFECTIVE model instead of re-deriving it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveModel {
+    /// The resolved profile key (`provider/model`).
+    pub profile: String,
+    /// The context window the switch installed (`None` when the profile
+    /// declares none, or a `--model` override replaced the wire model).
+    pub context_window: Option<u64>,
+    /// The effort override the switch resolved with, verbatim — `None` when
+    /// the profile's own configured effort applied, and [`EffortOverride::Omit`]
+    /// when the switch explicitly omitted the field. Never folded into `None`.
+    pub effort: Option<crate::session_factory::EffortOverride>,
+}
+
 /// Steering commands accepted by a session's command channel. Not
 /// `Clone`/`Debug`/`PartialEq`/`Eq` because `SwitchModel` carries a
 /// `Box<dyn Model>`; tests compare via `matches!` instead.
@@ -255,13 +277,15 @@ pub enum SessionCommand {
     Cancel,
     Compact,
     /// Runtime model switch (web/TUI `/model <profile>`): the caller
-    /// resolves the profile to a concrete model and its context window;
-    /// the runner installs both on the agent together and remembers the
-    /// profile as the session's live routing identity.
+    /// resolves the profile (with its effort override) to a concrete model
+    /// and its context window; the runner installs both on the agent together
+    /// and remembers the whole identity — profile, window and override — as
+    /// the session's live routing identity.
     SwitchModel {
         profile: String,
         model: Box<dyn Model>,
         context_window: Option<u64>,
+        effort: Option<crate::session_factory::EffortOverride>,
     },
     /// Human-issued goal mutation (`/goal` commands, web API). The model
     /// never creates goals; its `update_goal` tool is intercepted by the
@@ -391,11 +415,15 @@ struct Shared {
     /// Latest goal snapshot, mirrored from the runner for UI reads
     /// (REPL `/goal`, TUI GoalBar, web `GET /api/sessions/{id}/goal`).
     goal: Option<crate::agent::GoalSnapshot>,
-    /// The session's live routing identity — `(profile key, context window)`
-    /// installed by a runtime `/model` switch — or `None` while the startup
-    /// model still applies. Fork admission reads it so a forked child never
-    /// inherits the model captured when the parent was built.
-    live_model: Option<(String, Option<u64>)>,
+    /// The session's live routing identity installed by a runtime `/model`
+    /// switch — or `None` while the startup model still applies. Fork
+    /// admission reads it so a forked child never inherits the model captured
+    /// when the parent was built.
+    live_model: Option<LiveModel>,
+    /// Image hashes a live provider rejection made sticky for this session's
+    /// request copies (the `Agent`'s own omission set, mirrored here so a
+    /// `fork` child can inherit it). Empty while nothing was rejected.
+    omitted_images: HashSet<String>,
     /// Goal-admission state only: ids of this session's own live
     /// `delegate`/btw children whose completion is not durably committed yet.
     /// Registered at spawn (before the wrapper's work runs) and released only
@@ -562,13 +590,32 @@ impl WeakSessionHandle {
         true
     }
 
-    /// The session's live model identity — `(profile key, context window)`
-    /// installed by the last runtime `/model` switch — or `None` while the
-    /// startup model still applies. A `fork` delegate reads it so the child
-    /// runs and reports the parent's CURRENT model, never the one captured
-    /// when the parent was built.
-    pub fn live_model(&self) -> Option<(String, Option<u64>)> {
+    /// The session's live routing identity — profile key, context window and
+    /// the effort override it resolved with — installed by the last runtime
+    /// `/model` switch, or `None` while the startup model still applies. A
+    /// `fork` delegate reads it so the child runs and reports the parent's
+    /// CURRENT EFFECTIVE model, never the one captured when the parent was
+    /// built: its presence alone is the "build-time head is stale" signal.
+    pub fn live_model(&self) -> Option<LiveModel> {
         self.shared.upgrade()?.lock().unwrap().live_model.clone()
+    }
+
+    /// The image hashes a live provider rejection made this session's request
+    /// copies skip (sorted, so the snapshot a fork takes is deterministic).
+    /// Losing the runner state yields an empty list.
+    pub fn omitted_images(&self) -> Vec<String> {
+        let Some(shared) = self.shared.upgrade() else {
+            return Vec::new();
+        };
+        let mut hashes: Vec<String> = shared
+            .lock()
+            .unwrap()
+            .omitted_images
+            .iter()
+            .cloned()
+            .collect();
+        hashes.sort_unstable();
+        hashes
     }
 
     /// Test-only: this session's registered Goal children, so spawn-path
@@ -792,9 +839,16 @@ impl SessionHandle {
         }
     }
     /// Switch the session's model and context window at runtime. The caller
-    /// resolves the profile (web/TUI `/model`); the runner installs both from
-    /// its next call on.
-    pub fn switch_model(&self, profile: &str, model: Box<dyn Model>, context_window: Option<u64>) {
+    /// resolves the profile (web/TUI `/model`) and passes the SAME effort
+    /// override it resolved with; the runner installs both from its next call
+    /// on and records the identity a fork reproduces.
+    pub fn switch_model(
+        &self,
+        profile: &str,
+        model: Box<dyn Model>,
+        context_window: Option<u64>,
+        effort: Option<crate::session_factory::EffortOverride>,
+    ) {
         let mut shared = self.shared.lock().unwrap();
         if shared.commands_open
             && !self.commands.is_closed()
@@ -804,6 +858,7 @@ impl SessionHandle {
                     profile: profile.to_owned(),
                     model,
                     context_window,
+                    effort,
                 })
                 .is_err()
         {
@@ -966,6 +1021,7 @@ pub(crate) fn session_test_channel() -> (
         pending_questions: std::collections::HashMap::new(),
         goal: None,
         live_model: None,
+        omitted_images: HashSet::new(),
         goal_children: std::collections::HashSet::new(),
     }));
     let (commands, receiver) = mpsc::unbounded_channel();
@@ -1385,6 +1441,7 @@ impl SessionRunner {
             pending_questions: std::collections::HashMap::new(),
             goal,
             live_model: None,
+            omitted_images: HashSet::new(),
             goal_children: std::collections::HashSet::new(),
         }));
         let handler_shared = shared.clone();
@@ -2403,13 +2460,22 @@ impl SessionRunner {
                 profile,
                 model,
                 context_window,
+                effort,
             } => {
                 // Instant, not queued: the new model applies to the next
                 // model call (a call already in flight keeps its model).
                 self.agent.set_model(model, context_window);
+                let mut shared = self.shared.lock().unwrap();
                 // The live routing identity a fork child must inherit; the
                 // request head captured at build time is stale from here on.
-                self.shared.lock().unwrap().live_model = Some((profile, context_window));
+                shared.live_model = Some(LiveModel {
+                    profile,
+                    context_window,
+                    effort,
+                });
+                // `Agent::set_model` clears the request-copy image omissions;
+                // the fork-visible mirror follows the same rule.
+                shared.omitted_images.clear();
                 Steering::None
             }
             SessionCommand::Cancel => {
@@ -2621,9 +2687,18 @@ impl SessionRunner {
                     profile,
                     model,
                     context_window,
+                    effort,
                 } => {
                     self.agent.set_model(model, context_window);
-                    self.shared.lock().unwrap().live_model = Some((profile, context_window));
+                    let mut shared = self.shared.lock().unwrap();
+                    shared.live_model = Some(LiveModel {
+                        profile,
+                        context_window,
+                        effort,
+                    });
+                    // Matches `Agent::set_model`: a replacement model gets the
+                    // untouched request again.
+                    shared.omitted_images.clear();
                 }
                 other => deferred.push(other),
             }

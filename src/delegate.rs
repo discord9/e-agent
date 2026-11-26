@@ -161,11 +161,18 @@ pub type SubagentModelSource =
 pub type RoleModelSource =
     Arc<dyn Fn(&str) -> Option<(ConfiguredModel, Option<u64>)> + Send + Sync>;
 
-/// Live model resolver used by `fork`: resolves the parent's current model
-/// profile name to a concrete model plus context window, or `None` when the
-/// profile cannot be resolved (the fork then fails closed).
-pub type ForkModelSource =
-    Arc<dyn Fn(&str) -> Option<(ConfiguredModel, Option<u64>)> + Send + Sync>;
+/// Live model resolver used by `fork`: resolves the parent's current routing
+/// identity — profile key AND the effort override it resolved with — to a
+/// concrete model plus context window, or `None` when the profile cannot be
+/// resolved (the fork then fails closed).
+pub type ForkModelSource = Arc<
+    dyn Fn(
+            &str,
+            Option<crate::session_factory::EffortOverride>,
+        ) -> Option<(ConfiguredModel, Option<u64>)>
+        + Send
+        + Sync,
+>;
 
 /// Direct, live-only parent/child agent messaging. Endpoints are bound by a
 /// runner at construction time and are deliberately never reconstructed.
@@ -762,16 +769,20 @@ impl Delegate {
         Ok((handle, runner_task))
     }
 
-    /// The fork's model: the parent's CURRENT routing identity, not the
+    /// The fork's model: the parent's CURRENT EFFECTIVE model, not the
     /// request head captured when the parent was built. A runtime `/model`
     /// switch installs a new model on the parent's live agent only, so the
-    /// head's model is stale from then on. Resolution fails closed rather
-    /// than silently forking on the stale model.
+    /// head's model is stale from then on — even when the profile NAME is
+    /// unchanged (an effort override, or a profile definition edited and
+    /// reselected since the build). Hence: whenever a live identity exists,
+    /// re-resolve it — profile plus the effort the switch actually used — and
+    /// never fall back to the head object because the names match. Resolution
+    /// fails closed rather than silently forking on a stale model.
     fn fork_model(
         &self,
         head: &crate::session_factory::RequestHead,
     ) -> Result<(ConfiguredModel, Option<u64>), String> {
-        let Some((profile, context_window)) = self
+        let Some(live) = self
             .parent_endpoint
             .as_ref()
             .and_then(WeakSessionHandle::live_model)
@@ -779,14 +790,9 @@ impl Delegate {
             // No runtime switch: the head still describes the live model.
             return Ok((head.model.clone(), head.context_window));
         };
-        if profile == head.model.profile_key() {
-            // Same profile: the head's model object was built from it; only
-            // the context window may have been re-declared by the switch.
-            return Ok((head.model.clone(), context_window));
-        }
         self.fork_model_source
             .as_ref()
-            .and_then(|source| source(&profile))
+            .and_then(|source| source(&live.profile, live.effort))
             .ok_or_else(|| "fork requires the parent's current model".to_string())
     }
 
@@ -820,6 +826,9 @@ impl Delegate {
         }
         // The parent's current model, never the head captured at build time.
         let (model, context_window) = self.fork_model(&head)?;
+        // The parent's live image-omission set, likewise never the build-time
+        // snapshot: installed on the child below, before its first request.
+        let omitted_images = head.omitted_images.clone();
         let session_id = crate::session::new_id_prefixed("sub-");
         let persist_root = self
             .persist_root
@@ -893,6 +902,11 @@ impl Delegate {
         )));
         tools.push(Box::new(child_delegate));
         let mut agent = Agent::new(Box::new(model.clone()), tools);
+        // Inherit the parent's live rejections BEFORE the first request: the
+        // child skips exactly the attachments the parent's provider already
+        // rejected, under the same cached-omission notice the parent's next
+        // request carries, so the two requests stay comparable.
+        agent.omit_images(omitted_images);
         if let Some(prefix) = head.context_prefix {
             agent.set_context_prefix(prefix);
         }
@@ -1485,8 +1499,24 @@ impl Tool for Delegate {
         } else {
             json!({"type": "string", "enum": roles, "description": format!("specialized role for the subagent; available roles: {}", role_disclosures.join(", "))})
         };
+        // A fork defaults its workspace to the parent's root, so `workspace`
+        // is only unconditionally required by a delegate that cannot fork
+        // (and, inside a fork-capable delegate, for a non-fork call such as
+        // `resume`). The property description states that split; the
+        // `required` list can only name the unconditional case.
+        //
+        // Keyed on the head, not on `fork_child`: a forked child's own
+        // `delegate` must stay byte-identical to its parent's spec (its
+        // request has to be an identical provider prefix), and that tool is
+        // inert anyway — `execute` rejects every delegation from a fork.
+        let forks = self.fork_head.is_some();
+        let workspace_description = if forks {
+            "working directory for the subagent (e.g. /home/user/project or C:\\Users\\user\\project). REQUIRED for a non-fork delegate and for `resume`; a `fork` omits it to inherit the parent's root. May be absolute or relative: relative paths are resolved against YOUR workspace root (e.g. `.e-agent/worktrees/wt-x`) and must stay inside it or an authorized external directory."
+        } else {
+            "REQUIRED — working directory for the subagent (e.g. /home/user/project or C:\\Users\\user\\project). May be absolute or relative: relative paths are resolved against YOUR workspace root (e.g. `.e-agent/worktrees/wt-x`) and must stay inside it or an authorized external directory."
+        };
         let mut properties = json!({
-            "workspace": {"type": "string", "description": "REQUIRED — working directory for the subagent (e.g. /home/user/project or C:\\Users\\user\\project). May be absolute or relative: relative paths are resolved against YOUR workspace root (e.g. `.e-agent/worktrees/wt-x`) and must stay inside it or an authorized external directory."},
+            "workspace": {"type": "string", "description": workspace_description},
             "role": role_property,
             "label": {"type": "string", "description": "short (≤ 40 chars) human-readable title for the task panel; defaults to the role name or a preview of the task"},
             "resume": {"type": "string", "description": "id of a previous subagent session (sub-…) to continue from; its transcript becomes the starting context"},
@@ -1495,10 +1525,18 @@ impl Tool for Delegate {
         if self.fork_head.is_some() {
             properties["fork"] = json!({"type":"boolean", "description":"Continue from the parent's completed-turn prefix: the child inherits the parent's current model, system prompt, goal and tool schemas, except `generate_image`, which is main-only and absent from every fork (no placeholder is exposed, so a fork of a main session that exposed it has a different tool array). `workspace` defaults to the parent's root; with that default (apart from that one main-only tool, and with the same MCP tool set) the child's request is a byte-identical provider prefix and reuses the parent's prompt cache, while an explicit different `workspace` runs the child's tools/MCP elsewhere and loses that guarantee. Mutually exclusive with `role` and `resume`. The current in-flight turn is excluded, so put everything the child needs in `task`."});
         }
+        // `task` is always required; `workspace` is required unless this
+        // delegate can fork (a fork's workspace defaults to the parent's
+        // root, see the property description).
+        let required = if forks {
+            json!(["task"])
+        } else {
+            json!(["workspace", "task"])
+        };
         ToolSpec {
             name: "delegate".into(),
             description,
-            parameters: json!({"type":"object", "properties": properties, "required":["workspace","task"]}),
+            parameters: json!({"type":"object", "properties": properties, "required": required}),
         }
     }
 
@@ -1627,6 +1665,15 @@ impl Tool for Delegate {
                 next_older: cut.older.clone(),
             };
             let mut head = factory();
+            // Snapshot the parent's LIVE image-omission set into the head: the
+            // build-time head cannot know what this live session was rejected
+            // for, and a child that re-sent those attachments would diverge
+            // from the parent's own next request.
+            head.omitted_images = self
+                .parent_endpoint
+                .as_ref()
+                .map(WeakSessionHandle::omitted_images)
+                .unwrap_or_default();
             // Freeze the parent's LIVE goal projection (unchanged policy): the
             // newest durable goal state, even when the fork's cut prefix ends
             // before it. One bounded goal row is read; the history is not

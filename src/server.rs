@@ -1876,20 +1876,21 @@ async fn session_model(
             }
         }
     };
-    let (configured, context_window) =
-        state
-            .factory
-            .resolve_profile(profile, effort)
-            .map_err(|e| {
-                error(
-                    StatusCode::BAD_REQUEST,
-                    format!("unknown model profile `{profile}`: {e:#}"),
-                )
-            })?;
+    let (configured, context_window) = state
+        .factory
+        .resolve_profile(profile, effort.clone())
+        .map_err(|e| {
+            error(
+                StatusCode::BAD_REQUEST,
+                format!("unknown model profile `{profile}`: {e:#}"),
+            )
+        })?;
     let name = configured.profile_key();
+    // The same override the resolution used travels with the live identity,
+    // so a `fork` child reproduces this session's effective model.
     session
         .handle()
-        .switch_model(&name, Box::new(configured), context_window);
+        .switch_model(&name, Box::new(configured), context_window, effort);
     // Mirror the new model into the registry metadata so `GET /api/sessions`
     // (sidebar / composer meta) reflects the switch immediately. Subagent
     // sessions keep their spawn-time display name (the delegate entry is
