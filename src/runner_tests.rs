@@ -32,13 +32,155 @@ fn entry_event_projects_tool_images_for_durable_replay() {
             images: images.clone(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
         },
     };
     assert!(matches!(
         entry_event(&entry),
-        Some(AgentEvent::ToolResult { is_error: false, content, images: projected, call_id: Some(call_id) })
+        Some(AgentEvent::ToolResult { is_error: false, content, images: projected, call_id: Some(call_id), started_task_id: None, subagent_session_id: None })
             if content == "persisted image result" && call_id == "call-image-replay" && projected == images
     ));
+}
+
+/// The model-facing receipt text of a delegate start: what the model sees and
+/// what old rows only have. It must keep working as display text, never as the
+/// source of the machine facts.
+const DELEGATE_START_RECEIPT: &str = "started background task 7: 看图\nsubagent session: sub-chat";
+
+/// A delegate-shaped tool: it STARTED a delegated subagent, so its output
+/// carries BOTH the registry task id and the child session id as fields.
+struct StartingDelegateMock;
+
+#[async_trait]
+impl Tool for StartingDelegateMock {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "delegate".into(),
+            description: "delegate metadata test".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+    async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
+        Ok(ToolOutput::started_task(DELEGATE_START_RECEIPT, 7).subagent_session("sub-chat"))
+    }
+}
+
+/// A delegate tool result carries the started task id and the child session id
+/// as FIELDS, on the live event and on the durable `Tool` row, so no frontend
+/// has to recover them from the receipt prose.
+#[tokio::test]
+async fn delegate_tool_result_carries_task_and_child_session_fields() {
+    let temp = tempfile::tempdir().unwrap();
+    let agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: VecDeque::from(vec![
+                blocking_tool_call("call-delegate", "delegate"),
+                assistant_reply("delegated"),
+            ]),
+        }),
+        vec![Box::new(StartingDelegateMock)],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "delegate-metadata".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let task = runner.start(Some("start".into()));
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "delegated"),
+    )
+    .await;
+    assert!(
+        handle.snapshot().iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolResult {
+                call_id: Some(call_id),
+                content,
+                started_task_id: Some(7),
+                subagent_session_id: Some(session_id),
+                ..
+            } if call_id == "call-delegate" && session_id == "sub-chat"
+                && content == DELEGATE_START_RECEIPT
+        )),
+        "the live delegate result must carry both ids as fields: {:?}",
+        handle.snapshot()
+    );
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "delegate-metadata")
+        .await
+        .unwrap()
+        .entries;
+    assert!(
+        tool_entries(&entries).iter().any(|message| matches!(
+            message,
+            Message::Tool {
+                name,
+                content,
+                started_task_id: Some(7),
+                subagent_session_id: Some(session_id),
+                ..
+            } if name == "delegate" && session_id == "sub-chat"
+                && content == DELEGATE_START_RECEIPT
+        )),
+        "the durable Tool row must carry both ids as fields: {entries:?}"
+    );
+    drop(task);
+}
+
+/// A `Tool` row persisted BEFORE the structured ids existed deserialises (both
+/// fields default to `None`) and projects to a `ToolResult` with both absent —
+/// which is exactly what makes the web UI take its legacy prose fallback.
+#[test]
+fn old_tool_row_without_structured_ids_still_loads_and_projects() {
+    let old = r#"{"Tool":{"call_id":"call-old","name":"delegate","content":"started background task 7: 看图\nsubagent session: sub-old","is_error":false,"synthetic":false}}"#;
+    let message: Message = serde_json::from_str(old).expect("old Tool rows must stay loadable");
+    assert!(matches!(
+        &message,
+        Message::Tool {
+            started_task_id: None,
+            subagent_session_id: None,
+            ..
+        }
+    ));
+    assert!(matches!(
+        entry_event(&SessionEntry::Message { message }),
+        Some(AgentEvent::ToolResult {
+            call_id: Some(call_id),
+            started_task_id: None,
+            subagent_session_id: None,
+            ..
+        }) if call_id == "call-old"
+    ));
+}
+
+/// A bash result carries neither id, and its serialized entry keeps exactly the
+/// old shape (both fields skipped when absent).
+#[test]
+fn bash_tool_row_serializes_without_the_structured_ids() {
+    let message = Message::Tool {
+        call_id: "call-bash".into(),
+        name: "bash".into(),
+        content: "started background task 7: build".into(),
+        images: Vec::new(),
+        is_error: false,
+        synthetic: false,
+        started_task_id: None,
+        subagent_session_id: None,
+    };
+    assert_eq!(
+        serde_json::to_value(&message).unwrap(),
+        serde_json::json!({"Tool": {
+            "call_id": "call-bash",
+            "name": "bash",
+            "content": "started background task 7: build",
+            "is_error": false,
+            "synthetic": false,
+        }})
+    );
 }
 
 struct IdentityCaptureModel(Arc<Mutex<Option<String>>>);
@@ -2480,6 +2622,8 @@ impl Tool for MarkerTool {
                 mime: "image/png".into(),
             }],
             background_started: false,
+            started_task_id: None,
+            subagent_session_id: None,
         })
     }
 }
@@ -2547,6 +2691,8 @@ impl Tool for BlockingMarkerTool {
                 mime: "image/png".into(),
             }],
             background_started: false,
+            started_task_id: None,
+            subagent_session_id: None,
         })
     }
 }
@@ -2968,12 +3114,14 @@ async fn switch_model_applies_to_the_next_turn() {
 
     // Runtime switch, then turn 2 must run on the new model.
     handle.switch_model(
-        "model-b",
         Box::new(NamedRecordingModel {
             name: "model-b".into(),
             calls: calls.clone(),
         }),
         Some(32_000),
+        // A programmatically installed model has no resolved snapshot to
+        // inherit, so a `fork` would fail closed (this session never forks).
+        None,
     );
     handle.prompt("second");
     loop {
@@ -5701,6 +5849,8 @@ async fn requested_compaction_singletask_resume_keeps_pair_and_summary_constrain
                 images: vec![],
                 is_error: false,
                 synthetic: false,
+                started_task_id: None,
+                subagent_session_id: None,
             }
             .into(),
         );
@@ -7077,7 +7227,7 @@ async fn switch_to_non_vision_during_read_image_strips_request() {
     );
     let task = runner.start(Some("look".into()));
     entered.notified().await;
-    handle.switch_model("non-vision", Box::new(non_vision), None);
+    handle.switch_model(Box::new(non_vision), None, None);
     release.notify_one();
     let mut status = handle.status();
     let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
@@ -7190,7 +7340,7 @@ async fn switch_to_vision_during_read_image_keeps_history_image_and_serves_it() 
     );
     let task = runner.start(Some("look".into()));
     entered.notified().await;
-    handle.switch_model("vision", Box::new(vision), None);
+    handle.switch_model(Box::new(vision), None, None);
     release.notify_one();
     let mut status = handle.status();
     let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
@@ -7478,10 +7628,12 @@ impl Tool for MockBackgroundBash {
         }
     }
     async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
-        Ok(ToolOutput::text(format!(
-            "started background task {}: {}",
-            self.id, self.label
-        )))
+        // The structured id, not the prose: this is what the runner's
+        // finish gate keys on.
+        Ok(ToolOutput::started_task(
+            format!("started background task {}: {}", self.id, self.label),
+            self.id,
+        ))
     }
     fn set_event_sender(&mut self, sender: mpsc::UnboundedSender<AgentEvent>) {
         *self.sender.lock().unwrap() = Some(sender);
@@ -7509,7 +7661,7 @@ impl Tool for ProjectingBackgroundBash {
     }
     async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
         let release = self.release.clone();
-        let started = self.background.spawn_with_id(
+        let (task_id, started) = self.background.spawn_with_id(
             "slow build".into(),
             None,
             None,
@@ -7521,7 +7673,7 @@ impl Tool for ProjectingBackgroundBash {
                 "build ok".to_string()
             },
         )?;
-        Ok(ToolOutput::text(started))
+        Ok(ToolOutput::started_task(started, task_id))
     }
     fn set_event_sender(&mut self, sender: mpsc::UnboundedSender<AgentEvent>) {
         self.background.set_event_sender(sender);
@@ -7753,6 +7905,7 @@ async fn unfinished_background_bash_blocks_finish_when_idle_until_completion() {
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         })
         .unwrap();
     loop {
@@ -7885,11 +8038,14 @@ impl Tool for StartingBashMock {
         }
     }
     async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
+        // Ids start at 1, like the registry's own allocator.
         let id = self.0.fetch_add(1, Ordering::SeqCst) + 1;
         Ok(ToolOutput {
             content: format!("started background task {id}: build {id}"),
             images: Vec::new(),
             background_started: true,
+            started_task_id: Some(id as u64),
+            subagent_session_id: None,
         })
     }
 }
@@ -8474,6 +8630,7 @@ async fn content_and_tool_calls_in_same_round_still_block_and_complete() {
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         })
         .unwrap();
     loop {
@@ -8583,6 +8740,7 @@ async fn completion_arriving_during_last_model_round_is_committed_before_finaliz
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         })
         .unwrap();
     release.notify_one();
@@ -8666,12 +8824,13 @@ impl Tool for SelfCompletingBash {
                 status: None,
                 kind: None,
                 cancellation_source: None,
+                subagent_session_id: None,
             })
             .unwrap();
-        Ok(ToolOutput::text(format!(
-            "started background task {}: cargo build",
-            self.id
-        )))
+        Ok(ToolOutput::started_task(
+            format!("started background task {}: cargo build", self.id),
+            self.id,
+        ))
     }
     fn set_event_sender(&mut self, sender: mpsc::UnboundedSender<AgentEvent>) {
         *self.sender.lock().unwrap() = Some(sender);
@@ -8879,6 +9038,7 @@ async fn finish_when_idle_waits_indefinitely_for_blocking_completion() {
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         })
         .unwrap();
     loop {
@@ -10013,6 +10173,7 @@ async fn steer_cancel_then_prompt_at_idle_with_blocking_background_runs_queued_t
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         })
         .unwrap();
     loop {
@@ -12025,6 +12186,7 @@ async fn oracle449_runner_persists_notice_before_completion_and_keeps_owner_unti
         status: None,
         kind: None,
         cancellation_source: None,
+        subagent_session_id: None,
     })
     .unwrap();
     loop {
@@ -12281,6 +12443,7 @@ async fn oracle449_runner_notice_is_visible_once_to_attached_and_late_views() {
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         })
         .unwrap();
     let mut notices = 0;
@@ -12304,24 +12467,32 @@ async fn oracle449_runner_notice_is_visible_once_to_attached_and_late_views() {
 }
 
 #[test]
-fn switch_model_command_carries_context_window() {
+fn switch_model_command_carries_the_resolved_snapshot_and_window() {
     let (handle, _emitter, mut commands) = session_test_channel();
-    handle.switch_model(
-        "model-b",
-        Box::new(NamedRecordingModel {
-            name: "model-b".into(),
-            calls: Arc::new(Mutex::new(Vec::new())),
-        }),
-        Some(32_000),
+    // The RESOLVED model the caller switched with: the runner snapshots this
+    // clone plus the installed window as the identity a fork inherits (it
+    // never re-resolves, so a config reload cannot reroute the child).
+    let resolved = crate::model::ConfiguredModel::chat(
+        crate::model::OpenAiModel::new(
+            "http://localhost".into(),
+            "test-key".into(),
+            "model-b".into(),
+            Some("high".into()),
+        )
+        .unwrap(),
     );
-    assert!(matches!(
-        commands.try_recv(),
-        Ok(SessionCommand::SwitchModel {
-            context_window: Some(32_000),
-            profile,
-            ..
-        }) if profile == "model-b"
-    ));
+    handle.switch_model(Box::new(resolved.clone()), Some(32_000), Some(resolved));
+    let Ok(SessionCommand::SwitchModel {
+        context_window,
+        fork_snapshot,
+        ..
+    }) = commands.try_recv()
+    else {
+        panic!("expected a SwitchModel command");
+    };
+    assert_eq!(context_window, Some(32_000));
+    let snapshot = fork_snapshot.expect("the resolved model travels with the switch");
+    assert_eq!(snapshot.name(), "model-b");
 }
 
 // Focused `/goal continue` contract tests. Continuation state is deliberately
@@ -12621,6 +12792,7 @@ async fn goal_continue_idle_background_followup_then_resume() {
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         })
         .unwrap();
     wait_for_log_event(
@@ -16050,6 +16222,7 @@ async fn oracle718_background_during_answer_compact_keeps_resume(
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         })
         .unwrap();
     compact_release.notify_one();
@@ -17584,10 +17757,10 @@ impl Tool for BlockingBackgroundBash {
     async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
         self.entered.notify_one();
         self.release.notified().await;
-        Ok(ToolOutput::text(format!(
-            "started background task {}: {}",
-            self.id, self.label
-        )))
+        Ok(ToolOutput::started_task(
+            format!("started background task {}: {}", self.id, self.label),
+            self.id,
+        ))
     }
     fn set_event_sender(&mut self, sender: mpsc::UnboundedSender<AgentEvent>) {
         *self.sender.lock().unwrap() = Some(sender);
@@ -17606,6 +17779,7 @@ fn owned_background_completed(id: u64, output: &str, label: &str) -> AgentEvent 
         status: None,
         kind: None,
         cancellation_source: None,
+        subagent_session_id: None,
     }
 }
 
@@ -18560,7 +18734,7 @@ async fn a_shared_registry_task_this_session_did_not_start_does_not_suspend_the_
             },
         )
         .unwrap();
-    assert!(started.starts_with("started background task"));
+    assert!(started.1.starts_with("started background task"));
     let agent = Agent::new(
         Box::new(BlockingContextCaptureModel {
             replies: vec![

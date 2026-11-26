@@ -43,7 +43,7 @@ impl Tool for ReceiptTool {
         }
     }
     async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
-        Ok(ToolOutput::text("started background task 7: x"))
+        Ok(ToolOutput::started_task("started background task 7: x", 7))
     }
 }
 
@@ -118,12 +118,16 @@ impl Tool for ScriptedBackgroundTool {
                 status: None,
                 kind: None,
                 cancellation_source: None,
+                subagent_session_id: None,
             });
             if let Some(sent) = completion_sent {
                 sent.notify_one();
             }
         });
-        Ok(ToolOutput::text("started background task 1: echo done"))
+        Ok(ToolOutput::started_task(
+            "started background task 1: echo done",
+            1,
+        ))
     }
 
     fn set_event_sender(&mut self, sender: mpsc::UnboundedSender<AgentEvent>) {
@@ -167,10 +171,14 @@ impl Tool for NoticeBackgroundTool {
                     status: None,
                     kind: None,
                     cancellation_source: None,
+                    subagent_session_id: None,
                 });
             }
         });
-        Ok(ToolOutput::text("started background task 1: cmd"))
+        Ok(ToolOutput::started_task(
+            "started background task 1: cmd",
+            1,
+        ))
     }
     fn set_event_sender(&mut self, sender: mpsc::UnboundedSender<AgentEvent>) {
         self.sender = Some(sender);
@@ -283,6 +291,8 @@ impl Tool for BackgroundStartingTool {
             content: "started background task 1: build".into(),
             images: vec![],
             background_started: true,
+            started_task_id: Some(1),
+            subagent_session_id: None,
         })
     }
 }
@@ -385,6 +395,8 @@ async fn background_reminder_notice_is_never_the_compaction_current_prompt() {
             images: vec![],
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
         }
         .into(),
         Message::Assistant(AssistantMessage {
@@ -504,7 +516,7 @@ async fn receipt_without_background_argument_registers_blocking_task_and_detache
     };
     let mut agent = Agent::new(Box::new(model), vec![Box::new(ReceiptTool)]);
     // Directly exercise the tool-result hook so no second model reply is needed.
-    let receipt = Ok(ToolOutput::text("started background task 7: x"));
+    let receipt = Ok(ToolOutput::started_task("started background task 7: x", 7));
     agent
         .after_tool_entry(&call("a", "bash", r#"{"command":"x"}"#), &receipt)
         .await
@@ -521,6 +533,112 @@ async fn receipt_without_background_argument_registers_blocking_task_and_detache
     assert_eq!(agent.background_task_ids().len(), 1);
     assert!(agent.background_task_ids().contains(&7));
     assert!(!agent.background_task_ids().contains(&8));
+}
+
+/// The background-start id is a STRUCTURED field, so a receipt whose
+/// model-facing prose is reworded (or translated) still registers the task.
+/// Under the old prefix parser this test registered nothing.
+#[tokio::test]
+async fn reworded_background_receipt_still_registers_the_structured_id() {
+    let model = ScriptedModel {
+        replies: vec![],
+        requests: Arc::new(Mutex::new(Vec::new())),
+        delays: Default::default(),
+    };
+    let mut agent = Agent::new(Box::new(model), vec![Box::new(ReceiptTool)]);
+    let receipt = Ok(ToolOutput::started_task(
+        "已在后台启动任务 #42（build）；完成时会自动通知。",
+        42,
+    ));
+    agent
+        .after_tool_entry(&call("a", "bash", r#"{"command":"x"}"#), &receipt)
+        .await
+        .unwrap();
+    assert!(agent.background_task_ids().contains(&42));
+    assert!(agent.has_blocking_background());
+}
+
+/// ...and the reverse: a receipt whose TEXT looks like a background start but
+/// carries no id field is just prose. It must not enter the blocking set.
+#[tokio::test]
+async fn prose_only_background_receipt_does_not_register() {
+    let model = ScriptedModel {
+        replies: vec![],
+        requests: Arc::new(Mutex::new(Vec::new())),
+        delays: Default::default(),
+    };
+    let mut agent = Agent::new(Box::new(model), vec![Box::new(ReceiptTool)]);
+    let receipt = Ok(ToolOutput::text("started background task 99: x"));
+    agent
+        .after_tool_entry(&call("a", "bash", r#"{"command":"x"}"#), &receipt)
+        .await
+        .unwrap();
+    assert!(agent.background_task_ids().is_empty());
+    assert!(!agent.has_blocking_background());
+}
+
+/// The delegate session tag comes from the structured field: a fork child
+/// (`fork session:` prose) is tagged exactly like a `subagent session:` one,
+/// and reworded prose still tags because the field wins. `output` is only the
+/// legacy fallback for rows persisted before the field existed.
+#[test]
+fn background_session_tag_prefers_the_structured_session_id() {
+    let id = "sub-0123456789abcdef0123456789abcdef";
+    let expected = format!(" [session: {id}]");
+    // A `subagent session:` completion (fresh spawn or resume).
+    assert_eq!(
+        background_session_tag(
+            Some("delegate"),
+            Some(id),
+            &format!("subagent session: {id}\nanswer")
+        )
+        .as_deref(),
+        Some(expected.as_str())
+    );
+    // A `fork session:` completion: the web UI used to hide these entirely.
+    assert_eq!(
+        background_session_tag(
+            Some("delegate"),
+            Some(id),
+            &format!("fork session: {id}\nanswer")
+        )
+        .as_deref(),
+        Some(expected.as_str())
+    );
+    // Reworded prose: only the field can produce the tag.
+    assert_eq!(
+        background_session_tag(
+            Some("delegate"),
+            Some(id),
+            "child session: whatever\nanswer"
+        )
+        .as_deref(),
+        Some(expected.as_str())
+    );
+    // Old persisted row: no field, so the first-line fallback still applies.
+    assert_eq!(
+        background_session_tag(
+            Some("delegate"),
+            None,
+            "subagent session: sub-legacy\nanswer"
+        )
+        .as_deref(),
+        Some(" [session: sub-legacy]")
+    );
+    assert_eq!(
+        background_session_tag(
+            Some("delegate"),
+            None,
+            "fork session: sub-legacy-fork\nanswer"
+        )
+        .as_deref(),
+        Some(" [session: sub-legacy-fork]")
+    );
+    // bash completions stay byte-identical (no tag, no parsing).
+    assert_eq!(
+        background_session_tag(Some("bash"), None, "exit code: 0\nok"),
+        None
+    );
 }
 
 #[test]
@@ -544,6 +662,8 @@ fn repair_tool_pairs_drops_orphan_results_after_a_synthetic_answer() {
             content: "[turn interrupted before a tool result was produced]".into(),
             is_error: true,
             synthetic: true,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         },
         Message::Tool {
@@ -552,6 +672,8 @@ fn repair_tool_pairs_drops_orphan_results_after_a_synthetic_answer() {
             content: "real result".into(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         },
     ];
@@ -625,6 +747,8 @@ fn repair_tool_pairs_keeps_real_result_matching_placeholder_text() {
             content: "[turn interrupted before a tool result was produced]".into(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         },
     ];
@@ -682,6 +806,8 @@ fn repair_tool_pairs_keeps_image_bearing_tool_results() {
             content: "[image read: a.png] (hash deadbeef, image/png, 4 bytes)".into(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![image.clone()],
         },
         Message::User {
@@ -844,6 +970,8 @@ fn restore_history_migrates_legacy_placeholders_end_to_end() {
             content: "real result".into(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         }
         .into(),
@@ -913,6 +1041,8 @@ fn context_pairs_real_result_across_a_compaction_snapshot() {
                     content: INTERRUPTED.into(),
                     is_error: true,
                     synthetic: true,
+                    started_task_id: None,
+                    subagent_session_id: None,
                     images: vec![],
                 },
             ],
@@ -925,6 +1055,8 @@ fn context_pairs_real_result_across_a_compaction_snapshot() {
             content: "real result".into(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         }
         .into(),
@@ -1025,6 +1157,8 @@ async fn main_pending_batch_boundary_keeps_late_result_after_repair() {
                 images: vec![],
                 is_error: false,
                 synthetic: false,
+                started_task_id: None,
+                subagent_session_id: None,
             }
             .into(),
         );
@@ -1528,6 +1662,8 @@ async fn emits_assistant_tool_and_result_events_in_order() {
                 content: "\"ok\"".into(),
                 images: vec![],
                 call_id: Some("call-1".into()),
+                started_task_id: None,
+                subagent_session_id: None,
             },
         ]
     );
@@ -1555,6 +1691,8 @@ async fn emits_deltas_without_duplicate_assistant_text() {
                 content: "\"ok\"".into(),
                 images: vec![],
                 call_id: Some("call-1".into()),
+                started_task_id: None,
+                subagent_session_id: None,
             },
         ]
     );
@@ -1722,6 +1860,8 @@ fn tool_loop(prefix: &str, n: usize) -> Vec<Message> {
                     content: format!("result {i}"),
                     is_error: false,
                     synthetic: false,
+                    started_task_id: None,
+                    subagent_session_id: None,
                     images: vec![],
                 },
             ]
@@ -1761,6 +1901,8 @@ async fn compacts_everything_before_the_bounded_tail() {
             content: "building".into(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         },
         Message::Tool {
@@ -1769,6 +1911,8 @@ async fn compacts_everything_before_the_bounded_tail() {
             content: "still building".into(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         },
         Message::Assistant(AssistantMessage {
@@ -1794,6 +1938,8 @@ async fn compacts_everything_before_the_bounded_tail() {
             content: "old result".into(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         },
         Message::User {
@@ -1942,6 +2088,8 @@ async fn context_repairs_unanswered_tool_calls_from_interrupted_turns() {
             content: "built".into(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         },
     ];
@@ -2200,6 +2348,7 @@ fn background_completion_entry_serde_old_and_new() {
         status: None,
         kind: None,
         cancellation_source: None,
+        subagent_session_id: None,
     };
     let json = serde_json::to_string(&entry).unwrap();
     assert!(
@@ -2220,6 +2369,7 @@ fn background_completion_entry_serde_old_and_new() {
         status: None,
         kind: None,
         cancellation_source: None,
+        subagent_session_id: None,
     };
     let json_none = serde_json::to_string(&entry_none).unwrap();
     assert!(
@@ -2276,6 +2426,7 @@ fn background_completion_trace_fields_serde_roundtrip() {
         status: Some("killed".into()),
         kind: Some("bash".into()),
         cancellation_source: Some(CancellationSource::User),
+        subagent_session_id: None,
     };
     let json = serde_json::to_value(&full).unwrap();
     let obj = json.as_object().unwrap();
@@ -2301,6 +2452,7 @@ fn background_completion_trace_fields_serde_roundtrip() {
         status: None,
         kind: None,
         cancellation_source: None,
+        subagent_session_id: None,
     };
     let json_min = serde_json::to_string(&minimal).unwrap();
     for field in [
@@ -2354,6 +2506,7 @@ fn context_formats_background_completion_with_label_variants() {
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         }]);
         let msgs = agent.context();
         assert_eq!(msgs.len(), 1);
@@ -2410,6 +2563,7 @@ fn context_tags_delegate_completion_notice_with_session_id() {
             status: None,
             kind: kind.map(str::to_string),
             cancellation_source: None,
+            subagent_session_id: None,
         }]);
         let msgs = agent.context();
         assert_eq!(msgs.len(), 1);
@@ -2457,6 +2611,7 @@ fn background_completion_and_notice_coexist_in_context() {
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         },
     ]);
     let msgs = agent.context();
@@ -2522,6 +2677,7 @@ fn context_is_full_and_lossless_for_background_completions() {
         status: None,
         kind: None,
         cancellation_source: None,
+        subagent_session_id: None,
     }]);
     let msgs = agent.context();
     assert_eq!(msgs.len(), 1);
@@ -2594,6 +2750,7 @@ fn context_request_passes_small_outputs_through_byte_identical() {
         status: None,
         kind: None,
         cancellation_source: None,
+        subagent_session_id: None,
     })
     .unwrap();
     location.entry_hash = crate::session_store::entry_payload_hash(&payload);
@@ -2609,6 +2766,7 @@ fn context_request_passes_small_outputs_through_byte_identical() {
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         }],
         vec![Some(location)],
     );
@@ -2652,6 +2810,7 @@ fn context_request_bounds_oversized_background_completion_with_receipt() {
         status: None,
         kind: None,
         cancellation_source: None,
+        subagent_session_id: None,
     })
     .unwrap();
     location.entry_hash = crate::session_store::entry_payload_hash(&payload);
@@ -2667,6 +2826,7 @@ fn context_request_bounds_oversized_background_completion_with_receipt() {
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         }],
         vec![Some(location.clone())],
     );
@@ -2723,6 +2883,8 @@ fn context_request_bounds_oversized_tool_content_with_receipt() {
             content: content.clone(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         },
     };
@@ -2911,6 +3073,8 @@ fn context_request_keeps_goal_tool_calls_and_reasoning_exact() {
             content: "ok".into(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         },
     };
@@ -3031,6 +3195,7 @@ async fn compaction_retained_stays_full_and_request_is_bounded() {
         status: None,
         kind: None,
         cancellation_source: None,
+        subagent_session_id: None,
     };
     loc.entry_hash =
         crate::session_store::entry_payload_hash(&serde_json::to_string(&completion).unwrap());
@@ -3056,6 +3221,8 @@ async fn compaction_retained_stays_full_and_request_is_bounded() {
             content: "first result".into(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         }
         .into(),
@@ -3077,6 +3244,8 @@ async fn compaction_retained_stays_full_and_request_is_bounded() {
             content: "current result".into(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         }
         .into(),
@@ -3220,6 +3389,7 @@ async fn main_compaction_provenance_ignores_background_completion() {
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         },
     ]);
     let history_len = history.len();
@@ -3518,6 +3688,8 @@ async fn context_request_retained_receipt_binds_the_full_retained_array() {
             content: huge.clone(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         },
     ];
@@ -3611,6 +3783,7 @@ fn fork_prefix_default_cuts_at_last_completed_turn_and_drops_tail() {
         status: None,
         kind: None,
         cancellation_source: None,
+        subagent_session_id: None,
     });
     entries.push(SessionEntry::ForkedFrom {
         source: "other".into(),
@@ -3851,6 +4024,8 @@ fn fork_prefix_complete_accepts_a_superseded_synthetic_placeholder() {
             images: vec![],
             is_error: true,
             synthetic: true,
+            started_task_id: None,
+            subagent_session_id: None,
         }
         .into(),
         Message::Tool {
@@ -3860,6 +4035,8 @@ fn fork_prefix_complete_accepts_a_superseded_synthetic_placeholder() {
             images: vec![],
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
         }
         .into(),
         Message::User {
@@ -4062,6 +4239,8 @@ fn tool_images_serde_round_trips_and_old_sessions_load_without_images() {
         }],
         is_error: false,
         synthetic: false,
+        started_task_id: None,
+        subagent_session_id: None,
     };
     let json = serde_json::to_string(&message).unwrap();
     let back: Message = serde_json::from_str(&json).unwrap();
@@ -4082,6 +4261,8 @@ fn tool_images_serde_round_trips_and_old_sessions_load_without_images() {
             images: vec![],
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
         }
     );
     // And serialize back without the images key when empty.
@@ -4101,6 +4282,8 @@ fn tool_marker_like_text_is_plain_content_no_parsing() {
         images: vec![],
         is_error: false,
         synthetic: false,
+        started_task_id: None,
+        subagent_session_id: None,
     };
     let json = serde_json::to_string(&message).unwrap();
     let back: Message = serde_json::from_str(&json).unwrap();
@@ -4141,6 +4324,8 @@ impl Tool for ImageTool {
                 mime: "image/png".into(),
             }],
             background_started: false,
+            started_task_id: None,
+            subagent_session_id: None,
         })
     }
 }
@@ -4905,6 +5090,8 @@ async fn compaction_clamp_is_not_shifted_by_a_dropped_own_tool_result() {
             content: "orphan".into(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         }
         .into(),
@@ -5807,6 +5994,8 @@ async fn single_user_session_compacts_tool_history() {
                 content: format!("result {i}"),
                 is_error: false,
                 synthetic: false,
+                started_task_id: None,
+                subagent_session_id: None,
                 images: vec![],
             }
             .into(),
@@ -5894,6 +6083,8 @@ async fn single_user_retained_tail_adjusts_onto_an_assistant_boundary() {
                 content: format!("result {i}"),
                 is_error: false,
                 synthetic: false,
+                started_task_id: None,
+                subagent_session_id: None,
                 images: vec![],
             }
             .into(),
@@ -6274,6 +6465,8 @@ async fn single_task_compacts_twice_consecutively() {
                 content: format!("result {i}"),
                 is_error: false,
                 synthetic: false,
+                started_task_id: None,
+                subagent_session_id: None,
                 images: vec![],
             }
             .into(),
@@ -6319,6 +6512,8 @@ async fn single_task_compacts_twice_consecutively() {
                 content: format!("result {i}"),
                 is_error: false,
                 synthetic: false,
+                started_task_id: None,
+                subagent_session_id: None,
                 images: vec![],
             }
             .into(),
@@ -6393,6 +6588,8 @@ fn single_task_retained_background_completion_is_not_the_current_prompt() {
             content: "result".into(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         },
         // A background completion projected as a user message INSIDE the
@@ -6572,6 +6769,8 @@ async fn image_rejection_omissions_are_request_only_and_cleared_by_set_model() {
             }],
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
         }
         .into(),
     ]);
@@ -6726,6 +6925,8 @@ fn strip_images_clears_user_and_tool_images_with_text_degradation() {
             content: "[image read: a.png]".into(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![ImagePart {
                 hash: "beef".into(),
                 mime: "image/png".into(),
@@ -6758,6 +6959,8 @@ fn strip_images_clears_user_and_tool_images_with_text_degradation() {
                 content: "[image read: a.png]（当前模型不支持图片，已跳过附加）".into(),
                 is_error: false,
                 synthetic: false,
+                started_task_id: None,
+                subagent_session_id: None,
                 images: vec![],
             },
             Message::User {
@@ -7731,6 +7934,8 @@ fn latest_read_output_result_stays_full_in_request_context() {
                     images: vec![],
                     is_error: false,
                     synthetic: false,
+                    started_task_id: None,
+                    subagent_session_id: None,
                 },
             },
         ],

@@ -57,6 +57,12 @@ pub(crate) struct RequestHead {
     /// explicit clear tombstone from "never set".
     pub goal: Option<GoalSnapshot>,
     pub goal_cleared: bool,
+    /// Image hashes the parent's provider already rejected in this live
+    /// session (the fork takes this from the live parent, not from the
+    /// build-time snapshot). A fork installs them on its agent before its
+    /// first request, so it skips the same attachments under the same
+    /// omission notice instead of re-sending them.
+    pub omitted_images: Vec<String>,
 }
 
 /// What to do with background-task records left behind by a previous run
@@ -626,9 +632,11 @@ impl SessionFactory {
     /// when there is no config or the profile is unknown — the caller turns
     /// that into a 400. A chatgpt-routed profile loads the login credentials
     /// lazily on first use ([`AuthSource::Lazy`]), so a login that happened
-    /// after start works without a restart. The context window accompanies
-    /// the concrete model so a runtime switch updates both runner
-    /// observations together.
+    /// after start works without a restart. The concrete model and its
+    /// context window are BOTH handed to the runner, which snapshots them as
+    /// the switch's live identity: a later `fork` inherits that resolution
+    /// instead of re-resolving it here against a config that may have
+    /// hot-reloaded (or lost the profile) since.
     pub fn resolve_profile(
         &self,
         profile: &str,
@@ -641,22 +649,6 @@ impl SessionFactory {
             profile,
             effort,
         )
-    }
-
-    /// Resolve a model profile by name at FORK time — the `fork` delegate's
-    /// child runs on the parent's current model, so a parent `/model <profile>`
-    /// switch (which only updates the live agent) must not leave the child on
-    /// the build-time model. `None` when the profile cannot be resolved (no
-    /// config, unknown profile); the fork then fails closed instead of
-    /// silently using the stale model. The effort level is the profile's own
-    /// configured default: the live identity carries the profile name only.
-    pub fn fork_model_resolver(&self) -> crate::delegate::ForkModelSource {
-        let reloadable = self.reloadable.clone();
-        let base_url = self.base_url.clone();
-        let model = self.model.clone();
-        Arc::new(move |profile: &str| {
-            resolve_profile_from(&reloadable, base_url.clone(), model.clone(), profile, None).ok()
-        })
     }
 
     /// Every switchable model profile name (`[models]` keys + `[roles]`
@@ -1144,10 +1136,6 @@ impl SessionFactory {
                 .expect("main request head initialized")
                 .clone()
         }));
-        // A forked child runs on the parent's CURRENT model: after a runtime
-        // `/model` switch the request head above is stale, so the fork asks
-        // the runner for its live identity and re-resolves that profile here.
-        delegate = delegate.with_fork_model_source(self.fork_model_resolver());
         let subagent_sessions = delegate.sessions();
         tools.push(Box::new(crate::delegate::SendMessage::parent(
             subagent_sessions.clone(),
@@ -1217,6 +1205,9 @@ impl SessionFactory {
             mcp_servers: mcp_servers_for_fork.clone(),
             goal: head_goal,
             goal_cleared: head_goal_cleared,
+            // A main session starts with no rejected images; the fork path
+            // overwrites this from the parent's live state.
+            omitted_images: Vec::new(),
         };
         *head_cell.lock().unwrap() = Some(head_value);
         let recovery_labels = if matches!(unfinished, UnfinishedPolicy::Consume) {

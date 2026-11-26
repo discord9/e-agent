@@ -576,6 +576,71 @@ async fn capturing_model() -> (String, Arc<Mutex<Vec<u8>>>) {
     (format!("http://{address}"), captured)
 }
 
+/// Like `capturing_model`, but the provider holds its response until the test
+/// releases it: the child stays live (registered, mid-turn) so the test can
+/// inspect the session it actually runs before its turn finishes.
+async fn gated_capturing_model() -> (String, Arc<Mutex<Vec<u8>>>, Arc<Notify>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let captured_clone = captured.clone();
+    let release = Arc::new(Notify::new());
+    let release_clone = release.clone();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let header_end = loop {
+            let mut chunk = [0; 1024];
+            let count = stream.read(&mut chunk).await.unwrap();
+            request.extend_from_slice(&chunk[..count]);
+            if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                break end + 4;
+            }
+        };
+        let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap();
+        let received_body = request.len() - header_end;
+        let mut rest = vec![0; content_length - received_body];
+        stream.read_exact(&mut rest).await.unwrap();
+        request.extend_from_slice(&rest);
+        *captured_clone.lock().unwrap() = request;
+        // A permit stored by an earlier `notify_one` is not lost.
+        release_clone.notified().await;
+
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+            .to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+    });
+    (format!("http://{address}"), captured, release)
+}
+
+/// Wait until the fork registers its live child session (the spawn inserts it
+/// before the child runner starts) and return that entry.
+async fn wait_for_child_session(sessions: &Sessions) -> Arc<SessionEntry> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some((_, entry)) = sessions.list().into_iter().next() {
+            return entry;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the fork never registered a live child session"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 /// A provider that accepts connections but never answers: the subagent's
 /// first model call blocks forever, so an abort deterministically lands on
 /// a live child runner.
@@ -937,10 +1002,14 @@ async fn resume_requires_persistence_and_an_existing_session() {
     let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
     tool.set_event_sender(sender);
     assert!(
-        tool.execute(json!({"task": "hi", "resume": "sub-does-not-exist"}))
-            .await
-            .unwrap_err()
-            .contains("no such subagent session")
+        tool.execute(json!({
+            "task": "hi",
+            "resume": "sub-does-not-exist",
+            "workspace": temp.path().to_str().unwrap()
+        }))
+        .await
+        .unwrap_err()
+        .contains("no such subagent session")
     );
 }
 
@@ -1683,7 +1752,7 @@ async fn shared_background_registry_completion_reaches_its_configured_channel() 
     let (parent_sender, mut parent_receiver) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
     parent_background.set_event_sender(parent_sender);
 
-    let started = parent_background
+    let (_id, started) = parent_background
         .start(workspace, "echo shared".into(), false)
         .unwrap();
     assert!(started.starts_with("started background task"));
@@ -3356,7 +3425,11 @@ async fn delegate_failed_resume_load_releases_local_permit() {
     let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
     delegate.set_event_sender(sender);
     let error = delegate
-        .execute(json!({"task": "resume", "resume": "missing"}))
+        .execute(json!({
+            "task": "resume",
+            "resume": "missing",
+            "workspace": temp.path().to_str().unwrap()
+        }))
         .await
         .unwrap_err();
     assert!(error.contains("no such subagent session"), "{error}");
@@ -3742,6 +3815,7 @@ fn fork_child_delegate_spec_matches_parent() {
             mcp_servers: std::collections::HashMap::new(),
             goal: None,
             goal_cleared: false,
+            omitted_images: Vec::new(),
         }));
     let child = parent.fork_child_delegate();
     assert_eq!(parent.spec(), child.spec());
@@ -3772,6 +3846,16 @@ fn seed_fork_parent(root: &std::path::Path, session: &str) {
         },
     ];
     Session::append(root, session, &entries).unwrap();
+}
+
+/// A vision-capable chat model, i.e. one that does not strip image parts
+/// from the request copy before the rejection-omission logic runs.
+fn vision_chat_model(base_url: String, wire: &str) -> ConfiguredModel {
+    ConfiguredModel::chat(
+        crate::model::OpenAiModel::new(base_url, "test-key".into(), wire.to_string(), None)
+            .unwrap()
+            .with_vision(true),
+    )
 }
 
 fn chat_model(base_url: String, wire: &str) -> ConfiguredModel {
@@ -3816,6 +3900,7 @@ fn forking_delegate(
             mcp_servers: std::collections::HashMap::new(),
             goal: None,
             goal_cleared: false,
+            omitted_images: Vec::new(),
         }))
 }
 
@@ -4309,16 +4394,14 @@ async fn fork_runs_on_the_parents_live_model_after_a_switch() {
     let head = chat_model("http://127.0.0.1:1".into(), "stale-model");
     let (live_url, captured) = capturing_model().await;
     let live_model = chat_model(live_url, "test-model-2");
-    let resolved = live_model.clone();
-    let mut delegate = forking_delegate(&root, &fork_record(&root, "parent"), head)
-        .with_fork_model_source(Arc::new(move |profile: &str| {
-            (profile == "live-profile").then(|| (resolved.clone(), Some(64_000)))
-        }));
+    let mut delegate = forking_delegate(&root, &fork_record(&root, "parent"), head);
     let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
     delegate.set_event_sender(sender);
     let (handle, parent_task) = parent_endpoint(&root, "parent");
     delegate.set_session_handle("parent", handle.clone());
-    handle.switch_model("live-profile", Box::new(live_model), Some(64_000));
+    // The switch snapshots the RESOLVED model it installs: that clone (plus
+    // the installed window) is all a fork inherits.
+    handle.switch_model(Box::new(live_model.clone()), Some(64_000), Some(live_model));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while handle.downgrade().live_model().is_none() {
         assert!(
@@ -4371,8 +4454,8 @@ async fn fork_fails_closed_when_the_live_model_cannot_be_represented() {
     let (handle, parent_task) = parent_endpoint(&root, "parent");
     delegate.set_session_handle("parent", handle.clone());
     handle.switch_model(
-        "unresolvable-profile",
         Box::new(chat_model("http://127.0.0.1:1".into(), "other-model")),
+        None,
         None,
     );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -4398,6 +4481,534 @@ async fn fork_fails_closed_when_the_live_model_cannot_be_represented() {
     drop(parent_task);
 }
 
+/// Wait until the parent runner has installed a live routing identity (the
+/// switch is a command, applied by the runner loop).
+async fn wait_for_live_model(handle: &SessionHandle) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while handle.downgrade().live_model().is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the parent runner never installed the live model"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// A factory whose `p/m` profile points at `base_url` and declares
+/// `reasoning_effort = "low"`, plus any extra profiles in `extra`.
+fn effort_factory(
+    root: &std::path::Path,
+    base_url: &str,
+    extra: &str,
+) -> crate::session_factory::SessionFactory {
+    let config = format!(
+        r#"
+[providers.p]
+base_url = "{base_url}"
+api_key_env = "PATH"
+
+[models."p/m"]
+model = "wire-m"
+reasoning_effort = "low"
+{extra}
+"#
+    );
+    crate::session_factory::SessionFactory::test_factory_with_config(
+        root.to_path_buf(),
+        Some(toml::from_str(&config).unwrap()),
+    )
+}
+
+#[tokio::test]
+async fn fork_inherits_the_same_profile_with_the_parents_effort_override() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    seed_fork_parent(&root, "parent");
+    let (live_url, captured) = capturing_model().await;
+    let factory = effort_factory(&root, &live_url, "");
+    // The head is the BUILD-TIME object: `p/m` without the override.
+    let (head_model, head_window) = factory.resolve_profile("p/m", None).unwrap();
+    assert!(head_window.is_none());
+    let mut delegate = forking_delegate(&root, &fork_record(&root, "parent"), head_model);
+    let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
+    delegate.set_event_sender(sender);
+    let (handle, parent_task) = parent_endpoint(&root, "parent");
+    delegate.set_session_handle("parent", handle.clone());
+    // SAME profile, explicit effort: the parent's effective model is now
+    // `p/m` at effort `high`, while the live profile NAME is unchanged. The
+    // resolved model itself carries the effort, so the switch snapshots it.
+    let effort = crate::session_factory::EffortOverride::Literal("high".into());
+    let (live, window) = factory.resolve_profile("p/m", Some(effort)).unwrap();
+    handle.switch_model(Box::new(live.clone()), window, Some(live));
+    wait_for_live_model(&handle).await;
+
+    delegate
+        .execute(json!({
+            "task": "same profile, new effort",
+            "fork": true,
+            "workspace": root.display().to_string()
+        }))
+        .await
+        .expect("the fork spawns");
+    let (status, _) = await_background_status(&mut completions).await;
+    assert_eq!(status.as_deref(), Some("completed"));
+    let body = captured_request_body(&captured);
+    assert_eq!(
+        body["model"], "wire-m",
+        "the fork runs on the parent's profile, got: {body}"
+    );
+    assert_eq!(
+        body["reasoning_effort"], "high",
+        "a same-profile switch is stale in the head: the fork must run the \
+         parent's snapshot of its explicit effort override, got: {body}"
+    );
+    drop(parent_task);
+}
+
+#[tokio::test]
+async fn fork_inherits_a_different_profile_with_the_effort_override() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    seed_fork_parent(&root, "parent");
+    let (live_url, captured) = capturing_model().await;
+    let factory = effort_factory(
+        &root,
+        &live_url,
+        r#"
+[models."p/other"]
+model = "wire-other"
+reasoning_effort = "low"
+"#,
+    );
+    let (head_model, _) = factory.resolve_profile("p/m", None).unwrap();
+    let mut delegate = forking_delegate(&root, &fork_record(&root, "parent"), head_model);
+    let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
+    delegate.set_event_sender(sender);
+    let (handle, parent_task) = parent_endpoint(&root, "parent");
+    delegate.set_session_handle("parent", handle.clone());
+    // A DIFFERENT profile plus an explicit effort: neither the head's model
+    // nor the profile's own default effort is the parent's effective model.
+    let effort = crate::session_factory::EffortOverride::Literal("max".into());
+    let (live, window) = factory.resolve_profile("p/other", Some(effort)).unwrap();
+    handle.switch_model(Box::new(live.clone()), window, Some(live));
+    wait_for_live_model(&handle).await;
+
+    delegate
+        .execute(json!({
+            "task": "different profile, new effort",
+            "fork": true,
+            "workspace": root.display().to_string()
+        }))
+        .await
+        .expect("the fork spawns");
+    let (status, _) = await_background_status(&mut completions).await;
+    assert_eq!(status.as_deref(), Some("completed"));
+    let body = captured_request_body(&captured);
+    assert_eq!(
+        body["model"], "wire-other",
+        "the fork runs on the parent's switched profile, got: {body}"
+    );
+    assert_eq!(
+        body["reasoning_effort"], "max",
+        "the fork must inherit the parent's explicit effort override, not the \
+         profile default, got: {body}"
+    );
+    drop(parent_task);
+}
+
+/// Write the reloadable global config a `reload_config()` reads, in an
+/// isolated `$XDG_CONFIG_HOME`.
+fn write_global_config(xdg: &std::path::Path, contents: &str) {
+    let dir = xdg.join("e-agent");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("config.toml"), contents).unwrap();
+}
+
+/// A config whose `p/m` profile points at `url` as `wire` with `window`.
+fn reloadable_profile_config(url: &str, wire: &str, window: u64) -> String {
+    format!(
+        r#"default = "p/m"
+
+[providers.p]
+base_url = "{url}"
+api_key_env = "PATH"
+
+[models."p/m"]
+model = "{wire}"
+context_window = {window}
+"#
+    )
+}
+
+#[tokio::test]
+// Test-only env isolation: the std Mutex guard is held across .execute()
+// awaits to serialize XDG_CONFIG_HOME mutation with roles.rs tests.
+#[allow(clippy::await_holding_lock)]
+async fn fork_keeps_the_parents_switched_model_across_a_changed_definition() {
+    let _guard = crate::roles::XDG_TEST_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    let xdg = temp.path().join("xdg");
+    unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
+    seed_fork_parent(&root, "parent");
+
+    let (url, captured, release) = gated_capturing_model().await;
+    write_global_config(&xdg, &reloadable_profile_config(&url, "wire-one", 48_000));
+    let factory = crate::session_factory::SessionFactory::test_factory(root.clone());
+    assert!(matches!(
+        factory.reload_config(),
+        crate::session_factory::ReloadResult::Reloaded
+    ));
+    // The parent switches to `p/m` AS RESOLVED NOW: wire-one at 48k.
+    let (live, window) = factory.resolve_profile("p/m", None).unwrap();
+    assert_eq!(window, Some(48_000));
+    let head = chat_model("http://127.0.0.1:1".into(), "stale-model");
+    let mut delegate = forking_delegate(&root, &fork_record(&root, "parent"), head);
+    let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
+    delegate.set_event_sender(sender);
+    let (handle, parent_task) = parent_endpoint(&root, "parent");
+    delegate.set_session_handle("parent", handle.clone());
+    handle.switch_model(Box::new(live.clone()), window, Some(live));
+    wait_for_live_model(&handle).await;
+
+    // The SAME profile is redefined and reloaded. The parent keeps its
+    // already-installed model object; only the factory's state changed, so a
+    // fork that re-resolved would move to wire-two/111k.
+    write_global_config(&xdg, &reloadable_profile_config(&url, "wire-two", 111_000));
+    assert!(matches!(
+        factory.reload_config(),
+        crate::session_factory::ReloadResult::Reloaded
+    ));
+    let (reresolved, rewindow) = factory.resolve_profile("p/m", None).unwrap();
+    assert_eq!(reresolved.name(), "wire-two");
+    assert_eq!(rewindow, Some(111_000));
+
+    delegate
+        .execute(json!({
+            "task": "after the reload",
+            "fork": true,
+            "workspace": root.display().to_string()
+        }))
+        .await
+        .expect("the fork spawns on the parent's snapshot");
+    // The child is still live on the held provider connection, so the
+    // session it actually runs is observable before its turn stops.
+    let child = wait_for_child_session(&delegate.sessions()).await;
+    assert_eq!(
+        child.context_window,
+        Some(48_000),
+        "the child inherits the window the parent installed, never the re-resolved one"
+    );
+    release.notify_one();
+    let (status, output) = await_background_status(&mut completions).await;
+    assert_eq!(status.as_deref(), Some("completed"));
+    assert!(output.contains("done"), "child answered, got: {output}");
+    let body = captured_request_body(&captured);
+    assert_eq!(
+        body["model"], "wire-one",
+        "the child runs the wire model the parent installed, got: {body}"
+    );
+    assert_ne!(
+        body["model"], "wire-two",
+        "a reloaded definition must not reroute the child, got: {body}"
+    );
+    drop(parent_task);
+    unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+}
+
+#[tokio::test]
+// Test-only env isolation: the std Mutex guard is held across .execute()
+// awaits to serialize XDG_CONFIG_HOME mutation with roles.rs tests.
+#[allow(clippy::await_holding_lock)]
+async fn fork_keeps_the_parents_switched_model_across_a_reload_that_loses_it() {
+    let _guard = crate::roles::XDG_TEST_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    let xdg = temp.path().join("xdg");
+    unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
+    seed_fork_parent(&root, "parent");
+
+    let (url, captured, release) = gated_capturing_model().await;
+    write_global_config(&xdg, &reloadable_profile_config(&url, "wire-one", 48_000));
+    let factory = crate::session_factory::SessionFactory::test_factory(root.clone());
+    assert!(matches!(
+        factory.reload_config(),
+        crate::session_factory::ReloadResult::Reloaded
+    ));
+    let (live, window) = factory.resolve_profile("p/m", None).unwrap();
+    let head = chat_model("http://127.0.0.1:1".into(), "stale-model");
+    let mut delegate = forking_delegate(&root, &fork_record(&root, "parent"), head);
+    let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
+    delegate.set_event_sender(sender);
+    let (handle, parent_task) = parent_endpoint(&root, "parent");
+    delegate.set_session_handle("parent", handle.clone());
+    handle.switch_model(Box::new(live.clone()), window, Some(live));
+    wait_for_live_model(&handle).await;
+
+    // The reloaded config no longer defines `p/m` at all: re-resolution now
+    // errors, while the parent's in-memory model is still perfectly usable.
+    // A fork must not lose access because of that.
+    write_global_config(
+        &xdg,
+        &format!(
+            r#"default = "p/other"
+
+[providers.p]
+base_url = "{url}"
+api_key_env = "PATH"
+
+[models."p/other"]
+model = "wire-other"
+context_window = 111000
+"#
+        ),
+    );
+    assert!(matches!(
+        factory.reload_config(),
+        crate::session_factory::ReloadResult::Reloaded
+    ));
+    assert!(
+        factory.resolve_profile("p/m", None).is_err(),
+        "the reload lost `p/m`, so a re-resolution here must fail"
+    );
+
+    delegate
+        .execute(json!({
+            "task": "after the reload that lost the profile",
+            "fork": true,
+            "workspace": root.display().to_string()
+        }))
+        .await
+        .expect("the fork still spawns: it inherits the parent's snapshot");
+    let child = wait_for_child_session(&delegate.sessions()).await;
+    assert_eq!(
+        child.context_window,
+        Some(48_000),
+        "the child inherits the installed window, not a re-resolution"
+    );
+    release.notify_one();
+    let (status, output) = await_background_status(&mut completions).await;
+    assert_eq!(status.as_deref(), Some("completed"));
+    assert!(output.contains("done"), "child answered, got: {output}");
+    let body = captured_request_body(&captured);
+    assert_eq!(
+        body["model"], "wire-one",
+        "the fork keeps the parent's installed model even though the profile is gone, \
+         got: {body}"
+    );
+    drop(parent_task);
+    unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+}
+
+/// Keeps the parent session's background channel open so a `WaitForInput`
+/// runner survives the idle select between turns.
+struct HoldOpen {
+    sender: Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
+}
+
+#[async_trait]
+impl Tool for HoldOpen {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "hold_open".into(),
+            description: "test only".into(),
+            parameters: json!({"type": "object"}),
+        }
+    }
+    async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
+        Ok(ToolOutput::text(String::new()))
+    }
+    fn set_event_sender(&mut self, sender: tokio::sync::mpsc::UnboundedSender<AgentEvent>) {
+        self.sender = Some(sender);
+    }
+}
+
+/// Vision model that rejects its first request with the typed provider image
+/// rejection (blaming the hashes it was built with), then answers.
+struct ImageRejectingParentModel {
+    hashes: Vec<String>,
+    rejected: bool,
+    reply: &'static str,
+}
+
+#[async_trait]
+impl Model for ImageRejectingParentModel {
+    fn supports_vision(&self) -> bool {
+        true
+    }
+    async fn complete(
+        &mut self,
+        _: &[Message],
+        _: &[ToolSpec],
+        _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        if !self.rejected {
+            self.rejected = true;
+            return Err(anyhow::Error::new(crate::model::ImageRejection {
+                status: reqwest::StatusCode::BAD_REQUEST,
+                diagnostic: "invalid image input: unsupported image format".into(),
+                hashes: self.hashes.clone(),
+            }));
+        }
+        Ok((
+            AssistantMessage {
+                content: Some(self.reply.into()),
+                tool_calls: vec![],
+                reasoning: None,
+            },
+            None,
+        ))
+    }
+}
+
+#[tokio::test]
+async fn fork_inherits_the_parents_live_image_omissions() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    // A completed parent turn that carries an image the provider rejects.
+    seed_parent_entries(
+        &root,
+        "parent",
+        &[
+            crate::agent::SessionEntry::Message {
+                message: Message::User {
+                    content: "look at this".into(),
+                    images: vec![crate::agent::ImagePart {
+                        hash: "seeded-image-hash".into(),
+                        mime: "image/png".into(),
+                    }],
+                },
+            },
+            parent_answer(),
+        ],
+    );
+    // The parent session lives: its provider rejects the image, so the live
+    // session records the hash as omitted from every later request copy.
+    let agent = Agent::new(
+        Box::new(ImageRejectingParentModel {
+            hashes: vec!["seeded-image-hash".into()],
+            rejected: false,
+            reply: "parent answered",
+        }),
+        vec![Box::new(HoldOpen { sender: None })],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        root.clone(),
+        "parent".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let (_, mut live, _) = handle.attach();
+    let parent_task = runner.start(None);
+    handle.prompt("second question");
+    loop {
+        match live.recv().await.unwrap() {
+            AgentEvent::AssistantText(text) if text == "parent answered" => break,
+            AgentEvent::AssistantText(other) => panic!("unexpected answer {other}"),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        handle.downgrade().omitted_images(),
+        vec!["seeded-image-hash".to_string()],
+        "the parent's live rejection must be visible to fork admission"
+    );
+
+    let (child_url, captured) = capturing_model().await;
+    // The parent's provider rejected an IMAGE, so the parent runs on a vision
+    // model; the fork inherits that. (A non-vision child would strip images
+    // before the omission logic and carry its own notice instead.)
+    let head = vision_chat_model(child_url.clone(), "child-model");
+    let mut delegate = forking_delegate(&root, &fork_record(&root, "parent"), head);
+    let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
+    delegate.set_event_sender(sender);
+    delegate.set_session_handle("parent", handle.clone());
+    delegate
+        .execute(json!({
+            "task": "continue after the rejection",
+            "fork": true,
+            "workspace": root.display().to_string()
+        }))
+        .await
+        .expect("the fork spawns");
+    let (status, _) = await_background_status(&mut completions).await;
+    assert_eq!(status.as_deref(), Some("completed"));
+    let body = captured_request_body(&captured);
+    let body = body.to_string();
+    assert!(
+        !body.contains("seeded-image-hash"),
+        "the fork must not re-send an attachment the parent's provider already \
+         rejected, got: {body}"
+    );
+    assert!(
+        body.contains("[image request recovery]"),
+        "the omission must carry the same notice the parent's request has, got: {body}"
+    );
+    drop(parent_task);
+}
+
+#[tokio::test]
+async fn fork_schema_and_admission_allow_only_a_fork_to_omit_workspace() {
+    let temp = tempfile::tempdir().unwrap();
+    // A delegate that cannot fork keeps `workspace` unconditionally required.
+    let plain = delegate(temp.path()).spec();
+    assert_eq!(plain.parameters["required"], json!(["workspace", "task"]));
+    let forking = delegate(temp.path()).with_fork_head(Arc::new(|| {
+        fork_head(
+            chat_model("http://127.0.0.1:1".into(), "head-model"),
+            None,
+            None,
+            false,
+        )
+    }));
+    let spec = forking.spec();
+    assert_eq!(
+        spec.parameters["required"],
+        json!(["task"]),
+        "a fork defaults its workspace to the parent's root, so the schema must \
+         not require it: {}",
+        spec.parameters
+    );
+    let workspace = spec.parameters["properties"]["workspace"]["description"]
+        .as_str()
+        .unwrap();
+    assert!(
+        workspace.contains("REQUIRED for a non-fork delegate and for `resume`"),
+        "the requirement stays documented for non-fork/resume calls, got: {workspace}"
+    );
+    // The leading description must not promise that a `fork` also emits it.
+    assert!(
+        spec.description
+            .starts_with("For a non-`fork` delegate the first argument MUST be workspace"),
+        "the first sentence qualifies the fork exception, got: {}",
+        spec.description
+    );
+    // A forked child's own `delegate` stays byte-identical to its parent's
+    // (identical provider prefix) even though that tool is inert there.
+    assert_eq!(forking.fork_child_delegate().spec(), forking.spec());
+
+    // Schema and admission AGREE: only `fork` may omit `workspace`. A
+    // `resume` without one is a plain model-facing error naming the session
+    // id it tried to resume — never a silent reroot to the caller's root.
+    let mut resuming = forking.persist_sessions(temp.path().join("sessions"));
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+    resuming.set_event_sender(sender);
+    let error = resuming
+        .execute(json!({"task": "continue it", "resume": "sub-omitted-ws"}))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        "`resume` requires a workspace parameter for session `sub-omitted-ws`: pass the \
+         working directory it ran in (absolute, or relative to this workspace's root)"
+    );
+    assert!(
+        resuming.sessions().list().is_empty() && resuming.background.running().is_empty(),
+        "a rejected resume allocates nothing"
+    );
+}
+
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 // fork boundary + workspace + frozen goal/MCP head
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -4421,6 +5032,7 @@ fn fork_head(
         mcp_servers: std::collections::HashMap::new(),
         goal,
         goal_cleared,
+        omitted_images: Vec::new(),
     }
 }
 

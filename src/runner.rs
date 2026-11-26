@@ -222,6 +222,12 @@ fn recover_image_rejection(
         let mut shared = shared.lock().unwrap();
         shared.emit_presentation(AgentEvent::Error(rejection.to_string()));
         shared.emit_presentation(AgentEvent::Display(IMAGE_RETRY_NOTICE.into()));
+        // Mirror the agent's sticky omission set so a `fork` child inherits
+        // it: the child's first request must skip exactly the attachments the
+        // parent already knows its provider rejects.
+        shared
+            .omitted_images
+            .extend(rejection.hashes.iter().cloned());
     }
     agent.omit_images(rejection.hashes.iter().cloned());
 }
@@ -291,6 +297,23 @@ where
     }
 }
 
+/// A session's live routing identity, installed by a runtime `/model` switch:
+/// the model the switch actually installed (already resolved against the
+/// config at that instant) plus its context window, so a `fork` reproduces the
+/// parent's EFFECTIVE model by CLONING it rather than re-resolving it — a
+/// config reload after the switch must not reroute the child.
+#[derive(Clone)]
+pub struct LiveModel {
+    /// The resolved model the switch installed, carried whole (wire model,
+    /// endpoint, effort, thinking switches). `None` when the caller installed
+    /// a model programmatically, i.e. there is no config snapshot to inherit:
+    /// such a session has no forkable model and a `fork` fails closed.
+    pub model: Option<crate::model::ConfiguredModel>,
+    /// The context window the switch installed (`None` when the profile
+    /// declares none, or a `--model` override replaced the wire model).
+    pub context_window: Option<u64>,
+}
+
 /// Steering commands accepted by a session's command channel. Not
 /// `Clone`/`Debug`/`PartialEq`/`Eq` because `SwitchModel` carries a
 /// `Box<dyn Model>`; tests compare via `matches!` instead.
@@ -304,13 +327,17 @@ pub enum SessionCommand {
     Cancel,
     Compact,
     /// Runtime model switch (web/TUI `/model <profile>`): the caller
-    /// resolves the profile to a concrete model and its context window;
-    /// the runner installs both on the agent together and remembers the
-    /// profile as the session's live routing identity.
+    /// resolves the profile (with its effort override) to a concrete model
+    /// and its context window; the runner installs both on the agent together
+    /// and snapshots the SAME window plus a clone of the resolved model
+    /// (`fork_snapshot`) as the session's live routing identity.
     SwitchModel {
-        profile: String,
         model: Box<dyn Model>,
         context_window: Option<u64>,
+        /// The resolved model the switch was built from, cloned so a `fork`
+        /// inherits it (never re-resolved against a reloaded config). `None`
+        /// for a programmatically installed model.
+        fork_snapshot: Option<crate::model::ConfiguredModel>,
     },
     /// Human-issued goal mutation (`/goal` commands, web API). The model
     /// never creates goals; its `update_goal` tool is intercepted by the
@@ -440,11 +467,15 @@ struct Shared {
     /// Latest goal snapshot, mirrored from the runner for UI reads
     /// (REPL `/goal`, TUI GoalBar, web `GET /api/sessions/{id}/goal`).
     goal: Option<crate::agent::GoalSnapshot>,
-    /// The session's live routing identity — `(profile key, context window)`
-    /// installed by a runtime `/model` switch — or `None` while the startup
-    /// model still applies. Fork admission reads it so a forked child never
-    /// inherits the model captured when the parent was built.
-    live_model: Option<(String, Option<u64>)>,
+    /// The session's live routing identity installed by a runtime `/model`
+    /// switch — or `None` while the startup model still applies. Fork
+    /// admission reads it so a forked child never inherits the model captured
+    /// when the parent was built.
+    live_model: Option<LiveModel>,
+    /// Image hashes a live provider rejection made sticky for this session's
+    /// request copies (the `Agent`'s own omission set, mirrored here so a
+    /// `fork` child can inherit it). Empty while nothing was rejected.
+    omitted_images: HashSet<String>,
     /// Goal-admission state only: ids of this session's own live
     /// `delegate`/btw children whose completion is not durably committed yet.
     /// Registered at spawn (before the wrapper's work runs) and released only
@@ -611,13 +642,32 @@ impl WeakSessionHandle {
         true
     }
 
-    /// The session's live model identity — `(profile key, context window)`
-    /// installed by the last runtime `/model` switch — or `None` while the
-    /// startup model still applies. A `fork` delegate reads it so the child
-    /// runs and reports the parent's CURRENT model, never the one captured
-    /// when the parent was built.
-    pub fn live_model(&self) -> Option<(String, Option<u64>)> {
+    /// The session's live routing identity — the resolved model the last
+    /// runtime `/model` switch installed plus its context window — or `None`
+    /// while the startup model still applies. A `fork` delegate clones it so
+    /// the child runs the parent's CURRENT EFFECTIVE model, never the one
+    /// captured when the parent was built: its presence alone is the
+    /// "build-time head is stale" signal.
+    pub fn live_model(&self) -> Option<LiveModel> {
         self.shared.upgrade()?.lock().unwrap().live_model.clone()
+    }
+
+    /// The image hashes a live provider rejection made this session's request
+    /// copies skip (sorted, so the snapshot a fork takes is deterministic).
+    /// Losing the runner state yields an empty list.
+    pub fn omitted_images(&self) -> Vec<String> {
+        let Some(shared) = self.shared.upgrade() else {
+            return Vec::new();
+        };
+        let mut hashes: Vec<String> = shared
+            .lock()
+            .unwrap()
+            .omitted_images
+            .iter()
+            .cloned()
+            .collect();
+        hashes.sort_unstable();
+        hashes
     }
 
     /// Test-only: this session's registered Goal children, so spawn-path
@@ -854,18 +904,24 @@ impl SessionHandle {
         }
     }
     /// Switch the session's model and context window at runtime. The caller
-    /// resolves the profile (web/TUI `/model`); the runner installs both from
-    /// its next call on.
-    pub fn switch_model(&self, profile: &str, model: Box<dyn Model>, context_window: Option<u64>) {
+    /// resolves the profile (web/TUI `/model`) and passes the resolved model
+    /// again as `fork_snapshot`: the runner installs the model and snapshots
+    /// the clone with the SAME window as the identity a fork inherits.
+    pub fn switch_model(
+        &self,
+        model: Box<dyn Model>,
+        context_window: Option<u64>,
+        fork_snapshot: Option<crate::model::ConfiguredModel>,
+    ) {
         let mut shared = self.shared.lock().unwrap();
         if shared.commands_open
             && !self.commands.is_closed()
             && self
                 .commands
                 .send(SessionCommand::SwitchModel {
-                    profile: profile.to_owned(),
                     model,
                     context_window,
+                    fork_snapshot,
                 })
                 .is_err()
         {
@@ -1028,6 +1084,7 @@ pub(crate) fn session_test_channel() -> (
         pending_questions: std::collections::HashMap::new(),
         goal: None,
         live_model: None,
+        omitted_images: HashSet::new(),
         goal_children: std::collections::HashSet::new(),
     }));
     let (commands, receiver) = mpsc::unbounded_channel();
@@ -1447,6 +1504,7 @@ impl SessionRunner {
             pending_questions: std::collections::HashMap::new(),
             goal,
             live_model: None,
+            omitted_images: HashSet::new(),
             goal_children: std::collections::HashSet::new(),
         }));
         let handler_shared = shared.clone();
@@ -1609,6 +1667,7 @@ impl SessionRunner {
                 status,
                 kind,
                 cancellation_source,
+                subagent_session_id,
             } => Some(AgentEvent::BackgroundCompletionNotice {
                 id: *id,
                 output: output.clone(),
@@ -1620,6 +1679,7 @@ impl SessionRunner {
                 status: status.clone(),
                 kind: kind.clone(),
                 cancellation_source: *cancellation_source,
+                subagent_session_id: subagent_session_id.clone(),
             }),
             SessionEntry::Notice { text } => Some(AgentEvent::Notice(text.clone())),
             // Goal updates fan out as one live event after durable commit
@@ -2102,6 +2162,10 @@ impl SessionRunner {
             Ok(output) => (output.content.clone(), output.images.clone()),
             Err(error) => (error.clone(), Vec::new()),
         };
+        let (started_task_id, subagent_session_id) = match &result {
+            Ok(output) => (output.started_task_id, output.subagent_session_id.clone()),
+            Err(_) => (None, None),
+        };
         let is_error = result.is_err();
         let event_images = images.clone();
         let entry = Message::Tool {
@@ -2111,6 +2175,8 @@ impl SessionRunner {
             images,
             is_error,
             synthetic: false,
+            started_task_id,
+            subagent_session_id: subagent_session_id.clone(),
         }
         .into();
         self.commit(entry).await?;
@@ -2122,6 +2188,8 @@ impl SessionRunner {
                 content: tool_text,
                 images: event_images,
                 call_id: Some(call.id.clone()),
+                started_task_id,
+                subagent_session_id,
             });
         let steering = self.intake_after_operation(Vec::new());
         if steering != Steering::None {
@@ -2462,16 +2530,23 @@ impl SessionRunner {
                 Steering::None
             }
             SessionCommand::SwitchModel {
-                profile,
                 model,
                 context_window,
+                fork_snapshot,
             } => {
                 // Instant, not queued: the new model applies to the next
                 // model call (a call already in flight keeps its model).
                 self.agent.set_model(model, context_window);
+                let mut shared = self.shared.lock().unwrap();
                 // The live routing identity a fork child must inherit; the
                 // request head captured at build time is stale from here on.
-                self.shared.lock().unwrap().live_model = Some((profile, context_window));
+                shared.live_model = Some(LiveModel {
+                    model: fork_snapshot,
+                    context_window,
+                });
+                // `Agent::set_model` clears the request-copy image omissions;
+                // the fork-visible mirror follows the same rule.
+                shared.omitted_images.clear();
                 Steering::None
             }
             SessionCommand::Cancel => {
@@ -2562,6 +2637,7 @@ impl SessionRunner {
                     status,
                     kind,
                     cancellation_source,
+                    subagent_session_id,
                 } => AgentEvent::BackgroundCompletionNotice {
                     id: *id,
                     output: output.clone(),
@@ -2573,6 +2649,7 @@ impl SessionRunner {
                     status: status.clone(),
                     kind: kind.clone(),
                     cancellation_source: *cancellation_source,
+                    subagent_session_id: subagent_session_id.clone(),
                 },
                 _ => unreachable!("peek_background_entry returns a background entry"),
             };
@@ -2680,12 +2757,19 @@ impl SessionRunner {
         for command in pending {
             match command {
                 SessionCommand::SwitchModel {
-                    profile,
                     model,
                     context_window,
+                    fork_snapshot,
                 } => {
                     self.agent.set_model(model, context_window);
-                    self.shared.lock().unwrap().live_model = Some((profile, context_window));
+                    let mut shared = self.shared.lock().unwrap();
+                    shared.live_model = Some(LiveModel {
+                        model: fork_snapshot,
+                        context_window,
+                    });
+                    // Matches `Agent::set_model`: a replacement model gets the
+                    // untouched request again.
+                    shared.omitted_images.clear();
                 }
                 other => deferred.push(other),
             }
@@ -3675,6 +3759,8 @@ impl SessionRunner {
                                     images: Vec::new(),
                                     is_error: true,
                                     synthetic: false,
+                                    started_task_id: None,
+                                    subagent_session_id: None,
                                 }
                                 .into();
                                 if let Err(error) = self.commit(entry).await {
@@ -3693,6 +3779,8 @@ impl SessionRunner {
                                         content: error,
                                         images: Vec::new(),
                                         call_id: Some(call.id.clone()),
+                                        started_task_id: None,
+                                        subagent_session_id: None,
                                     });
                                 continue;
                             }
@@ -3759,6 +3847,8 @@ impl SessionRunner {
                                     images: Vec::new(),
                                     is_error: false,
                                     synthetic: false,
+                                    started_task_id: None,
+                                    subagent_session_id: None,
                                 }
                                 .into();
                                 if let Err(error) = self.commit(entry).await {
@@ -3779,6 +3869,8 @@ impl SessionRunner {
                                         content,
                                         images: Vec::new(),
                                         call_id: Some(call.id.clone()),
+                                        started_task_id: None,
+                                        subagent_session_id: None,
                                     });
                                 let steering = self.intake_after_operation(waited.pending);
                                 if steering != Steering::None {
@@ -3981,6 +4073,14 @@ impl SessionRunner {
                         Ok(output) => (output.content.clone(), output.images.clone()),
                         Err(error) => (tool_error_content(error).to_owned(), Vec::new()),
                     };
+                    // The started-task / child-session ids are structured
+                    // fields on the tool OUTPUT; they ride onto the durable
+                    // Tool entry and the live event so no frontend has to
+                    // recover them from the receipt prose.
+                    let (started_task_id, subagent_session_id) = match &result {
+                        Ok(output) => (output.started_task_id, output.subagent_session_id.clone()),
+                        Err(_) => (None, None),
+                    };
                     let is_error = result.is_err();
                     let entry = Message::Tool {
                         call_id: call.id.clone(),
@@ -3989,6 +4089,8 @@ impl SessionRunner {
                         images: images.clone(),
                         is_error,
                         synthetic: false,
+                        started_task_id,
+                        subagent_session_id: subagent_session_id.clone(),
                     }
                     .into();
                     if let Err(error) = self.commit(entry).await {
@@ -4009,6 +4111,8 @@ impl SessionRunner {
                             content: tool_text,
                             images,
                             call_id: Some(call.id.clone()),
+                            started_task_id,
+                            subagent_session_id,
                         });
                     // A release that raced the tool's own completion: the
                     // tool result was committed above (contract: completed
@@ -4296,6 +4400,8 @@ fn entry_event(entry: &SessionEntry) -> Option<AgentEvent> {
                     content,
                     images,
                     is_error,
+                    started_task_id,
+                    subagent_session_id,
                     ..
                 },
         } => Some(AgentEvent::ToolResult {
@@ -4303,6 +4409,8 @@ fn entry_event(entry: &SessionEntry) -> Option<AgentEvent> {
             content: content.clone(),
             images: images.clone(),
             call_id: Some(call_id.clone()),
+            started_task_id: *started_task_id,
+            subagent_session_id: subagent_session_id.clone(),
         }),
         SessionEntry::Compaction { summary, .. } => {
             Some(AgentEvent::Display(format!("compacted: {summary}")))
@@ -4319,6 +4427,7 @@ fn entry_event(entry: &SessionEntry) -> Option<AgentEvent> {
             status,
             kind,
             cancellation_source,
+            subagent_session_id,
         } => Some(AgentEvent::BackgroundCompletionNotice {
             id: *id,
             output: output.clone(),
@@ -4330,6 +4439,7 @@ fn entry_event(entry: &SessionEntry) -> Option<AgentEvent> {
             status: status.clone(),
             kind: kind.clone(),
             cancellation_source: *cancellation_source,
+            subagent_session_id: subagent_session_id.clone(),
         }),
         SessionEntry::ForkedFrom { .. } => {
             Some(AgentEvent::Display(entry.forked_from_text().expect(

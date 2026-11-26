@@ -1879,20 +1879,24 @@ async fn session_model(
             }
         }
     };
-    let (configured, context_window) =
-        state
-            .factory
-            .resolve_profile(profile, effort)
-            .map_err(|e| {
-                error(
-                    StatusCode::BAD_REQUEST,
-                    format!("unknown model profile `{profile}`: {e:#}"),
-                )
-            })?;
+    let (configured, context_window) = state
+        .factory
+        .resolve_profile(profile, effort.clone())
+        .map_err(|e| {
+            error(
+                StatusCode::BAD_REQUEST,
+                format!("unknown model profile `{profile}`: {e:#}"),
+            )
+        })?;
     let name = configured.profile_key();
-    session
-        .handle()
-        .switch_model(&name, Box::new(configured), context_window);
+    // The RESOLVED model travels with the live identity, so a `fork` child
+    // inherits this session's effective model (wire model, endpoint, effort)
+    // instead of re-resolving it against a config that may change later.
+    session.handle().switch_model(
+        Box::new(configured.clone()),
+        context_window,
+        Some(configured),
+    );
     // Mirror the new model into the registry metadata so `GET /api/sessions`
     // (sidebar / composer meta) reflects the switch immediately. Subagent
     // sessions keep their spawn-time display name (the delegate entry is
@@ -3906,12 +3910,25 @@ fn event_payload(event: &AgentEvent) -> serde_json::Value {
             content,
             images,
             call_id,
+            started_task_id,
+            subagent_session_id,
         } => {
-            if images.is_empty() {
+            let mut payload = if images.is_empty() {
                 json!({ "is_error": is_error, "content": content, "call_id": call_id })
             } else {
                 json!({ "is_error": is_error, "content": content, "call_id": call_id, "images": images })
+            };
+            // The ids a `delegate` result STARTED (task + child session) are
+            // fields, so the web UI never re-parses the receipt prose. Both
+            // are omitted when absent: a bash result payload stays
+            // byte-identical.
+            if let Some(id) = started_task_id {
+                payload["started_task_id"] = json!(id);
             }
+            if let Some(session_id) = subagent_session_id {
+                payload["subagent_session_id"] = json!(session_id);
+            }
+            payload
         }
         AgentEvent::BackgroundCompleted {
             id,
@@ -3924,6 +3941,7 @@ fn event_payload(event: &AgentEvent) -> serde_json::Value {
             status,
             kind,
             cancellation_source,
+            subagent_session_id,
         }
         | AgentEvent::BackgroundCompletionNotice {
             id,
@@ -3936,6 +3954,7 @@ fn event_payload(event: &AgentEvent) -> serde_json::Value {
             status,
             kind,
             cancellation_source,
+            subagent_session_id,
         } => {
             let mut payload = json!({
                 "id": id,
@@ -3950,6 +3969,13 @@ fn event_payload(event: &AgentEvent) -> serde_json::Value {
             });
             if let Some(source) = cancellation_source {
                 payload["cancellation_source"] = json!(source);
+            }
+            // Structured child session id: the web UI jumps to the subagent
+            // (or fork) transcript with it instead of re-parsing the output's
+            // first line. Omitted for bash tasks, so their payload stays
+            // byte-identical.
+            if let Some(session_id) = subagent_session_id {
+                payload["subagent_session_id"] = json!(session_id);
             }
             payload
         }
@@ -5018,6 +5044,8 @@ mod tests {
             content: "ok".into(),
             images: vec![],
             call_id: Some("call-2".into()),
+            started_task_id: None,
+            subagent_session_id: None,
         })
         .unwrap();
         assert_eq!(some_result["data"]["call_id"], "call-2");
@@ -5030,6 +5058,8 @@ mod tests {
                 mime: "image/png".into(),
             }],
             call_id: Some("call-image".into()),
+            started_task_id: None,
+            subagent_session_id: None,
         })
         .unwrap();
         assert_eq!(image_result["data"]["is_error"], false);
@@ -5081,6 +5111,8 @@ mod tests {
                 content: "o".into(),
                 images: vec![],
                 call_id: None,
+                started_task_id: None,
+                subagent_session_id: None,
             }),
             "ToolResult"
         );
@@ -5099,6 +5131,7 @@ mod tests {
                 status: None,
                 kind: None,
                 cancellation_source: None,
+                subagent_session_id: None,
             }),
             "BackgroundCompleted"
         );
@@ -5114,6 +5147,7 @@ mod tests {
                 status: None,
                 kind: None,
                 cancellation_source: None,
+                subagent_session_id: None,
             }),
             "BackgroundCompletionNotice"
         );
@@ -5168,6 +5202,8 @@ mod tests {
                 content: "boom".into(),
                 images: vec![],
                 call_id: None,
+                started_task_id: None,
+                subagent_session_id: None,
             }),
             json!({"is_error": true, "content": "boom", "call_id": null})
         );
@@ -5180,8 +5216,39 @@ mod tests {
                     mime: "image/png".into()
                 }],
                 call_id: Some("c".into()),
+                started_task_id: None,
+                subagent_session_id: None,
             }),
             json!({"is_error": false, "content": "image result", "call_id": "c", "images": [{"hash": "abc", "mime": "image/png"}]})
+        );
+        // A bash result carries neither structured id, so its payload keeps the
+        // exact old key set (absent, not null): the wire shape did not change.
+        assert_eq!(
+            event_payload(&AgentEvent::ToolResult {
+                is_error: false,
+                content: "bash ok".into(),
+                images: vec![],
+                call_id: Some("b".into()),
+                started_task_id: None,
+                subagent_session_id: None,
+            }),
+            json!({"is_error": false, "content": "bash ok", "call_id": "b"})
+        );
+        // A delegate result carries the started task id and the child session
+        // id as fields: the web UI jumps to the subagent without re-parsing the
+        // receipt prose.
+        assert_eq!(
+            event_payload(&AgentEvent::ToolResult {
+                is_error: false,
+                content: "started background task 7: 看图\nsubagent session: sub-chat".into(),
+                images: vec![],
+                call_id: Some("d".into()),
+                started_task_id: Some(7),
+                subagent_session_id: Some("sub-chat".into()),
+            }),
+            json!({"is_error": false,
+                   "content": "started background task 7: 看图\nsubagent session: sub-chat",
+                   "call_id": "d", "started_task_id": 7, "subagent_session_id": "sub-chat"})
         );
         assert_eq!(
             event_payload(&AgentEvent::Notice("hi".into())),
@@ -5207,6 +5274,7 @@ mod tests {
                 status: None,
                 kind: None,
                 cancellation_source: Some(CancellationSource::User),
+                subagent_session_id: None,
             }),
             json!({"id": 7, "output": "ok", "label": "cargo",
                    "started_at_ms": null, "duration_ms": null, "exit_code": null,
@@ -5225,10 +5293,34 @@ mod tests {
                 status: Some("completed".into()),
                 kind: Some("bash".into()),
                 cancellation_source: None,
+                subagent_session_id: None,
             }),
             json!({"id": 7, "output": "ok", "label": null,
                    "started_at_ms": 1_700_000_000_000u64, "duration_ms": 42, "exit_code": 0,
                    "signal": null, "status": "completed", "kind": "bash"})
+        );
+        // A delegate/fork completion carries the structured child session id:
+        // that is the field the web UI jumps to the subagent transcript with,
+        // so a `fork session:` child is no longer invisible there. The key is
+        // absent (not null) for bash tasks, keeping their payload unchanged.
+        assert_eq!(
+            event_payload(&AgentEvent::BackgroundCompletionNotice {
+                id: 8,
+                output: "fork session: sub-fork\nanswer".into(),
+                label: Some("fork".into()),
+                started_at_ms: None,
+                duration_ms: None,
+                exit_code: None,
+                signal: None,
+                status: Some("completed".into()),
+                kind: Some("delegate".into()),
+                cancellation_source: None,
+                subagent_session_id: Some("sub-fork".into()),
+            }),
+            json!({"id": 8, "output": "fork session: sub-fork\nanswer", "label": "fork",
+                   "started_at_ms": null, "duration_ms": null, "exit_code": null,
+                   "signal": null, "status": "completed", "kind": "delegate",
+                   "subagent_session_id": "sub-fork"})
         );
         assert_eq!(
             event_payload(&AgentEvent::Usage {
@@ -5264,6 +5356,8 @@ mod tests {
                 content: "ok".into(),
                 images: vec![],
                 call_id: None,
+                started_task_id: None,
+                subagent_session_id: None,
             },
             AgentEvent::ReasoningDelta("思考".into()),
             AgentEvent::Notice("后台任务完成".into()),
@@ -5278,6 +5372,7 @@ mod tests {
                 status: None,
                 kind: None,
                 cancellation_source: None,
+                subagent_session_id: None,
             },
             AgentEvent::Usage {
                 context_input: 1,
@@ -9427,6 +9522,8 @@ model = "deepseek-chat"
                 content: content.to_owned(),
                 is_error: false,
                 synthetic: false,
+                started_task_id: None,
+                subagent_session_id: None,
                 images: vec![],
             },
         }
@@ -10349,6 +10446,8 @@ model = "deepseek-chat"
                     content: "no".into(),
                     images: vec![],
                     call_id: None,
+                    started_task_id: None,
+                    subagent_session_id: None,
                 },
                 "ToolResult",
                 json!({"is_error": true, "content": "no", "call_id": null}),
