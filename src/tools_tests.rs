@@ -126,6 +126,89 @@ fn request_user_input_schema_and_validation_are_strict() {
 }
 
 #[test]
+fn request_user_input_options_schema_and_validation_are_strict() {
+    let tool = RequestUserInput;
+    let spec = tool.spec();
+    let questions = &spec.parameters["properties"]["questions"];
+    assert_eq!(questions["maxItems"], 1);
+    let options = &questions["items"]["properties"]["options"];
+    assert_eq!(options["type"], "array");
+    assert_eq!(options["minItems"], 1);
+    assert_eq!(options["items"]["type"], "object");
+    assert_eq!(options["items"]["additionalProperties"], false);
+    assert_eq!(
+        options["items"]["required"],
+        serde_json::json!(["id", "label"])
+    );
+    assert_eq!(
+        options["items"]["properties"]["description"]["type"],
+        "string"
+    );
+    // The description must state the pick-one / free-text contract.
+    let described = options["description"].as_str().unwrap();
+    assert!(
+        described.contains("picks one")
+            && described.contains("`id`")
+            && described.contains("free text"),
+        "options description: {described}"
+    );
+
+    let parsed = parse_questions(
+        r#"{"questions":[{"id":"perm","prompt":"Allow?","options":[
+            {"id":"allow-once","label":"允许一次","description":"仅此一次"},
+            {"id":"deny","label":"拒绝"}]}]}"#,
+    )
+    .unwrap();
+    assert_eq!(parsed.question.options.len(), 2);
+    assert_eq!(parsed.question.options[0].id, "allow-once");
+    assert_eq!(parsed.question.options[0].label, "允许一次");
+    assert_eq!(
+        parsed.question.options[0].description.as_deref(),
+        Some("仅此一次")
+    );
+    assert_eq!(parsed.question.options[1].id, "deny");
+    assert_eq!(parsed.question.options[1].description, None);
+    assert!(
+        parse_questions(r#"{"questions":[{"id":"name","prompt":"Your name?"}]}"#)
+            .unwrap()
+            .question
+            .options
+            .is_empty()
+    );
+
+    for args in [
+        // duplicate option ids
+        r#"{"questions":[{"id":"q","prompt":"p","options":[{"id":"a","label":"A"},{"id":"a","label":"B"}]}]}"#,
+        // empty ids
+        r#"{"questions":[{"id":"q","prompt":"p","options":[{"id":"","label":"A"}]}]}"#,
+        r#"{"questions":[{"id":"q","prompt":"p","options":[{"id":"  ","label":"A"}]}]}"#,
+        // empty labels
+        r#"{"questions":[{"id":"q","prompt":"p","options":[{"id":"a","label":""}]}]}"#,
+        r#"{"questions":[{"id":"q","prompt":"p","options":[{"id":"a","label":" "}]}]}"#,
+        // schema violations: empty list, missing label, extra field,
+        // non-string description, non-object option
+        r#"{"questions":[{"id":"q","prompt":"p","options":[]}]}"#,
+        r#"{"questions":[{"id":"q","prompt":"p","options":[{"id":"a"}]}]}"#,
+        r#"{"questions":[{"id":"q","prompt":"p","options":[{"id":"a","label":"A","extra":1}]}]}"#,
+        r#"{"questions":[{"id":"q","prompt":"p","options":[{"id":"a","label":"A","description":2}]}]}"#,
+        r#"{"questions":[{"id":"q","prompt":"p","options":[{"id":"a","label":"A"},"b"]}]}"#,
+        r#"{"questions":[{"id":"q","prompt":"p","options":{}}]}"#,
+    ] {
+        assert!(
+            parse_questions(args).is_err(),
+            "accepted invalid options: {args}"
+        );
+    }
+    let error = match parse_questions(
+        r#"{"questions":[{"id":"q","prompt":"p","options":[{"id":"dup","label":"A"},{"id":"dup","label":"B"}]}]}"#,
+    ) {
+        Ok(_) => panic!("duplicate option ids must be rejected"),
+        Err(error) => error,
+    };
+    assert!(error.contains("unique") && error.contains("dup"), "{error}");
+}
+
+#[test]
 fn request_user_input_is_not_in_common_builtins() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();
