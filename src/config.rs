@@ -37,6 +37,9 @@ pub struct Config {
     /// Optional `[background]` policy (background-task timeout).
     #[serde(default)]
     background: Option<BackgroundConfig>,
+    /// Optional `[images]` policy (outgoing image token budget / inline cap).
+    #[serde(default)]
+    images: Option<ImagesConfig>,
     /// Optional `[bash]` policy (foreground bash timeout).
     #[serde(default)]
     bash: Option<BashConfig>,
@@ -120,6 +123,20 @@ pub struct BashConfig {
 
 /// Default foreground bash residence threshold: 30 seconds.
 pub const DEFAULT_BASH_TIMEOUT_SECS: u64 = 30;
+
+/// Outgoing image budget, from `[images]`. Global-only: a project-level
+/// `[images]` section parses but is never merged (see `ProjectConfig`),
+/// because the image store is per user, not per workspace.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImagesConfig {
+    /// Distinct images kept inline per request; the oldest by first
+    /// appearance are replaced by a text placeholder naming their stored
+    /// hash. `0` never offloads (every image is sent). Absent defaults to
+    /// [`crate::images::DEFAULT_MAX_INLINE`].
+    #[serde(default)]
+    pub max_inline: Option<usize>,
+}
 
 /// User-level `[code_mode]` enabling the experimental `run_rust` tool.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
@@ -858,6 +875,17 @@ impl Config {
     pub fn code_mode_enabled(&self) -> bool {
         self.code_mode.as_ref().is_some_and(|c| c.enabled)
     }
+
+    /// `[images] max_inline`: how many distinct images a request keeps
+    /// inline. Older ones are replaced by a text placeholder naming their
+    /// stored hash. `0` never offloads; absent means
+    /// [`crate::images::DEFAULT_MAX_INLINE`].
+    pub fn images_max_inline(&self) -> usize {
+        self.images
+            .as_ref()
+            .and_then(|images| images.max_inline)
+            .unwrap_or(crate::images::DEFAULT_MAX_INLINE)
+    }
     /// The session backend from `[session] backend`, defaulting to Sqlite
     /// (`<workspace>/.e-agent/sessions.db`).
     pub fn session_backend(&self) -> SessionBackend {
@@ -1327,6 +1355,11 @@ struct ProjectConfig {
     bash: Option<BashConfig>,
     /// `[background]` override, consumed by `resolve_background_timeout`.
     background: Option<BackgroundConfig>,
+    /// Global-only `[images]`: parsed for compatibility so a project file
+    /// carrying it keeps starting, never merged (the image store is per
+    /// user, not per workspace).
+    #[allow(dead_code)]
+    images: Option<ImagesConfig>,
     /// Whole-section `[tui]` replacement; absent keeps the global section.
     tui: Option<TuiConfig>,
     /// Whole-section `[pet]` replacement; absent keeps the global section.

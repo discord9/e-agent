@@ -2154,6 +2154,23 @@ timeout_secs = 120
     assert_eq!(t, Some(Duration::from_secs(120)));
 }
 #[test]
+fn images_max_inline_parses_and_defaults_to_six() {
+    let absent: Config = toml::from_str("default = \"kimi/k3\"\n").unwrap();
+    assert_eq!(
+        absent.images_max_inline(),
+        crate::images::DEFAULT_MAX_INLINE
+    );
+    let six: Config = toml::from_str("[images]\nmax_inline = 6\n").unwrap();
+    assert_eq!(six.images_max_inline(), 6);
+    // `0` is meaningful ("never offload"), not "unset".
+    let zero: Config = toml::from_str("[images]\nmax_inline = 0\n").unwrap();
+    assert_eq!(zero.images_max_inline(), 0);
+    let empty: Config = toml::from_str("[images]\n").unwrap();
+    assert_eq!(empty.images_max_inline(), crate::images::DEFAULT_MAX_INLINE);
+    // A typo in the section is a config error, not a silent default.
+    assert!(toml::from_str::<Config>("[images]\nmax_inlin = 3\n").is_err());
+}
+#[test]
 fn code_mode_enabled_parses_and_defaults_to_false() {
     let on: Config = toml::from_str("[code_mode]\nenabled = true\n").unwrap();
     let off: Config = toml::from_str("default = \"kimi/k3\"\n").unwrap();
