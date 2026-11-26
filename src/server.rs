@@ -7794,6 +7794,7 @@ model = "deepseek-chat"
             title: title.map(str::to_owned),
             pinned: None,
             archived: None,
+            acp_session_id: None,
             writer: None,
             label: None,
         };
@@ -7919,6 +7920,7 @@ model = "deepseek-chat"
             title: None,
             pinned: None,
             archived,
+            acp_session_id: None,
             writer: None,
             label: None,
         };
@@ -8065,6 +8067,7 @@ model = "deepseek-chat"
             title: None,
             pinned: None,
             archived: None,
+            acp_session_id: None,
             writer: None,
             label: None,
         };

@@ -3732,3 +3732,97 @@ writable_paths = ["./p"]
         "unknown"
     );
 }
+
+#[test]
+fn parses_acp_section_with_defaults_and_overrides() {
+    // Absent section: no `acp_prompt` tool at all (opt-in).
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("key"), "key").unwrap();
+    let base = r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://test.test/v1"
+api_key_file = "key"
+[models."kimi/k3"]
+model = "k3"
+"#;
+    let path = write_config(temp.path(), base);
+    let config = Config::from_path(&path).unwrap();
+    assert_eq!(config.acp(), None);
+
+    // An empty `[acp]` table is the opt-in with every default.
+    let path = write_config(temp.path(), &format!("{base}[acp]\n"));
+    let config = Config::from_path(&path).unwrap();
+    assert_eq!(
+        config.acp(),
+        Some(AcpConfig {
+            binary: DEFAULT_ACP_BINARY.to_owned(),
+            args: DEFAULT_ACP_ARGS
+                .iter()
+                .map(|arg| (*arg).to_owned())
+                .collect(),
+            model: None,
+            allow_kinds: DEFAULT_ACP_ALLOW_KINDS
+                .iter()
+                .map(|kind| (*kind).to_owned())
+                .collect(),
+            danger: false,
+        })
+    );
+
+    // Explicit values win; a blank model means "leave the agent's model",
+    // and kinds are normalized because they are matched verbatim.
+    let path = write_config(
+        temp.path(),
+        &format!(
+            "{base}[acp]\nbinary = \"/opt/other-acp\"\nargs = [\"serve\"]\nmodel = \"  \"\nallow_kinds = [\"Read\", \" \"]\ndanger = true\n"
+        ),
+    );
+    let config = Config::from_path(&path).unwrap();
+    assert_eq!(
+        config.acp(),
+        Some(AcpConfig {
+            binary: "/opt/other-acp".into(),
+            args: vec!["serve".into()],
+            model: None,
+            allow_kinds: vec!["read".into()],
+            danger: true,
+        })
+    );
+
+    // `allow_kinds = []` is an explicit "deny every kind".
+    let path = write_config(temp.path(), &format!("{base}[acp]\nallow_kinds = []\n"));
+    let config = Config::from_path(&path).unwrap();
+    assert_eq!(config.acp().unwrap().allow_kinds, Vec::<String>::new());
+
+    // A misspelled key is refused instead of silently ignored.
+    let path = write_config(temp.path(), &format!("{base}[acp]\ndangerous = true\n"));
+    assert!(Config::from_path(&path).is_err());
+}
+
+#[test]
+fn a_project_acp_section_is_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("key"), "key").unwrap();
+    let path = write_config(
+        temp.path(),
+        r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://test.test/v1"
+api_key_file = "key"
+[models."kimi/k3"]
+model = "k3"
+"#,
+    );
+    let config = Config::from_path(&path).unwrap();
+    // `[acp]` names a program to spawn, so a project layer may not carry it.
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(project.join(".e-agent")).unwrap();
+    std::fs::write(
+        project.join(".e-agent/config.toml"),
+        "[acp]\nbinary = \"/bin/false\"\n",
+    )
+    .unwrap();
+    assert!(config.merged_with_project(&project).is_err());
+}

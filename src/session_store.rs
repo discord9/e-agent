@@ -849,6 +849,14 @@ pub struct SessionMeta {
     /// `Some(false)` = explicitly restored, `None` = never touched (reads
     /// as unarchived).
     pub archived: Option<bool>,
+    /// The ACP (Agent Client Protocol) session id this e-agent session last
+    /// used, so `acp_prompt` can resume its reviewer conversation after an
+    /// e-agent restart. `None` = no ACP conversation yet; every row written
+    /// before the column existed reads as NULL, which is the same "start a
+    /// new one" behaviour. The list projections do not select it — only the
+    /// per-session read does.
+    #[serde(default)]
+    pub acp_session_id: Option<String>,
     /// Writer process identity of this snapshot row
     /// (`pid@hostname#nonce`, see [`process_identity`]): the process whose
     /// insert appended the row (the audit table / sidecar records every
@@ -3612,6 +3620,70 @@ impl SessionStore {
         }
     }
 
+    /// The ACP session id this e-agent session last used, or `None` when it
+    /// never ran `acp_prompt`. The backend reads the newest metadata snapshot
+    /// for the session, so the value survives a restart (and is visible to
+    /// another process sharing the same database file).
+    #[allow(unused_variables)]
+    pub async fn acp_session_id(&self, root: &Path, session: &str) -> Result<Option<String>> {
+        match self {
+            SessionStore::Jsonl => {
+                Ok(jsonl_read_meta_snapshot(root, session)?.and_then(|meta| meta.acp_session_id))
+            }
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime {
+                session: greptime_session,
+                ..
+            } => greptime_session.acp_session_id(session).await,
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite {
+                session: sqlite_session,
+                ..
+            } => sqlite_session
+                .lock()
+                .await
+                .acp_session_id(session)
+                .await
+                .map_err(anyhow::Error::msg),
+        }
+    }
+
+    /// Record (or clear) the ACP session id on the session's metadata row:
+    /// appends one full snapshot row, exactly like [`Self::set_title`]. Never
+    /// self-creates (R3): a session with no metadata row is a no-op `Ok`.
+    #[allow(unused_variables)]
+    pub async fn set_acp_session_id(
+        &self,
+        root: &Path,
+        session: &str,
+        acp_session_id: Option<&str>,
+    ) -> Result<()> {
+        match self {
+            SessionStore::Jsonl => jsonl_update_meta(root, session, |meta| {
+                meta.acp_session_id = acp_session_id.map(str::to_owned)
+            }),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime {
+                session: greptime_session,
+                ..
+            } => {
+                greptime_session
+                    .set_acp_session_id(session, acp_session_id)
+                    .await
+            }
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite {
+                session: sqlite_session,
+                ..
+            } => sqlite_session
+                .lock()
+                .await
+                .set_acp_session_id(session, acp_session_id)
+                .await
+                .map_err(anyhow::Error::msg),
+        }
+    }
+
     /// One-time bootstrap migration: create metadata rows for sessions
     /// that predate the `sessions` table (they have `session_entries` but
     /// no metadata row). Idempotent: sessions that already have a row are
@@ -4199,6 +4271,7 @@ fn jsonl_create_meta(
                 title: existing.title.clone(),
                 pinned: existing.pinned,
                 archived: existing.archived,
+                acp_session_id: existing.acp_session_id.clone(),
                 writer: None, // stamped by jsonl_append_meta_snapshot with the writing process
                 label: None, // label lives in running_tasks / background records, resolved at list time
             };
@@ -4219,6 +4292,7 @@ fn jsonl_create_meta(
         title: title.map(str::to_owned), // a fresh session may be named at creation (subagent label)
         pinned: None,                    // a fresh session is unpinned until the user pins it
         archived: None,                  // a fresh session is unarchived until the user archives it
+        acp_session_id: None,            // no ACP conversation until `acp_prompt` runs
         writer: None, // stamped by jsonl_append_meta_snapshot with the writing process
         label: None,  // label lives in running_tasks / background records, resolved at list time
     };
@@ -4387,10 +4461,11 @@ fn jsonl_backfill_sessions(root: &Path) -> anyhow::Result<()> {
             entry_count: jsonl_count_transcript_entries(root, &session)?,
             parent_session_id: None,
             parent_task_id: None,
-            title: None,    // pre-sidecar sessions have no user-assigned name
-            pinned: None,   // pre-sidecar sessions are unpinned
-            archived: None, // pre-sidecar sessions are unarchived
-            writer: None,   // stamped by jsonl_append_meta_snapshot with the writing process
+            title: None,          // pre-sidecar sessions have no user-assigned name
+            pinned: None,         // pre-sidecar sessions are unpinned
+            archived: None,       // pre-sidecar sessions are unarchived
+            acp_session_id: None, // pre-sidecar sessions have no ACP conversation
+            writer: None,         // stamped by jsonl_append_meta_snapshot with the writing process
             label: None, // label lives in running_tasks / background records, resolved at list time
         };
         jsonl_append_meta_snapshot(root, &session, &mut meta)?;

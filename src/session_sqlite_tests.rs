@@ -308,6 +308,29 @@ async fn connect_migrates_legacy_sessions_table_missing_feature_columns() {
     assert_eq!(meta.pinned, None, "old rows read pinned back as NULL");
     assert_eq!(meta.title, None, "old rows read title back as NULL");
     assert_eq!(meta.writer, None, "old rows read writer back as NULL");
+    assert_eq!(
+        meta.acp_session_id, None,
+        "old rows read acp_session_id back as NULL (no ACP conversation yet)"
+    );
+    assert_eq!(
+        session
+            .acp_session_id("legacy-1")
+            .await
+            .expect("read the migrated acp_session_id"),
+        None,
+        "the per-session ACP read works on a migrated table"
+    );
+    // The ACP id is a nullable per-session column, written like the other
+    // feature columns (one full snapshot row) and read back through the same
+    // path `acp_prompt` uses.
+    session
+        .set_acp_session_id("legacy-1", Some("70bd9ad0-acp"))
+        .await
+        .expect("store the ACP session id on the migrated table");
+    assert_eq!(
+        session.acp_session_id("legacy-1").await.unwrap().as_deref(),
+        Some("70bd9ad0-acp")
+    );
 
     session
         .set_archived("legacy-1", true)
@@ -2433,6 +2456,7 @@ fn backfill_meta_snapshot_preserves_immutable_columns() {
         title: Some("a title".into()),
         pinned: Some(true),
         archived: Some(true),
+        acp_session_id: None,
         writer: None,
         label: None,
     };
@@ -2482,6 +2506,7 @@ fn backfill_meta_snapshot_preserves_immutable_columns() {
         title: None,
         pinned: None,
         archived: None,
+        acp_session_id: None,
         writer: None,
         label: None,
     };
@@ -4700,6 +4725,7 @@ impl<'a> SnapshotRow<'a> {
             title: self.title.map(str::to_owned),
             pinned: self.pinned.map(|flag| flag == 1),
             archived: self.archived.map(|flag| flag == 1),
+            acp_session_id: None,
             writer: self.writer.map(str::to_owned),
             label: None,
         }

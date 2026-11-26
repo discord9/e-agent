@@ -113,6 +113,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     pinned BOOLEAN NULL,
     archived BOOLEAN NULL,
     writer STRING NULL,
+    acp_session_id STRING NULL,
     entry_count BIGINT NOT NULL DEFAULT 0,
     parent_session_id STRING NULL,
     parent_task_id BIGINT NULL,
@@ -258,6 +259,7 @@ impl GreptimeSession {
         let mut pinned_available = true;
         let mut archived_available = true;
         let mut writer_available = true;
+        let mut acp_available = true;
         let columns: Vec<String> = client
             .query(
                 "SELECT column_name FROM information_schema.columns \
@@ -310,6 +312,24 @@ impl GreptimeSession {
                     tracing::warn!(
                         "e-agent: cannot add sessions.archived column (session archiving unavailable): \
                          {error:#}"
+                    );
+                }
+            }
+        }
+        if !columns.iter().any(|c| c == "acp_session_id") {
+            match client
+                .execute(
+                    "ALTER TABLE sessions ADD COLUMN acp_session_id STRING NULL",
+                    &[],
+                )
+                .await
+            {
+                Ok(_) => {}
+                Err(error) => {
+                    acp_available = false;
+                    tracing::warn!(
+                        "e-agent: cannot add sessions.acp_session_id column (ACP session reuse \
+                         unavailable): {error:#}"
                     );
                 }
             }
@@ -438,12 +458,16 @@ impl GreptimeSession {
         // touches rewrite complete rows without re-reading immutable
         // columns. The table is append-only; the newest row per session
         // wins (ORDER BY last_active_at DESC LIMIT 1).
-        let cached_meta =
-            if title_available && pinned_available && archived_available && writer_available {
-                let meta_row = client
+        let cached_meta = if title_available
+            && pinned_available
+            && archived_available
+            && writer_available
+            && acp_available
+        {
+            let meta_row = client
                     .query_opt(
                         "SELECT created_at, last_active_at, model, \"role\", entry_count, \
-                            parent_session_id, parent_task_id, title, pinned, archived, writer \
+                            parent_session_id, parent_task_id, title, pinned, archived, writer, acp_session_id \
                      FROM sessions \
                      WHERE workspace_id = $1 AND session_id = $2 \
                      ORDER BY last_active_at DESC LIMIT 1",
@@ -451,24 +475,25 @@ impl GreptimeSession {
                     )
                     .await
                     .context("cannot query session metadata")?;
-                meta_row.map(|row| SessionMeta {
-                    session_id: session_id.to_string(),
-                    created_at: row.get("created_at"),
-                    last_active_at: row.get("last_active_at"),
-                    model: row.get("model"),
-                    role: row.get("role"),
-                    entry_count: row.get("entry_count"),
-                    parent_session_id: row.get("parent_session_id"),
-                    parent_task_id: row.get("parent_task_id"),
-                    title: row.get("title"),
-                    pinned: row.get("pinned"),
-                    archived: row.get("archived"),
-                    writer: row.get("writer"),
-                    label: None, // label lives in running_tasks, resolved at list time
-                })
-            } else {
-                None
-            };
+            meta_row.map(|row| SessionMeta {
+                session_id: session_id.to_string(),
+                created_at: row.get("created_at"),
+                last_active_at: row.get("last_active_at"),
+                model: row.get("model"),
+                role: row.get("role"),
+                entry_count: row.get("entry_count"),
+                parent_session_id: row.get("parent_session_id"),
+                parent_task_id: row.get("parent_task_id"),
+                title: row.get("title"),
+                pinned: row.get("pinned"),
+                archived: row.get("archived"),
+                acp_session_id: row.get("acp_session_id"),
+                writer: row.get("writer"),
+                label: None, // label lives in running_tasks, resolved at list time
+            })
+        } else {
+            None
+        };
 
         let backend_fp = crate::session_store::backend_instance_fingerprint("greptime", conn);
         let session = Self {
@@ -2189,7 +2214,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             .client
             .query_opt(
                 "SELECT created_at, last_active_at, model, \"role\", entry_count, \
-                        parent_session_id, parent_task_id, title, pinned, archived, writer \
+                        parent_session_id, parent_task_id, title, pinned, archived, writer, acp_session_id \
                  FROM sessions \
                  WHERE workspace_id = $1 AND session_id = $2 \
                  ORDER BY last_active_at DESC LIMIT 1",
@@ -2209,6 +2234,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             title: row.get("title"),
             pinned: row.get("pinned"),
             archived: row.get("archived"),
+            acp_session_id: row.get("acp_session_id"),
             writer: row.get("writer"),
             label: None, // label lives in running_tasks, resolved at list time
         }))
@@ -2225,8 +2251,9 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             .execute(
                 "INSERT INTO sessions \
                  (workspace_id, session_id, created_at, last_active_at, model, \"role\", \
-                  entry_count, parent_session_id, parent_task_id, title, pinned, archived, writer) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+                  entry_count, parent_session_id, parent_task_id, title, pinned, archived, writer, \
+                  acp_session_id) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
                 &[
                     &self.workspace_id,
                     &meta.session_id,
@@ -2241,6 +2268,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
                     &meta.pinned,
                     &meta.archived,
                     &meta.writer,
+                    &meta.acp_session_id,
                 ],
             )
             .await
@@ -2299,6 +2327,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
                 .or_else(|| existing.parent_session_id.clone()),
             parent_task_id: parent_task_id.or(existing.parent_task_id),
             title: existing.title.clone(),
+            acp_session_id: existing.acp_session_id.clone(),
             pinned: existing.pinned,
             archived: existing.archived,
             writer: None, // stamped by insert_meta with the writing process
@@ -2372,6 +2401,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             parent_session_id: parent_session_id.map(str::to_owned),
             parent_task_id,
             title: title.map(str::to_owned), // a fresh session may be named at creation (subagent label)
+            acp_session_id: None,            // no ACP conversation until `acp_prompt` runs
             pinned: None,                    // a fresh session is unpinned until the user pins it
             archived: None, // a fresh session is unarchived until the user archives it
             writer: None,   // stamped by insert_meta with the writing process
@@ -2430,6 +2460,41 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             return Ok(());
         };
         meta.title = title.map(str::to_owned);
+        meta.last_active_at = us_to_datetime(next_event_time_us());
+        self.insert_meta(&mut meta).await?;
+        if session_id == self.session_id {
+            *self.cached_meta.lock().unwrap() = Some(meta);
+        }
+        Ok(())
+    }
+
+    /// The ACP session id this session last used, or `None` when it never
+    /// ran `acp_prompt` (also `None` for a session with no metadata row).
+    pub async fn acp_session_id(&self, session_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .load_meta_row(session_id)
+            .await?
+            .and_then(|meta| meta.acp_session_id))
+    }
+
+    /// Record (or clear) the ACP session id: appends one full snapshot row
+    /// with the new value and a fresh `last_active_at`, exactly like
+    /// [`Self::set_title`]. Never self-creates (R3): a session with no
+    /// metadata row is a no-op `Ok`.
+    pub async fn set_acp_session_id(
+        &self,
+        session_id: &str,
+        acp_session_id: Option<&str>,
+    ) -> Result<()> {
+        let meta = if session_id == self.session_id {
+            self.effective_meta().await?
+        } else {
+            self.load_meta_row(session_id).await?
+        };
+        let Some(mut meta) = meta else {
+            return Ok(());
+        };
+        meta.acp_session_id = acp_session_id.map(str::to_owned);
         meta.last_active_at = us_to_datetime(next_event_time_us());
         self.insert_meta(&mut meta).await?;
         if session_id == self.session_id {
@@ -2638,6 +2703,9 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
                 title: row.get("title"),
                 pinned: row.get("pinned"),
                 archived: row.get("archived"),
+                // The list projection aggregates a fixed column set and does
+                // not carry the ACP session id.
+                acp_session_id: None,
                 writer: row.get("writer"),
                 label: None, // label lives in running_tasks, resolved at list time
             })
@@ -2663,7 +2731,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             .client
             .query(
                 "SELECT created_at, last_active_at, model, \"role\", entry_count, \
-                        parent_session_id, parent_task_id, title, pinned, archived, writer \
+                        parent_session_id, parent_task_id, title, pinned, archived, writer, acp_session_id \
                  FROM sessions \
                  WHERE workspace_id = $1 AND session_id = $2 \
                  ORDER BY last_active_at ASC",
@@ -2685,6 +2753,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
                 title: row.get("title"),
                 pinned: row.get("pinned"),
                 archived: row.get("archived"),
+                acp_session_id: row.get("acp_session_id"),
                 writer: row.get("writer"),
                 label: None, // label lives in running_tasks, resolved at list time
             })
@@ -2757,11 +2826,12 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
                 entry_count: row.get("entry_count"),
                 parent_session_id: None,
                 parent_task_id: None,
-                title: None,    // pre-table sessions have no user-assigned name
-                pinned: None,   // pre-table sessions are unpinned
-                archived: None, // pre-table sessions are unarchived
-                writer: None,   // stamped by insert_meta with the writing process
-                label: None,    // label lives in running_tasks, resolved at list time
+                title: None,          // pre-table sessions have no user-assigned name
+                pinned: None,         // pre-table sessions are unpinned
+                archived: None,       // pre-table sessions are unarchived
+                acp_session_id: None, // pre-table sessions have no ACP conversation
+                writer: None,         // stamped by insert_meta with the writing process
+                label: None,          // label lives in running_tasks, resolved at list time
             })
             .await?;
         }
@@ -6390,6 +6460,7 @@ mod tests {
             title: Some("a title".into()),
             pinned: Some(true),
             archived: Some(true),
+            acp_session_id: None,
             writer: None,
             label: None,
         };
@@ -6446,6 +6517,7 @@ mod tests {
             title: None,
             pinned: None,
             archived: None,
+            acp_session_id: None,
             writer: None,
             label: None,
         };
