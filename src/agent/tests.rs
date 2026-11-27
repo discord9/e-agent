@@ -2621,6 +2621,26 @@ fn context_request_passes_small_outputs_through_byte_identical() {
     assert!(!content.contains("ref=eout1."));
 }
 
+/// Decode the owner-bearing receipt embedded in a bounded field and assert it
+/// names `session`'s row for `field`. Every receipt is owner-bearing, so the
+/// bytes of a projection depend only on the stored row — never on the reader.
+fn decoded_receipt(
+    text: &str,
+    session: &str,
+    field: crate::output_receipt::FieldId,
+) -> crate::output_receipt::VerifiedRef {
+    let start = text.find("read_output ref=").expect("a receipt") + "read_output ref=".len();
+    let end = text[start..].find(']').expect("marker terminator") + start;
+    match crate::output_receipt::parse_ref(&text[start..end]).unwrap() {
+        crate::output_receipt::OutputRef::Legacy(verified) => {
+            assert_eq!(verified.location.session, session);
+            assert_eq!(verified.field, field);
+            verified
+        }
+        other => panic!("expected an owner-bearing receipt, got {other:?}"),
+    }
+}
+
 #[test]
 fn context_request_bounds_oversized_background_completion_with_receipt() {
     let output = format!(
@@ -2699,7 +2719,9 @@ fn context_request_bounds_oversized_background_completion_with_receipt() {
             + format!("\n[truncated: 14 bytes omitted; read_output ref={receipt}]\n").len()
             + PROJECTION_TAIL_BYTES,
     );
-    assert_eq!(receipt, "eout1.0.b");
+    let verified = decoded_receipt(content, &session, crate::output_receipt::FieldId::BgOutput);
+    assert_eq!(verified.location.key.seq(), 0);
+    assert_eq!(verified.total, output.len(), "the full field size is bound");
     // The persisted entry keeps the FULL output untouched.
     assert!(matches!(
         agent.history().first().unwrap(),
@@ -2967,7 +2989,7 @@ fn context_request_leaves_unlocated_fields_full() {
 }
 
 #[test]
-fn context_request_with_location_uses_direct_ref() {
+fn context_request_with_location_uses_an_owner_bearing_ref() {
     let huge = "u".repeat(PROJECTION_THRESHOLD + 10);
     let mut agent = Agent::new(
         Box::new(ScriptedModel {
@@ -2985,10 +3007,17 @@ fn context_request_with_location_uses_direct_ref() {
         crate::session_store::entry_payload_hash(&serde_json::to_string(&entry).unwrap());
     agent.restore_located(vec![entry], vec![Some(loc)]);
     let msgs = agent.context_request();
-    assert!(
-        matches!(&msgs[0], Message::User { content, .. } if content.contains("ref=eout1.0.n") && !content.contains(&huge)),
-        "persisted location should issue a direct ref"
+    let Message::User { content, .. } = &msgs[0] else {
+        panic!("expected the notice projection, got {:?}", msgs[0]);
+    };
+    assert!(!content.contains(&huge), "the field is bounded");
+    let verified = decoded_receipt(
+        content,
+        &session,
+        crate::output_receipt::FieldId::NoticeText,
     );
+    assert_eq!(verified.location.key.seq(), 0);
+    assert_eq!(verified.total, huge.len());
 }
 
 #[tokio::test]
@@ -3352,10 +3381,17 @@ fn resumed_projection_keeps_actual_user_provenance() {
         Message::User { content, .. } if content == "the actual prompt"
     ));
     // And the receipt resolves against the compaction_retained field.
-    let ref_start = content.find("ref=eout1.").unwrap() + "ref=".len();
-    let ref_end = content[ref_start..].find(']').unwrap() + ref_start;
-    let receipt = &content[ref_start..ref_end];
-    assert_eq!(receipt, "eout1.0.r");
+    let verified = decoded_receipt(
+        content,
+        &session,
+        crate::output_receipt::FieldId::CompactionRetained,
+    );
+    assert_eq!(verified.location.key.seq(), 0);
+    let retained_total = serde_json::to_vec(&retained).unwrap().len();
+    assert_eq!(
+        verified.total, retained_total,
+        "the receipt binds the whole retained array"
+    );
 }
 
 #[test]
@@ -3404,12 +3440,14 @@ fn context_request_bounds_second_retained_projection() {
     let Message::User { content, .. } = &msgs[2] else {
         panic!("expected the projected completion, got {:?}", msgs[2]);
     };
-    assert!(content.contains("ref=eout1."), "{content:?}");
     assert!(!content.contains(&huge));
-    let ref_start = content.find("ref=eout1.").unwrap() + "ref=".len();
-    let ref_end = content[ref_start..].find(']').unwrap() + ref_start;
-    let receipt = &content[ref_start..ref_end];
-    assert_eq!(receipt, "eout1.0.r");
+    let verified = decoded_receipt(
+        content,
+        &session,
+        crate::output_receipt::FieldId::CompactionRetained,
+    );
+    assert_eq!(verified.location.key.seq(), 0);
+    assert_eq!(verified.total, serde_json::to_vec(&retained).unwrap().len());
 }
 
 #[tokio::test]
@@ -3550,12 +3588,14 @@ async fn context_request_retained_receipt_binds_the_full_retained_array() {
     let Message::Tool { content, .. } = &msgs[2] else {
         panic!("expected retained tool message, got {:?}", msgs[2]);
     };
-    assert!(content.contains("ref=eout1."));
     assert!(!content.contains(&huge));
-    let ref_start = content.find("ref=eout1.").unwrap() + "ref=".len();
-    let ref_end = content[ref_start..].find(']').unwrap() + ref_start;
-    let receipt = &content[ref_start..ref_end];
-    assert_eq!(receipt, "eout1.0.r");
+    let verified = decoded_receipt(
+        content,
+        &session,
+        crate::output_receipt::FieldId::CompactionRetained,
+    );
+    assert_eq!(verified.location.key.seq(), 0);
+    assert_eq!(verified.total, serde_json::to_vec(&retained).unwrap().len());
     // Reconstruct through a real JSONL persistence layer and resolve the
     // direct ref using the current session only.
     crate::session::Session::append_located(root.path(), &session, &[compaction]).unwrap();

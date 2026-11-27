@@ -1,6 +1,9 @@
 //! The always-on `read_output` tool pages full persisted fields named by an
-//! `eout1` ref. Direct numeric refs are bound to the runner's current
-//! session/store; historical long refs are decoded for compatibility.
+//! `eout1` ref. A short direct ref is resolved inside the runner's current
+//! session; an owner-bearing ref names the session that PHYSICALLY stores the
+//! row (a zero-copy fork's inherited prefix) and is resolved through THAT
+//! session's store, after proving the owner is this session or one of its
+//! transitive fork sources.
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -149,15 +152,12 @@ async fn resolve_page(
                 .read_field_direct(root, session, entry_id, field)
                 .await
         }
-        OutputRef::Legacy(verified) => {
-            if verified.location.session != session {
-                return Err(ReceiptError::new(
-                    crate::output_receipt::ReceiptErrorKind::Invalid,
-                    "ref not found",
-                ));
-            }
-            store.read_field(root, &verified).await
-        }
+        OutputRef::Legacy(verified) => match owner_field(store, root, session, &verified).await {
+            Ok(bytes) => Ok(bytes),
+            // An unauthorized owner is the same refusal a wrong-session ref
+            // always produced: never a hint about what exists elsewhere.
+            Err(error) => return Err(error),
+        },
     };
     let bytes = match bytes {
         Ok(bytes) => bytes,
@@ -173,6 +173,62 @@ async fn resolve_page(
         }
     };
     crate::output_receipt::page_field(&bytes, offset, limit)
+}
+
+/// Read one owner-bearing ref with the OWNER's authority.
+///
+/// The ref names the session that physically stores the row, which is
+/// authorized only when it is this session itself or one of its transitive fork
+/// sources ([`SessionStore::authorizes_owner`]) — the parent of a fork is
+/// authorized precisely because it is this session's fork source, and a fork of
+/// a fork reaches its grandparent the same way.
+///
+/// The read then opens the OWNER's store: the SQL backends bind the session id
+/// at connect time (`read_field_direct` is bound-session and cannot serve a
+/// cross-owner ref), and the existing verification runs there — backend kind,
+/// workspace fingerprint, backend-instance fingerprint, the exact physical
+/// key, the payload hash and the total size. A row of any other session, an
+/// ambiguous ref, or any verification failure is an error, never a guess.
+async fn owner_field(
+    store: &SessionStore,
+    root: &std::path::Path,
+    session: &str,
+    verified: &crate::output_receipt::VerifiedRef,
+) -> Result<Vec<u8>, ReceiptError> {
+    let not_found = || {
+        ReceiptError::new(
+            crate::output_receipt::ReceiptErrorKind::Invalid,
+            "ref not found",
+        )
+    };
+    let owner = verified.location.session.as_str();
+    let authorized = store
+        .authorizes_owner(root, session, owner)
+        .await
+        .map_err(|error| {
+            tracing::error!("read_output: cannot verify the ref owner: {error:#}");
+            not_found()
+        })?;
+    if !authorized {
+        return Err(not_found());
+    }
+    let owner_store = store.source_store(root, owner).await.map_err(|error| {
+        tracing::error!("read_output: cannot open the ref owner's store: {error:#}");
+        ReceiptError::new(
+            crate::output_receipt::ReceiptErrorKind::Invalid,
+            "cannot read the persisted field",
+        )
+    })?;
+    owner_store
+        .read_field(root, verified)
+        .await
+        .map_err(|error| {
+            tracing::error!("read_output: cannot read persisted field: {error:#}");
+            ReceiptError::new(
+                crate::output_receipt::ReceiptErrorKind::Invalid,
+                "cannot read the persisted field",
+            )
+        })
 }
 
 /// Render the closed JSON page schema:

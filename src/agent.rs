@@ -940,9 +940,9 @@ pub enum SessionEntry {
     /// A structured background completion entry. Persisted in the session
     /// log with the full output. The TUI renders a truncated preview; the
     /// provider REQUEST copy bounds the output (UTF-8-safe head+tail plus a
-    /// session-local `read_output` ref, see
-    /// [`crate::output_receipt`]) so an oversized completion can never
-    /// blow up the provider context — the persisted entry stays full.
+    /// stored-row `read_output` ref, see [`crate::output_receipt`]) so an
+    /// oversized completion can never blow up the provider context — the
+    /// persisted entry stays full.
     /// Backwards-compatible: old `Notice` entries are read without guessing
     /// string prefixes.
     BackgroundCompletion {
@@ -1321,9 +1321,11 @@ pub struct Agent {
     /// "never set" from "cleared", so the provider context can override a
     /// stale compaction summary that still mentions the old goal.
     goal_cleared: bool,
-    /// Exact physical located keys of the persisted history, aligned 1:1
-    /// with `history` (`None` = the entry has no located key: legacy/test
-    /// in-memory entries, entries pushed without a location).
+    /// Exact physical locations of the persisted history, aligned 1:1 with
+    /// `history` (`None` = the entry has no located key: legacy/test
+    /// in-memory entries, entries pushed without a location). An inherited
+    /// fork prefix carries its OWNER's location, so [`Self::project_item`]
+    /// bounds it exactly like the parent did and embeds the same receipt.
     entry_locations: Vec<Option<EntryLocation>>,
     /// Number of LEADING history entries inherited read-only from a
     /// zero-copy fork source ([`crate::session_store::SessionStore::load_fork_located`]).
@@ -1907,10 +1909,11 @@ impl Agent {
     /// except that eligible oversized persisted fields (background
     /// completion output, tool content, notice text, historical
     /// user/assistant content, compaction summary/retained) are projected
-    /// as a UTF-8-safe head+tail plus a session-local `eout1` ref
-    /// (`read_output` ref). System messages, the session goal, the newest
-    /// `read_output` page the model asked for, tool call
-    /// ids/names/arguments, reasoning, and images are kept exact. A field is
+    /// as a UTF-8-safe head+tail plus an `eout1` ref (`read_output` ref) that
+    /// depends only on the stored row, so a fork's inherited prefix projects
+    /// byte-identically to the parent's own request. System messages, the
+    /// session goal, the newest `read_output` page the model asked for, tool
+    /// call ids/names/arguments, reasoning, and images are kept exact. A field is
     /// left full when no located key exists for its entry or when no
     /// registry is installed — never an unusable ref. The current user
     /// prompt gets no exemption: it is bounded like any other located field
@@ -2607,7 +2610,7 @@ impl Agent {
         let mut produced_content_delta = false;
         // The BOUNDED request copy: canonical `context()` stays full and
         // lossless; oversized eligible persisted fields are projected as
-        // head+tail + a session-local `read_output` ref.
+        // head+tail + a stored-row `read_output` ref.
         let mut context = self.context_request();
         // Non-vision models cannot consume image parts. Strip them from the
         // *request* only, so the wire gate never rejects the whole history

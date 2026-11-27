@@ -1268,7 +1268,10 @@ pub async fn spawn_btw_subagent(
         .len();
     let mut seeded = crate::session_store::LoadedLocated {
         entries: cut.context[..prefix].to_vec(),
-        locations: vec![None; prefix],
+        // Each inherited row keeps the location of the session that PHYSICALLY
+        // stores it, so the child's provider projection bounds it exactly like
+        // the source and emits an owner-bearing receipt.
+        locations: cut.locations[..prefix].to_vec(),
         legacy: false,
         inherited: prefix,
         next_older: cut.older,
@@ -1620,8 +1623,11 @@ impl Tool for Delegate {
             // the marker.
             let seeded = crate::session_store::LoadedLocated {
                 entries: prefix,
-                // Inherited rows never carry a child location.
-                locations: vec![None; inherited],
+                // Inherited rows carry the OWNER's location (`cut.locations` is
+                // aligned 1:1 with `cut.context`, and `prefix` is its leading
+                // completed-turn slice): the child never stores these rows, so
+                // a child-keyed receipt could read a same-keyed child entry.
+                locations: cut.locations[..inherited].to_vec(),
                 legacy: false,
                 inherited,
                 next_older: cut.older.clone(),

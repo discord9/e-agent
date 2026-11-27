@@ -4092,6 +4092,118 @@ mod tests {
         assert_eq!(loaded_a.len(), 1);
     }
 
+    /// Cross-owner (owner-bearing) refs through the GREPTIME binding: an
+    /// inherited prefix names its parent, and `read_output` opens the PARENT's
+    /// store — the SQL backends bind the session id at connect time, so a
+    /// bound-session read could never serve a cross-owner ref. Requires a live
+    /// DB (`GREPTIME_PG`).
+    #[tokio::test]
+    async fn owner_bearing_ref_reads_the_parent_row_through_the_greptime_binding() {
+        use crate::config::SessionBackend;
+        use crate::output_receipt::{FieldId, issue_owner};
+        use crate::session_store::{LocatedKey, SessionStore};
+
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let root = Path::new("/tmp/e-agent-test");
+        let backend = SessionBackend::Greptime { conn: conn.clone() };
+        let parent = format!("test-gt-owner-parent-{}", crate::session::new_id());
+        let parent_store = SessionStore::connect(&backend, root, &parent)
+            .await
+            .unwrap();
+        let rows = vec![
+            SessionEntry::Message {
+                message: Message::User {
+                    content: "gt parent q".into(),
+                    images: vec![],
+                },
+            },
+            SessionEntry::Message {
+                message: Message::Tool {
+                    call_id: "gt-call".into(),
+                    name: "bash".into(),
+                    content: "PARENT-GT-ROW".into(),
+                    is_error: false,
+                    synthetic: false,
+                    images: vec![],
+                },
+            },
+        ];
+        let parent_locations = parent_store
+            .append_located(root, &parent, &rows)
+            .await
+            .unwrap();
+        let cut = parent_locations.last().unwrap().clone();
+        let LocatedKey::Greptime { seq, event_time_us } = cut.key else {
+            panic!("the greptime binding pins a greptime key");
+        };
+
+        let child = format!("test-gt-owner-child-{}", crate::session::new_id());
+        let child_store = SessionStore::connect(&backend, root, &child).await.unwrap();
+        child_store
+            .append(
+                root,
+                &child,
+                &[
+                    SessionEntry::ForkedFrom {
+                        source: parent.clone(),
+                        at: None,
+                        event_time: Some(event_time_us),
+                        seq: Some(seq),
+                    },
+                    SessionEntry::Message {
+                        message: Message::User {
+                            content: "gt child q".into(),
+                            images: vec![],
+                        },
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let loaded = child_store
+            .load_fork_head_located(root, &child)
+            .await
+            .unwrap();
+        assert_eq!(loaded.inherited, 2);
+        for (index, expected) in parent_locations.iter().enumerate() {
+            assert_eq!(
+                loaded.locations[index].as_ref(),
+                Some(expected),
+                "inherited greptime row {index} carries the parent's identity"
+            );
+        }
+
+        let reference = issue_owner(&cut, FieldId::ToolContent, "PARENT-GT-ROW".len());
+        let page = crate::tools::output::execute(&child_store, root, &child, &reference, 0, 1024)
+            .await
+            .expect("the child resolves the parent's greptime row");
+        let page: serde_json::Value = serde_json::from_str(&page).unwrap();
+        assert_eq!(page["text"], "PARENT-GT-ROW");
+        assert_eq!(page["total_bytes"], "PARENT-GT-ROW".len());
+
+        // A third session is not this child's fork source: refused.
+        let other = format!("test-gt-owner-other-{}", crate::session::new_id());
+        let other_store = SessionStore::connect(&backend, root, &other).await.unwrap();
+        let other_locations = other_store
+            .append_located(root, &other, &rows)
+            .await
+            .unwrap();
+        let foreign = issue_owner(
+            &other_locations[1],
+            FieldId::ToolContent,
+            "PARENT-GT-ROW".len(),
+        );
+        let error = crate::tools::output::execute(&child_store, root, &child, &foreign, 0, 1024)
+            .await
+            .unwrap_err();
+        assert_eq!(error, "read_output error: ref not found");
+    }
+
     /// Exact-version semantics through the Greptime backend (requires a live
     /// DB, `GREPTIME_PG`): `append_located` pins (seq, event_time, payload
     /// hash); a same-seq later version (a newer event_time row appended

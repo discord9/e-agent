@@ -2625,8 +2625,11 @@ async fn spawn_btw_subagent_forks_history_and_registers_persistent_subagent() {
     assert_eq!(resolved.entries[1], source_entries[1]);
     assert_eq!(resolved.entries[2], loaded[0]);
     assert!(
-        resolved.locations[..2].iter().all(Option::is_none),
-        "inherited entries must not carry child locations"
+        resolved.locations[..2].iter().all(|location| location
+            .as_ref()
+            .is_some_and(|loc| loc.session == "web-main")),
+        "inherited entries name their OWNER, never a child location: {:?}",
+        resolved.locations
     );
     assert!(
         resolved.locations[2].is_some(),
@@ -4052,8 +4055,9 @@ async fn fork_spawn_writes_only_the_marker_and_loads_the_parent_prefix() {
     assert!(
         resolved.locations[..parent_entries.len()]
             .iter()
-            .all(Option::is_none),
-        "inherited entries carry no child location"
+            .all(|location| location.as_ref().is_some_and(|loc| loc.session == "parent")),
+        "inherited entries name their OWNER, never a child location: {:?}",
+        resolved.locations
     );
     // The parent is frozen at the marker: a later parent append stays out.
     Session::append(
@@ -4461,6 +4465,228 @@ fn parent_answer() -> crate::agent::SessionEntry {
             reasoning: None,
         }),
     }
+}
+
+/// An owned tool call + result turn whose result is far over the projection
+/// budget (`PROJECTION_THRESHOLD` = 12 KiB): the parent bounds it, and a fork of
+/// that cut must bound it BYTE-IDENTICALLY — the receipt is owner-bearing, so
+/// its bytes depend only on the stored row, never on the reader. Before this
+/// change the child sent the inherited field UNBOUNDED, diverging from the
+/// parent exactly at that field (measured: an identical prefix reused 4,864 of
+/// 5,054 prompt tokens).
+const OVERSIZED_TOOL_CHUNK: usize = 8 * 1024;
+
+fn oversized_tool_result() -> String {
+    format!(
+        "{}{}{}",
+        "H".repeat(OVERSIZED_TOOL_CHUNK),
+        "OMITTED-MIDDLE",
+        "T".repeat(OVERSIZED_TOOL_CHUNK)
+    )
+}
+
+fn tool_turn_entries(result: &str) -> Vec<crate::agent::SessionEntry> {
+    vec![
+        parent_user(),
+        crate::agent::SessionEntry::Message {
+            message: Message::Assistant(AssistantMessage {
+                content: None,
+                tool_calls: vec![crate::agent::ToolCall {
+                    id: "call-big".into(),
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                }],
+                reasoning: None,
+            }),
+        },
+        crate::agent::SessionEntry::Message {
+            message: Message::Tool {
+                call_id: "call-big".into(),
+                name: "bash".into(),
+                content: result.to_owned(),
+                is_error: false,
+                synthetic: false,
+                images: vec![],
+            },
+        },
+        parent_answer(),
+    ]
+}
+
+/// The receipt embedded in one bounded field (`read_output ref=…`).
+fn embedded_receipt(text: &str) -> String {
+    let start = text
+        .find("read_output ref=")
+        .expect("the bounded field carries a receipt")
+        + "read_output ref=".len();
+    let end = text[start..].find(']').expect("marker terminator") + start;
+    text[start..end].to_owned()
+}
+
+/// One session's provider projection of its stored history (exactly what its
+/// next request carries): the marker-aware head load plus the same bounding the
+/// live agent applies. Run for the parent and for the forked child, it proves
+/// whether the two requests agree byte for byte.
+async fn projected_history(root: &std::path::Path, session: &str) -> Vec<Message> {
+    let store = SessionStore::Jsonl;
+    let loaded = store.load_fork_head_located(root, session).await.unwrap();
+    let mut agent = Agent::new(
+        Box::new(chat_model("http://127.0.0.1:1".into(), "projected-model")),
+        vec![],
+    );
+    agent.restore_located(loaded.entries, loaded.locations);
+    agent.set_inherited_prefix(loaded.inherited);
+    agent.context_request()
+}
+
+/// The projected text of the (single) tool result in a session's history.
+fn tool_text(messages: &[Message]) -> String {
+    messages
+        .iter()
+        .find_map(|message| match message {
+            Message::Tool { content, .. } => Some(content.clone()),
+            _ => None,
+        })
+        .expect("the turn carries a tool result")
+}
+
+#[tokio::test]
+async fn fork_bounds_an_inherited_oversized_tool_result_with_an_owner_receipt() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    let result = oversized_tool_result();
+    seed_parent_entries(&root, "parent", &tool_turn_entries(&result));
+    let (url, captured) = capturing_model().await;
+    let model = chat_model(url, "receipt-model");
+    let head_model = model.clone();
+    let mut delegate = forking_delegate(&root, &fork_record(&root, "parent"), model)
+        .with_fork_head(Arc::new(move || {
+            fork_head(head_model.clone(), Some("parent system"), None, false)
+        }));
+    let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
+    delegate.set_event_sender(sender);
+    delegate.set_session_handle("parent", live_parent_endpoint());
+
+    delegate
+        .execute(json!({
+            "task": "inherited receipt work",
+            "fork": true,
+            "workspace": root.display().to_string()
+        }))
+        .await
+        .expect("the fork spawns");
+    let (status, output) = await_background_status(&mut completions).await;
+    assert_eq!(status.as_deref(), Some("completed"));
+    let child_id = output
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("fork session: "))
+        .expect("the completion reports the fork session id")
+        .to_owned();
+
+    // The parent's own request copy: bounded, own receipt.
+    let parent_messages = projected_history(&root, "parent").await;
+    let parent_field = tool_text(&parent_messages);
+    assert!(parent_field.len() < result.len(), "the parent bounds it");
+    assert!(!parent_field.contains("OMITTED-MIDDLE"));
+    let parent_receipt = embedded_receipt(&parent_field);
+    let parent_verified = match crate::output_receipt::parse_ref(&parent_receipt).unwrap() {
+        crate::output_receipt::OutputRef::Legacy(verified) => verified,
+        other => panic!("every receipt is owner-bearing now, got {other:?}"),
+    };
+    assert_eq!(parent_verified.location.session, "parent");
+    assert_eq!(parent_verified.total, result.len());
+
+    // The child's real wire request: the SAME field, bounded, with an
+    // owner-bearing receipt.
+    let body = captured_request_body(&captured);
+    let messages = body["messages"].as_array().expect("messages array");
+    let child_field = messages
+        .iter()
+        .find(|message| message["role"] == "tool" && message["tool_call_id"] == "call-big")
+        .and_then(|message| message["content"].as_str())
+        .expect("the child's request carries the inherited tool result")
+        .to_owned();
+    assert!(
+        child_field.len() < result.len(),
+        "the fork must bound the inherited field, got {} bytes",
+        child_field.len()
+    );
+    assert!(!child_field.contains("OMITTED-MIDDLE"));
+    let child_receipt = embedded_receipt(&child_field);
+    let verified = match crate::output_receipt::parse_ref(&child_receipt).unwrap() {
+        crate::output_receipt::OutputRef::Legacy(verified) => verified,
+        other => panic!("the inherited field must name its owner, got {other:?}"),
+    };
+    assert_eq!(verified.location.session, "parent");
+    assert_eq!(
+        verified.location.key,
+        crate::session_store::LocatedKey::Jsonl { ordinal: 2 }
+    );
+    assert_eq!(
+        verified.total,
+        result.len(),
+        "the receipt binds the full field"
+    );
+    let parent_locations = Session::load_located(&root, "parent").unwrap();
+    let parent_row = parent_locations.locations[2].as_ref().unwrap();
+    assert_eq!(
+        &verified.location, parent_row,
+        "the receipt carries the parent's EXACT physical identity"
+    );
+    // `h` and `t` are properties of the STORED ROW, so both sides compute the
+    // same values: `h` pins the parent's persisted payload bytes, `t` is the
+    // field's full byte length there.
+    assert_eq!(verified.location.entry_hash, parent_row.entry_hash);
+    assert_eq!(
+        parent_verified.location, verified.location,
+        "parent and child name the same row"
+    );
+    assert_eq!(parent_verified.total, verified.total);
+    assert_eq!(
+        parent_receipt, child_receipt,
+        "the receipt bytes do not depend on the reader"
+    );
+
+    // THE ACCEPTANCE ASSERTION: the parent's projection of that stored row and
+    // the child's first request carry BYTE-IDENTICAL text — receipt included.
+    // This is what lets the provider's prefix cache match past a bounded field.
+    assert_eq!(
+        child_field, parent_field,
+        "an inherited field must project byte-identically to the parent's own"
+    );
+    // Re-folding the child from its store (the resume path) agrees too, so the
+    // equality is not an artifact of the seeded in-memory prefix.
+    let child_messages = projected_history(&root, &child_id).await;
+    let child_reloaded = tool_text(&child_messages);
+    assert_eq!(
+        child_reloaded, parent_field,
+        "the child's reloaded projection is the same bytes"
+    );
+    // Stronger: EVERY inherited message projects identically (the child's own
+    // later entries follow the prefix).
+    assert!(child_messages.len() >= parent_messages.len());
+    assert_eq!(
+        child_messages[..parent_messages.len()],
+        parent_messages[..],
+        "the whole inherited prefix projects byte-identically"
+    );
+
+    // `read_output` from the CHILD resolves the owner-bearing receipt to the
+    // parent's original bytes.
+    let page = crate::tools::output::execute(
+        &SessionStore::Jsonl,
+        &root,
+        &child_id,
+        &child_receipt,
+        0,
+        32 * 1024,
+    )
+    .await
+    .expect("the child resolves the parent's row");
+    let page: serde_json::Value = serde_json::from_str(&page).unwrap();
+    assert_eq!(page["text"].as_str().unwrap(), result);
+    assert_eq!(page["total_bytes"].as_u64().unwrap(), result.len() as u64);
 }
 
 #[tokio::test]

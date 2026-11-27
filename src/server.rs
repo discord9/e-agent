@@ -9626,16 +9626,20 @@ model = "deepseek-chat"
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["next_before_seq"], serde_json::json!(2));
         assert_eq!(value["next_older_session"], serde_json::json!(owner));
-        // The head owns an inherited (UNLOCATED) prefix even though it hands
-        // out an older cursor: the web client must treat the head as
-        // authoritative for those rows rather than judging by the cursor.
+        // The head owns an inherited prefix even though it hands out an older
+        // cursor: those rows carry the OWNER's physical identity (never a child
+        // one), so the web client reconciles them by key exactly like its own.
+        let locations = value["locations"].as_array().unwrap();
         assert!(
-            value["locations"]
-                .as_array()
-                .unwrap()
+            locations[..3]
                 .iter()
-                .any(|location| location.is_null()),
-            "inherited rows carry no child location: {value}"
+                .all(|location| location["session"] == serde_json::json!(owner)),
+            "inherited rows name their owner: {value}"
+        );
+        assert_eq!(
+            locations[3]["session"],
+            serde_json::json!(child),
+            "the child's own marker stays child-owned: {value}"
         );
         assert_eq!(
             value["entries"].as_array().unwrap().len(),

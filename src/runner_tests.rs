@@ -6905,24 +6905,29 @@ async fn runner_durable_before_ref_for_oversized_tool_content() {
     };
 
     // The embedded receipt resolves against the DURABLY PERSISTED session
-    // file (durable-before-ref): read the exact full field back.
+    // file (durable-before-ref): read the exact full field back through the
+    // production `read_output` path. The receipt is owner-bearing and names
+    // this session's own row.
     let ref_start = bounded.find("ref=eout1.").unwrap() + "ref=".len();
     let ref_end = bounded[ref_start..].find(']').unwrap() + ref_start;
     let receipt = &bounded[ref_start..ref_end];
-    let parsed = crate::output_receipt::parse_ref(receipt).unwrap();
-    let crate::output_receipt::OutputRef::Direct { entry_id, field } = parsed else {
-        panic!("expected a direct short ref, got legacy: {receipt}");
+    let verified = match crate::output_receipt::parse_ref(receipt).unwrap() {
+        crate::output_receipt::OutputRef::Legacy(verified) => verified,
+        other => panic!("expected an owner-bearing ref, got {other:?}"),
     };
-    assert_eq!(field, crate::output_receipt::FieldId::ToolContent);
-    let bytes = store
-        .read_field_direct(temp.path(), "durable-ref", entry_id, field)
-        .await
-        .unwrap();
+    assert_eq!(verified.location.session, "durable-ref");
+    assert_eq!(verified.field, crate::output_receipt::FieldId::ToolContent);
+    let page =
+        crate::tools::output::execute(&store, temp.path(), "durable-ref", receipt, 0, 32 * 1024)
+            .await
+            .expect("the receipt resolves against the persisted session");
+    let page: serde_json::Value = serde_json::from_str(&page).unwrap();
     assert_eq!(
-        bytes,
-        tool.as_bytes(),
+        page["text"].as_str().unwrap(),
+        tool,
         "receipt reads the persisted full field"
     );
+    assert_eq!(page["total_bytes"].as_u64().unwrap(), tool.len() as u64);
 }
 
 #[tokio::test]
@@ -10506,10 +10511,13 @@ async fn assert_read_only_runner_cancel_while_sqlite_read_pending(read_output: b
             .unwrap();
         let loaded = store.load_located(temp.path(), &session_id).await.unwrap();
         let location = loaded.locations.last().unwrap().as_ref().unwrap();
-        (serde_json::json!({
-            "ref": crate::output_receipt::issue_direct(location, crate::output_receipt::FieldId::NoticeText),
-            "limit": 100,
-        }).to_string(), "read_output")
+        // The HISTORICAL short form an older build would have persisted: it
+        // still resolves inside this session's own store.
+        let reference = format!("eout1.{}.n", location.key.seq());
+        (
+            serde_json::json!({"ref": reference, "limit": 100}).to_string(),
+            "read_output",
+        )
     } else {
         store
             .append(

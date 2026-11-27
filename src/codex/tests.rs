@@ -854,3 +854,74 @@ async fn responses_request_hot_reloads_disk_login_headers() {
     model.complete(&messages, &[], None).await.unwrap();
     server.await.unwrap();
 }
+
+/// The bounded projection of one oversized tool result whose persisted row
+/// belongs to ANOTHER session (an inherited fork prefix). Shared by the two
+/// wire-encoder tests: the receipt must name the owner, and the encoder must
+/// carry the bounded text verbatim.
+fn forked_bounded_tool_content() -> (String, String) {
+    let location = crate::session_store::EntryLocation {
+        backend: "jsonl",
+        fingerprint: "fp".into(),
+        backend_fp: "bi".into(),
+        session: "parent".into(),
+        key: crate::session_store::LocatedKey::Jsonl { ordinal: 5 },
+        entry_hash: "hash".into(),
+    };
+    let content = format!(
+        "{}{}{}",
+        "h".repeat(crate::output_receipt::PROJECTION_HEAD_BYTES),
+        "OMITTED-MIDDLE",
+        "t".repeat(crate::output_receipt::PROJECTION_TAIL_BYTES)
+    );
+    let bounded = crate::output_receipt::bound_field(
+        &content,
+        &location,
+        crate::output_receipt::FieldId::ToolContent,
+        content.len(),
+    );
+    let start = bounded.find("read_output ref=").unwrap() + "read_output ref=".len();
+    let end = bounded[start..].find(']').unwrap() + start;
+    let reference = bounded[start..end].to_owned();
+    // The receipt names the OWNER, binds the full field and round-trips.
+    match crate::output_receipt::parse_ref(&reference).unwrap() {
+        crate::output_receipt::OutputRef::Legacy(verified) => {
+            assert_eq!(verified.location.session, "parent");
+            assert_eq!(verified.location, location);
+            assert_eq!(verified.total, content.len());
+        }
+        other => panic!("an inherited field must carry an owner-bearing receipt: {other:?}"),
+    }
+    assert!(!bounded.contains("OMITTED-MIDDLE"), "the field is bounded");
+    (bounded, reference)
+}
+
+/// The Responses encoder carries the same bounded inherited field verbatim
+/// (owner-bearing receipt included) in the `function_call_output` item.
+#[test]
+fn responses_wire_carries_a_forked_fields_owner_bearing_receipt() {
+    let (bounded, reference) = forked_bounded_tool_content();
+    let request = ResponsesRequest::from_internal(
+        "codex",
+        None,
+        &[Message::Tool {
+            call_id: "call-1".into(),
+            name: "bash".into(),
+            content: bounded.clone(),
+            is_error: false,
+            synthetic: false,
+            images: vec![],
+        }],
+        &[],
+        None,
+    );
+    let value = serde_json::to_value(request).unwrap();
+    assert_eq!(value["input"][0]["type"], "function_call_output");
+    assert_eq!(value["input"][0]["output"], bounded.as_str());
+    assert!(
+        value["input"][0]["output"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("read_output ref={reference}]"))
+    );
+}

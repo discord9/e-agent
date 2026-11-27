@@ -1,8 +1,16 @@
 //! Durable `eout1` output refs.
 //!
-//! New refs directly name a persisted entry in the current session:
-//! `eout1.<entry-id>.<field-code>`. Historical self-contained long refs
-//! remain accepted for transcript compatibility.
+//! Every ref this module ISSUES is owner-bearing:
+//! `eout1.<base64url(json)>` carries the session that physically stores the row
+//! (its workspace and backend-instance fingerprints, the pinned physical key,
+//! the payload hash and the field's full size). The bytes therefore depend only
+//! on the STORED ROW, never on which session projects it — a zero-copy fork's
+//! inherited prefix projects exactly the same field text as the parent's own
+//! request, which is what keeps the provider's prefix cache matching.
+//!
+//! The historical short `eout1.<entry-id>.<field-code>` form is still ACCEPTED
+//! for transcript compatibility: it names a key inside the READER'S own session
+//! and keeps resolving there. Nothing issues it any more.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -69,7 +77,8 @@ pub enum FieldId {
     CompactionRetained,
 }
 impl FieldId {
-    /// The one-character durable direct-ref field code.
+    /// The one-character field code of the historical SHORT ref form
+    /// (`eout1.<entry-id>.<code>`), still parsed for transcript compatibility.
     pub fn short_code(self) -> char {
         match self {
             Self::BgOutput => 'b',
@@ -131,14 +140,37 @@ pub enum OutputRef {
     Legacy(VerifiedRef),
 }
 
-/// Format a direct durable ref from its persisted location. SQLite and
-/// Greptime locations deliberately use their logical seq, not event time.
-pub fn issue_direct(location: &EntryLocation, field: FieldId) -> String {
-    let entry_id = match location.key {
-        LocatedKey::Jsonl { ordinal } => ordinal,
-        LocatedKey::Sqlite { seq, .. } | LocatedKey::Greptime { seq, .. } => seq,
-    };
-    format!("{RECEIPT_VERSION}.{entry_id}.{}", field.short_code())
+/// Format the owner-bearing ref: `eout1.<base64url(json)>`, carrying the
+/// owning session, its workspace and backend-instance fingerprints, the pinned
+/// physical key, the payload hash `h` and the field's full size `t`.
+///
+/// It is the ONLY form issued, for every bounded field and for every reader.
+/// The bytes are a pure function of the stored row (see the module docs), so
+/// the parent and a fork that inherited the row emit the SAME string; a
+/// reader-dependent choice would break the provider's prefix cache at the first
+/// bounded field. A short key alone would also be ambiguous: JSONL ordinals
+/// restart in every file and the SQL backends number each session separately, so
+/// the child and its parent both have (say) entry 5.
+///
+/// `read_output` resolves it after proving the named owner is the reader's own
+/// session or one of its transitive fork sources.
+pub fn issue_owner(location: &EntryLocation, field: FieldId, total: usize) -> String {
+    let (o, q, e) = located_key_params(&location.key);
+    let payload = serde_json::json!({"v": RECEIPT_VERSION, "f": field.code(), "b": location.backend, "fp": location.fingerprint, "bi": location.backend_fp, "s": location.session, "o": o, "q": q, "e": e, "h": location.entry_hash, "t": total, "m": "ignored"});
+    format!(
+        "{RECEIPT_VERSION}.{}",
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).expect("serializable receipt"))
+    )
+}
+
+/// The backend-shaped key members of an owner-bearing ref payload.
+fn located_key_params(key: &LocatedKey) -> (Option<i64>, Option<i64>, Option<i64>) {
+    match key {
+        LocatedKey::Jsonl { ordinal } => (Some(*ordinal), None, None),
+        LocatedKey::Sqlite { seq, event_time_us } | LocatedKey::Greptime { seq, event_time_us } => {
+            (None, Some(*seq), Some(*event_time_us))
+        }
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -231,22 +263,12 @@ pub fn parse_ref(reference: &str) -> Result<OutputRef, ReceiptError> {
     }))
 }
 
-/// Test helper: build a historical self-contained long ref for a legacy
-/// location. The `m` member is emitted as a placeholder and ignored on
-/// parse — there is no MAC/keying anymore.
+/// Test helper: build the historical self-contained long ref for a location
+/// (the same bytes [`issue_owner`] emits). The `m` member is a placeholder and
+/// is ignored on parse — there is no MAC/keying anymore.
 #[cfg(test)]
 pub fn issue_legacy_for_test(location: &EntryLocation, field: FieldId, total: usize) -> String {
-    let (o, q, e) = match location.key {
-        LocatedKey::Jsonl { ordinal } => (Some(ordinal), None, None),
-        LocatedKey::Sqlite { seq, event_time_us } | LocatedKey::Greptime { seq, event_time_us } => {
-            (None, Some(seq), Some(event_time_us))
-        }
-    };
-    let payload = serde_json::json!({"v": RECEIPT_VERSION, "f": field.code(), "b": location.backend, "fp": location.fingerprint, "bi": location.backend_fp, "s": location.session, "o": o, "q": q, "e": e, "h": location.entry_hash, "t": total, "m": "ignored"});
-    format!(
-        "{RECEIPT_VERSION}.{}",
-        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).expect("serializable receipt"))
-    )
+    issue_owner(location, field, total)
 }
 
 /// Test helper: decode a historical self-contained long ref.
@@ -390,31 +412,36 @@ pub fn page_field(bytes: &[u8], offset: usize, limit: usize) -> Result<FieldPage
     })
 }
 
-/// UTF-8-safe head+tail projection with a session-local short receipt. `total` is
-/// the FULL field byte length the receipt binds — for plain messages it
-/// equals `text.len()`; for a message inside a compaction's retained tail
-/// it is the length of the WHOLE persisted `compaction_retained` field
-/// (the array), which is what `read_output` returns for that receipt.
+/// UTF-8-safe head+tail projection with a receipt. `total` is the FULL field
+/// byte length the receipt binds — for plain messages it equals `text.len()`;
+/// for a message inside a compaction's retained tail it is the length of the
+/// WHOLE persisted `compaction_retained` field (the array), which is what
+/// `read_output` returns for that receipt.
+///
+/// The receipt is ALWAYS the owner-bearing form and depends only on the stored
+/// row, so two sessions projecting the same row produce byte-identical text: a
+/// zero-copy fork's inherited prefix is indistinguishable from the parent's own
+/// request. Nothing about the projecting session enters these bytes.
+///
 /// Returns the field byte-identical when it fits the budget or when no
 /// located key exists (leave full — never emit an unusable ref).
-pub fn bound_field(text: &str, location: &EntryLocation, field: FieldId, _total: usize) -> String {
+pub fn bound_field(text: &str, location: &EntryLocation, field: FieldId, total: usize) -> String {
     let text_total = text.len();
     if text_total <= PROJECTION_THRESHOLD {
         return text.to_owned();
     }
+    let receipt = issue_owner(location, field, total);
     let head_len = utf8_back_boundary(text.as_bytes(), PROJECTION_HEAD_BYTES);
     let tail_start = utf8_front_boundary(text.as_bytes(), text_total - PROJECTION_TAIL_BYTES);
     if tail_start <= head_len {
         // Degenerate (e.g. a single huge multibyte char): serve the head
         // only — the tail would overlap it.
-        let receipt = issue_direct(location, field);
         return format!(
             "{}\n[truncated: {} bytes omitted; read_output ref={receipt}]\n",
             &text[..head_len],
             text_total - head_len
         );
     }
-    let receipt = issue_direct(location, field);
     let omitted = tail_start - head_len;
     format!(
         "{}\n[truncated: {omitted} bytes omitted; read_output ref={receipt}]\n{}",
@@ -458,8 +485,11 @@ pub(crate) fn utf8_front_boundary(bytes: &[u8], offset: usize) -> usize {
     pos
 }
 
-/// Compatibility validation used by backend readers. New refs are already
-/// session-local; legacy refs retain their physical location fields.
+/// Compatibility validation used by backend readers: a ref's backend,
+/// workspace fingerprint, backend-instance fingerprint and OWNING session must
+/// all match the store that is about to serve it (the reader opens the owner's
+/// store, see `read_output`), and every ref retains its physical location
+/// fields.
 pub(crate) fn validate_location_for_store(
     location: &EntryLocation,
     backend_kind: &str,
@@ -485,7 +515,8 @@ mod tests {
     use super::*;
     fn location(key: LocatedKey) -> EntryLocation {
         EntryLocation {
-            backend: "jsonl",
+            // Every backend's key shape must render (and parse) as itself.
+            backend: key.backend(),
             fingerprint: "fp".into(),
             backend_fp: "bi".into(),
             session: "session".into(),
@@ -493,35 +524,41 @@ mod tests {
             entry_hash: "hash".into(),
         }
     }
+    /// `issue_owner` pins the backend-shaped key members of every backend: the
+    /// JSONL ordinal, or the SQL `seq` + `event_time` pair (never "latest
+    /// wins"), so the same row always renders the same ref.
     #[test]
-    fn direct_refs_use_location_identity_and_field_codes() {
-        assert_eq!(
-            issue_direct(
-                &location(LocatedKey::Jsonl { ordinal: 12 }),
-                FieldId::ToolContent
-            ),
-            "eout1.12.t"
-        );
-        assert_eq!(
-            issue_direct(
-                &location(LocatedKey::Sqlite {
+    fn owner_refs_pin_every_backend_key_shape() {
+        for (key, member) in [
+            (LocatedKey::Jsonl { ordinal: 12 }, "o"),
+            (
+                LocatedKey::Sqlite {
                     seq: 8,
-                    event_time_us: 9
-                }),
-                FieldId::BgOutput
+                    event_time_us: 9,
+                },
+                "q",
             ),
-            "eout1.8.b"
-        );
-        assert_eq!(
-            issue_direct(
-                &location(LocatedKey::Greptime {
+            (
+                LocatedKey::Greptime {
                     seq: 37,
-                    event_time_us: 9
-                }),
-                FieldId::CompactionSummary
+                    event_time_us: 9,
+                },
+                "e",
             ),
-            "eout1.37.s"
-        );
+        ] {
+            let reference = issue_owner(&location(key.clone()), FieldId::ToolContent, 42);
+            let verified = verify_legacy_for_test(&reference).unwrap();
+            assert_eq!(verified.location, location(key), "the key is pinned");
+            assert_eq!(verified.total, 42);
+            let json = String::from_utf8(
+                URL_SAFE_NO_PAD
+                    .decode(&reference[RECEIPT_VERSION.len() + 1..])
+                    .unwrap(),
+            )
+            .unwrap();
+            let payload: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert!(payload[member].is_i64(), "{member} carries the key: {json}");
+        }
     }
     #[test]
     fn direct_parser_and_field_codes() {
@@ -564,5 +601,71 @@ mod tests {
             parse_ref(&reference).unwrap(),
             OutputRef::Legacy(VerifiedRef { total: 42, .. })
         ));
+    }
+    /// The only form issued: the owner-bearing ref. Its bytes are a pure
+    /// function of the stored row, so the projection of one row is identical no
+    /// matter which session projects it (the property the provider prefix cache
+    /// depends on), and it round-trips the owner's exact location and total.
+    #[test]
+    fn bound_field_always_emits_the_owner_bearing_ref() {
+        let location = location(LocatedKey::Jsonl { ordinal: 5 });
+        let huge = format!(
+            "{}{}{}",
+            "h".repeat(PROJECTION_HEAD_BYTES),
+            "OMITTED-MIDDLE",
+            "t".repeat(PROJECTION_TAIL_BYTES)
+        );
+        let bounded = bound_field(&huge, &location, FieldId::ToolContent, huge.len());
+        assert!(!bounded.contains(&huge), "the middle is projected out");
+        assert!(
+            !bounded.contains("ref=eout1.5.t]"),
+            "the short form is never issued: {bounded:?}"
+        );
+        let ref_start = bounded.find("read_output ref=").unwrap() + "read_output ref=".len();
+        let ref_end = bounded[ref_start..].find(']').unwrap() + ref_start;
+        let reference = &bounded[ref_start..ref_end];
+        match parse_ref(reference).unwrap() {
+            OutputRef::Legacy(verified) => {
+                assert_eq!(
+                    verified.location, location,
+                    "the owner's location is copied"
+                );
+                assert_eq!(verified.field, FieldId::ToolContent);
+                assert_eq!(verified.total, huge.len(), "the full field size is bound");
+            }
+            other => panic!("a bounded field must carry an owner-bearing ref, got {other:?}"),
+        }
+        // Same row, same bytes — there is no reader input left to vary.
+        assert_eq!(
+            bounded,
+            bound_field(&huge, &location, FieldId::ToolContent, huge.len())
+        );
+        assert_eq!(
+            issue_owner(&location, FieldId::ToolContent, huge.len()),
+            reference,
+            "the projection embeds exactly the issuer's bytes"
+        );
+        // The historical SHORT form is still parsed (old persisted refs keep
+        // resolving inside the reader's own session).
+        for (entry_id, field) in [
+            (0, FieldId::BgOutput),
+            (5, FieldId::ToolContent),
+            (12, FieldId::NoticeText),
+            (7, FieldId::AssistantContent),
+            (3, FieldId::UserContent),
+            (1, FieldId::CompactionSummary),
+            (2, FieldId::CompactionRetained),
+        ] {
+            let legacy = format!("{RECEIPT_VERSION}.{entry_id}.{}", field.short_code());
+            assert_eq!(
+                parse_ref(&legacy).unwrap(),
+                OutputRef::Direct { entry_id, field },
+                "{legacy}"
+            );
+            assert_eq!(
+                FieldId::from_short_code(&field.short_code().to_string()),
+                Some(field)
+            );
+        }
     }
 }

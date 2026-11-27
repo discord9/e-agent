@@ -5230,8 +5230,11 @@ async fn zero_copy_fork_child_stores_one_marker_row_and_loads_the_prefix() {
     assert_eq!(resolved.entries[..4], entries[..]);
     assert_eq!(resolved.entries[4], marker);
     assert!(
-        resolved.locations[..4].iter().all(Option::is_none),
-        "inherited entries carry no child location"
+        resolved.locations[..4].iter().all(|location| location
+            .as_ref()
+            .is_some_and(|loc| loc.session == "sql-parent")),
+        "inherited entries name their OWNER, never a child location: {:?}",
+        resolved.locations
     );
     assert!(resolved.locations[4].is_some());
 
@@ -5484,7 +5487,13 @@ async fn sqlite_pinned_fork_marker_pages_to_the_segment_holding_the_cut() {
     assert_eq!(resolved.inherited, 2);
     assert_eq!(resolved.entries[..2], rows[2..4]);
     assert_eq!(resolved.entries[2], marker);
-    assert!(resolved.locations[..2].iter().all(Option::is_none));
+    assert!(
+        resolved.locations[..2].iter().all(|location| location
+            .as_ref()
+            .is_some_and(|loc| loc.session == "pin-parent")),
+        "inherited entries name their OWNER: {:?}",
+        resolved.locations
+    );
     assert!(resolved.locations[2].is_some());
 }
 
@@ -5663,7 +5672,13 @@ async fn head_page_probe_keeps_ordinary_sql_pages_bounded_and_resolves_forks() {
     assert_eq!(page.entries.len(), 41, "inherited prefix + marker");
     assert_eq!(page.entries[..40], entries[..]);
     assert_eq!(page.next_before_seq, None, "no child seq to page by");
-    assert!(page.locations[..40].iter().all(Option::is_none));
+    assert!(
+        page.locations[..40].iter().all(|location| location
+            .as_ref()
+            .is_some_and(|loc| loc.session == "sql-head-parent")),
+        "inherited rows keep the parent's physical identity: {:?}",
+        page.locations
+    );
     assert!(page.locations[40].is_some());
 }
 
@@ -5853,7 +5868,13 @@ async fn head_page_probe_finds_a_marker_beyond_a_sparse_seq() {
         "the inherited prefix is resolved despite the sparse marker seq"
     );
     assert_eq!(page.next_before_seq, None, "no child seq to page by");
-    assert!(page.locations[..2].iter().all(Option::is_none));
+    assert!(
+        page.locations[..2].iter().all(|location| location
+            .as_ref()
+            .is_some_and(|loc| loc.session == "sparse-parent")),
+        "inherited rows name their owner: {:?}",
+        page.locations
+    );
     assert!(page.locations[2..].iter().all(Option::is_some));
 }
 
