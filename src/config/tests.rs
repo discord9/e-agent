@@ -116,7 +116,7 @@ context_window = 131072
 }
 
 #[test]
-fn vision_defaults_to_false_and_reads_from_model_profile() {
+fn vision_defaults_to_true_and_reads_from_model_profile() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("key"), "key").unwrap();
     let path = write_config(
@@ -128,13 +128,13 @@ base_url = "https://api.kimi.com/coding/v1"
 api_key_file = "key"
 [models."kimi/k3"]
 model = "k3"
-vision = true
 "#,
     );
+    // Absent `vision` means vision-capable.
     let resolved = Config::from_path(&path).unwrap().resolve(None).unwrap();
     assert!(resolved.vision);
 
-    // Absent `vision` means false (deepseek-style default).
+    // An explicit `vision = false` opts a text-only model out.
     let path = write_config(
         temp.path(),
         r#"
@@ -144,10 +144,31 @@ base_url = "https://api.deepseek.com/v1"
 api_key_file = "key"
 [models."deepseek/v3"]
 model = "deepseek-chat"
+vision = false
 "#,
     );
     let resolved = Config::from_path(&path).unwrap().resolve(None).unwrap();
     assert!(!resolved.vision);
+
+    // The opt-out profile still fails the vision gate, with the existing
+    // message (it names the wire model and says images are unsupported).
+    let image = crate::agent::ImagePart {
+        hash: "x".into(),
+        mime: "image/png".into(),
+    };
+    let error = crate::agent::ensure_vision_supported(
+        &resolved.model,
+        resolved.vision,
+        &[crate::agent::Message::User {
+            content: "hi".into(),
+            images: vec![image],
+        }],
+    )
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("deepseek-chat does not support image input"),
+        "{error:#}"
+    );
 }
 
 #[test]
