@@ -55,6 +55,10 @@ reasoning_effort = "high"          # provider-specific pass-through
 vision = true                      # default; a text-only model sets false
 ```
 
+`vision` defaults to on, so a profile written for a text-only model must set
+`vision = false` or its requests will carry images — see the
+[upgrade note](#image-input-multimodal) before reusing an existing config.
+
 A provider needs exactly one of `api_key_file` or `api_key_env`; with neither it
 is treated as an unauthenticated local endpoint (vLLM, Ollama, llama.cpp) and
 requests omit `Authorization`. Provider names are inferred from the prefix
@@ -443,10 +447,32 @@ credential and profile values instead of `OPENAI_*`; see [Run](#run).
 `read_image` (tool) and the REPL `/image <path>` command attach png/jpeg/webp/gif
 images up to 10 MiB; bytes are stored once in a content-addressed cache under
 `$XDG_STATE_HOME/e-agent/images/`. Sessions persist only the reference, never
-base64, and the wire re-reads the file when sending. Profiles are
-vision-capable by default; a text-only model must set `vision = false`,
-otherwise the turn fails with a model-does-not-support-images error.
+base64, and the wire re-reads the file when sending.
+
+Profiles are vision-capable by default, so image parts in a request — including
+references already stored in the session history — go to the provider. Set
+`vision = false` for a text-only model: image parts are then stripped from every
+outgoing request (the affected message text gains a short note that the images
+were skipped), while the session history keeps the references, so switching
+back to a vision model sends them again. An explicit `/image <path>` on a
+non-vision model is refused before anything is committed: the rejection is
+reported as an error and the session stays alive instead of failing. Leaving the
+default on for a text-only model sends the images anyway and the turn ends on
+the provider's error — a recognized image rejection is retried once with those
+images omitted.
 `generate_image` (main session only, ChatGPT login) writes a PNG.
+
+**Upgrading from a config that omits `vision`.** Omitting `vision` used to mean
+"images are refused"; it now means "vision is on". Every profile that omits
+`vision` — including one written for a text-only model — starts transmitting
+images: newly attached ones, and the ones already recorded in that session's
+history. To keep the old behaviour, set `vision = false` on each such profile
+(`[models."<provider>/<name>"]` in `config.toml`):
+
+```toml
+[models."deepseek/deepseek-chat"]
+vision = false                     # text-only: keep images off the wire
+```
 
 ## SQLite session backend
 

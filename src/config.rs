@@ -375,9 +375,14 @@ struct ModelProfile {
     /// shows a percentage alongside the token count.
     context_window: Option<u64>,
     /// Whether the model accepts image input. Defaults to true: user
-    /// messages with attached images are sent to the model. A text-only
-    /// model must opt out explicitly with `vision = false`; otherwise its
-    /// image-bearing turns fail the vision gate with a clear error.
+    /// messages with attached images are sent to the model, including
+    /// references already recorded in the session history. A text-only
+    /// model must opt out explicitly with `vision = false`: image parts are
+    /// then stripped from each outgoing request (the message text notes
+    /// that the images were skipped) while the session history keeps the
+    /// references, and an explicit `/image` attach is refused before
+    /// anything is committed — the error is reported and the session stays
+    /// alive.
     #[serde(default)]
     vision: Option<bool>,
     /// DeepSeek Chat wire compatibility (default false). Solely for
