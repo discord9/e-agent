@@ -52,6 +52,8 @@ fn test_entries() -> Vec<SessionEntry> {
             content: "exit code: 0\nstdout:\nok\n".into(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         }
         .into(),
@@ -61,6 +63,8 @@ fn test_entries() -> Vec<SessionEntry> {
             content: "command not found".into(),
             is_error: true,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         }
         .into(),
@@ -94,6 +98,7 @@ fn test_entries() -> Vec<SessionEntry> {
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         },
         // Entry with a label to verify serde roundtrip with label.
         SessionEntry::BackgroundCompletion {
@@ -107,6 +112,7 @@ fn test_entries() -> Vec<SessionEntry> {
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         },
         Message::User {
             content: "你好世界👋\n多行".into(),
@@ -302,6 +308,29 @@ async fn connect_migrates_legacy_sessions_table_missing_feature_columns() {
     assert_eq!(meta.pinned, None, "old rows read pinned back as NULL");
     assert_eq!(meta.title, None, "old rows read title back as NULL");
     assert_eq!(meta.writer, None, "old rows read writer back as NULL");
+    assert_eq!(
+        meta.acp_session_id, None,
+        "old rows read acp_session_id back as NULL (no ACP conversation yet)"
+    );
+    assert_eq!(
+        session
+            .acp_session_id("legacy-1")
+            .await
+            .expect("read the migrated acp_session_id"),
+        None,
+        "the per-session ACP read works on a migrated table"
+    );
+    // The ACP id is a nullable per-session column, written like the other
+    // feature columns (one full snapshot row) and read back through the same
+    // path `acp_prompt` uses.
+    session
+        .set_acp_session_id("legacy-1", Some("70bd9ad0-acp"))
+        .await
+        .expect("store the ACP session id on the migrated table");
+    assert_eq!(
+        session.acp_session_id("legacy-1").await.unwrap().as_deref(),
+        Some("70bd9ad0-acp")
+    );
 
     session
         .set_archived("legacy-1", true)
@@ -635,6 +664,8 @@ async fn history_query_search_is_literal_and_ignores_unselected_bad_json() {
             images: vec![],
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
         },
     })
     .unwrap();
@@ -2425,6 +2456,7 @@ fn backfill_meta_snapshot_preserves_immutable_columns() {
         title: Some("a title".into()),
         pinned: Some(true),
         archived: Some(true),
+        acp_session_id: None,
         writer: None,
         label: None,
     };
@@ -2474,6 +2506,7 @@ fn backfill_meta_snapshot_preserves_immutable_columns() {
         title: None,
         pinned: None,
         archived: None,
+        acp_session_id: None,
         writer: None,
         label: None,
     };
@@ -3241,6 +3274,7 @@ async fn finished_tasks_reads_background_completion_entries_newest_first() {
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         },
         SessionEntry::BackgroundCompletion {
             id: 2,
@@ -3253,6 +3287,7 @@ async fn finished_tasks_reads_background_completion_entries_newest_first() {
             status: Some("failed".into()),
             kind: Some("bash".into()),
             cancellation_source: None,
+            subagent_session_id: None,
         },
         SessionEntry::BackgroundCompletion {
             id: 3,
@@ -3265,6 +3300,7 @@ async fn finished_tasks_reads_background_completion_entries_newest_first() {
             status: Some("completed".into()),
             kind: Some("delegate".into()),
             cancellation_source: None,
+            subagent_session_id: Some("sub-1".into()),
         },
     ];
     session
@@ -3290,6 +3326,10 @@ async fn finished_tasks_reads_background_completion_entries_newest_first() {
     assert_eq!(task2.started_at_ms, Some(1_700_000_000_000));
     assert_eq!(task2.duration_ms, Some(500));
     assert_eq!(task2.signal, None);
+    // The persisted row exposes the structured child session id, so the
+    // finished-tasks API never has to parse the output's first line.
+    assert_eq!(finished[0].subagent_session_id.as_deref(), Some("sub-1"));
+    assert_eq!(task2.subagent_session_id, None);
     assert!(
         task2.finished_at_us >= 1_700_000_000_000_000,
         "finished_at is the row's event_time_us (µs clock), got {}",
@@ -4685,6 +4725,7 @@ impl<'a> SnapshotRow<'a> {
             title: self.title.map(str::to_owned),
             pinned: self.pinned.map(|flag| flag == 1),
             archived: self.archived.map(|flag| flag == 1),
+            acp_session_id: None,
             writer: self.writer.map(str::to_owned),
             label: None,
         }
@@ -5230,8 +5271,11 @@ async fn zero_copy_fork_child_stores_one_marker_row_and_loads_the_prefix() {
     assert_eq!(resolved.entries[..4], entries[..]);
     assert_eq!(resolved.entries[4], marker);
     assert!(
-        resolved.locations[..4].iter().all(Option::is_none),
-        "inherited entries carry no child location"
+        resolved.locations[..4].iter().all(|location| location
+            .as_ref()
+            .is_some_and(|loc| loc.session == "sql-parent")),
+        "inherited entries name their OWNER, never a child location: {:?}",
+        resolved.locations
     );
     assert!(resolved.locations[4].is_some());
 
@@ -5484,7 +5528,13 @@ async fn sqlite_pinned_fork_marker_pages_to_the_segment_holding_the_cut() {
     assert_eq!(resolved.inherited, 2);
     assert_eq!(resolved.entries[..2], rows[2..4]);
     assert_eq!(resolved.entries[2], marker);
-    assert!(resolved.locations[..2].iter().all(Option::is_none));
+    assert!(
+        resolved.locations[..2].iter().all(|location| location
+            .as_ref()
+            .is_some_and(|loc| loc.session == "pin-parent")),
+        "inherited entries name their OWNER: {:?}",
+        resolved.locations
+    );
     assert!(resolved.locations[2].is_some());
 }
 
@@ -5663,7 +5713,13 @@ async fn head_page_probe_keeps_ordinary_sql_pages_bounded_and_resolves_forks() {
     assert_eq!(page.entries.len(), 41, "inherited prefix + marker");
     assert_eq!(page.entries[..40], entries[..]);
     assert_eq!(page.next_before_seq, None, "no child seq to page by");
-    assert!(page.locations[..40].iter().all(Option::is_none));
+    assert!(
+        page.locations[..40].iter().all(|location| location
+            .as_ref()
+            .is_some_and(|loc| loc.session == "sql-head-parent")),
+        "inherited rows keep the parent's physical identity: {:?}",
+        page.locations
+    );
     assert!(page.locations[40].is_some());
 }
 
@@ -5853,7 +5909,13 @@ async fn head_page_probe_finds_a_marker_beyond_a_sparse_seq() {
         "the inherited prefix is resolved despite the sparse marker seq"
     );
     assert_eq!(page.next_before_seq, None, "no child seq to page by");
-    assert!(page.locations[..2].iter().all(Option::is_none));
+    assert!(
+        page.locations[..2].iter().all(|location| location
+            .as_ref()
+            .is_some_and(|loc| loc.session == "sparse-parent")),
+        "inherited rows name their owner: {:?}",
+        page.locations
+    );
     assert!(page.locations[2..].iter().all(Option::is_some));
 }
 
@@ -5910,6 +5972,8 @@ fn tail_tool_result(id: &str, content: &str) -> SessionEntry {
         images: vec![],
         is_error: false,
         synthetic: false,
+        started_task_id: None,
+        subagent_session_id: None,
     }
     .into()
 }

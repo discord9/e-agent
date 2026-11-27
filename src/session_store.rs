@@ -299,6 +299,13 @@ pub(crate) fn us_to_datetime(us: i64) -> chrono::NaiveDateTime {
         .naive_utc()
 }
 
+/// [`us_to_datetime`] for a value that came from OUTSIDE this process — a
+/// receipt's pinned `event_time` µs. `None` rather than a panic: a malformed
+/// ref must surface as an error, never take the process down.
+pub(crate) fn checked_us_to_datetime(us: i64) -> Option<chrono::NaiveDateTime> {
+    chrono::DateTime::from_timestamp_micros(us).map(|dt| dt.naive_utc())
+}
+
 /// Convert chrono NaiveDateTime to microseconds-since-epoch for storage
 /// (SQLite stores INTEGER microseconds; Greptime stores NaiveDateTime
 /// directly and does not need this).
@@ -649,9 +656,10 @@ impl LocatedKey {
 /// pinned key, and the SHA-256 hex of the exact persisted payload bytes
 /// (the serialized `SessionEntry` line/row). Aligned 1:1 with the agent
 /// history by [`crate::agent::Agent::restore_locations`]; the provider
-/// projection (`src/output_receipt.rs`) turns a location into a
-/// direct `eout1.<entry-id>.<field-code>` ref, and `read_output` resolves the ref
-/// back to this location.
+/// projection (`src/output_receipt.rs`) turns a location the reader stores
+/// itself into a direct `eout1.<entry-id>.<field-code>` ref and one it does not
+/// (an inherited fork prefix, where `session` names the OWNER) into an
+/// owner-bearing long ref, and `read_output` resolves either back here.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct EntryLocation {
     /// Backend kind code: `"jsonl"` | `"sqlite"` | `"greptime"`.
@@ -702,6 +710,13 @@ impl From<&EntryLocation> for WebEntryLocation {
 /// a located key (all durable backends; legacy/test in-memory entries are
 /// `None` — the projection then leaves such fields full instead of emitting
 /// an unusable receipt ref).
+///
+/// An INHERITED entry's location is the OWNER's: `location.session` names the
+/// session that physically stores the row (this session's fork source, or an
+/// ancestor further up the chain), never this session. The projection bounds
+/// such a field exactly like the owner does and emits an owner-bearing
+/// receipt, so a fork's inherited prefix projects byte-for-byte the same head,
+/// omission marker and tail as the parent's own request.
 #[derive(Clone, Debug)]
 pub struct LoadedLocated {
     pub entries: Vec<SessionEntry>,
@@ -709,7 +724,7 @@ pub struct LoadedLocated {
     pub legacy: bool,
     /// Number of LEADING `entries` inherited read-only from a zero-copy fork
     /// source ([`SessionStore::load_fork_located`]). Those entries are never
-    /// persisted in this session, so they carry no child location; `0` for
+    /// persisted in this session (their locations point at the owner); `0` for
     /// every ordinary load (and for the copy-based forks written by older
     /// builds, whose prefix really is stored here).
     pub inherited: usize,
@@ -727,14 +742,15 @@ pub struct LoadedLocated {
 impl LoadedLocated {
     /// Cut this loaded history to the first `at` entries and mark them as the
     /// inherited fork prefix: exactly the shape
-    /// [`SessionStore::load_fork_located`] returns, with NO child location for
-    /// an inherited entry (its row lives in the source session's store, and a
-    /// numeric `eout1` ref has no session identity — a child-bound ref could
-    /// read the wrong row). Used by the fork producers to seed a child's
-    /// in-memory history without writing anything.
+    /// [`SessionStore::load_fork_located`] returns, keeping each inherited
+    /// entry's OWNER location (its row lives in the source session's store; a
+    /// numeric `eout1` ref has no session identity, but an owner-bearing ref
+    /// does). Used by the fork producers to seed a child's in-memory history
+    /// without writing anything.
     pub fn inherit_prefix(&mut self, at: usize) {
         self.entries.truncate(at);
-        self.locations = vec![None; at];
+        self.locations.truncate(at);
+        self.locations.resize(at, None);
         self.inherited = at;
     }
 }
@@ -742,10 +758,12 @@ impl LoadedLocated {
 /// One entry of a resolved fork context and where it physically lives.
 #[derive(Clone, Debug)]
 enum CutOrigin {
-    /// A row stored by this session at this exact pinned key.
-    Row(String, LocatedKey),
+    /// A row a session really stores, at its exact pinned location (the
+    /// location names the OWNING session — this one or an ancestor).
+    Row(EntryLocation),
     /// An entry read from `session`'s RESOLVED transcript at this 1-based
-    /// index (the prefix of a legacy positional marker).
+    /// index (the prefix of a legacy positional marker, or an entry its source
+    /// has no physical identity for, e.g. a legacy whole-document session).
     Resolved(String, usize),
 }
 
@@ -759,6 +777,21 @@ struct InheritedContext {
     /// position (the compaction that opens the materialized context). `None`
     /// when the context already starts at the owner's own first row.
     older: Option<(String, i64)>,
+}
+
+impl InheritedContext {
+    /// The inherited entries' physical locations, aligned 1:1: `Some` for a row
+    /// a session really stores (its location names the OWNER), `None` for an
+    /// entry with no physical identity (legacy whole-document source).
+    fn locations(&self) -> Vec<Option<EntryLocation>> {
+        self.origins
+            .iter()
+            .map(|origin| match origin {
+                CutOrigin::Row(location) => Some(location.clone()),
+                CutOrigin::Resolved(..) => None,
+            })
+            .collect()
+    }
 }
 
 /// Index of the child's OWN [`SessionEntry::ForkedFrom`] marker when this
@@ -780,6 +813,18 @@ pub(crate) fn zero_copy_marker(entries: &[SessionEntry]) -> Option<usize> {
     }
 }
 
+/// Attach [`SessionStore::ANCESTRY_REFUSED`] as the OUTERMOST reason of a
+/// fork-chain failure, keeping the detail one level down (`{:#}` still shows
+/// it). A reason that is already on top is never nested twice, so a legacy
+/// chain that fails several hops down still reads as one refusal.
+fn ancestry_refusal(error: anyhow::Error) -> anyhow::Error {
+    if error.to_string() == SessionStore::ANCESTRY_REFUSED {
+        error
+    } else {
+        error.context(SessionStore::ANCESTRY_REFUSED)
+    }
+}
+
 /// The DEFAULT fork cut of a session, selected from its physical located head
 /// ([`SessionStore::default_fork_cut`]).
 #[derive(Clone, Debug)]
@@ -792,6 +837,11 @@ pub struct ForkHeadCut {
     /// Exactly the rows the child materializes through the cut: the session's
     /// own head up to its boundary, or the inherited context it reuses.
     pub context: Vec<SessionEntry>,
+    /// Each context row's physical location, aligned 1:1 with `context`: the
+    /// OWNER's location for an inherited row (the child never stores it), the
+    /// session's own for its own head rows. Carried so a fork producer can seed
+    /// the child's in-memory prefix with the owner identity instead of `None`.
+    pub locations: Vec<Option<EntryLocation>>,
     /// The 1-based RESOLVED index of the cut when it lies in an inherited
     /// prefix (`None` when the cut is the session's own row).
     pub inherited: Option<usize>,
@@ -849,6 +899,14 @@ pub struct SessionMeta {
     /// `Some(false)` = explicitly restored, `None` = never touched (reads
     /// as unarchived).
     pub archived: Option<bool>,
+    /// The ACP (Agent Client Protocol) session id this e-agent session last
+    /// used, so `acp_prompt` can resume its reviewer conversation after an
+    /// e-agent restart. `None` = no ACP conversation yet; every row written
+    /// before the column existed reads as NULL, which is the same "start a
+    /// new one" behaviour. The list projections do not select it — only the
+    /// per-session read does.
+    #[serde(default)]
+    pub acp_session_id: Option<String>,
     /// Writer process identity of this snapshot row
     /// (`pid@hostname#nonce`, see [`process_identity`]): the process whose
     /// insert appended the row (the audit table / sidecar records every
@@ -984,6 +1042,11 @@ pub struct FinishedTask {
     pub kind: Option<String>,
     /// Explicit cancellation source, absent for normal/legacy completion.
     pub cancellation_source: Option<crate::agent::CancellationSource>,
+    /// The delegate/fork/btw child's own session id (the `send_message`
+    /// target), from the persisted entry's structured field. Absent for bash
+    /// tasks and for rows persisted before the field existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagent_session_id: Option<String>,
 }
 
 /// Identifies a session's background-task projection target: the workspace
@@ -2090,10 +2153,10 @@ impl SessionStore {
     ///   parent and the first `n` entries of its RESOLVED transcript are
     ///   inherited. Old rows keep loading exactly as written.
     ///
-    /// Inherited entries carry `locations[i] = None` (their physical rows
-    /// belong to the source session, and a receipt's numeric `eout1` ref has
-    /// no session identity — see [`LoadedLocated::inherited`]), so no receipt
-    /// is ever issued against the child's store for them.
+    /// Inherited entries carry the OWNER's location (their physical rows belong
+    /// to the source session — see [`LoadedLocated::inherited`]), so the
+    /// provider projection bounds them exactly like the owner does and emits an
+    /// OWNER-BEARING receipt instead of a key that would name a child row.
     ///
     /// Fails closed (naming the source session) when a source is
     /// missing/empty/truncated, when a pinned cut no longer matches the row it
@@ -2124,14 +2187,15 @@ impl SessionStore {
         };
         let context = self
             .fork_marker_context(root, name, &loaded.entries, marker, depth)
-            .await?;
+            .await
+            .map_err(ancestry_refusal)?;
         let inherited = context.entries.len();
+        let mut locations = context.locations();
         let mut entries = context.entries;
         entries.extend(loaded.entries);
-        // Inherited entries keep NO child location: their rows live in the
-        // source session's store, and a receipt's numeric `eout1` ref carries
-        // no session identity, so a child-bound ref could read the wrong row.
-        let mut locations = vec![None; inherited];
+        // Inherited entries keep their OWNER's location: the row lives in the
+        // source session's store, so the projection must name that owner (a
+        // numeric `eout1` ref would address a same-keyed CHILD row).
         locations.extend(loaded.locations);
         Ok(LoadedLocated {
             entries,
@@ -2202,7 +2266,7 @@ impl SessionStore {
             Box::pin(store.fork_marker_context(root, name, &own.entries, marker, depth)).await?;
         if at <= context.entries.len() {
             return match &context.origins[at - 1] {
-                CutOrigin::Row(session, key) => Ok((session.clone(), key.clone())),
+                CutOrigin::Row(location) => Ok((location.session.clone(), location.key.clone())),
                 CutOrigin::Resolved(session, index) => {
                     Box::pin(self.fork_cut_origin_inner(root, session, *index, depth + 1)).await
                 }
@@ -2225,11 +2289,55 @@ impl SessionStore {
 
     /// A store bound to `session` on this backend/root instance. Every method
     /// that touches an OTHER session's rows must connect its own store: the
-    /// SQL backends bind the session id at connect time.
-    async fn source_store(&self, root: &Path, session: &str) -> Result<Self> {
+    /// SQL backends bind the session id at connect time. (The one read that
+    /// must NOT reconnect is the authorized receipt read — see
+    /// [`Self::read_owner_field`], where a second connection would be an empty
+    /// SQLite `:memory:` database.)
+    pub(crate) async fn source_store(&self, root: &Path, session: &str) -> Result<Self> {
         Self::connect(&self.backend(), root, session)
             .await
             .with_context(|| format!("cannot open fork source session {session}"))
+    }
+
+    /// Every session that physically stores a row of `reader`'s RESOLVED
+    /// history: the reader itself plus the owner of each inherited row.
+    ///
+    /// This is the ONLY source of ancestry. It is read off the chain the loader
+    /// itself resolved and validated ([`Self::load_fork_located`]) — never off
+    /// the presence or position of a marker: a marker at the front of a log
+    /// says nothing about who owns the rows behind it, so a log whose chain
+    /// does not resolve (a moved or missing fork point, a missing `seq`, a lost
+    /// source, a cycle) authorizes NOTHING — not even an owner-bearing ref
+    /// naming the reader itself — and the failure is the loader's own
+    /// ([`ANCESTRY_REFUSED`]).
+    pub(crate) async fn authorized_owners(&self, root: &Path, reader: &str) -> Result<Vec<String>> {
+        let loaded = self.load_fork_located(root, reader).await?;
+        let mut owners = vec![reader.to_owned()];
+        for location in loaded.locations.iter().flatten() {
+            if !owners.iter().any(|owner| owner == &location.session) {
+                owners.push(location.session.clone());
+            }
+        }
+        Ok(owners)
+    }
+
+    /// Whether `owner` is `reader`'s own session or a session that physically
+    /// owns a row of its resolved history (see [`Self::authorized_owners`]) —
+    /// an owner-bearing ref naming any other session is refused.
+    ///
+    /// Fails closed with [`ANCESTRY_REFUSED`]: a chain that cannot be resolved
+    /// authorizes nothing, so the refusal is the same one the loader gives.
+    pub(crate) async fn authorizes_owner(
+        &self,
+        root: &Path,
+        reader: &str,
+        owner: &str,
+    ) -> Result<bool> {
+        Ok(self
+            .authorized_owners(root, reader)
+            .await?
+            .iter()
+            .any(|authorized| authorized == owner))
     }
 
     /// Resolve what ONE zero-copy marker inherits. `own` is the session's own
@@ -2330,10 +2438,16 @@ impl SessionStore {
         // `seq`/`event_time` the marker recorded (a rewritten source — e.g. a
         // compaction that replaced entries — fails closed instead of silently
         // inheriting a different prefix). A source that is itself a fork child
-        // may sit inside an already-inherited region; such entries carry no
-        // physical location of their own and are accepted positionally, as are
-        // legacy whole-document sources.
-        if let Some(end) = resolved.locations.get(at - 1).and_then(|loc| loc.as_ref()) {
+        // may sit inside an already-inherited region: those rows belong to an
+        // ANCESTOR (the location says so), the recorded `seq` was never that
+        // ancestor's numbering, and such cuts stay accepted positionally — as
+        // are legacy whole-document sources.
+        if let Some(end) = resolved
+            .locations
+            .get(at - 1)
+            .and_then(|loc| loc.as_ref())
+            .filter(|loc| loc.session == source)
+        {
             if let Some(expected) = seq {
                 anyhow::ensure!(
                     end.key.seq() == expected,
@@ -2356,9 +2470,18 @@ impl SessionStore {
         Ok(InheritedContext {
             entries: resolved.entries[..at].to_vec(),
             // Each inherited entry is the source's RESOLVED entry at the same
-            // 1-based index (legacy markers are positional by definition).
+            // 1-based index (legacy markers are positional by definition). When
+            // that entry has a physical location the source already reports the
+            // OWNER (a chain of forks resolves to the ancestor that stores the
+            // row); only an entry with no physical identity (a legacy
+            // whole-document source) keeps the positional origin.
             origins: (1..=at)
-                .map(|index| CutOrigin::Resolved(source.clone(), index))
+                .map(
+                    |index| match resolved.locations.get(index - 1).and_then(Clone::clone) {
+                        Some(location) => CutOrigin::Row(location),
+                        None => CutOrigin::Resolved(source.clone(), index),
+                    },
+                )
                 .collect(),
             // A legacy positional prefix has no physical cursor of its own:
             // paging further back stays a documented legacy boundary.
@@ -2432,11 +2555,9 @@ impl SessionStore {
         );
         let row_origin = |index: usize| {
             CutOrigin::Row(
-                owner.to_owned(),
                 page.locations[index]
                     .as_ref()
-                    .expect("every row of a located page carries its key")
-                    .key
+                    .expect("every row of a located page carries its location")
                     .clone(),
             )
         };
@@ -2587,9 +2708,9 @@ impl SessionStore {
             .fork_marker_context(root, name, &head.entries, marker, 0)
             .await?;
         let inherited = context.entries.len();
+        let mut locations = context.locations();
         let mut entries = context.entries;
         entries.extend(head.entries);
-        let mut locations = vec![None; inherited];
         locations.extend(head.locations);
         Ok(LoadedLocated {
             entries,
@@ -2631,25 +2752,34 @@ impl SessionStore {
             // materializes BOTH, so resolve that prefix here — otherwise a
             // fresh seed would disagree with what reloading the child
             // resolves.
-            let (mut entries, inherited, older) =
+            let (mut entries, mut locations, inherited, older) =
                 match zero_copy_marker(&head.entries).filter(|&marker| marker <= index) {
                     Some(marker) => {
                         let prefix = self
                             .fork_marker_context(root, name, &head.entries, marker, 0)
                             .await?;
                         let inherited = prefix.entries.len();
+                        let mut locations = prefix.locations();
                         let mut entries = prefix.entries;
                         entries.extend(head.entries.iter().cloned());
-                        (entries, Some(inherited), prefix.older)
+                        locations.extend(head.locations.iter().cloned());
+                        (entries, locations, Some(inherited), prefix.older)
                     }
-                    None => (head.entries.clone(), None, head.next_older.clone()),
+                    None => (
+                        head.entries.clone(),
+                        head.locations.clone(),
+                        None,
+                        head.next_older.clone(),
+                    ),
                 };
             let keep = inherited.unwrap_or(0) + index + 1;
             entries.truncate(keep);
+            locations.truncate(keep);
             return Ok(ForkHeadCut {
                 owner: name.to_owned(),
                 key,
                 context: entries,
+                locations,
                 inherited,
                 // A prepended prefix moves the context start into the
                 // ancestor, so its own older route wins.
@@ -2694,6 +2824,7 @@ impl SessionStore {
         Ok(ForkHeadCut {
             owner,
             key,
+            locations: context.locations(),
             inherited: Some(context.entries.len()),
             context: context.entries,
             older: context.older,
@@ -2914,6 +3045,13 @@ impl SessionStore {
     /// treated as a cycle and fails closed instead of resolving forever.
     const FORK_CHAIN_LIMIT: usize = 32;
 
+    /// The ONE reason a fork ancestry that does not resolve is refused. The
+    /// loader that resolves the chain and `read_output`, which authorizes a ref
+    /// against that chain, both refuse with exactly this reason: a refused read
+    /// says what a refused load says. (The loader keeps the failure's detail one
+    /// level down, where `{:#}` still shows it.)
+    pub(crate) const ANCESTRY_REFUSED: &str = "fork ancestry does not resolve";
+
     /// The resolved zero-copy fork transcript, but ONLY when this session
     /// really stores a leading fork marker.
     ///
@@ -2967,10 +3105,11 @@ impl SessionStore {
     }
 
     /// [`Self::load_fork_located`] paired with each entry's backend `seq`
-    /// (the JSONL ordinal or the SQL `seq` column; the entry index when the
-    /// entry has no child location, i.e. an inherited prefix entry). Used by
-    /// the fork-boundary scans (TUI `/fork`, Web fork-candidates) so `at`
-    /// always indexes the RESOLVED transcript the fork itself re-loads.
+    /// (the JSONL ordinal or the SQL `seq` column of the session ITSELF; the
+    /// entry index for an inherited prefix entry, whose location belongs to the
+    /// owner and whose seq would therefore be a different session's number).
+    /// Used by the fork-boundary scans (TUI `/fork`, Web fork-candidates) so
+    /// `at` always indexes the RESOLVED transcript the fork itself re-loads.
     pub async fn load_fork_with_seq(
         &self,
         root: &Path,
@@ -2986,6 +3125,10 @@ impl SessionStore {
                     .locations
                     .get(index)
                     .and_then(|location| location.as_ref())
+                    // An inherited entry's location names its OWNER: its seq is
+                    // that session's numbering, never this session's. Report the
+                    // resolved-transcript position instead.
+                    .filter(|location| location.session == name)
                     .map_or(index as i64, |location| location.key.seq())
             })
             .collect();
@@ -2997,9 +3140,10 @@ impl SessionStore {
     /// location (`seq`+`event_time` / `ordinal`), re-checks the entry hash
     /// (a same-seq later version can never retarget an old ref), verifies
     /// the fingerprint/session binding, extracts the field, and rejects any
-    /// total-size drift with an `integrity` error. The caller (the runner's
-    /// `read_output`) additionally checks the receipt names the current
-    /// session before calling.
+    /// total-size drift with an `integrity` error — but this store must be
+    /// bound to the receipt's OWNING session: this is the bound-session read
+    /// (the runner's `read_output` uses [`Self::read_owner_field`] instead, see
+    /// there).
     pub async fn read_field(
         &self,
         root: &Path,
@@ -3014,6 +3158,41 @@ impl SessionStore {
                 .lock()
                 .await
                 .read_field(verified)
+                .await
+                .map_err(anyhow::Error::msg),
+        }
+    }
+
+    /// Exact-version field read of a ref the caller has ALREADY authorized
+    /// ([`Self::authorizes_owner`]): the row is selected from the ref's own
+    /// owner session THROUGH THIS ALREADY-OPEN HANDLE.
+    ///
+    /// Reconnecting to the owner's session would be wrong: the SQL backends
+    /// bind the session id at connect time, and a SQLite `:memory:` database
+    /// lives in ONE connection — a second connection is an empty database, so
+    /// a receipt that re-opened the store read nothing at all. The backend
+    /// verification is unchanged (backend kind, workspace and backend-instance
+    /// fingerprints, the pinned physical key, the payload hash, the total
+    /// size); only the session the ref names is taken from the ref itself,
+    /// which is exactly the session the caller authorized.
+    pub(crate) async fn read_owner_field(
+        &self,
+        root: &Path,
+        verified: &crate::output_receipt::VerifiedRef,
+    ) -> Result<Vec<u8>> {
+        match self {
+            SessionStore::Jsonl => Session::read_field(root, verified),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session, .. } => {
+                session
+                    .read_field_as(&verified.location.session, verified)
+                    .await
+            }
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite { session, .. } => session
+                .lock()
+                .await
+                .read_field_as(&verified.location.session, verified)
                 .await
                 .map_err(anyhow::Error::msg),
         }
@@ -3607,6 +3786,70 @@ impl SessionStore {
         }
     }
 
+    /// The ACP session id this e-agent session last used, or `None` when it
+    /// never ran `acp_prompt`. The backend reads the newest metadata snapshot
+    /// for the session, so the value survives a restart (and is visible to
+    /// another process sharing the same database file).
+    #[allow(unused_variables)]
+    pub async fn acp_session_id(&self, root: &Path, session: &str) -> Result<Option<String>> {
+        match self {
+            SessionStore::Jsonl => {
+                Ok(jsonl_read_meta_snapshot(root, session)?.and_then(|meta| meta.acp_session_id))
+            }
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime {
+                session: greptime_session,
+                ..
+            } => greptime_session.acp_session_id(session).await,
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite {
+                session: sqlite_session,
+                ..
+            } => sqlite_session
+                .lock()
+                .await
+                .acp_session_id(session)
+                .await
+                .map_err(anyhow::Error::msg),
+        }
+    }
+
+    /// Record (or clear) the ACP session id on the session's metadata row:
+    /// appends one full snapshot row, exactly like [`Self::set_title`]. Never
+    /// self-creates (R3): a session with no metadata row is a no-op `Ok`.
+    #[allow(unused_variables)]
+    pub async fn set_acp_session_id(
+        &self,
+        root: &Path,
+        session: &str,
+        acp_session_id: Option<&str>,
+    ) -> Result<()> {
+        match self {
+            SessionStore::Jsonl => jsonl_update_meta(root, session, |meta| {
+                meta.acp_session_id = acp_session_id.map(str::to_owned)
+            }),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime {
+                session: greptime_session,
+                ..
+            } => {
+                greptime_session
+                    .set_acp_session_id(session, acp_session_id)
+                    .await
+            }
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite {
+                session: sqlite_session,
+                ..
+            } => sqlite_session
+                .lock()
+                .await
+                .set_acp_session_id(session, acp_session_id)
+                .await
+                .map_err(anyhow::Error::msg),
+        }
+    }
+
     /// One-time bootstrap migration: create metadata rows for sessions
     /// that predate the `sessions` table (they have `session_entries` but
     /// no metadata row). Idempotent: sessions that already have a row are
@@ -4194,6 +4437,7 @@ fn jsonl_create_meta(
                 title: existing.title.clone(),
                 pinned: existing.pinned,
                 archived: existing.archived,
+                acp_session_id: existing.acp_session_id.clone(),
                 writer: None, // stamped by jsonl_append_meta_snapshot with the writing process
                 label: None, // label lives in running_tasks / background records, resolved at list time
             };
@@ -4214,6 +4458,7 @@ fn jsonl_create_meta(
         title: title.map(str::to_owned), // a fresh session may be named at creation (subagent label)
         pinned: None,                    // a fresh session is unpinned until the user pins it
         archived: None,                  // a fresh session is unarchived until the user archives it
+        acp_session_id: None,            // no ACP conversation until `acp_prompt` runs
         writer: None, // stamped by jsonl_append_meta_snapshot with the writing process
         label: None,  // label lives in running_tasks / background records, resolved at list time
     };
@@ -4382,10 +4627,11 @@ fn jsonl_backfill_sessions(root: &Path) -> anyhow::Result<()> {
             entry_count: jsonl_count_transcript_entries(root, &session)?,
             parent_session_id: None,
             parent_task_id: None,
-            title: None,    // pre-sidecar sessions have no user-assigned name
-            pinned: None,   // pre-sidecar sessions are unpinned
-            archived: None, // pre-sidecar sessions are unarchived
-            writer: None,   // stamped by jsonl_append_meta_snapshot with the writing process
+            title: None,          // pre-sidecar sessions have no user-assigned name
+            pinned: None,         // pre-sidecar sessions are unpinned
+            archived: None,       // pre-sidecar sessions are unarchived
+            acp_session_id: None, // pre-sidecar sessions have no ACP conversation
+            writer: None,         // stamped by jsonl_append_meta_snapshot with the writing process
             label: None, // label lives in running_tasks / background records, resolved at list time
         };
         jsonl_append_meta_snapshot(root, &session, &mut meta)?;
@@ -4613,6 +4859,7 @@ mod shared_helpers {
             status: Some(status.into()),
             kind: Some("bash".into()),
             cancellation_source: None,
+            subagent_session_id: None,
         })
         .unwrap()
     }
@@ -4852,6 +5099,8 @@ mod shared_helpers {
                 content: "ok".into(),
                 is_error: false,
                 synthetic: false,
+                started_task_id: None,
+                subagent_session_id: None,
                 images: vec![],
             }
             .into(),
@@ -4861,6 +5110,8 @@ mod shared_helpers {
                 content: "boom".into(),
                 is_error: true,
                 synthetic: false,
+                started_task_id: None,
+                subagent_session_id: None,
                 images: vec![],
             }
             .into(),
@@ -4884,6 +5135,7 @@ mod shared_helpers {
                 status: None,
                 kind: None,
                 cancellation_source: None,
+                subagent_session_id: None,
             },
             SessionEntry::ForkedFrom {
                 source: "src".into(),
@@ -5432,6 +5684,136 @@ mod tests {
     mod sqlite {
         use super::*;
 
+        /// The same collision on the SQLITE binding: parent and child each have
+        /// a tool result at the same `seq`. The historical short ref stays
+        /// per-session, while the owner-bearing ref (the only form issued)
+        /// reads the PARENT's row through the handle that is already open,
+        /// carrying the (authorized) owner from the ref itself.
+        #[tokio::test]
+        async fn owner_bearing_ref_reads_the_parent_row_not_the_same_seqed_child_row() {
+            use crate::agent::Message;
+            use crate::output_receipt::{FieldId, issue_owner};
+
+            let (_dir, path) = temp_db();
+            let root = std::env::temp_dir();
+            let backend = backend(&path);
+            let tool = |call: &str, text: &str| SessionEntry::Message {
+                message: Message::Tool {
+                    started_task_id: None,
+                    subagent_session_id: None,
+                    call_id: call.into(),
+                    name: "bash".into(),
+                    content: text.into(),
+                    is_error: false,
+                    synthetic: false,
+                    images: vec![],
+                },
+            };
+            let user = |text: &str| SessionEntry::Message {
+                message: Message::User {
+                    content: text.into(),
+                    images: vec![],
+                },
+            };
+
+            let parent = format!("test-store-owner-parent-{}", crate::session::new_id());
+            let parent_store = SessionStore::connect(&backend, &root, &parent)
+                .await
+                .unwrap();
+            let parent_locations = parent_store
+                .append_located(
+                    &root,
+                    &parent,
+                    &[user("parent q"), tool("p-call", "PARENT-SQL-ROW")],
+                )
+                .await
+                .unwrap();
+            let cut = parent_locations[1].clone();
+            let cut_seq = cut.key.seq();
+
+            let child = format!("test-store-owner-child-{}", crate::session::new_id());
+            let child_store = SessionStore::connect(&backend, &root, &child)
+                .await
+                .unwrap();
+            child_store
+                .append(
+                    &root,
+                    &child,
+                    &[
+                        SessionEntry::ForkedFrom {
+                            source: parent.clone(),
+                            at: None,
+                            event_time: cut.key.event_time_us(),
+                            seq: Some(cut_seq),
+                        },
+                        tool("c-call", "CHILD-SQL-ROW"),
+                    ],
+                )
+                .await
+                .unwrap();
+
+            let loaded = child_store
+                .load_fork_head_located(&root, &child)
+                .await
+                .unwrap();
+            assert_eq!(loaded.inherited, 2);
+            let inherited = loaded.locations[1]
+                .as_ref()
+                .expect("the inherited parent row carries the parent's location");
+            assert_eq!(inherited.session, parent);
+            assert_eq!(inherited.key.seq(), cut_seq);
+            // The child's own tool row really is a DIFFERENT row at the same
+            // seq: same key shape, different payload. (The SQL seq numbering is
+            // per session, so the marker is 0 and this tool result is 1 — the
+            // parent's tool result is its own seq 1.)
+            let own = child_store.load_located(&root, &child).await.unwrap();
+            let own = own.locations[1].as_ref().unwrap();
+            assert_eq!(own.session, child);
+            assert_eq!(
+                own.key.seq(),
+                cut_seq,
+                "the collision: both sessions store a tool result at this seq"
+            );
+            assert_ne!(own.entry_hash, inherited.entry_hash);
+
+            // The historical SHORT form stays session-local.
+            let short = format!("eout1.{cut_seq}.t");
+            assert_eq!(
+                read_page_text(&child_store, &root, &child, &short).await,
+                "CHILD-SQL-ROW"
+            );
+            assert_eq!(
+                read_page_text(&parent_store, &root, &parent, &short).await,
+                "PARENT-SQL-ROW"
+            );
+
+            // The owner-bearing ref resolves to the PARENT's bytes from both
+            // sides, never to the child's same-seqed row.
+            let owner_ref = issue_owner(inherited, FieldId::ToolContent, "PARENT-SQL-ROW".len());
+            assert_eq!(
+                read_page_text(&child_store, &root, &child, &owner_ref).await,
+                "PARENT-SQL-ROW"
+            );
+            assert_eq!(
+                read_page_text(&parent_store, &root, &parent, &owner_ref).await,
+                "PARENT-SQL-ROW"
+            );
+        }
+
+        /// One `read_output` page's text through the real execution path.
+        async fn read_page_text(
+            store: &SessionStore,
+            root: &Path,
+            session: &str,
+            reference: &str,
+        ) -> String {
+            let page = crate::tools::output::execute(store, root, session, reference, 0, 1024)
+                .await
+                .unwrap();
+            let page: serde_json::Value = serde_json::from_str(&page).unwrap();
+            page["text"].as_str().unwrap().to_owned()
+        }
+
         fn temp_db() -> (tempfile::TempDir, PathBuf) {
             let dir = tempfile::tempdir().expect("tempdir");
             let path = dir.path().join("sessions.db");
@@ -5442,6 +5824,52 @@ mod tests {
             SessionBackend::Sqlite {
                 path: Some(path.to_string_lossy().into_owned()),
             }
+        }
+
+        /// A SQLite `:memory:` database lives in ONE connection: a second
+        /// `connect` opens an EMPTY database. The receipt is therefore read
+        /// through the handle that is already open — write, then read the row
+        /// back through `read_output` and find the content.
+        #[tokio::test]
+        async fn receipt_read_uses_the_already_open_memory_store() {
+            use crate::agent::Message;
+            use crate::output_receipt::{FieldId, issue_owner};
+
+            let root = std::env::temp_dir();
+            let memory = SessionBackend::Sqlite {
+                path: Some(":memory:".into()),
+            };
+            let session = format!("test-store-memory-{}", crate::session::new_id());
+            let store = SessionStore::connect(&memory, &root, &session)
+                .await
+                .unwrap();
+            let located = store
+                .append_located(
+                    &root,
+                    &session,
+                    &[SessionEntry::Message {
+                        message: Message::Tool {
+                            started_task_id: None,
+                            subagent_session_id: None,
+                            call_id: "mem-call".into(),
+                            name: "bash".into(),
+                            content: "MEMORY-ROW".into(),
+                            is_error: false,
+                            synthetic: false,
+                            images: vec![],
+                        },
+                    }],
+                )
+                .await
+                .unwrap();
+            let reference = issue_owner(&located[0], FieldId::ToolContent, "MEMORY-ROW".len());
+
+            let page = crate::tools::output::execute(&store, &root, &session, &reference, 0, 1024)
+                .await
+                .expect("the receipt reads through the open connection");
+            let page: serde_json::Value = serde_json::from_str(&page).unwrap();
+            assert_eq!(page["text"], "MEMORY-ROW");
+            assert_eq!(page["total_bytes"], "MEMORY-ROW".len());
         }
 
         fn test_entries() -> Vec<SessionEntry> {
@@ -6091,10 +6519,15 @@ mod tests {
         assert_eq!(resolved.entries.len(), at + 1);
         assert_eq!(resolved.entries[..at], entries[..at]);
         assert_eq!(resolved.entries[at], marker(parent, at, Some(3)));
-        assert!(
-            resolved.locations[..at].iter().all(Option::is_none),
-            "inherited entries never carry a child location"
-        );
+        // Inherited rows carry the OWNER's location: same-session key, plus the
+        // payload hash of the parent line — never a child-keyed ref.
+        let owner_locations = Session::load_located(root, parent).unwrap();
+        for index in 0..at {
+            assert_eq!(
+                resolved.locations[index], owner_locations.locations[index],
+                "inherited entry {index} carries the parent's exact location"
+            );
+        }
         assert!(
             resolved.locations[at].is_some(),
             "the child's own marker is located"
@@ -6485,7 +6918,21 @@ mod tests {
             .unwrap();
         assert_eq!(page.entries.len(), 6, "no physical cursor to page by");
         assert_eq!(page.next_before_seq, None);
-        assert!(page.locations[..4].iter().all(Option::is_none));
+        // The inherited rows keep the PARENT's physical identity, so the Web
+        // client reconciles the right rows (and a bounded field names its owner).
+        assert!(
+            page.locations[..4].iter().all(|location| location
+                .as_ref()
+                .is_some_and(|loc| loc.session == "seq-parent")),
+            "{:?}",
+            page.locations
+        );
+        assert!(
+            page.locations[4]
+                .as_ref()
+                .is_some_and(|loc| loc.session == "seq-fork"),
+            "the child's own marker stays child-owned"
+        );
     }
 
     // ── Pinned (owner + key) fork markers ────────────────────────────
@@ -6551,8 +6998,11 @@ mod tests {
         assert_eq!(resolved.inherited, 4);
         assert_eq!(resolved.entries[..4], rows[..4]);
         assert!(
-            resolved.locations[..4].iter().all(Option::is_none),
-            "inherited entries carry no child location"
+            resolved.locations[..4].iter().all(|location| location
+                .as_ref()
+                .is_some_and(|loc| loc.session == "pc-parent")),
+            "inherited entries name the parent as their owner: {:?}",
+            resolved.locations
         );
     }
 
@@ -6889,6 +7339,453 @@ mod tests {
         assert_eq!(resolved.inherited, 4);
         assert_eq!(resolved.entries[..4], entries[..4]);
         assert_eq!(resolved.entries[4], marker("plain-legacy-parent", 4, None));
+    }
+
+    // ── Owner-bearing refs for an inherited fork prefix ──────────────
+
+    fn tool_result(call_id: &str, content: &str) -> SessionEntry {
+        SessionEntry::Message {
+            message: crate::agent::Message::Tool {
+                started_task_id: None,
+                subagent_session_id: None,
+                call_id: call_id.to_owned(),
+                name: "bash".into(),
+                content: content.to_owned(),
+                is_error: false,
+                synthetic: false,
+                images: vec![],
+            },
+        }
+    }
+
+    /// The oversized tool result every projection test bounds.
+    fn oversized_tool_text() -> String {
+        "PARENT-ROW-5".repeat(1200)
+    }
+
+    /// The same 6-line parent: line 4 is an OVERSIZED tool result and line 5 a
+    /// short one (the row a fork's cut pins).
+    fn collision_parent() -> Vec<SessionEntry> {
+        vec![
+            fork_user("pq"),
+            fork_assistant("pa"),
+            fork_user("pq2"),
+            fork_assistant("pa2"),
+            tool_result("huge-call", &oversized_tool_text()),
+            tool_result("parent-call", "PARENT-ROW-5"),
+        ]
+    }
+
+    /// Read one ref through the real `read_output` execution path and return
+    /// the page text (or the model-facing error).
+    async fn read_output(root: &Path, session: &str, reference: &str) -> Result<String, String> {
+        let page = crate::tools::output::execute(
+            &SessionStore::Jsonl,
+            root,
+            session,
+            reference,
+            0,
+            crate::tools::output::READ_OUTPUT_MAX_LIMIT,
+        )
+        .await?;
+        let value: serde_json::Value = serde_json::from_str(&page).expect("JSON page");
+        Ok(value["text"].as_str().expect("page text").to_owned())
+    }
+
+    /// The inherited prefix's locations are the OWNER's own (backend, key,
+    /// payload hash), so the child can bound the field exactly like the parent
+    /// and name that owner. Both marker-aware loaders and the fork cut carry
+    /// them.
+    #[tokio::test]
+    async fn inherited_prefix_locations_name_the_owner_in_every_loader() {
+        use crate::session::Session;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let parent = "owner-parent";
+        let entries = collision_parent();
+        Session::append(root, parent, &entries).unwrap();
+        let parent_located = Session::load_located(root, parent).unwrap();
+        Session::append(
+            root,
+            "owner-child",
+            &[pinned(parent, 5, None), fork_user("child q")],
+        )
+        .unwrap();
+
+        let store = SessionStore::Jsonl;
+        for resolved in [
+            store.load_fork_located(root, "owner-child").await.unwrap(),
+            store
+                .load_fork_head_located(root, "owner-child")
+                .await
+                .unwrap(),
+        ] {
+            assert_eq!(resolved.inherited, 6);
+            for index in 0..6 {
+                let inherited = resolved.locations[index]
+                    .as_ref()
+                    .expect("an inherited row carries its owner's location");
+                assert_eq!(
+                    inherited,
+                    parent_located.locations[index].as_ref().unwrap(),
+                    "inherited entry {index} is byte-identical to the parent's location"
+                );
+                assert_eq!(inherited.session, parent);
+            }
+            assert!(
+                resolved.locations[6]
+                    .as_ref()
+                    .is_some_and(|location| location.session == "owner-child"),
+                "the child's own marker stays child-owned"
+            );
+        }
+
+        // The fork cut carries the same aligned locations for the producer.
+        let cut = store.default_fork_cut(root, parent).await.unwrap();
+        assert_eq!(cut.locations.len(), cut.context.len());
+        for (index, location) in cut.locations.iter().enumerate() {
+            assert_eq!(
+                location, &parent_located.locations[index],
+                "cut row {index} keeps its physical identity"
+            );
+        }
+    }
+
+    /// The collision the review proved: parent and child both store entry 5 as
+    /// a tool result. The historical SHORT form stays per-session (each side
+    /// reads its OWN row), while the owner-bearing ref — now the only form
+    /// ISSUED, and identical for parent and child — resolves to the PARENT's
+    /// bytes from both sides.
+    #[tokio::test]
+    async fn cross_owner_refs_resolve_the_owner_row_not_the_same_keyed_child_row() {
+        use crate::output_receipt::{FieldId, OutputRef, bound_field, issue_owner};
+        use crate::session::Session;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let parent = "col-parent";
+        Session::append(root, parent, &collision_parent()).unwrap();
+        // Own ordinals: 0 marker, 1..5 filler, 5 = the child's own tool result.
+        Session::append(
+            root,
+            "col-child",
+            &[
+                pinned(parent, 5, None),
+                fork_user("cq1"),
+                fork_assistant("ca1"),
+                fork_user("cq2"),
+                fork_assistant("ca2"),
+                tool_result("child-call", "CHILD-ROW-5"),
+            ],
+        )
+        .unwrap();
+
+        let store = SessionStore::Jsonl;
+        let loaded = store.load_fork_located(root, "col-child").await.unwrap();
+        let inherited = loaded.locations[5].as_ref().expect("inherited row 5");
+        assert_eq!(inherited.session, parent);
+        assert_eq!(inherited.key, LocatedKey::Jsonl { ordinal: 5 });
+        let own = loaded.locations[11]
+            .as_ref()
+            .expect("the child's own row 5");
+        assert_eq!(own.session, "col-child");
+        assert_eq!(own.key, LocatedKey::Jsonl { ordinal: 5 });
+        assert_eq!(inherited.key, own.key, "the two rows share a key");
+
+        // The HISTORICAL short form (what older builds issued, and what old
+        // persisted markers/transcripts still contain) stays session-local:
+        // each side reads its OWN row 5.
+        let short = "eout1.5.t";
+        assert_eq!(
+            read_output(root, "col-child", short).await.unwrap(),
+            "CHILD-ROW-5"
+        );
+        assert_eq!(
+            read_output(root, parent, short).await.unwrap(),
+            "PARENT-ROW-5"
+        );
+
+        // The oversized row is projected from the CHILD's inherited view and
+        // from the PARENT's own view: the same stored row, so the same bytes.
+        let text = oversized_tool_text();
+        let reloaded = Session::load_located(root, parent).unwrap();
+        let parent_huge = reloaded.locations[4].as_ref().unwrap();
+        let child_huge = loaded.locations[4].as_ref().expect("inherited row 4");
+        assert_eq!(parent_huge, child_huge, "one row, one physical identity");
+        let projected = bound_field(&text, child_huge, FieldId::ToolContent, text.len());
+        assert_eq!(
+            projected,
+            bound_field(&text, parent_huge, FieldId::ToolContent, text.len()),
+            "the projection does not depend on the reader"
+        );
+        let ref_start = projected.find("read_output ref=").unwrap() + "read_output ref=".len();
+        let ref_end = projected[ref_start..].find(']').unwrap() + ref_start;
+        let owner_ref = &projected[ref_start..ref_end];
+        match crate::output_receipt::parse_ref(owner_ref).unwrap() {
+            OutputRef::Legacy(verified) => {
+                assert_eq!(verified.location.session, parent);
+                assert_eq!(verified.total, text.len());
+            }
+            other => panic!("expected an owner-bearing ref, got {other:?}"),
+        }
+        assert_eq!(
+            read_output(root, "col-child", owner_ref).await.unwrap(),
+            text
+        );
+        assert_eq!(read_output(root, parent, owner_ref).await.unwrap(), text);
+        // An explicit owner ref for the parent's short row works the same way.
+        let explicit = issue_owner(inherited, FieldId::ToolContent, "PARENT-ROW-5".len());
+        assert_eq!(
+            read_output(root, "col-child", &explicit).await.unwrap(),
+            "PARENT-ROW-5"
+        );
+    }
+
+    /// A ref naming a session that is not this session's fork source is
+    /// refused, from every side: the reader may only reach its own rows and its
+    /// transitive fork sources.
+    #[tokio::test]
+    async fn owner_ref_to_a_session_outside_the_fork_chain_is_refused() {
+        use crate::output_receipt::{FieldId, issue_owner};
+        use crate::session::Session;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        Session::append(root, "ref-parent", &collision_parent()).unwrap();
+        Session::append(
+            root,
+            "ref-child",
+            &[pinned("ref-parent", 5, None), fork_user("child q")],
+        )
+        .unwrap();
+        Session::append(root, "ref-unrelated", &collision_parent()).unwrap();
+
+        let unrelated = Session::load_located(root, "ref-unrelated").unwrap();
+        let foreign = unrelated.locations[5].as_ref().unwrap();
+        let foreign_ref = issue_owner(foreign, FieldId::ToolContent, "PARENT-ROW-5".len());
+
+        // The child of another session, the unrelated session itself is nobody's
+        // source, and a plain session that never forked.
+        for reader in ["ref-child", "ref-parent"] {
+            let error = read_output(root, reader, &foreign_ref).await.unwrap_err();
+            assert_eq!(error, "read_output error: ref not found", "reader {reader}");
+        }
+        // The owner itself can read it (its own session is always authorized).
+        assert_eq!(
+            read_output(root, "ref-unrelated", &foreign_ref)
+                .await
+                .unwrap(),
+            "PARENT-ROW-5"
+        );
+        // The chain is direction-sensitive: the PARENT may not read the child's
+        // own rows through an owner-bearing ref.
+        let child = Session::load_located(root, "ref-child").unwrap();
+        let child_ref = issue_owner(
+            child.locations[1].as_ref().unwrap(),
+            FieldId::UserContent,
+            "child q".len(),
+        );
+        let error = read_output(root, "ref-parent", &child_ref)
+            .await
+            .unwrap_err();
+        assert_eq!(error, "read_output error: ref not found");
+    }
+
+    /// A leading marker is NOT proof of ancestry: it is a claim about the front
+    /// of a log, never about who owns the rows behind it.
+    ///
+    /// Both logs below lead with a marker that NAMES the session their ref
+    /// names — one of them names the CALLER itself — yet neither chain descends
+    /// from that session: the loader refuses each log, and `read_output` must
+    /// refuse the ref for exactly the same reason instead of reading the rows a
+    /// marker merely claims.
+    #[tokio::test]
+    async fn owner_ref_is_refused_when_the_leading_marker_chain_does_not_resolve() {
+        use crate::output_receipt::{FieldId, issue_owner};
+        use crate::session::Session;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        // A real owner whose row an authorized reader would see.
+        Session::append(root, "bm-owner", &collision_parent()).unwrap();
+        let owner_rows = Session::load_located(root, "bm-owner").unwrap();
+        let owner_ref = issue_owner(
+            owner_rows.locations[5].as_ref().unwrap(),
+            FieldId::ToolContent,
+            "PARENT-ROW-5".len(),
+        );
+        // (1) The caller's own log leads with a marker that names the CALLER,
+        // pinned to a row it never stored: a marker is all it is.
+        Session::append(
+            root,
+            "bm-self",
+            &[
+                pinned("bm-self", 99, None),
+                tool_result("self-call", "SELF-ROW"),
+            ],
+        )
+        .unwrap();
+        let own_rows = Session::load_located(root, "bm-self").unwrap();
+        let own_ref = issue_owner(
+            own_rows.locations[1].as_ref().unwrap(),
+            FieldId::ToolContent,
+            "SELF-ROW".len(),
+        );
+        // (2) A log whose leading marker names the owner the ref names, with a
+        // cut the owner never had.
+        Session::append(root, "bm-foreign", &[pinned("bm-owner", 99, None)]).unwrap();
+
+        for (reader, reference, case) in [
+            ("bm-self", own_ref.as_str(), "the marker names the caller"),
+            (
+                "bm-self",
+                owner_ref.as_str(),
+                "the caller's marker names it",
+            ),
+            ("bm-foreign", owner_ref.as_str(), "a foreign log claims it"),
+        ] {
+            let loader = SessionStore::Jsonl
+                .load_fork_located(root, reader)
+                .await
+                .expect_err("the loader refuses a chain that does not resolve");
+            assert_eq!(
+                loader.to_string(),
+                SessionStore::ANCESTRY_REFUSED,
+                "{case}: the loader's reason"
+            );
+            // The detail stays one level down, where the user still sees it.
+            assert!(
+                format!("{loader:#}").contains(&format!("session {reader}")),
+                "{case}: {loader:#}"
+            );
+            let refused = read_output(root, reader, reference).await.unwrap_err();
+            assert_eq!(
+                refused,
+                format!("read_output error: {}", SessionStore::ANCESTRY_REFUSED),
+                "{case}: the read refuses for the SAME reason"
+            );
+        }
+    }
+
+    /// A fork of a fork authorizes its GRANDPARENT, and its inherited entries
+    /// name the grandparent as the owner.
+    #[tokio::test]
+    async fn transitive_fork_sources_are_authorized_and_name_the_owner() {
+        use crate::output_receipt::{FieldId, issue_owner};
+        use crate::session::Session;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        Session::append(root, "chain-grand", &collision_parent()).unwrap();
+        Session::append(
+            root,
+            "chain-mid",
+            &[pinned("chain-grand", 5, None), fork_user("mid q")],
+        )
+        .unwrap();
+        // The leaf inherits all 8 resolved entries of `chain-mid`.
+        Session::append(
+            root,
+            "chain-leaf",
+            &[pinned("chain-mid", 1, None), fork_user("leaf q")],
+        )
+        .unwrap();
+
+        let store = SessionStore::Jsonl;
+        let loaded = store.load_fork_located(root, "chain-leaf").await.unwrap();
+        for index in 0..6 {
+            assert_eq!(
+                loaded.locations[index]
+                    .as_ref()
+                    .map(|location| location.session.as_str()),
+                Some("chain-grand"),
+                "grandparent rows keep their owner at index {index}"
+            );
+        }
+        let grand_row = loaded.locations[5].as_ref().unwrap();
+        let reference = issue_owner(grand_row, FieldId::ToolContent, "PARENT-ROW-5".len());
+        assert_eq!(
+            read_output(root, "chain-leaf", &reference).await.unwrap(),
+            "PARENT-ROW-5",
+            "a grandchild may read its grandparent's row"
+        );
+        // The grandparent may not read the leaf's own rows.
+        let leaf_own = Session::load_located(root, "chain-leaf").unwrap();
+        let leaf_ref = issue_owner(
+            leaf_own.locations[1].as_ref().unwrap(),
+            FieldId::UserContent,
+            "leaf q".len(),
+        );
+        assert_eq!(
+            read_output(root, "chain-grand", &leaf_ref)
+                .await
+                .unwrap_err(),
+            "read_output error: ref not found"
+        );
+    }
+
+    /// The copy-based fork layout older builds wrote (marker DEEPER in the log,
+    /// prefix physically stored) is not a zero-copy fork: everything really is
+    /// stored here, so its rows bound and read exactly like any other session's
+    /// — the receipt names this session itself and resolves in its own store.
+    #[tokio::test]
+    async fn copy_based_legacy_fork_bounds_and_reads_its_own_copies() {
+        use crate::output_receipt::{FieldId, OutputRef, bound_field};
+        use crate::session::Session;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let text = "COPIED-ROW".repeat(1500);
+        let parent_entries = vec![
+            fork_user("lpq"),
+            fork_assistant("lpa"),
+            tool_result("copied", &text),
+            fork_assistant("done"),
+        ];
+        Session::append(root, "copy-parent", &parent_entries).unwrap();
+        // Marker-first + stored prefix is the AMBIGUOUS layout; older builds
+        // also placed it deeper, which is unambiguously a copy.
+        let mut stored = parent_entries.clone();
+        stored.insert(2, marker("copy-parent", 3, None));
+        Session::append(root, "copy-child", &stored).unwrap();
+
+        let store = SessionStore::Jsonl;
+        let loaded = store
+            .load_fork_head_located(root, "copy-child")
+            .await
+            .unwrap();
+        assert_eq!(loaded.inherited, 0, "the prefix really is stored here");
+        assert!(
+            loaded
+                .locations
+                .iter()
+                .flatten()
+                .all(|location| location.session == "copy-child"),
+            "every row is this session's own"
+        );
+        // The stored layout is [user, assistant, marker, tool, done]: the
+        // oversized tool result is ordinal 3.
+        let location = loaded.locations[3].as_ref().unwrap();
+        let projected = bound_field(&text, location, FieldId::ToolContent, text.len());
+        let ref_start = projected.find("read_output ref=").unwrap() + "read_output ref=".len();
+        let ref_end = projected[ref_start..].find(']').unwrap() + ref_start;
+        let reference = &projected[ref_start..ref_end];
+        match crate::output_receipt::parse_ref(reference).unwrap() {
+            OutputRef::Legacy(verified) => {
+                assert_eq!(
+                    verified.location.session, "copy-child",
+                    "a copy-based fork's copies name the fork itself: {reference}"
+                );
+                assert_eq!(verified.location.key, LocatedKey::Jsonl { ordinal: 3 });
+                assert_eq!(verified.total, text.len());
+            }
+            other => panic!("expected an owner-bearing ref, got {other:?}"),
+        }
+        assert_eq!(
+            read_output(root, "copy-child", reference).await.unwrap(),
+            text
+        );
     }
 }
 

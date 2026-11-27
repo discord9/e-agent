@@ -32,13 +32,155 @@ fn entry_event_projects_tool_images_for_durable_replay() {
             images: images.clone(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
         },
     };
     assert!(matches!(
         entry_event(&entry),
-        Some(AgentEvent::ToolResult { is_error: false, content, images: projected, call_id: Some(call_id) })
+        Some(AgentEvent::ToolResult { is_error: false, content, images: projected, call_id: Some(call_id), started_task_id: None, subagent_session_id: None })
             if content == "persisted image result" && call_id == "call-image-replay" && projected == images
     ));
+}
+
+/// The model-facing receipt text of a delegate start: what the model sees and
+/// what old rows only have. It must keep working as display text, never as the
+/// source of the machine facts.
+const DELEGATE_START_RECEIPT: &str = "started background task 7: 看图\nsubagent session: sub-chat";
+
+/// A delegate-shaped tool: it STARTED a delegated subagent, so its output
+/// carries BOTH the registry task id and the child session id as fields.
+struct StartingDelegateMock;
+
+#[async_trait]
+impl Tool for StartingDelegateMock {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "delegate".into(),
+            description: "delegate metadata test".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+    async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
+        Ok(ToolOutput::started_task(DELEGATE_START_RECEIPT, 7).subagent_session("sub-chat"))
+    }
+}
+
+/// A delegate tool result carries the started task id and the child session id
+/// as FIELDS, on the live event and on the durable `Tool` row, so no frontend
+/// has to recover them from the receipt prose.
+#[tokio::test]
+async fn delegate_tool_result_carries_task_and_child_session_fields() {
+    let temp = tempfile::tempdir().unwrap();
+    let agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: VecDeque::from(vec![
+                blocking_tool_call("call-delegate", "delegate"),
+                assistant_reply("delegated"),
+            ]),
+        }),
+        vec![Box::new(StartingDelegateMock)],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "delegate-metadata".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let task = runner.start(Some("start".into()));
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "delegated"),
+    )
+    .await;
+    assert!(
+        handle.snapshot().iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolResult {
+                call_id: Some(call_id),
+                content,
+                started_task_id: Some(7),
+                subagent_session_id: Some(session_id),
+                ..
+            } if call_id == "call-delegate" && session_id == "sub-chat"
+                && content == DELEGATE_START_RECEIPT
+        )),
+        "the live delegate result must carry both ids as fields: {:?}",
+        handle.snapshot()
+    );
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "delegate-metadata")
+        .await
+        .unwrap()
+        .entries;
+    assert!(
+        tool_entries(&entries).iter().any(|message| matches!(
+            message,
+            Message::Tool {
+                name,
+                content,
+                started_task_id: Some(7),
+                subagent_session_id: Some(session_id),
+                ..
+            } if name == "delegate" && session_id == "sub-chat"
+                && content == DELEGATE_START_RECEIPT
+        )),
+        "the durable Tool row must carry both ids as fields: {entries:?}"
+    );
+    drop(task);
+}
+
+/// A `Tool` row persisted BEFORE the structured ids existed deserialises (both
+/// fields default to `None`) and projects to a `ToolResult` with both absent —
+/// which is exactly what makes the web UI take its legacy prose fallback.
+#[test]
+fn old_tool_row_without_structured_ids_still_loads_and_projects() {
+    let old = r#"{"Tool":{"call_id":"call-old","name":"delegate","content":"started background task 7: 看图\nsubagent session: sub-old","is_error":false,"synthetic":false}}"#;
+    let message: Message = serde_json::from_str(old).expect("old Tool rows must stay loadable");
+    assert!(matches!(
+        &message,
+        Message::Tool {
+            started_task_id: None,
+            subagent_session_id: None,
+            ..
+        }
+    ));
+    assert!(matches!(
+        entry_event(&SessionEntry::Message { message }),
+        Some(AgentEvent::ToolResult {
+            call_id: Some(call_id),
+            started_task_id: None,
+            subagent_session_id: None,
+            ..
+        }) if call_id == "call-old"
+    ));
+}
+
+/// A bash result carries neither id, and its serialized entry keeps exactly the
+/// old shape (both fields skipped when absent).
+#[test]
+fn bash_tool_row_serializes_without_the_structured_ids() {
+    let message = Message::Tool {
+        call_id: "call-bash".into(),
+        name: "bash".into(),
+        content: "started background task 7: build".into(),
+        images: Vec::new(),
+        is_error: false,
+        synthetic: false,
+        started_task_id: None,
+        subagent_session_id: None,
+    };
+    assert_eq!(
+        serde_json::to_value(&message).unwrap(),
+        serde_json::json!({"Tool": {
+            "call_id": "call-bash",
+            "name": "bash",
+            "content": "started background task 7: build",
+            "is_error": false,
+            "synthetic": false,
+        }})
+    );
 }
 
 struct IdentityCaptureModel(Arc<Mutex<Option<String>>>);
@@ -583,6 +725,479 @@ async fn request_user_input_waits_answers_and_resumes_same_turn() {
         SessionEntry::Message { message: Message::User { content, .. } } if content == "Ada"
     )));
     drop(task);
+}
+
+/// A tool that asks the human ONE option question mid-call, exactly as the
+/// ACP tool does, and records the id it got back.
+struct AskTool {
+    handle: Option<SessionHandle>,
+    answer: Arc<Mutex<Option<Option<String>>>>,
+}
+
+#[async_trait]
+impl Tool for AskTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "ask_tool".into(),
+            description: "test only".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+    async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
+        let handle = self.handle.as_ref().expect("the runner binds a handle");
+        let request = UserInputRequest {
+            call_id: "tool-ask".into(),
+            questions: vec![UserQuestion {
+                id: "permission".into(),
+                prompt: "Allow the tool to run?".into(),
+                options: vec![
+                    UserOption {
+                        id: "allow".into(),
+                        label: "Allow".into(),
+                        description: None,
+                    },
+                    UserOption {
+                        id: "deny".into(),
+                        label: "Deny".into(),
+                        description: Some("reject_once".into()),
+                    },
+                ],
+            }],
+        };
+        // No frontend must mean `Err` (the tool then applies its own policy),
+        // never a parked turn.
+        let answer = match handle.ask_user(request) {
+            Ok(answer) => answer.await.ok().flatten(),
+            Err(_) => None,
+        };
+        *self.answer.lock().unwrap() = Some(answer.clone());
+        Ok(ToolOutput::text(format!("answer: {answer:?}")))
+    }
+    fn set_session_handle(&mut self, _session_id: &str, handle: SessionHandle) {
+        self.handle = Some(handle);
+    }
+}
+
+/// The next `WaitingInput` request, or a failure naming the status actually
+/// observed (a parked turn that never reaches `WaitingInput` fails here).
+async fn wait_for_question(status: &mut watch::Receiver<SessionStatus>) -> UserInputRequest {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let SessionStatus::WaitingInput(request) = &*status.borrow() {
+                return request.clone();
+            }
+            status.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no question surfaced; status={:?}", *status.borrow()))
+}
+
+/// Wait for the committed tool result event of `call_id`. The durable row is
+/// already written when it is emitted, so the store can be read right after.
+async fn wait_for_tool_result(events: &mut broadcast::Receiver<AgentEvent>, call_id: &str) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let AgentEvent::ToolResult {
+                call_id: Some(id), ..
+            } = events.recv().await.expect("the session emits events")
+                && id == call_id
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the tool result must be emitted")
+}
+
+fn ask_tool_agent(answer: Arc<Mutex<Option<Option<String>>>>) -> Agent {
+    Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: VecDeque::from(vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call-ask".into(),
+                        name: "ask_tool".into(),
+                        arguments: "{}".into(),
+                    }],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("done".into()),
+                    tool_calls: Vec::new(),
+                    reasoning: None,
+                },
+            ]),
+        }),
+        vec![Box::new(AskTool {
+            handle: None,
+            answer,
+        })],
+    )
+}
+
+/// A tool's mid-call question parks the turn through the SAME frontend as
+/// `request_user_input`, and the tool gets the chosen option id back.
+#[tokio::test]
+async fn a_tool_question_parks_the_turn_and_returns_the_chosen_option_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let answer = Arc::new(Mutex::new(None));
+    let (runner, handle) = SessionRunner::new(
+        ask_tool_agent(answer.clone()),
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "tool-ask".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let runner = runner.with_user_input_allowed();
+    let (_, mut events, mut status) = handle.attach();
+    let task = runner.start(Some("start".into()));
+
+    let request = wait_for_question(&mut status).await;
+    assert_eq!(request.call_id, "tool-ask");
+    assert_eq!(request.questions[0].prompt, "Allow the tool to run?");
+    assert_eq!(
+        request.questions[0]
+            .options
+            .iter()
+            .map(|option| option.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["allow", "deny"]
+    );
+    // An id the question does not offer is refused and leaves it answerable.
+    assert!(matches!(
+        handle.submit_prompt_with_call_id(Some("tool-ask".into()), "bogus".into()),
+        PromptSubmission::Invalid(_)
+    ));
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("tool-ask".into()), "deny".into()),
+        PromptSubmission::Answered
+    );
+
+    wait_for_tool_result(&mut events, "call-ask").await;
+    drop(task);
+    assert_eq!(*answer.lock().unwrap(), Some(Some("deny".to_owned())));
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "tool-ask")
+        .await
+        .unwrap()
+        .entries;
+    let result = tool_entries(&entries)
+        .into_iter()
+        .find_map(|message| match message {
+            Message::Tool {
+                call_id, content, ..
+            } if call_id == "call-ask" => Some(content.clone()),
+            _ => None,
+        })
+        .expect("the tool result is committed");
+    assert_eq!(result, r#"answer: Some("deny")"#);
+}
+
+/// Without a frontend a tool's ask is refused outright: no `WaitingInput`, no
+/// parked turn — the tool applies its own policy on the next line.
+#[tokio::test]
+async fn a_tool_question_without_a_frontend_is_refused_instead_of_parking() {
+    let temp = tempfile::tempdir().unwrap();
+    let answer = Arc::new(Mutex::new(None));
+    let (runner, handle) = SessionRunner::new(
+        ask_tool_agent(answer.clone()),
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "tool-ask-child".into(),
+        IdlePolicy::WaitForInput,
+    );
+    // A delegate/btw/fork child: no `with_user_input_allowed`.
+    let (_, mut events, _status) = handle.attach();
+    let task = runner.start(Some("start".into()));
+    wait_for_tool_result(&mut events, "call-ask").await;
+    drop(task);
+    assert_eq!(*answer.lock().unwrap(), Some(None));
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "tool-ask-child")
+        .await
+        .unwrap()
+        .entries;
+    assert!(
+        tool_entries(&entries).iter().any(|message| matches!(
+            message,
+            Message::Tool { call_id, content, .. }
+                if call_id == "call-ask" && content == "answer: None"
+        )),
+        "the tool ran without asking"
+    );
+}
+
+/// End-to-end blocking path with fixed options: an invalid id is rejected
+/// while the turn stays parked, and the accepted option reaches the model as
+/// `Selected option: {id} ({label})` inside the tool result.
+#[tokio::test]
+async fn blocking_option_question_answer_reaches_the_model_with_id_and_label() {
+    let temp = tempfile::tempdir().unwrap();
+    let agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: VecDeque::from(vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call-opt".into(),
+                        name: "request_user_input".into(),
+                        arguments: r#"{"questions":[{"id":"perm","prompt":"Allow?","options":[{"id":"allow-once","label":"允许一次"},{"id":"deny","label":"拒绝","description":"仅此一次"}]}]}"#.into(),
+                    }],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("decided".into()),
+                    tool_calls: Vec::new(),
+                    reasoning: None,
+                },
+            ]),
+        }),
+        vec![
+            Box::new(crate::tools::user_input::RequestUserInput),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "option-input".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let runner = runner.with_user_input_allowed();
+    let (_, _events, mut status) = handle.attach();
+    let task = runner.start(Some("start".into()));
+    let waiting = wait_for_status(&mut status, |status| {
+        matches!(status, SessionStatus::WaitingInput(_))
+    })
+    .await;
+    match waiting {
+        SessionStatus::WaitingInput(request) => {
+            assert_eq!(request.call_id, "call-opt");
+            assert_eq!(request.questions[0].options.len(), 2);
+        }
+        other => panic!("expected WaitingInput, got {other:?}"),
+    }
+    assert!(matches!(
+        handle.submit_prompt_with_call_id(Some("call-opt".into()), "allow".into()),
+        PromptSubmission::Invalid(error) if error.contains("allow-once") && error.contains("deny")
+    ));
+    assert!(
+        matches!(&*status.borrow(), SessionStatus::WaitingInput(request) if request.call_id == "call-opt"),
+        "a rejected id leaves the turn parked: {:?}",
+        *status.borrow()
+    );
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("call-opt".into()), "deny".into()),
+        PromptSubmission::Answered
+    );
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "decided"),
+    )
+    .await;
+    wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)).await;
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "option-input")
+        .await
+        .unwrap()
+        .entries;
+    match tool_entries(&entries)[0] {
+        Message::Tool {
+            call_id, content, ..
+        } => {
+            assert_eq!(call_id, "call-opt");
+            assert!(
+                content.contains("Selected option: deny (拒绝)"),
+                "model-facing answer: {content}"
+            );
+            assert!(content.contains("\"id\":\"perm\""), "{content}");
+        }
+        other => panic!("expected the tool result, got {other:?}"),
+    }
+    drop(task);
+}
+
+/// A question may carry fixed options. Only an option id is accepted, the
+/// rejection names the allowed ids, and the model-facing answer carries both
+/// the id and its label so no mapping has to be remembered.
+#[test]
+fn option_answer_accepts_only_listed_ids_and_keeps_id_and_label() {
+    let (handle, emitter, mut commands) = crate::runner::session_test_channel();
+    emitter.set_status(SessionStatus::WaitingInput(UserInputRequest {
+        call_id: "call-perm".into(),
+        questions: vec![option_question()],
+    }));
+    for submitted in ["allow", "允许一次"] {
+        match handle.submit_prompt_with_call_id(Some("call-perm".into()), submitted.into()) {
+            PromptSubmission::Invalid(error) => assert!(
+                error.contains("allow-once") && error.contains("deny"),
+                "{error}"
+            ),
+            other => panic!("accepted {submitted:?}: {other:?}"),
+        }
+    }
+    // A rejected answer never claims the question.
+    assert!(commands.try_recv().is_err());
+    // Trimming is only layout: the id itself is accepted and resolves to
+    // `Selected option: {id} ({label})`.
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("call-perm".into()), " allow-once ".into()),
+        PromptSubmission::Answered
+    );
+    match commands.try_recv().unwrap() {
+        SessionCommand::Answer { call_id, answers } => {
+            assert_eq!(call_id, "call-perm");
+            assert_eq!(
+                answers,
+                vec![(
+                    "perm".to_owned(),
+                    "Selected option: allow-once (允许一次)".to_owned()
+                )]
+            );
+        }
+        _ => panic!("expected the structured answer command"),
+    }
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("call-perm".into()), "deny".into()),
+        PromptSubmission::Conflict
+    );
+}
+
+/// The async path shares the same acceptance rule: the later user-shaped
+/// message (:Notice) carries the id and the label.
+#[test]
+fn async_option_answer_uses_the_same_resolution() {
+    let (handle, emitter, mut commands) = crate::runner::session_test_channel();
+    emitter.register_pending_question(UserInputRequest {
+        call_id: "call-async-perm".into(),
+        questions: vec![option_question()],
+    });
+    assert!(matches!(
+        handle.submit_prompt_with_call_id(Some("call-async-perm".into()), "allow".into()),
+        PromptSubmission::Invalid(error) if error.contains("allow-once, deny")
+    ));
+    assert_eq!(
+        handle.pending_questions(),
+        vec![UserInputRequest {
+            call_id: "call-async-perm".into(),
+            questions: vec![option_question()],
+        }],
+        "a rejected answer leaves the question answerable"
+    );
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("call-async-perm".into()), "deny".into()),
+        PromptSubmission::Answered
+    );
+    match commands.try_recv().unwrap() {
+        SessionCommand::Answer { call_id, answers } => {
+            assert_eq!(call_id, "call-async-perm");
+            assert_eq!(
+                answers,
+                vec![("perm".to_owned(), "Selected option: deny (拒绝)".to_owned())]
+            );
+        }
+        _ => panic!("expected the structured answer command"),
+    }
+}
+
+/// A free-text question keeps today's contract: any non-empty answer is
+/// accepted verbatim (no trimming, no rewriting).
+#[test]
+fn free_text_answer_still_accepts_any_non_empty_text() {
+    let (handle, emitter, mut commands) = crate::runner::session_test_channel();
+    emitter.set_status(SessionStatus::WaitingInput(UserInputRequest {
+        call_id: "call-text".into(),
+        questions: vec![UserQuestion {
+            id: "answer".into(),
+            prompt: "Your name?".into(),
+            options: Vec::new(),
+        }],
+    }));
+    assert!(matches!(
+        handle.submit_prompt_with_call_id(Some("call-text".into()), "  ".into()),
+        PromptSubmission::Invalid(_)
+    ));
+    assert!(commands.try_recv().is_err());
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("call-text".into()), " Ada 你好 ".into()),
+        PromptSubmission::Answered
+    );
+    match commands.try_recv().unwrap() {
+        SessionCommand::Answer { call_id, answers } => {
+            assert_eq!(call_id, "call-text");
+            assert_eq!(
+                answers,
+                vec![("answer".to_owned(), " Ada 你好 ".to_owned())]
+            );
+        }
+        _ => panic!("expected the structured answer command"),
+    }
+}
+
+/// A question with options serializes them; one without serializes exactly as
+/// before (no empty `options` key), which is what the frontends and the
+/// status payload rely on.
+#[test]
+fn user_question_serde_omits_empty_options() {
+    let with_options = UserQuestion {
+        id: "perm".into(),
+        prompt: "Allow?".into(),
+        options: vec![
+            UserOption {
+                id: "allow-once".into(),
+                label: "允许一次".into(),
+                description: Some("仅此一次".into()),
+            },
+            UserOption {
+                id: "deny".into(),
+                label: "拒绝".into(),
+                description: None,
+            },
+        ],
+    };
+    assert_eq!(
+        serde_json::to_value(&with_options).unwrap(),
+        serde_json::json!({
+            "id": "perm",
+            "prompt": "Allow?",
+            "options": [
+                {"id": "allow-once", "label": "允许一次", "description": "仅此一次"},
+                {"id": "deny", "label": "拒绝"}
+            ]
+        })
+    );
+    let plain = UserQuestion {
+        id: "name".into(),
+        prompt: "Your name?".into(),
+        options: Vec::new(),
+    };
+    assert_eq!(
+        serde_json::to_value(&plain).unwrap(),
+        serde_json::json!({"id": "name", "prompt": "Your name?"})
+    );
+}
+
+fn option_question() -> UserQuestion {
+    UserQuestion {
+        id: "perm".into(),
+        prompt: "Allow?".into(),
+        options: vec![
+            UserOption {
+                id: "allow-once".into(),
+                label: "允许一次".into(),
+                description: Some("仅此一次".into()),
+            },
+            UserOption {
+                id: "deny".into(),
+                label: "拒绝".into(),
+                description: None,
+            },
+        ],
+    }
 }
 
 /// A delegate/btw/fork session has no frontend that could answer a
@@ -1280,6 +1895,7 @@ async fn async_request_user_input_receipts_and_keeps_the_turn_going() {
             questions: vec![UserQuestion {
                 id: "name".into(),
                 prompt: "Your name?".into(),
+                options: Vec::new(),
             }],
         }]
     );
@@ -2209,6 +2825,8 @@ impl Tool for MarkerTool {
                 mime: "image/png".into(),
             }],
             background_started: false,
+            started_task_id: None,
+            subagent_session_id: None,
         })
     }
 }
@@ -2276,6 +2894,8 @@ impl Tool for BlockingMarkerTool {
                 mime: "image/png".into(),
             }],
             background_started: false,
+            started_task_id: None,
+            subagent_session_id: None,
         })
     }
 }
@@ -2697,12 +3317,14 @@ async fn switch_model_applies_to_the_next_turn() {
 
     // Runtime switch, then turn 2 must run on the new model.
     handle.switch_model(
-        "model-b",
         Box::new(NamedRecordingModel {
             name: "model-b".into(),
             calls: calls.clone(),
         }),
         Some(32_000),
+        // A programmatically installed model has no resolved snapshot to
+        // inherit, so a `fork` would fail closed (this session never forks).
+        None,
     );
     handle.prompt("second");
     loop {
@@ -5430,6 +6052,8 @@ async fn requested_compaction_singletask_resume_keeps_pair_and_summary_constrain
                 images: vec![],
                 is_error: false,
                 synthetic: false,
+                started_task_id: None,
+                subagent_session_id: None,
             }
             .into(),
         );
@@ -6634,24 +7258,29 @@ async fn runner_durable_before_ref_for_oversized_tool_content() {
     };
 
     // The embedded receipt resolves against the DURABLY PERSISTED session
-    // file (durable-before-ref): read the exact full field back.
+    // file (durable-before-ref): read the exact full field back through the
+    // production `read_output` path. The receipt is owner-bearing and names
+    // this session's own row.
     let ref_start = bounded.find("ref=eout1.").unwrap() + "ref=".len();
     let ref_end = bounded[ref_start..].find(']').unwrap() + ref_start;
     let receipt = &bounded[ref_start..ref_end];
-    let parsed = crate::output_receipt::parse_ref(receipt).unwrap();
-    let crate::output_receipt::OutputRef::Direct { entry_id, field } = parsed else {
-        panic!("expected a direct short ref, got legacy: {receipt}");
+    let verified = match crate::output_receipt::parse_ref(receipt).unwrap() {
+        crate::output_receipt::OutputRef::Legacy(verified) => verified,
+        other => panic!("expected an owner-bearing ref, got {other:?}"),
     };
-    assert_eq!(field, crate::output_receipt::FieldId::ToolContent);
-    let bytes = store
-        .read_field_direct(temp.path(), "durable-ref", entry_id, field)
-        .await
-        .unwrap();
+    assert_eq!(verified.location.session, "durable-ref");
+    assert_eq!(verified.field, crate::output_receipt::FieldId::ToolContent);
+    let page =
+        crate::tools::output::execute(&store, temp.path(), "durable-ref", receipt, 0, 32 * 1024)
+            .await
+            .expect("the receipt resolves against the persisted session");
+    let page: serde_json::Value = serde_json::from_str(&page).unwrap();
     assert_eq!(
-        bytes,
-        tool.as_bytes(),
+        page["text"].as_str().unwrap(),
+        tool,
         "receipt reads the persisted full field"
     );
+    assert_eq!(page["total_bytes"].as_u64().unwrap(), tool.len() as u64);
 }
 
 #[tokio::test]
@@ -6806,7 +7435,7 @@ async fn switch_to_non_vision_during_read_image_strips_request() {
     );
     let task = runner.start(Some("look".into()));
     entered.notified().await;
-    handle.switch_model("non-vision", Box::new(non_vision), None);
+    handle.switch_model(Box::new(non_vision), None, None);
     release.notify_one();
     let mut status = handle.status();
     let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
@@ -6919,7 +7548,7 @@ async fn switch_to_vision_during_read_image_keeps_history_image_and_serves_it() 
     );
     let task = runner.start(Some("look".into()));
     entered.notified().await;
-    handle.switch_model("vision", Box::new(vision), None);
+    handle.switch_model(Box::new(vision), None, None);
     release.notify_one();
     let mut status = handle.status();
     let result = wait_for_status(&mut status, |s| matches!(s, SessionStatus::Finished(_))).await;
@@ -7207,10 +7836,12 @@ impl Tool for MockBackgroundBash {
         }
     }
     async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
-        Ok(ToolOutput::text(format!(
-            "started background task {}: {}",
-            self.id, self.label
-        )))
+        // The structured id, not the prose: this is what the runner's
+        // finish gate keys on.
+        Ok(ToolOutput::started_task(
+            format!("started background task {}: {}", self.id, self.label),
+            self.id,
+        ))
     }
     fn set_event_sender(&mut self, sender: mpsc::UnboundedSender<AgentEvent>) {
         *self.sender.lock().unwrap() = Some(sender);
@@ -7238,7 +7869,7 @@ impl Tool for ProjectingBackgroundBash {
     }
     async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
         let release = self.release.clone();
-        let started = self.background.spawn_with_id(
+        let (task_id, started) = self.background.spawn_with_id(
             "slow build".into(),
             None,
             None,
@@ -7250,7 +7881,7 @@ impl Tool for ProjectingBackgroundBash {
                 "build ok".to_string()
             },
         )?;
-        Ok(ToolOutput::text(started))
+        Ok(ToolOutput::started_task(started, task_id))
     }
     fn set_event_sender(&mut self, sender: mpsc::UnboundedSender<AgentEvent>) {
         self.background.set_event_sender(sender);
@@ -7482,6 +8113,7 @@ async fn unfinished_background_bash_blocks_finish_when_idle_until_completion() {
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         })
         .unwrap();
     loop {
@@ -7614,11 +8246,14 @@ impl Tool for StartingBashMock {
         }
     }
     async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
+        // Ids start at 1, like the registry's own allocator.
         let id = self.0.fetch_add(1, Ordering::SeqCst) + 1;
         Ok(ToolOutput {
             content: format!("started background task {id}: build {id}"),
             images: Vec::new(),
             background_started: true,
+            started_task_id: Some(id as u64),
+            subagent_session_id: None,
         })
     }
 }
@@ -8203,6 +8838,7 @@ async fn content_and_tool_calls_in_same_round_still_block_and_complete() {
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         })
         .unwrap();
     loop {
@@ -8312,6 +8948,7 @@ async fn completion_arriving_during_last_model_round_is_committed_before_finaliz
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         })
         .unwrap();
     release.notify_one();
@@ -8395,12 +9032,13 @@ impl Tool for SelfCompletingBash {
                 status: None,
                 kind: None,
                 cancellation_source: None,
+                subagent_session_id: None,
             })
             .unwrap();
-        Ok(ToolOutput::text(format!(
-            "started background task {}: cargo build",
-            self.id
-        )))
+        Ok(ToolOutput::started_task(
+            format!("started background task {}: cargo build", self.id),
+            self.id,
+        ))
     }
     fn set_event_sender(&mut self, sender: mpsc::UnboundedSender<AgentEvent>) {
         *self.sender.lock().unwrap() = Some(sender);
@@ -8608,6 +9246,7 @@ async fn finish_when_idle_waits_indefinitely_for_blocking_completion() {
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         })
         .unwrap();
     loop {
@@ -9742,6 +10381,7 @@ async fn steer_cancel_then_prompt_at_idle_with_blocking_background_runs_queued_t
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         })
         .unwrap();
     loop {
@@ -10235,10 +10875,13 @@ async fn assert_read_only_runner_cancel_while_sqlite_read_pending(read_output: b
             .unwrap();
         let loaded = store.load_located(temp.path(), &session_id).await.unwrap();
         let location = loaded.locations.last().unwrap().as_ref().unwrap();
-        (serde_json::json!({
-            "ref": crate::output_receipt::issue_direct(location, crate::output_receipt::FieldId::NoticeText),
-            "limit": 100,
-        }).to_string(), "read_output")
+        // The HISTORICAL short form an older build would have persisted: it
+        // still resolves inside this session's own store.
+        let reference = format!("eout1.{}.n", location.key.seq());
+        (
+            serde_json::json!({"ref": reference, "limit": 100}).to_string(),
+            "read_output",
+        )
     } else {
         store
             .append(
@@ -11754,6 +12397,7 @@ async fn oracle449_runner_persists_notice_before_completion_and_keeps_owner_unti
         status: None,
         kind: None,
         cancellation_source: None,
+        subagent_session_id: None,
     })
     .unwrap();
     loop {
@@ -12010,6 +12654,7 @@ async fn oracle449_runner_notice_is_visible_once_to_attached_and_late_views() {
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         })
         .unwrap();
     let mut notices = 0;
@@ -12033,24 +12678,32 @@ async fn oracle449_runner_notice_is_visible_once_to_attached_and_late_views() {
 }
 
 #[test]
-fn switch_model_command_carries_context_window() {
+fn switch_model_command_carries_the_resolved_snapshot_and_window() {
     let (handle, _emitter, mut commands) = session_test_channel();
-    handle.switch_model(
-        "model-b",
-        Box::new(NamedRecordingModel {
-            name: "model-b".into(),
-            calls: Arc::new(Mutex::new(Vec::new())),
-        }),
-        Some(32_000),
+    // The RESOLVED model the caller switched with: the runner snapshots this
+    // clone plus the installed window as the identity a fork inherits (it
+    // never re-resolves, so a config reload cannot reroute the child).
+    let resolved = crate::model::ConfiguredModel::chat(
+        crate::model::OpenAiModel::new(
+            "http://localhost".into(),
+            "test-key".into(),
+            "model-b".into(),
+            Some("high".into()),
+        )
+        .unwrap(),
     );
-    assert!(matches!(
-        commands.try_recv(),
-        Ok(SessionCommand::SwitchModel {
-            context_window: Some(32_000),
-            profile,
-            ..
-        }) if profile == "model-b"
-    ));
+    handle.switch_model(Box::new(resolved.clone()), Some(32_000), Some(resolved));
+    let Ok(SessionCommand::SwitchModel {
+        context_window,
+        fork_snapshot,
+        ..
+    }) = commands.try_recv()
+    else {
+        panic!("expected a SwitchModel command");
+    };
+    assert_eq!(context_window, Some(32_000));
+    let snapshot = fork_snapshot.expect("the resolved model travels with the switch");
+    assert_eq!(snapshot.name(), "model-b");
 }
 
 // Focused `/goal continue` contract tests. Continuation state is deliberately
@@ -12350,6 +13003,7 @@ async fn goal_continue_idle_background_followup_then_resume() {
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         })
         .unwrap();
     wait_for_log_event(
@@ -15779,6 +16433,7 @@ async fn oracle718_background_during_answer_compact_keeps_resume(
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         })
         .unwrap();
     compact_release.notify_one();
@@ -17313,10 +17968,10 @@ impl Tool for BlockingBackgroundBash {
     async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
         self.entered.notify_one();
         self.release.notified().await;
-        Ok(ToolOutput::text(format!(
-            "started background task {}: {}",
-            self.id, self.label
-        )))
+        Ok(ToolOutput::started_task(
+            format!("started background task {}: {}", self.id, self.label),
+            self.id,
+        ))
     }
     fn set_event_sender(&mut self, sender: mpsc::UnboundedSender<AgentEvent>) {
         *self.sender.lock().unwrap() = Some(sender);
@@ -17335,6 +17990,7 @@ fn owned_background_completed(id: u64, output: &str, label: &str) -> AgentEvent 
         status: None,
         kind: None,
         cancellation_source: None,
+        subagent_session_id: None,
     }
 }
 
@@ -18289,7 +18945,7 @@ async fn a_shared_registry_task_this_session_did_not_start_does_not_suspend_the_
             },
         )
         .unwrap();
-    assert!(started.starts_with("started background task"));
+    assert!(started.1.starts_with("started background task"));
     let agent = Agent::new(
         Box::new(BlockingContextCaptureModel {
             replies: vec![

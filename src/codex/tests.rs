@@ -32,6 +32,8 @@ fn responses_wire_flattens_system_tools_and_tool_results() {
                 content: "failed".into(),
                 is_error: true,
                 synthetic: false,
+                started_task_id: None,
+                subagent_session_id: None,
                 images: vec![],
             },
         ],
@@ -47,6 +49,7 @@ fn responses_wire_flattens_system_tools_and_tool_results() {
             }),
         }],
         None,
+        crate::images::DEFAULT_MAX_INLINE,
     );
     let value = serde_json::to_value(request).unwrap();
     assert_eq!(value["instructions"], "first\n\nsecond");
@@ -85,6 +88,7 @@ fn responses_wire_emits_input_image_parts_for_attached_images() {
         }],
         &[],
         Some(temp.path()),
+        crate::images::DEFAULT_MAX_INLINE,
     );
     let value = serde_json::to_value(request).unwrap();
     let parts = value["input"][0]["content"].as_array().unwrap();
@@ -116,6 +120,7 @@ fn responses_wire_degrades_missing_image_to_text_placeholder() {
         }],
         &[],
         None,
+        crate::images::DEFAULT_MAX_INLINE,
     );
     let value = serde_json::to_value(request).unwrap();
     let parts = value["input"][0]["content"].as_array().unwrap();
@@ -155,10 +160,13 @@ fn responses_wire_encodes_image_bearing_tool_output_as_output_array() {
                 }],
                 is_error: false,
                 synthetic: false,
+                started_task_id: None,
+                subagent_session_id: None,
             },
         ],
         &[],
         Some(temp.path()),
+        crate::images::DEFAULT_MAX_INLINE,
     );
     let value = serde_json::to_value(request).unwrap();
     // content: None => the assistant contributes only the function_call
@@ -208,10 +216,13 @@ fn responses_wire_degrades_missing_tool_image_to_text_part() {
                 }],
                 is_error: false,
                 synthetic: false,
+                started_task_id: None,
+                subagent_session_id: None,
             },
         ],
         &[],
         None,
+        crate::images::DEFAULT_MAX_INLINE,
     );
     let value = serde_json::to_value(request).unwrap();
     let output = &value["input"][1]["output"];
@@ -853,4 +864,179 @@ async fn responses_request_hot_reloads_disk_login_headers() {
     .unwrap();
     model.complete(&messages, &[], None).await.unwrap();
     server.await.unwrap();
+}
+
+/// The bounded projection of one oversized tool result whose persisted row
+/// belongs to ANOTHER session (an inherited fork prefix). Shared by the two
+/// wire-encoder tests: the receipt must name the owner, and the encoder must
+/// carry the bounded text verbatim.
+fn forked_bounded_tool_content() -> (String, String) {
+    let location = crate::session_store::EntryLocation {
+        backend: "jsonl",
+        fingerprint: "fp".into(),
+        backend_fp: "bi".into(),
+        session: "parent".into(),
+        key: crate::session_store::LocatedKey::Jsonl { ordinal: 5 },
+        entry_hash: "hash".into(),
+    };
+    let content = format!(
+        "{}{}{}",
+        "h".repeat(crate::output_receipt::PROJECTION_HEAD_BYTES),
+        "OMITTED-MIDDLE",
+        "t".repeat(crate::output_receipt::PROJECTION_TAIL_BYTES)
+    );
+    let bounded = crate::output_receipt::bound_field(
+        &content,
+        &location,
+        crate::output_receipt::FieldId::ToolContent,
+        content.len(),
+    );
+    let start = bounded.find("read_output ref=").unwrap() + "read_output ref=".len();
+    let end = bounded[start..].find(']').unwrap() + start;
+    let reference = bounded[start..end].to_owned();
+    // The receipt names the OWNER, binds the full field and round-trips.
+    match crate::output_receipt::parse_ref(&reference).unwrap() {
+        crate::output_receipt::OutputRef::Legacy(verified) => {
+            assert_eq!(verified.location.session, "parent");
+            assert_eq!(verified.location, location);
+            assert_eq!(verified.total, content.len());
+        }
+        other => panic!("an inherited field must carry an owner-bearing receipt: {other:?}"),
+    }
+    assert!(!bounded.contains("OMITTED-MIDDLE"), "the field is bounded");
+    (bounded, reference)
+}
+
+/// The Responses encoder carries the same bounded inherited field verbatim
+/// (owner-bearing receipt included) in the `function_call_output` item.
+#[test]
+fn responses_wire_carries_a_forked_fields_owner_bearing_receipt() {
+    let (bounded, reference) = forked_bounded_tool_content();
+    let request = ResponsesRequest::from_internal(
+        "codex",
+        None,
+        &[Message::Tool {
+            call_id: "call-1".into(),
+            name: "bash".into(),
+            content: bounded.clone(),
+            is_error: false,
+            synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
+            images: vec![],
+        }],
+        &[],
+        None,
+        crate::images::DEFAULT_MAX_INLINE,
+    );
+    let value = serde_json::to_value(request).unwrap();
+    assert_eq!(value["input"][0]["type"], "function_call_output");
+    assert_eq!(value["input"][0]["output"], bounded.as_str());
+    assert!(
+        value["input"][0]["output"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("read_output ref={reference}]"))
+    );
+}
+
+/// A tiny valid PNG: below the token budget, so it is sent byte-identical.
+fn tiny_png() -> Vec<u8> {
+    let image =
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(8, 8, image::Rgb([1, 2, 3])));
+    let mut bytes = Vec::new();
+    image
+        .write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+    bytes
+}
+
+/// Ten distinct user images in one request: the serialized Responses body
+/// keeps the newest six as `input_image` parts and replaces the oldest four
+/// with recovery placeholders, in place.
+#[test]
+fn responses_wire_offloads_the_oldest_images() {
+    let store = tempfile::tempdir().unwrap();
+    let png = tiny_png();
+    let messages: Vec<Message> = (0..10)
+        .map(|index| {
+            let hash = format!("img{index}");
+            std::fs::write(store.path().join(&hash), &png).unwrap();
+            Message::User {
+                content: format!("image {index}"),
+                images: vec![ImagePart {
+                    hash,
+                    mime: "image/png".into(),
+                }],
+            }
+        })
+        .collect();
+    let body = |max_inline: usize| {
+        serde_json::to_string(&ResponsesRequest::from_internal(
+            "codex",
+            None,
+            &messages,
+            &[],
+            Some(store.path()),
+            max_inline,
+        ))
+        .unwrap()
+    };
+    let value: serde_json::Value = serde_json::from_str(&body(6)).unwrap();
+    let input = value["input"].as_array().unwrap();
+    assert_eq!(input.len(), 10);
+    for (index, item) in input.iter().enumerate() {
+        let parts = item["content"].as_array().unwrap();
+        let images: Vec<_> = parts
+            .iter()
+            .filter(|part| part["type"] == "input_image")
+            .collect();
+        let placeholders: Vec<_> = parts
+            .iter()
+            .filter(|part| {
+                part["type"] == "input_text"
+                    && part["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("image omitted"))
+            })
+            .collect();
+        if index < 4 {
+            assert!(images.is_empty(), "old image {index} must be offloaded");
+            assert_eq!(
+                placeholders[0]["text"],
+                format!(
+                    "[image omitted: 4 older image(s); read again with read_image (hash img{index})]"
+                )
+            );
+        } else {
+            assert_eq!(images.len(), 1, "the newest six stay inline");
+            assert!(placeholders.is_empty());
+            assert_eq!(
+                images[0]["image_url"],
+                format!(
+                    "data:image/png;base64,{}",
+                    base64::engine::general_purpose::STANDARD.encode(&png)
+                ),
+                "a fitting image is sent byte-identical"
+            );
+        }
+    }
+    // Pure and deterministic: the same messages serialise to the same bytes.
+    assert_eq!(body(6), body(6));
+    // `max_inline = 0` disables offloading: every image stays inline.
+    let all: serde_json::Value = serde_json::from_str(&body(0)).unwrap();
+    let inline = all["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| {
+            item["content"]
+                .as_array()
+                .is_some_and(|parts| parts.iter().any(|part| part["type"] == "input_image"))
+        })
+        .count();
+    assert_eq!(inline, 10);
 }

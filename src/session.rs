@@ -1503,6 +1503,7 @@ mod tests {
                 status: None,
                 kind: None,
                 cancellation_source: None,
+                subagent_session_id: None,
             },
         ]
     }
@@ -1561,6 +1562,8 @@ mod tests {
                 images: vec![],
                 is_error: false,
                 synthetic: false,
+                started_task_id: None,
+                subagent_session_id: None,
             },
         }];
         let two = vec![SessionEntry::Message {
@@ -1571,6 +1574,8 @@ mod tests {
                 images: vec![],
                 is_error: false,
                 synthetic: false,
+                started_task_id: None,
+                subagent_session_id: None,
             },
         }];
         Session::append(temp.path(), "one", &one).unwrap();
@@ -1732,6 +1737,7 @@ mod tests {
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         };
         let more = Session::append_located(temp.path(), "loc", &[entry]).unwrap();
         let receipt = issue_legacy_for_test(&more[0], FieldId::BgOutput, output.len());
@@ -1845,6 +1851,7 @@ mod tests {
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         };
         let locations =
             Session::append_located(dir_a.path(), session, std::slice::from_ref(&entry)).unwrap();

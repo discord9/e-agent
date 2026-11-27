@@ -24,10 +24,25 @@ use tokio::{
     task::JoinHandle,
 };
 
+/// One fixed choice of a `request_user_input` question. The answer the user
+/// submits is the option's `id`; `label` is the human-facing text the model
+/// gets back alongside it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct UserOption {
+    pub id: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// One question. Empty `options` is the original free-text question and
+/// serializes exactly as before (no `options` key at all).
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct UserQuestion {
     pub id: String,
     pub prompt: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<UserOption>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -58,12 +73,46 @@ fn pending_questions(shared: &Shared) -> Vec<UserInputRequest> {
     requests
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PromptSubmission {
     Answered,
     Queued,
     Conflict,
     Closed,
+    /// The submitted text is not a valid answer to the open question (an id
+    /// that is not one of its options, or an empty answer). The plain message
+    /// names the allowed ids; the question stays answerable.
+    Invalid(String),
+}
+
+/// Resolve one submitted answer against its question — the single acceptance
+/// rule shared by the blocking and asynchronous paths.
+///
+/// * A free-text question (no options) keeps today's contract: any non-empty
+///   answer is accepted verbatim.
+/// * A question with options accepts exactly one of those option ids and
+///   yields the model-facing `Selected option: {id} ({label})`, so the model
+///   never has to remember the id → label mapping.
+fn resolve_answer(question: &UserQuestion, submitted: &str) -> Result<String, String> {
+    let answer = submitted.trim();
+    if answer.is_empty() {
+        return Err("answer must not be empty".into());
+    }
+    if question.options.is_empty() {
+        return Ok(submitted.to_owned());
+    }
+    let Some(option) = question.options.iter().find(|option| option.id == answer) else {
+        let allowed: Vec<&str> = question
+            .options
+            .iter()
+            .map(|option| option.id.as_str())
+            .collect();
+        return Err(format!(
+            "answer {answer:?} is not an option of this question; allowed ids: {}",
+            allowed.join(", ")
+        ));
+    };
+    Ok(format!("Selected option: {} ({})", option.id, option.label))
 }
 
 const EVENT_CAPACITY: usize = 256;
@@ -173,6 +222,12 @@ fn recover_image_rejection(
         let mut shared = shared.lock().unwrap();
         shared.emit_presentation(AgentEvent::Error(rejection.to_string()));
         shared.emit_presentation(AgentEvent::Display(IMAGE_RETRY_NOTICE.into()));
+        // Mirror the agent's sticky omission set so a `fork` child inherits
+        // it: the child's first request must skip exactly the attachments the
+        // parent already knows its provider rejects.
+        shared
+            .omitted_images
+            .extend(rejection.hashes.iter().cloned());
     }
     agent.omit_images(rejection.hashes.iter().cloned());
 }
@@ -235,11 +290,127 @@ where
                 Some(SessionCommand::Cancel) => {
                     return WaitResult { outcome: WaitOutcome::Released, pending };
                 }
+                Some(SessionCommand::AskUser { request, reply }) => {
+                    // A tool asked the human mid-call. Surface it as this
+                    // session's blocking question — the same `WaitingInput`
+                    // state and structured answer every frontend already
+                    // renders — while the tool future stays parked on its
+                    // receiver.
+                    match ask_user_while_waiting(commands, shared, request, &mut pending).await {
+                        AskOutcome::Answered(answer) => {
+                            let _ = reply.send(answer);
+                        }
+                        AskOutcome::Released => {
+                            return WaitResult { outcome: WaitOutcome::Released, pending };
+                        }
+                        AskOutcome::Closed => {
+                            return WaitResult { outcome: WaitOutcome::Closed, pending };
+                        }
+                    }
+                }
                 Some(command) => pending.push(command),
                 None => return WaitResult { outcome: WaitOutcome::Closed, pending },
             }
         }
     }
+}
+
+/// A session's live routing identity, installed by a runtime `/model` switch:
+/// the model the switch actually installed (already resolved against the
+/// config at that instant) plus its context window, so a `fork` reproduces the
+/// parent's EFFECTIVE model by CLONING it rather than re-resolving it — a
+/// config reload after the switch must not reroute the child.
+#[derive(Clone)]
+pub struct LiveModel {
+    /// The resolved model the switch installed, carried whole (wire model,
+    /// endpoint, effort, thinking switches). `None` when the caller installed
+    /// a model programmatically, i.e. there is no config snapshot to inherit:
+    /// such a session has no forkable model and a `fork` fails closed.
+    pub model: Option<crate::model::ConfiguredModel>,
+    /// The context window the switch installed (`None` when the profile
+    /// declares none, or a `--model` override replaced the wire model).
+    pub context_window: Option<u64>,
+}
+
+/// How a running tool's mid-call question ended.
+enum AskOutcome {
+    /// The question closed with (`Some(chosen option id)`) or without
+    /// (`None` = cancelled) an answer; the tool is told either way.
+    Answered(Option<String>),
+    /// The turn was cancelled while the question was open: the in-flight
+    /// tool future (and its agent child) is released.
+    Released,
+    /// The command channel closed: the session is ending.
+    Closed,
+}
+
+/// Surface one tool's question as this session's blocking request and wait
+/// for the structured answer — the same `WaitingInput` state, first-answer
+/// claim, and option-id validation the `request_user_input` interception
+/// uses, so no frontend needs a second question path. The tool future stays
+/// parked on its receiver meanwhile; `pending` collects every other command
+/// for the caller, exactly like the outer wait.
+async fn ask_user_while_waiting(
+    commands: &mut mpsc::UnboundedReceiver<SessionCommand>,
+    shared: &Arc<Mutex<Shared>>,
+    request: UserInputRequest,
+    pending: &mut Vec<SessionCommand>,
+) -> AskOutcome {
+    let call_id = request.call_id.clone();
+    let question = request.questions.first().cloned();
+    {
+        let mut state = shared.lock().unwrap();
+        state.input_claimed = false;
+        state.waiting_input = Some(request.clone());
+        state
+            .status
+            .send_replace(SessionStatus::WaitingInput(request));
+    }
+    let outcome = loop {
+        match commands.recv().await {
+            Some(SessionCommand::Answer {
+                call_id: answered,
+                answers,
+            }) if answered == call_id => {
+                let value = answers.into_iter().next().map(|(_, value)| value);
+                let answer = match (question.as_ref(), value.as_deref()) {
+                    (Some(question), Some(value)) => tool_answer(question, value),
+                    _ => None,
+                };
+                break AskOutcome::Answered(answer);
+            }
+            Some(SessionCommand::WebAttach(reply)) => {
+                // WaitingInput is a stable runner boundary: answer the attach
+                // from the head frozen before this wait.
+                respond_web_attach_shared(shared, reply)
+            }
+            Some(SessionCommand::Cancel) => break AskOutcome::Released,
+            Some(command) => pending.push(command),
+            None => break AskOutcome::Closed,
+        }
+    };
+    {
+        let mut state = shared.lock().unwrap();
+        state.waiting_input = None;
+        state.input_claimed = false;
+        state.status.send_replace(SessionStatus::Busy);
+    }
+    outcome
+}
+
+/// The value a tool-facing ask returns for one validated answer: the option
+/// id the answer names (inverting the single `resolve_answer` rendering,
+/// never re-parsing user text), the answer verbatim for a free-text question,
+/// and `None` when the value names no offered option (cancelled).
+fn tool_answer(question: &UserQuestion, value: &str) -> Option<String> {
+    if question.options.is_empty() {
+        return Some(value.to_owned());
+    }
+    question
+        .options
+        .iter()
+        .find(|option| resolve_answer(question, &option.id).ok().as_deref() == Some(value))
+        .map(|option| option.id.clone())
 }
 
 /// Steering commands accepted by a session's command channel. Not
@@ -255,13 +426,17 @@ pub enum SessionCommand {
     Cancel,
     Compact,
     /// Runtime model switch (web/TUI `/model <profile>`): the caller
-    /// resolves the profile to a concrete model and its context window;
-    /// the runner installs both on the agent together and remembers the
-    /// profile as the session's live routing identity.
+    /// resolves the profile (with its effort override) to a concrete model
+    /// and its context window; the runner installs both on the agent together
+    /// and snapshots the SAME window plus a clone of the resolved model
+    /// (`fork_snapshot`) as the session's live routing identity.
     SwitchModel {
-        profile: String,
         model: Box<dyn Model>,
         context_window: Option<u64>,
+        /// The resolved model the switch was built from, cloned so a `fork`
+        /// inherits it (never re-resolved against a reloaded config). `None`
+        /// for a programmatically installed model.
+        fork_snapshot: Option<crate::model::ConfiguredModel>,
     },
     /// Human-issued goal mutation (`/goal` commands, web API). The model
     /// never creates goals; its `update_goal` tool is intercepted by the
@@ -283,6 +458,14 @@ pub enum SessionCommand {
     AgentMessage {
         source: String,
         body: String,
+    },
+    /// A tool asking the human mid-call (`SessionHandle::ask_user`). The
+    /// runner surfaces `request` as this session's blocking question and
+    /// answers `reply` with the chosen option id (`None` = cancelled), so a
+    /// tool never fakes a suspension of its own.
+    AskUser {
+        request: UserInputRequest,
+        reply: oneshot::Sender<Option<String>>,
     },
 }
 
@@ -388,14 +571,25 @@ struct Shared {
     latest_usage: Option<AgentEvent>,
     usage_pre_compaction: bool,
     commands_open: bool,
+    /// Whether this session may suspend on a question and wait for a human
+    /// answer. Only the root/main session installs its single
+    /// `WaitingInput` frontend (`with_user_input_allowed`); delegate, btw and
+    /// fork runners keep `false`, so `request_user_input` fails back to their
+    /// model and a tool's mid-call ask (`SessionHandle::ask_user`) refuses
+    /// instead of parking a turn nobody can answer.
+    user_input_allowed: bool,
     /// Latest goal snapshot, mirrored from the runner for UI reads
     /// (REPL `/goal`, TUI GoalBar, web `GET /api/sessions/{id}/goal`).
     goal: Option<crate::agent::GoalSnapshot>,
-    /// The session's live routing identity — `(profile key, context window)`
-    /// installed by a runtime `/model` switch — or `None` while the startup
-    /// model still applies. Fork admission reads it so a forked child never
-    /// inherits the model captured when the parent was built.
-    live_model: Option<(String, Option<u64>)>,
+    /// The session's live routing identity installed by a runtime `/model`
+    /// switch — or `None` while the startup model still applies. Fork
+    /// admission reads it so a forked child never inherits the model captured
+    /// when the parent was built.
+    live_model: Option<LiveModel>,
+    /// Image hashes a live provider rejection made sticky for this session's
+    /// request copies (the `Agent`'s own omission set, mirrored here so a
+    /// `fork` child can inherit it). Empty while nothing was rejected.
+    omitted_images: HashSet<String>,
     /// Goal-admission state only: ids of this session's own live
     /// `delegate`/btw children whose completion is not durably committed yet.
     /// Registered at spawn (before the wrapper's work runs) and released only
@@ -562,13 +756,32 @@ impl WeakSessionHandle {
         true
     }
 
-    /// The session's live model identity — `(profile key, context window)`
-    /// installed by the last runtime `/model` switch — or `None` while the
-    /// startup model still applies. A `fork` delegate reads it so the child
-    /// runs and reports the parent's CURRENT model, never the one captured
-    /// when the parent was built.
-    pub fn live_model(&self) -> Option<(String, Option<u64>)> {
+    /// The session's live routing identity — the resolved model the last
+    /// runtime `/model` switch installed plus its context window — or `None`
+    /// while the startup model still applies. A `fork` delegate clones it so
+    /// the child runs the parent's CURRENT EFFECTIVE model, never the one
+    /// captured when the parent was built: its presence alone is the
+    /// "build-time head is stale" signal.
+    pub fn live_model(&self) -> Option<LiveModel> {
         self.shared.upgrade()?.lock().unwrap().live_model.clone()
+    }
+
+    /// The image hashes a live provider rejection made this session's request
+    /// copies skip (sorted, so the snapshot a fork takes is deterministic).
+    /// Losing the runner state yields an empty list.
+    pub fn omitted_images(&self) -> Vec<String> {
+        let Some(shared) = self.shared.upgrade() else {
+            return Vec::new();
+        };
+        let mut hashes: Vec<String> = shared
+            .lock()
+            .unwrap()
+            .omitted_images
+            .iter()
+            .cloned()
+            .collect();
+        hashes.sort_unstable();
+        hashes
     }
 
     /// Test-only: this session's registered Goal children, so spawn-path
@@ -642,12 +855,20 @@ impl SessionHandle {
                 if shared.input_claimed {
                     return PromptSubmission::Conflict;
                 }
-                let id = request.questions[0].id.clone();
+                let Some(question) = request.questions.first() else {
+                    return PromptSubmission::Conflict;
+                };
+                let value = match resolve_answer(question, &prompt) {
+                    Ok(value) => value,
+                    Err(error) => return PromptSubmission::Invalid(error),
+                };
+                let answer_call_id = request.call_id.clone();
+                let id = question.id.clone();
                 if self
                     .commands
                     .send(SessionCommand::Answer {
-                        call_id: request.call_id.clone(),
-                        answers: vec![(id, prompt)],
+                        call_id: answer_call_id,
+                        answers: vec![(id, value)],
                     })
                     .is_err()
                 {
@@ -691,6 +912,8 @@ impl SessionHandle {
     /// Claim one process-local asynchronous question and send its answer
     /// command. `None` means no such unclaimed question (unknown id, already
     /// answered, or an empty answer that must leave the question answerable).
+    /// An answer that is not one of the question's option ids is rejected
+    /// (`Invalid`) without claiming it, so it stays answerable.
     fn claim_async_answer(
         &self,
         shared: &mut Shared,
@@ -704,13 +927,16 @@ impl SessionHandle {
             .pending_questions
             .get(call_id)
             .filter(|pending| !pending.claimed)
-            .and_then(|pending| pending.request.questions.first())
-            .map(|question| question.id.clone())?;
+            .and_then(|pending| pending.request.questions.first())?;
+        let (id, value) = match resolve_answer(question, &prompt) {
+            Ok(value) => (question.id.clone(), value),
+            Err(error) => return Some(PromptSubmission::Invalid(error)),
+        };
         if self
             .commands
             .send(SessionCommand::Answer {
                 call_id: call_id.to_owned(),
-                answers: vec![(question, prompt)],
+                answers: vec![(id, value)],
             })
             .is_err()
         {
@@ -721,6 +947,45 @@ impl SessionHandle {
             pending.claimed = true;
         }
         Some(PromptSubmission::Answered)
+    }
+
+    /// Ask the human ONE question from inside a running tool call.
+    ///
+    /// Only the runner may suspend a turn, so this sends the question through
+    /// the session's own command channel and returns the receiver the tool
+    /// awaits: the runner parks the turn exactly like the blocking
+    /// `request_user_input` interception (`WaitingInput` + first-answer claims
+    /// it, and the answer must name one of the question's option ids). The
+    /// reply is the chosen option id; `None` means cancelled.
+    ///
+    /// `Err` means this call must NOT wait: the session has no user-facing
+    /// frontend (a delegate/btw/fork child), another question is already open,
+    /// or the session is no longer live. The caller falls back to its own
+    /// policy.
+    pub fn ask_user(
+        &self,
+        request: UserInputRequest,
+    ) -> Result<oneshot::Receiver<Option<String>>, String> {
+        let mut shared = self.shared.lock().unwrap();
+        if !shared.user_input_allowed {
+            return Err("this session has no frontend that could answer a question".into());
+        }
+        if shared.waiting_input.is_some() {
+            return Err("another question is already open".into());
+        }
+        if !shared.commands_open || self.commands.is_closed() {
+            return Err("the session is no longer live".into());
+        }
+        let (reply, answer) = oneshot::channel();
+        if self
+            .commands
+            .send(SessionCommand::AskUser { request, reply })
+            .is_err()
+        {
+            shared.commands_open = false;
+            return Err("the session is no longer live".into());
+        }
+        Ok(answer)
     }
 
     /// Queue a prompt with an image attached; the image rides along as a
@@ -792,18 +1057,24 @@ impl SessionHandle {
         }
     }
     /// Switch the session's model and context window at runtime. The caller
-    /// resolves the profile (web/TUI `/model`); the runner installs both from
-    /// its next call on.
-    pub fn switch_model(&self, profile: &str, model: Box<dyn Model>, context_window: Option<u64>) {
+    /// resolves the profile (web/TUI `/model`) and passes the resolved model
+    /// again as `fork_snapshot`: the runner installs the model and snapshots
+    /// the clone with the SAME window as the identity a fork inherits.
+    pub fn switch_model(
+        &self,
+        model: Box<dyn Model>,
+        context_window: Option<u64>,
+        fork_snapshot: Option<crate::model::ConfiguredModel>,
+    ) {
         let mut shared = self.shared.lock().unwrap();
         if shared.commands_open
             && !self.commands.is_closed()
             && self
                 .commands
                 .send(SessionCommand::SwitchModel {
-                    profile: profile.to_owned(),
                     model,
                     context_window,
+                    fork_snapshot,
                 })
                 .is_err()
         {
@@ -924,6 +1195,11 @@ impl TestSessionEmitter {
         shared.input_claimed = false;
         shared.status.send_replace(status);
     }
+    /// Test-only: let this ad-hoc handle answer questions exactly like a root
+    /// session (the real gate is installed by `with_user_input_allowed`).
+    pub(crate) fn allow_user_input(&self) {
+        self.shared.lock().unwrap().user_input_allowed = true;
+    }
     /// Test-only: register one process-local asynchronous question exactly as
     /// the runner does, so status/answer tests can exercise the map without
     /// driving a full turn.
@@ -961,11 +1237,13 @@ pub(crate) fn session_test_channel() -> (
         latest_usage: None,
         usage_pre_compaction: false,
         commands_open: true,
+        user_input_allowed: false,
         waiting_input: None,
         input_claimed: false,
         pending_questions: std::collections::HashMap::new(),
         goal: None,
         live_model: None,
+        omitted_images: HashSet::new(),
         goal_children: std::collections::HashSet::new(),
     }));
     let (commands, receiver) = mpsc::unbounded_channel();
@@ -1117,12 +1395,6 @@ pub struct SessionRunner {
     pending: VecDeque<PendingCommand>,
     pending_web_attaches: Vec<oneshot::Sender<WebAttach>>,
     policy: IdlePolicy,
-    /// Whether this session may suspend on `request_user_input` and wait for
-    /// a human answer. Only the root/main session has a frontend that can
-    /// answer, so `false` (the default) makes the interception fail that call
-    /// back to the model instead of parking the turn in `WaitingInput` with
-    /// nobody to answer — a delegate, btw or fork child has no such frontend.
-    user_input_allowed: bool,
     last_answer: Option<String>,
     /// Internal trigger for the next turn; Goal is the in-memory driver mount.
     armed_trigger: Option<RunnerTrigger>,
@@ -1237,13 +1509,14 @@ impl SessionRunner {
         self
     }
 
-    /// Let this session suspend on `request_user_input` until a human answers.
-    /// Only the root/main session installs this: it owns the single
+    /// Let this session suspend on `request_user_input` (and on a tool's
+    /// mid-call ask, `SessionHandle::ask_user`) until a human answers. Only the
+    /// root/main session installs this: it owns the single
     /// `WaitingInput`/answer frontend. Delegate, btw and fork runners keep the
     /// `false` default, so the tool fails back to their model instead of
     /// waiting for an answer nobody can give.
-    pub(crate) fn with_user_input_allowed(mut self) -> Self {
-        self.user_input_allowed = true;
+    pub(crate) fn with_user_input_allowed(self) -> Self {
+        self.shared.lock().unwrap().user_input_allowed = true;
         self
     }
 
@@ -1251,7 +1524,7 @@ impl SessionRunner {
     /// session classes may park in `WaitingInput` without driving the tool.
     #[cfg(test)]
     pub(crate) fn user_input_allowed_for_test(&self) -> bool {
-        self.user_input_allowed
+        self.shared.lock().unwrap().user_input_allowed
     }
 
     /// The live goal projection a resumed session built its request from. A
@@ -1380,11 +1653,13 @@ impl SessionRunner {
             latest_usage,
             usage_pre_compaction: false,
             commands_open: true,
+            user_input_allowed: false,
             waiting_input: None,
             input_claimed: false,
             pending_questions: std::collections::HashMap::new(),
             goal,
             live_model: None,
+            omitted_images: HashSet::new(),
             goal_children: std::collections::HashSet::new(),
         }));
         let handler_shared = shared.clone();
@@ -1411,7 +1686,6 @@ impl SessionRunner {
                 pending: VecDeque::new(),
                 pending_web_attaches: Vec::new(),
                 policy,
-                user_input_allowed: false,
                 last_answer: None,
                 armed_trigger: None,
                 turn_just_ended: false,
@@ -1547,6 +1821,7 @@ impl SessionRunner {
                 status,
                 kind,
                 cancellation_source,
+                subagent_session_id,
             } => Some(AgentEvent::BackgroundCompletionNotice {
                 id: *id,
                 output: output.clone(),
@@ -1558,6 +1833,7 @@ impl SessionRunner {
                 status: status.clone(),
                 kind: kind.clone(),
                 cancellation_source: *cancellation_source,
+                subagent_session_id: subagent_session_id.clone(),
             }),
             SessionEntry::Notice { text } => Some(AgentEvent::Notice(text.clone())),
             // Goal updates fan out as one live event after durable commit
@@ -2040,6 +2316,10 @@ impl SessionRunner {
             Ok(output) => (output.content.clone(), output.images.clone()),
             Err(error) => (error.clone(), Vec::new()),
         };
+        let (started_task_id, subagent_session_id) = match &result {
+            Ok(output) => (output.started_task_id, output.subagent_session_id.clone()),
+            Err(_) => (None, None),
+        };
         let is_error = result.is_err();
         let event_images = images.clone();
         let entry = Message::Tool {
@@ -2049,6 +2329,8 @@ impl SessionRunner {
             images,
             is_error,
             synthetic: false,
+            started_task_id,
+            subagent_session_id: subagent_session_id.clone(),
         }
         .into();
         self.commit(entry).await?;
@@ -2060,6 +2342,8 @@ impl SessionRunner {
                 content: tool_text,
                 images: event_images,
                 call_id: Some(call.id.clone()),
+                started_task_id,
+                subagent_session_id,
             });
         let steering = self.intake_after_operation(Vec::new());
         if steering != Steering::None {
@@ -2400,16 +2684,23 @@ impl SessionRunner {
                 Steering::None
             }
             SessionCommand::SwitchModel {
-                profile,
                 model,
                 context_window,
+                fork_snapshot,
             } => {
                 // Instant, not queued: the new model applies to the next
                 // model call (a call already in flight keeps its model).
                 self.agent.set_model(model, context_window);
+                let mut shared = self.shared.lock().unwrap();
                 // The live routing identity a fork child must inherit; the
                 // request head captured at build time is stale from here on.
-                self.shared.lock().unwrap().live_model = Some((profile, context_window));
+                shared.live_model = Some(LiveModel {
+                    model: fork_snapshot,
+                    context_window,
+                });
+                // `Agent::set_model` clears the request-copy image omissions;
+                // the fork-visible mirror follows the same rule.
+                shared.omitted_images.clear();
                 Steering::None
             }
             SessionCommand::Cancel => {
@@ -2432,6 +2723,13 @@ impl SessionRunner {
             }
             SessionCommand::WebAttach(reply) => {
                 self.pending_web_attaches.push(reply);
+                Steering::None
+            }
+            SessionCommand::AskUser { .. } => {
+                // A tool question only ever arrives while the runner waits on
+                // that tool (`wait_for_operation` answers it inline). One that
+                // reaches the queue has no parked tool left: dropping its reply
+                // resolves the ask as cancelled instead of waiting forever.
                 Steering::None
             }
         }
@@ -2500,6 +2798,7 @@ impl SessionRunner {
                     status,
                     kind,
                     cancellation_source,
+                    subagent_session_id,
                 } => AgentEvent::BackgroundCompletionNotice {
                     id: *id,
                     output: output.clone(),
@@ -2511,6 +2810,7 @@ impl SessionRunner {
                     status: status.clone(),
                     kind: kind.clone(),
                     cancellation_source: *cancellation_source,
+                    subagent_session_id: subagent_session_id.clone(),
                 },
                 _ => unreachable!("peek_background_entry returns a background entry"),
             };
@@ -2618,12 +2918,19 @@ impl SessionRunner {
         for command in pending {
             match command {
                 SessionCommand::SwitchModel {
-                    profile,
                     model,
                     context_window,
+                    fork_snapshot,
                 } => {
                     self.agent.set_model(model, context_window);
-                    self.shared.lock().unwrap().live_model = Some((profile, context_window));
+                    let mut shared = self.shared.lock().unwrap();
+                    shared.live_model = Some(LiveModel {
+                        model: fork_snapshot,
+                        context_window,
+                    });
+                    // Matches `Agent::set_model`: a replacement model gets the
+                    // untouched request again.
+                    shared.omitted_images.clear();
                 }
                 other => deferred.push(other),
             }
@@ -3582,7 +3889,7 @@ impl SessionRunner {
                         // fork session has none: suspending there would park the
                         // turn forever, so the call fails back to the model as a
                         // normal tool error and the loop continues.
-                        if !self.user_input_allowed {
+                        if !self.shared.lock().unwrap().user_input_allowed {
                             let result = Err(USER_INPUT_UNAVAILABLE.to_owned());
                             match self.finish_intercepted_tool(&call, result).await {
                                 Ok(Steering::None) => {}
@@ -3613,6 +3920,8 @@ impl SessionRunner {
                                     images: Vec::new(),
                                     is_error: true,
                                     synthetic: false,
+                                    started_task_id: None,
+                                    subagent_session_id: None,
                                 }
                                 .into();
                                 if let Err(error) = self.commit(entry).await {
@@ -3631,6 +3940,8 @@ impl SessionRunner {
                                         content: error,
                                         images: Vec::new(),
                                         call_id: Some(call.id.clone()),
+                                        started_task_id: None,
+                                        subagent_session_id: None,
                                     });
                                 continue;
                             }
@@ -3697,6 +4008,8 @@ impl SessionRunner {
                                     images: Vec::new(),
                                     is_error: false,
                                     synthetic: false,
+                                    started_task_id: None,
+                                    subagent_session_id: None,
                                 }
                                 .into();
                                 if let Err(error) = self.commit(entry).await {
@@ -3717,6 +4030,8 @@ impl SessionRunner {
                                         content,
                                         images: Vec::new(),
                                         call_id: Some(call.id.clone()),
+                                        started_task_id: None,
+                                        subagent_session_id: None,
                                     });
                                 let steering = self.intake_after_operation(waited.pending);
                                 if steering != Steering::None {
@@ -3919,6 +4234,14 @@ impl SessionRunner {
                         Ok(output) => (output.content.clone(), output.images.clone()),
                         Err(error) => (tool_error_content(error).to_owned(), Vec::new()),
                     };
+                    // The started-task / child-session ids are structured
+                    // fields on the tool OUTPUT; they ride onto the durable
+                    // Tool entry and the live event so no frontend has to
+                    // recover them from the receipt prose.
+                    let (started_task_id, subagent_session_id) = match &result {
+                        Ok(output) => (output.started_task_id, output.subagent_session_id.clone()),
+                        Err(_) => (None, None),
+                    };
                     let is_error = result.is_err();
                     let entry = Message::Tool {
                         call_id: call.id.clone(),
@@ -3927,6 +4250,8 @@ impl SessionRunner {
                         images: images.clone(),
                         is_error,
                         synthetic: false,
+                        started_task_id,
+                        subagent_session_id: subagent_session_id.clone(),
                     }
                     .into();
                     if let Err(error) = self.commit(entry).await {
@@ -3947,6 +4272,8 @@ impl SessionRunner {
                             content: tool_text,
                             images,
                             call_id: Some(call.id.clone()),
+                            started_task_id,
+                            subagent_session_id,
                         });
                     // A release that raced the tool's own completion: the
                     // tool result was committed above (contract: completed
@@ -4234,6 +4561,8 @@ fn entry_event(entry: &SessionEntry) -> Option<AgentEvent> {
                     content,
                     images,
                     is_error,
+                    started_task_id,
+                    subagent_session_id,
                     ..
                 },
         } => Some(AgentEvent::ToolResult {
@@ -4241,6 +4570,8 @@ fn entry_event(entry: &SessionEntry) -> Option<AgentEvent> {
             content: content.clone(),
             images: images.clone(),
             call_id: Some(call_id.clone()),
+            started_task_id: *started_task_id,
+            subagent_session_id: subagent_session_id.clone(),
         }),
         SessionEntry::Compaction { summary, .. } => {
             Some(AgentEvent::Display(format!("compacted: {summary}")))
@@ -4257,6 +4588,7 @@ fn entry_event(entry: &SessionEntry) -> Option<AgentEvent> {
             status,
             kind,
             cancellation_source,
+            subagent_session_id,
         } => Some(AgentEvent::BackgroundCompletionNotice {
             id: *id,
             output: output.clone(),
@@ -4268,6 +4600,7 @@ fn entry_event(entry: &SessionEntry) -> Option<AgentEvent> {
             status: status.clone(),
             kind: kind.clone(),
             cancellation_source: *cancellation_source,
+            subagent_session_id: subagent_session_id.clone(),
         }),
         SessionEntry::ForkedFrom { .. } => {
             Some(AgentEvent::Display(entry.forked_from_text().expect(

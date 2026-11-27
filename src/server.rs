@@ -63,7 +63,9 @@ use crate::runner::{
     IdlePolicy, PromptSubmission, SessionHandle, SessionStatus, SessionTask, UserInputRequest,
     WeakSessionHandle,
 };
-use crate::session_factory::{EffortOverride, SessionBuild, SessionFactory, UnfinishedPolicy};
+use crate::session_factory::{
+    EffortOverride, SessionAlreadyLive, SessionBuild, SessionFactory, UnfinishedPolicy,
+};
 use crate::session_store::{
     FinishedTask, ListMetaDiagnostics, SessionStore, UsageDashboardMetadata, UsageDashboardRow,
 };
@@ -1568,14 +1570,21 @@ async fn build_session(
             UnfinishedPolicy::Consume,
         )
         .await
-        .map_err(|e| {
-            let message = format!("{e:#}");
-            if message.contains("already live locally") {
-                error(StatusCode::CONFLICT, message)
-            } else {
-                error(StatusCode::INTERNAL_SERVER_ERROR, message)
-            }
-        })
+        .map_err(|e| error(session_status(&e), format!("{e:#}")))
+}
+
+/// HTTP status for one failed session build/fork: the typed admission
+/// rejection is the only expected conflict, everything else is a genuine
+/// server failure. The rendered message is never inspected, so rewording an
+/// error (or adding one) cannot flip a `409` into a `500` or vice versa.
+fn session_status(e: &anyhow::Error) -> StatusCode {
+    if e.chain()
+        .any(|cause| cause.downcast_ref::<SessionAlreadyLive>().is_some())
+    {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
 }
 
 /// Resolve a session id to something the web can attach to: the main
@@ -1642,6 +1651,9 @@ async fn session_prompt(
             StatusCode::CONFLICT,
             format!("session {id} has finished"),
         )),
+        // Plain text naming the allowed option ids: the question stays
+        // answerable, so this is a client-side 400, not a conflict.
+        PromptSubmission::Invalid(detail) => Err(error(StatusCode::BAD_REQUEST, detail)),
     }
 }
 
@@ -1876,20 +1888,24 @@ async fn session_model(
             }
         }
     };
-    let (configured, context_window) =
-        state
-            .factory
-            .resolve_profile(profile, effort)
-            .map_err(|e| {
-                error(
-                    StatusCode::BAD_REQUEST,
-                    format!("unknown model profile `{profile}`: {e:#}"),
-                )
-            })?;
+    let (configured, context_window) = state
+        .factory
+        .resolve_profile(profile, effort.clone())
+        .map_err(|e| {
+            error(
+                StatusCode::BAD_REQUEST,
+                format!("unknown model profile `{profile}`: {e:#}"),
+            )
+        })?;
     let name = configured.profile_key();
-    session
-        .handle()
-        .switch_model(&name, Box::new(configured), context_window);
+    // The RESOLVED model travels with the live identity, so a `fork` child
+    // inherits this session's effective model (wire model, endpoint, effort)
+    // instead of re-resolving it against a config that may change later.
+    session.handle().switch_model(
+        Box::new(configured.clone()),
+        context_window,
+        Some(configured),
+    );
     // Mirror the new model into the registry metadata so `GET /api/sessions`
     // (sidebar / composer meta) reflects the switch immediately. Subagent
     // sessions keep their spawn-time display name (the delegate entry is
@@ -2910,9 +2926,12 @@ async fn session_fork(
         .await
         .map_err(|e| {
             let message = format!("{e:#}");
-            if message.contains("fork point")
+            // The admission conflict is typed (`session_status`); the two
+            // remaining clauses are the fork-boundary rejections, which are
+            // still classified by text and keep their existing status.
+            if session_status(&e) == StatusCode::CONFLICT
+                || message.contains("fork point")
                 || message.contains("no completed turn")
-                || message.contains("already live locally")
             {
                 error(StatusCode::CONFLICT, format!("无法 fork：{message}"))
             } else {
@@ -3903,12 +3922,25 @@ fn event_payload(event: &AgentEvent) -> serde_json::Value {
             content,
             images,
             call_id,
+            started_task_id,
+            subagent_session_id,
         } => {
-            if images.is_empty() {
+            let mut payload = if images.is_empty() {
                 json!({ "is_error": is_error, "content": content, "call_id": call_id })
             } else {
                 json!({ "is_error": is_error, "content": content, "call_id": call_id, "images": images })
+            };
+            // The ids a `delegate` result STARTED (task + child session) are
+            // fields, so the web UI never re-parses the receipt prose. Both
+            // are omitted when absent: a bash result payload stays
+            // byte-identical.
+            if let Some(id) = started_task_id {
+                payload["started_task_id"] = json!(id);
             }
+            if let Some(session_id) = subagent_session_id {
+                payload["subagent_session_id"] = json!(session_id);
+            }
+            payload
         }
         AgentEvent::BackgroundCompleted {
             id,
@@ -3921,6 +3953,7 @@ fn event_payload(event: &AgentEvent) -> serde_json::Value {
             status,
             kind,
             cancellation_source,
+            subagent_session_id,
         }
         | AgentEvent::BackgroundCompletionNotice {
             id,
@@ -3933,6 +3966,7 @@ fn event_payload(event: &AgentEvent) -> serde_json::Value {
             status,
             kind,
             cancellation_source,
+            subagent_session_id,
         } => {
             let mut payload = json!({
                 "id": id,
@@ -3947,6 +3981,13 @@ fn event_payload(event: &AgentEvent) -> serde_json::Value {
             });
             if let Some(source) = cancellation_source {
                 payload["cancellation_source"] = json!(source);
+            }
+            // Structured child session id: the web UI jumps to the subagent
+            // (or fork) transcript with it instead of re-parsing the output's
+            // first line. Omitted for bash tasks, so their payload stays
+            // byte-identical.
+            if let Some(session_id) = subagent_session_id {
+                payload["subagent_session_id"] = json!(session_id);
             }
             payload
         }
@@ -4769,6 +4810,7 @@ mod tests {
             questions: vec![crate::runner::UserQuestion {
                 id: "confirm".into(),
                 prompt: "Continue?".into(),
+                options: Vec::new(),
             }],
         };
         assert_eq!(
@@ -4776,6 +4818,71 @@ mod tests {
             json!({"status": "WaitingInput", "call_id": "call-7",
                    "questions": [{"id": "confirm", "prompt": "Continue?"}],
                    "pending_questions": []})
+        );
+    }
+
+    /// The wire shape the web JS reads: a question with options carries them
+    /// (both as the blocking `WaitingInput` questions and inside
+    /// `pending_questions`), while a question without options keeps exactly
+    /// the old shape — no `options` key at all.
+    #[test]
+    fn status_json_carries_question_options_only_when_present() {
+        use serde_json::json;
+        let optioned = crate::runner::UserQuestion {
+            id: "perm".into(),
+            prompt: "Allow?".into(),
+            options: vec![
+                crate::runner::UserOption {
+                    id: "allow-once".into(),
+                    label: "允许一次".into(),
+                    description: Some("仅此一次".into()),
+                },
+                crate::runner::UserOption {
+                    id: "deny".into(),
+                    label: "拒绝".into(),
+                    description: None,
+                },
+            ],
+        };
+        let request = UserInputRequest {
+            call_id: "call-perm".into(),
+            questions: vec![optioned],
+        };
+        assert_eq!(
+            status_json(&SessionStatus::WaitingInput(request.clone()), &[]),
+            json!({"status": "WaitingInput", "call_id": "call-perm",
+                   "questions": [{"id": "perm", "prompt": "Allow?", "options": [
+                       {"id": "allow-once", "label": "允许一次", "description": "仅此一次"},
+                       {"id": "deny", "label": "拒绝"}
+                   ]}],
+                   "pending_questions": []})
+        );
+        assert_eq!(
+            status_json(&SessionStatus::Idle, std::slice::from_ref(&request)),
+            json!({"status": "Idle", "pending_questions": [
+                {"call_id": "call-perm", "questions": [{"id": "perm", "prompt": "Allow?",
+                   "options": [
+                       {"id": "allow-once", "label": "允许一次", "description": "仅此一次"},
+                       {"id": "deny", "label": "拒绝"}
+                   ]}]}
+            ]})
+        );
+        // Old sessions (and free-text questions) never grow an empty key.
+        assert_eq!(
+            status_json(
+                &SessionStatus::Idle,
+                &[UserInputRequest {
+                    call_id: "call-text".into(),
+                    questions: vec![crate::runner::UserQuestion {
+                        id: "name".into(),
+                        prompt: "Your name?".into(),
+                        options: Vec::new(),
+                    }],
+                }]
+            ),
+            json!({"status": "Idle", "pending_questions": [
+                {"call_id": "call-text", "questions": [{"id": "name", "prompt": "Your name?"}]}
+            ]})
         );
     }
 
@@ -4791,6 +4898,7 @@ mod tests {
             questions: vec![crate::runner::UserQuestion {
                 id: "name".into(),
                 prompt: "Your name?".into(),
+                options: Vec::new(),
             }],
         };
         assert!(handle.pending_questions().is_empty());
@@ -4834,6 +4942,7 @@ mod tests {
             questions: vec![crate::runner::UserQuestion {
                 id: "q".into(),
                 prompt: "?".into(),
+                options: Vec::new(),
             }],
         }));
         state.registry.insert(
@@ -4947,6 +5056,8 @@ mod tests {
             content: "ok".into(),
             images: vec![],
             call_id: Some("call-2".into()),
+            started_task_id: None,
+            subagent_session_id: None,
         })
         .unwrap();
         assert_eq!(some_result["data"]["call_id"], "call-2");
@@ -4959,6 +5070,8 @@ mod tests {
                 mime: "image/png".into(),
             }],
             call_id: Some("call-image".into()),
+            started_task_id: None,
+            subagent_session_id: None,
         })
         .unwrap();
         assert_eq!(image_result["data"]["is_error"], false);
@@ -5010,6 +5123,8 @@ mod tests {
                 content: "o".into(),
                 images: vec![],
                 call_id: None,
+                started_task_id: None,
+                subagent_session_id: None,
             }),
             "ToolResult"
         );
@@ -5028,6 +5143,7 @@ mod tests {
                 status: None,
                 kind: None,
                 cancellation_source: None,
+                subagent_session_id: None,
             }),
             "BackgroundCompleted"
         );
@@ -5043,6 +5159,7 @@ mod tests {
                 status: None,
                 kind: None,
                 cancellation_source: None,
+                subagent_session_id: None,
             }),
             "BackgroundCompletionNotice"
         );
@@ -5097,6 +5214,8 @@ mod tests {
                 content: "boom".into(),
                 images: vec![],
                 call_id: None,
+                started_task_id: None,
+                subagent_session_id: None,
             }),
             json!({"is_error": true, "content": "boom", "call_id": null})
         );
@@ -5109,8 +5228,39 @@ mod tests {
                     mime: "image/png".into()
                 }],
                 call_id: Some("c".into()),
+                started_task_id: None,
+                subagent_session_id: None,
             }),
             json!({"is_error": false, "content": "image result", "call_id": "c", "images": [{"hash": "abc", "mime": "image/png"}]})
+        );
+        // A bash result carries neither structured id, so its payload keeps the
+        // exact old key set (absent, not null): the wire shape did not change.
+        assert_eq!(
+            event_payload(&AgentEvent::ToolResult {
+                is_error: false,
+                content: "bash ok".into(),
+                images: vec![],
+                call_id: Some("b".into()),
+                started_task_id: None,
+                subagent_session_id: None,
+            }),
+            json!({"is_error": false, "content": "bash ok", "call_id": "b"})
+        );
+        // A delegate result carries the started task id and the child session
+        // id as fields: the web UI jumps to the subagent without re-parsing the
+        // receipt prose.
+        assert_eq!(
+            event_payload(&AgentEvent::ToolResult {
+                is_error: false,
+                content: "started background task 7: 看图\nsubagent session: sub-chat".into(),
+                images: vec![],
+                call_id: Some("d".into()),
+                started_task_id: Some(7),
+                subagent_session_id: Some("sub-chat".into()),
+            }),
+            json!({"is_error": false,
+                   "content": "started background task 7: 看图\nsubagent session: sub-chat",
+                   "call_id": "d", "started_task_id": 7, "subagent_session_id": "sub-chat"})
         );
         assert_eq!(
             event_payload(&AgentEvent::Notice("hi".into())),
@@ -5136,6 +5286,7 @@ mod tests {
                 status: None,
                 kind: None,
                 cancellation_source: Some(CancellationSource::User),
+                subagent_session_id: None,
             }),
             json!({"id": 7, "output": "ok", "label": "cargo",
                    "started_at_ms": null, "duration_ms": null, "exit_code": null,
@@ -5154,10 +5305,34 @@ mod tests {
                 status: Some("completed".into()),
                 kind: Some("bash".into()),
                 cancellation_source: None,
+                subagent_session_id: None,
             }),
             json!({"id": 7, "output": "ok", "label": null,
                    "started_at_ms": 1_700_000_000_000u64, "duration_ms": 42, "exit_code": 0,
                    "signal": null, "status": "completed", "kind": "bash"})
+        );
+        // A delegate/fork completion carries the structured child session id:
+        // that is the field the web UI jumps to the subagent transcript with,
+        // so a `fork session:` child is no longer invisible there. The key is
+        // absent (not null) for bash tasks, keeping their payload unchanged.
+        assert_eq!(
+            event_payload(&AgentEvent::BackgroundCompletionNotice {
+                id: 8,
+                output: "fork session: sub-fork\nanswer".into(),
+                label: Some("fork".into()),
+                started_at_ms: None,
+                duration_ms: None,
+                exit_code: None,
+                signal: None,
+                status: Some("completed".into()),
+                kind: Some("delegate".into()),
+                cancellation_source: None,
+                subagent_session_id: Some("sub-fork".into()),
+            }),
+            json!({"id": 8, "output": "fork session: sub-fork\nanswer", "label": "fork",
+                   "started_at_ms": null, "duration_ms": null, "exit_code": null,
+                   "signal": null, "status": "completed", "kind": "delegate",
+                   "subagent_session_id": "sub-fork"})
         );
         assert_eq!(
             event_payload(&AgentEvent::Usage {
@@ -5193,6 +5368,8 @@ mod tests {
                 content: "ok".into(),
                 images: vec![],
                 call_id: None,
+                started_task_id: None,
+                subagent_session_id: None,
             },
             AgentEvent::ReasoningDelta("思考".into()),
             AgentEvent::Notice("后台任务完成".into()),
@@ -5207,6 +5384,7 @@ mod tests {
                 status: None,
                 kind: None,
                 cancellation_source: None,
+                subagent_session_id: None,
             },
             AgentEvent::Usage {
                 context_input: 1,
@@ -5526,6 +5704,147 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// An `AppState` around `factory`, for handler tests that really build
+    /// sessions (admission conflicts, store failures).
+    fn rooted_state(factory: crate::session_factory::SessionFactory) -> Arc<AppState> {
+        Arc::new(AppState {
+            factory,
+            registry: Arc::new(SessionRegistry::default()),
+            token: "sekrit".to_owned(),
+            meta_store: SessionStore::Jsonl,
+            summaries: Arc::new(Mutex::new(HashMap::new())),
+            summary_pending: Arc::new(SummaryPending(Mutex::new(HashSet::new()))),
+            shutdown: watch::channel(()).0,
+        })
+    }
+
+    /// `POST /api/sessions {id}` on an id the process-local admission registry
+    /// already holds: `409 CONFLICT`, with exactly the plain-text body the
+    /// message-matching code produced (nothing about the conflict changes
+    /// except how it is classified).
+    #[tokio::test]
+    async fn create_session_live_reservation_conflict_is_409() {
+        use tower::util::ServiceExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let state = rooted_state(crate::session_factory::SessionFactory::test_factory(
+            root.clone(),
+        ));
+        let app = router(state.clone());
+        let post = |app: Router| async move {
+            app.oneshot(
+                Request::builder()
+                    .uri("/api/sessions")
+                    .method("POST")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"id":"web-taken"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        };
+
+        // A live runner holds the permit for this id (an already-built
+        // session and an in-flight build look the same to the registry).
+        let permit = state
+            .factory
+            .local_sessions()
+            .reserve(state.factory.local_session_key("web-taken"))
+            .unwrap();
+        let response = post(app.clone()).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(body.to_vec()).unwrap(),
+            "session web-taken is already live locally"
+        );
+
+        // Releasing the permit frees the id: the same request now builds.
+        drop(permit);
+        let response = post(app).await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    /// The regression this guards: the status comes from the error TYPE, never
+    /// from its English wording. A deliberately reworded conflict still
+    /// answers `409`, and a plain error that merely contains the old marker
+    /// answers `500`.
+    #[test]
+    fn session_build_status_is_typed_not_textual() {
+        let produced = anyhow::Error::new(
+            crate::session_factory::SessionAlreadyLive::already_live("web-1"),
+        );
+        assert_eq!(
+            format!("{produced:#}"),
+            "session web-1 is already live locally"
+        );
+        assert_eq!(session_status(&produced), StatusCode::CONFLICT);
+        // Context on top does not hide the type.
+        assert_eq!(
+            session_status(&produced.context("cannot resume web-1")),
+            StatusCode::CONFLICT
+        );
+
+        // Rewording the conflict message — the whole point of the type — must
+        // not demote it to a `500`.
+        let reworded = anyhow::Error::new(crate::session_factory::SessionAlreadyLive::reworded(
+            "那个会话仍在运行，请稍后再试",
+        ));
+        assert_eq!(session_status(&reworded), StatusCode::CONFLICT);
+
+        // And the inverse: the old marker as plain text decides nothing now.
+        let old_marker = anyhow!("session web-1 is already live locally");
+        assert_eq!(
+            session_status(&old_marker),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    /// A genuine failure at the same call site keeps its `500`: the store
+    /// cannot be opened (the backend path is a directory), which is not a
+    /// conflict. Nothing here edits a message to fake the failure.
+    #[tokio::test]
+    #[cfg(feature = "sqlite")]
+    async fn create_session_store_failure_is_500() {
+        use tower::util::ServiceExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let blocked = root.join("db-is-a-directory");
+        std::fs::create_dir_all(&blocked).unwrap();
+        let state = rooted_state(
+            crate::session_factory::SessionFactory::test_factory_with_backend(
+                root,
+                crate::config::SessionBackend::Sqlite {
+                    path: Some(blocked.display().to_string()),
+                },
+            ),
+        );
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions")
+                    .method("POST")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"id":"web-broken"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("SQLite"), "{body}");
     }
 
     /// A surviving `running_tasks` record does not act as a cross-process
@@ -7475,6 +7794,7 @@ model = "deepseek-chat"
             title: title.map(str::to_owned),
             pinned: None,
             archived: None,
+            acp_session_id: None,
             writer: None,
             label: None,
         };
@@ -7600,6 +7920,7 @@ model = "deepseek-chat"
             title: None,
             pinned: None,
             archived,
+            acp_session_id: None,
             writer: None,
             label: None,
         };
@@ -7746,6 +8067,7 @@ model = "deepseek-chat"
             title: None,
             pinned: None,
             archived: None,
+            acp_session_id: None,
             writer: None,
             label: None,
         };
@@ -9356,6 +9678,8 @@ model = "deepseek-chat"
                 content: content.to_owned(),
                 is_error: false,
                 synthetic: false,
+                started_task_id: None,
+                subagent_session_id: None,
                 images: vec![],
             },
         }
@@ -9555,16 +9879,20 @@ model = "deepseek-chat"
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["next_before_seq"], serde_json::json!(2));
         assert_eq!(value["next_older_session"], serde_json::json!(owner));
-        // The head owns an inherited (UNLOCATED) prefix even though it hands
-        // out an older cursor: the web client must treat the head as
-        // authoritative for those rows rather than judging by the cursor.
+        // The head owns an inherited prefix even though it hands out an older
+        // cursor: those rows carry the OWNER's physical identity (never a child
+        // one), so the web client reconciles them by key exactly like its own.
+        let locations = value["locations"].as_array().unwrap();
         assert!(
-            value["locations"]
-                .as_array()
-                .unwrap()
+            locations[..3]
                 .iter()
-                .any(|location| location.is_null()),
-            "inherited rows carry no child location: {value}"
+                .all(|location| location["session"] == serde_json::json!(owner)),
+            "inherited rows name their owner: {value}"
+        );
+        assert_eq!(
+            locations[3]["session"],
+            serde_json::json!(child),
+            "the child's own marker stays child-owned: {value}"
         );
         assert_eq!(
             value["entries"].as_array().unwrap().len(),
@@ -10278,6 +10606,8 @@ model = "deepseek-chat"
                     content: "no".into(),
                     images: vec![],
                     call_id: None,
+                    started_task_id: None,
+                    subagent_session_id: None,
                 },
                 "ToolResult",
                 json!({"is_error": true, "content": "no", "call_id": null}),

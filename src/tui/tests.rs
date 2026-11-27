@@ -36,6 +36,7 @@ async fn main_waiting_submission_is_call_id_bound_and_preserves_conflicts() {
         questions: vec![crate::runner::UserQuestion {
             id: "q".into(),
             prompt: "?".into(),
+            options: Vec::new(),
         }],
     };
     emitter.set_status(SessionStatus::WaitingInput(request));
@@ -82,6 +83,7 @@ async fn main_waiting_submission_routes_matching_answer_through_key_handler() {
             questions: vec![crate::runner::UserQuestion {
                 id: "q".into(),
                 prompt: "?".into(),
+                options: Vec::new(),
             }],
         },
     ));
@@ -108,6 +110,160 @@ async fn main_waiting_submission_routes_matching_answer_through_key_handler() {
     assert!(
         matches!(commands.try_recv(), Ok(crate::runner::SessionCommand::Answer { call_id, .. }) if call_id == "main-call")
     );
+}
+
+/// A pending question with fixed options turns the input box into a
+/// selectable list: ↑/↓ move the highlight, Enter and 1..9 submit the right
+/// option id through the one `submit_prompt_with_call_id` path.
+#[tokio::test]
+async fn main_option_question_moves_selection_and_submits_the_chosen_id() {
+    let (handle, emitter, mut commands) = crate::runner::session_test_channel();
+    let request = option_request();
+    emitter.set_status(SessionStatus::WaitingInput(request.clone()));
+    let mut state = TuiState::default();
+    project_main_status(&mut state, &SessionStatus::WaitingInput(request.clone()));
+    assert_eq!(state.waiting_options.len(), 2);
+    assert_eq!(state.waiting_selection, 0);
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+    let mut events =
+        futures_util::stream::iter(Vec::<Result<crossterm::event::Event, std::io::Error>>::new())
+            .peekable();
+    let sessions = Sessions::default();
+    let (sender, _receiver) = mpsc::unbounded_channel();
+    // Same call the pre-draw urgent peek and the select branch share.
+    macro_rules! press {
+        ($code:expr) => {
+            handle_pressed_key(
+                &mut state,
+                KeyEvent::new($code, KeyModifiers::empty()),
+                &handle,
+                &handle.status(),
+                &sessions,
+                &sender,
+                &mut terminal,
+                &mut events,
+            )
+            .await
+            .unwrap()
+        };
+    }
+    // ↑/↓ only move the highlight; they never submit and never wrap past the
+    // ends (the list owns the key, so the scrollback does not move).
+    press!(KeyCode::Down);
+    assert_eq!(state.waiting_selection, 1);
+    press!(KeyCode::Down);
+    assert_eq!(state.waiting_selection, 1);
+    assert!(commands.try_recv().is_err());
+    press!(KeyCode::Up);
+    assert_eq!(state.waiting_selection, 0);
+    press!(KeyCode::Down);
+    // Enter submits the HIGHLIGHTED option's id.
+    press!(KeyCode::Enter);
+    match commands.try_recv().unwrap() {
+        crate::runner::SessionCommand::Answer { call_id, answers } => {
+            assert_eq!(call_id, "perm-call");
+            assert_eq!(
+                answers,
+                vec![("perm".to_owned(), "Selected option: deny (拒绝)".to_owned())]
+            );
+        }
+        _ => panic!("expected the structured answer command"),
+    }
+    // Digits are 1-based shortcuts that select and submit in one keystroke.
+    emitter.set_status(SessionStatus::WaitingInput(request.clone()));
+    project_main_status(&mut state, &SessionStatus::WaitingInput(request.clone()));
+    press!(KeyCode::Char('1'));
+    assert_eq!(state.waiting_selection, 0);
+    match commands.try_recv().unwrap() {
+        crate::runner::SessionCommand::Answer { answers, .. } => assert_eq!(
+            answers,
+            vec![(
+                "perm".to_owned(),
+                "Selected option: allow-once (允许一次)".to_owned()
+            )]
+        ),
+        _ => panic!("expected the structured answer command"),
+    }
+    // Printable keys must not accumulate into the invisible free-text buffer.
+    emitter.set_status(SessionStatus::WaitingInput(request.clone()));
+    project_main_status(&mut state, &SessionStatus::WaitingInput(request.clone()));
+    press!(KeyCode::Char('x'));
+    assert!(state.input.text.is_empty());
+    assert!(commands.try_recv().is_err());
+}
+
+/// The list replaces the free-text buffer inside the SAME input box; the
+/// highlighted row uses the panel's selection background.
+#[test]
+fn draw_shows_the_pending_option_list_in_the_input_box() {
+    let mut state = TuiState {
+        waiting_question: Some("Allow?".into()),
+        waiting_options: option_request().questions[0].options.clone(),
+        waiting_selection: 1,
+        ..Default::default()
+    };
+    let backend = ratatui::backend::TestBackend::new(60, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    draw(&mut terminal, &mut state).unwrap();
+    let buffer = terminal.backend().buffer();
+    let rows: Vec<String> = (0..12)
+        .map(|y| {
+            (0..60)
+                .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        })
+        .collect();
+    // TestBackend pads every wide (CJK) glyph with a placeholder cell, so the
+    // comparisons run on the space-free row text.
+    let squashed: Vec<String> = rows.iter().map(|row| row.replace(' ', "")).collect();
+    let first = squashed
+        .iter()
+        .position(|row| row.contains("1.允许一次"))
+        .unwrap_or_else(|| panic!("option 1 not drawn: {rows:?}"));
+    let second = squashed
+        .iter()
+        .position(|row| row.contains("2.拒绝"))
+        .unwrap_or_else(|| panic!("option 2 not drawn: {rows:?}"));
+    assert_eq!(second, first + 1, "one row per option: {rows:?}");
+    assert!(
+        rows.iter().any(|row| row.contains("waiting: Allow?")),
+        "the question keeps the input-box title: {rows:?}"
+    );
+    assert!(
+        squashed[second].contains("仅此一次"),
+        "the description rides on the option row: {:?}",
+        rows[second]
+    );
+    // The highlighted row carries the selection background, the other one the
+    // plain panel background.
+    let selected_bg = buffer[(1, second as u16)].bg;
+    let other_bg = buffer[(1, first as u16)].bg;
+    assert_eq!(selected_bg, SOLARIZED_LIGHT.selection);
+    assert_ne!(other_bg, SOLARIZED_LIGHT.selection);
+}
+
+fn option_request() -> crate::runner::UserInputRequest {
+    crate::runner::UserInputRequest {
+        call_id: "perm-call".into(),
+        questions: vec![crate::runner::UserQuestion {
+            id: "perm".into(),
+            prompt: "Allow?".into(),
+            options: vec![
+                crate::runner::UserOption {
+                    id: "allow-once".into(),
+                    label: "允许一次".into(),
+                    description: None,
+                },
+                crate::runner::UserOption {
+                    id: "deny".into(),
+                    label: "拒绝".into(),
+                    description: Some("仅此一次".into()),
+                },
+            ],
+        }],
+    }
 }
 
 #[test]
@@ -144,6 +300,7 @@ async fn attached_waiting_submission_routes_and_restores_unicode_cursor_on_confl
             questions: vec![crate::runner::UserQuestion {
                 id: "q".into(),
                 prompt: "?".into(),
+                options: Vec::new(),
             }],
         },
     ));
@@ -1071,6 +1228,8 @@ fn attached_view_replays_snapshot_and_marks_finished_on_completion() {
         content: "files".into(),
         images: vec![],
         call_id: None,
+        started_task_id: None,
+        subagent_session_id: None,
     });
     attach_test(&mut state, 7, "demo task", handle);
     let lines: Vec<_> = state
@@ -1100,6 +1259,7 @@ fn attached_view_replays_snapshot_and_marks_finished_on_completion() {
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         },
     });
     assert!(state.attached.as_ref().unwrap().finished);
@@ -1147,6 +1307,7 @@ fn attached_view_clears_spinner_on_background_completed_from_bridge() {
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         },
     });
     let attached = state.attached.as_ref().unwrap();
@@ -1171,6 +1332,7 @@ fn attach_after_completion_marks_finished_from_the_snapshot() {
         status: None,
         kind: None,
         cancellation_source: None,
+        subagent_session_id: None,
     });
     let mut state = TuiState::default();
     attach_test(&mut state, 3, "demo task", handle);
@@ -1227,6 +1389,74 @@ fn background_completion_notice_renders_as_dim_line() {
     assert_eq!(state.lines.last().unwrap().text, "you> hello");
 }
 
+/// The completion header takes the child session id from the STRUCTURED
+/// field: a `fork session:` child (and any future wording) is tagged exactly
+/// like a `subagent session:` one. Only rows persisted before the field
+/// existed fall back to the first-line prose.
+#[test]
+fn background_completion_header_prefers_the_structured_session_id() {
+    let lines = |entry: &SessionEntry| session_entry_to_lines(entry);
+    // Live event: reworded first line, the field still tags it.
+    let mut state = TuiState::default();
+    state.push_agent_event(AgentEvent::BackgroundCompletionNotice {
+        id: 5,
+        output: "child session: sub-forked\nanswer".into(),
+        label: Some("fork".into()),
+        started_at_ms: None,
+        duration_ms: None,
+        exit_code: None,
+        signal: None,
+        status: Some("completed".into()),
+        kind: Some("delegate".into()),
+        cancellation_source: None,
+        subagent_session_id: Some("sub-forked".into()),
+    });
+    assert_eq!(
+        state.lines[0].text,
+        "[background task 5 completed: fork] [session: sub-forked]"
+    );
+
+    // Persisted replay of a fork completion: the tag comes from the field.
+    let out = lines(&SessionEntry::BackgroundCompletion {
+        id: 9,
+        output: "fork session: sub-forked\nanswer".into(),
+        label: None,
+        started_at_ms: None,
+        duration_ms: None,
+        exit_code: None,
+        signal: None,
+        status: Some("completed".into()),
+        kind: Some("delegate".into()),
+        cancellation_source: None,
+        subagent_session_id: Some("sub-forked".into()),
+    });
+    assert_eq!(
+        out[0].text,
+        "[background task 9 completed] [session: sub-forked]"
+    );
+
+    // An old row (no field) still renders through the legacy first-line
+    // fallback; the fallback can only be deleted by a persisted-format
+    // migration, never by pointing at the live registry.
+    let out = lines(&SessionEntry::BackgroundCompletion {
+        id: 10,
+        output: "subagent session: sub-legacy\nanswer".into(),
+        label: None,
+        started_at_ms: None,
+        duration_ms: None,
+        exit_code: None,
+        signal: None,
+        status: None,
+        kind: Some("delegate".into()),
+        cancellation_source: None,
+        subagent_session_id: None,
+    });
+    assert_eq!(
+        out[0].text,
+        "[background task 10 completed] [session: sub-legacy]"
+    );
+}
+
 #[test]
 fn background_completion_notice_populates_finished_task_section() {
     // The structured notice (emitted only after the durable entry is
@@ -1244,6 +1474,7 @@ fn background_completion_notice_populates_finished_task_section() {
         status: Some("completed".into()),
         kind: Some("bash".into()),
         cancellation_source: None,
+        subagent_session_id: None,
     });
     assert_eq!(state.finished_tasks.len(), 1);
     assert_eq!(state.finished_tasks[0].id, 1);
@@ -1265,6 +1496,7 @@ fn background_completion_notice_populates_finished_task_section() {
         status: Some("failed".into()),
         kind: Some("delegate".into()),
         cancellation_source: None,
+        subagent_session_id: None,
     });
     assert_eq!(state.finished_tasks.len(), 2);
     assert_eq!(state.finished_tasks[0].id, 2, "newest first");
@@ -1337,6 +1569,7 @@ fn attached_enter_steers_and_ctrl_c_cancels_through_the_handle() {
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         },
     });
     state.handle_attached_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), 80);
@@ -1364,6 +1597,7 @@ fn attached_enter_on_finished_keeps_input_and_sends_nothing() {
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         },
     });
     {
@@ -1414,6 +1648,7 @@ fn finish_with_queued_prompts_notes_them_as_unanswered() {
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         },
     });
     let attached = state.attached.as_ref().unwrap();
@@ -2238,6 +2473,7 @@ fn attached_title_shows_finished_before_subagent_label() {
         status: None,
         kind: None,
         cancellation_source: None,
+        subagent_session_id: None,
     });
     let mut state = TuiState::default();
     let snapshot = _handle.snapshot();
@@ -2948,6 +3184,7 @@ fn background_completion_ends_stream_lane_so_next_delta_starts_fresh_line() {
         status: None,
         kind: None,
         cancellation_source: None,
+        subagent_session_id: None,
     });
     state.push_agent_event(AgentEvent::AssistantDelta("\nlet y = 2;\n```".into()));
 
@@ -3764,6 +4001,8 @@ fn scrolling_is_bounded_and_events_append_echo_lines() {
         content: "done".into(),
         images: vec![],
         call_id: None,
+        started_task_id: None,
+        subagent_session_id: None,
     });
     assert_eq!(state.lines.last().unwrap().text, "  ok: done");
     assert_eq!(state.lines.last().unwrap().kind, LineKind::ToolResult);
@@ -3776,6 +4015,8 @@ fn scrolling_is_bounded_and_events_append_echo_lines() {
         content: "failed".into(),
         images: vec![],
         call_id: None,
+        started_task_id: None,
+        subagent_session_id: None,
     });
     assert_eq!(state.lines.last().unwrap().text, "  error: failed");
     assert_eq!(state.lines.last().unwrap().kind, LineKind::ToolError);
@@ -3828,6 +4069,8 @@ fn edit_file_tool_calls_render_as_a_numbered_diff_on_result() {
         content: "file edited (line 7)".into(),
         images: vec![],
         call_id: None,
+        started_task_id: None,
+        subagent_session_id: None,
     });
     let lines: Vec<_> = state
         .lines
@@ -4069,6 +4312,8 @@ fn session_entry_to_lines_maps_persisted_entry_kinds() {
             content: "done".into(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         },
     });
@@ -4082,6 +4327,8 @@ fn session_entry_to_lines_maps_persisted_entry_kinds() {
             content: "boom".into(),
             is_error: true,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         },
     });
@@ -4129,6 +4376,7 @@ fn session_entry_to_lines_maps_persisted_entry_kinds() {
         status: None,
         kind: None,
         cancellation_source: None,
+        subagent_session_id: None,
     });
     assert_eq!(out.len(), 3);
     assert_eq!(out[0].text, "[background task 7 completed: demo]");
@@ -4148,6 +4396,7 @@ fn session_entry_to_lines_maps_persisted_entry_kinds() {
         status: None,
         kind: Some("delegate".into()),
         cancellation_source: None,
+        subagent_session_id: None,
     });
     assert_eq!(
         out[0].text,
@@ -4575,6 +4824,8 @@ fn fork_session_entries() -> Vec<SessionEntry> {
             content: "ok".into(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         }
         .into(),

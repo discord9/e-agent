@@ -17,6 +17,17 @@ base64 = "0.22"
 cap-std = "=4.0.2"
 chrono = { version = "0.4", features = ["serde"] }
 crossterm = { version = "0.29.0", features = ["event-stream", "bracketed-paste"] }
+# Charset decoding for `web_fetch` (GBK/GB18030/Big5 pages are common on
+# Chinese sites).
+encoding_rs = "0.8"
+# HTML -> readable text for the local `web_fetch`: a Rust port of Mozilla
+# Readability (MIT, pure Rust), instead of a hand-rolled tag stripper.
+dom_smoothie = "0.20"
+# Decode/re-encode for the outgoing image token budget (src/images.rs). Every
+# codec it pulls in is pure Rust (no -sys, no C toolchain): PNG/JPEG/WebP/GIF
+# decode, PNG + JPEG encode. Default features are off to skip the codecs the
+# agent never sends.
+image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 eventsource-stream = "0.2.3"
 futures-util = "0.3.33"
 ratatui = "0.30.2"

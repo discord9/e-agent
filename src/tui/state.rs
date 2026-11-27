@@ -168,6 +168,11 @@ pub(crate) struct TuiState {
     pub(crate) output_height: usize,
     pub(crate) busy: Option<BusyState>,
     pub(crate) waiting_question: Option<String>,
+    /// Fixed choices of the pending blocking question (`WaitingInput`). Empty
+    /// for a free-text question, which keeps today's input-box behaviour.
+    pub(crate) waiting_options: Vec<crate::runner::UserOption>,
+    /// Highlighted index into `waiting_options` (clamped on render/submit).
+    pub(crate) waiting_selection: usize,
     pub(crate) streamed: bool,
     pub(crate) active_lane: Option<ActiveStreamLane>,
     /// Whether model reasoning ("thinking") lines render as a single
@@ -685,9 +690,10 @@ impl TuiState {
         output: &str,
         label: Option<&str>,
         kind: Option<&str>,
+        subagent_session_id: Option<&str>,
     ) {
         self.push_line(
-            background_completion_header(id, label, kind, output),
+            background_completion_header(id, label, kind, subagent_session_id, output),
             LineKind::Dim,
         );
         let truncated = truncate_background_output(output);
@@ -968,6 +974,68 @@ impl TuiState {
             KeyCode::Backspace => self.input.backspace(),
             KeyCode::Delete => self.input.delete(),
             _ => {}
+        }
+    }
+
+    /// Keys owned by a pending `WaitingInput` question that carries fixed
+    /// options: the input box shows a selectable list instead of free text, so
+    /// ↑/↓ move the highlight, Enter submits it, and 1..9 submit that option
+    /// directly. Returns false for keys the list does not own, so the caller
+    /// keeps its normal handling (cancel, exit, scrolling when nothing waits).
+    pub(crate) fn handle_option_key(
+        &mut self,
+        key: KeyEvent,
+        call_id: &str,
+        handle: &RunnerHandle,
+    ) -> bool {
+        let count = self.waiting_options.len();
+        if count == 0 {
+            return false;
+        }
+        let last = count - 1;
+        match key.code {
+            KeyCode::Up => {
+                self.waiting_selection = self.waiting_selection.min(last).saturating_sub(1);
+                true
+            }
+            KeyCode::Down => {
+                self.waiting_selection = (self.waiting_selection + 1).min(last);
+                true
+            }
+            KeyCode::Enter => {
+                self.submit_option(call_id, self.waiting_selection.min(last), handle);
+                true
+            }
+            KeyCode::Char(digit @ '1'..='9') if key.modifiers.is_empty() => {
+                let index = usize::from(digit as u8 - b'1');
+                if index <= last {
+                    self.waiting_selection = index;
+                    self.submit_option(call_id, index, handle);
+                }
+                true
+            }
+            // The list replaces the input box, so printable keys must not
+            // accumulate into an invisible buffer.
+            KeyCode::Char(_)
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Submit one fixed option through the SAME `submit_prompt_with_call_id`
+    /// path the free-text answer uses; the runner validates the id.
+    fn submit_option(&mut self, call_id: &str, index: usize, handle: &RunnerHandle) {
+        let Some(option) = self.waiting_options.get(index) else {
+            return;
+        };
+        let id = option.id.clone();
+        if let crate::runner::PromptSubmission::Invalid(error) =
+            handle.submit_prompt_with_call_id(Some(call_id.to_owned()), id)
+        {
+            self.push_line(error, LineKind::Dim);
         }
     }
 
@@ -1790,6 +1858,7 @@ impl TuiState {
                 status,
                 kind,
                 cancellation_source,
+                subagent_session_id,
                 ..
             } => {
                 // End the streaming lane BEFORE the aside lines: a
@@ -1798,7 +1867,13 @@ impl TuiState {
                 // the next delta (the body would merge into the Dim line
                 // and lose its markdown rendering). Same as Notice/Error.
                 self.active_lane = None;
-                self.push_background_completion(id, &output, label.as_deref(), kind.as_deref());
+                self.push_background_completion(
+                    id,
+                    &output,
+                    label.as_deref(),
+                    kind.as_deref(),
+                    subagent_session_id.as_deref(),
+                );
                 // Finished section: newest first, capped. The notice fires
                 // only after the durable entry is committed, so this is a
                 // projection of `session_entries`, not a second store.
@@ -1938,14 +2013,19 @@ impl TuiState {
 /// path (`push_background_completion`) and the persisted-entry replay
 /// (`session_entry_to_lines`) so the two can never drift apart. Delegate
 /// completions end with the child's untruncated session id tag, matching the
-/// model-facing notice.
+/// model-facing notice. The tag prefers the structured
+/// `subagent_session_id`; `output` is only the legacy fallback for rows
+/// persisted before that field existed (see
+/// [`crate::agent::background_session_tag`]).
 fn background_completion_header(
     id: u64,
     label: Option<&str>,
     kind: Option<&str>,
+    subagent_session_id: Option<&str>,
     output: &str,
 ) -> String {
-    let tag = crate::agent::background_session_tag(kind, output).unwrap_or_default();
+    let tag =
+        crate::agent::background_session_tag(kind, subagent_session_id, output).unwrap_or_default();
     match label.filter(|l| !l.trim().is_empty()) {
         Some(l) => {
             let previewed = crate::agent::preview(l, 60);
@@ -2023,10 +2103,17 @@ pub(crate) fn session_entry_to_lines(entry: &SessionEntry) -> Vec<DisplayLine> {
             output,
             label,
             kind,
+            subagent_session_id,
             ..
         } => {
             let mut lines = vec![DisplayLine {
-                text: background_completion_header(*id, label.as_deref(), kind.as_deref(), output),
+                text: background_completion_header(
+                    *id,
+                    label.as_deref(),
+                    kind.as_deref(),
+                    subagent_session_id.as_deref(),
+                    output,
+                ),
                 kind: LineKind::Dim,
                 collapsed_summary: None,
             }];

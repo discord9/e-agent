@@ -117,6 +117,8 @@ pub(crate) fn repair_tool_pairs(messages: Vec<Message>) -> Vec<Message> {
                 images: vec![],
                 is_error: true,
                 synthetic: true,
+                started_task_id: None,
+                subagent_session_id: None,
             });
         }
     }
@@ -186,6 +188,8 @@ fn repair_item_pairs(items: Vec<ContextItem>) -> Vec<ContextItem> {
                     images: vec![],
                     is_error: true,
                     synthetic: true,
+                    started_task_id: None,
+                    subagent_session_id: None,
                 },
                 prefix: String::new(),
                 location: None,
@@ -259,6 +263,18 @@ pub struct ToolOutput {
     /// do-not-wait guidance reaches the NEXT provider request as a
     /// user-shaped entry instead of trailing text in the tool result.
     pub background_started: bool,
+    /// The registry id of the background task this output just STARTED, for
+    /// the agent's own bookkeeping (the live background-task set). `None`
+    /// means "no task was started by this call" (or the tool has no
+    /// registry). The id also appears in `content`, but that text is written
+    /// for the model and must never be parsed back into machine state.
+    pub started_task_id: Option<u64>,
+    /// The child subagent's own session id when this call STARTED a delegated
+    /// subagent (or fork). `None` for every other tool. Like
+    /// `started_task_id`, the id also appears in `content`, but that receipt
+    /// text is for the model only — this field is the machine fact the UI
+    /// jumps to a transcript with.
+    pub subagent_session_id: Option<String>,
 }
 
 impl ToolOutput {
@@ -268,7 +284,29 @@ impl ToolOutput {
             content: content.into(),
             images: Vec::new(),
             background_started: false,
+            started_task_id: None,
+            subagent_session_id: None,
         }
+    }
+
+    /// Text result of a call that STARTED a background task: the model-facing
+    /// receipt plus the registry id the scheduler tracks. The receipt text is
+    /// for the model only; `started_task_id` is the machine fact.
+    pub fn started_task(content: impl Into<String>, id: u64) -> Self {
+        Self {
+            content: content.into(),
+            images: Vec::new(),
+            background_started: false,
+            started_task_id: Some(id),
+            subagent_session_id: None,
+        }
+    }
+
+    /// Attach the child subagent's session id: a delegate/fork spawn knows it
+    /// from its own spawn result, never from the receipt text it writes.
+    pub fn subagent_session(mut self, session_id: impl Into<String>) -> Self {
+        self.subagent_session_id = Some(session_id.into());
+        self
     }
 }
 
@@ -449,6 +487,18 @@ pub enum Message {
         /// mistaken for it.
         #[serde(default)]
         synthetic: bool,
+        /// The background task this call STARTED (see
+        /// [`ToolOutput::started_task_id`]). Structured so no frontend has to
+        /// recover the id from `content`; `#[serde(default)]` keeps rows
+        /// persisted before the field existed loadable, and `None` is skipped
+        /// so other tool results serialize byte-identically.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        started_task_id: Option<u64>,
+        /// The child subagent session a delegate/fork call STARTED (see
+        /// [`ToolOutput::subagent_session_id`]); `None` for every other
+        /// tool.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent_session_id: Option<String>,
     },
 }
 
@@ -747,6 +797,15 @@ pub enum AgentEvent {
         images: Vec<ImagePart>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         call_id: Option<String>,
+        /// The background task this call STARTED, when the tool result
+        /// carries one (see [`Message::Tool`]). Omitted when absent so a bash
+        /// result payload stays byte-identical.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        started_task_id: Option<u64>,
+        /// The delegate/fork child session this call STARTED, when the tool
+        /// result carries one. Omitted when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent_session_id: Option<String>,
     },
     /// A durable, model-facing system notice (background completion or task
     /// report). Fresh background ingress commits it as a `SessionEntry::Notice`,
@@ -781,6 +840,12 @@ pub enum AgentEvent {
         kind: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cancellation_source: Option<CancellationSource>,
+        /// The delegate/fork/btw child's own session id, from the registry's
+        /// task display metadata (`None` for bash tasks). A fork child is
+        /// identified by this field, never by the completion text's first
+        /// line.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent_session_id: Option<String>,
     },
     /// A structured background completion notice for TUI scrollback display.
     /// Unlike `BackgroundCompleted` (the transient arrival/drain signal),
@@ -805,6 +870,10 @@ pub enum AgentEvent {
         kind: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cancellation_source: Option<CancellationSource>,
+        /// The delegate/fork/btw child's own session id (see
+        /// [`AgentEvent::BackgroundCompleted::subagent_session_id`]).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent_session_id: Option<String>,
     },
     Usage {
         /// Input tokens of the most recent regular turn, approximating the
@@ -940,9 +1009,9 @@ pub enum SessionEntry {
     /// A structured background completion entry. Persisted in the session
     /// log with the full output. The TUI renders a truncated preview; the
     /// provider REQUEST copy bounds the output (UTF-8-safe head+tail plus a
-    /// session-local `read_output` ref, see
-    /// [`crate::output_receipt`]) so an oversized completion can never
-    /// blow up the provider context — the persisted entry stays full.
+    /// stored-row `read_output` ref, see [`crate::output_receipt`]) so an
+    /// oversized completion can never blow up the provider context — the
+    /// persisted entry stays full.
     /// Backwards-compatible: old `Notice` entries are read without guessing
     /// string prefixes.
     BackgroundCompletion {
@@ -971,6 +1040,13 @@ pub enum SessionEntry {
         /// entries persisted before cancellation provenance existed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cancellation_source: Option<CancellationSource>,
+        /// The child session id a delegate/fork/btw task ran (the
+        /// `send_message` target), read from the registry's structured task
+        /// display metadata. `None` for bash tasks and for rows persisted
+        /// before this field existed; display code may then fall back to the
+        /// old first-line prose of `output`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent_session_id: Option<String>,
     },
     /// A new session forked from an existing one (provenance only; never
     /// sent to the provider). Two marker generations share this shape:
@@ -1321,9 +1397,11 @@ pub struct Agent {
     /// "never set" from "cleared", so the provider context can override a
     /// stale compaction summary that still mentions the old goal.
     goal_cleared: bool,
-    /// Exact physical located keys of the persisted history, aligned 1:1
-    /// with `history` (`None` = the entry has no located key: legacy/test
-    /// in-memory entries, entries pushed without a location).
+    /// Exact physical locations of the persisted history, aligned 1:1 with
+    /// `history` (`None` = the entry has no located key: legacy/test
+    /// in-memory entries, entries pushed without a location). An inherited
+    /// fork prefix carries its OWNER's location, so [`Self::project_item`]
+    /// bounds it exactly like the parent did and embeds the same receipt.
     entry_locations: Vec<Option<EntryLocation>>,
     /// Number of LEADING history entries inherited read-only from a
     /// zero-copy fork source ([`crate::session_store::SessionStore::load_fork_located`]).
@@ -1907,10 +1985,11 @@ impl Agent {
     /// except that eligible oversized persisted fields (background
     /// completion output, tool content, notice text, historical
     /// user/assistant content, compaction summary/retained) are projected
-    /// as a UTF-8-safe head+tail plus a session-local `eout1` ref
-    /// (`read_output` ref). System messages, the session goal, the newest
-    /// `read_output` page the model asked for, tool call
-    /// ids/names/arguments, reasoning, and images are kept exact. A field is
+    /// as a UTF-8-safe head+tail plus an `eout1` ref (`read_output` ref) that
+    /// depends only on the stored row, so a fork's inherited prefix projects
+    /// byte-identically to the parent's own request. System messages, the
+    /// session goal, the newest `read_output` page the model asked for, tool
+    /// call ids/names/arguments, reasoning, and images are kept exact. A field is
     /// left full when no located key exists for its entry or when no
     /// registry is installed — never an unusable ref. The current user
     /// prompt gets no exemption: it is bounded like any other located field
@@ -2092,11 +2171,17 @@ impl Agent {
                     output,
                     label,
                     kind,
+                    subagent_session_id,
                     ..
                 } => {
                     // Delegate completions also name the child's session id
                     // (the `send_message` target); bash stays unchanged.
-                    let tag = background_session_tag(kind.as_deref(), output).unwrap_or_default();
+                    let tag = background_session_tag(
+                        kind.as_deref(),
+                        subagent_session_id.as_deref(),
+                        output,
+                    )
+                    .unwrap_or_default();
                     let header = match label.as_ref().map(|l| l.trim()).filter(|l| !l.is_empty()) {
                         Some(l) => format!("[background task {id} completed: {l}]{tag}"),
                         None => format!("[background task {id} completed]{tag}"),
@@ -2182,6 +2267,8 @@ impl Agent {
                 images,
                 is_error,
                 synthetic,
+                started_task_id,
+                subagent_session_id,
             } => {
                 debug_assert!(item.prefix.is_empty());
                 Message::Tool {
@@ -2191,6 +2278,8 @@ impl Agent {
                     images: images.clone(),
                     is_error: *is_error,
                     synthetic: *synthetic,
+                    started_task_id: *started_task_id,
+                    subagent_session_id: subagent_session_id.clone(),
                 }
             }
             Message::System { .. } => item.message.clone(),
@@ -2535,15 +2624,10 @@ impl Agent {
         call: &ToolCall,
         result: &Result<ToolOutput, String>,
     ) -> Result<(), String> {
-        if result.is_ok()
+        if let Ok(output) = result
             && (call.name == "bash" || call.name == "pwsh")
             && !is_detached_background_call(call)
-            && let Some(id) = started_task_id(
-                result
-                    .as_ref()
-                    .map(|output| output.content.as_str())
-                    .unwrap_or_default(),
-            )
+            && let Some(id) = output.started_task_id
         {
             self.running_background.insert(id);
         }
@@ -2607,7 +2691,7 @@ impl Agent {
         let mut produced_content_delta = false;
         // The BOUNDED request copy: canonical `context()` stays full and
         // lossless; oversized eligible persisted fields are projected as
-        // head+tail + a session-local `read_output` ref.
+        // head+tail + a stored-row `read_output` ref.
         let mut context = self.context_request();
         // Non-vision models cannot consume image parts. Strip them from the
         // *request* only, so the wire gate never rejects the whole history
@@ -2729,12 +2813,18 @@ impl Agent {
                     Ok(output) => (output.content.clone(), output.images.clone()),
                     Err(error) => (tool_error_content(error).to_owned(), Vec::new()),
                 };
+                let (started_task_id, subagent_session_id) = match &result {
+                    Ok(output) => (output.started_task_id, output.subagent_session_id.clone()),
+                    Err(_) => (None, None),
+                };
                 let is_error = result.is_err();
                 self.emit(AgentEvent::ToolResult {
                     is_error,
                     content: content.clone(),
                     images: images.clone(),
                     call_id: Some(call.id.clone()),
+                    started_task_id,
+                    subagent_session_id: subagent_session_id.clone(),
                 });
                 self.push_message(Message::Tool {
                     call_id: call.id.clone(),
@@ -2743,6 +2833,8 @@ impl Agent {
                     images,
                     is_error,
                     synthetic: false,
+                    started_task_id,
+                    subagent_session_id,
                 });
             }
             if background_started {
@@ -2820,6 +2912,7 @@ impl Agent {
                 status,
                 kind,
                 cancellation_source,
+                subagent_session_id,
             } => {
                 self.pending_background
                     .push_back(SessionEntry::BackgroundCompletion {
@@ -2833,6 +2926,7 @@ impl Agent {
                         status: status.clone(),
                         kind: kind.clone(),
                         cancellation_source,
+                        subagent_session_id: subagent_session_id.clone(),
                     });
                 if fanout && let Some(subscriber) = &self.subscriber {
                     let _ = subscriber.send(AgentEvent::BackgroundCompleted {
@@ -2846,6 +2940,7 @@ impl Agent {
                         status: status.clone(),
                         kind: kind.clone(),
                         cancellation_source,
+                        subagent_session_id,
                     });
                 }
                 Some((
@@ -2944,33 +3039,43 @@ fn is_detached_background_call(call: &ToolCall) -> bool {
         .unwrap_or(false)
 }
 
-fn started_task_id(output: &str) -> Option<u64> {
-    output
-        .strip_prefix("started background task ")?
-        .split_once(':')?
-        .0
-        .parse()
-        .ok()
-}
-
 /// The trailing `[session: <id>]` tag a delegate completion notice carries:
 /// the child subagent's own session id, exactly what `send_message`'s
-/// `target` expects. The id is the one the delegate wrapper already writes on
-/// the completion output's first line (`subagent session: …` on a fresh
-/// spawn/continuation, `fork session: …` on a fork), so no extra event field
-/// has to be threaded through the session schema. `kind` gates the tag to
-/// delegate tasks: bash completions have a shell `kind`, so their notice text
-/// stays byte-identical. The id is returned verbatim (never truncated) — it
-/// must stay copy-pasteable.
-pub(crate) fn background_session_tag(kind: Option<&str>, output: &str) -> Option<String> {
+/// `target` expects.
+///
+/// The id comes from the STRUCTURED `subagent_session_id` field (the
+/// registry's task display metadata), never from the completion prose —
+/// that is why a `fork session:` child is tagged exactly like a `subagent
+/// session:` one. `kind` gates the tag to delegate tasks: bash completions
+/// have a shell `kind`, so their notice text stays byte-identical. The id is
+/// returned verbatim (never truncated) — it must stay copy-pasteable.
+///
+/// `output` is only the LEGACY fallback: rows persisted before
+/// `subagent_session_id` existed carry the id in their first line only. It
+/// can be removed once a persisted-format migration backfills the field on
+/// those old `SessionEntry::BackgroundCompletion` rows — not merely because
+/// the live registry always sets it now.
+pub(crate) fn background_session_tag(
+    kind: Option<&str>,
+    subagent_session_id: Option<&str>,
+    output: &str,
+) -> Option<String> {
     if kind != Some("delegate") {
         return None;
     }
-    let first = output.lines().next()?;
-    let id = first
-        .strip_prefix("subagent session: ")
-        .or_else(|| first.strip_prefix("fork session: "))?
-        .trim();
+    let id = match subagent_session_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        Some(id) => id,
+        None => {
+            let first = output.lines().next()?;
+            first
+                .strip_prefix("subagent session: ")
+                .or_else(|| first.strip_prefix("fork session: "))?
+                .trim()
+        }
+    };
     (!id.is_empty()).then(|| format!(" [session: {id}]"))
 }
 

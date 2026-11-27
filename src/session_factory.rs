@@ -22,7 +22,7 @@ use crate::codex::CodexModel;
 use crate::codex_auth::CodexAuth;
 use crate::config::{
     AuthMode, Config, ProjectSourceObservation, ResolvedModel, Sandbox, SandboxPolicy,
-    WebSearchProvider,
+    WebFetchProvider, WebSearchProvider,
 };
 use crate::delegate::{Delegate, Sessions};
 use crate::mcp;
@@ -31,7 +31,8 @@ use crate::runner::{IdlePolicy, SessionBootstrap, SessionHandle, SessionRunner};
 use crate::session_store::SessionStore;
 use crate::tools::{
     AuthResolver, BackgroundTasks, DEEPSEEK_API_KEY_ENV, SEARXNG_BASE_URL_ENV,
-    add_root_user_input_tool, builtins_with_bash_timeout, generate_image_tool,
+    WEB_FETCH_PROVIDER_ENV, WEB_SEARCH_PROVIDER_ENV, add_root_user_input_tool,
+    builtins_with_bash_timeout, generate_image_tool,
 };
 use crate::workspace::Workspace;
 
@@ -47,7 +48,6 @@ pub(crate) struct RequestHead {
     /// policy.
     pub rust_sandbox: Option<crate::config::Sandbox>,
     pub read_only: bool,
-    pub protect_git: bool,
     pub code_mode: bool,
     pub mcp_servers: HashMap<String, crate::mcp::McpServerConfig>,
     /// The parent's goal projection at build time (folded from the restored
@@ -56,6 +56,12 @@ pub(crate) struct RequestHead {
     /// explicit clear tombstone from "never set".
     pub goal: Option<GoalSnapshot>,
     pub goal_cleared: bool,
+    /// Image hashes the parent's provider already rejected in this live
+    /// session (the fork takes this from the live parent, not from the
+    /// build-time snapshot). A fork installs them on its agent before its
+    /// first request, so it skips the same attachments under the same
+    /// omission notice instead of re-sending them.
+    pub omitted_images: Vec<String>,
 }
 
 /// What to do with background-task records left behind by a previous run
@@ -85,6 +91,41 @@ pub struct LocalSessionKey {
     pub session: String,
 }
 
+/// Typed admission conflict: this session id is already reserved in this
+/// process (a live runner, or a build that is still reserving it).
+///
+/// This exists so a caller can tell an EXPECTED conflict from a genuine
+/// failure by TYPE instead of matching the English wording (the HTTP layer
+/// answers `409 CONFLICT` for this type and `500` for everything else).
+/// `Display` renders the plain message the pre-typing `anyhow!` produced, so
+/// logs and non-HTTP callers (TUI/REPL) are unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionAlreadyLive(String);
+
+impl SessionAlreadyLive {
+    /// The one place the client-visible wording lives. It is deliberately
+    /// NOT part of the classification: reword it and every conflicted
+    /// request still answers `409`.
+    pub(crate) fn already_live(session: &str) -> Self {
+        Self(format!("session {session} is already live locally"))
+    }
+
+    /// Same type, arbitrary wording: proves the conflict status comes from
+    /// the type and never from this text.
+    #[cfg(test)]
+    pub(crate) fn reworded(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+}
+
+impl std::fmt::Display for SessionAlreadyLive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SessionAlreadyLive {}
+
 /// Shared process-local admission registry. Persisted rows are deliberately
 /// not consulted; a permit only represents a live local runner.
 #[derive(Clone, Default)]
@@ -98,11 +139,13 @@ pub struct LocalSessionPermit {
 }
 
 impl LocalSessionRegistry {
-    #[allow(clippy::result_unit_err)]
-    pub fn reserve(&self, key: LocalSessionKey) -> Result<LocalSessionPermit, ()> {
+    /// Reserve `key` for the caller's lifetime. A duplicate reservation is
+    /// [`SessionAlreadyLive`], not a `()`: callers that must answer over HTTP
+    /// classify it by type.
+    pub fn reserve(&self, key: LocalSessionKey) -> Result<LocalSessionPermit, SessionAlreadyLive> {
         let mut live = self.live.lock().unwrap();
         if !live.insert(key.clone()) {
-            return Err(());
+            return Err(SessionAlreadyLive::already_live(&key.session));
         }
         Ok(LocalSessionPermit {
             registry: self.clone(),
@@ -316,6 +359,7 @@ fn resolve_profile_from(
         AuthSource::Lazy(reloadable),
         base_url,
         model_override,
+        config.images_max_inline(),
     )?;
     Ok((model, context_window))
 }
@@ -352,16 +396,36 @@ impl SessionFactory {
             .as_ref()
             .map(|c| c.session_backend())
             .unwrap_or_default();
-        // Web search reads its backend from the process env (tools.rs and
-        // subagents pick it up there): EXA_API_KEY for the default Exa
+        // Web search/fetch read their backends from the process env (tools.rs
+        // and subagents pick it up there): EXA_API_KEY for the default Exa
         // provider, the internal `E_AGENT_SEARXNG_BASE_URL` for
         // `[web_search] provider = "searxng"`, and the internal
-        // `E_AGENT_DEEPSEEK_API_KEY` for `provider = "deepseek"`. The
-        // section is validated once here, which keeps the single transport
-        // mechanism and avoids threading the setting through every tools
-        // constructor. Startup is single-threaded, so set_var is safe.
+        // `E_AGENT_DEEPSEEK_API_KEY` for `provider = "deepseek"` or
+        // `fetch_provider = "deepseek"`. The provider choices travel beside
+        // the credentials in `E_AGENT_WEB_SEARCH` / `E_AGENT_WEB_FETCH`, so a
+        // SearXNG search can carry a DeepSeek key for the fetch without the
+        // key hijacking the search backend. The section is validated once
+        // here, which keeps the single transport mechanism and avoids
+        // threading the setting through every tools constructor. Startup is
+        // single-threaded, so set_var is safe.
         if let Some(config) = &config {
-            match config.web_search_provider()? {
+            let search = config.web_search_provider()?;
+            let deepseek_fetch = config.web_fetch_provider()? == Some(WebFetchProvider::Deepseek);
+            if let Some(search) = &search {
+                let selector = match search {
+                    WebSearchProvider::Exa => "exa",
+                    WebSearchProvider::Searxng { .. } => "searxng",
+                    WebSearchProvider::Deepseek => "deepseek",
+                };
+                if std::env::var_os(WEB_SEARCH_PROVIDER_ENV).is_none() {
+                    unsafe { std::env::set_var(WEB_SEARCH_PROVIDER_ENV, selector) };
+                }
+            }
+            if deepseek_fetch && std::env::var_os(WEB_FETCH_PROVIDER_ENV).is_none() {
+                unsafe { std::env::set_var(WEB_FETCH_PROVIDER_ENV, "deepseek") };
+            }
+            let search_is_deepseek = matches!(search, Some(WebSearchProvider::Deepseek));
+            match search {
                 Some(WebSearchProvider::Searxng { base_url }) => {
                     if std::env::var_os(SEARXNG_BASE_URL_ENV).is_none() {
                         unsafe { std::env::set_var(SEARXNG_BASE_URL_ENV, base_url) };
@@ -383,6 +447,15 @@ impl SessionFactory {
                         unsafe { std::env::set_var(DEEPSEEK_API_KEY_ENV, key) };
                     }
                 }
+            }
+            // A SearXNG (or Exa) search with a DeepSeek fetch still needs the
+            // credential, because it now belongs to the fetch.
+            if deepseek_fetch
+                && !search_is_deepseek
+                && std::env::var_os(DEEPSEEK_API_KEY_ENV).is_none()
+                && let Some(key) = config.web_search_key()?
+            {
+                unsafe { std::env::set_var(DEEPSEEK_API_KEY_ENV, key) };
             }
         }
         let (runtime, auth) = match &config {
@@ -408,6 +481,7 @@ impl SessionFactory {
                     AuthSource::Fixed(auth.as_ref()),
                     &base_url,
                     &model,
+                    config.images_max_inline(),
                 )?;
                 (Some(models), auth)
             }
@@ -596,9 +670,11 @@ impl SessionFactory {
     /// when there is no config or the profile is unknown — the caller turns
     /// that into a 400. A chatgpt-routed profile loads the login credentials
     /// lazily on first use ([`AuthSource::Lazy`]), so a login that happened
-    /// after start works without a restart. The context window accompanies
-    /// the concrete model so a runtime switch updates both runner
-    /// observations together.
+    /// after start works without a restart. The concrete model and its
+    /// context window are BOTH handed to the runner, which snapshots them as
+    /// the switch's live identity: a later `fork` inherits that resolution
+    /// instead of re-resolving it here against a config that may have
+    /// hot-reloaded (or lost the profile) since.
     pub fn resolve_profile(
         &self,
         profile: &str,
@@ -611,22 +687,6 @@ impl SessionFactory {
             profile,
             effort,
         )
-    }
-
-    /// Resolve a model profile by name at FORK time — the `fork` delegate's
-    /// child runs on the parent's current model, so a parent `/model <profile>`
-    /// switch (which only updates the live agent) must not leave the child on
-    /// the build-time model. `None` when the profile cannot be resolved (no
-    /// config, unknown profile); the fork then fails closed instead of
-    /// silently using the stale model. The effort level is the profile's own
-    /// configured default: the live identity carries the profile name only.
-    pub fn fork_model_resolver(&self) -> crate::delegate::ForkModelSource {
-        let reloadable = self.reloadable.clone();
-        let base_url = self.base_url.clone();
-        let model = self.model.clone();
-        Arc::new(move |profile: &str| {
-            resolve_profile_from(&reloadable, base_url.clone(), model.clone(), profile, None).ok()
-        })
     }
 
     /// Every switchable model profile name (`[models]` keys + `[roles]`
@@ -907,11 +967,14 @@ impl SessionFactory {
         fork_target: Option<&str>,
     ) -> anyhow::Result<SessionBuild> {
         let mut session = id.to_owned();
+        // The admission rejection is propagated UNWRAPPED: a typed
+        // [`SessionAlreadyLive`] must stay downcastable for the HTTP layer,
+        // so no `anyhow!`/`.context()` is put on top of it (its `Display`
+        // already carries the human message).
         let mut local_permit = if fork_target.is_some() || fork_from.is_none() {
             Some(
                 self.local_sessions
-                    .reserve(self.local_session_key(&session))
-                    .map_err(|_| anyhow!("session {session} is already live locally"))?,
+                    .reserve(self.local_session_key(&session))?,
             )
         } else {
             None
@@ -986,10 +1049,11 @@ impl SessionFactory {
             eprintln!("e-agent: forked session: {new_id}");
             session = new_id;
             if local_permit.is_none() {
+                // Fork target reservation: same typed conflict as above,
+                // propagated unwrapped for the same reason.
                 local_permit = Some(
                     self.local_sessions
-                        .reserve(self.local_session_key(&session))
-                        .map_err(|_| anyhow!("session {session} is already live locally"))?,
+                        .reserve(self.local_session_key(&session))?,
                 );
             }
         }
@@ -1065,6 +1129,21 @@ impl SessionFactory {
             self.read_only,
             self.skills_root.as_deref(),
         );
+        // Main-agent only: `acp_prompt` (one external ACP stdio agent per
+        // call). Children/btw forks build the common builtins, so they never
+        // see it — like `generate_image`, a same-workspace fork of a main
+        // session that exposed it has a different tool array.
+        // The store + root + session id are the ACP session-reuse wiring: the
+        // tool reads/writes `sessions.acp_session_id` through the store.
+        register_acp(
+            &mut tools,
+            &tools_workspace,
+            config.as_ref(),
+            self.read_only,
+            &store,
+            &self.root,
+            &session,
+        );
         // Read-only sessions skip MCP entirely: MCP tools carry no read-only
         // marker, so exposing them would defeat the policy. Delegation stays —
         // spawning a subagent does not mutate this session's host state, and
@@ -1114,10 +1193,6 @@ impl SessionFactory {
                 .expect("main request head initialized")
                 .clone()
         }));
-        // A forked child runs on the parent's CURRENT model: after a runtime
-        // `/model` switch the request head above is stale, so the fork asks
-        // the runner for its live identity and re-resolves that profile here.
-        delegate = delegate.with_fork_model_source(self.fork_model_resolver());
         let subagent_sessions = delegate.sessions();
         tools.push(Box::new(crate::delegate::SendMessage::parent(
             subagent_sessions.clone(),
@@ -1182,11 +1257,13 @@ impl SessionFactory {
             compaction_reminder: head_reminder,
             rust_sandbox: self.rust_sandbox.clone(),
             read_only: self.read_only,
-            protect_git: false,
             code_mode: self.code_mode,
             mcp_servers: mcp_servers_for_fork.clone(),
             goal: head_goal,
             goal_cleared: head_goal_cleared,
+            // A main session starts with no rejected images; the fork path
+            // overwrites this from the parent's live state.
+            omitted_images: Vec::new(),
         };
         *head_cell.lock().unwrap() = Some(head_value);
         let recovery_labels = if matches!(unfinished, UnfinishedPolicy::Consume) {
@@ -1429,6 +1506,42 @@ pub(crate) fn register_generate_image(
         tools.push(tool);
     }
 }
+
+/// Register the main-agent-only `acp_prompt` tool. The `[acp]` section is the
+/// opt-in: without it nothing is registered (the same boundary as a
+/// `[web_search]` without a usable credential). Read-only sessions skip it —
+/// the external agent carries no read-only marker and would defeat the policy
+/// — and children/btw forks build the common builtins without it.
+///
+/// This is the wiring point for ACP session reuse: the tool gets the session
+/// store (`sessions.acp_session_id`) plus the store's workspace root and the
+/// session id it belongs to, so it never opens a database itself.
+pub(crate) fn register_acp(
+    tools: &mut Vec<Box<dyn crate::agent::Tool>>,
+    workspace: &Workspace,
+    config: Option<&crate::config::Config>,
+    read_only: bool,
+    store: &crate::session_store::SessionStore,
+    root: &std::path::Path,
+    session: &str,
+) {
+    if read_only {
+        return;
+    }
+    let Some(acp) = config.and_then(crate::config::Config::acp) else {
+        return;
+    };
+    // The session id is bound up front: the ACP id belongs to THIS session's
+    // metadata row from the first call.
+    tools.push(crate::tools::acp_tool(
+        workspace.clone(),
+        acp,
+        store.clone(),
+        root.to_path_buf(),
+        session,
+    ));
+}
+
 fn preflight_sandbox(policy: &Sandbox, announce: bool) -> anyhow::Result<()> {
     #[cfg(windows)]
     {
@@ -1713,6 +1826,9 @@ fn configured_model(
     auth: AuthSource<'_>,
     base_url: Option<String>,
     model: Option<String>,
+    // `[images] max_inline`: the inline-image cap every wire model built here
+    // applies (see `crate::images`).
+    max_inline: usize,
 ) -> anyhow::Result<ConfiguredModel> {
     let display = Some(resolved.display);
     match resolved.auth {
@@ -1726,7 +1842,8 @@ fn configured_model(
                 )?
                 .with_vision(resolved.vision)
                 .with_thinking(resolved.thinking)
-                .with_deepseek_compat(resolved.deepseek_compat),
+                .with_deepseek_compat(resolved.deepseek_compat)
+                .with_max_inline(max_inline),
             );
             cm.display = display;
             Ok(cm)
@@ -1744,7 +1861,8 @@ fn configured_model(
                     model.unwrap_or(resolved.model),
                     resolved.reasoning_effort,
                 )?
-                .with_vision(resolved.vision),
+                .with_vision(resolved.vision)
+                .with_max_inline(max_inline),
             );
             cm.display = display;
             Ok(cm)
@@ -1782,6 +1900,7 @@ fn build_runtime_models(
     auth: AuthSource<'_>,
     base_url: &Option<String>,
     model: &Option<String>,
+    max_inline: usize,
 ) -> anyhow::Result<RuntimeModels> {
     if matches!(resolved.main.auth, AuthMode::ChatGpt) && base_url.is_some() {
         return Err(anyhow!(
@@ -1795,17 +1914,26 @@ fn build_runtime_models(
     } else {
         resolved.main.context_window
     };
-    let main = configured_model(resolved.main, auth, base_url.clone(), model.clone())?;
+    let main = configured_model(
+        resolved.main,
+        auth,
+        base_url.clone(),
+        model.clone(),
+        max_inline,
+    )?;
     let subagent_context_window = resolved.subagent.as_ref().and_then(|r| r.context_window);
     let subagent = resolved
         .subagent
-        .map(|resolved| configured_model(resolved, auth, None, None))
+        .map(|resolved| configured_model(resolved, auth, None, None, max_inline))
         .transpose()?;
     let mut roles = HashMap::new();
     let mut role_context_windows = HashMap::new();
     for (role, resolved) in resolved.roles {
         role_context_windows.insert(role.clone(), resolved.context_window);
-        roles.insert(role, configured_model(resolved, auth, None, None)?);
+        roles.insert(
+            role,
+            configured_model(resolved, auth, None, None, max_inline)?,
+        );
     }
     Ok(RuntimeModels {
         main,
@@ -1848,9 +1976,18 @@ fn apply_reloaded_config(
         Ok(provider) => provider,
         Err(error) => return ReloadResult::Rejected(format!("{error:#}")),
     };
+    let web_fetch_provider = match config.web_fetch_provider() {
+        Ok(provider) => provider,
+        Err(error) => return ReloadResult::Rejected(format!("{error:#}")),
+    };
+    let deepseek_fetch = web_fetch_provider == Some(WebFetchProvider::Deepseek);
     let key_env = match &web_search_provider {
-        Some(WebSearchProvider::Searxng { .. }) => None,
-        Some(WebSearchProvider::Deepseek) => Some(DEEPSEEK_API_KEY_ENV),
+        // A SearXNG search carries no credential unless the fetch is
+        // DeepSeek's, which then needs one.
+        Some(WebSearchProvider::Searxng { .. }) if !deepseek_fetch => None,
+        Some(WebSearchProvider::Searxng { .. }) | Some(WebSearchProvider::Deepseek) => {
+            Some(DEEPSEEK_API_KEY_ENV)
+        }
         Some(WebSearchProvider::Exa) | None => Some("EXA_API_KEY"),
     };
     if let Some(variable) = key_env
@@ -1883,7 +2020,14 @@ fn apply_reloaded_config(
     } else {
         None
     };
-    match build_runtime_models(resolved, AuthSource::Fixed(auth.as_ref()), base_url, model) {
+    let max_inline = config.images_max_inline();
+    match build_runtime_models(
+        resolved,
+        AuthSource::Fixed(auth.as_ref()),
+        base_url,
+        model,
+        max_inline,
+    ) {
         Ok(models) => {
             state.config = Some(config);
             state.auth = auth;
@@ -4649,5 +4793,62 @@ mod generate_image_registration_tests {
             )
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod admission_conflict_tests {
+    use super::*;
+
+    /// A non-HTTP caller (the CLI/TUI/REPL `factory.build(..)?` path in
+    /// `main.rs`) still gets a readable message: the typed conflict renders
+    /// through `Display` exactly like the old `anyhow!` text, while `anyhow`
+    /// keeps it downcastable for the HTTP layer. Both properties are load
+    /// bearing, so both are asserted here.
+    #[tokio::test]
+    async fn a_second_build_reads_as_a_plain_conflict_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let factory = SessionFactory::test_factory(temp.path().to_path_buf());
+        let live = factory
+            .build(
+                "dup",
+                None,
+                None,
+                IdlePolicy::WaitForInput,
+                UnfinishedPolicy::Consume,
+            )
+            .await
+            .expect("the first build owns the reservation");
+        let error = match factory
+            .build(
+                "dup",
+                None,
+                None,
+                IdlePolicy::WaitForInput,
+                UnfinishedPolicy::Consume,
+            )
+            .await
+        {
+            Ok(_) => panic!("the id is already live in this process"),
+            Err(error) => error,
+        };
+        // Unchanged human wording — the log line / TUI failure text.
+        assert_eq!(format!("{error:#}"), "session dup is already live locally");
+        assert!(
+            error.downcast_ref::<SessionAlreadyLive>().is_some(),
+            "the conflict survives `anyhow` as a type: {error:#}"
+        );
+        drop(live);
+        // The permit is released with the build, so the id frees up again.
+        factory
+            .build(
+                "dup",
+                None,
+                None,
+                IdlePolicy::WaitForInput,
+                UnfinishedPolicy::Consume,
+            )
+            .await
+            .expect("the released id can be built again");
     }
 }

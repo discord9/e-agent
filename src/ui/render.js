@@ -432,28 +432,69 @@ function renderSearchResult(resEl, content) {
   resEl.innerHTML = renderMarkdown(String(content == null ? "" : content));
 }
 
+/* delegate 后台启动回执的标题块：「后台运行 任务 #N label」+「子代理会话 id」。
+   机器事实（任务 id、子代理会话 id）来自 ToolResult 的 started_task_id /
+   subagent_session_id 字段；body 是正文里除回执行之外剩下的部分（启动回执
+   没有 body，长答案同步结果走下面的折叠形态）。两行各自按字段是否存在渲染，
+   所以只有会话 id 的旧形态也不会被硬塞一个 "任务 #?"。 */
+function delegateReceiptBlock(resEl, taskId, label, sessionId, body) {
+  resEl.classList.add("delegate-result");
+  const wrap = el("div", "delegate-result-wrap");
+  if (taskId != null) {
+    const line = el("div", "delegate-bg-line");
+    line.appendChild(el("span", "delegate-chip", "后台运行"));
+    line.appendChild(el("span", "delegate-label",
+      "任务 #" + taskId + (label ? " " + label : "")));
+    wrap.appendChild(line);
+  }
+  if (sessionId != null) {
+    wrap.appendChild(el("div", "delegate-session", "子代理会话 " + sessionId));
+  }
+  if (body) {
+    const md = el("div", "tool-markdown");
+    md.innerHTML = renderMarkdown(body);
+    wrap.appendChild(md);
+  }
+  resEl.appendChild(wrap);
+}
+
 /* delegate 结果：
-   - 后台启动回执 "started background task N: label\nsubagent session: sub-…" →
-     「后台运行 任务 #N label」+ 「子代理会话 sub-…」
+   - 后台启动回执 → 「后台运行 任务 #N label」+ 「子代理会话 sub-…」（结构化
+     字段优先，见下；旧持久化行回退正文正则）
    - 同步完成 "subagent session: sub-…\n<答案>" → 「子代理会话 sub-…」+ 答案 markdown
    - 不匹配回退原文（错误正文由 isError 分支走 renderPlainResult，保持完整可复制）。
    长答案（>DELEGATE_COLLAPSE_THRESHOLD）默认折叠进 details.delegate-collapse
    （与 appendBackgroundCompletion 的 delegate 完成 notice 同一折叠形态）：
    markdown 答案整体隐藏、summary 「查看完整答案（N 字符）」点击展开；
    短答案直接显示，避免「已完成」这类短回复也要点开。 */
-function renderDelegateResult(resEl, content) {
+function renderDelegateResult(resEl, content, startedTaskId, subagentSessionId) {
   const s = String(content == null ? "" : content);
+  if (startedTaskId != null || subagentSessionId != null) {
+    // 结构化路径：id 与会话 id 已是字段，正文里的回执行按「已知 id 的精确
+    // 前缀/整行」剥离（得到给人看的任务标签），不再用正则从正文回收机器状态。
+    const head = startedTaskId == null ? null : "started background task " + startedTaskId + ": ";
+    const receiptLines = new Set();
+    if (subagentSessionId != null) {
+      const sid = String(subagentSessionId);
+      receiptLines.add("subagent session: " + sid);
+      receiptLines.add("fork session: " + sid);
+      receiptLines.add(sid);        // fork 的工具结果正文只有裸会话 id
+    }
+    const lines = s.split("\n");
+    let label = "";
+    if (head && lines.length && String(lines[0]).startsWith(head)) {
+      label = lines.shift().slice(head.length);
+    }
+    const body = lines.filter(line => !receiptLines.has(line)).join("\n").trim();
+    delegateReceiptBlock(resEl, startedTaskId, label, subagentSessionId, body);
+    return;
+  }
+  // 旧持久化行（字段出现之前写下的 ToolResult / Message::Tool）回退正文正则。
+  // 该回退要等一次持久化格式迁移（回填旧行的 started_task_id /
+  // subagent_session_id）之后才能删。
   const bg = /^started background task (\d+): ([^\n]*)\nsubagent session: ([^\n]+)$/.exec(s);
   if (bg) {
-    resEl.classList.add("delegate-result");
-    const wrap = el("div", "delegate-result-wrap");
-    const line = el("div", "delegate-bg-line");
-    line.appendChild(el("span", "delegate-chip", "后台运行"));
-    line.appendChild(el("span", "delegate-label",
-      "任务 #" + bg[1] + (bg[2] ? " " + bg[2] : "")));
-    wrap.appendChild(line);
-    wrap.appendChild(el("div", "delegate-session", "子代理会话 " + bg[3]));
-    resEl.appendChild(wrap);
+    delegateReceiptBlock(resEl, bg[1], bg[2], bg[3], "");
     return;
   }
   const done = /^subagent session: ([^\n]+)\n?([\s\S]*)$/.exec(s);
@@ -531,8 +572,11 @@ function renderImageReceipt(resEl, content, images) {
 }
 
 /* 统一结果入口：isError → 纯文本（保持完整可复制）；否则按工具名分派。
-   args 只对文件工具传入（diff 渲染需要）；其余工具结果渲染只依赖 content。 */
-function renderToolResult(resEl, name, args, content, isError, images) {
+   args 只对文件工具传入（diff 渲染需要）；其余工具结果渲染只依赖 content。
+   startedTaskId / subagentSessionId 是 ToolResult 的结构化字段（delegate 启动
+   回执）：有字段时渲染不再从正文正则回收机器事实，其余工具两者都是 undefined。 */
+function renderToolResult(resEl, name, args, content, isError, images,
+                          startedTaskId, subagentSessionId) {
   resEl.textContent = "";
   resEl.classList.remove("expandable", "expanded");
   if (isError) { renderPlainResult(resEl, content, "(无错误信息)"); return; }
@@ -546,7 +590,7 @@ function renderToolResult(resEl, name, args, content, isError, images) {
       renderSearchResult(resEl, content);
       return;
     case "delegate":
-      renderDelegateResult(resEl, content);
+      renderDelegateResult(resEl, content, startedTaskId, subagentSessionId);
       return;
     case "get_background_tasks":
       renderBackgroundTaskList(resEl, content);
@@ -1033,7 +1077,10 @@ function appendToolCall(name, args, acc, callId) {
   pruneMessages();      // 卡片是「执行中…」：进行中，不折叠
 }
 
-function appendToolResult(isError, content, acc, callId, images) {
+/* startedTaskId / subagentSessionId：ToolResult 的结构化字段（delegate 启动
+   回执的任务 id 与子代理会话 id）。除了 delegate 之外的工具都没有这两项。 */
+function appendToolResult(isError, content, acc, callId, images,
+                          startedTaskId, subagentSessionId) {
   let card = null;
   if (callId && acc.pendingByCall.has(callId)) {
     card = acc.pendingByCall.get(callId);
@@ -1058,7 +1105,8 @@ function appendToolResult(isError, content, acc, callId, images) {
     const tArgs = (name === "edit_file" || name === "read_file" || name === "write_file")
       ? cardArgs(card) : null;
     const isFileTool = tArgs !== null;
-    renderToolResult(resEl, name, tArgs, content, isError, images);
+    renderToolResult(resEl, name, tArgs, content, isError, images,
+      startedTaskId, subagentSessionId);
     if ((isFileTool || (name === "read_image" && resEl.querySelector("img.attached-image"))) && !isError) {
       card.setAttribute("open", "");
     } else {
@@ -1213,12 +1261,21 @@ function appendNoticeLong(prefix, text) {
 }
 
 /* 后台任务最终完成（live BackgroundCompleted 事件与 history background_completion
-   条目共用）：output 以 "subagent session: " 开头 → delegate 完成（子代理会话 +
-   markdown 答案）；否则走现有 bash 路径（appendNoticeLong）。 */
-function appendBackgroundCompletion(id, label, output) {
+   条目共用）：携带结构化 subagent_session_id → delegate 完成（子代理会话 +
+   markdown 答案）；否则走现有 bash 路径（appendNoticeLong）。
+   旧持久化行没有该字段：只有它们才回退到 output 首行的旧式前缀解析
+   （"subagent session: "）。该回退要等一次持久化格式迁移（回填旧行）之后
+   才能删除——仅仅因为新事件都带字段并不够。 */
+const BG_SESSION_LINE_RE = /^(?:subagent|fork) session: ([^\n]+)\n?([\s\S]*)$/;
+function appendBackgroundCompletion(id, label, output, subagentSessionId) {
   const s = String(output == null ? "" : output);
-  const m = /^subagent session: ([^\n]+)\n?([\s\S]*)$/.exec(s);
-  if (!m) {
+  const legacy = BG_SESSION_LINE_RE.exec(s);
+  // 优先结构化字段（fork 子会话同样可见）；无字段时才用旧文本回退。
+  const sessionId = subagentSessionId || (legacy ? legacy[1] : "");
+  // 首行是旧式会话行时，正文在其后；否则（新事件，首行可能是任意文案）
+  // 整段 output 就是答案正文。
+  const body = legacy ? legacy[2] : s;
+  if (!sessionId) {
     return appendNoticeLong("⌛ 后台任务 #" + (id ?? "?") + " 完成"
       + (label ? "（" + label + "）" : "") + "\n", s);
   }
@@ -1229,20 +1286,20 @@ function appendBackgroundCompletion(id, label, output) {
   line.appendChild(el("span", "delegate-label",
     "任务 #" + (id ?? "?") + (label ? " " + label : "")));
   n.appendChild(line);
-  n.appendChild(el("div", "delegate-session", "子代理会话 " + m[1]));
-  if (m[2]) {
+  n.appendChild(el("div", "delegate-session", "子代理会话 " + sessionId));
+  if (body) {
     const md = el("div", "tool-markdown");
-    md.innerHTML = renderMarkdown(m[2]);
+    md.innerHTML = renderMarkdown(body);
     // delegate 答案：长答案（>200 字符）默认折叠——包进 details.delegate-collapse
     // （不 open），summary 显示字符数，点击展开；短答案直接展开显示，避免
     // 「已完成」这类短回复也要点开。与 renderDelegateResult（delegate 工具
     // 结果）同一折叠形态（details.delegate-collapse + 相同 summary 文案）。
-    if (m[2].length <= DELEGATE_COLLAPSE_THRESHOLD) {
+    if (body.length <= DELEGATE_COLLAPSE_THRESHOLD) {
       n.appendChild(md);
     } else {
       const det = el("details", "delegate-collapse");
       det.open = false;                       // 默认折叠
-      const sum = el("summary", "", "查看完整答案（" + m[2].length + " 字符）");
+      const sum = el("summary", "", "查看完整答案（" + body.length + " 字符）");
       det.append(sum, md);
       n.appendChild(det);
     }
@@ -1415,7 +1472,8 @@ function renderEntry(entry, acc, pendingCards) {
     case "display": return appendNotice(entry.text);
     case "error": return appendError(entry.text);
     case "background_completion":
-      return appendBackgroundCompletion(entry.id ?? "?", entry.label, entry.output || "");
+      return appendBackgroundCompletion(entry.id ?? "?", entry.label,
+        entry.output || "", entry.subagent_session_id);
     case "forked_from":
       // 新标记按「物理行」pin 切点（没有位置 at），旧标记才有 1-based at。
       els.messages.appendChild(el("div", "forked",
@@ -1501,7 +1559,8 @@ function renderMessage(m, acc, pendingCards) {
         ? cardArgs(card) : null;
       // 与 live 路径同一 renderToolResult：特殊结果（web_search / delegate /
       // get_background_tasks / 文件 diff）在 history 重放时渲染一致
-      renderToolResult(resEl, name, tArgs, t.content, t.is_error, t.images);
+      renderToolResult(resEl, name, tArgs, t.content, t.is_error, t.images,
+        t.started_task_id, t.subagent_session_id);
       const isFileTool = tArgs !== null;
       if ((isFileTool || (name === "read_image" && resEl.querySelector("img.attached-image"))) && !t.is_error) {
         card.setAttribute("open", "");
@@ -1789,43 +1848,87 @@ function normalizePendingQuestions(payload) {
   return out;
 }
 
+/* 固定选项：老会话/自由文本问题没有 options 键（或为空）→ 保持文本框。 */
+function questionOptions(question) {
+  const options = question && Array.isArray(question.options) ? question.options : [];
+  return options.filter((option) => option && typeof option.id === "string" && option.id);
+}
+
+/* 同一 call_id 的选项集合（id + label）变化时才需要重建卡片控件。 */
+function pendingOptionsKey(item) {
+  return questionOptions(item.questions[0])
+    .map((option) => option.id + "=" + (typeof option.label === "string" ? option.label : ""))
+    .join("\u0000");
+}
+
 function buildPendingQuestionCard(item) {
   const promptText = item.questions.map((q) => q.prompt).join("\n");
+  const options = questionOptions(item.questions[0]);
   const root = el("article", "pending-question-card");
   root.setAttribute("data-call-id", item.callId);
   root.appendChild(el("p", "pending-question-prompt", promptText));
-  const row = el("div", "pending-question-row");
-  const field = el("label", "pending-question-field");
-  field.appendChild(el("span", "sr-only", "回答：" + promptText));
-  const input = document.createElement("input");
-  input.type = "text";
-  input.className = "pending-question-input";
-  input.placeholder = "输入回答…";
-  input.autocomplete = "off";
-  input.spellcheck = "false";
-  input.setAttribute("aria-label", "回答：" + promptText);
-  field.appendChild(input);
-  row.appendChild(field);
-  const button = document.createElement("button");
-  button.type = "button";
-  button.className = "pending-question-submit primary";
-  button.textContent = "回答";
-  row.appendChild(button);
-  root.appendChild(row);
+  const entry = {
+    root, input: null, button: null, optionButtons: [], status: null,
+    pending: false, submitted: false, chosen: "",
+  };
+  if (options.length) {
+    // 固定选项：一个选项一个按钮，点选即提交该选项的 id——与文本框走同一条
+    // submitPendingAnswer → POST /prompt 路径，绝不另开提交通道。
+    const list = el("div", "pending-question-options");
+    list.setAttribute("role", "group");
+    list.setAttribute("aria-label", "选项：" + promptText);
+    for (const option of options) {
+      const choice = document.createElement("button");
+      choice.type = "button";
+      choice.className = "pending-question-option primary";
+      choice.textContent = typeof option.label === "string" && option.label
+        ? option.label : option.id;
+      choice.setAttribute("data-option-id", option.id);
+      if (typeof option.description === "string" && option.description) {
+        choice.title = option.description;
+        choice.setAttribute("aria-description", option.description);
+      }
+      choice.addEventListener("click", () => submitPendingAnswer(item.callId, option.id));
+      list.appendChild(choice);
+      entry.optionButtons.push({ el: choice, id: option.id });
+    }
+    root.appendChild(list);
+  } else {
+    const row = el("div", "pending-question-row");
+    const field = el("label", "pending-question-field");
+    field.appendChild(el("span", "sr-only", "回答：" + promptText));
+    const input = document.createElement("input");
+    input.type = "text";
+    input.className = "pending-question-input";
+    input.placeholder = "输入回答…";
+    input.autocomplete = "off";
+    input.spellcheck = "false";
+    input.setAttribute("aria-label", "回答：" + promptText);
+    field.appendChild(input);
+    row.appendChild(field);
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "pending-question-submit primary";
+    button.textContent = "回答";
+    row.appendChild(button);
+    root.appendChild(row);
+    entry.input = input;
+    entry.button = button;
+    // 键盘可达：Enter 提交本卡片（单行 input，无需 Shift+Enter 换行）。
+    button.addEventListener("click", () => submitPendingAnswer(item.callId));
+    input.addEventListener("keydown", (ev) => {
+      if (ev.key !== "Enter" || ev.isComposing || ev.keyCode === 229) return;
+      ev.preventDefault();
+      submitPendingAnswer(item.callId);
+    });
+    input.addEventListener("input", () => {
+      if (!entry.pending && !entry.submitted) entry.status.textContent = "";
+    });
+  }
   const status = el("p", "pending-question-status");
   status.setAttribute("role", "status");
   root.appendChild(status);
-  const entry = { root, input, button, status, pending: false, submitted: false };
-  // 键盘可达：Enter 提交本卡片（单行 input，无需 Shift+Enter 换行）。
-  button.addEventListener("click", () => submitPendingAnswer(item.callId));
-  input.addEventListener("keydown", (ev) => {
-    if (ev.key !== "Enter" || ev.isComposing || ev.keyCode === 229) return;
-    ev.preventDefault();
-    submitPendingAnswer(item.callId);
-  });
-  input.addEventListener("input", () => {
-    if (!entry.pending && !entry.submitted) status.textContent = "";
-  });
+  entry.status = status;
   return entry;
 }
 
@@ -1835,11 +1938,17 @@ function syncPendingQuestionCards() {
     const busy = !!entry.pending;
     // 已提交的卡片保持只读，直到下一次 status 帧把它移除（避免重复回答）。
     const locked = finished || busy || !!entry.submitted;
-    entry.input.disabled = locked;
-    entry.button.disabled = locked;
+    if (entry.input) entry.input.disabled = locked;
+    if (entry.button) entry.button.disabled = locked;
+    for (const option of entry.optionButtons) {
+      option.el.disabled = locked;
+      option.el.classList.toggle("chosen", !!entry.chosen && option.id === entry.chosen);
+    }
     entry.root.classList.toggle("submitted", !!entry.submitted);
     entry.root.classList.toggle("sending", busy);
-    entry.button.textContent = entry.submitted ? "已提交" : (busy ? "提交中…" : "回答");
+    if (entry.button) {
+      entry.button.textContent = entry.submitted ? "已提交" : (busy ? "提交中…" : "回答");
+    }
   }
 }
 
@@ -1872,11 +1981,27 @@ function renderPendingQuestions(payload) {
   let cursor = els.pendingQuestionsList.firstChild;
   for (const item of items) {
     const promptText = item.questions.map((q) => q.prompt).join("\n");
+    const optionsKey = pendingOptionsKey(item);
     let entry = state.pendingCards.get(item.callId);
     if (!entry) {
       entry = buildPendingQuestionCard(item);
       entry.promptText = promptText;
+      entry.optionsKey = optionsKey;
       state.pendingCards.set(item.callId, entry);
+    } else if (entry.optionsKey !== optionsKey) {
+      // 同一 call_id 的选项集合变了：文本框与选项按钮不能就地互换，重建卡片并
+      // 保留草稿/已提交/选中状态。
+      const rebuilt = buildPendingQuestionCard(item);
+      rebuilt.promptText = promptText;
+      rebuilt.optionsKey = optionsKey;
+      rebuilt.submitted = entry.submitted;
+      rebuilt.chosen = entry.chosen;
+      if (entry.input && rebuilt.input) rebuilt.input.value = entry.input.value;
+      if (entry.root === cursor) cursor = cursor.nextSibling;
+      els.pendingQuestionsList.insertBefore(rebuilt.root, entry.root);
+      entry.root.remove();
+      state.pendingCards.set(item.callId, rebuilt);
+      entry = rebuilt;
     } else if (entry.promptText !== promptText) {
       // Same call id, changed prompt text: update labels in place; keep the
       // input value and submission state.
@@ -1884,7 +2009,7 @@ function renderPendingQuestions(payload) {
       if (prompt) prompt.textContent = promptText;
       const label = entry.root.querySelector(".pending-question-field .sr-only");
       if (label) label.textContent = "回答：" + promptText;
-      entry.input.setAttribute("aria-label", "回答：" + promptText);
+      if (entry.input) entry.input.setAttribute("aria-label", "回答：" + promptText);
       entry.promptText = promptText;
     }
     if (entry.root === cursor) {
@@ -1898,15 +2023,17 @@ function renderPendingQuestions(payload) {
   syncPendingQuestionCards();
 }
 
-/* 回答一张卡片：POST 现有 /prompt，携带该卡片自己的 call_id。失败时保留
-   文本并显示既有 banner；成功后卡片标记「已提交」，等下一次 status 帧移除。 */
-async function submitPendingAnswer(callId) {
+/* 回答一张卡片：POST 现有 /prompt，携带该卡片自己的 call_id。固定选项卡片提交
+   所点选项的 id（与文本框同一条路径），失败时保留状态并显示既有 banner；成功后
+   卡片标记「已提交」，等下一次 status 帧移除。 */
+async function submitPendingAnswer(callId, optionId) {
   const entry = state.pendingCards.get(callId);
   if (!entry || entry.pending || entry.submitted || !state.sessionId) return;
-  const text = entry.input.value.trim();
+  const choice = typeof optionId === "string" ? optionId : "";
+  const text = choice || (entry.input ? entry.input.value.trim() : "");
   if (!text) {
     entry.status.textContent = "请输入回答后再提交。";
-    entry.input.focus();
+    if (entry.input) entry.input.focus();
     return;
   }
   const captured = {
@@ -1918,6 +2045,7 @@ async function submitPendingAnswer(callId) {
     && !!state.workspace && state.workspace.id === captured.wid
     && state.pendingCards.get(callId) === entry;
   entry.pending = true;
+  entry.chosen = choice;
   syncPendingQuestionCards();
   entry.status.textContent = "正在提交…";
   try {
@@ -1935,6 +2063,7 @@ async function submitPendingAnswer(callId) {
     if (!current()) return;
     setBanner("⚠ 回答未发送：" + e.message, true);
     entry.status.textContent = "未发送，请重试";
+    entry.chosen = "";
   } finally {
     if (state.pendingCards.get(callId) === entry) {
       entry.pending = false;

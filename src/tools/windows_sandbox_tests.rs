@@ -645,7 +645,7 @@ async fn concurrent_first_installs_serialize_and_leave_exact_v4_layout() {
 
         // Background and foreground race through the same fresh write root:
         // both must pass preflight + scan + ACE install + command execution.
-        let started = bash
+        let (_task_id, started) = bash
             .background
             .start_with_sender(
                 workspace.clone(),

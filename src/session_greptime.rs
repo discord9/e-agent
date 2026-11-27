@@ -15,10 +15,10 @@ use crate::output_receipt::{
     ReceiptError, ReceiptErrorKind, VerifiedRef, field_bytes, validate_location_for_store,
 };
 use crate::session_store::{
-    EntryLocation, HistoryEntry, HistoryQuery, LocatedKey, SessionMeta, UsageRow, datetime_to_us,
-    dedup_finished_rows, dedup_raw_entries, dedup_raw_located, entry_kind, entry_payload_hash,
-    format_conflict_error, is_error, next_event_time_us, process_identity, us_to_datetime,
-    workspace_id_fingerprint,
+    EntryLocation, HistoryEntry, HistoryQuery, LocatedKey, SessionMeta, UsageRow,
+    checked_us_to_datetime, datetime_to_us, dedup_finished_rows, dedup_raw_entries,
+    dedup_raw_located, entry_kind, entry_payload_hash, format_conflict_error, is_error,
+    next_event_time_us, process_identity, us_to_datetime, workspace_id_fingerprint,
 };
 // Public path preserved for `src/bin/import_jsonl.rs` (was a `pub fn`
 // defined here before the shared-helper extraction).
@@ -113,6 +113,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     pinned BOOLEAN NULL,
     archived BOOLEAN NULL,
     writer STRING NULL,
+    acp_session_id STRING NULL,
     entry_count BIGINT NOT NULL DEFAULT 0,
     parent_session_id STRING NULL,
     parent_task_id BIGINT NULL,
@@ -258,6 +259,7 @@ impl GreptimeSession {
         let mut pinned_available = true;
         let mut archived_available = true;
         let mut writer_available = true;
+        let mut acp_available = true;
         let columns: Vec<String> = client
             .query(
                 "SELECT column_name FROM information_schema.columns \
@@ -310,6 +312,24 @@ impl GreptimeSession {
                     tracing::warn!(
                         "e-agent: cannot add sessions.archived column (session archiving unavailable): \
                          {error:#}"
+                    );
+                }
+            }
+        }
+        if !columns.iter().any(|c| c == "acp_session_id") {
+            match client
+                .execute(
+                    "ALTER TABLE sessions ADD COLUMN acp_session_id STRING NULL",
+                    &[],
+                )
+                .await
+            {
+                Ok(_) => {}
+                Err(error) => {
+                    acp_available = false;
+                    tracing::warn!(
+                        "e-agent: cannot add sessions.acp_session_id column (ACP session reuse \
+                         unavailable): {error:#}"
                     );
                 }
             }
@@ -438,12 +458,16 @@ impl GreptimeSession {
         // touches rewrite complete rows without re-reading immutable
         // columns. The table is append-only; the newest row per session
         // wins (ORDER BY last_active_at DESC LIMIT 1).
-        let cached_meta =
-            if title_available && pinned_available && archived_available && writer_available {
-                let meta_row = client
+        let cached_meta = if title_available
+            && pinned_available
+            && archived_available
+            && writer_available
+            && acp_available
+        {
+            let meta_row = client
                     .query_opt(
                         "SELECT created_at, last_active_at, model, \"role\", entry_count, \
-                            parent_session_id, parent_task_id, title, pinned, archived, writer \
+                            parent_session_id, parent_task_id, title, pinned, archived, writer, acp_session_id \
                      FROM sessions \
                      WHERE workspace_id = $1 AND session_id = $2 \
                      ORDER BY last_active_at DESC LIMIT 1",
@@ -451,24 +475,25 @@ impl GreptimeSession {
                     )
                     .await
                     .context("cannot query session metadata")?;
-                meta_row.map(|row| SessionMeta {
-                    session_id: session_id.to_string(),
-                    created_at: row.get("created_at"),
-                    last_active_at: row.get("last_active_at"),
-                    model: row.get("model"),
-                    role: row.get("role"),
-                    entry_count: row.get("entry_count"),
-                    parent_session_id: row.get("parent_session_id"),
-                    parent_task_id: row.get("parent_task_id"),
-                    title: row.get("title"),
-                    pinned: row.get("pinned"),
-                    archived: row.get("archived"),
-                    writer: row.get("writer"),
-                    label: None, // label lives in running_tasks, resolved at list time
-                })
-            } else {
-                None
-            };
+            meta_row.map(|row| SessionMeta {
+                session_id: session_id.to_string(),
+                created_at: row.get("created_at"),
+                last_active_at: row.get("last_active_at"),
+                model: row.get("model"),
+                role: row.get("role"),
+                entry_count: row.get("entry_count"),
+                parent_session_id: row.get("parent_session_id"),
+                parent_task_id: row.get("parent_task_id"),
+                title: row.get("title"),
+                pinned: row.get("pinned"),
+                archived: row.get("archived"),
+                acp_session_id: row.get("acp_session_id"),
+                writer: row.get("writer"),
+                label: None, // label lives in running_tasks, resolved at list time
+            })
+        } else {
+            None
+        };
 
         let backend_fp = crate::session_store::backend_instance_fingerprint("greptime", conn);
         let session = Self {
@@ -591,13 +616,8 @@ impl GreptimeSession {
         ).await.context("cannot load session entries")?;
         let raw = rows
             .iter()
-            .map(|r| {
-                let seq: i64 = r.get("seq");
-                let event_time: chrono::NaiveDateTime = r.get("event_time");
-                let payload: String = r.get("payload");
-                (seq, event_time, payload)
-            })
-            .collect::<Vec<_>>();
+            .map(decode_entry_row)
+            .collect::<Result<Vec<_>>>()?;
         dedup_raw_entries(&raw, session_id, workspace_id, "event_time").map_err(anyhow::Error::msg)
     }
 
@@ -812,13 +832,8 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
 
         let raw: Vec<(i64, chrono::NaiveDateTime, String)> = rows
             .iter()
-            .map(|r| {
-                let seq: i64 = r.get("seq");
-                let et: chrono::NaiveDateTime = r.get("event_time");
-                let p: String = r.get("payload");
-                (seq, et, p)
-            })
-            .collect();
+            .map(decode_entry_row)
+            .collect::<Result<Vec<_>>>()?;
 
         let fingerprint = workspace_id_fingerprint(&self.workspace_id);
         let located = dedup_raw_located(&raw, &self.session_id, &self.workspace_id, "event_time")
@@ -873,13 +888,28 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
     /// receipt's signed hash (identical duplicates fold), and reject
     /// divergent rows / no match. Re-checks the entry hash, extracts the
     /// field, and rejects total-size drift.
+    ///
+    /// Bound-session read: the ref must name THIS session.
+    /// [`Self::read_field_as`] is the same read for a row the caller has
+    /// already authorized (a fork source's row, read through this open
+    /// connection).
     pub async fn read_field(&self, verified: &VerifiedRef) -> Result<Vec<u8>> {
+        self.read_field_as(&self.session_id, verified).await
+    }
+
+    /// [`Self::read_field`] for a row owned by `session_id` — the ref's own
+    /// session, which the caller has already authorized. The query runs on the
+    /// client that is ALREADY CONNECTED; everything else is unchanged.
+    ///
+    /// A receipt's pinned `event_time` µs is decoded FALLIBLY: an out-of-range
+    /// value is an `integrity` error the caller sees, never a panic.
+    pub async fn read_field_as(&self, session_id: &str, verified: &VerifiedRef) -> Result<Vec<u8>> {
         let location = &verified.location;
         validate_location_for_store(
             location,
             "greptime",
             &self.workspace_id,
-            &self.session_id,
+            session_id,
             &self.backend_fp,
         )
         .map_err(anyhow::Error::msg)?;
@@ -890,17 +920,13 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             )
             .into());
         };
+        let pinned_time = pinned_event_time(event_time_us)?;
         let rows = self
             .client
             .query(
                 "SELECT payload FROM session_entries \
                  WHERE workspace_id = $1 AND session_id = $2 AND seq = $3 AND event_time = $4",
-                &[
-                    &self.workspace_id,
-                    &self.session_id,
-                    &seq,
-                    &us_to_datetime(event_time_us),
-                ],
+                &[&self.workspace_id, &session_id, &seq, &pinned_time],
             )
             .await
             .context("cannot read pinned entry")?;
@@ -1017,13 +1043,8 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             .context("cannot load head segment")?;
         let raw: Vec<(i64, chrono::NaiveDateTime, String)> = rows
             .iter()
-            .map(|r| {
-                let seq: i64 = r.get("seq");
-                let et: chrono::NaiveDateTime = r.get("event_time");
-                let p: String = r.get("payload");
-                (seq, et, p)
-            })
-            .collect();
+            .map(decode_entry_row)
+            .collect::<Result<Vec<_>>>()?;
 
         dedup_raw_entries(&raw, &self.session_id, &self.workspace_id, "event_time")
             .map_err(anyhow::Error::msg)
@@ -1175,13 +1196,8 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
                         .context("cannot load middle segment")?
                 };
                 rows.iter()
-                    .map(|r| {
-                        let seq: i64 = r.get("seq");
-                        let et: chrono::NaiveDateTime = r.get("event_time");
-                        let p: String = r.get("payload");
-                        (seq, et, p)
-                    })
-                    .collect()
+                    .map(decode_entry_row)
+                    .collect::<Result<Vec<_>>>()?
             }
             // Oldest segment: [0, before). Nothing older follows.
             None => {
@@ -1213,13 +1229,8 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
                         .context("cannot load oldest segment")?
                 };
                 rows.iter()
-                    .map(|r| {
-                        let seq: i64 = r.get("seq");
-                        let et: chrono::NaiveDateTime = r.get("event_time");
-                        let p: String = r.get("payload");
-                        (seq, et, p)
-                    })
-                    .collect()
+                    .map(decode_entry_row)
+                    .collect::<Result<Vec<_>>>()?
             }
         };
 
@@ -1306,12 +1317,11 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
                 )
                 .await
                 .context("cannot load oldest entries")?;
-            raw.extend(rows.iter().map(|r| {
-                let seq: i64 = r.get("seq");
-                let et: chrono::NaiveDateTime = r.get("event_time");
-                let payload: String = r.get("payload");
-                (seq, et, payload)
-            }));
+            raw.extend(
+                rows.iter()
+                    .map(decode_entry_row)
+                    .collect::<Result<Vec<_>>>()?,
+            );
         }
         // 3. Shared winner fold: max event_time per seq wins, divergent ties
         //    fail closed.
@@ -1393,13 +1403,8 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             .context("cannot load oldest segment")?;
         let raw: Vec<(i64, chrono::NaiveDateTime, String)> = rows
             .iter()
-            .map(|r| {
-                let seq: i64 = r.get("seq");
-                let et: chrono::NaiveDateTime = r.get("event_time");
-                let p: String = r.get("payload");
-                (seq, et, p)
-            })
-            .collect();
+            .map(decode_entry_row)
+            .collect::<Result<Vec<_>>>()?;
 
         let entries = dedup_raw_entries(&raw, &self.session_id, &self.workspace_id, "event_time")
             .map_err(anyhow::Error::msg)?
@@ -1453,13 +1458,8 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
                     .await
                     .context("cannot load middle segment")?;
                 rows.iter()
-                    .map(|r| {
-                        let seq: i64 = r.get("seq");
-                        let et: chrono::NaiveDateTime = r.get("event_time");
-                        let p: String = r.get("payload");
-                        (seq, et, p)
-                    })
-                    .collect()
+                    .map(decode_entry_row)
+                    .collect::<Result<Vec<_>>>()?
             }
             // Nothing newer: the caller already holds the head segment.
             None => Vec::new(),
@@ -1829,6 +1829,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
                 status,
                 kind,
                 cancellation_source,
+                subagent_session_id,
                 ..
             } = entry
             else {
@@ -1848,6 +1849,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
                 status,
                 kind,
                 cancellation_source,
+                subagent_session_id,
             });
         }
         Ok(out)
@@ -2070,9 +2072,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
         let mut per_seq: std::collections::HashMap<i64, (chrono::NaiveDateTime, Vec<String>)> =
             std::collections::HashMap::with_capacity(rows.len().min(64));
         for row in &rows {
-            let seq: i64 = row.get("seq");
-            let et: chrono::NaiveDateTime = row.get("event_time");
-            let payload: String = row.get("payload");
+            let (seq, et, payload) = decode_entry_row(row)?;
             let entry = per_seq.entry(seq).or_insert((et, Vec::new()));
             match et.cmp(&entry.0) {
                 std::cmp::Ordering::Greater => {
@@ -2132,9 +2132,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
         let mut per_seq: std::collections::HashMap<i64, (chrono::NaiveDateTime, Vec<String>)> =
             std::collections::HashMap::with_capacity(rows.len().min(64));
         for row in &rows {
-            let seq: i64 = row.get("seq");
-            let et: chrono::NaiveDateTime = row.get("event_time");
-            let payload: String = row.get("payload");
+            let (seq, et, payload) = decode_entry_row(row)?;
             let entry = per_seq.entry(seq).or_insert((et, Vec::new()));
             match et.cmp(&entry.0) {
                 std::cmp::Ordering::Greater => {
@@ -2187,7 +2185,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             .client
             .query_opt(
                 "SELECT created_at, last_active_at, model, \"role\", entry_count, \
-                        parent_session_id, parent_task_id, title, pinned, archived, writer \
+                        parent_session_id, parent_task_id, title, pinned, archived, writer, acp_session_id \
                  FROM sessions \
                  WHERE workspace_id = $1 AND session_id = $2 \
                  ORDER BY last_active_at DESC LIMIT 1",
@@ -2207,6 +2205,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             title: row.get("title"),
             pinned: row.get("pinned"),
             archived: row.get("archived"),
+            acp_session_id: row.get("acp_session_id"),
             writer: row.get("writer"),
             label: None, // label lives in running_tasks, resolved at list time
         }))
@@ -2223,8 +2222,9 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             .execute(
                 "INSERT INTO sessions \
                  (workspace_id, session_id, created_at, last_active_at, model, \"role\", \
-                  entry_count, parent_session_id, parent_task_id, title, pinned, archived, writer) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+                  entry_count, parent_session_id, parent_task_id, title, pinned, archived, writer, \
+                  acp_session_id) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
                 &[
                     &self.workspace_id,
                     &meta.session_id,
@@ -2239,6 +2239,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
                     &meta.pinned,
                     &meta.archived,
                     &meta.writer,
+                    &meta.acp_session_id,
                 ],
             )
             .await
@@ -2297,6 +2298,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
                 .or_else(|| existing.parent_session_id.clone()),
             parent_task_id: parent_task_id.or(existing.parent_task_id),
             title: existing.title.clone(),
+            acp_session_id: existing.acp_session_id.clone(),
             pinned: existing.pinned,
             archived: existing.archived,
             writer: None, // stamped by insert_meta with the writing process
@@ -2370,6 +2372,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             parent_session_id: parent_session_id.map(str::to_owned),
             parent_task_id,
             title: title.map(str::to_owned), // a fresh session may be named at creation (subagent label)
+            acp_session_id: None,            // no ACP conversation until `acp_prompt` runs
             pinned: None,                    // a fresh session is unpinned until the user pins it
             archived: None, // a fresh session is unarchived until the user archives it
             writer: None,   // stamped by insert_meta with the writing process
@@ -2428,6 +2431,41 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             return Ok(());
         };
         meta.title = title.map(str::to_owned);
+        meta.last_active_at = us_to_datetime(next_event_time_us());
+        self.insert_meta(&mut meta).await?;
+        if session_id == self.session_id {
+            *self.cached_meta.lock().unwrap() = Some(meta);
+        }
+        Ok(())
+    }
+
+    /// The ACP session id this session last used, or `None` when it never
+    /// ran `acp_prompt` (also `None` for a session with no metadata row).
+    pub async fn acp_session_id(&self, session_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .load_meta_row(session_id)
+            .await?
+            .and_then(|meta| meta.acp_session_id))
+    }
+
+    /// Record (or clear) the ACP session id: appends one full snapshot row
+    /// with the new value and a fresh `last_active_at`, exactly like
+    /// [`Self::set_title`]. Never self-creates (R3): a session with no
+    /// metadata row is a no-op `Ok`.
+    pub async fn set_acp_session_id(
+        &self,
+        session_id: &str,
+        acp_session_id: Option<&str>,
+    ) -> Result<()> {
+        let meta = if session_id == self.session_id {
+            self.effective_meta().await?
+        } else {
+            self.load_meta_row(session_id).await?
+        };
+        let Some(mut meta) = meta else {
+            return Ok(());
+        };
+        meta.acp_session_id = acp_session_id.map(str::to_owned);
         meta.last_active_at = us_to_datetime(next_event_time_us());
         self.insert_meta(&mut meta).await?;
         if session_id == self.session_id {
@@ -2636,6 +2674,9 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
                 title: row.get("title"),
                 pinned: row.get("pinned"),
                 archived: row.get("archived"),
+                // The list projection aggregates a fixed column set and does
+                // not carry the ACP session id.
+                acp_session_id: None,
                 writer: row.get("writer"),
                 label: None, // label lives in running_tasks, resolved at list time
             })
@@ -2661,7 +2702,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             .client
             .query(
                 "SELECT created_at, last_active_at, model, \"role\", entry_count, \
-                        parent_session_id, parent_task_id, title, pinned, archived, writer \
+                        parent_session_id, parent_task_id, title, pinned, archived, writer, acp_session_id \
                  FROM sessions \
                  WHERE workspace_id = $1 AND session_id = $2 \
                  ORDER BY last_active_at ASC",
@@ -2683,6 +2724,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
                 title: row.get("title"),
                 pinned: row.get("pinned"),
                 archived: row.get("archived"),
+                acp_session_id: row.get("acp_session_id"),
                 writer: row.get("writer"),
                 label: None, // label lives in running_tasks, resolved at list time
             })
@@ -2755,11 +2797,12 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
                 entry_count: row.get("entry_count"),
                 parent_session_id: None,
                 parent_task_id: None,
-                title: None,    // pre-table sessions have no user-assigned name
-                pinned: None,   // pre-table sessions are unpinned
-                archived: None, // pre-table sessions are unarchived
-                writer: None,   // stamped by insert_meta with the writing process
-                label: None,    // label lives in running_tasks, resolved at list time
+                title: None,          // pre-table sessions have no user-assigned name
+                pinned: None,         // pre-table sessions are unpinned
+                archived: None,       // pre-table sessions are unarchived
+                acp_session_id: None, // pre-table sessions have no ACP conversation
+                writer: None,         // stamped by insert_meta with the writing process
+                label: None,          // label lives in running_tasks, resolved at list time
             })
             .await?;
         }
@@ -3025,6 +3068,77 @@ fn history_payload_matches(payload: &str, needle: &str) -> bool {
         .is_some_and(|text| text.contains(needle))
 }
 
+/// One `event_time` cell of a GreptimeDB `session_entries` row, decoded WITHOUT
+/// panicking: `Row::get` panics on a NULL column and on a column of another
+/// type, so one malformed row would take the whole process down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TimestampCell {
+    /// A usable timestamp.
+    Value(chrono::NaiveDateTime),
+    /// SQL NULL: the row carries no timestamp.
+    Missing,
+    /// The column exists but is not a timestamp (e.g. a numeric or text
+    /// column), so it cannot be pinned into a receipt.
+    NotTimestamp,
+}
+
+/// Decode one timestamp column through `try_get`, the non-panicking row
+/// accessor.
+fn timestamp_cell(row: &tokio_postgres::Row, column: &str) -> TimestampCell {
+    match row.try_get::<_, Option<chrono::NaiveDateTime>>(column) {
+        Ok(Some(value)) => TimestampCell::Value(value),
+        Ok(None) => TimestampCell::Missing,
+        Err(_) => TimestampCell::NotTimestamp,
+    }
+}
+
+/// The `event_time` a loadable session row must carry. A receipt pins
+/// `(seq, event_time)`, so a row without a usable timestamp has no physical
+/// identity: the documented outcome is an ERROR the caller sees, never a panic.
+fn row_event_time(seq: i64, cell: TimestampCell) -> Result<chrono::NaiveDateTime> {
+    match cell {
+        TimestampCell::Value(event_time) => Ok(event_time),
+        TimestampCell::Missing => Err(anyhow::anyhow!(
+            "session entry (seq {seq}) has no event_time; a row without a timestamp \
+             cannot be pinned to a receipt"
+        )),
+        TimestampCell::NotTimestamp => Err(anyhow::anyhow!(
+            "session entry (seq {seq}) has a non-timestamp event_time; a row without a \
+             timestamp cannot be pinned to a receipt"
+        )),
+    }
+}
+
+/// Decode one `session_entries` row as `(seq, event_time, payload)` without
+/// panicking on any of its columns.
+fn decode_entry_row(row: &tokio_postgres::Row) -> Result<(i64, chrono::NaiveDateTime, String)> {
+    let seq: i64 = row
+        .try_get("seq")
+        .context("session entry row has no usable seq")?;
+    let event_time = row_event_time(seq, timestamp_cell(row, "event_time"))?;
+    let payload: String = row
+        .try_get("payload")
+        .context("session entry row has no usable payload")?;
+    Ok((seq, event_time, payload))
+}
+
+/// The `event_time` a receipt pins, decoded FALLIBLY: the µs value comes from
+/// the ref itself (outside this process), so an out-of-range value is an
+/// `integrity` error the caller sees — never the panic `us_to_datetime` raises.
+fn pinned_event_time(
+    event_time_us: i64,
+) -> std::result::Result<chrono::NaiveDateTime, ReceiptError> {
+    checked_us_to_datetime(event_time_us).ok_or_else(|| {
+        ReceiptError::new(
+            ReceiptErrorKind::Integrity,
+            format!(
+                "receipt event_time {event_time_us} µs is out of range; \
+                 the pinned row cannot be located"
+            ),
+        )
+    })
+}
+
 /// Decode one selected physical row; the error text is the read path's
 /// unchanged failure surface.
 fn decode_history_row(row: &tokio_postgres::Row) -> Result<HistoryEntry> {
@@ -3151,6 +3265,55 @@ mod tests {
         assert!(source.contains("pub async fn load_older_located"));
     }
 
+    /// A row whose `event_time` cell is MISSING (SQL NULL) or NOT A TIMESTAMP
+    /// must not take the process down: `Row::get` panics on both, so the cell is
+    /// decoded through `try_get` and the documented outcome is the load's error.
+    /// (A `tokio_postgres::Row` cannot be built without a server; the decoded
+    /// cell is what a malformed row yields.)
+    #[test]
+    fn malformed_event_time_is_an_error_not_a_panic() {
+        for (cell, reason) in [
+            (TimestampCell::Missing, "has no event_time"),
+            (
+                TimestampCell::NotTimestamp,
+                "has a non-timestamp event_time",
+            ),
+        ] {
+            let error = row_event_time(7, cell).expect_err("a row without a timestamp fails");
+            let message = error.to_string();
+            assert!(message.contains("seq 7"), "{message}");
+            assert!(message.contains(reason), "{message}");
+            assert!(
+                message.contains("cannot be pinned to a receipt"),
+                "{message}"
+            );
+        }
+        let stamp = us_to_datetime(1_000_001);
+        assert_eq!(
+            row_event_time(7, TimestampCell::Value(stamp)).unwrap(),
+            stamp,
+            "a well-formed cell still loads"
+        );
+    }
+
+    /// A receipt's pinned `event_time` µs comes from the ref, not from this
+    /// process: an out-of-range value is an `integrity` error, never the panic
+    /// `us_to_datetime` raises.
+    #[test]
+    fn out_of_range_receipt_event_time_is_refused_not_panicked() {
+        for bad in [i64::MAX, i64::MIN] {
+            let error = pinned_event_time(bad).expect_err("out-of-range µs is refused");
+            assert_eq!(error.kind, ReceiptErrorKind::Integrity, "{bad}");
+            assert!(
+                error.detail.contains("out of range") && error.detail.contains(&bad.to_string()),
+                "{}",
+                error.detail
+            );
+        }
+        assert_eq!(pinned_event_time(0).unwrap(), us_to_datetime(0));
+        assert_eq!(pinned_event_time(-1).unwrap(), us_to_datetime(-1));
+    }
+
     #[test]
     fn cursor_advancement_is_monotonic_under_concurrency() {
         use std::sync::Arc;
@@ -3232,6 +3395,8 @@ mod tests {
                 content: "exit code: 0\nstdout:\nok\n".into(),
                 is_error: false,
                 synthetic: false,
+                started_task_id: None,
+                subagent_session_id: None,
                 images: vec![],
             }
             .into(),
@@ -3241,6 +3406,8 @@ mod tests {
                 content: "command not found".into(),
                 is_error: true,
                 synthetic: false,
+                started_task_id: None,
+                subagent_session_id: None,
                 images: vec![],
             }
             .into(),
@@ -3274,6 +3441,7 @@ mod tests {
                 status: None,
                 kind: None,
                 cancellation_source: None,
+                subagent_session_id: None,
             },
             // Entry with a label to verify serde roundtrip with label.
             SessionEntry::BackgroundCompletion {
@@ -3287,6 +3455,7 @@ mod tests {
                 status: None,
                 kind: None,
                 cancellation_source: None,
+                subagent_session_id: None,
             },
             Message::User {
                 content: "你好世界👋\n多行".into(),
@@ -3344,6 +3513,7 @@ mod tests {
                 status: None,
                 kind: None,
                 cancellation_source: None,
+                subagent_session_id: None,
             },
             SessionEntry::BackgroundCompletion {
                 id: 2,
@@ -3356,6 +3526,7 @@ mod tests {
                 status: Some("failed".into()),
                 kind: Some("bash".into()),
                 cancellation_source: None,
+                subagent_session_id: None,
             },
         ];
         session.append(&entries).await.unwrap();
@@ -3400,6 +3571,7 @@ mod tests {
             status: Some("completed".into()),
             kind: Some("bash".into()),
             cancellation_source: None,
+            subagent_session_id: None,
         })
         .unwrap();
         let retried = serde_json::to_string(&SessionEntry::BackgroundCompletion {
@@ -3413,6 +3585,7 @@ mod tests {
             status: Some("failed".into()),
             kind: Some("bash".into()),
             cancellation_source: None,
+            subagent_session_id: None,
         })
         .unwrap();
         let second = serde_json::to_string(&SessionEntry::BackgroundCompletion {
@@ -3426,6 +3599,7 @@ mod tests {
             status: Some("completed".into()),
             kind: Some("bash".into()),
             cancellation_source: None,
+            subagent_session_id: None,
         })
         .unwrap();
         let _ = &first;
@@ -4092,6 +4266,120 @@ mod tests {
         assert_eq!(loaded_a.len(), 1);
     }
 
+    /// Cross-owner (owner-bearing) refs through the GREPTIME binding: an
+    /// inherited prefix names its parent, and `read_output` opens the PARENT's
+    /// store — the SQL backends bind the session id at connect time, so a
+    /// bound-session read could never serve a cross-owner ref. Requires a live
+    /// DB (`GREPTIME_PG`).
+    #[tokio::test]
+    async fn owner_bearing_ref_reads_the_parent_row_through_the_greptime_binding() {
+        use crate::config::SessionBackend;
+        use crate::output_receipt::{FieldId, issue_owner};
+        use crate::session_store::{LocatedKey, SessionStore};
+
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let root = Path::new("/tmp/e-agent-test");
+        let backend = SessionBackend::Greptime { conn: conn.clone() };
+        let parent = format!("test-gt-owner-parent-{}", crate::session::new_id());
+        let parent_store = SessionStore::connect(&backend, root, &parent)
+            .await
+            .unwrap();
+        let rows = vec![
+            SessionEntry::Message {
+                message: Message::User {
+                    content: "gt parent q".into(),
+                    images: vec![],
+                },
+            },
+            SessionEntry::Message {
+                message: Message::Tool {
+                    call_id: "gt-call".into(),
+                    name: "bash".into(),
+                    content: "PARENT-GT-ROW".into(),
+                    is_error: false,
+                    synthetic: false,
+                    started_task_id: None,
+                    subagent_session_id: None,
+                    images: vec![],
+                },
+            },
+        ];
+        let parent_locations = parent_store
+            .append_located(root, &parent, &rows)
+            .await
+            .unwrap();
+        let cut = parent_locations.last().unwrap().clone();
+        let LocatedKey::Greptime { seq, event_time_us } = cut.key else {
+            panic!("the greptime binding pins a greptime key");
+        };
+
+        let child = format!("test-gt-owner-child-{}", crate::session::new_id());
+        let child_store = SessionStore::connect(&backend, root, &child).await.unwrap();
+        child_store
+            .append(
+                root,
+                &child,
+                &[
+                    SessionEntry::ForkedFrom {
+                        source: parent.clone(),
+                        at: None,
+                        event_time: Some(event_time_us),
+                        seq: Some(seq),
+                    },
+                    SessionEntry::Message {
+                        message: Message::User {
+                            content: "gt child q".into(),
+                            images: vec![],
+                        },
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let loaded = child_store
+            .load_fork_head_located(root, &child)
+            .await
+            .unwrap();
+        assert_eq!(loaded.inherited, 2);
+        for (index, expected) in parent_locations.iter().enumerate() {
+            assert_eq!(
+                loaded.locations[index].as_ref(),
+                Some(expected),
+                "inherited greptime row {index} carries the parent's identity"
+            );
+        }
+
+        let reference = issue_owner(&cut, FieldId::ToolContent, "PARENT-GT-ROW".len());
+        let page = crate::tools::output::execute(&child_store, root, &child, &reference, 0, 1024)
+            .await
+            .expect("the child resolves the parent's greptime row");
+        let page: serde_json::Value = serde_json::from_str(&page).unwrap();
+        assert_eq!(page["text"], "PARENT-GT-ROW");
+        assert_eq!(page["total_bytes"], "PARENT-GT-ROW".len());
+
+        // A third session is not this child's fork source: refused.
+        let other = format!("test-gt-owner-other-{}", crate::session::new_id());
+        let other_store = SessionStore::connect(&backend, root, &other).await.unwrap();
+        let other_locations = other_store
+            .append_located(root, &other, &rows)
+            .await
+            .unwrap();
+        let foreign = issue_owner(
+            &other_locations[1],
+            FieldId::ToolContent,
+            "PARENT-GT-ROW".len(),
+        );
+        let error = crate::tools::output::execute(&child_store, root, &child, &foreign, 0, 1024)
+            .await
+            .unwrap_err();
+        assert_eq!(error, "read_output error: ref not found");
+    }
+
     /// Exact-version semantics through the Greptime backend (requires a live
     /// DB, `GREPTIME_PG`): `append_located` pins (seq, event_time, payload
     /// hash); a same-seq later version (a newer event_time row appended
@@ -4686,6 +4974,8 @@ mod tests {
                 images: vec![],
                 is_error: false,
                 synthetic: false,
+                started_task_id: None,
+                subagent_session_id: None,
             },
         })
         .unwrap();
@@ -5094,6 +5384,8 @@ mod tests {
                     content: format!("{marker} {name_marker} {escaped_needle} {verbatim_needle}"),
                     is_error: false,
                     synthetic: false,
+                    started_task_id: None,
+                    subagent_session_id: None,
                     images: vec![],
                 },
             },
@@ -5130,6 +5422,7 @@ mod tests {
                 status: None,
                 kind: None,
                 cancellation_source: None,
+                subagent_session_id: None,
             },
             SessionEntry::Message {
                 message: Message::User {
@@ -6372,6 +6665,7 @@ mod tests {
             title: Some("a title".into()),
             pinned: Some(true),
             archived: Some(true),
+            acp_session_id: None,
             writer: None,
             label: None,
         };
@@ -6428,6 +6722,7 @@ mod tests {
             title: None,
             pinned: None,
             archived: None,
+            acp_session_id: None,
             writer: None,
             label: None,
         };

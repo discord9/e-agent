@@ -546,6 +546,136 @@ provider = "deepseek"
     unsafe { std::env::remove_var("E_AGENT_TEST_WEB_SEARCH_KEY") };
 }
 
+/// The `[web_search] fetch_provider` field: `local` by default, `deepseek`
+/// by explicit opt-in, nothing else.
+#[test]
+fn web_fetch_provider_defaults_to_local_and_validates() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("key"), "key").unwrap();
+    let config_for = |section: &str| {
+        let path = write_config(
+            temp.path(),
+            &format!(
+                r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://x"
+api_key_file = "key"
+[models."kimi/k3"]
+model = "k3"
+{section}"#
+            ),
+        );
+        Config::from_path(&path).unwrap()
+    };
+
+    // Absent `[web_search]`: no fetch backend to report.
+    assert_eq!(config_for("").web_fetch_provider().unwrap(), None);
+
+    // Absent, blank and explicit `local` all mean this process.
+    for field in [
+        "",
+        "fetch_provider = \"\"\n",
+        "fetch_provider = \"local\"\n",
+    ] {
+        let config = config_for(&format!(
+            "[web_search]\nprovider = \"searxng\"\nbase_url = \"http://127.0.0.1:8088\"\n{field}"
+        ));
+        assert_eq!(
+            config.web_fetch_provider().unwrap(),
+            Some(WebFetchProvider::Local),
+            "{field}"
+        );
+    }
+
+    let config = config_for(
+        "[web_search]\nprovider = \"deepseek\"\napi_key_file = \"key\"\nfetch_provider = \"deepseek\"\n",
+    );
+    assert_eq!(
+        config.web_fetch_provider().unwrap(),
+        Some(WebFetchProvider::Deepseek)
+    );
+
+    // Unknown values are a config error, reported by both resolvers.
+    let config = config_for("[web_search]\nfetch_provider = \"remote\"\n");
+    for error in [
+        config.web_fetch_provider().unwrap_err().to_string(),
+        config.web_search_provider().unwrap_err().to_string(),
+    ] {
+        assert!(error.contains("`fetch_provider` `remote`"), "{error}");
+        assert!(error.contains("expected `local` or `deepseek`"), "{error}");
+    }
+}
+
+/// A SearXNG search may carry the credential a DeepSeek fetch needs, and
+/// nothing else may.
+#[test]
+fn searxng_allows_a_key_only_for_a_deepseek_fetch() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("ds-key"), "  deepseek-secret\n").unwrap();
+    let config_for = |field: &str| {
+        let path = write_config(
+            temp.path(),
+            &format!(
+                r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://x"
+api_key_file = "ds-key"
+[models."kimi/k3"]
+model = "k3"
+[web_search]
+provider = "searxng"
+base_url = "http://127.0.0.1:8088"
+{field}"#
+            ),
+        );
+        Config::from_path(&path).unwrap()
+    };
+
+    // Allowed with `fetch_provider = "deepseek"`: search to SearXNG, fetch
+    // key resolved for DeepSeek.
+    let config = config_for("fetch_provider = \"deepseek\"\napi_key_file = \"ds-key\"\n");
+    assert_eq!(
+        config.web_search_provider().unwrap(),
+        Some(WebSearchProvider::Searxng {
+            base_url: "http://127.0.0.1:8088".into()
+        })
+    );
+    assert_eq!(
+        config.web_fetch_provider().unwrap(),
+        Some(WebFetchProvider::Deepseek)
+    );
+    assert_eq!(
+        config.web_search_key().unwrap(),
+        Some("deepseek-secret".into())
+    );
+
+    // Still forbidden without it, for both key fields.
+    for field in [
+        "api_key_file = \"ds-key\"\n",
+        "api_key_env = \"E_AGENT_TEST_FETCH_KEY\"\n",
+        "fetch_provider = \"local\"\napi_key_file = \"ds-key\"\n",
+    ] {
+        let config = config_for(field);
+        let error = config.web_search_provider().unwrap_err().to_string();
+        assert!(error.contains("must not set"), "{field}: {error}");
+        // The key resolver runs the same validation, so it rejects it too.
+        assert!(config.web_search_key().is_err(), "{field}");
+    }
+
+    // With no key field a SearXNG search needs no credential at all.
+    assert_eq!(config_for("").web_search_key().unwrap(), None);
+
+    // A DeepSeek fetch without any credential is a config error, not a
+    // silently local fetch.
+    let error = config_for("fetch_provider = \"deepseek\"\n")
+        .web_search_key()
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("exactly one"), "{error}");
+}
+
 #[test]
 fn resolves_role_routing_and_falls_back_when_unrouted() {
     let temp = tempfile::tempdir().unwrap();
@@ -2022,6 +2152,23 @@ timeout_secs = 120
     let config = Config::from_path(&path).unwrap();
     let t = resolve_bash_timeout(Some(&config), temp.path()).unwrap();
     assert_eq!(t, Some(Duration::from_secs(120)));
+}
+#[test]
+fn images_max_inline_parses_and_defaults_to_six() {
+    let absent: Config = toml::from_str("default = \"kimi/k3\"\n").unwrap();
+    assert_eq!(
+        absent.images_max_inline(),
+        crate::images::DEFAULT_MAX_INLINE
+    );
+    let six: Config = toml::from_str("[images]\nmax_inline = 6\n").unwrap();
+    assert_eq!(six.images_max_inline(), 6);
+    // `0` is meaningful ("never offload"), not "unset".
+    let zero: Config = toml::from_str("[images]\nmax_inline = 0\n").unwrap();
+    assert_eq!(zero.images_max_inline(), 0);
+    let empty: Config = toml::from_str("[images]\n").unwrap();
+    assert_eq!(empty.images_max_inline(), crate::images::DEFAULT_MAX_INLINE);
+    // A typo in the section is a config error, not a silent default.
+    assert!(toml::from_str::<Config>("[images]\nmax_inlin = 3\n").is_err());
 }
 #[test]
 fn code_mode_enabled_parses_and_defaults_to_false() {
@@ -3584,4 +3731,98 @@ writable_paths = ["./p"]
         .0,
         "unknown"
     );
+}
+
+#[test]
+fn parses_acp_section_with_defaults_and_overrides() {
+    // Absent section: no `acp_prompt` tool at all (opt-in).
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("key"), "key").unwrap();
+    let base = r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://test.test/v1"
+api_key_file = "key"
+[models."kimi/k3"]
+model = "k3"
+"#;
+    let path = write_config(temp.path(), base);
+    let config = Config::from_path(&path).unwrap();
+    assert_eq!(config.acp(), None);
+
+    // An empty `[acp]` table is the opt-in with every default.
+    let path = write_config(temp.path(), &format!("{base}[acp]\n"));
+    let config = Config::from_path(&path).unwrap();
+    assert_eq!(
+        config.acp(),
+        Some(AcpConfig {
+            binary: DEFAULT_ACP_BINARY.to_owned(),
+            args: DEFAULT_ACP_ARGS
+                .iter()
+                .map(|arg| (*arg).to_owned())
+                .collect(),
+            model: None,
+            allow_kinds: DEFAULT_ACP_ALLOW_KINDS
+                .iter()
+                .map(|kind| (*kind).to_owned())
+                .collect(),
+            danger: false,
+        })
+    );
+
+    // Explicit values win; a blank model means "leave the agent's model",
+    // and kinds are normalized because they are matched verbatim.
+    let path = write_config(
+        temp.path(),
+        &format!(
+            "{base}[acp]\nbinary = \"/opt/other-acp\"\nargs = [\"serve\"]\nmodel = \"  \"\nallow_kinds = [\"Read\", \" \"]\ndanger = true\n"
+        ),
+    );
+    let config = Config::from_path(&path).unwrap();
+    assert_eq!(
+        config.acp(),
+        Some(AcpConfig {
+            binary: "/opt/other-acp".into(),
+            args: vec!["serve".into()],
+            model: None,
+            allow_kinds: vec!["read".into()],
+            danger: true,
+        })
+    );
+
+    // `allow_kinds = []` is an explicit "deny every kind".
+    let path = write_config(temp.path(), &format!("{base}[acp]\nallow_kinds = []\n"));
+    let config = Config::from_path(&path).unwrap();
+    assert_eq!(config.acp().unwrap().allow_kinds, Vec::<String>::new());
+
+    // A misspelled key is refused instead of silently ignored.
+    let path = write_config(temp.path(), &format!("{base}[acp]\ndangerous = true\n"));
+    assert!(Config::from_path(&path).is_err());
+}
+
+#[test]
+fn a_project_acp_section_is_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("key"), "key").unwrap();
+    let path = write_config(
+        temp.path(),
+        r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://test.test/v1"
+api_key_file = "key"
+[models."kimi/k3"]
+model = "k3"
+"#,
+    );
+    let config = Config::from_path(&path).unwrap();
+    // `[acp]` names a program to spawn, so a project layer may not carry it.
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(project.join(".e-agent")).unwrap();
+    std::fs::write(
+        project.join(".e-agent/config.toml"),
+        "[acp]\nbinary = \"/bin/false\"\n",
+    )
+    .unwrap();
+    assert!(config.merged_with_project(&project).is_err());
 }

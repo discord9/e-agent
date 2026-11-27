@@ -23,8 +23,9 @@ pub struct Config {
     /// exists; new roles are added where they are spawned.
     #[serde(default)]
     roles: HashMap<String, String>,
-    /// Optional `[web_search]` backend for the `web_search` tool: Exa
-    /// credentials (default) or a SearXNG base URL.
+    /// Optional `[web_search]` section: the `web_search` backend (Exa
+    /// credentials, a SearXNG base URL or DeepSeek) plus the independent
+    /// `web_fetch` backend (`fetch_provider`, local by default).
     #[serde(default)]
     web_search: Option<WebSearch>,
     /// Optional `[sandbox]` policy shared by bash mounts and file tools.
@@ -36,9 +37,17 @@ pub struct Config {
     /// Optional `[background]` policy (background-task timeout).
     #[serde(default)]
     background: Option<BackgroundConfig>,
+    /// Optional `[images]` policy (outgoing image token budget / inline cap).
+    #[serde(default)]
+    images: Option<ImagesConfig>,
     /// Optional `[bash]` policy (foreground bash timeout).
     #[serde(default)]
     bash: Option<BashConfig>,
+    /// Optional `[acp]` section: the external ACP (Agent Client Protocol)
+    /// stdio agent behind the main session's `acp_prompt` tool. Absent = no
+    /// tool (opt-in, like a `[web_search]` without a usable credential).
+    #[serde(default)]
+    acp: Option<Acp>,
     #[serde(default)]
     code_mode: Option<CodeModeConfig>,
     /// Optional `[tui]` submit/newline key mapping. A project-level
@@ -119,6 +128,20 @@ pub struct BashConfig {
 
 /// Default foreground bash residence threshold: 30 seconds.
 pub const DEFAULT_BASH_TIMEOUT_SECS: u64 = 30;
+
+/// Outgoing image budget, from `[images]`. Global-only: a project-level
+/// `[images]` section parses but is never merged (see `ProjectConfig`),
+/// because the image store is per user, not per workspace.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImagesConfig {
+    /// Distinct images kept inline per request; the oldest by first
+    /// appearance are replaced by a text placeholder naming their stored
+    /// hash. `0` never offloads (every image is sent). Absent defaults to
+    /// [`crate::images::DEFAULT_MAX_INLINE`].
+    #[serde(default)]
+    pub max_inline: Option<usize>,
+}
 
 /// User-level `[code_mode]` enabling the experimental `run_rust` tool.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
@@ -315,13 +338,68 @@ fn default_true() -> bool {
     true
 }
 
+/// Default `[acp] binary`: the ACP-capable agent CLI.
+pub const DEFAULT_ACP_BINARY: &str = "agy";
+
+/// Default `[acp] args`: speak ACP over stdio.
+pub const DEFAULT_ACP_ARGS: [&str; 2] = ["acp", "--stdio"];
+
+/// Default `[acp] allow_kinds`: the read-only tool kinds the reviewer may do
+/// freely. Everything else (edit / delete / move / execute / unknown) is
+/// denied by default: an oracle that silently edits the workspace is not an
+/// oracle.
+pub const DEFAULT_ACP_ALLOW_KINDS: [&str; 4] = ["read", "search", "fetch", "think"];
+
+/// The `[acp]` config section: ONE external ACP stdio agent the main session
+/// may prompt through the `acp_prompt` tool. Global-only, matching
+/// `[web_search]` / `[session]`: a project `[acp]` is a parse error, because
+/// the section names a program to spawn and `<workspace>/.e-agent/config.toml`
+/// is untrusted input.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Acp {
+    /// Program to spawn; [`DEFAULT_ACP_BINARY`] when absent.
+    binary: Option<PathBuf>,
+    /// Program arguments; [`DEFAULT_ACP_ARGS`] when absent. An explicit
+    /// empty list means "no arguments".
+    args: Option<Vec<String>>,
+    /// Model id applied with `session/set_model` after `session/new`;
+    /// absent = leave the agent's own model choice alone.
+    model: Option<String>,
+    /// Tool kinds answered "allow once" on a `session/request_permission`
+    /// request; [`DEFAULT_ACP_ALLOW_KINDS`] when absent. An explicit empty
+    /// list denies everything.
+    allow_kinds: Option<Vec<String>>,
+    /// Answer EVERY permission request "allow once", whatever its tool kind.
+    /// The only effect of this flag.
+    #[serde(default)]
+    danger: bool,
+}
+
+/// Resolved `[acp]` settings handed to the `acp_prompt` tool.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcpConfig {
+    pub binary: String,
+    pub args: Vec<String>,
+    pub model: Option<String>,
+    pub allow_kinds: Vec<String>,
+    pub danger: bool,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct WebSearch {
     /// Backend: `"exa"` (default when absent), `"searxng"` or `"deepseek"`.
     provider: Option<String>,
+    /// `web_fetch` backend, independent of `provider`: `"local"` (default
+    /// when absent; this process fetches the page) or `"deepseek"` (the
+    /// remote `tools/fetch`, which needs the credential below).
+    fetch_provider: Option<String>,
     /// SearXNG only: the base URL, e.g. `http://127.0.0.1:8088`.
     /// Rejected for `provider = "deepseek"`, whose endpoints are fixed.
     base_url: Option<String>,
+    /// The credential for Exa/DeepSeek search, and for a DeepSeek fetch. With
+    /// `provider = "searxng"` it is allowed only when
+    /// `fetch_provider = "deepseek"`, where it belongs to the fetch.
     api_key_file: Option<PathBuf>,
     api_key_env: Option<String>,
 }
@@ -333,9 +411,21 @@ pub enum WebSearchProvider {
     Exa,
     /// SearXNG: searches go to `{base_url}/search` with no credential.
     Searxng { base_url: String },
-    /// DeepSeek: `tools/search` plus `tools/fetch` at the fixed
-    /// `https://api.deepseek.com` endpoints; the credential comes from
-    /// `web_search_key`.
+    /// DeepSeek: `tools/search` at the fixed `https://api.deepseek.com`
+    /// endpoint; the credential comes from `web_search_key`.
+    Deepseek,
+}
+
+/// The `web_fetch` backend selected by `[web_search] fetch_provider`, which
+/// is independent of [`WebSearchProvider`]: a SearXNG search may pair with a
+/// DeepSeek fetch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WebFetchProvider {
+    /// The default: this process GETs the URL, so it reaches whatever the
+    /// process reaches (the same network as `bash`).
+    Local,
+    /// DeepSeek `tools/fetch` at the fixed endpoint; a credential is
+    /// required, from the same `api_key_file` / `api_key_env` fields.
     Deepseek,
 }
 
@@ -557,7 +647,10 @@ impl Config {
     /// the project file themselves and apply per-key overrides. The
     /// remaining sections (`providers`, `web_search`, `session`) stay
     /// global-only — a project file that carries them is accepted for
-    /// compatibility but the sections are ignored.
+    /// compatibility but the sections are ignored. `[acp]` is global-only
+    /// too, but is NOT white-listed: it names a program to spawn, so a
+    /// project `[acp]` fails `deny_unknown_fields` instead of being
+    /// silently dropped.
     ///
     /// The project file is parsed with `deny_unknown_fields` (see
     /// [`ProjectConfig`]): an unknown section is a parse error, refusing
@@ -708,18 +801,26 @@ impl Config {
     /// The provider selected by `[web_search]`, or None when the section is
     /// absent; `exa` is the default when `provider` is unset. Validated
     /// without resolving credentials: `provider = "searxng"` requires
-    /// `base_url` and forbids `api_key_file` / `api_key_env`,
-    /// `provider = "deepseek"` forbids `base_url` (its endpoints are fixed),
-    /// and any other provider value is a config error. Credentials come from
-    /// [`Self::web_search_key`] for both `exa` and `deepseek`.
+    /// `base_url` and forbids `api_key_file` / `api_key_env` unless
+    /// `fetch_provider = "deepseek"` needs the credential, `provider =
+    /// "deepseek"` forbids `base_url` (its endpoints are fixed), and any
+    /// other provider value (for either field) is a config error.
+    /// Credentials come from [`Self::web_search_key`].
     pub fn web_search_provider(&self) -> anyhow::Result<Option<WebSearchProvider>> {
         let Some(web_search) = &self.web_search else {
             return Ok(None);
         };
+        // Validated here too, so a bad `fetch_provider` cannot slip through
+        // a caller that only asks about the search backend.
+        let fetch = self.web_fetch_provider()?;
         match web_search.provider.as_deref() {
             None | Some("exa") => Ok(Some(WebSearchProvider::Exa)),
             Some("searxng") => {
-                if web_search.api_key_file.is_some() || web_search.api_key_env.is_some() {
+                // A SearXNG search carries no credential; the fields are
+                // allowed only when they belong to a DeepSeek fetch.
+                if fetch != Some(WebFetchProvider::Deepseek)
+                    && (web_search.api_key_file.is_some() || web_search.api_key_env.is_some())
+                {
                     bail!(
                         "[web_search] provider `searxng` must not set `api_key_file` or `api_key_env`"
                     );
@@ -755,16 +856,43 @@ impl Config {
         }
     }
 
-    /// The web-search API key from `[web_search]` (Exa or DeepSeek), or None
-    /// when the section is absent or selects the SearXNG provider. Process
-    /// env `EXA_API_KEY` always wins over this for Exa (callers check it
-    /// first). Exactly one of `api_key_file` / `api_key_env` must be set for
-    /// the Exa and DeepSeek providers.
+    /// The `web_fetch` backend selected by `[web_search] fetch_provider`, or
+    /// None when the section is absent. `local` is the default when the field
+    /// is unset: this process fetches the URL, so the tool has the same
+    /// network reach as `bash`. `deepseek` keeps the remote `tools/fetch` and
+    /// is the only reason a `provider = "searxng"` section may carry
+    /// `api_key_file` / `api_key_env`. Any other value is a config error.
+    pub fn web_fetch_provider(&self) -> anyhow::Result<Option<WebFetchProvider>> {
+        let Some(web_search) = &self.web_search else {
+            return Ok(None);
+        };
+        match web_search.fetch_provider.as_deref().map(str::trim) {
+            None | Some("") | Some("local") => Ok(Some(WebFetchProvider::Local)),
+            Some("deepseek") => Ok(Some(WebFetchProvider::Deepseek)),
+            Some(fetch_provider) => bail!(
+                "[web_search] `fetch_provider` `{fetch_provider}` is not supported (expected `local` or `deepseek`)"
+            ),
+        }
+    }
+
+    /// The credential from `[web_search]`: the search key for the Exa and
+    /// DeepSeek providers, and the fetch key when `fetch_provider =
+    /// "deepseek"` (the only case where `provider = "searxng"` may carry
+    /// one). None when the section is absent or needs no credential, i.e. a
+    /// SearXNG search with a local fetch. Process env `EXA_API_KEY` always
+    /// wins over this for Exa (callers check it first). Exactly one of
+    /// `api_key_file` / `api_key_env` must be set whenever it is needed.
     pub fn web_search_key(&self) -> anyhow::Result<Option<String>> {
         match self.web_search_provider()? {
-            // SearXNG carries no credential; an absent section has nothing
-            // to resolve.
-            Some(WebSearchProvider::Searxng { .. }) | None => return Ok(None),
+            // SearXNG carries no credential for the search itself; the
+            // fields are resolved only when a DeepSeek fetch needs them.
+            Some(WebSearchProvider::Searxng { .. }) => {
+                if self.web_fetch_provider()? != Some(WebFetchProvider::Deepseek) {
+                    return Ok(None);
+                }
+            }
+            // An absent section has nothing to resolve.
+            None => return Ok(None),
             Some(WebSearchProvider::Exa) | Some(WebSearchProvider::Deepseek) => {}
         }
         let Some(web_search) = &self.web_search else {
@@ -795,6 +923,55 @@ impl Config {
         Ok(Some(key))
     }
 
+    /// The resolved `[acp]` settings, or None when the section is absent —
+    /// the `acp_prompt` tool is then not registered at all (opt-in, exactly
+    /// like a `[web_search]` without a usable credential). A blank `binary`
+    /// or `model` falls back to the default / "leave the agent's model
+    /// alone"; an explicit `args = []` is honored as "no arguments", and an
+    /// explicit `allow_kinds = []` as "deny every tool kind".
+    pub fn acp(&self) -> Option<AcpConfig> {
+        let acp = self.acp.as_ref()?;
+        let binary = acp
+            .binary
+            .as_deref()
+            .map(|binary| binary.to_string_lossy().trim().to_owned())
+            .filter(|binary| !binary.is_empty())
+            .unwrap_or_else(|| DEFAULT_ACP_BINARY.to_owned());
+        let args = acp.args.clone().unwrap_or_else(|| {
+            DEFAULT_ACP_ARGS
+                .iter()
+                .map(|arg| (*arg).to_owned())
+                .collect()
+        });
+        let model = acp
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_owned);
+        // Kinds are matched verbatim against the agent's `toolCall.kind`, so
+        // they are normalized once here (`"Read"` == `"read"`); an explicit
+        // empty list stays empty (deny everything).
+        let allow_kinds = acp.allow_kinds.clone().unwrap_or_else(|| {
+            DEFAULT_ACP_ALLOW_KINDS
+                .iter()
+                .map(|kind| (*kind).to_owned())
+                .collect()
+        });
+        let allow_kinds = allow_kinds
+            .iter()
+            .map(|kind| kind.trim().to_ascii_lowercase())
+            .filter(|kind| !kind.is_empty())
+            .collect();
+        Some(AcpConfig {
+            binary,
+            args,
+            model,
+            allow_kinds,
+            danger: acp.danger,
+        })
+    }
+
     /// Resolve the shared bash/file path policy for a workspace.
     pub fn sandbox(&self, workspace: &Path) -> anyhow::Result<Sandbox> {
         resolve_sandbox(Some(self), workspace)
@@ -802,6 +979,17 @@ impl Config {
 
     pub fn code_mode_enabled(&self) -> bool {
         self.code_mode.as_ref().is_some_and(|c| c.enabled)
+    }
+
+    /// `[images] max_inline`: how many distinct images a request keeps
+    /// inline. Older ones are replaced by a text placeholder naming their
+    /// stored hash. `0` never offloads; absent means
+    /// [`crate::images::DEFAULT_MAX_INLINE`].
+    pub fn images_max_inline(&self) -> usize {
+        self.images
+            .as_ref()
+            .and_then(|images| images.max_inline)
+            .unwrap_or(crate::images::DEFAULT_MAX_INLINE)
     }
     /// The session backend from `[session] backend`, defaulting to Sqlite
     /// (`<workspace>/.e-agent/sessions.db`).
@@ -1251,6 +1439,8 @@ pub fn resolve_background_timeout(
 /// `[session]` are white-listed for compatibility — they parse but stay
 /// global-only and are silently ignored by the project layer (a project
 /// file that carried them before this strictness was added keeps starting).
+/// `[acp]` is deliberately absent from this list: it names a program to
+/// spawn, so a project file carrying it is refused rather than ignored.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProjectConfig {
@@ -1272,6 +1462,11 @@ struct ProjectConfig {
     bash: Option<BashConfig>,
     /// `[background]` override, consumed by `resolve_background_timeout`.
     background: Option<BackgroundConfig>,
+    /// Global-only `[images]`: parsed for compatibility so a project file
+    /// carrying it keeps starting, never merged (the image store is per
+    /// user, not per workspace).
+    #[allow(dead_code)]
+    images: Option<ImagesConfig>,
     /// Whole-section `[tui]` replacement; absent keeps the global section.
     tui: Option<TuiConfig>,
     /// Whole-section `[pet]` replacement; absent keeps the global section.
@@ -1932,7 +2127,10 @@ fn classify_source_edit_with_snapshots(
         }
         return ("effective", None);
     }
-    if matches!(section, "session" | "web_search" | "code_mode" | "tui") {
+    if matches!(
+        section,
+        "session" | "web_search" | "code_mode" | "tui" | "acp"
+    ) {
         return ("shadowed", Some("setting requires restart"));
     }
     if section == "providers"
