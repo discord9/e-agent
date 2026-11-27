@@ -409,6 +409,17 @@ struct ModelProfile {
     /// default wire and are unaffected.
     #[serde(default)]
     deepseek_compat: Option<bool>,
+    /// Model wire: `"chat"` (default, OpenAI-compatible HTTP) or `"acp"` (an
+    /// external Agent Client Protocol agent process). ACP profiles need
+    /// `command` and neither `model` nor a provider `base_url`/credential.
+    #[serde(default)]
+    kind: Option<String>,
+    /// ACP only: the agent program to spawn.
+    #[serde(default)]
+    command: Option<String>,
+    /// ACP only: arguments passed to the agent program.
+    #[serde(default)]
+    args: Option<Vec<String>>,
 }
 
 #[derive(Debug)]
@@ -429,12 +440,19 @@ pub struct ResolvedModel {
     pub display: String,
     pub context_window: Option<u64>,
     pub vision: bool,
+    /// ACP only: the agent program to spawn.
+    pub command: Option<String>,
+    /// ACP only: arguments passed to the agent program.
+    pub args: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthMode {
     ApiKey,
     ChatGpt,
+    /// The profile launches an external ACP agent process; no HTTP endpoint or
+    /// credential is involved.
+    Acp,
 }
 
 #[derive(Debug)]
@@ -911,6 +929,36 @@ impl Config {
             .models
             .get(profile)
             .ok_or_else(|| anyhow!("model profile `{profile}` is not defined"))?;
+        match model_profile.kind.as_deref().unwrap_or("chat") {
+            "chat" => {}
+            "acp" => {
+                // An ACP profile names an external agent: `command` is the
+                // only required field, and no provider/base_url/credential is
+                // involved (the agent authenticates itself).
+                let command = model_profile
+                    .command
+                    .as_deref()
+                    .filter(|command| !command.is_empty())
+                    .ok_or_else(|| {
+                        anyhow!("model profile `{profile}` with kind = \"acp\" requires `command`")
+                    })?;
+                return Ok(ResolvedModel {
+                    base_url: String::new(),
+                    api_key: String::new(),
+                    model: model_profile.model.clone().unwrap_or_default(),
+                    reasoning_effort: model_profile.reasoning_effort.clone(),
+                    thinking: model_profile.thinking.unwrap_or(false),
+                    deepseek_compat: model_profile.deepseek_compat.unwrap_or(false),
+                    auth: AuthMode::Acp,
+                    display: profile.to_owned(),
+                    context_window: model_profile.context_window,
+                    vision: model_profile.vision.unwrap_or(false),
+                    command: Some(command.to_owned()),
+                    args: model_profile.args.clone().unwrap_or_default(),
+                });
+            }
+            kind => bail!("model profile `{profile}` has unsupported kind `{kind}`"),
+        }
         let model = model_profile
             .model
             .as_deref()
@@ -945,6 +993,8 @@ impl Config {
                 display: profile.to_owned(),
                 context_window: model_profile.context_window,
                 vision: model_profile.vision.unwrap_or(false),
+                command: None,
+                args: Vec::new(),
             });
         }
         let base_url = provider
@@ -985,6 +1035,8 @@ impl Config {
             display: profile.to_owned(),
             context_window: model_profile.context_window,
             vision: model_profile.vision.unwrap_or(false),
+            command: None,
+            args: Vec::new(),
         })
     }
 

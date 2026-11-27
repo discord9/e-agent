@@ -1730,6 +1730,72 @@ fn reports_missing_model_and_provider() {
 }
 
 #[test]
+fn resolves_acp_profile_without_model_provider_or_credentials() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = write_config(
+        temp.path(),
+        r#"
+[models."acp/stub"]
+kind = "acp"
+command = "acp-stub"
+args = ["--stdio"]
+"#,
+    );
+    let resolved = Config::from_path(&path)
+        .unwrap()
+        .resolve(Some("acp/stub"))
+        .unwrap();
+    assert_eq!(resolved.auth, AuthMode::Acp);
+    assert_eq!(resolved.command.as_deref(), Some("acp-stub"));
+    assert_eq!(resolved.args, ["--stdio"]);
+    // An ACP agent authenticates itself: no provider endpoint/key is needed.
+    assert!(resolved.base_url.is_empty());
+    assert!(resolved.api_key.is_empty());
+    assert_eq!(resolved.display, "acp/stub");
+}
+
+#[test]
+fn acp_profile_without_command_is_a_config_error_naming_the_profile() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = write_config(
+        temp.path(),
+        r#"
+[models."acp/stub"]
+kind = "acp"
+"#,
+    );
+    let error = Config::from_path(&path)
+        .unwrap()
+        .resolve(Some("acp/stub"))
+        .unwrap_err();
+    let text = format!("{error:#}");
+    assert!(text.contains("model profile `acp/stub`"), "{text}");
+    assert!(text.contains("`command`"), "{text}");
+}
+
+#[test]
+fn unknown_profile_kind_is_a_config_error_naming_the_profile() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = write_config(
+        temp.path(),
+        r#"
+[providers.p1]
+base_url = "http://one"
+[models."p1/m1"]
+model = "m1"
+kind = "telepathy"
+"#,
+    );
+    let error = Config::from_path(&path)
+        .unwrap()
+        .resolve(Some("p1/m1"))
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("model profile `p1/m1` has unsupported kind `telepathy`")
+    );
+}
+
+#[test]
 fn resolves_keyless_local_provider_without_credentials() {
     let temp = tempfile::tempdir().unwrap();
     let path = write_config(

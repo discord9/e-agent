@@ -17,6 +17,7 @@ use std::time::SystemTime;
 
 use anyhow::{Context, anyhow};
 
+use crate::acp_model::AcpModel;
 use crate::agent::{Agent, GoalSnapshot, SessionEntry};
 use crate::codex::CodexModel;
 use crate::codex_auth::CodexAuth;
@@ -284,6 +285,7 @@ pub struct SessionBuild {
 /// `'static` closure can resolve a profile without capturing the factory.
 fn resolve_profile_from(
     reloadable: &Arc<RwLock<ReloadableState>>,
+    root: &Path,
     base_url: Option<String>,
     model_override: Option<String>,
     profile: &str,
@@ -315,6 +317,7 @@ fn resolve_profile_from(
     let model = configured_model(
         resolved,
         AuthSource::Lazy(reloadable),
+        root,
         base_url,
         model_override,
     )?;
@@ -436,6 +439,7 @@ impl SessionFactory {
                 let models = build_runtime_models(
                     resolved,
                     AuthSource::Fixed(auth.as_ref()),
+                    &root,
                     &base_url,
                     &model,
                 )?;
@@ -636,6 +640,7 @@ impl SessionFactory {
     ) -> anyhow::Result<(ConfiguredModel, Option<u64>)> {
         resolve_profile_from(
             &self.reloadable,
+            &self.root,
             self.base_url.clone(),
             self.model.clone(),
             profile,
@@ -652,10 +657,19 @@ impl SessionFactory {
     /// configured default: the live identity carries the profile name only.
     pub fn fork_model_resolver(&self) -> crate::delegate::ForkModelSource {
         let reloadable = self.reloadable.clone();
+        let root = self.root.clone();
         let base_url = self.base_url.clone();
         let model = self.model.clone();
         Arc::new(move |profile: &str| {
-            resolve_profile_from(&reloadable, base_url.clone(), model.clone(), profile, None).ok()
+            resolve_profile_from(
+                &reloadable,
+                &root,
+                base_url.clone(),
+                model.clone(),
+                profile,
+                None,
+            )
+            .ok()
         })
     }
 
@@ -1741,6 +1755,7 @@ fn lazy_chatgpt_auth(reloadable: &RwLock<ReloadableState>) -> anyhow::Result<Cod
 fn configured_model(
     resolved: ResolvedModel,
     auth: AuthSource<'_>,
+    root: &Path,
     base_url: Option<String>,
     model: Option<String>,
 ) -> anyhow::Result<ConfiguredModel> {
@@ -1779,6 +1794,17 @@ fn configured_model(
             cm.display = display;
             Ok(cm)
         }
+        AuthMode::Acp => {
+            // `--base-url`/`--model` are HTTP-wire overrides; an ACP profile
+            // spawns the configured agent program in the session workspace.
+            let command = resolved
+                .command
+                .context("an acp model profile requires `command`")?;
+            let mut cm =
+                ConfiguredModel::acp(AcpModel::new(command, resolved.args, root.to_path_buf()));
+            cm.display = display;
+            Ok(cm)
+        }
     }
 }
 
@@ -1810,6 +1836,7 @@ fn resolved_profiles(config: &Config, profile: Option<&str>) -> anyhow::Result<P
 fn build_runtime_models(
     resolved: ProfilesResolved,
     auth: AuthSource<'_>,
+    root: &Path,
     base_url: &Option<String>,
     model: &Option<String>,
 ) -> anyhow::Result<RuntimeModels> {
@@ -1825,17 +1852,17 @@ fn build_runtime_models(
     } else {
         resolved.main.context_window
     };
-    let main = configured_model(resolved.main, auth, base_url.clone(), model.clone())?;
+    let main = configured_model(resolved.main, auth, root, base_url.clone(), model.clone())?;
     let subagent_context_window = resolved.subagent.as_ref().and_then(|r| r.context_window);
     let subagent = resolved
         .subagent
-        .map(|resolved| configured_model(resolved, auth, None, None))
+        .map(|resolved| configured_model(resolved, auth, root, None, None))
         .transpose()?;
     let mut roles = HashMap::new();
     let mut role_context_windows = HashMap::new();
     for (role, resolved) in resolved.roles {
         role_context_windows.insert(role.clone(), resolved.context_window);
-        roles.insert(role, configured_model(resolved, auth, None, None)?);
+        roles.insert(role, configured_model(resolved, auth, root, None, None)?);
     }
     Ok(RuntimeModels {
         main,
@@ -1856,6 +1883,7 @@ fn apply_reloaded_config(
     state: &mut ReloadableState,
     loaded: Option<Config>,
     profile: Option<&str>,
+    root: &Path,
     base_url: &Option<String>,
     model: &Option<String>,
 ) -> ReloadResult {
@@ -1922,7 +1950,13 @@ fn apply_reloaded_config(
     } else {
         None
     };
-    match build_runtime_models(resolved, AuthSource::Fixed(auth.as_ref()), base_url, model) {
+    match build_runtime_models(
+        resolved,
+        AuthSource::Fixed(auth.as_ref()),
+        root,
+        base_url,
+        model,
+    ) {
         Ok(models) => {
             state.config = Some(config);
             state.auth = auth;
@@ -2064,7 +2098,7 @@ fn reload_config_at(
     } else {
         None
     };
-    let result = apply_reloaded_config(&mut state, loaded, profile, base_url, model);
+    let result = apply_reloaded_config(&mut state, loaded, profile, root, base_url, model);
     if matches!(result, ReloadResult::Reloaded) {
         if let Some(policy) = policy {
             sandbox.replace(policy);
@@ -2138,6 +2172,7 @@ model = "m1"
         match &model.kind {
             crate::model::ConfiguredModelKind::Chat(model) => model.reasoning_effort.as_deref(),
             crate::model::ConfiguredModelKind::Codex(model) => model.reasoning_effort.as_deref(),
+            crate::model::ConfiguredModelKind::Acp(_) => None,
         }
     }
 
@@ -2429,7 +2464,7 @@ api_key_env = "PATH"
         );
         let result = {
             let mut state = factory.reloadable.write().unwrap();
-            apply_reloaded_config(&mut state, Some(second), None, &None, &None)
+            apply_reloaded_config(&mut state, Some(second), None, &factory.root, &None, &None)
         };
         assert!(matches!(result, ReloadResult::Reloaded), "{result:?}");
 
@@ -2493,7 +2528,7 @@ api_key_env = "PATH"
         let broken = test_config("nope/nope", "");
         let result = {
             let mut state = factory.reloadable.write().unwrap();
-            apply_reloaded_config(&mut state, Some(broken), None, &None, &None)
+            apply_reloaded_config(&mut state, Some(broken), None, &factory.root, &None, &None)
         };
         assert!(
             matches!(result, ReloadResult::Rejected(_)),
@@ -2513,7 +2548,7 @@ api_key_env = "PATH"
         );
         let result = {
             let mut state = factory.reloadable.write().unwrap();
-            apply_reloaded_config(&mut state, None, None, &None, &None)
+            apply_reloaded_config(&mut state, None, None, &factory.root, &None, &None)
         };
         assert!(matches!(result, ReloadResult::Reloaded));
         assert!(factory.current_config().is_none());
@@ -2564,6 +2599,7 @@ api_key_env = "PATH"
                 &mut state,
                 Some(second),
                 factory.profile.as_deref(),
+                &factory.root,
                 &None,
                 &None,
             )
@@ -2895,7 +2931,14 @@ fixer = "{role_profile}"
         };
         {
             let mut state = factory.reloadable.write().unwrap();
-            apply_reloaded_config(&mut state, Some(with_role("p1/m1")), None, &None, &None);
+            apply_reloaded_config(
+                &mut state,
+                Some(with_role("p1/m1")),
+                None,
+                &factory.root,
+                &None,
+                &None,
+            );
         }
         let resolver = factory.role_models_resolver();
         // Startup config routes fixer to p1/m1 (display name "m1").
@@ -2907,7 +2950,14 @@ fixer = "{role_profile}"
         // so a resident Delegate picks the new model up at spawn.
         {
             let mut state = factory.reloadable.write().unwrap();
-            apply_reloaded_config(&mut state, Some(with_role("p2/m2")), None, &None, &None);
+            apply_reloaded_config(
+                &mut state,
+                Some(with_role("p2/m2")),
+                None,
+                &factory.root,
+                &None,
+                &None,
+            );
         }
         let (model, _) = resolver("fixer").expect("fixer still routed");
         assert_eq!(model.display_name(), "m2");
@@ -3163,6 +3213,7 @@ model = "m2"
                 &mut state,
                 Some(with_subagent(Some("p1/m1"))),
                 None,
+                &factory.root,
                 &None,
                 &None,
             );
@@ -3183,6 +3234,7 @@ model = "m2"
                 &mut state,
                 Some(with_subagent(Some("p2/m2"))),
                 None,
+                &factory.root,
                 &None,
                 &None,
             );
@@ -3195,7 +3247,14 @@ model = "m2"
         // uses, so a resident Delegate and a fresh session agree.
         {
             let mut state = factory.reloadable.write().unwrap();
-            apply_reloaded_config(&mut state, Some(with_subagent(None)), None, &None, &None);
+            apply_reloaded_config(
+                &mut state,
+                Some(with_subagent(None)),
+                None,
+                &factory.root,
+                &None,
+                &None,
+            );
         }
         let (model, context_window) = resolver().expect("main fallback");
         assert_eq!(model.display_name(), "m1");
@@ -3265,7 +3324,7 @@ context_window = 3000
         };
         let apply = |config: Config| {
             let mut state = factory.reloadable.write().unwrap();
-            apply_reloaded_config(&mut state, Some(config), None, &None, &None);
+            apply_reloaded_config(&mut state, Some(config), None, &factory.root, &None, &None);
         };
         let resolver = factory.subagent_model_resolver();
 
