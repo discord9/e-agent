@@ -1684,6 +1684,8 @@ async fn image_rejection_is_typed_with_the_full_untruncated_diagnostic() {
     );
     let address = serve_error_responses("400 Bad Request", body.clone(), attempts.clone()).await;
     let temp = tempfile::tempdir().unwrap();
+    // The image must REALLY be on the wire for the rejection to claim it.
+    std::fs::write(temp.path().join("hash-a"), tiny_png()).unwrap();
     let mut model = OpenAiModel::with_timeout(
         format!("http://{address}/v1"),
         "test-key".into(),
@@ -1720,6 +1722,8 @@ async fn image_rejection_bypasses_the_retryable_403_path() {
     let attempts = Arc::new(AtomicUsize::new(0));
     let body = r#"{"error":{"message":"image input is not supported"}}"#;
     let address = serve_error_responses("403 Forbidden", body.into(), attempts.clone()).await;
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("hash-a"), tiny_png()).unwrap();
     let mut model = OpenAiModel::with_timeout(
         format!("http://{address}/v1"),
         "test-key".into(),
@@ -1728,7 +1732,8 @@ async fn image_rejection_bypasses_the_retryable_403_path() {
         true,
         Duration::from_secs(1),
     )
-    .unwrap();
+    .unwrap()
+    .with_image_store(temp.path().to_path_buf());
     let error = model
         .complete(&image_request(), &[], None)
         .await
@@ -2313,7 +2318,7 @@ fn tiny_png() -> Vec<u8> {
 fn chat_wire_offloads_the_oldest_images() {
     let store = tempfile::tempdir().unwrap();
     let png = tiny_png();
-    let messages: Vec<Message> = (0..10)
+    let mut messages: Vec<Message> = (0..10)
         .map(|index| {
             let hash = format!("img{index}");
             std::fs::write(store.path().join(&hash), &png).unwrap();
@@ -2326,6 +2331,12 @@ fn chat_wire_offloads_the_oldest_images() {
             }
         })
         .collect();
+    // A completed model response: all ten images are delivered.
+    messages.push(Message::Assistant(AssistantMessage {
+        content: Some("seen".into()),
+        tool_calls: Vec::new(),
+        reasoning: None,
+    }));
     let body = |max_inline: usize| {
         serde_json::to_string(&ChatRequest::from_internal(
             "test-model",
@@ -2341,8 +2352,8 @@ fn chat_wire_offloads_the_oldest_images() {
     };
     let value: serde_json::Value = serde_json::from_str(&body(6)).unwrap();
     let wire = value["messages"].as_array().unwrap();
-    assert_eq!(wire.len(), 10);
-    for (index, message) in wire.iter().enumerate() {
+    assert_eq!(wire.len(), 11, "ten images plus the assistant response");
+    for (index, message) in wire[..10].iter().enumerate() {
         let parts = message["content"].as_array().unwrap();
         let images: Vec<_> = parts
             .iter()
@@ -2395,6 +2406,80 @@ fn chat_wire_offloads_the_oldest_images() {
     assert_eq!(inline, 10);
 }
 
+/// Finding 4: the recovery record is exactly what the request put on the
+/// wire. Offloaded images and files that degraded to `[image missing: …]`
+/// were never submitted and must not be claimed (or later omitted) as the
+/// cause of an image rejection.
+#[test]
+fn image_rejection_records_only_images_that_were_transmitted() {
+    let store = tempfile::tempdir().unwrap();
+    let png = tiny_png();
+    let mut messages: Vec<Message> = (0..8)
+        .map(|index| {
+            let hash = format!("img{index}");
+            std::fs::write(store.path().join(&hash), &png).unwrap();
+            Message::User {
+                content: format!("image {index}"),
+                images: vec![ImagePart {
+                    hash,
+                    mime: "image/png".into(),
+                }],
+            }
+        })
+        .collect();
+    // A reference whose store file is missing: it becomes a text placeholder
+    // on the wire and must not enter the record.
+    messages.push(Message::User {
+        content: "gone".into(),
+        images: vec![ImagePart {
+            hash: "missing".into(),
+            mime: "image/png".into(),
+        }],
+    });
+    messages.push(Message::Assistant(AssistantMessage {
+        content: Some("seen".into()),
+        tool_calls: Vec::new(),
+        reasoning: None,
+    }));
+    // max_inline 3 keeps the newest three delivered: img6, img7, missing.
+    // The missing file is not transmitted, so only two images are recorded.
+    let request = ChatRequest::from_internal(
+        "test-model",
+        None,
+        false,
+        false,
+        &messages,
+        &[],
+        Some(store.path()),
+        3,
+    );
+    assert_eq!(
+        request.transmitted_images,
+        vec!["img6".to_owned(), "img7".to_owned()]
+    );
+    let rejection = ImageRejection::classify(
+        reqwest::StatusCode::BAD_REQUEST,
+        "image input is not supported",
+        &request.transmitted_images,
+    )
+    .expect("an image rejection over transmitted images");
+    assert_eq!(rejection.hashes, request.transmitted_images);
+    assert!(!rejection.hashes.iter().any(|hash| hash == "missing"));
+    assert!(
+        !rejection.hashes.iter().any(|hash| hash == "img0"),
+        "an offloaded image is not claimed"
+    );
+    // Nothing transmitted: the provider's image wording is not a rejection.
+    assert!(
+        ImageRejection::classify(
+            reqwest::StatusCode::BAD_REQUEST,
+            "image input is not supported",
+            &[],
+        )
+        .is_none()
+    );
+}
+
 /// Tool-result images ride on the aggregated temporary user message on the
 /// chat wire; the budget applies there too, so the placeholder lands in that
 /// aggregated message rather than breaking the `role: "tool"` shape.
@@ -2442,22 +2527,43 @@ fn chat_wire_offloads_old_tool_images_in_the_aggregated_message() {
             synthetic: false,
         });
     }
-    let body = |max_inline: usize| {
+    let body = |msgs: &[Message], max_inline: usize| {
         serde_json::to_string(&ChatRequest::from_internal(
             "test-model",
             None,
             false,
             false,
-            &messages,
+            msgs,
             &[],
             Some(store.path()),
             max_inline,
         ))
         .unwrap()
     };
-    // Six distinct images, newest two inline: user0..user2 and tool0 are
-    // offloaded, tool1/tool2 stay.
-    let value: serde_json::Value = serde_json::from_str(&body(2)).unwrap();
+    // The three tool images were just read and have never been on the wire,
+    // so all three stay inline. Only the delivered user0 is over the window.
+    let request = ChatRequest::from_internal(
+        "test-model",
+        None,
+        false,
+        false,
+        &messages,
+        &[],
+        Some(store.path()),
+        2,
+    );
+    assert_eq!(
+        request.transmitted_images,
+        vec![
+            "user1".to_owned(),
+            "user2".to_owned(),
+            "tool0".to_owned(),
+            "tool1".to_owned(),
+            "tool2".to_owned(),
+        ],
+        "the transmitted record names only images really on the wire"
+    );
+    let value: serde_json::Value = serde_json::to_value(&request).unwrap();
     let wire = value["messages"].as_array().unwrap();
     let aggregated: Vec<_> = wire
         .iter()
@@ -2481,8 +2587,54 @@ fn chat_wire_offloads_old_tool_images_in_the_aggregated_message() {
             .iter()
             .filter(|part| part["type"] == "image_url")
             .count(),
+        3,
+        "a tool batch's new images all get their first send"
+    );
+    assert!(
+        !parts.iter().any(|part| part["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("hash tool0"))),
+        "a never-transmitted tool image is not offloaded"
+    );
+    assert!(
+        wire[0]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|part| part["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("hash user0"))),
+        "the delivered user0 is deferred"
+    );
+
+    // After the next model response every image is delivered: the newest two
+    // stay, and tool0 becomes a placeholder in the aggregated message.
+    messages.push(Message::Assistant(AssistantMessage {
+        content: Some("done".into()),
+        tool_calls: Vec::new(),
+        reasoning: None,
+    }));
+    let value: serde_json::Value = serde_json::from_str(&body(&messages, 2)).unwrap();
+    let wire = value["messages"].as_array().unwrap();
+    let aggregated: Vec<_> = wire
+        .iter()
+        .filter(|message| {
+            message["role"] == "user"
+                && message["content"].as_array().is_some_and(|parts| {
+                    parts[0]["text"]
+                        .as_str()
+                        .is_some_and(|text| text.starts_with("[image attached:"))
+                })
+        })
+        .collect();
+    let parts = aggregated[0]["content"].as_array().unwrap();
+    assert_eq!(
+        parts
+            .iter()
+            .filter(|part| part["type"] == "image_url")
+            .count(),
         2,
-        "only the newest tool images stay inline"
+        "only the newest delivered tool images stay inline"
     );
     assert_eq!(
         parts
@@ -2495,6 +2647,6 @@ fn chat_wire_offloads_old_tool_images_in_the_aggregated_message() {
             })
             .count(),
         1,
-        "the oldest tool image becomes a placeholder in place"
+        "the oldest delivered tool image becomes a placeholder in place"
     );
 }

@@ -138,24 +138,34 @@ pub(crate) struct ImageRejection {
     pub(crate) status: reqwest::StatusCode,
     /// Full, untruncated provider diagnostic (response body / message).
     pub(crate) diagnostic: String,
-    /// Distinct image hashes carried by the failed request, in first-seen
-    /// order.
+    /// Distinct image hashes the failed request actually put ON THE WIRE, in
+    /// first-seen order. Images the budget offloaded into placeholders and
+    /// files that degraded to `[image missing: …]` are excluded: they never
+    /// left the process and cannot have caused an image rejection. Recovery
+    /// must not claim or re-send them.
     pub(crate) hashes: Vec<String>,
 }
 
 impl ImageRejection {
-    /// Classify a failed provider response as an image rejection. Returns
-    /// `None` for every other failure, leaving the existing status/retry/
-    /// auth behavior untouched.
+    /// Classify a failed provider response as an image rejection. `transmitted`
+    /// is the exact set of image hashes the request serialized as image parts
+    /// (never every reference in the messages: offloaded and missing images
+    /// were not submitted). Returns `None` for every other failure, leaving
+    /// the existing status/retry/auth behavior untouched.
     pub(crate) fn classify(
         status: reqwest::StatusCode,
         body: &str,
-        messages: &[Message],
+        transmitted: &[String],
     ) -> Option<Self> {
         if !status.is_client_error() || !body.to_ascii_lowercase().contains("image") {
             return None;
         }
-        let hashes = submitted_image_hashes(messages);
+        let mut seen = std::collections::HashSet::new();
+        let hashes: Vec<String> = transmitted
+            .iter()
+            .filter(|hash| seen.insert(hash.as_str()))
+            .cloned()
+            .collect();
         (!hashes.is_empty()).then(|| Self {
             status,
             diagnostic: body.to_owned(),
@@ -175,25 +185,6 @@ impl std::fmt::Display for ImageRejection {
 }
 
 impl std::error::Error for ImageRejection {}
-
-/// Distinct image hashes carried by a request's messages (user and tool
-/// references alike), in first-seen order.
-fn submitted_image_hashes(messages: &[Message]) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
-    let mut hashes = Vec::new();
-    for message in messages {
-        let images = match message {
-            Message::User { images, .. } | Message::Tool { images, .. } => images,
-            Message::System { .. } | Message::Assistant(_) => continue,
-        };
-        for image in images {
-            if seen.insert(image.hash.as_str()) {
-                hashes.push(image.hash.clone());
-            }
-        }
-    }
-    hashes
-}
 
 /// The typed image rejection carried by a failed model request, if any.
 pub(crate) fn image_rejection(error: &anyhow::Error) -> Option<&ImageRejection> {
@@ -393,7 +384,9 @@ impl Model for OpenAiModel {
             // Every other status keeps the existing retry-before-body path.
             if status.is_client_error() {
                 let body = response.text().await.unwrap_or_default();
-                if let Some(rejection) = ImageRejection::classify(status, &body, messages) {
+                if let Some(rejection) =
+                    ImageRejection::classify(status, &body, &request.transmitted_images)
+                {
                     return Err(anyhow::Error::new(rejection));
                 }
                 if is_retryable_http_status(status) && attempt < HTTP_RETRY_ATTEMPTS {
@@ -641,6 +634,12 @@ struct ChatRequest<'a> {
     messages: Vec<WireMessage>,
     tools: Vec<WireTool<'a>>,
     stream: bool,
+    /// Hashes this request serialized as actual `image_url` parts, in wire
+    /// order. NOT serialized and never includes an offloaded or missing
+    /// image: this is the record the image-rejection recovery uses (`only
+    /// what was actually transmitted`).
+    #[serde(skip)]
+    transmitted_images: Vec<String>,
 }
 
 /// The OpenAI-compatible thinking switch payload.
@@ -681,6 +680,7 @@ impl<'a> ChatRequest<'a> {
         max_inline: usize,
     ) -> Self {
         let budget = crate::images::ImageBudget::project(messages, max_inline);
+        let mut transmitted_images = Vec::new();
         Self {
             model: model.into(),
             reasoning_effort: reasoning_effort.map(str::to_owned),
@@ -693,7 +693,9 @@ impl<'a> ChatRequest<'a> {
                 &budget,
                 deepseek_compat,
                 thinking,
+                &mut transmitted_images,
             ),
+            transmitted_images,
             tools: tools
                 .iter()
                 .map(|tool| WireTool {
@@ -725,6 +727,7 @@ impl<'a> ChatRequest<'a> {
         budget: &crate::images::ImageBudget,
         deepseek_compat: bool,
         thinking: bool,
+        transmitted_images: &mut Vec<String>,
     ) -> Vec<WireMessage> {
         let mut wire = Vec::new();
         let mut index = 0;
@@ -743,6 +746,7 @@ impl<'a> ChatRequest<'a> {
                         budget,
                         deepseek_compat,
                         thinking,
+                        &mut *transmitted_images,
                     )
                 }));
                 // At most one aggregated temporary user image wire message
@@ -763,6 +767,7 @@ impl<'a> ChatRequest<'a> {
                             &images,
                             image_store,
                             budget,
+                            &mut *transmitted_images,
                         )),
                         tool_calls: None,
                         tool_call_id: None,
@@ -779,6 +784,7 @@ impl<'a> ChatRequest<'a> {
                         budget,
                         deepseek_compat,
                         thinking,
+                        &mut *transmitted_images,
                     ));
                 }
             }
@@ -824,6 +830,7 @@ impl WireMessage {
         budget: &crate::images::ImageBudget,
         deepseek_compat: bool,
         thinking: bool,
+        transmitted_images: &mut Vec<String>,
     ) -> Self {
         match message {
             Message::System { content } => Self {
@@ -835,7 +842,13 @@ impl WireMessage {
             },
             Message::User { content, images } => Self {
                 role: "user",
-                content: Some(WireContent::from_user(content, images, image_store, budget)),
+                content: Some(WireContent::from_user(
+                    content,
+                    images,
+                    image_store,
+                    budget,
+                    transmitted_images,
+                )),
                 tool_calls: None,
                 tool_call_id: None,
                 reasoning_content: None,
@@ -906,13 +919,16 @@ impl WireContent {
     /// array of `text` + `image_url` parts. Image files are re-read from the
     /// global store, normalised to the image token budget, and base64-encoded
     /// at send time; an image the budget offloaded degrades to its recovery
-    /// placeholder text part, and a missing file to `[image missing: <hash>]`
-    /// — neither ever fails the request or changes the wire shape.
+    /// placeholder text part, and a missing/over-cap file to a clear text
+    /// part — neither ever fails the request or changes the wire shape. The
+    /// hash of every image that really became an `image_url` part is recorded
+    /// in `transmitted_images` (the recovery record must not claim more).
     fn from_user(
         content: &str,
         images: &[ImagePart],
         image_store: Option<&Path>,
         budget: &crate::images::ImageBudget,
+        transmitted_images: &mut Vec<String>,
     ) -> Self {
         if images.is_empty() {
             return Self::Text(content.to_owned());
@@ -924,20 +940,22 @@ impl WireContent {
                 continue;
             }
             match crate::images::wire_image(image_store, image) {
-                Some((bytes, mime)) => parts.push(json!({
-                    "type": "image_url",
-                    "image_url": {
-                        "url": format!(
-                            "data:{};base64,{}",
-                            mime,
-                            base64::engine::general_purpose::STANDARD.encode(bytes)
-                        )
-                    }
-                })),
-                None => parts.push(json!({
-                    "type": "text",
-                    "text": format!("[image missing: {}]", image.hash)
-                })),
+                Ok((bytes, mime)) => {
+                    transmitted_images.push(image.hash.clone());
+                    parts.push(json!({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": format!(
+                                "data:{};base64,{}",
+                                mime,
+                                base64::engine::general_purpose::STANDARD.encode(bytes)
+                            )
+                        }
+                    }));
+                }
+                // Missing and rejected-over-cap images degrade to a text part
+                // naming the reason; they never count as transmitted.
+                Err(text) => parts.push(json!({"type": "text", "text": text})),
             }
         }
         Self::Parts(parts)

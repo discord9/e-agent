@@ -7722,6 +7722,45 @@ async fn read_image_stores_hashes_and_returns_structured_images() {
     assert_eq!(std::fs::read_dir(&store).unwrap().count(), 1);
 }
 
+/// Finding 6: the budget placeholder prints a bare content hash. That hash
+/// names an extensionless file in the image store, and `read_image` must be
+/// able to read it back — the recovery instruction has to work, not just be
+/// printed.
+#[tokio::test]
+async fn read_image_recovers_an_offloaded_hash_named_store_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = temp.path().join("images");
+    let bytes = b"\x89PNG\r\n\x1a\nstored-budget-image";
+    let hash = crate::agent::store_image_bytes(&store, bytes).unwrap();
+    // Content-addressed: the file name is the hash, with no extension.
+    assert!(store.join(&hash).is_file());
+    assert_eq!(
+        crate::agent::image_mime_from_extension(&hash),
+        None,
+        "there is no extension to whitelist"
+    );
+
+    let tool = read_image_tool(&temp, &store);
+    let recovered = tool.execute(json!({"path": hash.as_str()})).await.unwrap();
+    assert_eq!(recovered.images.len(), 1);
+    assert_eq!(
+        recovered.images[0].hash, hash,
+        "the same attachment comes back"
+    );
+    assert_eq!(
+        recovered.images[0].mime, "image/png",
+        "the extensionless file is sniffed"
+    );
+
+    // A hash with no stored file fails with a clear store error rather than a
+    // misleading "unsupported image type".
+    let error = tool
+        .execute(json!({"path": "0".repeat(64)}))
+        .await
+        .unwrap_err();
+    assert!(error.contains("cannot read stored image"), "{error}");
+}
+
 #[tokio::test]
 async fn read_image_sniffs_mime_from_extension_whitelist() {
     let temp = tempfile::tempdir().unwrap();
