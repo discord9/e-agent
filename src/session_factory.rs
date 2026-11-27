@@ -4743,6 +4743,106 @@ mod link_ref_registration_tests {
         .into()
     }
 
+    fn fork_marker(source: &str, at: usize, seq: i64) -> SessionEntry {
+        SessionEntry::ForkedFrom {
+            source: source.to_owned(),
+            at: Some(at),
+            event_time: None,
+            seq: Some(seq),
+        }
+    }
+
+    /// Provenance must cover every fork layout that exists on disk, not just
+    /// the zero-copy leading marker: zero-copy children store the marker
+    /// first (optionally after the frozen goal), while the older copy-based
+    /// layout stores the copied prefix BEFORE the marker. Reopening each by
+    /// id (no `fork_from` in the build request) must still keep `link_ref`
+    /// off; a session the human started from scratch keeps it.
+    #[tokio::test]
+    async fn every_persisted_fork_layout_reopens_without_link_ref() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let source = [user("q0"), assistant("a0"), user("q1"), assistant("a1")];
+        Session::append(&root, "layout-src", &source).unwrap();
+        // Zero-copy: marker alone, and marker after the child's frozen goal.
+        Session::append(
+            &root,
+            "layout-zero",
+            std::slice::from_ref(&fork_marker("layout-src", 4, 3)),
+        )
+        .unwrap();
+        Session::append(
+            &root,
+            "layout-goal",
+            &[
+                SessionEntry::GoalUpdated { goal: None },
+                fork_marker("layout-src", 4, 3),
+            ],
+        )
+        .unwrap();
+        // Older copy-based layout: two and four stored prefix entries before
+        // the marker (the four-entry one is the layout this repo actually
+        // still carries).
+        Session::append(
+            &root,
+            "layout-copy2",
+            &[
+                source[0].clone(),
+                source[1].clone(),
+                fork_marker("layout-src", 2, 1),
+            ],
+        )
+        .unwrap();
+        Session::append(
+            &root,
+            "layout-copy4",
+            &[
+                source[0].clone(),
+                source[1].clone(),
+                source[2].clone(),
+                source[3].clone(),
+                fork_marker("layout-src", 4, 3),
+            ],
+        )
+        .unwrap();
+
+        let factory = SessionFactory::test_factory(root.clone());
+        for id in ["layout-zero", "layout-goal", "layout-copy2", "layout-copy4"] {
+            let reopened = factory
+                .build(
+                    id,
+                    None,
+                    None,
+                    IdlePolicy::FinishWhenIdle,
+                    UnfinishedPolicy::Preserve,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{id} reopens: {error:#}"));
+            let names = reopened.runner.tool_names_for_test();
+            assert!(
+                !names.iter().any(|name| name == "link_ref"),
+                "{id} must stay recognizable as a fork: {names:?}"
+            );
+        }
+
+        Session::append(&root, "layout-plain", &[user("q0"), assistant("a0")]).unwrap();
+        let plain = factory
+            .build(
+                "layout-plain",
+                None,
+                None,
+                IdlePolicy::FinishWhenIdle,
+                UnfinishedPolicy::Preserve,
+            )
+            .await
+            .expect("normal session builds");
+        let names = plain.runner.tool_names_for_test();
+        assert!(
+            names.iter().any(|name| name == "link_ref"),
+            "a user-created top-level session still gets link_ref: {names:?}"
+        );
+    }
+
     /// `link_ref` writes to THIS session's metadata row, so only a session the
     /// human started from scratch gets it. A web fork goes through the same
     /// factory path as a CLI fork (`build_fork` → `build_internal`) and IS a

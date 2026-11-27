@@ -205,6 +205,50 @@ impl Session {
         })
     }
 
+    /// The first `bound` entries of the stored log.
+    ///
+    /// JSONL is read line by line and STOPS at `bound`, so a provenance
+    /// probe over a long session never parses the whole transcript. The
+    /// legacy whole-document fallback is no better off (it is one JSON
+    /// value), but it stores only messages — never a `ForkedFrom` marker —
+    /// so callers probing fork provenance still pay only for a legacy
+    /// session, not for an ordinary JSONL one.
+    pub fn load_first(root: &Path, name: &str, bound: usize) -> anyhow::Result<Vec<SessionEntry>> {
+        if bound == 0 {
+            return Ok(Vec::new());
+        }
+        let jsonl = session_path(root, name, "jsonl")?;
+        if !jsonl.exists() {
+            return Ok(Self::load(root, name)?
+                .entries
+                .into_iter()
+                .take(bound)
+                .collect());
+        }
+        let file = std::fs::File::open(&jsonl)
+            .with_context(|| format!("cannot open session {}", jsonl.display()))?;
+        let mut entries = Vec::new();
+        for (index, line) in std::io::BufReader::new(file).lines().enumerate() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            entries.push(
+                serde_json::from_str::<SessionEntry>(&line).with_context(|| {
+                    format!(
+                        "cannot decode session {} line {}",
+                        jsonl.display(),
+                        index + 1
+                    )
+                })?,
+            );
+            if entries.len() == bound {
+                break;
+            }
+        }
+        Ok(entries)
+    }
+
     /// Append new entries to the JSONL log, creating the file (0600) if needed.
     pub fn append(root: &Path, name: &str, entries: &[SessionEntry]) -> anyhow::Result<()> {
         if entries.is_empty() {

@@ -5012,6 +5012,198 @@ async fn sessions_meta_backfill_skips_sessions_with_rows() {
     assert_eq!(mine[0].entry_count, 2);
 }
 
+/// A create can land between `backfill_sessions`' aggregate scan (which
+/// releases the connection) and its insertion. The insertion must recheck
+/// absence INSIDE its own write transaction: a second, empty-links snapshot
+/// with a newer timestamp would otherwise win the latest-row race and hide
+/// the link the create just stored.
+#[tokio::test]
+async fn create_between_backfill_scan_and_insert_keeps_the_created_rows_refs() {
+    let (dir, backfill, sid) = fresh_session().await;
+    backfill.append(&test_entries()[..3]).await.unwrap();
+
+    // The lifecycle bounds the scan aggregated for this session. The
+    // timestamp is deliberately LATER than the concurrent create's, exactly
+    // the ordering that used to let the spurious row hide the link.
+    let created_at = us_to_datetime(next_event_time_us());
+    let backfill_last_active = us_to_datetime(next_event_time_us() + 3_600_000_000);
+
+    // A concurrent create + ref edit, after the scan released the handle.
+    let db_path = dir.path().join("sessions.db");
+    let other = SqliteSession::connect(db_path.to_str().unwrap(), &workspace_id(), &sid)
+        .await
+        .expect("second handle");
+    other
+        .create_meta(&sid, Some("m"), Some("main"), None, None, None)
+        .await
+        .expect("concurrent create");
+    let pr = crate::session_store::SessionRef::new("pr", "https://github.com/acme/widget/pull/14")
+        .unwrap();
+    other
+        .update_refs(&sid, |refs| {
+            refs.push(pr.clone());
+            Ok(())
+        })
+        .await
+        .expect("concurrent ref edit");
+
+    // What `backfill_sessions` does after its scan: insert the aggregated
+    // snapshot, unless the row appeared in the meantime.
+    backfill
+        .insert_backfill_meta(SessionMeta {
+            session_id: sid.clone(),
+            created_at,
+            last_active_at: backfill_last_active,
+            model: None,
+            role: None,
+            entry_count: 3,
+            parent_session_id: None,
+            parent_task_id: None,
+            title: None,
+            pinned: None,
+            archived: None,
+            refs: Vec::new(),
+            writer: None,
+            label: None,
+        })
+        .await
+        .expect("backfill insertion");
+
+    let audit = other.audit_meta(&sid).await.unwrap();
+    assert_eq!(
+        audit.len(),
+        2,
+        "create + ref edit only: the backfill must append no third row"
+    );
+    assert_eq!(
+        audit.last().unwrap().refs,
+        vec![pr.clone()],
+        "the newest row is still the edit that stored the link, not a          stale empty backfill snapshot"
+    );
+    let latest = other
+        .list_meta()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|meta| meta.session_id == sid)
+        .expect("created row is listed");
+    assert_eq!(latest.refs, vec![pr], "the latest row still carries it");
+    drop(dir);
+}
+
+/// A degraded handle that stays open across another handle's schema repair
+/// must not erase the link that repair stored when it later writes a
+/// backfill snapshot. The insertion takes ONE availability decision inside
+/// its transaction and rechecks the row there, so the repaired link is
+/// never overwritten by a stale, empty snapshot.
+#[tokio::test]
+async fn degraded_backfill_after_schema_repair_keeps_repaired_links() {
+    let (dir, path) = temp_db();
+    let wid = workspace_id();
+    let db_path = path.to_str().unwrap().to_owned();
+    // The pre-`refs` table shape: every other column, no `refs`.
+    {
+        let db = turso::Builder::new_local(&db_path)
+            .build()
+            .await
+            .expect("open legacy database");
+        let conn = db.connect().expect("connect legacy database");
+        conn.execute(
+            r#"CREATE TABLE sessions (
+                workspace_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                last_active_at INTEGER NOT NULL,
+                model TEXT NULL,
+                "role" TEXT NULL,
+                entry_count INTEGER NOT NULL DEFAULT 0,
+                parent_session_id TEXT NULL,
+                parent_task_id INTEGER NULL,
+                title TEXT NULL,
+                pinned INTEGER NULL,
+                archived INTEGER NULL,
+                writer TEXT NULL,
+                PRIMARY KEY (workspace_id, session_id, last_active_at)
+            )"#,
+            (),
+        )
+        .await
+        .expect("old sessions schema");
+    }
+    let sid = format!("test-sql-degraded-backfill-{}", crate::session::new_id());
+    let degraded = SqliteSession::connect_with_failed_refs_migration(&db_path, &wid, &sid)
+        .await
+        .expect("connect to the degraded database");
+    degraded
+        .append(&test_entries()[..3])
+        .await
+        .expect("a degraded handle still appends its transcript");
+
+    // Another handle repairs the schema and stores a link.
+    let repairing = SqliteSession::connect(&db_path, &wid, &sid)
+        .await
+        .expect("connect repairs the column");
+    repairing
+        .create_meta(&sid, Some("m"), Some("main"), None, None, None)
+        .await
+        .expect("repairing create");
+    let pr = crate::session_store::SessionRef::new("pr", "https://github.com/acme/widget/pull/14")
+        .unwrap();
+    repairing
+        .update_refs(&sid, |refs| {
+            refs.push(pr.clone());
+            Ok(())
+        })
+        .await
+        .expect("repairing ref edit");
+
+    // The degraded handle now writes the (already-scanned) backfill row.
+    degraded
+        .insert_backfill_meta(SessionMeta {
+            session_id: sid.clone(),
+            created_at: us_to_datetime(next_event_time_us()),
+            last_active_at: us_to_datetime(next_event_time_us() + 3_600_000_000),
+            model: None,
+            role: None,
+            entry_count: 3,
+            parent_session_id: None,
+            parent_task_id: None,
+            title: None,
+            pinned: None,
+            archived: None,
+            refs: Vec::new(),
+            writer: None,
+            label: None,
+        })
+        .await
+        .expect("degraded backfill insertion");
+
+    let audit = repairing.audit_meta(&sid).await.unwrap();
+    assert_eq!(
+        audit.len(),
+        2,
+        "create + ref edit only: no stale empty snapshot is appended"
+    );
+    assert_eq!(
+        audit.last().unwrap().refs,
+        vec![pr.clone()],
+        "the repaired link stays in the newest snapshot"
+    );
+    assert_eq!(
+        repairing
+            .list_meta()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|meta| meta.session_id == sid)
+            .unwrap()
+            .refs,
+        vec![pr],
+        "the repaired link is still the latest state"
+    );
+    drop(dir);
+}
+
 // ----------------------------------------------------------------------
 // rewrite is a no-op
 // ----------------------------------------------------------------------

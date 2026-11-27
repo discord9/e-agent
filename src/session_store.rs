@@ -3027,37 +3027,60 @@ impl SessionStore {
         Ok(page)
     }
 
-    /// The session's own leading zero-copy marker, if it has one. Bounded: only
-    /// the FIRST few logical rows are read.
-    async fn leading_fork_marker(&self, root: &Path, name: &str) -> Result<Option<SessionEntry>> {
-        let bound = 3;
-        let entries = match self {
-            SessionStore::Jsonl => Session::load(root, name)?
-                .entries
-                .into_iter()
-                .take(bound)
-                .collect(),
+    /// The first `bound` stored entries through the backend's own bounded
+    /// reader: JSONL stops reading after `bound` lines, the SQL backends
+    /// LIMIT their payload query. Every fork probe goes through this one
+    /// path, never through a full-transcript load.
+    async fn load_first_entries(
+        &self,
+        root: &Path,
+        name: &str,
+        bound: usize,
+    ) -> Result<Vec<SessionEntry>> {
+        match self {
+            SessionStore::Jsonl => Session::load_first(root, name, bound),
             #[cfg(feature = "greptime")]
-            SessionStore::Greptime { session, .. } => session.load_first(bound).await?,
+            SessionStore::Greptime { session, .. } => session.load_first(bound).await,
             #[cfg(feature = "sqlite")]
             SessionStore::Sqlite { session, .. } => session
                 .lock()
                 .await
                 .load_first(bound)
                 .await
-                .map_err(anyhow::Error::msg)?,
-        };
+                .map_err(anyhow::Error::msg),
+        }
+    }
+
+    /// The session's own leading zero-copy marker, if it has one. Bounded: only
+    /// the FIRST few logical rows are read.
+    async fn leading_fork_marker(&self, root: &Path, name: &str) -> Result<Option<SessionEntry>> {
+        let entries = self.load_first_entries(root, name, 3).await?;
         Ok(zero_copy_marker(&entries).map(|marker| entries[marker].clone()))
     }
 
     /// Bounded probe: does the PERSISTED transcript mark this session as a
-    /// fork? A zero-copy child stores its `ForkedFrom` marker as the first
-    /// logical row (optionally after the frozen goal), so the leading-marker
-    /// probe still answers after the child compacted on its own — reopening
-    /// the session by id must not lose the provenance its build request no
-    /// longer carries.
+    /// fork?
+    ///
+    /// A zero-copy child stores its `ForkedFrom` marker first (optionally
+    /// after the frozen goal), so the probe still answers after the child
+    /// compacted on its own. The older copy-based layout stores the copied
+    /// prefix BEFORE the marker, so "starts with a marker" is not the same
+    /// question as "is a fork": scan the bounded head for any `ForkedFrom`
+    /// entry instead. Reopening by id must not lose the provenance its build
+    /// request no longer carries.
     pub(crate) async fn has_fork_provenance(&self, root: &Path, name: &str) -> Result<bool> {
-        self.has_leading_fork_marker(root, name, 3).await
+        // Deep enough for every marker layout this repo has ever written:
+        // leading, after a frozen goal, and after the old copy-based prefix
+        // (the four-entry layout is the deepest it stores). An ordinary
+        // long session still reads only this fixed head, never its whole
+        // transcript.
+        const PROVENANCE_DEPTH: usize = 8;
+        let entries = self
+            .load_first_entries(root, name, PROVENANCE_DEPTH)
+            .await?;
+        Ok(entries
+            .iter()
+            .any(|entry| matches!(entry, SessionEntry::ForkedFrom { .. })))
     }
 
     /// Depth limit for a fork ancestry walk. A chain longer than this is
@@ -3097,22 +3120,7 @@ impl SessionStore {
     /// probe and hide the leading marker (a segment page would: its LIMIT
     /// counts physical versions).
     async fn has_leading_fork_marker(&self, root: &Path, name: &str, bound: usize) -> Result<bool> {
-        let entries = match self {
-            SessionStore::Jsonl => Session::load(root, name)?
-                .entries
-                .into_iter()
-                .take(bound)
-                .collect(),
-            #[cfg(feature = "greptime")]
-            SessionStore::Greptime { session, .. } => session.load_first(bound).await?,
-            #[cfg(feature = "sqlite")]
-            SessionStore::Sqlite { session, .. } => session
-                .lock()
-                .await
-                .load_first(bound)
-                .await
-                .map_err(anyhow::Error::msg)?,
-        };
+        let entries = self.load_first_entries(root, name, bound).await?;
         Ok(zero_copy_marker(&entries).is_some())
     }
 
@@ -6322,6 +6330,19 @@ mod tests {
             event_time: None,
             seq,
         }
+    }
+
+    /// The provenance probe stops at its bound instead of parsing the whole
+    /// JSONL transcript: opening a long ordinary session must not pay for
+    /// every line just to decide whether it is a fork.
+    #[test]
+    fn jsonl_load_first_reads_a_bounded_head() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let entries = fork_turns(10);
+        crate::session::Session::append(root, "bounded", &entries).unwrap();
+        let first = crate::session::Session::load_first(root, "bounded", 3).unwrap();
+        assert_eq!(first, entries[..3]);
     }
 
     /// Only the two LEADING layouts are a zero-copy fork. A marker deeper in

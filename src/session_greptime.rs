@@ -193,9 +193,10 @@ pub struct GreptimeSession {
     /// working, and only an explicit ref edit fails loudly.
     ///
     /// Mutable because another handle may repair the schema while this one
-    /// stays open: every degraded write re-probes the column and flips this
-    /// flag, so the repaired database's links are carried forward instead
-    /// of being erased by a snapshot that omits them.
+    /// stays open: each metadata operation re-probes the column once (with
+    /// the session's mutation lock held) and uses that single decision for
+    /// its read and its write, so the repaired database's links are carried
+    /// forward instead of being erased by a snapshot that omits them.
     refs_available: AtomicBool,
 }
 
@@ -2329,8 +2330,22 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
     /// Latest metadata snapshot for one session, or `None` when the
     /// session has no row yet (brand-new session, or a subagent whose
     /// parent has not written its row yet).
+    #[cfg(test)]
     async fn load_meta_row(&self, session_id: &str) -> Result<Option<SessionMeta>> {
-        let refs = refs_select(self.refs_available.load(Ordering::Relaxed));
+        let refs_available = self.refs_available.load(Ordering::Relaxed);
+        self.load_meta_row_with(session_id, refs_available).await
+    }
+
+    /// [`Self::load_meta_row`] with the caller's ONE availability decision
+    /// for this operation: the same bool selects the projected column and
+    /// the decode, so a concurrent repair can never make the SELECT omit a
+    /// column the decoder then names (or vice versa).
+    async fn load_meta_row_with(
+        &self,
+        session_id: &str,
+        refs_available: bool,
+    ) -> Result<Option<SessionMeta>> {
+        let refs = refs_select(refs_available);
         let row = self
             .client
             .query_opt(
@@ -2345,19 +2360,15 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             )
             .await
             .context("cannot query session metadata")?;
-        row.map(|row| {
-            Self::meta_from_row(
-                &row,
-                session_id,
-                self.refs_available.load(Ordering::Relaxed),
-            )
-        })
-        .transpose()
+        row.map(|row| Self::meta_from_row(&row, session_id, refs_available))
+            .transpose()
     }
 
-    /// Re-probe a degraded handle before a write: another handle may have
-    /// added `sessions.refs` since this one connected. Returns the
-    /// availability the write should use; a failed probe keeps the feature
+    /// Re-probe a degraded handle ONCE, at the start of one metadata
+    /// operation (with that session's mutation lock held): another handle
+    /// may have added `sessions.refs` since this one connected. The returned
+    /// bool is the operation's one availability decision — the row read and
+    /// the snapshot write both use it. A failed probe keeps the feature
     /// degraded rather than failing the metadata write.
     async fn ensure_refs_available(&self) -> bool {
         if self.refs_available.load(Ordering::Relaxed) {
@@ -2379,26 +2390,18 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
         }
     }
 
-    async fn insert_meta(&self, meta: &mut SessionMeta) -> Result<()> {
-        // A handle that connected while `refs` was missing took the degraded
-        // path; another handle may have repaired the schema since. Re-probe
-        // before the degraded write, and when the column now exists carry
-        // the CURRENT row's links forward — the snapshot in hand was read
-        // without them (an omission here would erase what the repairing
-        // handle stored).
-        if !self.refs_available.load(Ordering::Relaxed)
-            && self.ensure_refs_available().await
-            && let Some(current) = self.load_meta_row(&meta.session_id).await?
-        {
-            meta.refs = current.refs;
-        }
+    /// Append one complete snapshot. `refs_available` is the operation's
+    /// ONE decision (taken before its row read, under the mutation lock):
+    /// writing with a different value than the read used is what erased a
+    /// link a repairing handle had just stored.
+    async fn insert_meta(&self, meta: &mut SessionMeta, refs_available: bool) -> Result<()> {
         // Stamp the writer identity at insert time, not at construction
         // (P3): every snapshot row records the process that actually wrote
         // it, and a cross-process resume never replays a stale identity
         // from a row cached by another process. Callers construct with
         // `writer: None`; the stamped value is what lands in the column.
         meta.writer = Some(process_identity().to_owned());
-        if self.refs_available.load(Ordering::Relaxed) {
+        if refs_available {
             // One JSON value for the whole list; NULL when empty (the same
             // value a pre-column row reads back as). Encoding happens before
             // the statement so the parameter borrows a local that outlives it.
@@ -2469,8 +2472,11 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
     /// optimistic last-write-wins semantics. Delete-vs-touch races remain a
     /// documented limitation until database-level conditional/versioned
     /// writes are available.
-    async fn effective_meta(&self) -> Result<Option<SessionMeta>> {
-        match self.load_meta_row(&self.session_id).await? {
+    async fn effective_meta(&self, refs_available: bool) -> Result<Option<SessionMeta>> {
+        match self
+            .load_meta_row_with(&self.session_id, refs_available)
+            .await?
+        {
             Some(meta) => {
                 *self.cached_meta.lock().unwrap() = Some(meta.clone());
                 Ok(Some(meta))
@@ -2554,7 +2560,10 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
         title: Option<&str>,
     ) -> Result<()> {
         let _guard = self.session_meta_lock(session_id).lock_owned().await;
-        if let Some(existing) = self.load_meta_row(session_id).await? {
+        // One availability decision for this operation, taken AFTER the
+        // mutation lock: every row read and the snapshot write below use it.
+        let refs_available = self.ensure_refs_available().await;
+        if let Some(existing) = self.load_meta_row_with(session_id, refs_available).await? {
             // Row already exists (resume, or a btw/subagent row whose
             // parent link was unknown at build time): only ever backfill
             // what is MISSING — the parent link and/or a model — never
@@ -2572,7 +2581,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
                     parent_session_id,
                     parent_task_id,
                 );
-                self.insert_meta(&mut meta).await?;
+                self.insert_meta(&mut meta, refs_available).await?;
                 *self.cached_meta.lock().unwrap() = Some(meta);
             }
             return Ok(());
@@ -2594,7 +2603,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             writer: None,   // stamped by insert_meta with the writing process
             label: None,    // label lives in running_tasks, resolved at list time
         };
-        self.insert_meta(&mut meta).await?;
+        self.insert_meta(&mut meta, refs_available).await?;
         *self.cached_meta.lock().unwrap() = Some(meta);
         Ok(())
     }
@@ -2611,13 +2620,14 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
     /// losing the final touch at process exit is acceptable.
     pub async fn touch_meta(&self) -> Result<()> {
         let _guard = self.session_meta_lock(&self.session_id).lock_owned().await;
-        let Some(meta) = self.effective_meta().await? else {
+        let refs_available = self.ensure_refs_available().await;
+        let Some(meta) = self.effective_meta(refs_available).await? else {
             return Ok(());
         };
         let mut meta = meta;
         meta.last_active_at = us_to_datetime(next_event_time_us());
         meta.entry_count = self.next_seq.load(Ordering::Acquire);
-        self.insert_meta(&mut meta).await?;
+        self.insert_meta(&mut meta, refs_available).await?;
         *self.cached_meta.lock().unwrap() = Some(meta);
         Ok(())
     }
@@ -2640,17 +2650,18 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
     /// touches.
     pub async fn set_title(&self, session_id: &str, title: Option<&str>) -> Result<()> {
         let _guard = self.session_meta_lock(session_id).lock_owned().await;
+        let refs_available = self.ensure_refs_available().await;
         let meta = if session_id == self.session_id {
-            self.effective_meta().await?
+            self.effective_meta(refs_available).await?
         } else {
-            self.load_meta_row(session_id).await?
+            self.load_meta_row_with(session_id, refs_available).await?
         };
         let Some(mut meta) = meta else {
             return Ok(());
         };
         meta.title = title.map(str::to_owned);
         meta.last_active_at = us_to_datetime(next_event_time_us());
-        self.insert_meta(&mut meta).await?;
+        self.insert_meta(&mut meta, refs_available).await?;
         if session_id == self.session_id {
             *self.cached_meta.lock().unwrap() = Some(meta);
         }
@@ -2675,17 +2686,18 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
     /// touches.
     pub async fn set_pinned(&self, session_id: &str, pinned: bool) -> Result<()> {
         let _guard = self.session_meta_lock(session_id).lock_owned().await;
+        let refs_available = self.ensure_refs_available().await;
         let meta = if session_id == self.session_id {
-            self.effective_meta().await?
+            self.effective_meta(refs_available).await?
         } else {
-            self.load_meta_row(session_id).await?
+            self.load_meta_row_with(session_id, refs_available).await?
         };
         let Some(mut meta) = meta else {
             return Ok(());
         };
         meta.pinned = Some(pinned);
         meta.last_active_at = us_to_datetime(next_event_time_us());
-        self.insert_meta(&mut meta).await?;
+        self.insert_meta(&mut meta, refs_available).await?;
         if session_id == self.session_id {
             *self.cached_meta.lock().unwrap() = Some(meta);
         }
@@ -2711,17 +2723,18 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
     /// touches.
     pub async fn set_archived(&self, session_id: &str, archived: bool) -> Result<()> {
         let _guard = self.session_meta_lock(session_id).lock_owned().await;
+        let refs_available = self.ensure_refs_available().await;
         let meta = if session_id == self.session_id {
-            self.effective_meta().await?
+            self.effective_meta(refs_available).await?
         } else {
-            self.load_meta_row(session_id).await?
+            self.load_meta_row_with(session_id, refs_available).await?
         };
         let Some(mut meta) = meta else {
             return Ok(());
         };
         meta.archived = Some(archived);
         meta.last_active_at = us_to_datetime(next_event_time_us());
-        self.insert_meta(&mut meta).await?;
+        self.insert_meta(&mut meta, refs_available).await?;
         if session_id == self.session_id {
             *self.cached_meta.lock().unwrap() = Some(meta);
         }
@@ -2743,21 +2756,25 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             &mut Vec<crate::session_store::SessionRef>,
         ) -> std::result::Result<(), String>,
     ) -> Result<Vec<crate::session_store::SessionRef>> {
+        // Serialized against every other metadata writer for this session
+        // FIRST: the read-mutate-insert below is not atomic on its own, and
+        // a probe/flag flip before taking this lock would let a concurrent
+        // touch read without `refs` and then write without carrying them.
+        let _guard = self.session_meta_lock(session_id).lock_owned().await;
+        // ONE availability decision for this operation (read, mutate, write).
         // A degraded handle re-probes before refusing: another handle may
         // have repaired the schema since this one connected.
-        if !self.ensure_refs_available().await {
+        let refs_available = self.ensure_refs_available().await;
+        if !refs_available {
             anyhow::bail!(
                 "session links are unavailable: the sessions.refs column is missing \
                  (the schema migration failed on this database)"
             );
         }
-        // Serialized against every other metadata writer for this session:
-        // the read-mutate-insert below is not atomic on its own.
-        let _guard = self.session_meta_lock(session_id).lock_owned().await;
         let meta = if session_id == self.session_id {
-            self.effective_meta().await?
+            self.effective_meta(refs_available).await?
         } else {
-            self.load_meta_row(session_id).await?
+            self.load_meta_row_with(session_id, refs_available).await?
         };
         let Some(mut meta) = meta else {
             anyhow::bail!("session {session_id} has no metadata row to store links in");
@@ -2765,7 +2782,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
         mutate(&mut meta.refs).map_err(anyhow::Error::msg)?;
         crate::session_store::dedup_refs(&mut meta.refs);
         meta.last_active_at = us_to_datetime(next_event_time_us());
-        self.insert_meta(&mut meta).await?;
+        self.insert_meta(&mut meta, refs_available).await?;
         if session_id == self.session_id {
             *self.cached_meta.lock().unwrap() = Some(meta.clone());
         }
@@ -2855,10 +2872,13 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
     ) -> Result<(Vec<SessionMeta>, crate::session_store::ListMetaDiagnostics)> {
         let query_started = std::time::Instant::now();
         let (filter_clause, live_ids) = sidebar_filter_clause(sidebar_filter);
-        let refs = refs_select(self.refs_available.load(Ordering::Relaxed));
+        // One availability decision for this query: projection, aggregate
+        // expression and decode all use the same shape.
+        let refs_available = self.refs_available.load(Ordering::Relaxed);
+        let refs = refs_select(refs_available);
         // The dedup subquery projects the same tail: a missing column is
         // simply not selected, so a degraded old database still lists.
-        let refs_groups = refs_group(self.refs_available.load(Ordering::Relaxed));
+        let refs_groups = refs_group(refs_available);
         let sql = format!(
             "SELECT session_id, created_at, last_active_at, model, \"role\", entry_count, \
                     parent_session_id, parent_task_id, title, pinned, archived, writer{refs} \
@@ -2897,11 +2917,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             .iter()
             .map(|row| {
                 let session_id: String = row.get("session_id");
-                Self::meta_from_row(
-                    row,
-                    &session_id,
-                    self.refs_available.load(Ordering::Relaxed),
-                )
+                Self::meta_from_row(row, &session_id, refs_available)
             })
             .collect::<Result<Vec<_>>>()?;
         let decode_ms = decode_started.elapsed().as_millis();
@@ -2921,7 +2937,8 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
     /// activity first. This is the audit view — [`Self::list_meta`] shows
     /// only the latest snapshot per session.
     pub async fn audit_meta(&self, session_id: &str) -> Result<Vec<SessionMeta>> {
-        let refs = refs_select(self.refs_available.load(Ordering::Relaxed));
+        let refs_available = self.refs_available.load(Ordering::Relaxed);
+        let refs = refs_select(refs_available);
         let rows = self
             .client
             .query(
@@ -2937,9 +2954,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             .await
             .context("cannot load session metadata audit trail")?;
         rows.iter()
-            .map(|row| {
-                Self::meta_from_row(row, session_id, self.refs_available.load(Ordering::Relaxed))
-            })
+            .map(|row| Self::meta_from_row(row, session_id, refs_available))
             .collect()
     }
 
@@ -3000,22 +3015,38 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             if existing.iter().any(|id| id == &session_id) {
                 continue;
             }
-            self.insert_meta(&mut SessionMeta {
-                session_id,
-                created_at: row.get("created_at"),
-                last_active_at: row.get("last_active_at"),
-                model: None,
-                role: None,
-                entry_count: row.get("entry_count"),
-                parent_session_id: None,
-                parent_task_id: None,
-                title: None,      // pre-table sessions have no user-assigned name
-                pinned: None,     // pre-table sessions are unpinned
-                archived: None,   // pre-table sessions are unarchived
-                refs: Vec::new(), // pre-table sessions carry no PR/issue links
-                writer: None,     // stamped by insert_meta with the writing process
-                label: None,      // label lives in running_tasks, resolved at list time
-            })
+            // The scan above is only a prefilter: a concurrent create may
+            // have landed since. Recheck absence under the same per-session
+            // mutation lock every other metadata writer uses, with ONE
+            // availability decision serving that read and the INSERT.
+            let _guard = self.session_meta_lock(&session_id).lock_owned().await;
+            let refs_available = self.ensure_refs_available().await;
+            if self
+                .load_meta_row_with(&session_id, refs_available)
+                .await?
+                .is_some()
+            {
+                continue;
+            }
+            self.insert_meta(
+                &mut SessionMeta {
+                    session_id,
+                    created_at: row.get("created_at"),
+                    last_active_at: row.get("last_active_at"),
+                    model: None,
+                    role: None,
+                    entry_count: row.get("entry_count"),
+                    parent_session_id: None,
+                    parent_task_id: None,
+                    title: None,      // pre-table sessions have no user-assigned name
+                    pinned: None,     // pre-table sessions are unpinned
+                    archived: None,   // pre-table sessions are unarchived
+                    refs: Vec::new(), // pre-table sessions carry no PR/issue links
+                    writer: None,     // stamped by the insert with the writing process
+                    label: None,      // label lives in running_tasks, resolved at list time
+                },
+                refs_available,
+            )
             .await?;
         }
         Ok(())
@@ -3570,6 +3601,109 @@ mod tests {
             "both concurrent adds survive the read-mutate-insert: {stored:?}"
         );
         a.delete_meta(&sid).await.unwrap();
+    }
+
+    /// A handle that opened while `refs` was unavailable must not erase a
+    /// link another handle stored after repairing the schema. Every
+    /// metadata operation decides availability ONCE, after taking the
+    /// per-session mutation lock, and uses that decision for its read and
+    /// its write — a probe that ran before the lock could flip the flag
+    /// under a touch that had already read without `refs`.
+    #[tokio::test]
+    async fn degraded_handle_metadata_writes_keep_repaired_links() {
+        use crate::session_store::SessionRef;
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let sid = format!("test-gt-degraded-refs-{}", crate::session::new_id());
+        // Simulate a handle that connected while the column was missing:
+        // the schema is repaired by the other handle below.
+        let degraded = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        degraded.refs_available.store(false, Ordering::Relaxed);
+        let repairing = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        repairing
+            .create_meta(&sid, Some("m"), Some("main"), None, None, None)
+            .await
+            .unwrap();
+        let pr = SessionRef::new("pr", "https://github.com/acme/widget/pull/14").unwrap();
+        repairing
+            .update_refs(&sid, |refs| {
+                refs.push(pr.clone());
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        // A turn-boundary metadata touch on the degraded handle must carry
+        // the link forward instead of appending a snapshot without it.
+        degraded.touch_meta().await.unwrap();
+        assert_eq!(
+            repairing.load_meta_row(&sid).await.unwrap().unwrap().refs,
+            vec![pr.clone()],
+            "the degraded handle's touch must not erase the repaired link"
+        );
+
+        // The ref edit sibling: it takes the mutation lock BEFORE probing,
+        // so its read and write share one availability decision and the
+        // existing link survives its own addition.
+        let issue = SessionRef::new("issue", "https://github.com/acme/gadget/issues/22").unwrap();
+        degraded
+            .update_refs(&sid, |refs| {
+                refs.push(issue.clone());
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            repairing.load_meta_row(&sid).await.unwrap().unwrap().refs,
+            vec![pr, issue],
+            "the degraded edit keeps every link and adds its own"
+        );
+        degraded.delete_meta(&sid).await.unwrap();
+    }
+
+    /// The ref edit must take the per-session mutation lock BEFORE probing
+    /// `sessions.refs`. A probe that runs first can flip the shared
+    /// availability flag while a concurrent touch is between its row read
+    /// (without `refs`) and its snapshot write, making the touch skip the
+    /// carry-forward and erase the repaired link.
+    #[tokio::test]
+    async fn update_refs_probes_only_after_taking_the_mutation_lock() {
+        use std::sync::Arc;
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let sid = format!("test-gt-refs-lock-order-{}", crate::session::new_id());
+        let session = Arc::new(GreptimeSession::connect(&conn, &wid, &sid).await.unwrap());
+        session
+            .create_meta(&sid, Some("m"), Some("main"), None, None, None)
+            .await
+            .unwrap();
+        // Degraded handle: the schema is actually present, so a probe WOULD
+        // flip the flag to true.
+        session.refs_available.store(false, Ordering::Relaxed);
+        let lock = session.session_meta_lock(&sid);
+        let guard = lock.lock_owned().await;
+        let edit = tokio::spawn({
+            let session = session.clone();
+            let sid = sid.clone();
+            async move { session.update_refs(&sid, |_| Ok(())).await }
+        });
+        // Let the spawned edit reach its first await: the lock.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !session.refs_available.load(Ordering::Relaxed),
+            "update_refs must not probe (and promote the flag) before the              mutation lock is held"
+        );
+        drop(guard);
+        edit.await.unwrap().unwrap();
+        session.delete_meta(&sid).await.unwrap();
     }
 
     fn conn_str() -> String {

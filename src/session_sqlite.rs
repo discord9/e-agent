@@ -2319,8 +2319,12 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
     /// ONE column wide either way, so the row decoders keep their positional
     /// indices and a degraded old database reads links as empty instead of
     /// failing the whole read.
-    fn refs_projection(&self, qualified: bool) -> &'static str {
-        match (self.refs_available.load(Ordering::Relaxed), qualified) {
+    ///
+    /// `refs_available` is the ONE decision an operation made when it began
+    /// (`ensure_refs_available_in`): projection, decode and write all use it,
+    /// never a fresh look at the shared flag.
+    fn refs_projection(refs_available: bool, qualified: bool) -> &'static str {
+        match (refs_available, qualified) {
             (true, true) => "s.refs",
             (true, false) => "refs",
             (false, _) => "NULL",
@@ -2334,8 +2338,12 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
     /// their transaction.
     #[cfg(test)]
     async fn load_meta_row(&self, session_id: &str) -> Result<Option<SessionMeta>, String> {
+        // One decision for this read: the projection and the decode must
+        // agree even if a degraded handle flips its flag concurrently.
+        let refs_available = self.refs_available.load(Ordering::Relaxed);
         let conn = self.conn.lock().await;
-        self.load_meta_row_locked(&conn, session_id).await
+        self.load_meta_row_locked(&conn, session_id, refs_available)
+            .await
     }
 
     /// The row read behind [`Self::load_meta_row`], on a connection the
@@ -2346,8 +2354,9 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
         &self,
         conn: &turso::Connection,
         session_id: &str,
+        refs_available: bool,
     ) -> Result<Option<SessionMeta>, String> {
-        let refs = self.refs_projection(false);
+        let refs = Self::refs_projection(refs_available, false);
         let mut rows = conn
             .query(
                 &format!(
@@ -2371,19 +2380,46 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
         }
     }
 
-    async fn insert_meta(&self, meta: &mut SessionMeta) -> Result<(), String> {
-        let conn = self.conn.lock().await;
-        // A degraded handle must not omit `refs` after another handle
-        // repaired the schema: the probe runs on this handle's connection
-        // before the write. When it now finds the column, carry the CURRENT
-        // row's links forward — the snapshot in hand was read without them.
-        if !self.refs_available.load(Ordering::Relaxed)
-            && self.ensure_refs_available_in(&conn).await?
-            && let Some(current) = self.load_meta_row_locked(&conn, &meta.session_id).await?
-        {
-            meta.refs = current.refs;
+    /// Append the bootstrap snapshot for ONE session, atomically.
+    ///
+    /// The absence recheck and the INSERT run inside one `BEGIN IMMEDIATE`
+    /// transaction: the aggregate scan and this write deliberately release
+    /// the connection between them, so a concurrent create (or a ref edit on
+    /// a just-created row) can otherwise land in the window and a second,
+    /// empty-links snapshot would win the latest-row race. One availability
+    /// decision, taken inside that transaction, selects both the projection
+    /// the recheck decodes and the column the INSERT writes.
+    async fn insert_backfill_meta(&self, mut meta: SessionMeta) -> Result<(), String> {
+        let mut conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(turso::transaction::TransactionBehavior::Immediate)
+            .await
+            .map_err(|e| format!("cannot begin metadata backfill transaction: {e}"))?;
+        let outcome: Result<(), String> = async {
+            let refs_available = self.ensure_refs_available_in(&tx).await?;
+            if self
+                .load_meta_row_locked(&tx, &meta.session_id, refs_available)
+                .await?
+                .is_some()
+            {
+                // The row appeared after the aggregate scan: leave it
+                // untouched (its links and fresh timestamp win).
+                return Ok(());
+            }
+            self.insert_meta_locked(&tx, &mut meta, refs_available)
+                .await
         }
-        self.insert_meta_locked(&conn, meta).await
+        .await;
+        match outcome {
+            Ok(()) => tx
+                .commit()
+                .await
+                .map_err(|e| format!("cannot commit metadata backfill transaction: {e}")),
+            Err(error) => {
+                let _ = tx.rollback().await;
+                Err(error)
+            }
+        }
     }
 
     /// Does the caller's connection see `sessions.refs`? Used to re-probe
@@ -2427,12 +2463,16 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
         Ok(available)
     }
 
-    /// The append behind [`Self::insert_meta`], on a connection the caller
-    /// already holds (see [`Self::load_meta_row_locked`]).
+    /// The append behind the metadata mutators, on a connection the caller
+    /// already holds (see [`Self::load_meta_row_locked`]). `refs_available`
+    /// is the operation's ONE decision: it selects the INSERT shape, exactly
+    /// the decision the row read used, so a flag flip cannot make the write
+    /// name a column the read never decoded.
     async fn insert_meta_locked(
         &self,
         conn: &turso::Connection,
         meta: &mut SessionMeta,
+        refs_available: bool,
     ) -> Result<(), String> {
         // Stamp the writer identity at insert time, not at construction
         // (P3): every snapshot row records the process that actually wrote
@@ -2440,7 +2480,7 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
         // from a row cached by another process. Callers construct with
         // `writer: None`; the stamped value is what lands in the column.
         meta.writer = Some(process_identity().to_owned());
-        if self.refs_available.load(Ordering::Relaxed) {
+        if refs_available {
             // Encode the refs JSON before the statement: the column is one
             // JSON value, and its absence (NULL) and an empty list mean the
             // same thing on read.
@@ -2512,9 +2552,11 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
     /// - a row deleted between the read and the append cannot be
     ///   resurrected: the check and the INSERT are one atomic write
     ///   transaction (the transcript append path's discipline);
-    /// - a degraded handle re-probes `sessions.refs` before its degraded
-    ///   write, so a schema another handle repaired is used and the latest
-    ///   row's links are carried forward instead of being written as NULL.
+    /// - a degraded handle makes ONE availability decision inside the
+    ///   transaction (re-probing `sessions.refs`), and that same decision
+    ///   selects the row read and the snapshot write: a schema another
+    ///   handle repaired is used for both, so the latest row's links are
+    ///   read and carried instead of being written as NULL.
     ///
     /// Returns the mutation's value, or `None` when the session has no
     /// metadata row (R3: touch / flag setters never self-create).
@@ -2540,12 +2582,16 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
                         .to_string(),
                 );
             }
-            let Some(mut meta) = self.load_meta_row_locked(&tx, session_id).await? else {
+            let Some(mut meta) = self
+                .load_meta_row_locked(&tx, session_id, refs_available)
+                .await?
+            else {
                 return Ok(None);
             };
             let value = mutate(&mut meta)?;
             meta.last_active_at = us_to_datetime(next_event_time_us());
-            self.insert_meta_locked(&tx, &mut meta).await?;
+            self.insert_meta_locked(&tx, &mut meta, refs_available)
+                .await?;
             Ok(Some((value, meta)))
         }
         .await;
@@ -2608,7 +2654,7 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
             pinned: existing.pinned,
             archived: existing.archived,
             refs: existing.refs.clone(), // links are never rewritten by a resume
-            writer: None,                // stamped by insert_meta with the writing process
+            writer: None,                // stamped by the insert with the writing process
             label: None,                 // label lives in running_tasks, resolved at list time
         }
     }
@@ -2655,8 +2701,13 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
             .await
             .map_err(|e| format!("cannot begin metadata transaction: {e}"))?;
         let outcome: Result<Option<SessionMeta>, String> = async {
-            self.ensure_refs_available_in(&tx).await?;
-            if let Some(existing) = self.load_meta_row_locked(&tx, session_id).await? {
+            // ONE decision for this operation: the same `refs_available`
+            // selects the row projection and the INSERT shape below.
+            let refs_available = self.ensure_refs_available_in(&tx).await?;
+            if let Some(existing) = self
+                .load_meta_row_locked(&tx, session_id, refs_available)
+                .await?
+            {
                 // Row already exists (resume, or a btw/subagent row whose
                 // parent link was unknown at build time): only ever backfill
                 // what is MISSING — the parent link and/or a model — never
@@ -2674,7 +2725,8 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
                         parent_session_id,
                         parent_task_id,
                     );
-                    self.insert_meta_locked(&tx, &mut meta).await?;
+                    self.insert_meta_locked(&tx, &mut meta, refs_available)
+                        .await?;
                     return Ok(Some(meta));
                 }
                 return Ok(None);
@@ -2693,10 +2745,11 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
                 pinned: None,     // a fresh session is unpinned until the user pins it
                 archived: None,   // a fresh session is unarchived until the user archives it
                 refs: Vec::new(), // no PR/issue links until the tool or the owner adds them
-                writer: None,     // stamped by insert_meta with the writing process
+                writer: None,     // stamped by the insert with the writing process
                 label: None,      // label lives in running_tasks, resolved at list time
             };
-            self.insert_meta_locked(&tx, &mut meta).await?;
+            self.insert_meta_locked(&tx, &mut meta, refs_available)
+                .await?;
             Ok(Some(meta))
         }
         .await;
@@ -2879,7 +2932,10 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
         let connection_lock_wait_ms = lock_started.elapsed().as_millis();
         let query_started = std::time::Instant::now();
         let (filter_clause, live_ids) = sqlite_sidebar_filter_clause(sidebar_filter);
-        let refs = self.refs_projection(true);
+        // One decision for this read: the projection and the NULL-or-column
+        // decode below can never disagree.
+        let refs_available = self.refs_available.load(Ordering::Relaxed);
+        let refs = Self::refs_projection(refs_available, true);
         let sql = format!(
             "SELECT s.session_id, s.created_at, s.last_active_at, s.model, s.\"role\", \
                     s.entry_count, s.parent_session_id, s.parent_task_id, s.title, s.pinned, \
@@ -2939,7 +2995,8 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
     /// activity first. This is the audit view — [`Self::list_meta`] shows
     /// only the latest snapshot per session.
     pub async fn audit_meta(&self, session_id: &str) -> Result<Vec<SessionMeta>, String> {
-        let refs = self.refs_projection(false);
+        let refs_available = self.refs_available.load(Ordering::Relaxed);
+        let refs = Self::refs_projection(refs_available, false);
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
@@ -3090,7 +3147,10 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
             if existing.iter().any(|id| id == &session_id) {
                 continue;
             }
-            self.insert_meta(&mut SessionMeta {
+            // The scan above is only a prefilter: the row may have appeared
+            // since. `insert_backfill_meta` rechecks absence inside its own
+            // write transaction and appends nothing when it finds one.
+            self.insert_backfill_meta(SessionMeta {
                 session_id,
                 created_at: us_to_datetime(created_us),
                 last_active_at: us_to_datetime(last_us),
@@ -3103,7 +3163,7 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
                 pinned: None,     // pre-table sessions are unpinned
                 archived: None,   // pre-table sessions are unarchived
                 refs: Vec::new(), // pre-table sessions carry no PR/issue links
-                writer: None,     // stamped by insert_meta with the writing process
+                writer: None,     // stamped by the insert with the writing process
                 label: None,      // label lives in running_tasks, resolved at list time
             })
             .await?;
