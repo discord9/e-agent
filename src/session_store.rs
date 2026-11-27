@@ -984,6 +984,11 @@ pub struct FinishedTask {
     pub kind: Option<String>,
     /// Explicit cancellation source, absent for normal/legacy completion.
     pub cancellation_source: Option<crate::agent::CancellationSource>,
+    /// The delegate/fork/btw child's own session id (the `send_message`
+    /// target), from the persisted entry's structured field. Absent for bash
+    /// tasks and for rows persisted before the field existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagent_session_id: Option<String>,
 }
 
 /// Identifies a session's background-task projection target: the workspace
@@ -4613,6 +4618,7 @@ mod shared_helpers {
             status: Some(status.into()),
             kind: Some("bash".into()),
             cancellation_source: None,
+            subagent_session_id: None,
         })
         .unwrap()
     }
@@ -4852,6 +4858,8 @@ mod shared_helpers {
                 content: "ok".into(),
                 is_error: false,
                 synthetic: false,
+                started_task_id: None,
+                subagent_session_id: None,
                 images: vec![],
             }
             .into(),
@@ -4861,6 +4869,8 @@ mod shared_helpers {
                 content: "boom".into(),
                 is_error: true,
                 synthetic: false,
+                started_task_id: None,
+                subagent_session_id: None,
                 images: vec![],
             }
             .into(),
@@ -4884,6 +4894,7 @@ mod shared_helpers {
                 status: None,
                 kind: None,
                 cancellation_source: None,
+                subagent_session_id: None,
             },
             SessionEntry::ForkedFrom {
                 source: "src".into(),

@@ -685,9 +685,10 @@ impl TuiState {
         output: &str,
         label: Option<&str>,
         kind: Option<&str>,
+        subagent_session_id: Option<&str>,
     ) {
         self.push_line(
-            background_completion_header(id, label, kind, output),
+            background_completion_header(id, label, kind, subagent_session_id, output),
             LineKind::Dim,
         );
         let truncated = truncate_background_output(output);
@@ -1790,6 +1791,7 @@ impl TuiState {
                 status,
                 kind,
                 cancellation_source,
+                subagent_session_id,
                 ..
             } => {
                 // End the streaming lane BEFORE the aside lines: a
@@ -1798,7 +1800,13 @@ impl TuiState {
                 // the next delta (the body would merge into the Dim line
                 // and lose its markdown rendering). Same as Notice/Error.
                 self.active_lane = None;
-                self.push_background_completion(id, &output, label.as_deref(), kind.as_deref());
+                self.push_background_completion(
+                    id,
+                    &output,
+                    label.as_deref(),
+                    kind.as_deref(),
+                    subagent_session_id.as_deref(),
+                );
                 // Finished section: newest first, capped. The notice fires
                 // only after the durable entry is committed, so this is a
                 // projection of `session_entries`, not a second store.
@@ -1938,14 +1946,19 @@ impl TuiState {
 /// path (`push_background_completion`) and the persisted-entry replay
 /// (`session_entry_to_lines`) so the two can never drift apart. Delegate
 /// completions end with the child's untruncated session id tag, matching the
-/// model-facing notice.
+/// model-facing notice. The tag prefers the structured
+/// `subagent_session_id`; `output` is only the legacy fallback for rows
+/// persisted before that field existed (see
+/// [`crate::agent::background_session_tag`]).
 fn background_completion_header(
     id: u64,
     label: Option<&str>,
     kind: Option<&str>,
+    subagent_session_id: Option<&str>,
     output: &str,
 ) -> String {
-    let tag = crate::agent::background_session_tag(kind, output).unwrap_or_default();
+    let tag =
+        crate::agent::background_session_tag(kind, subagent_session_id, output).unwrap_or_default();
     match label.filter(|l| !l.trim().is_empty()) {
         Some(l) => {
             let previewed = crate::agent::preview(l, 60);
@@ -2023,10 +2036,17 @@ pub(crate) fn session_entry_to_lines(entry: &SessionEntry) -> Vec<DisplayLine> {
             output,
             label,
             kind,
+            subagent_session_id,
             ..
         } => {
             let mut lines = vec![DisplayLine {
-                text: background_completion_header(*id, label.as_deref(), kind.as_deref(), output),
+                text: background_completion_header(
+                    *id,
+                    label.as_deref(),
+                    kind.as_deref(),
+                    subagent_session_id.as_deref(),
+                    output,
+                ),
                 kind: LineKind::Dim,
                 collapsed_summary: None,
             }];
