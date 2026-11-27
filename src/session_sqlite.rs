@@ -952,13 +952,31 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
     /// payload pinned by `seq` + `event_time_us` (never latest-wins),
     /// re-check the entry hash, extract the field, and reject total-size
     /// drift. Returns the exact persisted field bytes.
+    ///
+    /// Bound-session read: the ref must name THIS session. [`Self::read_field_as`]
+    /// is the same read for a row the caller has already authorized (a fork
+    /// source's row, read through this open handle).
     pub async fn read_field(&self, verified: &VerifiedRef) -> Result<Vec<u8>, String> {
+        self.read_field_as(&self.session_id, verified).await
+    }
+
+    /// [`Self::read_field`] for a row owned by `session_id` — the ref's own
+    /// session, which the caller has already authorized. The connection is the
+    /// one that is ALREADY OPEN: a `:memory:` database lives in this
+    /// connection, so reconnecting to reach the row would read an empty
+    /// database. Everything else is unchanged (workspace + backend-instance
+    /// fingerprint, pinned `(seq, event_time_us)`, payload hash, field, size).
+    pub async fn read_field_as(
+        &self,
+        session_id: &str,
+        verified: &VerifiedRef,
+    ) -> Result<Vec<u8>, String> {
         let location = &verified.location;
         validate_location_for_store(
             location,
             "sqlite",
             &self.workspace_id,
-            &self.session_id,
+            session_id,
             &self.backend_fp,
         )
         .map_err(|error| error.display())?;
@@ -974,12 +992,7 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
             .query(
                 "SELECT payload FROM session_entries \
                  WHERE workspace_id = ?1 AND session_id = ?2 AND seq = ?3 AND event_time_us = ?4",
-                (
-                    self.workspace_id.as_str(),
-                    self.session_id.as_str(),
-                    seq,
-                    event_time_us,
-                ),
+                (self.workspace_id.as_str(), session_id, seq, event_time_us),
             )
             .await
             .map_err(|e| format!("cannot read pinned entry: {e}"))?;

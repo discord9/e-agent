@@ -15,10 +15,10 @@ use crate::output_receipt::{
     ReceiptError, ReceiptErrorKind, VerifiedRef, field_bytes, validate_location_for_store,
 };
 use crate::session_store::{
-    EntryLocation, HistoryEntry, HistoryQuery, LocatedKey, SessionMeta, UsageRow, datetime_to_us,
-    dedup_finished_rows, dedup_raw_entries, dedup_raw_located, entry_kind, entry_payload_hash,
-    format_conflict_error, is_error, next_event_time_us, process_identity, us_to_datetime,
-    workspace_id_fingerprint,
+    EntryLocation, HistoryEntry, HistoryQuery, LocatedKey, SessionMeta, UsageRow,
+    checked_us_to_datetime, datetime_to_us, dedup_finished_rows, dedup_raw_entries,
+    dedup_raw_located, entry_kind, entry_payload_hash, format_conflict_error, is_error,
+    next_event_time_us, process_identity, us_to_datetime, workspace_id_fingerprint,
 };
 // Public path preserved for `src/bin/import_jsonl.rs` (was a `pub fn`
 // defined here before the shared-helper extraction).
@@ -616,13 +616,8 @@ impl GreptimeSession {
         ).await.context("cannot load session entries")?;
         let raw = rows
             .iter()
-            .map(|r| {
-                let seq: i64 = r.get("seq");
-                let event_time: chrono::NaiveDateTime = r.get("event_time");
-                let payload: String = r.get("payload");
-                (seq, event_time, payload)
-            })
-            .collect::<Vec<_>>();
+            .map(decode_entry_row)
+            .collect::<Result<Vec<_>>>()?;
         dedup_raw_entries(&raw, session_id, workspace_id, "event_time").map_err(anyhow::Error::msg)
     }
 
@@ -837,13 +832,8 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
 
         let raw: Vec<(i64, chrono::NaiveDateTime, String)> = rows
             .iter()
-            .map(|r| {
-                let seq: i64 = r.get("seq");
-                let et: chrono::NaiveDateTime = r.get("event_time");
-                let p: String = r.get("payload");
-                (seq, et, p)
-            })
-            .collect();
+            .map(decode_entry_row)
+            .collect::<Result<Vec<_>>>()?;
 
         let fingerprint = workspace_id_fingerprint(&self.workspace_id);
         let located = dedup_raw_located(&raw, &self.session_id, &self.workspace_id, "event_time")
@@ -898,13 +888,28 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
     /// receipt's signed hash (identical duplicates fold), and reject
     /// divergent rows / no match. Re-checks the entry hash, extracts the
     /// field, and rejects total-size drift.
+    ///
+    /// Bound-session read: the ref must name THIS session.
+    /// [`Self::read_field_as`] is the same read for a row the caller has
+    /// already authorized (a fork source's row, read through this open
+    /// connection).
     pub async fn read_field(&self, verified: &VerifiedRef) -> Result<Vec<u8>> {
+        self.read_field_as(&self.session_id, verified).await
+    }
+
+    /// [`Self::read_field`] for a row owned by `session_id` — the ref's own
+    /// session, which the caller has already authorized. The query runs on the
+    /// client that is ALREADY CONNECTED; everything else is unchanged.
+    ///
+    /// A receipt's pinned `event_time` µs is decoded FALLIBLY: an out-of-range
+    /// value is an `integrity` error the caller sees, never a panic.
+    pub async fn read_field_as(&self, session_id: &str, verified: &VerifiedRef) -> Result<Vec<u8>> {
         let location = &verified.location;
         validate_location_for_store(
             location,
             "greptime",
             &self.workspace_id,
-            &self.session_id,
+            session_id,
             &self.backend_fp,
         )
         .map_err(anyhow::Error::msg)?;
@@ -915,17 +920,13 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             )
             .into());
         };
+        let pinned_time = pinned_event_time(event_time_us)?;
         let rows = self
             .client
             .query(
                 "SELECT payload FROM session_entries \
                  WHERE workspace_id = $1 AND session_id = $2 AND seq = $3 AND event_time = $4",
-                &[
-                    &self.workspace_id,
-                    &self.session_id,
-                    &seq,
-                    &us_to_datetime(event_time_us),
-                ],
+                &[&self.workspace_id, &session_id, &seq, &pinned_time],
             )
             .await
             .context("cannot read pinned entry")?;
@@ -1042,13 +1043,8 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             .context("cannot load head segment")?;
         let raw: Vec<(i64, chrono::NaiveDateTime, String)> = rows
             .iter()
-            .map(|r| {
-                let seq: i64 = r.get("seq");
-                let et: chrono::NaiveDateTime = r.get("event_time");
-                let p: String = r.get("payload");
-                (seq, et, p)
-            })
-            .collect();
+            .map(decode_entry_row)
+            .collect::<Result<Vec<_>>>()?;
 
         dedup_raw_entries(&raw, &self.session_id, &self.workspace_id, "event_time")
             .map_err(anyhow::Error::msg)
@@ -1200,13 +1196,8 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
                         .context("cannot load middle segment")?
                 };
                 rows.iter()
-                    .map(|r| {
-                        let seq: i64 = r.get("seq");
-                        let et: chrono::NaiveDateTime = r.get("event_time");
-                        let p: String = r.get("payload");
-                        (seq, et, p)
-                    })
-                    .collect()
+                    .map(decode_entry_row)
+                    .collect::<Result<Vec<_>>>()?
             }
             // Oldest segment: [0, before). Nothing older follows.
             None => {
@@ -1238,13 +1229,8 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
                         .context("cannot load oldest segment")?
                 };
                 rows.iter()
-                    .map(|r| {
-                        let seq: i64 = r.get("seq");
-                        let et: chrono::NaiveDateTime = r.get("event_time");
-                        let p: String = r.get("payload");
-                        (seq, et, p)
-                    })
-                    .collect()
+                    .map(decode_entry_row)
+                    .collect::<Result<Vec<_>>>()?
             }
         };
 
@@ -1331,12 +1317,11 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
                 )
                 .await
                 .context("cannot load oldest entries")?;
-            raw.extend(rows.iter().map(|r| {
-                let seq: i64 = r.get("seq");
-                let et: chrono::NaiveDateTime = r.get("event_time");
-                let payload: String = r.get("payload");
-                (seq, et, payload)
-            }));
+            raw.extend(
+                rows.iter()
+                    .map(decode_entry_row)
+                    .collect::<Result<Vec<_>>>()?,
+            );
         }
         // 3. Shared winner fold: max event_time per seq wins, divergent ties
         //    fail closed.
@@ -1418,13 +1403,8 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             .context("cannot load oldest segment")?;
         let raw: Vec<(i64, chrono::NaiveDateTime, String)> = rows
             .iter()
-            .map(|r| {
-                let seq: i64 = r.get("seq");
-                let et: chrono::NaiveDateTime = r.get("event_time");
-                let p: String = r.get("payload");
-                (seq, et, p)
-            })
-            .collect();
+            .map(decode_entry_row)
+            .collect::<Result<Vec<_>>>()?;
 
         let entries = dedup_raw_entries(&raw, &self.session_id, &self.workspace_id, "event_time")
             .map_err(anyhow::Error::msg)?
@@ -1478,13 +1458,8 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
                     .await
                     .context("cannot load middle segment")?;
                 rows.iter()
-                    .map(|r| {
-                        let seq: i64 = r.get("seq");
-                        let et: chrono::NaiveDateTime = r.get("event_time");
-                        let p: String = r.get("payload");
-                        (seq, et, p)
-                    })
-                    .collect()
+                    .map(decode_entry_row)
+                    .collect::<Result<Vec<_>>>()?
             }
             // Nothing newer: the caller already holds the head segment.
             None => Vec::new(),
@@ -2097,9 +2072,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
         let mut per_seq: std::collections::HashMap<i64, (chrono::NaiveDateTime, Vec<String>)> =
             std::collections::HashMap::with_capacity(rows.len().min(64));
         for row in &rows {
-            let seq: i64 = row.get("seq");
-            let et: chrono::NaiveDateTime = row.get("event_time");
-            let payload: String = row.get("payload");
+            let (seq, et, payload) = decode_entry_row(row)?;
             let entry = per_seq.entry(seq).or_insert((et, Vec::new()));
             match et.cmp(&entry.0) {
                 std::cmp::Ordering::Greater => {
@@ -2159,9 +2132,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
         let mut per_seq: std::collections::HashMap<i64, (chrono::NaiveDateTime, Vec<String>)> =
             std::collections::HashMap::with_capacity(rows.len().min(64));
         for row in &rows {
-            let seq: i64 = row.get("seq");
-            let et: chrono::NaiveDateTime = row.get("event_time");
-            let payload: String = row.get("payload");
+            let (seq, et, payload) = decode_entry_row(row)?;
             let entry = per_seq.entry(seq).or_insert((et, Vec::new()));
             match et.cmp(&entry.0) {
                 std::cmp::Ordering::Greater => {
@@ -3097,6 +3068,77 @@ fn history_payload_matches(payload: &str, needle: &str) -> bool {
         .is_some_and(|text| text.contains(needle))
 }
 
+/// One `event_time` cell of a GreptimeDB `session_entries` row, decoded WITHOUT
+/// panicking: `Row::get` panics on a NULL column and on a column of another
+/// type, so one malformed row would take the whole process down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TimestampCell {
+    /// A usable timestamp.
+    Value(chrono::NaiveDateTime),
+    /// SQL NULL: the row carries no timestamp.
+    Missing,
+    /// The column exists but is not a timestamp (e.g. a numeric or text
+    /// column), so it cannot be pinned into a receipt.
+    NotTimestamp,
+}
+
+/// Decode one timestamp column through `try_get`, the non-panicking row
+/// accessor.
+fn timestamp_cell(row: &tokio_postgres::Row, column: &str) -> TimestampCell {
+    match row.try_get::<_, Option<chrono::NaiveDateTime>>(column) {
+        Ok(Some(value)) => TimestampCell::Value(value),
+        Ok(None) => TimestampCell::Missing,
+        Err(_) => TimestampCell::NotTimestamp,
+    }
+}
+
+/// The `event_time` a loadable session row must carry. A receipt pins
+/// `(seq, event_time)`, so a row without a usable timestamp has no physical
+/// identity: the documented outcome is an ERROR the caller sees, never a panic.
+fn row_event_time(seq: i64, cell: TimestampCell) -> Result<chrono::NaiveDateTime> {
+    match cell {
+        TimestampCell::Value(event_time) => Ok(event_time),
+        TimestampCell::Missing => Err(anyhow::anyhow!(
+            "session entry (seq {seq}) has no event_time; a row without a timestamp \
+             cannot be pinned to a receipt"
+        )),
+        TimestampCell::NotTimestamp => Err(anyhow::anyhow!(
+            "session entry (seq {seq}) has a non-timestamp event_time; a row without a \
+             timestamp cannot be pinned to a receipt"
+        )),
+    }
+}
+
+/// Decode one `session_entries` row as `(seq, event_time, payload)` without
+/// panicking on any of its columns.
+fn decode_entry_row(row: &tokio_postgres::Row) -> Result<(i64, chrono::NaiveDateTime, String)> {
+    let seq: i64 = row
+        .try_get("seq")
+        .context("session entry row has no usable seq")?;
+    let event_time = row_event_time(seq, timestamp_cell(row, "event_time"))?;
+    let payload: String = row
+        .try_get("payload")
+        .context("session entry row has no usable payload")?;
+    Ok((seq, event_time, payload))
+}
+
+/// The `event_time` a receipt pins, decoded FALLIBLY: the µs value comes from
+/// the ref itself (outside this process), so an out-of-range value is an
+/// `integrity` error the caller sees — never the panic `us_to_datetime` raises.
+fn pinned_event_time(
+    event_time_us: i64,
+) -> std::result::Result<chrono::NaiveDateTime, ReceiptError> {
+    checked_us_to_datetime(event_time_us).ok_or_else(|| {
+        ReceiptError::new(
+            ReceiptErrorKind::Integrity,
+            format!(
+                "receipt event_time {event_time_us} µs is out of range; \
+                 the pinned row cannot be located"
+            ),
+        )
+    })
+}
+
 /// Decode one selected physical row; the error text is the read path's
 /// unchanged failure surface.
 fn decode_history_row(row: &tokio_postgres::Row) -> Result<HistoryEntry> {
@@ -3221,6 +3263,55 @@ mod tests {
         assert!(source.contains("ORDER BY seq DESC, event_time DESC LIMIT $5"));
         assert!(source.contains("ORDER BY seq DESC, event_time DESC LIMIT $4"));
         assert!(source.contains("pub async fn load_older_located"));
+    }
+
+    /// A row whose `event_time` cell is MISSING (SQL NULL) or NOT A TIMESTAMP
+    /// must not take the process down: `Row::get` panics on both, so the cell is
+    /// decoded through `try_get` and the documented outcome is the load's error.
+    /// (A `tokio_postgres::Row` cannot be built without a server; the decoded
+    /// cell is what a malformed row yields.)
+    #[test]
+    fn malformed_event_time_is_an_error_not_a_panic() {
+        for (cell, reason) in [
+            (TimestampCell::Missing, "has no event_time"),
+            (
+                TimestampCell::NotTimestamp,
+                "has a non-timestamp event_time",
+            ),
+        ] {
+            let error = row_event_time(7, cell).expect_err("a row without a timestamp fails");
+            let message = error.to_string();
+            assert!(message.contains("seq 7"), "{message}");
+            assert!(message.contains(reason), "{message}");
+            assert!(
+                message.contains("cannot be pinned to a receipt"),
+                "{message}"
+            );
+        }
+        let stamp = us_to_datetime(1_000_001);
+        assert_eq!(
+            row_event_time(7, TimestampCell::Value(stamp)).unwrap(),
+            stamp,
+            "a well-formed cell still loads"
+        );
+    }
+
+    /// A receipt's pinned `event_time` µs comes from the ref, not from this
+    /// process: an out-of-range value is an `integrity` error, never the panic
+    /// `us_to_datetime` raises.
+    #[test]
+    fn out_of_range_receipt_event_time_is_refused_not_panicked() {
+        for bad in [i64::MAX, i64::MIN] {
+            let error = pinned_event_time(bad).expect_err("out-of-range µs is refused");
+            assert_eq!(error.kind, ReceiptErrorKind::Integrity, "{bad}");
+            assert!(
+                error.detail.contains("out of range") && error.detail.contains(&bad.to_string()),
+                "{}",
+                error.detail
+            );
+        }
+        assert_eq!(pinned_event_time(0).unwrap(), us_to_datetime(0));
+        assert_eq!(pinned_event_time(-1).unwrap(), us_to_datetime(-1));
     }
 
     #[test]

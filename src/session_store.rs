@@ -299,6 +299,13 @@ pub(crate) fn us_to_datetime(us: i64) -> chrono::NaiveDateTime {
         .naive_utc()
 }
 
+/// [`us_to_datetime`] for a value that came from OUTSIDE this process — a
+/// receipt's pinned `event_time` µs. `None` rather than a panic: a malformed
+/// ref must surface as an error, never take the process down.
+pub(crate) fn checked_us_to_datetime(us: i64) -> Option<chrono::NaiveDateTime> {
+    chrono::DateTime::from_timestamp_micros(us).map(|dt| dt.naive_utc())
+}
+
 /// Convert chrono NaiveDateTime to microseconds-since-epoch for storage
 /// (SQLite stores INTEGER microseconds; Greptime stores NaiveDateTime
 /// directly and does not need this).
@@ -803,6 +810,18 @@ pub(crate) fn zero_copy_marker(entries: &[SessionEntry]) -> Option<usize> {
             ..,
         ] => Some(1),
         _ => None,
+    }
+}
+
+/// Attach [`SessionStore::ANCESTRY_REFUSED`] as the OUTERMOST reason of a
+/// fork-chain failure, keeping the detail one level down (`{:#}` still shows
+/// it). A reason that is already on top is never nested twice, so a legacy
+/// chain that fails several hops down still reads as one refusal.
+fn ancestry_refusal(error: anyhow::Error) -> anyhow::Error {
+    if error.to_string() == SessionStore::ANCESTRY_REFUSED {
+        error
+    } else {
+        error.context(SessionStore::ANCESTRY_REFUSED)
     }
 }
 
@@ -2168,7 +2187,8 @@ impl SessionStore {
         };
         let context = self
             .fork_marker_context(root, name, &loaded.entries, marker, depth)
-            .await?;
+            .await
+            .map_err(ancestry_refusal)?;
         let inherited = context.entries.len();
         let mut locations = context.locations();
         let mut entries = context.entries;
@@ -2269,56 +2289,55 @@ impl SessionStore {
 
     /// A store bound to `session` on this backend/root instance. Every method
     /// that touches an OTHER session's rows must connect its own store: the
-    /// SQL backends bind the session id at connect time.
+    /// SQL backends bind the session id at connect time. (The one read that
+    /// must NOT reconnect is the authorized receipt read — see
+    /// [`Self::read_owner_field`], where a second connection would be an empty
+    /// SQLite `:memory:` database.)
     pub(crate) async fn source_store(&self, root: &Path, session: &str) -> Result<Self> {
         Self::connect(&self.backend(), root, session)
             .await
             .with_context(|| format!("cannot open fork source session {session}"))
     }
 
-    /// The session a zero-copy marker names as its source (`None` when the
-    /// session has no LEADING marker — an ordinary session, or a copy-based
-    /// fork whose own prefix really is stored here). Bounded: only the leading
-    /// rows are read, never the whole transcript.
-    async fn fork_source(&self, root: &Path, session: &str) -> Result<Option<String>> {
-        let store = self.source_store(root, session).await?;
-        let Some(marker) = store.leading_fork_marker(root, session).await? else {
-            return Ok(None);
-        };
-        let SessionEntry::ForkedFrom { source, .. } = marker else {
-            unreachable!("leading_fork_marker only returns a ForkedFrom entry")
-        };
-        Ok(Some(source))
+    /// Every session that physically stores a row of `reader`'s RESOLVED
+    /// history: the reader itself plus the owner of each inherited row.
+    ///
+    /// This is the ONLY source of ancestry. It is read off the chain the loader
+    /// itself resolved and validated ([`Self::load_fork_located`]) — never off
+    /// the presence or position of a marker: a marker at the front of a log
+    /// says nothing about who owns the rows behind it, so a log whose chain
+    /// does not resolve (a moved or missing fork point, a missing `seq`, a lost
+    /// source, a cycle) authorizes NOTHING — not even an owner-bearing ref
+    /// naming the reader itself — and the failure is the loader's own
+    /// ([`ANCESTRY_REFUSED`]).
+    pub(crate) async fn authorized_owners(&self, root: &Path, reader: &str) -> Result<Vec<String>> {
+        let loaded = self.load_fork_located(root, reader).await?;
+        let mut owners = vec![reader.to_owned()];
+        for location in loaded.locations.iter().flatten() {
+            if !owners.iter().any(|owner| owner == &location.session) {
+                owners.push(location.session.clone());
+            }
+        }
+        Ok(owners)
     }
 
-    /// Whether `owner` is `reader`'s own session or one of its TRANSITIVE fork
-    /// sources — exactly the set of sessions whose rows `reader`'s resolved
-    /// history may name. An inherited prefix points into them (a fork of a fork
-    /// inherits its grandparent's rows), and nothing else is reachable, so an
-    /// owner-bearing ref naming any other session is refused.
+    /// Whether `owner` is `reader`'s own session or a session that physically
+    /// owns a row of its resolved history (see [`Self::authorized_owners`]) —
+    /// an owner-bearing ref naming any other session is refused.
     ///
-    /// Fails closed: a chain that cannot be loaded, or one longer than
-    /// [`Self::FORK_CHAIN_LIMIT`] (a cycle), authorizes nothing.
+    /// Fails closed with [`ANCESTRY_REFUSED`]: a chain that cannot be resolved
+    /// authorizes nothing, so the refusal is the same one the loader gives.
     pub(crate) async fn authorizes_owner(
         &self,
         root: &Path,
         reader: &str,
         owner: &str,
     ) -> Result<bool> {
-        if owner == reader {
-            return Ok(true);
-        }
-        let mut current = reader.to_owned();
-        for _ in 0..Self::FORK_CHAIN_LIMIT {
-            let Some(source) = self.fork_source(root, &current).await? else {
-                return Ok(false);
-            };
-            if source == owner {
-                return Ok(true);
-            }
-            current = source;
-        }
-        Ok(false)
+        Ok(self
+            .authorized_owners(root, reader)
+            .await?
+            .iter()
+            .any(|authorized| authorized == owner))
     }
 
     /// Resolve what ONE zero-copy marker inherits. `own` is the session's own
@@ -3026,6 +3045,13 @@ impl SessionStore {
     /// treated as a cycle and fails closed instead of resolving forever.
     const FORK_CHAIN_LIMIT: usize = 32;
 
+    /// The ONE reason a fork ancestry that does not resolve is refused. The
+    /// loader that resolves the chain and `read_output`, which authorizes a ref
+    /// against that chain, both refuse with exactly this reason: a refused read
+    /// says what a refused load says. (The loader keeps the failure's detail one
+    /// level down, where `{:#}` still shows it.)
+    pub(crate) const ANCESTRY_REFUSED: &str = "fork ancestry does not resolve";
+
     /// The resolved zero-copy fork transcript, but ONLY when this session
     /// really stores a leading fork marker.
     ///
@@ -3115,10 +3141,9 @@ impl SessionStore {
     /// (a same-seq later version can never retarget an old ref), verifies
     /// the fingerprint/session binding, extracts the field, and rejects any
     /// total-size drift with an `integrity` error — but this store must be
-    /// bound to the receipt's OWNING session: the runner's `read_output`
-    /// authorizes the owner and connects THAT session's store
-    /// ([`Self::source_store`]), so the session-binding check below is exactly
-    /// "the reader opened the session the ref names".
+    /// bound to the receipt's OWNING session: this is the bound-session read
+    /// (the runner's `read_output` uses [`Self::read_owner_field`] instead, see
+    /// there).
     pub async fn read_field(
         &self,
         root: &Path,
@@ -3133,6 +3158,41 @@ impl SessionStore {
                 .lock()
                 .await
                 .read_field(verified)
+                .await
+                .map_err(anyhow::Error::msg),
+        }
+    }
+
+    /// Exact-version field read of a ref the caller has ALREADY authorized
+    /// ([`Self::authorizes_owner`]): the row is selected from the ref's own
+    /// owner session THROUGH THIS ALREADY-OPEN HANDLE.
+    ///
+    /// Reconnecting to the owner's session would be wrong: the SQL backends
+    /// bind the session id at connect time, and a SQLite `:memory:` database
+    /// lives in ONE connection — a second connection is an empty database, so
+    /// a receipt that re-opened the store read nothing at all. The backend
+    /// verification is unchanged (backend kind, workspace and backend-instance
+    /// fingerprints, the pinned physical key, the payload hash, the total
+    /// size); only the session the ref names is taken from the ref itself,
+    /// which is exactly the session the caller authorized.
+    pub(crate) async fn read_owner_field(
+        &self,
+        root: &Path,
+        verified: &crate::output_receipt::VerifiedRef,
+    ) -> Result<Vec<u8>> {
+        match self {
+            SessionStore::Jsonl => Session::read_field(root, verified),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session, .. } => {
+                session
+                    .read_field_as(&verified.location.session, verified)
+                    .await
+            }
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite { session, .. } => session
+                .lock()
+                .await
+                .read_field_as(&verified.location.session, verified)
                 .await
                 .map_err(anyhow::Error::msg),
         }
@@ -5627,8 +5687,8 @@ mod tests {
         /// The same collision on the SQLITE binding: parent and child each have
         /// a tool result at the same `seq`. The historical short ref stays
         /// per-session, while the owner-bearing ref (the only form issued)
-        /// resolves through the PARENT's store — the session id is bound at
-        /// connect time, so the reader's own store can never serve it.
+        /// reads the PARENT's row through the handle that is already open,
+        /// carrying the (authorized) owner from the ref itself.
         #[tokio::test]
         async fn owner_bearing_ref_reads_the_parent_row_not_the_same_seqed_child_row() {
             use crate::agent::Message;
@@ -5764,6 +5824,52 @@ mod tests {
             SessionBackend::Sqlite {
                 path: Some(path.to_string_lossy().into_owned()),
             }
+        }
+
+        /// A SQLite `:memory:` database lives in ONE connection: a second
+        /// `connect` opens an EMPTY database. The receipt is therefore read
+        /// through the handle that is already open — write, then read the row
+        /// back through `read_output` and find the content.
+        #[tokio::test]
+        async fn receipt_read_uses_the_already_open_memory_store() {
+            use crate::agent::Message;
+            use crate::output_receipt::{FieldId, issue_owner};
+
+            let root = std::env::temp_dir();
+            let memory = SessionBackend::Sqlite {
+                path: Some(":memory:".into()),
+            };
+            let session = format!("test-store-memory-{}", crate::session::new_id());
+            let store = SessionStore::connect(&memory, &root, &session)
+                .await
+                .unwrap();
+            let located = store
+                .append_located(
+                    &root,
+                    &session,
+                    &[SessionEntry::Message {
+                        message: Message::Tool {
+                            started_task_id: None,
+                            subagent_session_id: None,
+                            call_id: "mem-call".into(),
+                            name: "bash".into(),
+                            content: "MEMORY-ROW".into(),
+                            is_error: false,
+                            synthetic: false,
+                            images: vec![],
+                        },
+                    }],
+                )
+                .await
+                .unwrap();
+            let reference = issue_owner(&located[0], FieldId::ToolContent, "MEMORY-ROW".len());
+
+            let page = crate::tools::output::execute(&store, &root, &session, &reference, 0, 1024)
+                .await
+                .expect("the receipt reads through the open connection");
+            let page: serde_json::Value = serde_json::from_str(&page).unwrap();
+            assert_eq!(page["text"], "MEMORY-ROW");
+            assert_eq!(page["total_bytes"], "MEMORY-ROW".len());
         }
 
         fn test_entries() -> Vec<SessionEntry> {
@@ -7484,6 +7590,82 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error, "read_output error: ref not found");
+    }
+
+    /// A leading marker is NOT proof of ancestry: it is a claim about the front
+    /// of a log, never about who owns the rows behind it.
+    ///
+    /// Both logs below lead with a marker that NAMES the session their ref
+    /// names — one of them names the CALLER itself — yet neither chain descends
+    /// from that session: the loader refuses each log, and `read_output` must
+    /// refuse the ref for exactly the same reason instead of reading the rows a
+    /// marker merely claims.
+    #[tokio::test]
+    async fn owner_ref_is_refused_when_the_leading_marker_chain_does_not_resolve() {
+        use crate::output_receipt::{FieldId, issue_owner};
+        use crate::session::Session;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        // A real owner whose row an authorized reader would see.
+        Session::append(root, "bm-owner", &collision_parent()).unwrap();
+        let owner_rows = Session::load_located(root, "bm-owner").unwrap();
+        let owner_ref = issue_owner(
+            owner_rows.locations[5].as_ref().unwrap(),
+            FieldId::ToolContent,
+            "PARENT-ROW-5".len(),
+        );
+        // (1) The caller's own log leads with a marker that names the CALLER,
+        // pinned to a row it never stored: a marker is all it is.
+        Session::append(
+            root,
+            "bm-self",
+            &[
+                pinned("bm-self", 99, None),
+                tool_result("self-call", "SELF-ROW"),
+            ],
+        )
+        .unwrap();
+        let own_rows = Session::load_located(root, "bm-self").unwrap();
+        let own_ref = issue_owner(
+            own_rows.locations[1].as_ref().unwrap(),
+            FieldId::ToolContent,
+            "SELF-ROW".len(),
+        );
+        // (2) A log whose leading marker names the owner the ref names, with a
+        // cut the owner never had.
+        Session::append(root, "bm-foreign", &[pinned("bm-owner", 99, None)]).unwrap();
+
+        for (reader, reference, case) in [
+            ("bm-self", own_ref.as_str(), "the marker names the caller"),
+            (
+                "bm-self",
+                owner_ref.as_str(),
+                "the caller's marker names it",
+            ),
+            ("bm-foreign", owner_ref.as_str(), "a foreign log claims it"),
+        ] {
+            let loader = SessionStore::Jsonl
+                .load_fork_located(root, reader)
+                .await
+                .expect_err("the loader refuses a chain that does not resolve");
+            assert_eq!(
+                loader.to_string(),
+                SessionStore::ANCESTRY_REFUSED,
+                "{case}: the loader's reason"
+            );
+            // The detail stays one level down, where the user still sees it.
+            assert!(
+                format!("{loader:#}").contains(&format!("session {reader}")),
+                "{case}: {loader:#}"
+            );
+            let refused = read_output(root, reader, reference).await.unwrap_err();
+            assert_eq!(
+                refused,
+                format!("read_output error: {}", SessionStore::ANCESTRY_REFUSED),
+                "{case}: the read refuses for the SAME reason"
+            );
+        }
     }
 
     /// A fork of a fork authorizes its GRANDPARENT, and its inherited entries

@@ -1,9 +1,9 @@
 //! The always-on `read_output` tool pages full persisted fields named by an
 //! `eout1` ref. A short direct ref is resolved inside the runner's current
 //! session; an owner-bearing ref names the session that PHYSICALLY stores the
-//! row (a zero-copy fork's inherited prefix) and is resolved through THAT
-//! session's store, after proving the owner is this session or one of its
-//! transitive fork sources.
+//! row (a zero-copy fork's inherited prefix) and is read through the store handle
+//! that is already open, after proving from the loader-validated fork chain that
+//! the owner really stores a row of this session's resolved history.
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -178,17 +178,24 @@ async fn resolve_page(
 /// Read one owner-bearing ref with the OWNER's authority.
 ///
 /// The ref names the session that physically stores the row, which is
-/// authorized only when it is this session itself or one of its transitive fork
-/// sources ([`SessionStore::authorizes_owner`]) — the parent of a fork is
-/// authorized precisely because it is this session's fork source, and a fork of
-/// a fork reaches its grandparent the same way.
+/// authorized only when it is this session itself or a session that owns a row
+/// of this session's RESOLVED history ([`SessionStore::authorizes_owner`]).
+/// Ancestry comes from the chain the loader itself resolves and validates,
+/// never from the presence or position of a marker: a marker at the front of a
+/// log proves nothing about who owns the rows behind it, so a log whose chain
+/// does not resolve authorizes nothing — and it is refused for exactly the
+/// reason the loader refuses that same log
+/// ([`SessionStore::ANCESTRY_REFUSED`]).
 ///
-/// The read then opens the OWNER's store: the SQL backends bind the session id
-/// at connect time (`read_field_direct` is bound-session and cannot serve a
-/// cross-owner ref), and the existing verification runs there — backend kind,
-/// workspace fingerprint, backend-instance fingerprint, the exact physical
-/// key, the payload hash and the total size. A row of any other session, an
-/// ambiguous ref, or any verification failure is an error, never a guess.
+/// The read then goes through the store handle that is ALREADY OPEN, with the
+/// ref's owner taken from the (authorized) ref itself: re-opening the owner's
+/// store would be wrong for the SQL backends — they bind the session id at
+/// connect time, and a SQLite `:memory:` database lives in one connection, so a
+/// second connection is an empty database. The existing verification runs
+/// unchanged — backend kind, workspace fingerprint, backend-instance
+/// fingerprint, the exact physical key, the payload hash and the total size. A
+/// row of any other session, an ambiguous ref, or any verification failure is
+/// an error, never a guess.
 async fn owner_field(
     store: &SessionStore,
     root: &std::path::Path,
@@ -206,21 +213,22 @@ async fn owner_field(
         .authorizes_owner(root, session, owner)
         .await
         .map_err(|error| {
-            tracing::error!("read_output: cannot verify the ref owner: {error:#}");
-            not_found()
+            tracing::error!("read_output: cannot resolve the ref owner's chain: {error:#}");
+            // A chain that does not resolve is refused with the loader's OWN
+            // reason; any other store failure keeps the fixed, pathless
+            // message (it may carry paths or connection strings).
+            let reason = if error.to_string() == SessionStore::ANCESTRY_REFUSED {
+                SessionStore::ANCESTRY_REFUSED
+            } else {
+                "cannot read the persisted field"
+            };
+            ReceiptError::new(crate::output_receipt::ReceiptErrorKind::Invalid, reason)
         })?;
     if !authorized {
         return Err(not_found());
     }
-    let owner_store = store.source_store(root, owner).await.map_err(|error| {
-        tracing::error!("read_output: cannot open the ref owner's store: {error:#}");
-        ReceiptError::new(
-            crate::output_receipt::ReceiptErrorKind::Invalid,
-            "cannot read the persisted field",
-        )
-    })?;
-    owner_store
-        .read_field(root, verified)
+    store
+        .read_owner_field(root, verified)
         .await
         .map_err(|error| {
             tracing::error!("read_output: cannot read persisted field: {error:#}");
