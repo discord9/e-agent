@@ -1032,11 +1032,21 @@ impl SessionFactory {
         // and/or its stored transcript still carries the `ForkedFrom` marker
         // (at whatever depth the layout put it). `link_ref` must stay off for
         // it exactly as it does for a fresh fork.
+        //
+        // Head-oriented marker-aware load: the model context this session
+        // initializes from — its own head, or a zero-copy child's resolved
+        // inherited context — never the whole transcript. Older rows stay
+        // readable on demand through the history pager. On JSONL this load
+        // necessarily decodes every entry before slicing at the last
+        // compaction, so it ALSO answers the transcript-marker question: a
+        // second provenance scan would be a second full decode of a long
+        // transcript on every reopen. SQL keeps its bounded marker query.
+        let (loaded, persisted_fork) = store
+            .load_fork_head_and_provenance(&self.root, &session)
+            .await
+            .with_context(|| format!("cannot reopen session {session}"))?;
         if !forked {
-            forked = store
-                .has_fork_provenance(&self.root, &session)
-                .await
-                .with_context(|| format!("cannot inspect fork provenance of session {session}"))?;
+            forked = persisted_fork;
         }
         // Snapshot the reloadable state once: the config watcher may swap it
         // between awaits, so everything below uses one consistent view. The
@@ -1212,11 +1222,6 @@ impl SessionFactory {
         if let Some(rounds) = max_rounds {
             agent = agent.max_tool_rounds(rounds);
         }
-        // Head-oriented marker-aware load: the model context this session
-        // initializes from — its own head, or a zero-copy child's resolved
-        // inherited context — never the whole transcript. Older rows stay
-        // readable on demand through the history pager.
-        let loaded = store.load_fork_head_located(&self.root, &session).await?;
         let legacy = loaded.legacy;
         let inherited = loaded.inherited;
         let older_route = loaded.next_older;
@@ -4991,6 +4996,93 @@ mod link_ref_registration_tests {
         assert!(
             names.iter().any(|name| name == "link_ref"),
             "a user-created top-level session keeps link_ref: {names:?}"
+        );
+    }
+
+    /// A reopen must answer fork provenance from the SAME JSONL decode that
+    /// builds the history head. The ninth-entry fix first added a separate
+    /// full scan here, so a long transcript was decoded twice on every
+    /// reopen. The probe counts both entry points for sessions named
+    /// `once-…` (this test only): the head decode runs once and the separate
+    /// marker scan never runs, while the fork/ordinary answer stays right.
+    #[tokio::test]
+    async fn a_reopen_decodes_a_large_transcript_once_for_provenance() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let turns: Vec<SessionEntry> = (0..500)
+            .flat_map(|i| [user(&format!("q{i}")), assistant(&format!("a{i}"))])
+            .collect();
+        Session::append(&root, "once-ordinary", &turns).unwrap();
+        // The legacy copy layout: the marker sits behind the whole copied
+        // prefix, so only a whole-log answer can recognize it.
+        let prefix = turns[..8].to_vec();
+        Session::append(&root, "once-source", &prefix).unwrap();
+        let mut copy = prefix.clone();
+        copy.push(fork_marker("once-source", prefix.len(), 7));
+        Session::append(&root, "once-fork", &copy).unwrap();
+
+        let factory = SessionFactory::test_factory(root.clone());
+        for (id, expected_link_ref) in [("once-ordinary", true), ("once-fork", false)] {
+            crate::session::reopen_decode_probe::reset();
+            let built = factory
+                .build(
+                    id,
+                    None,
+                    None,
+                    IdlePolicy::FinishWhenIdle,
+                    UnfinishedPolicy::Preserve,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{id} reopens: {error:#}"));
+            let (loads, scans) = crate::session::reopen_decode_probe::counts();
+            assert_eq!(
+                loads, 1,
+                "{id} must decode the transcript once for history + provenance"
+            );
+            assert_eq!(
+                scans, 0,
+                "{id} must not run a second provenance scan over the transcript"
+            );
+            let names = built.runner.tool_names_for_test();
+            assert_eq!(
+                names.iter().any(|name| name == "link_ref"),
+                expected_link_ref,
+                "{id}: {names:?}"
+            );
+            drop(built);
+        }
+    }
+
+    /// An unreadable parent sidecar must never be read as "no parent": that
+    /// fall-through is what re-enabled `link_ref` on a child. The reopen
+    /// surfaces the sidecar error instead (so no session/tool is built).
+    #[tokio::test]
+    async fn an_unreadable_sidecar_fails_the_reopen_instead_of_enabling_link_ref() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        Session::append(&root, "unreadable-child", &[user("q0"), assistant("a0")]).unwrap();
+        // A directory at the sidecar path is openable but not readable on
+        // Unix, and refused at open on Windows: both are non-NotFound.
+        std::fs::create_dir(root.join(".e-agent/sessions/unreadable-child.meta.jsonl")).unwrap();
+
+        let factory = SessionFactory::test_factory(root.clone());
+        let error = match factory
+            .build(
+                "unreadable-child",
+                None,
+                None,
+                IdlePolicy::FinishWhenIdle,
+                UnfinishedPolicy::Preserve,
+            )
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("an unreadable sidecar is not an ordinary session"),
+        };
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("unreadable-child.meta.jsonl"),
+            "the sidecar read error is surfaced by name: {text}"
         );
     }
 }

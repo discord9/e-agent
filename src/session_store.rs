@@ -2643,26 +2643,7 @@ impl SessionStore {
     /// is always parsed in full — only what is RETURNED is bounded there.
     pub async fn load_head_located(&self, root: &Path, name: &str) -> Result<LoadedLocated> {
         match self {
-            SessionStore::Jsonl => {
-                let loaded = Session::load_located(root, name)?;
-                if loaded.legacy {
-                    return Ok(loaded);
-                }
-                let start = loaded
-                    .entries
-                    .iter()
-                    .rposition(|entry| matches!(entry, SessionEntry::Compaction { .. }))
-                    .unwrap_or(0);
-                let mut head = LoadedLocated {
-                    entries: loaded.entries[start..].to_vec(),
-                    locations: loaded.locations[start..].to_vec(),
-                    legacy: false,
-                    inherited: 0,
-                    next_older: None,
-                };
-                head.next_older = (start > 0).then(|| (name.to_owned(), start as i64));
-                Ok(head)
-            }
+            SessionStore::Jsonl => Ok(Self::jsonl_head(Session::load_located(root, name)?, name)),
             #[cfg(feature = "greptime")]
             SessionStore::Greptime { session, .. } => {
                 let (rows, cursor) = session.load_older_located(HEAD_OPEN_SENTINEL, None).await?;
@@ -2699,6 +2680,28 @@ impl SessionStore {
         }
     }
 
+    /// Slice a fully decoded JSONL session to its physical head: the last
+    /// `Compaction` and everything after it. The caller must ask any
+    /// whole-log question (fork provenance) BEFORE this slice, because the
+    /// rows below the cut are dropped here.
+    fn jsonl_head(loaded: LoadedLocated, name: &str) -> LoadedLocated {
+        if loaded.legacy {
+            return loaded;
+        }
+        let start = loaded
+            .entries
+            .iter()
+            .rposition(|entry| matches!(entry, SessionEntry::Compaction { .. }))
+            .unwrap_or(0);
+        LoadedLocated {
+            entries: loaded.entries[start..].to_vec(),
+            locations: loaded.locations[start..].to_vec(),
+            legacy: false,
+            inherited: 0,
+            next_older: (start > 0).then(|| (name.to_owned(), start as i64)),
+        }
+    }
+
     /// HEAD-oriented marker-aware load: the model context this session
     /// initializes from, without materializing the whole transcript.
     ///
@@ -2716,6 +2719,72 @@ impl SessionStore {
     /// required (fork-boundary scans, explicit `--at` resolution).
     pub async fn load_fork_head_located(&self, root: &Path, name: &str) -> Result<LoadedLocated> {
         let head = self.load_head_located(root, name).await?;
+        self.resolve_fork_head(root, name, head).await
+    }
+
+    /// The factory's reopen load: [`Self::load_fork_head_located`] PLUS the
+    /// persisted session's fork provenance, from ONE JSONL decode.
+    ///
+    /// JSONL has no kind index, so the head load already decodes every entry
+    /// before slicing at the last compaction. Answering provenance from those
+    /// entries (before the slice) keeps a large ordinary transcript to one
+    /// sequential pass instead of scanning it a second time. The SQL backends
+    /// keep their bounded `LIMIT 1` marker query.
+    ///
+    /// Returns `(head, is_fork)`. The metadata parent is still part of the
+    /// answer: a child whose own log carries no marker is a fork when its
+    /// sidecar/row records one, and an unreadable sidecar is an error, never
+    /// "no parent".
+    pub(crate) async fn load_fork_head_and_provenance(
+        &self,
+        root: &Path,
+        name: &str,
+    ) -> Result<(LoadedLocated, bool)> {
+        match self {
+            SessionStore::Jsonl => {
+                // Sidecar first: an unreadable parent link must fail this
+                // reopen instead of falling through to "ordinary session".
+                let persisted_parent = self.metadata_parent(root, name).await?;
+                let loaded = Session::load_located(root, name)?;
+                let has_marker = loaded
+                    .entries
+                    .iter()
+                    .any(|entry| matches!(entry, SessionEntry::ForkedFrom { .. }));
+                let is_fork = persisted_parent.is_some() || has_marker;
+                let head = Self::jsonl_head(loaded, name);
+                Ok((self.resolve_fork_head(root, name, head).await?, is_fork))
+            }
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { .. } => {
+                self.load_fork_head_and_query_provenance(root, name).await
+            }
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite { .. } => {
+                self.load_fork_head_and_query_provenance(root, name).await
+            }
+        }
+    }
+
+    /// Bounded-backend half of [`Self::load_fork_head_and_provenance`].
+    async fn load_fork_head_and_query_provenance(
+        &self,
+        root: &Path,
+        name: &str,
+    ) -> Result<(LoadedLocated, bool)> {
+        let head = self.load_fork_head_located(root, name).await?;
+        let is_fork = self.has_fork_provenance(root, name).await?;
+        Ok((head, is_fork))
+    }
+
+    /// Prepend a zero-copy child's inherited context to its own physical
+    /// head. Shared by [`Self::load_fork_head_located`] and the factory's
+    /// one-decode reopen load.
+    async fn resolve_fork_head(
+        &self,
+        root: &Path,
+        name: &str,
+        head: LoadedLocated,
+    ) -> Result<LoadedLocated> {
         if head.legacy {
             // A legacy whole-document session has no physical head to page.
             return Ok(head);
@@ -3073,6 +3142,11 @@ impl SessionStore {
     /// There is deliberately no fixed head bound: a constant would silently
     /// answer "not a fork" for a marker it never looked at, which is exactly
     /// how a reopened copy fork regained `link_ref`.
+    ///
+    /// The factory's reopen path does NOT call this on JSONL: its head load
+    /// already decodes the transcript, so it uses
+    /// [`Self::load_fork_head_and_provenance`] and a long session is scanned
+    /// once instead of twice.
     pub(crate) async fn has_fork_provenance(&self, root: &Path, name: &str) -> Result<bool> {
         if self.metadata_parent(root, name).await?.is_some() {
             return Ok(true);
@@ -4353,16 +4427,25 @@ fn jsonl_append_meta_snapshot(
 /// sidecar does not exist or holds no parseable line. Corrupt lines are
 /// skipped: the file is append-only and only the tail matters (a corrupt
 /// tail is treated as "no newer snapshot").
+///
+/// ONLY `NotFound` means "no sidecar". Any other open/read error is
+/// propagated: fork provenance must never read an unreadable sidecar as a
+/// session without a parent (that is exactly how an unreadable child
+/// regained `link_ref`).
 fn jsonl_read_meta_snapshot(root: &Path, session: &str) -> anyhow::Result<Option<SessionMeta>> {
     let path = jsonl_meta_sidecar_path(root, session)?;
-    let Ok(file) = std::fs::File::open(&path) else {
-        return Ok(None);
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("cannot read session metadata {}", path.display()));
+        }
     };
     let mut latest: Option<SessionMeta> = None;
-    for line in std::io::BufReader::new(file)
-        .lines()
-        .map_while(|line| line.ok())
-    {
+    for line in std::io::BufReader::new(file).lines() {
+        let line =
+            line.with_context(|| format!("cannot read session metadata {}", path.display()))?;
         if line.trim().is_empty() {
             continue;
         }
@@ -6477,6 +6560,47 @@ mod tests {
                 .has_fork_provenance(root, "meta-child")
                 .await
                 .unwrap()
+        );
+    }
+
+    /// An unreadable metadata sidecar is NOT "no persisted parent": an
+    /// unknown provenance must never resolve to "ordinary session" and
+    /// re-enable `link_ref`. Only `NotFound` is absence.
+    #[tokio::test]
+    async fn an_unreadable_metadata_sidecar_is_an_error_not_an_absent_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        crate::session::Session::append(root, "meta-blocked", &fork_turns(1)).unwrap();
+        // A directory at the sidecar path is openable but not readable on
+        // Unix, and refused at open on Windows: both are non-NotFound.
+        std::fs::create_dir(root.join(".e-agent/sessions/meta-blocked.meta.jsonl")).unwrap();
+
+        let error = SessionStore::Jsonl
+            .has_fork_provenance(root, "meta-blocked")
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("meta-blocked.meta.jsonl"),
+            "the sidecar read error is surfaced by name: {error:#}"
+        );
+    }
+
+    /// The transcript probe follows the same rule: a failed open/read is an
+    /// error, never "no marker". A directory at the transcript path fails on
+    /// every platform (open or first read).
+    #[tokio::test]
+    async fn an_unreadable_transcript_is_an_error_not_an_absent_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join(".e-agent/sessions/tr-blocked.jsonl")).unwrap();
+
+        let error = SessionStore::Jsonl
+            .has_fork_provenance(root, "tr-blocked")
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("tr-blocked.jsonl"),
+            "the transcript read error is surfaced by name: {error:#}"
         );
     }
 
