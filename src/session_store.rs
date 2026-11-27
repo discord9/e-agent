@@ -1208,7 +1208,9 @@ enum PersistedParent {
     Parent,
     /// Every snapshot line decoded and the newest one records no parent.
     Parentless,
-    /// A snapshot line could not be decoded: provenance is UNKNOWN.
+    /// The sidecar exists but cannot prove parentlessness: a record failed
+    /// to decode, or it holds no nonblank record at all (an interrupted
+    /// first append). Provenance is UNKNOWN.
     Unknown,
 }
 
@@ -2752,8 +2754,8 @@ impl SessionStore {
     ///
     /// Returns `(head, is_fork)`. The metadata parent is still part of the
     /// answer: a child whose own log carries no marker is a fork when its
-    /// sidecar/row records one, and an unreadable or undecodable sidecar is
-    /// never "no parent".
+    /// sidecar/row records one, and an unreadable, undecodable, or
+    /// never-written sidecar is never "no parent".
     pub(crate) async fn load_fork_head_and_provenance(
         &self,
         root: &Path,
@@ -2762,7 +2764,8 @@ impl SessionStore {
         match self {
             SessionStore::Jsonl => {
                 // Sidecar first: an unreadable parent link fails this reopen,
-                // and an undecodable line (a torn crash tail) is unknown.
+                // and an undecodable record or an empty sidecar (an
+                // interrupted first append) is unknown.
                 let persisted_parent = self.metadata_parent(root, name).await?;
                 let loaded = Session::load_located(root, name)?;
                 let has_marker = loaded
@@ -3174,14 +3177,15 @@ impl SessionStore {
     }
 
     /// The session's persisted parent-link evidence. One narrow read: the
-    /// newest sidecar snapshot on JSONL (plus whether every line decoded), a
-    /// single-row/single-column SELECT on the SQL backends.
+    /// newest sidecar snapshot on JSONL (plus whether the sidecar can prove
+    /// parentlessness at all), a single-row/single-column SELECT on the SQL
+    /// backends.
     async fn metadata_parent(&self, root: &Path, name: &str) -> Result<PersistedParent> {
         match self {
             SessionStore::Jsonl => {
-                let (latest, torn) = jsonl_read_meta_snapshot_and_torn(root, name)?;
+                let (latest, unknown) = jsonl_read_meta_snapshot_and_unknown(root, name)?;
                 let parent = latest.and_then(|meta| meta.parent_session_id);
-                Ok(match (parent, torn) {
+                Ok(match (parent, unknown) {
                     (Some(_), _) => PersistedParent::Parent,
                     (None, true) => PersistedParent::Unknown,
                     (None, false) => PersistedParent::Parentless,
@@ -4460,7 +4464,7 @@ fn jsonl_append_meta_snapshot(
 }
 
 /// The newest snapshot of a session's metadata sidecar, or `None` when the
-/// sidecar does not exist or holds no parseable line. Corrupt lines are
+/// sidecar does not exist or holds no decodable record. Corrupt records are
 /// skipped: the file is append-only and only the tail matters (a corrupt
 /// tail is treated as "no newer snapshot").
 ///
@@ -4469,15 +4473,28 @@ fn jsonl_append_meta_snapshot(
 /// session without a parent (that is exactly how an unreadable child
 /// regained `link_ref`).
 fn jsonl_read_meta_snapshot(root: &Path, session: &str) -> anyhow::Result<Option<SessionMeta>> {
-    Ok(jsonl_read_meta_snapshot_and_torn(root, session)?.0)
+    Ok(jsonl_read_meta_snapshot_and_unknown(root, session)?.0)
 }
 
-/// [`jsonl_read_meta_snapshot`] plus whether any non-empty line failed to
-/// decode. The last good snapshot still opens the session for DISPLAY (a
-/// torn tail is a crash artifact), but provenance must know the read was
-/// incomplete: an undecodable line means "unknown", never "this session has
+/// [`jsonl_read_meta_snapshot`] plus whether provenance must be treated as
+/// UNKNOWN: the sidecar exists but no record in it can prove parentlessness.
+/// That covers a record that failed to decode (a torn crash tail) and a
+/// sidecar with no nonblank record at all — the writer creates the file
+/// BEFORE its first snapshot, so an interruption between those two
+/// operations leaves a zero-byte file, not "no sidecar".
+///
+/// The last good snapshot still opens the session for DISPLAY (a torn tail
+/// is a crash artifact), but provenance must know the read was incomplete:
+/// an undecodable or missing record means "unknown", never "this session has
 /// no parent".
-fn jsonl_read_meta_snapshot_and_torn(
+///
+/// Records are read as BYTES, not with `lines()`: `lines()` requires every
+/// line to be valid UTF-8, so a write that stopped inside a multi-byte
+/// character would fail the whole reopen and block a session whose history
+/// is intact. `serde_json::from_slice` puts a mid-character tear in the same
+/// "torn record" bucket as a torn brace, while genuine I/O errors still
+/// propagate.
+fn jsonl_read_meta_snapshot_and_unknown(
     root: &Path,
     session: &str,
 ) -> anyhow::Result<(Option<SessionMeta>, bool)> {
@@ -4491,19 +4508,21 @@ fn jsonl_read_meta_snapshot_and_torn(
         }
     };
     let mut latest: Option<SessionMeta> = None;
-    let mut torn = false;
-    for line in std::io::BufReader::new(file).lines() {
-        let line =
-            line.with_context(|| format!("cannot read session metadata {}", path.display()))?;
-        if line.trim().is_empty() {
+    let mut unknown = false;
+    let mut saw_record = false;
+    for record in std::io::BufReader::new(file).split(b'\n') {
+        let record =
+            record.with_context(|| format!("cannot read session metadata {}", path.display()))?;
+        if record.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        match serde_json::from_str::<SessionMeta>(&line) {
+        saw_record = true;
+        match serde_json::from_slice::<SessionMeta>(&record) {
             Ok(meta) => latest = Some(meta),
-            Err(_) => torn = true,
+            Err(_) => unknown = true,
         }
     }
-    Ok((latest, torn))
+    Ok((latest, unknown || !saw_record))
 }
 
 /// Count a session's transcript entries by counting the non-empty lines of

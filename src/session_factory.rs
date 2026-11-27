@@ -5071,6 +5071,125 @@ mod link_ref_registration_tests {
         );
     }
 
+    /// The writer creates the sidecar file BEFORE appending its first
+    /// snapshot, so an interruption between those two operations leaves a
+    /// zero-byte sidecar. That is an interrupted first write, not evidence
+    /// of "no parent": the session must still open with its history, and a
+    /// markerless child must stay without `link_ref`.
+    #[tokio::test]
+    async fn a_zero_byte_sidecar_is_unknown_not_parentless() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let history = [user("q0"), assistant("a0")];
+        Session::append(&root, "empty-sidecar-child", &history).unwrap();
+        SessionStore::Jsonl
+            .create_meta(
+                &root,
+                "empty-sidecar-child",
+                Some("m"),
+                Some("subagent"),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        // The crash: the file exists (created before the append) but its
+        // first snapshot never landed.
+        std::fs::write(
+            root.join(".e-agent/sessions/empty-sidecar-child.meta.jsonl"),
+            "",
+        )
+        .unwrap();
+
+        let factory = SessionFactory::test_factory(root.clone());
+        let reopened = factory
+            .build(
+                "empty-sidecar-child",
+                None,
+                None,
+                IdlePolicy::FinishWhenIdle,
+                UnfinishedPolicy::Preserve,
+            )
+            .await
+            .expect("a zero-byte sidecar must not block the session from opening");
+        assert_eq!(
+            Session::load(&root, "empty-sidecar-child").unwrap().entries,
+            history,
+            "the transcript still loads"
+        );
+        let names = reopened.runner.tool_names_for_test();
+        assert!(
+            !names.iter().any(|name| name == "link_ref"),
+            "an existing but empty sidecar is unknown provenance: {names:?}"
+        );
+    }
+
+    /// Truncate the sidecar inside a multi-byte character of the title. A
+    /// `lines()` reader would fail the whole reopen with `InvalidData`; the
+    /// crash only damaged the metadata tail, so the session must still open
+    /// with its history, and the undecodable record is unknown provenance
+    /// (no `link_ref` for a markerless child).
+    #[tokio::test]
+    async fn a_sidecar_torn_inside_a_multibyte_character_still_opens() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let history = [user("q0"), assistant("a0")];
+        Session::append(&root, "torn-multibyte-child", &history).unwrap();
+        SessionStore::Jsonl
+            .create_meta(
+                &root,
+                "torn-multibyte-child",
+                Some("m"),
+                Some("subagent"),
+                None,
+                None,
+                Some("crash 🧵 tail"),
+            )
+            .await
+            .unwrap();
+
+        let path = root.join(".e-agent/sessions/torn-multibyte-child.meta.jsonl");
+        let bytes = std::fs::read(&path).unwrap();
+        let scissor = "🧵".as_bytes();
+        let at = bytes
+            .windows(scissor.len())
+            .position(|window| window == scissor)
+            .expect("the snapshot title carries the multi-byte character");
+        // Keep ONE byte of the four-byte character: the file ends mid-char,
+        // so it is not valid UTF-8 and no JSON value decodes.
+        let torn = &bytes[..at + 1];
+        assert!(
+            std::str::from_utf8(torn).is_err(),
+            "the test must actually tear a multi-byte character"
+        );
+        std::fs::write(&path, torn).unwrap();
+
+        let factory = SessionFactory::test_factory(root.clone());
+        let reopened = factory
+            .build(
+                "torn-multibyte-child",
+                None,
+                None,
+                IdlePolicy::FinishWhenIdle,
+                UnfinishedPolicy::Preserve,
+            )
+            .await
+            .expect("a mid-character tear must not block the session from opening");
+        assert_eq!(
+            Session::load(&root, "torn-multibyte-child")
+                .unwrap()
+                .entries,
+            history,
+            "the intact transcript opens despite the torn metadata"
+        );
+        let names = reopened.runner.tool_names_for_test();
+        assert!(
+            !names.iter().any(|name| name == "link_ref"),
+            "an undecodable record is unknown provenance: {names:?}"
+        );
+    }
+
     /// The positive case: a sidecar whose lines ALL decode to "no parent" is
     /// evidence, so an ordinary session keeps `link_ref`. A transcript
     /// marker still overrides that answer.
