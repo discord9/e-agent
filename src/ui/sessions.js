@@ -1004,8 +1004,15 @@ function renderChatSessionId(id) {
  * 这里不做任何分组/过滤/按编号排序。
  * ===================================================================*/
 let refEditorOpen = false;      // 头部「＋」展开的添加表单（切会话时收起）
-let refEditorSession = null;    // 表单归属的会话 id
+let refEditorSession = null;    // 表单归属：workspace identity + 会话 id
 let chatRefsSig = "";           // 头部 chips 的签名：轮询只在链接变化时重绘
+
+/* 表单/草稿的归属键。只用会话 id 时，另一个 workspace 里的同 id 会话会
+   继承上一个 workspace 的编辑器状态与草稿；workspace identity 必须一起
+   进键（id 只在单个服务器内唯一）。 */
+function refEditorKey(id) {
+  return workspaceIdentityKey(state.workspace, workspaceToken(state.workspace)) + "\u0000" + id;
+}
 
 /* URL 的展示标签：能解析出编号就用 `PR #n` / `issue #n`，否则 host+path。 */
 function refChipLabel(url) {
@@ -1079,8 +1086,9 @@ function refChip(link, onRemove) {
 function renderChatRefs(s, id) {
   const host = els.chatRefs;
   if (!host) return;
-  if (refEditorSession !== id) {      // 切会话：收起表单，避免输入落到别的会话
-    refEditorSession = id;
+  const editorKey = id ? refEditorKey(id) : null;
+  if (refEditorSession !== editorKey) {  // 切会话/工作区：收起表单，避免草稿串到别处
+    refEditorSession = editorKey;
     refEditorOpen = false;
   }
   // 重绘（轮询/改名）不丢正在输入的表单：先记下草稿，重建后填回。
@@ -1145,20 +1153,28 @@ async function editSessionRef(kind, url, remove) {
   // state.workspace / state.sessionId / state.lastList 都可能已经指向别处。
   const wsId = state.workspace.id;
   const wsKey = workspaceIdentityKey(state.workspace, workspaceToken(state.workspace));
+  // 发起时的身份是否仍是当前可见的工作区（含 token/base 变化）。错误提示
+  // 也必须过这一关：迟到的 401/HTTP 错误/fetch 拒绝不能写到别的工作区的
+  // banner 上；await 错误体之后再校验一次。
+  const originCurrent = () => state.workspace.id === wsId
+    && workspaceIdentityKey(state.workspace, workspaceToken(state.workspace)) === wsKey;
+  // Banner 是全局的：错误只能落在发起这次编辑的 workspace + 会话上，
+  // 不能因为请求期间切走就显示在别人的上下文里。
+  const originVisible = () => originCurrent() && state.sessionId === id;
   if (!workspaceToken(state.workspace)) { setBanner("⚠ 请先输入 Token。", true); return false; }
   try {
     const res = await api("/api/sessions/" + encodeURIComponent(id) + "/refs",
       { method: "POST", body: JSON.stringify({ kind, url, remove }) });
     if (res.status === 401 || res.status === 403) {
-      setBanner("⚠ 认证失败：请检查 Token。");
+      if (originVisible()) setBanner("⚠ 认证失败：请检查 Token。");
       return false;
     }
     if (!res.ok) {
       if (res.status === 404 || res.status === 405) {
-        setBanner("⚠ 服务器不支持会话链接编辑。", true);
+        if (originVisible()) setBanner("⚠ 服务器不支持会话链接编辑。", true);
       } else {
         const detail = (await res.text().catch(() => "")).trim();
-        setBanner("⚠ 链接更新失败：" + (detail || ("HTTP " + res.status)), true);
+        if (originVisible()) setBanner("⚠ 链接更新失败：" + (detail || ("HTTP " + res.status)), true);
       }
       return false;
     }
@@ -1166,10 +1182,7 @@ async function editSessionRef(kind, url, remove) {
     // 工作区已切换：state.lastList 此刻是另一个工作区的列表，同 id 的行
     // 可能是另一条会话。这份响应只属于发起它的那个工作区，整条丢弃——
     // 新工作区的列表本来就是最新拉到的，不需要也不允许用旧响应去改。
-    if (state.workspace.id !== wsId
-        || workspaceIdentityKey(state.workspace, workspaceToken(state.workspace)) !== wsKey) {
-      return true;
-    }
+    if (!originCurrent()) return true;
     const s = (state.lastList || []).find((x) => x.id === id);
     if (s) {
       s.prs = Array.isArray(body.prs) ? body.prs : [];
@@ -1182,7 +1195,7 @@ async function editSessionRef(kind, url, remove) {
     renderChatSessionId(id);
     return true;
   } catch (e) {
-    setBanner("⚠ 链接更新失败：" + e.message, true);
+    if (originVisible()) setBanner("⚠ 链接更新失败：" + e.message, true);
     return false;
   }
 }

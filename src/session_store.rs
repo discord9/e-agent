@@ -872,7 +872,11 @@ impl SessionRef {
             .strip_prefix("http://")
             .or_else(|| lower.strip_prefix("https://"))
             .ok_or_else(|| format!("`{url}` must use an explicit http:// or https:// authority"))?;
-        if authority.is_empty() || authority.starts_with(&['/', '?', '#'][..]) {
+        // A leading backslash is a malformed authority too: the `url` crate
+        // repairs `https://\example.org/x` to host `example.org`, so the raw
+        // check must refuse it before the stored string keeps a backslash
+        // the browser could resolve against the UI origin.
+        if authority.is_empty() || authority.starts_with(&['/', '?', '#', '\\'][..]) {
             return Err(format!(
                 "`{url}` must name an authority (host) right after the scheme"
             ));
@@ -3046,6 +3050,16 @@ impl SessionStore {
         Ok(zero_copy_marker(&entries).map(|marker| entries[marker].clone()))
     }
 
+    /// Bounded probe: does the PERSISTED transcript mark this session as a
+    /// fork? A zero-copy child stores its `ForkedFrom` marker as the first
+    /// logical row (optionally after the frozen goal), so the leading-marker
+    /// probe still answers after the child compacted on its own — reopening
+    /// the session by id must not lose the provenance its build request no
+    /// longer carries.
+    pub(crate) async fn has_fork_provenance(&self, root: &Path, name: &str) -> Result<bool> {
+        self.has_leading_fork_marker(root, name, 3).await
+    }
+
     /// Depth limit for a fork ancestry walk. A chain longer than this is
     /// treated as a cycle and fails closed instead of resolving forever.
     const FORK_CHAIN_LIMIT: usize = 32;
@@ -4596,6 +4610,12 @@ fn jsonl_backfill_sessions(root: &Path) -> anyhow::Result<()> {
         .collect();
     sessions.sort();
     for session in sessions {
+        // Same per-session lock as every other metadata writer: another
+        // handle may create the sidecar between the absence check and this
+        // append, and a second creation line would rewrite created_at and
+        // omit links that handle stored. Re-check under the lock.
+        let path = jsonl_meta_sidecar_path(root, &session)?;
+        let _guard = lock_jsonl_meta(&path);
         if jsonl_read_meta_snapshot(root, &session)?.is_some() {
             continue; // already has a snapshot (idempotent)
         }
@@ -5347,6 +5367,7 @@ mod tests {
             ("http:example.org/x", "scheme without `//`"),
             ("https:/example.org/x", "single slash"),
             ("https:///example.org/x", "empty authority"),
+            ("https://\\example.org/pull/14", "backslash authority"),
             ("https://", "no authority"),
             ("//example.org/x", "no scheme"),
             ("example.org/pull/14", "relative path"),

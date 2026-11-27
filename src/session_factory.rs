@@ -949,7 +949,7 @@ impl SessionFactory {
         let mut store = SessionStore::connect(&self.backend, &self.root, &session).await?;
         // Whether this build CONTINUES another session's transcript (CLI/TUI
         // `--fork`, web fork) — captured before `fork_from` is consumed.
-        let forked = fork_from.is_some();
+        let mut forked = fork_from.is_some();
         if let Some((source, at)) = fork_from {
             // Zero-copy fork: the child's store receives ONLY its own frozen
             // goal plus the marker. The source prefix is read back read-only by
@@ -1025,6 +1025,16 @@ impl SessionFactory {
                         .map_err(|_| anyhow!("session {session} is already live locally"))?,
                 );
             }
+        }
+        // Persisted provenance, not just this build's request: a fork reopened
+        // by id (web resume, `--session`) passes `fork_from = None`, but its
+        // stored transcript still carries the `ForkedFrom` marker. `link_ref`
+        // must stay off for it exactly as it does for a fresh fork.
+        if !forked {
+            forked = store
+                .has_fork_provenance(&self.root, &session)
+                .await
+                .with_context(|| format!("cannot inspect fork provenance of session {session}"))?;
         }
         // Snapshot the reloadable state once: the config watcher may swap it
         // between awaits, so everything below uses one consistent view. The
@@ -4761,6 +4771,26 @@ mod link_ref_registration_tests {
             "a fork must not relink the source it continues: {names:?}"
         );
         drop(forked);
+
+        // Reopen the SAME fork by id, the way a web resume/attach does: no
+        // `fork_from` is available any more, so only the persisted
+        // `ForkedFrom` marker can keep `link_ref` off.
+        let reopened = factory
+            .build(
+                "refs-fork",
+                None,
+                None,
+                IdlePolicy::FinishWhenIdle,
+                UnfinishedPolicy::Preserve,
+            )
+            .await
+            .expect("the persisted fork resumes");
+        let names = reopened.runner.tool_names_for_test();
+        assert!(
+            !names.iter().any(|name| name == "link_ref"),
+            "a resumed fork must not regain link_ref: {names:?}"
+        );
+        drop(reopened);
 
         let fresh = factory
             .build(

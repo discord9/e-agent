@@ -7,7 +7,7 @@
 
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use tokio_postgres::NoTls;
 
 use crate::agent::SessionEntry;
@@ -191,7 +191,12 @@ pub struct GreptimeSession {
     /// every snapshot write omits it, so a failed migration takes away links
     /// and NOTHING else — listing, creating and resuming sessions keep
     /// working, and only an explicit ref edit fails loudly.
-    refs_available: bool,
+    ///
+    /// Mutable because another handle may repair the schema while this one
+    /// stays open: every degraded write re-probes the column and flips this
+    /// flag, so the repaired database's links are carried forward instead
+    /// of being erased by a snapshot that omits them.
+    refs_available: AtomicBool,
 }
 
 /// The `refs` tail of every meta SELECT: the column when the migration
@@ -287,17 +292,21 @@ impl GreptimeSession {
             session_id: session_id.to_owned(),
             backend_fp,
             cached_meta: std::sync::Mutex::new(None),
-            refs_available,
+            refs_available: AtomicBool::new(refs_available),
         })
     }
 
-    /// Whether `sessions.refs` exists, asked of `information_schema` with no
-    /// DDL: the read-only listing path's substitute for the migration probe.
+    /// Whether the ACTIVE schema's `sessions.refs` exists, asked of
+    /// `information_schema` with no DDL: the read-only listing path's
+    /// substitute for the migration probe. Scoped by `table_schema`: another
+    /// visible schema's `sessions.refs` must not satisfy the probe, because
+    /// the local `SELECT refs` would then name a column this schema lacks.
     async fn probe_refs_column(client: &tokio_postgres::Client) -> Result<bool> {
         let row = client
             .query_one(
                 "SELECT COUNT(*) AS n FROM information_schema.columns \
-                 WHERE table_name = 'sessions' AND column_name = 'refs'",
+                 WHERE table_schema = current_schema() \
+                   AND table_name = 'sessions' AND column_name = 'refs'",
                 &[],
             )
             .await
@@ -347,8 +356,11 @@ impl GreptimeSession {
         let mut refs_available = true;
         let columns: Vec<String> = client
             .query(
+                // Scoped to the ACTIVE schema: another visible schema's
+                // `sessions.refs` must not skip the local ALTER (the local
+                // SELECT would then name a nonexistent column).
                 "SELECT column_name FROM information_schema.columns \
-                 WHERE table_name = 'sessions'",
+                 WHERE table_schema = current_schema() AND table_name = 'sessions'",
                 &[],
             )
             .await
@@ -577,7 +589,7 @@ impl GreptimeSession {
             session_id: session_id.to_string(),
             backend_fp,
             cached_meta: std::sync::Mutex::new(cached_meta),
-            refs_available,
+            refs_available: AtomicBool::new(refs_available),
         };
 
         // Seed next_seq from the DB's current max seq (see db_max_seq).
@@ -2318,7 +2330,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
     /// session has no row yet (brand-new session, or a subagent whose
     /// parent has not written its row yet).
     async fn load_meta_row(&self, session_id: &str) -> Result<Option<SessionMeta>> {
-        let refs = refs_select(self.refs_available);
+        let refs = refs_select(self.refs_available.load(Ordering::Relaxed));
         let row = self
             .client
             .query_opt(
@@ -2333,18 +2345,60 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             )
             .await
             .context("cannot query session metadata")?;
-        row.map(|row| Self::meta_from_row(&row, session_id, self.refs_available))
-            .transpose()
+        row.map(|row| {
+            Self::meta_from_row(
+                &row,
+                session_id,
+                self.refs_available.load(Ordering::Relaxed),
+            )
+        })
+        .transpose()
+    }
+
+    /// Re-probe a degraded handle before a write: another handle may have
+    /// added `sessions.refs` since this one connected. Returns the
+    /// availability the write should use; a failed probe keeps the feature
+    /// degraded rather than failing the metadata write.
+    async fn ensure_refs_available(&self) -> bool {
+        if self.refs_available.load(Ordering::Relaxed) {
+            return true;
+        }
+        match Self::probe_refs_column(&self.client).await {
+            Ok(true) => {
+                self.refs_available.store(true, Ordering::Relaxed);
+                true
+            }
+            Ok(false) => false,
+            Err(error) => {
+                tracing::warn!(
+                    "e-agent: cannot inspect the sessions.refs column (session links may be \
+                     unavailable): {error:#}"
+                );
+                false
+            }
+        }
     }
 
     async fn insert_meta(&self, meta: &mut SessionMeta) -> Result<()> {
+        // A handle that connected while `refs` was missing took the degraded
+        // path; another handle may have repaired the schema since. Re-probe
+        // before the degraded write, and when the column now exists carry
+        // the CURRENT row's links forward — the snapshot in hand was read
+        // without them (an omission here would erase what the repairing
+        // handle stored).
+        if !self.refs_available.load(Ordering::Relaxed)
+            && self.ensure_refs_available().await
+            && let Some(current) = self.load_meta_row(&meta.session_id).await?
+        {
+            meta.refs = current.refs;
+        }
         // Stamp the writer identity at insert time, not at construction
         // (P3): every snapshot row records the process that actually wrote
         // it, and a cross-process resume never replays a stale identity
         // from a row cached by another process. Callers construct with
         // `writer: None`; the stamped value is what lands in the column.
         meta.writer = Some(process_identity().to_owned());
-        if self.refs_available {
+        if self.refs_available.load(Ordering::Relaxed) {
             // One JSON value for the whole list; NULL when empty (the same
             // value a pre-column row reads back as). Encoding happens before
             // the statement so the parameter borrows a local that outlives it.
@@ -2689,7 +2743,9 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             &mut Vec<crate::session_store::SessionRef>,
         ) -> std::result::Result<(), String>,
     ) -> Result<Vec<crate::session_store::SessionRef>> {
-        if !self.refs_available {
+        // A degraded handle re-probes before refusing: another handle may
+        // have repaired the schema since this one connected.
+        if !self.ensure_refs_available().await {
             anyhow::bail!(
                 "session links are unavailable: the sessions.refs column is missing \
                  (the schema migration failed on this database)"
@@ -2799,10 +2855,10 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
     ) -> Result<(Vec<SessionMeta>, crate::session_store::ListMetaDiagnostics)> {
         let query_started = std::time::Instant::now();
         let (filter_clause, live_ids) = sidebar_filter_clause(sidebar_filter);
-        let refs = refs_select(self.refs_available);
+        let refs = refs_select(self.refs_available.load(Ordering::Relaxed));
         // The dedup subquery projects the same tail: a missing column is
         // simply not selected, so a degraded old database still lists.
-        let refs_groups = refs_group(self.refs_available);
+        let refs_groups = refs_group(self.refs_available.load(Ordering::Relaxed));
         let sql = format!(
             "SELECT session_id, created_at, last_active_at, model, \"role\", entry_count, \
                     parent_session_id, parent_task_id, title, pinned, archived, writer{refs} \
@@ -2841,7 +2897,11 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             .iter()
             .map(|row| {
                 let session_id: String = row.get("session_id");
-                Self::meta_from_row(row, &session_id, self.refs_available)
+                Self::meta_from_row(
+                    row,
+                    &session_id,
+                    self.refs_available.load(Ordering::Relaxed),
+                )
             })
             .collect::<Result<Vec<_>>>()?;
         let decode_ms = decode_started.elapsed().as_millis();
@@ -2861,7 +2921,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
     /// activity first. This is the audit view — [`Self::list_meta`] shows
     /// only the latest snapshot per session.
     pub async fn audit_meta(&self, session_id: &str) -> Result<Vec<SessionMeta>> {
-        let refs = refs_select(self.refs_available);
+        let refs = refs_select(self.refs_available.load(Ordering::Relaxed));
         let rows = self
             .client
             .query(
@@ -2877,7 +2937,9 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             .await
             .context("cannot load session metadata audit trail")?;
         rows.iter()
-            .map(|row| Self::meta_from_row(row, session_id, self.refs_available))
+            .map(|row| {
+                Self::meta_from_row(row, session_id, self.refs_available.load(Ordering::Relaxed))
+            })
             .collect()
     }
 

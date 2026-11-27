@@ -6543,7 +6543,9 @@ async fn schema_without_refs_column_keeps_sessions_usable_and_refuses_links() {
         .await
         .expect("connect to the degraded database");
     assert!(
-        !session.refs_available,
+        !session
+            .refs_available
+            .load(std::sync::atomic::Ordering::Relaxed),
         "the schema really has no refs column"
     );
 
@@ -6595,7 +6597,12 @@ async fn schema_without_refs_column_keeps_sessions_usable_and_refuses_links() {
     // while it was missing read back unchanged and edits work again.
     drop(session);
     let repaired = SqliteSession::connect(&db_path, &wid, &sid).await.unwrap();
-    assert!(repaired.refs_available, "connect repairs the column");
+    assert!(
+        repaired
+            .refs_available
+            .load(std::sync::atomic::Ordering::Relaxed),
+        "connect repairs the column"
+    );
     let stored = repaired
         .update_refs(&sid, |refs| {
             refs.push(pr.clone());
@@ -6604,6 +6611,208 @@ async fn schema_without_refs_column_keeps_sessions_usable_and_refuses_links() {
         .await
         .unwrap();
     assert_eq!(stored, vec![pr]);
+    drop(dir);
+}
+
+/// A handle that stays open in degraded mode must re-probe before its next
+/// metadata write. Another handle may repair the schema and store a link in
+/// the meantime; the degraded handle's snapshot write must carry that link
+/// forward instead of appending `refs = NULL` and erasing it.
+#[tokio::test]
+async fn degraded_handle_write_carries_links_after_schema_repair() {
+    let (dir, path) = temp_db();
+    let wid = workspace_id();
+    let db_path = path.to_str().unwrap().to_owned();
+    // The pre-`refs` table shape: every other column, no `refs`.
+    {
+        let db = turso::Builder::new_local(&db_path)
+            .build()
+            .await
+            .expect("open legacy database");
+        let conn = db.connect().expect("connect legacy database");
+        conn.execute(
+            r#"CREATE TABLE sessions (
+                workspace_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                last_active_at INTEGER NOT NULL,
+                model TEXT NULL,
+                "role" TEXT NULL,
+                entry_count INTEGER NOT NULL DEFAULT 0,
+                parent_session_id TEXT NULL,
+                parent_task_id INTEGER NULL,
+                title TEXT NULL,
+                pinned INTEGER NULL,
+                archived INTEGER NULL,
+                writer TEXT NULL,
+                PRIMARY KEY (workspace_id, session_id, last_active_at)
+            )"#,
+            (),
+        )
+        .await
+        .expect("old sessions schema");
+    }
+    let sid = format!("test-sql-degraded-{}", crate::session::new_id());
+    let degraded = SqliteSession::connect_with_failed_refs_migration(&db_path, &wid, &sid)
+        .await
+        .expect("connect to the degraded database");
+    degraded
+        .create_meta(&sid, Some("m"), Some("main"), None, None, None)
+        .await
+        .expect("a degraded handle still creates sessions");
+
+    // Another handle repairs the schema and adds a link while A stays open.
+    let repairing = SqliteSession::connect(&db_path, &wid, &sid)
+        .await
+        .expect("connect repairs the column");
+    let pr = crate::session_store::SessionRef::new("pr", "https://github.com/acme/widget/pull/14")
+        .unwrap();
+    repairing
+        .update_refs(&sid, |refs| {
+            refs.push(pr.clone());
+            Ok(())
+        })
+        .await
+        .expect("the repairing handle stores the link");
+
+    // A's next metadata write is a turn-boundary touch. It must see the
+    // repaired column and carry the CURRENT row's links forward.
+    degraded
+        .touch_meta()
+        .await
+        .expect("degraded touch succeeds");
+    let stored = repairing
+        .load_meta_row(&sid)
+        .await
+        .unwrap()
+        .expect("metadata row");
+    assert_eq!(
+        stored.refs,
+        vec![pr],
+        "the degraded handle's snapshot must not erase the repaired link"
+    );
+
+    // A's own cache must not replay the old empty list either.
+    degraded
+        .set_title(&sid, Some("renamed"))
+        .await
+        .expect("degraded rename succeeds");
+    let stored = repairing.load_meta_row(&sid).await.unwrap().unwrap();
+    assert_eq!(stored.title.as_deref(), Some("renamed"));
+    assert_eq!(stored.refs.len(), 1, "the link survives every later write");
+    drop(dir);
+}
+
+/// Two independent handles adding a different URL to the same session must
+/// both survive. Each mutator reads the latest row INSIDE its own write
+/// transaction, so neither can start from the same snapshot and let the
+/// later append drop the earlier URL (the web opens one store per request).
+#[tokio::test]
+async fn concurrent_ref_adds_through_two_sqlite_handles_both_survive() {
+    let (dir, a, sid) = fresh_session().await;
+    a.create_meta(&sid, Some("m"), Some("main"), None, None, None)
+        .await
+        .unwrap();
+    let db_path = dir.path().join("sessions.db");
+    let b = SqliteSession::connect(db_path.to_str().unwrap(), &workspace_id(), &sid)
+        .await
+        .expect("second handle");
+    let pr = crate::session_store::SessionRef::new("pr", "https://github.com/acme/widget/pull/14")
+        .unwrap();
+    let issue =
+        crate::session_store::SessionRef::new("issue", "https://github.com/acme/gadget/issues/22")
+            .unwrap();
+    let (first, second) = tokio::join!(
+        a.update_refs(&sid, |refs| {
+            refs.push(pr.clone());
+            Ok(())
+        }),
+        b.update_refs(&sid, |refs| {
+            refs.push(issue.clone());
+            Ok(())
+        }),
+    );
+    first.expect("first add");
+    second.expect("second add");
+
+    let stored = a.load_meta_row(&sid).await.unwrap().unwrap().refs;
+    assert_eq!(stored.len(), 2, "both independent adds survive: {stored:?}");
+    assert!(stored.contains(&pr), "{stored:?}");
+    assert!(stored.contains(&issue), "{stored:?}");
+    drop(dir);
+}
+
+/// The old read and append were separate statements: a second handle could
+/// delete the row in between, and the edit's INSERT resurrected it. The
+/// mutation now runs under one `BEGIN IMMEDIATE` transaction, so the delete
+/// cannot interleave. The interleaving is deterministic: the mutation
+/// closure signals after the transactional read and waits for the second
+/// handle's delete attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_refs_delete_between_read_and_append_cannot_resurrect() {
+    let (dir, bound, sid) = fresh_session().await;
+    bound
+        .create_meta(&sid, Some("m"), Some("main"), None, None, None)
+        .await
+        .unwrap();
+    let db_path = dir.path().join("sessions.db");
+    let other = SqliteSession::connect(db_path.to_str().unwrap(), &workspace_id(), &sid)
+        .await
+        .unwrap();
+    // A short busy timeout makes the blocked delete fail promptly instead
+    // of waiting out the connect-time 5s default.
+    {
+        let conn = other.conn.lock().await;
+        conn.busy_timeout(std::time::Duration::from_millis(20))
+            .unwrap();
+    }
+
+    let (read_done_tx, read_done_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let bound = std::sync::Arc::new(bound);
+    let pr = crate::session_store::SessionRef::new("pr", "https://github.com/acme/widget/pull/14")
+        .unwrap();
+    let edit = tokio::spawn({
+        let bound = bound.clone();
+        let sid = sid.clone();
+        async move {
+            bound
+                .update_refs(&sid, move |refs| {
+                    read_done_tx.send(()).expect("signal read");
+                    release_rx.recv().expect("wait for the delete attempt");
+                    refs.push(pr);
+                    Ok(())
+                })
+                .await
+        }
+    });
+
+    read_done_rx.recv().expect("the transaction read the row");
+    // This delete runs in the middle of the read→append window. The write
+    // transaction holds the lock, so it cannot slip in.
+    let deleted = other.delete_meta(&sid).await;
+    assert!(
+        deleted.is_err(),
+        "the delete must not interleave with the metadata transaction: {deleted:?}"
+    );
+    release_tx.send(()).expect("release the edit");
+    edit.await.expect("edit task").expect("edit commits");
+
+    assert!(
+        other
+            .list_meta()
+            .await
+            .unwrap()
+            .iter()
+            .any(|meta| meta.session_id == sid),
+        "the committed row survives; it was never deleted mid-transaction \
+         and must not be resurrected"
+    );
+    assert_eq!(
+        other.load_meta_row(&sid).await.unwrap().unwrap().refs.len(),
+        1,
+        "the edit's link is stored"
+    );
     drop(dir);
 }
 
