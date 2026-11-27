@@ -343,6 +343,36 @@ pub fn image_mime_from_extension(path: &str) -> Option<&'static str> {
     }
 }
 
+/// MIME sniffing for an extensionless stored image file (magic bytes only,
+/// same four-format whitelist as [`image_mime_from_extension`]). Image-store
+/// files are named by content hash, so the recovery path — a bare hash handed
+/// back to `read_image` — has no extension to consult.
+pub fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+/// The bare content address a stored image is filed under, when `path` is
+/// exactly 64 lowercase hex characters. Anything else (separators, uppercase,
+/// a different length) is an ordinary path. Used by `read_image` so the hash
+/// an offloaded-image placeholder prints is directly readable.
+pub fn image_store_hash(path: &str) -> Option<&str> {
+    (path.len() == 64
+        && path
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()))
+    .then_some(path)
+}
+
 /// Store image bytes under their SHA-256 hex hash, creating the store
 /// directory as needed. Already-present files are skipped (cross-session
 /// dedup). Returns the hash.

@@ -7,10 +7,11 @@ Guidance for coding agents (and humans) working on e-agent.
 e-agent is a deliberately minimal Rust coding agent: single crate, streaming
 OpenAI-compatible Chat Completions plus ChatGPT Codex Responses, and a small
 built-in tool set for workspace files, notes, shell/background work, goals,
-and history/output receipts, plus conditional `web_search` (`web_fetch` too
-on the DeepSeek backend) and main-agent-only `delegate`. It has a text REPL,
-a ratatui TUI, a headless HTTP server (`--serve` / `web`) with a
-token-authenticated `/api` and a browser web UI, and session persistence over
+and history/output receipts, plus conditional `web_search` (`web_fetch` too:
+this process fetches the page by default, or DeepSeek's service does when
+`[web_search] fetch_provider = "deepseek"`) and main-agent-only `delegate`. It
+has a text REPL, a ratatui TUI, a headless HTTP server (`--serve` / `web`) with
+a token-authenticated `/api` and a browser web UI, and session persistence over
 three backends (SQLite default, JSONL, GreptimeDB). Keep it that way.
 
 ## Prime directive: do not over-design

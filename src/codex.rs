@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::agent::{
-    AssistantMessage, Message, Model, ModelDeltaKind, ToolCall, ToolSpec, Usage, preview,
+    AssistantMessage, ImagePart, Message, Model, ModelDeltaKind, ToolCall, ToolSpec, Usage, preview,
 };
 use crate::codex_auth::CodexAuth;
 use crate::model::ImageRejection;
@@ -104,6 +104,10 @@ pub struct CodexModel {
     vision: bool,
     /// Global content-addressed image store (see `agent::image_store_dir`).
     image_store: Option<PathBuf>,
+    /// `[images] max_inline`: distinct images kept inline per request; older
+    /// ones become a text placeholder naming their stored hash (see
+    /// `crate::images::ImageBudget`). `0` never offloads.
+    max_inline: usize,
 }
 
 impl CodexModel {
@@ -122,7 +126,15 @@ impl CodexModel {
             endpoint: RESPONSES_URL.into(),
             vision: false,
             image_store: crate::agent::image_store_dir(),
+            max_inline: crate::images::DEFAULT_MAX_INLINE,
         })
+    }
+
+    /// Set the `[images] max_inline` inline-image cap applied when this model
+    /// builds a Responses request (see `crate::images`).
+    pub fn with_max_inline(mut self, max_inline: usize) -> Self {
+        self.max_inline = max_inline;
+        self
     }
 
     /// Mark the model as vision-capable so user messages with attached
@@ -145,6 +157,7 @@ impl CodexModel {
             endpoint,
             vision: false,
             image_store: crate::agent::image_store_dir(),
+            max_inline: crate::images::DEFAULT_MAX_INLINE,
         }
     }
 
@@ -223,6 +236,7 @@ impl Model for CodexModel {
             messages,
             tools,
             self.image_store.as_deref(),
+            self.max_inline,
         );
         // Whole-request retry loop: HTTP 403/5xx responses and SSE streams cut
         // short mid-flight both restart the idempotent request (see
@@ -250,7 +264,9 @@ impl Model for CodexModel {
             // the existing retry-before-body path.
             if status.is_client_error() {
                 let body = response.text().await.unwrap_or_default();
-                if let Some(rejection) = ImageRejection::classify(status, &body, messages) {
+                if let Some(rejection) =
+                    ImageRejection::classify(status, &body, &request.transmitted_images)
+                {
                     return Err(anyhow::Error::new(rejection));
                 }
                 if is_retryable_http_status(status) && attempt < HTTP_RETRY_ATTEMPTS {
@@ -447,6 +463,39 @@ struct ResponsesRequest<'a> {
     include: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<Value>,
+    /// Hashes this request serialized as actual `input_image` parts, in wire
+    /// order. Never serialized; never includes an offloaded or missing image.
+    /// This is the recovery record's only source (what really left).
+    #[serde(skip)]
+    transmitted_images: Vec<String>,
+}
+
+/// One Responses input part for a stored image: an `input_image` data URL
+/// (`image_url` is a BARE STRING here, unlike the chat wire's object form), a
+/// plain text placeholder when the image budget offloaded it, or a clear text
+/// degradation when the file is missing/over the cap. Never changes the
+/// surrounding wire shape: an offloaded image is exactly where an
+/// `input_image` part would be. A part that becomes an `input_image` records
+/// its hash in `transmitted_images`.
+fn image_part(
+    image_store: Option<&Path>,
+    budget: &crate::images::ImageBudget,
+    image: &ImagePart,
+    transmitted_images: &mut Vec<String>,
+) -> Value {
+    if let Some(text) = budget.placeholder(&image.hash) {
+        return json!({"type":"input_text","text":text});
+    }
+    match crate::images::wire_image(image_store, image) {
+        Ok((bytes, mime)) => {
+            transmitted_images.push(image.hash.clone());
+            json!({
+                "type":"input_image",
+                "image_url":format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes))
+            })
+        }
+        Err(text) => json!({"type":"input_text","text":text}),
+    }
 }
 
 impl<'a> ResponsesRequest<'a> {
@@ -456,7 +505,10 @@ impl<'a> ResponsesRequest<'a> {
         messages: &[Message],
         tools: &[ToolSpec],
         image_store: Option<&Path>,
+        max_inline: usize,
     ) -> Self {
+        let budget = crate::images::ImageBudget::project(messages, max_inline);
+        let mut transmitted_images = Vec::new();
         let instructions = messages
             .iter()
             .filter_map(|message| match message {
@@ -473,10 +525,12 @@ impl<'a> ResponsesRequest<'a> {
             Message::User { content, images } => {
                 let mut parts = vec![json!({"type":"input_text","text":content})];
                 for image in images {
-                    match crate::agent::load_image_bytes(image_store, &image.hash) {
-                        Some(bytes) => parts.push(json!({"type":"input_image","image_url":format!("data:{};base64,{}", image.mime, base64::engine::general_purpose::STANDARD.encode(bytes))})),
-                        None => parts.push(json!({"type":"input_text","text":format!("[image missing: {}]", image.hash)})),
-                    }
+                    parts.push(image_part(
+                        image_store,
+                        &budget,
+                        image,
+                        &mut transmitted_images,
+                    ));
                 }
                 Some(json!({"type":"message","role":"user","content":parts}))
             }
@@ -508,10 +562,12 @@ impl<'a> ResponsesRequest<'a> {
                 } else {
                     let mut parts = vec![json!({"type":"input_text","text":text})];
                     for image in images {
-                        match crate::agent::load_image_bytes(image_store, &image.hash) {
-                            Some(bytes) => parts.push(json!({"type":"input_image","image_url":format!("data:{};base64,{}", image.mime, base64::engine::general_purpose::STANDARD.encode(bytes))})),
-                            None => parts.push(json!({"type":"input_text","text":format!("[image missing: {}]", image.hash)})),
-                        }
+                        parts.push(image_part(
+                        image_store,
+                        &budget,
+                        image,
+                        &mut transmitted_images,
+                    ));
                     }
                     Some(json!({"type":"function_call_output","call_id":call_id,"output":parts}))
                 }
@@ -529,6 +585,7 @@ impl<'a> ResponsesRequest<'a> {
             stream: true,
             include: Vec::new(),
             reasoning: reasoning_effort.map(|effort| json!({"effort": effort, "summary": "auto"})),
+            transmitted_images,
         }
     }
 }

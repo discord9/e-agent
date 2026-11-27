@@ -37,7 +37,16 @@ async fn opencode_send_chat_sets_session_and_agent_user_agent() {
         .build()
         .unwrap();
     model.set_request_session_id("stable-id");
-    let request = ChatRequest::from_internal("test", None, false, false, &[], &[], None);
+    let request = ChatRequest::from_internal(
+        "test",
+        None,
+        false,
+        false,
+        &[],
+        &[],
+        None,
+        crate::images::DEFAULT_MAX_INLINE,
+    );
     model.send_chat(&request).await.unwrap();
     let (headers, body) = server.await.unwrap();
     assert!(
@@ -104,7 +113,16 @@ async fn non_opencode_hosts_do_not_send_session_header() {
             .build()
             .unwrap();
         model.set_request_session_id("must-not-leak");
-        let request = ChatRequest::from_internal("test", None, false, false, &[], &[], None);
+        let request = ChatRequest::from_internal(
+            "test",
+            None,
+            false,
+            false,
+            &[],
+            &[],
+            None,
+            crate::images::DEFAULT_MAX_INLINE,
+        );
         model.send_chat(&request).await.unwrap();
         let headers = server.await.unwrap().to_ascii_lowercase();
         assert!(
@@ -116,7 +134,16 @@ async fn non_opencode_hosts_do_not_send_session_header() {
 
 #[test]
 fn opencode_session_id_is_not_part_of_chat_json() {
-    let request = ChatRequest::from_internal("test", None, false, false, &[], &[], None);
+    let request = ChatRequest::from_internal(
+        "test",
+        None,
+        false,
+        false,
+        &[],
+        &[],
+        None,
+        crate::images::DEFAULT_MAX_INLINE,
+    );
     let body = serde_json::to_value(request).unwrap();
     assert!(body.get("x-opencode-session").is_none());
 }
@@ -153,7 +180,16 @@ async fn opencode_redirect_to_other_host_does_not_forward_session_header() {
         .build()
         .unwrap();
     model.set_request_session_id("must-not-leave-opencode");
-    let request = ChatRequest::from_internal("test", None, false, false, &[], &[], None);
+    let request = ChatRequest::from_internal(
+        "test",
+        None,
+        false,
+        false,
+        &[],
+        &[],
+        None,
+        crate::images::DEFAULT_MAX_INLINE,
+    );
     let response = model.send_chat(&request).await.unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::FOUND);
     redirect.await.unwrap();
@@ -254,6 +290,7 @@ fn converts_internal_messages_and_function_schemas() {
         ],
         &tools,
         None,
+        crate::images::DEFAULT_MAX_INLINE,
     );
     let value = serde_json::to_value(request).unwrap();
     assert_eq!(value["tools"][0]["type"], "function");
@@ -288,6 +325,7 @@ fn omits_empty_tool_calls_on_plain_assistant_messages() {
         })],
         &[],
         None,
+        crate::images::DEFAULT_MAX_INLINE,
     );
     let value = serde_json::to_value(request).unwrap();
     assert_eq!(value["messages"][0]["content"], "done");
@@ -296,15 +334,32 @@ fn omits_empty_tool_calls_on_plain_assistant_messages() {
 
 #[test]
 fn serializes_reasoning_effort_at_the_top_level() {
-    let request =
-        ChatRequest::from_internal("test-model", Some("max"), false, false, &[], &[], None);
+    let request = ChatRequest::from_internal(
+        "test-model",
+        Some("max"),
+        false,
+        false,
+        &[],
+        &[],
+        None,
+        crate::images::DEFAULT_MAX_INLINE,
+    );
     let value = serde_json::to_value(request).unwrap();
     assert_eq!(value["reasoning_effort"], "max");
 }
 
 #[test]
 fn omits_reasoning_effort_when_unset() {
-    let request = ChatRequest::from_internal("test-model", None, false, false, &[], &[], None);
+    let request = ChatRequest::from_internal(
+        "test-model",
+        None,
+        false,
+        false,
+        &[],
+        &[],
+        None,
+        crate::images::DEFAULT_MAX_INLINE,
+    );
     let value = serde_json::to_value(request).unwrap();
     assert!(value.get("reasoning_effort").is_none());
     assert!(!value.as_object().unwrap().contains_key("reasoning_effort"));
@@ -344,6 +399,7 @@ deepseek_compat = true
             &[tool_call_assistant(None, Some("need pwd"))],
             &[],
             None,
+            crate::images::DEFAULT_MAX_INLINE,
         );
         serde_json::to_value(request).unwrap()
     };
@@ -366,8 +422,16 @@ deepseek_compat = true
 
 #[test]
 fn serializes_thinking_switch_when_enabled() {
-    let request =
-        ChatRequest::from_internal("test-model", Some("max"), true, false, &[], &[], None);
+    let request = ChatRequest::from_internal(
+        "test-model",
+        Some("max"),
+        true,
+        false,
+        &[],
+        &[],
+        None,
+        crate::images::DEFAULT_MAX_INLINE,
+    );
     let value = serde_json::to_value(request).unwrap();
     assert_eq!(value["thinking"]["type"], "enabled");
 }
@@ -383,6 +447,7 @@ fn thinking_switch_follows_profile_flag_even_without_effort() {
         &[],
         &[],
         None,
+        crate::images::DEFAULT_MAX_INLINE,
     ))
     .unwrap();
     assert!(disabled.get("thinking").is_none());
@@ -396,6 +461,7 @@ fn thinking_switch_follows_profile_flag_even_without_effort() {
         &[],
         &[],
         None,
+        crate::images::DEFAULT_MAX_INLINE,
     ))
     .unwrap();
     assert_eq!(no_effort["thinking"]["type"], "enabled");
@@ -814,6 +880,7 @@ async fn empty_only_reasoning_delta_preserves_empty_reasoning_field() {
         &[Message::Assistant(message)],
         &[],
         None,
+        crate::images::DEFAULT_MAX_INLINE,
     );
     let value = serde_json::to_value(request).unwrap();
     assert_eq!(value["messages"][0]["reasoning_content"], "");
@@ -833,6 +900,7 @@ fn wire_messages_never_echo_reasoning() {
         })],
         &[],
         None,
+        crate::images::DEFAULT_MAX_INLINE,
     );
     let value = serde_json::to_value(request).unwrap();
     let message = &value["messages"][0];
@@ -865,6 +933,7 @@ fn deepseek_compat_replays_reasoning_on_tool_call_assistant() {
         &[tool_call_assistant(None, Some("need pwd"))],
         &[],
         None,
+        crate::images::DEFAULT_MAX_INLINE,
     );
     let value = serde_json::to_value(request).unwrap();
     let message = &value["messages"][0];
@@ -887,6 +956,7 @@ fn deepseek_compat_replays_empty_reasoning_on_tool_call_assistant() {
         &[tool_call_assistant(None, Some(""))],
         &[],
         None,
+        crate::images::DEFAULT_MAX_INLINE,
     );
     let value = serde_json::to_value(request).unwrap();
     let message = &value["messages"][0];
@@ -913,6 +983,7 @@ fn deepseek_compat_emits_empty_reasoning_for_foreign_tool_turn() {
         &[tool_call_assistant(None, None)],
         &[],
         None,
+        crate::images::DEFAULT_MAX_INLINE,
     );
     let value = serde_json::to_value(request).unwrap();
     let message = &value["messages"][0];
@@ -938,6 +1009,7 @@ fn deepseek_compat_foreign_tool_turn_without_thinking_omits_reasoning_content() 
         &[tool_call_assistant(None, None)],
         &[],
         None,
+        crate::images::DEFAULT_MAX_INLINE,
     );
     let value = serde_json::to_value(request).unwrap();
     let message = &value["messages"][0];
@@ -958,6 +1030,7 @@ fn non_compat_foreign_tool_turn_omits_reasoning_content() {
         &[tool_call_assistant(None, None)],
         &[],
         None,
+        crate::images::DEFAULT_MAX_INLINE,
     );
     let value = serde_json::to_value(request).unwrap();
     let message = &value["messages"][0];
@@ -983,6 +1056,7 @@ fn deepseek_compat_plain_assistant_reasoning_is_not_replayed() {
         })],
         &[],
         None,
+        crate::images::DEFAULT_MAX_INLINE,
     );
     let value = serde_json::to_value(request).unwrap();
     let message = &value["messages"][0];
@@ -1003,6 +1077,7 @@ fn deepseek_compat_without_thinking_does_not_replay() {
         &[tool_call_assistant(None, Some("need pwd"))],
         &[],
         None,
+        crate::images::DEFAULT_MAX_INLINE,
     );
     let value = serde_json::to_value(request).unwrap();
     let message = &value["messages"][0];
@@ -1024,6 +1099,7 @@ fn non_deepseek_chat_wire_is_unchanged() {
         &[tool_call_assistant(None, Some("internal reasoning"))],
         &[],
         None,
+        crate::images::DEFAULT_MAX_INLINE,
     );
     let value = serde_json::to_value(request).unwrap();
     let message = &value["messages"][0];
@@ -1044,6 +1120,7 @@ fn non_deepseek_chat_wire_is_unchanged() {
         })],
         &[],
         None,
+        crate::images::DEFAULT_MAX_INLINE,
     );
     let value = serde_json::to_value(request).unwrap();
     assert_eq!(value["messages"][0]["content"], "done");
@@ -1069,6 +1146,7 @@ fn chat_wire_empty_tool_result_stays_empty_string() {
         }],
         &[],
         None,
+        crate::images::DEFAULT_MAX_INLINE,
     );
     let value = serde_json::to_value(request).unwrap();
     assert_eq!(value["messages"][0]["content"], "");
@@ -1089,6 +1167,7 @@ fn chat_wire_empty_tool_result_stays_empty_string() {
         }],
         &[],
         None,
+        crate::images::DEFAULT_MAX_INLINE,
     );
     let value = serde_json::to_value(request).unwrap();
     assert_eq!(value["messages"][0]["content"], "ERROR: ");
@@ -1214,6 +1293,7 @@ fn from_internal_filters_poisoned_assistant_messages() {
         ],
         &[],
         None,
+        crate::images::DEFAULT_MAX_INLINE,
     );
     let value = serde_json::to_value(request).unwrap();
     let messages = value["messages"].as_array().unwrap();
@@ -1604,6 +1684,8 @@ async fn image_rejection_is_typed_with_the_full_untruncated_diagnostic() {
     );
     let address = serve_error_responses("400 Bad Request", body.clone(), attempts.clone()).await;
     let temp = tempfile::tempdir().unwrap();
+    // The image must REALLY be on the wire for the rejection to claim it.
+    std::fs::write(temp.path().join("hash-a"), tiny_png()).unwrap();
     let mut model = OpenAiModel::with_timeout(
         format!("http://{address}/v1"),
         "test-key".into(),
@@ -1640,6 +1722,8 @@ async fn image_rejection_bypasses_the_retryable_403_path() {
     let attempts = Arc::new(AtomicUsize::new(0));
     let body = r#"{"error":{"message":"image input is not supported"}}"#;
     let address = serve_error_responses("403 Forbidden", body.into(), attempts.clone()).await;
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("hash-a"), tiny_png()).unwrap();
     let mut model = OpenAiModel::with_timeout(
         format!("http://{address}/v1"),
         "test-key".into(),
@@ -1648,7 +1732,8 @@ async fn image_rejection_bypasses_the_retryable_403_path() {
         true,
         Duration::from_secs(1),
     )
-    .unwrap();
+    .unwrap()
+    .with_image_store(temp.path().to_path_buf());
     let error = model
         .complete(&image_request(), &[], None)
         .await
@@ -1854,6 +1939,7 @@ fn chat_wire_emits_image_url_object_parts_for_attached_images() {
         }],
         &[],
         Some(temp.path()),
+        crate::images::DEFAULT_MAX_INLINE,
     );
     let value = serde_json::to_value(request).unwrap();
     // content switches from a plain string to a parts array.
@@ -1882,6 +1968,7 @@ fn chat_wire_emits_image_url_object_parts_for_attached_images() {
         }],
         &[],
         None,
+        crate::images::DEFAULT_MAX_INLINE,
     );
     let value = serde_json::to_value(request).unwrap();
     assert_eq!(value["messages"][0]["content"], "sys");
@@ -1903,6 +1990,7 @@ fn chat_wire_degrades_missing_image_file_to_text_placeholder() {
         }],
         &[],
         None,
+        crate::images::DEFAULT_MAX_INLINE,
     );
     let value = serde_json::to_value(request).unwrap();
     let parts = value["messages"][0]["content"].as_array().unwrap();
@@ -1939,6 +2027,7 @@ fn chat_wire_tool_batch_without_images_adds_no_user_message() {
         ],
         &[],
         None,
+        crate::images::DEFAULT_MAX_INLINE,
     );
     let value = serde_json::to_value(request).unwrap();
     let messages = value["messages"].as_array().unwrap();
@@ -2001,6 +2090,7 @@ fn chat_wire_aggregates_one_temporary_user_image_message_per_tool_batch() {
         ],
         &[],
         Some(temp.path()),
+        crate::images::DEFAULT_MAX_INLINE,
     );
     let value = serde_json::to_value(request).unwrap();
     let messages = value["messages"].as_array().unwrap();
@@ -2069,6 +2159,7 @@ fn chat_wire_tool_batch_with_single_image_aggregates_one_user_message() {
         ],
         &[],
         None,
+        crate::images::DEFAULT_MAX_INLINE,
     );
     let value = serde_json::to_value(request).unwrap();
     let messages = value["messages"].as_array().unwrap();
@@ -2204,4 +2295,358 @@ async fn chat_wire_sends_image_url_parts_over_http() {
         .await
         .unwrap();
     assert_eq!(message.content.as_deref(), Some("seen it"));
+}
+
+/// A tiny valid PNG: below the token budget, so it is sent byte-identical.
+fn tiny_png() -> Vec<u8> {
+    let image =
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(8, 8, image::Rgb([1, 2, 3])));
+    let mut bytes = Vec::new();
+    image
+        .write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+    bytes
+}
+
+/// Ten distinct user images in one request: the serialized chat body keeps
+/// the newest six as `image_url` parts and replaces the oldest four with
+/// recovery placeholders, without changing the wire shape of the message.
+#[test]
+fn chat_wire_offloads_the_oldest_images() {
+    let store = tempfile::tempdir().unwrap();
+    let png = tiny_png();
+    let mut messages: Vec<Message> = (0..10)
+        .map(|index| {
+            let hash = format!("img{index}");
+            std::fs::write(store.path().join(&hash), &png).unwrap();
+            Message::User {
+                content: format!("image {index}"),
+                images: vec![ImagePart {
+                    hash,
+                    mime: "image/png".into(),
+                }],
+            }
+        })
+        .collect();
+    // A completed model response: all ten images are delivered.
+    messages.push(Message::Assistant(AssistantMessage {
+        content: Some("seen".into()),
+        tool_calls: Vec::new(),
+        reasoning: None,
+    }));
+    let body = |max_inline: usize| {
+        serde_json::to_string(&ChatRequest::from_internal(
+            "test-model",
+            None,
+            false,
+            false,
+            &messages,
+            &[],
+            Some(store.path()),
+            max_inline,
+        ))
+        .unwrap()
+    };
+    let value: serde_json::Value = serde_json::from_str(&body(6)).unwrap();
+    let wire = value["messages"].as_array().unwrap();
+    assert_eq!(wire.len(), 11, "ten images plus the assistant response");
+    for (index, message) in wire[..10].iter().enumerate() {
+        let parts = message["content"].as_array().unwrap();
+        let images: Vec<_> = parts
+            .iter()
+            .filter(|part| part["type"] == "image_url")
+            .collect();
+        let placeholders: Vec<_> = parts
+            .iter()
+            .filter(|part| {
+                part["type"] == "text"
+                    && part["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("image omitted"))
+            })
+            .collect();
+        if index < 4 {
+            assert!(images.is_empty(), "old image {index} must be offloaded");
+            assert_eq!(
+                placeholders[0]["text"],
+                format!(
+                    "[image omitted: 4 older image(s); read again with read_image (hash img{index})]"
+                )
+            );
+        } else {
+            assert_eq!(images.len(), 1, "the newest six stay inline");
+            assert!(placeholders.is_empty());
+            assert_eq!(
+                images[0]["image_url"]["url"],
+                format!(
+                    "data:image/png;base64,{}",
+                    base64::engine::general_purpose::STANDARD.encode(&png)
+                ),
+                "a fitting image is sent byte-identical"
+            );
+        }
+    }
+    // Pure and deterministic: the same messages serialise to the same bytes.
+    assert_eq!(body(6), body(6));
+    // `max_inline = 0` disables offloading: every image stays inline.
+    let all: serde_json::Value = serde_json::from_str(&body(0)).unwrap();
+    let inline = all["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| {
+            message["content"]
+                .as_array()
+                .is_some_and(|parts| parts.iter().any(|part| part["type"] == "image_url"))
+        })
+        .count();
+    assert_eq!(inline, 10);
+}
+
+/// Finding 4: the recovery record is exactly what the request put on the
+/// wire. Offloaded images and files that degraded to `[image missing: …]`
+/// were never submitted and must not be claimed (or later omitted) as the
+/// cause of an image rejection.
+#[test]
+fn image_rejection_records_only_images_that_were_transmitted() {
+    let store = tempfile::tempdir().unwrap();
+    let png = tiny_png();
+    let mut messages: Vec<Message> = (0..8)
+        .map(|index| {
+            let hash = format!("img{index}");
+            std::fs::write(store.path().join(&hash), &png).unwrap();
+            Message::User {
+                content: format!("image {index}"),
+                images: vec![ImagePart {
+                    hash,
+                    mime: "image/png".into(),
+                }],
+            }
+        })
+        .collect();
+    // A reference whose store file is missing: it becomes a text placeholder
+    // on the wire and must not enter the record.
+    messages.push(Message::User {
+        content: "gone".into(),
+        images: vec![ImagePart {
+            hash: "missing".into(),
+            mime: "image/png".into(),
+        }],
+    });
+    messages.push(Message::Assistant(AssistantMessage {
+        content: Some("seen".into()),
+        tool_calls: Vec::new(),
+        reasoning: None,
+    }));
+    // max_inline 3 keeps the newest three delivered: img6, img7, missing.
+    // The missing file is not transmitted, so only two images are recorded.
+    let request = ChatRequest::from_internal(
+        "test-model",
+        None,
+        false,
+        false,
+        &messages,
+        &[],
+        Some(store.path()),
+        3,
+    );
+    assert_eq!(
+        request.transmitted_images,
+        vec!["img6".to_owned(), "img7".to_owned()]
+    );
+    let rejection = ImageRejection::classify(
+        reqwest::StatusCode::BAD_REQUEST,
+        "image input is not supported",
+        &request.transmitted_images,
+    )
+    .expect("an image rejection over transmitted images");
+    assert_eq!(rejection.hashes, request.transmitted_images);
+    assert!(!rejection.hashes.iter().any(|hash| hash == "missing"));
+    assert!(
+        !rejection.hashes.iter().any(|hash| hash == "img0"),
+        "an offloaded image is not claimed"
+    );
+    // Nothing transmitted: the provider's image wording is not a rejection.
+    assert!(
+        ImageRejection::classify(
+            reqwest::StatusCode::BAD_REQUEST,
+            "image input is not supported",
+            &[],
+        )
+        .is_none()
+    );
+}
+
+/// Tool-result images ride on the aggregated temporary user message on the
+/// chat wire; the budget applies there too, so the placeholder lands in that
+/// aggregated message rather than breaking the `role: "tool"` shape.
+#[test]
+fn chat_wire_offloads_old_tool_images_in_the_aggregated_message() {
+    let store = tempfile::tempdir().unwrap();
+    let png = tiny_png();
+    let mut messages = Vec::new();
+    for index in 0..3 {
+        let hash = format!("user{index}");
+        std::fs::write(store.path().join(&hash), &png).unwrap();
+        messages.push(Message::User {
+            content: format!("image {index}"),
+            images: vec![ImagePart {
+                hash,
+                mime: "image/png".into(),
+            }],
+        });
+    }
+    // One tool batch: three image-bearing results in a single consecutive
+    // run, which the chat wire aggregates into one temporary user message.
+    messages.push(Message::Assistant(AssistantMessage {
+        content: Some("reading".into()),
+        tool_calls: (0..3)
+            .map(|index| ToolCall {
+                id: format!("call-{index}"),
+                name: "read_image".into(),
+                arguments: "{}".into(),
+            })
+            .collect(),
+        reasoning: None,
+    }));
+    for index in 0..3 {
+        let hash = format!("tool{index}");
+        std::fs::write(store.path().join(&hash), &png).unwrap();
+        messages.push(Message::Tool {
+            call_id: format!("call-{index}"),
+            name: "read_image".into(),
+            content: "read".into(),
+            is_error: false,
+            images: vec![ImagePart {
+                hash,
+                mime: "image/png".into(),
+            }],
+            synthetic: false,
+        });
+    }
+    let body = |msgs: &[Message], max_inline: usize| {
+        serde_json::to_string(&ChatRequest::from_internal(
+            "test-model",
+            None,
+            false,
+            false,
+            msgs,
+            &[],
+            Some(store.path()),
+            max_inline,
+        ))
+        .unwrap()
+    };
+    // The three tool images were just read and have never been on the wire,
+    // so all three stay inline. Only the delivered user0 is over the window.
+    let request = ChatRequest::from_internal(
+        "test-model",
+        None,
+        false,
+        false,
+        &messages,
+        &[],
+        Some(store.path()),
+        2,
+    );
+    assert_eq!(
+        request.transmitted_images,
+        vec![
+            "user1".to_owned(),
+            "user2".to_owned(),
+            "tool0".to_owned(),
+            "tool1".to_owned(),
+            "tool2".to_owned(),
+        ],
+        "the transmitted record names only images really on the wire"
+    );
+    let value: serde_json::Value = serde_json::to_value(&request).unwrap();
+    let wire = value["messages"].as_array().unwrap();
+    let aggregated: Vec<_> = wire
+        .iter()
+        .filter(|message| {
+            message["role"] == "user"
+                && message["content"].as_array().is_some_and(|parts| {
+                    parts[0]["text"]
+                        .as_str()
+                        .is_some_and(|text| text.starts_with("[image attached:"))
+                })
+        })
+        .collect();
+    assert_eq!(aggregated.len(), 1, "one aggregated tool-image message");
+    assert_eq!(
+        aggregated[0]["content"][0]["text"],
+        "[image attached: 3 image(s)]"
+    );
+    let parts = aggregated[0]["content"].as_array().unwrap();
+    assert_eq!(
+        parts
+            .iter()
+            .filter(|part| part["type"] == "image_url")
+            .count(),
+        3,
+        "a tool batch's new images all get their first send"
+    );
+    assert!(
+        !parts.iter().any(|part| part["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("hash tool0"))),
+        "a never-transmitted tool image is not offloaded"
+    );
+    assert!(
+        wire[0]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|part| part["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("hash user0"))),
+        "the delivered user0 is deferred"
+    );
+
+    // After the next model response every image is delivered: the newest two
+    // stay, and tool0 becomes a placeholder in the aggregated message.
+    messages.push(Message::Assistant(AssistantMessage {
+        content: Some("done".into()),
+        tool_calls: Vec::new(),
+        reasoning: None,
+    }));
+    let value: serde_json::Value = serde_json::from_str(&body(&messages, 2)).unwrap();
+    let wire = value["messages"].as_array().unwrap();
+    let aggregated: Vec<_> = wire
+        .iter()
+        .filter(|message| {
+            message["role"] == "user"
+                && message["content"].as_array().is_some_and(|parts| {
+                    parts[0]["text"]
+                        .as_str()
+                        .is_some_and(|text| text.starts_with("[image attached:"))
+                })
+        })
+        .collect();
+    let parts = aggregated[0]["content"].as_array().unwrap();
+    assert_eq!(
+        parts
+            .iter()
+            .filter(|part| part["type"] == "image_url")
+            .count(),
+        2,
+        "only the newest delivered tool images stay inline"
+    );
+    assert_eq!(
+        parts
+            .iter()
+            .filter(|part| {
+                part["type"] == "text"
+                    && part["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("hash tool0"))
+            })
+            .count(),
+        1,
+        "the oldest delivered tool image becomes a placeholder in place"
+    );
 }

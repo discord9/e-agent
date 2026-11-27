@@ -81,6 +81,7 @@ The keys most configurations touch:
 | `[session].backend` | `sqlite` (default), `jsonl`, or `greptime` |
 | `[roles]` | role → model profile routing |
 | `[bash].timeout_secs`, `[background].timeout_secs` | command timeouts |
+| `[images].max_inline` | distinct inline images per request (default 6, `0` = never offload) |
 
 A workspace-level `.e-agent/config.toml` may add or override models, roles, MCP
 servers, `[bash]`, and `[background]`; it cannot define providers or the session
@@ -113,6 +114,12 @@ environment variables, and the network. On Unix, timed-out commands are killed
 as a process group; on non-Unix platforms only the direct child is killed.
 stdout and stderr are each captured up to 64 KiB, then drained and marked as
 truncated.
+
+`web_fetch` (the default `fetch_provider = "local"`) performs its HTTP GET in
+this process, so it has exactly the same network reach as `bash`. There is no
+public-only destination filter: filtering one tool while the shell it sits next
+to can reach the same hosts is theatre, so the fetch reaches whatever the
+process reaches.
 
 Optional shell restriction is available when `[sandbox] enabled = true` is set.
 On Linux/macOS this uses `bubblewrap` (`bwrap`) as described below. On Windows,
@@ -411,7 +418,8 @@ stable across runs and a forked child can reuse the parent's prompt cache.
 - `OPENAI_MODEL` — model name, default: `gpt-4o-mini`.
 - `EXA_API_KEY` — optional; a non-whitespace value enables `web_search` through
   Exa Context. `[web_search] provider = "searxng"` needs no environment
-  variable: its `base_url` comes from the config file only.
+  variable: its `base_url` comes from the config file only. See
+  [Web tools](#web-tools).
 - `RUST_BACKTRACE=1` — optional; appends a backtrace to ordinary `anyhow` error
   chains (and enables their full Rust verbosity). Rust panics always print a
   forced stack regardless of this setting.
@@ -438,6 +446,44 @@ panics.
 TOML config is optional. When present, it supplies the selected provider
 credential and profile values instead of `OPENAI_*`; see [Run](#run).
 
+## Web tools
+
+`web_search` and `web_fetch` are registered together as soon as one web-search
+source is usable: `EXA_API_KEY`, `[web_search] provider = "searxng"` plus a
+`base_url`, or `provider = "deepseek"` plus a credential. With no usable source
+neither tool exists, and a blank credential registers nothing.
+
+`web_fetch` is a single-URL fetch performed by this process: it GETs the URL
+over the network this process already has, follows at most 5 redirects, and
+accepts `text/html`, `application/xhtml+xml`, `text/plain` and `text/markdown`
+bodies up to 2 MiB. Bytes are decoded with the `Content-Type` charset, else a
+`<meta charset>` sniff, else UTF-8 (lossy, so GBK/Big5 pages are readable).
+HTML goes through Mozilla Readability (`dom_smoothie`) and comes back as the
+article title plus Markdown; a page with no readable article is an error, not
+a dump of tags and navigation. `text/plain` and `text/markdown` are returned
+as they are. It never follows links found in the page, so it is not a crawler.
+Because it runs in this process it reaches whatever the process reaches — the
+same network `bash` has, not only public hosts (see
+[Safety boundaries](#safety-boundaries)).
+
+`[web_search] fetch_provider` selects the fetch transport:
+
+```toml
+[web_search]
+provider = "searxng"
+base_url = "http://127.0.0.1:8088"
+fetch_provider = "deepseek"      # optional: "local" (default) or "deepseek"
+api_key_env = "DEEPSEEK_API_KEY" # allowed here only because the fetch needs it
+```
+
+`"local"` (the default when the field is absent) uses this process.
+`fetch_provider = "deepseek"` keeps the remote `tools/fetch` — DeepSeek's
+servers do the fetching, so a page they cannot reach fails — and requires a
+credential. The two choices are independent: a SearXNG search can pair with a
+DeepSeek fetch. `provider` still rejects a `base_url` for `"deepseek"`, and
+`api_key_file` / `api_key_env` are rejected for a SearXNG search unless
+`fetch_provider = "deepseek"` needs them.
+
 ## Image input (multimodal)
 
 `read_image` (tool) and the REPL `/image <path>` command attach png/jpeg/webp/gif
@@ -446,6 +492,41 @@ images up to 10 MiB; bytes are stored once in a content-addressed cache under
 base64, and the wire re-reads the file when sending. The profile needs
 `vision = true`, otherwise the turn fails with a model-does-not-support-images
 error. `generate_image` (main session only, ChatGPT login) writes a PNG.
+
+### Image budget
+
+Both wires (chat and ChatGPT Responses) put at most **1024 estimated vision
+tokens per image** on the wire. Each outgoing image is measured with DeepSeek's
+published calculator — 14px patches, merged 3:1 per axis into 42px token cells,
+`tokens = grid_h * (grid_w + 1) + 2` — and scaled **down** (never up) until the
+estimate fits, keeping its aspect ratio in whole 14px patches. The provider's
+own 544x544 total-pixel floor is its accounting only: a small image is sent
+unchanged. The re-encoded variant is cached next to the original as
+`<hash>.n<WxH>.<ext>` (JPEG quality 85 for opaque images, PNG when the source
+has alpha) and reused on later requests; an image that already fits is sent
+byte-identical with its original MIME type and is never re-encoded.
+
+```toml
+[images]
+max_inline = 6      # distinct images kept inline per request; 0 = never offload
+```
+
+When one request would carry more than `max_inline` distinct images, the oldest
+by first appearance in request order are replaced by a text part in place of the
+image part:
+
+```text
+[image omitted: 4 older image(s); read again with read_image (hash <sha256>)]
+```
+
+The placeholder names the stored hash — the file name in the image store, which
+`read_image` can read again when the store is an authorized external root — so
+nothing is silently lost, only deferred. Offloading applies to user and tool
+images (the same messages the image-rejection classifier walks), and the newest
+`max_inline` are always kept. Because the projection is pure (same messages in,
+same request bytes out), it is deterministic, but replacing an old image part
+with text changes every byte after it: **offloading costs prompt-cache reuse
+from the first changed message onward**.
 
 ## SQLite session backend
 
@@ -473,5 +554,7 @@ starts.
   background waits.
 - MCP is local stdio servers only; no remote HTTP/SSE, OAuth, resources,
   prompts, or server restart.
+- Image offload is positional only: no retention/expiry by wall-clock time, no
+  "recent turns" heuristic, no automatic re-read on offload, and no summariser.
 - The web server has no multi-user model: one token, one workspace per process.
 - Windows support is narrower than Linux (see the sandbox notes above).

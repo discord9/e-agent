@@ -126,9 +126,9 @@ impl Tool for ReadImage {
     fn spec(&self) -> ToolSpec {
         spec(
             "read_image",
-            "Read an image file (png, jpeg/jpg, webp, gif; up to 10 MiB) and attach it to the conversation so the model can see it. Relative paths use the workspace; authorized external absolute paths are accepted. The image bytes are stored once in a global content-addressed cache and sent to the provider on the next model call.",
+            "Read an image file (png, jpeg/jpg, webp, gif; up to 10 MiB) and attach it to the conversation so the model can see it. Relative paths use the workspace; authorized external absolute paths are accepted. A bare 64-character lowercase SHA-256 hash reads that image back from the global image store — this is the reference an offloaded-image placeholder prints. The image bytes are stored once in a global content-addressed cache and sent to the provider on the next model call.",
             json!({
-                "path": {"type": "string", "description": "workspace-relative or authorized external absolute path to an image file; absolute paths inside the workspace are also accepted (treated as workspace-relative)"}
+                "path": {"type": "string", "description": "workspace-relative or authorized external absolute path to an image file; absolute paths inside the workspace are also accepted (treated as workspace-relative); or a bare 64-character lowercase image-store hash"}
             }),
             &["path"],
         )
@@ -136,10 +136,32 @@ impl Tool for ReadImage {
 
     async fn execute(&self, arguments: Value) -> Result<ToolOutput, String> {
         let path = required_string(&arguments, "path")?;
-        let mime = crate::agent::image_mime_from_extension(path).ok_or_else(|| {
-            format!("unsupported image type for {path}: expected .png, .jpeg/.jpg, .webp, or .gif")
-        })?;
-        let bytes = self.workspace.read(path)?;
+        // A bare content hash names a file in the global image store. The
+        // image-budget placeholder prints exactly that hash, so recovery must
+        // accept it without the model having to know or be authorized for the
+        // store's directory.
+        let stored_hash = crate::agent::image_store_hash(path);
+        let bytes = match stored_hash {
+            Some(hash) => {
+                let store = self
+                    .store
+                    .as_deref()
+                    .ok_or("no image store: XDG_STATE_HOME or HOME is not set")?;
+                // Bounded read, like the budget's own store loader: a file
+                // larger than the cap is never materialized whole just to be
+                // rejected by the size check below.
+                let file = std::fs::File::open(store.join(hash))
+                    .map_err(|error| format!("cannot read stored image {hash}: {error}"))?;
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(
+                    &mut std::io::Read::take(file, crate::agent::IMAGE_MAX_BYTES as u64 + 1),
+                    &mut bytes,
+                )
+                .map_err(|error| format!("cannot read stored image {hash}: {error}"))?;
+                bytes
+            }
+            None => self.workspace.read(path)?,
+        };
         if bytes.len() > crate::agent::IMAGE_MAX_BYTES {
             return Err(format!(
                 "image {path} is {} bytes, exceeding the {} MiB limit",
@@ -147,6 +169,16 @@ impl Tool for ReadImage {
                 crate::agent::IMAGE_MAX_BYTES / (1024 * 1024)
             ));
         }
+        // Extension first (the attachment whitelist), then magic bytes: the
+        // stored file is named by hash and has no extension, so a bare hash
+        // resolves entirely through the sniff.
+        let mime = crate::agent::image_mime_from_extension(path)
+            .or_else(|| crate::agent::sniff_image_mime(&bytes))
+            .ok_or_else(|| {
+                format!(
+                    "unsupported image type for {path}: expected .png, .jpeg/.jpg, .webp, or .gif"
+                )
+            })?;
         let store = self
             .store
             .as_deref()
