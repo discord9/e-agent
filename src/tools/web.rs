@@ -1,7 +1,9 @@
 use super::*;
 
 use async_trait::async_trait;
-use reqwest::header::HeaderValue;
+use dom_smoothie::{Article, Config as ReadabilityConfig, Readability, TextMode};
+use encoding_rs::Encoding;
+use reqwest::header::{HeaderMap, HeaderValue};
 use serde::Deserialize;
 
 pub(super) const WEB_SEARCH_ENDPOINT: &str = "https://api.exa.ai/context";
@@ -21,6 +23,27 @@ pub(super) const DEEPSEEK_FETCH_PATH: &str = "/v1/tools/fetch";
 /// and a page body ~10KB, so neither is negotiable by the model.
 pub(super) const DEEPSEEK_SEARCH_COUNT: u8 = 5;
 pub(super) const WEB_FETCH_URL_LIMIT: usize = 8192;
+/// The local fetcher's timeout: the same 30s its DeepSeek predecessor used.
+pub(super) const WEB_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+/// Hard cap on a fetched body: a page past it is an error, not a truncated
+/// read, so the model never sees a silently clipped document.
+pub(super) const WEB_FETCH_BODY_LIMIT: usize = 2 * 1024 * 1024;
+/// Redirect hops `web_fetch` follows before failing.
+pub(super) const WEB_FETCH_REDIRECT_LIMIT: usize = 5;
+/// The local fetcher's `User-Agent`. `reqwest` sends none by default, and a
+/// UA-less client is answered with 403 by Wikipedia and much of the web, so
+/// this is a fixed, ordinary desktop-browser string — honest about being a
+/// generic browser, and carrying no version, contact or credential.
+pub(super) const WEB_FETCH_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+/// What the local fetcher says it accepts: the shape a browser sends, so a
+/// server that negotiates on `Accept` returns the HTML this tool parses
+/// instead of JSON or an image.
+pub(super) const WEB_FETCH_ACCEPT: &str =
+    "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8";
+/// How much of a failed request's reason reaches the model. `reqwest` repeats
+/// the URL in its `Display`, and the URL alone may be `WEB_FETCH_URL_LIMIT`
+/// bytes.
+pub(super) const WEB_FETCH_ERROR_REASON_LIMIT: usize = 512;
 
 /// The resolved web backend: each variant owns the credential and URL(s) it
 /// needs. Exactly three concrete shapes, so this is an enum rather than a
@@ -31,7 +54,8 @@ pub(super) enum WebBackend {
     /// SearXNG: GET `{base_url}/search`; no credential.
     Searxng { base_url: String },
     /// DeepSeek: POST `{base}/v1/tools/search` and `{base}/v1/tools/fetch`,
-    /// both with the same API key.
+    /// both with the same API key; the fetch endpoint is only used by
+    /// `WebFetch::Deepseek` (see `[web_search] fetch_provider`).
     Deepseek { api_key: String, base: String },
 }
 
@@ -41,13 +65,26 @@ pub(super) struct WebSearch {
     timeout: Duration,
 }
 
-/// `web_fetch` exists only for the DeepSeek backend (Exa/SearXNG register no
-/// fetch tool), so its credential and fixed base live here directly.
-pub(super) struct WebFetch {
-    api_key: String,
-    base: String,
-    client: reqwest::Client,
-    timeout: Duration,
+/// `web_fetch`: one URL, fetched either by THIS process (the default) or by
+/// DeepSeek's remote fetch service, chosen by `[web_search] fetch_provider`.
+///
+/// The local variant rides the process's own egress, so it reaches whatever
+/// the process reaches (the same network as `bash`) and is registered for
+/// every search backend. Neither variant follows links found in the page, so
+/// this is not a crawler.
+pub(super) enum WebFetch {
+    /// GET the URL here; no credential, no fixed endpoint.
+    Local {
+        client: reqwest::Client,
+        timeout: Duration,
+    },
+    /// POST the URL to `{base}/v1/tools/fetch` with the API key.
+    Deepseek {
+        api_key: String,
+        base: String,
+        client: reqwest::Client,
+        timeout: Duration,
+    },
 }
 
 #[derive(Deserialize)]
@@ -161,9 +198,18 @@ impl WebSearch {
 }
 
 impl WebFetch {
+    /// The local fetcher: no credential, no fixed endpoint (the URL is the
+    /// argument), and a redirect-following client of its own.
+    pub(super) fn local() -> Self {
+        Self::Local {
+            client: web_fetch_client(),
+            timeout: WEB_FETCH_TIMEOUT,
+        }
+    }
+
     /// DeepSeek fetch with the resolved API key; the endpoint is fixed.
     pub(super) fn deepseek(api_key: String) -> Self {
-        Self {
+        Self::Deepseek {
             api_key,
             base: DEEPSEEK_API_BASE.into(),
             client: web_search_client(),
@@ -173,7 +219,7 @@ impl WebFetch {
 
     #[cfg(test)]
     pub(super) fn for_test(api_key: String, base: String, timeout: Duration) -> Self {
-        Self {
+        Self::Deepseek {
             api_key,
             base,
             client: web_search_client(),
@@ -182,12 +228,59 @@ impl WebFetch {
     }
 }
 
+/// The `web_search` client: no redirects, no retries — every backend gets a
+/// single request whose response is either parsed or reported.
 pub(super) fn web_search_client() -> reqwest::Client {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())
         .build()
         .expect("web search client configuration is valid")
+}
+
+/// The `web_fetch` client: pages redirect (canonical URLs, short links), so
+/// this one follows up to 5 hops and still never retries. A 6-hop chain is
+/// an error rather than an unbounded walk.
+///
+/// It is also the only client that sends `User-Agent` and `Accept`: the
+/// header-less requests of `web_search_client` are API calls whose servers do
+/// not care, while a fetched page's server usually does (see
+/// `WEB_FETCH_USER_AGENT`). Both are client defaults, so every redirect hop
+/// carries them, and no credential is ever added here.
+pub(super) fn web_fetch_client() -> reqwest::Client {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        reqwest::header::ACCEPT,
+        HeaderValue::from_static(WEB_FETCH_ACCEPT),
+    );
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(WEB_FETCH_REDIRECT_LIMIT))
+        .retry(reqwest::retry::never())
+        .user_agent(WEB_FETCH_USER_AGENT)
+        .default_headers(headers)
+        .build()
+        .expect("web fetch client configuration is valid")
+}
+
+/// `{prefix}: {reason}` for a failed request or body read. `reqwest`'s own
+/// `Display` is only the error kind plus the URL (`error sending request for
+/// url (...)`), so the cause chain is appended too — a refused connection, a
+/// DNS failure, a TLS rejection and a timeout are otherwise one message, and
+/// the reason is what tells them apart. Bounded and flattened to one line so
+/// the model gets a single readable line.
+fn transport_error(prefix: &str, error: &reqwest::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    let text = truncate_utf8(text, WEB_FETCH_ERROR_REASON_LIMIT);
+    format!(
+        "{prefix}: {}",
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    )
 }
 
 /// `{base}{path}` with any trailing slash on the base removed, so a test base
@@ -253,9 +346,19 @@ impl Tool for WebSearch {
 #[async_trait]
 impl Tool for WebFetch {
     fn spec(&self) -> ToolSpec {
+        // The local fetcher is the one whose reach needs stating: it uses
+        // this process's egress. The DeepSeek variant fetches server-side.
+        let description = match self {
+            Self::Local { .. } => {
+                "Fetch one URL as text. This process performs the request over its own network, so it reaches whatever the process can reach (the same reach as `bash`), not only public hosts. HTML is reduced to its readable article as Markdown, and a page with no readable article is an error. It returns that single page and never follows links found in it. Never include secrets, private source code, or internal URLs in the URL."
+            }
+            Self::Deepseek { .. } => {
+                "Fetch a public web page as Markdown by its URL. Never include secrets, private source code, or internal URLs."
+            }
+        };
         ToolSpec {
             name: "web_fetch".into(),
-            description: "Fetch a public web page as Markdown by its URL. Never include secrets, private source code, or internal URLs.".into(),
+            description: description.into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -283,45 +386,138 @@ impl Tool for WebFetch {
                 "`url` must be at most {WEB_FETCH_URL_LIMIT} characters"
             ));
         }
-        let authorization = bearer_header(&self.api_key, "web fetch")?;
-        let mut response = self
-            .client
-            .post(deepseek_endpoint(&self.base, DEEPSEEK_FETCH_PATH))
-            .timeout(self.timeout)
-            .header("authorization", authorization)
-            .json(&json!({"url": url}))
-            .send()
-            .await
-            .map_err(|_| "web fetch request failed".to_string())?;
-        if !response.status().is_success() {
-            return Err(status_error(&mut response, "web fetch", &self.api_key).await?);
+        match self {
+            Self::Local { client, timeout } => execute_local_fetch(client, *timeout, url).await,
+            Self::Deepseek {
+                api_key,
+                base,
+                client,
+                timeout,
+            } => execute_deepseek_fetch(client, *timeout, api_key, base, url).await,
         }
+    }
+}
 
-        let (body, truncated) = read_response_prefix(&mut response, WEB_SEARCH_RESPONSE_LIMIT)
-            .await
-            .map_err(|_| "web fetch response body failed".to_string())?;
-        if truncated {
+/// The local fetch: GET the URL with this process's egress, then turn the
+/// body into text (`text/plain` and `text/markdown` verbatim, HTML through
+/// the readability extractor).
+async fn execute_local_fetch(
+    client: &reqwest::Client,
+    timeout: Duration,
+    url: &str,
+) -> Result<ToolOutput, String> {
+    let mut response = client
+        .get(url)
+        .timeout(timeout)
+        .send()
+        .await
+        .map_err(|error| transport_error("web fetch request failed", &error))?;
+    if !response.status().is_success() {
+        // No credential: this fetch carries none, so nothing to redact.
+        return Err(status_error(&mut response, "web fetch", "").await?);
+    }
+
+    // The media type decides how the body is read, so it is checked before
+    // the read: an unsupported type fails fast and a binary body never
+    // reaches the model.
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let html = match media_type.as_str() {
+        "" => return Err("web fetch response has no content type".into()),
+        "text/html" | "application/xhtml+xml" => true,
+        "text/plain" | "text/markdown" => false,
+        other => {
             return Err(format!(
-                "web fetch response body exceeds {WEB_SEARCH_RESPONSE_LIMIT} bytes"
+                "web fetch does not support content type `{other}` (accepted: text/html, application/xhtml+xml, text/plain, text/markdown)"
             ));
         }
-        let fetched: DeepseekFetchResponse = serde_json::from_slice(&body)
-            .map_err(|_| "web fetch returned malformed JSON or no response".to_string())?;
-        let output = [fetched.title.trim(), fetched.content.trim()]
-            .into_iter()
-            .filter(|part| !part.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        let output = if output.is_empty() {
-            "no content".to_owned()
-        } else {
-            output
-        };
-        Ok(ToolOutput::text(truncate_utf8(
-            redact_api_key(output, &self.api_key),
-            OUTPUT_LIMIT,
-        )))
+    };
+
+    let (body, truncated) = read_response_prefix(&mut response, WEB_FETCH_BODY_LIMIT)
+        .await
+        .map_err(|error| transport_error("web fetch response body failed", &error))?;
+    if truncated {
+        return Err(format!(
+            "web fetch response body exceeds {WEB_FETCH_BODY_LIMIT} bytes"
+        ));
     }
+    let text = decode_body(&body, &content_type);
+    let (title, text) = if html {
+        let article = extract_article(&text, url)?;
+        (Some(article.title), article.text_content.to_string())
+    } else {
+        (None, text.trim().to_owned())
+    };
+    let output = [title.as_deref().unwrap_or_default(), text.trim()]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let output = if output.is_empty() {
+        "no content".to_owned()
+    } else {
+        output
+    };
+    Ok(ToolOutput::text(truncate_utf8(output, OUTPUT_LIMIT)))
+}
+
+/// The DeepSeek fetch: POST the URL to `{base}/v1/tools/fetch` with the API
+/// key and return the server's title + Markdown body. Unchanged from the
+/// tool's original single-backend implementation.
+async fn execute_deepseek_fetch(
+    client: &reqwest::Client,
+    timeout: Duration,
+    api_key: &str,
+    base: &str,
+    url: &str,
+) -> Result<ToolOutput, String> {
+    let authorization = bearer_header(api_key, "web fetch")?;
+    let mut response = client
+        .post(deepseek_endpoint(base, DEEPSEEK_FETCH_PATH))
+        .timeout(timeout)
+        .header("authorization", authorization)
+        .json(&json!({"url": url}))
+        .send()
+        .await
+        .map_err(|_| "web fetch request failed".to_string())?;
+    if !response.status().is_success() {
+        return Err(status_error(&mut response, "web fetch", api_key).await?);
+    }
+
+    let (body, truncated) = read_response_prefix(&mut response, WEB_SEARCH_RESPONSE_LIMIT)
+        .await
+        .map_err(|_| "web fetch response body failed".to_string())?;
+    if truncated {
+        return Err(format!(
+            "web fetch response body exceeds {WEB_SEARCH_RESPONSE_LIMIT} bytes"
+        ));
+    }
+    let fetched: DeepseekFetchResponse = serde_json::from_slice(&body)
+        .map_err(|_| "web fetch returned malformed JSON or no response".to_string())?;
+    let output = [fetched.title.trim(), fetched.content.trim()]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let output = if output.is_empty() {
+        "no content".to_owned()
+    } else {
+        output
+    };
+    Ok(ToolOutput::text(truncate_utf8(
+        redact_api_key(output, api_key),
+        OUTPUT_LIMIT,
+    )))
 }
 
 impl WebSearch {
@@ -578,4 +774,77 @@ pub(super) fn redact_api_key(text: String, api_key: &str) -> String {
         return text;
     }
     text.replace(api_key, "[redacted]")
+}
+
+/// Decode a fetched body: the `charset` parameter of `content_type` wins,
+/// else a `<meta>` charset sniffed from the first KiB, else UTF-8. Decoding
+/// is always lossy — an invalid sequence becomes U+FFFD, never an error.
+pub(super) fn decode_body(body: &[u8], content_type: &str) -> String {
+    content_type_charset(content_type)
+        .or_else(|| sniff_charset(body))
+        .and_then(|label| Encoding::for_label(label.as_bytes()))
+        .map(|encoding| encoding.decode(body).0.into_owned())
+        .unwrap_or_else(|| String::from_utf8_lossy(body).into_owned())
+}
+
+/// The `charset` parameter of a `Content-Type` value, quotes removed.
+fn content_type_charset(content_type: &str) -> Option<String> {
+    content_type.split(';').skip(1).find_map(|parameter| {
+        let (name, value) = parameter.split_once('=')?;
+        name.trim()
+            .eq_ignore_ascii_case("charset")
+            .then(|| value.trim().trim_matches(['"', '\'']).trim().to_owned())
+            .filter(|charset| !charset.is_empty())
+    })
+}
+
+/// The charset of `<meta charset=...>` or `<meta http-equiv="content-type">`
+/// in the first KiB, which is all a browser looks at for the same job.
+fn sniff_charset(body: &[u8]) -> Option<String> {
+    let head = String::from_utf8_lossy(&body[..body.len().min(1024)]);
+    let mut search = 0;
+    while let Some(at) = find_ci(&head, "charset", search) {
+        let after = head[at + "charset".len()..].trim_start();
+        if let Some(after) = after.strip_prefix('=') {
+            let charset: String = after
+                .trim_start()
+                .trim_start_matches(['"', '\''])
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+                .collect();
+            if !charset.is_empty() {
+                return Some(charset);
+            }
+        }
+        search = at + "charset".len();
+    }
+    None
+}
+
+/// The readable article of a decoded HTML document (Mozilla Readability via
+/// `dom_smoothie`): its title and Markdown text. `url` is the document base,
+/// so relative links resolve in the Markdown output. A document without a
+/// readable article is an error naming the failure — this tool does not fall
+/// back to dumping tags and navigation text into the model's context.
+pub(super) fn extract_article(html: &str, url: &str) -> Result<Article, String> {
+    let config = ReadabilityConfig {
+        text_mode: TextMode::Markdown,
+        ..ReadabilityConfig::default()
+    };
+    let mut readability = Readability::new(html, Some(url), Some(config))
+        .map_err(|error| format!("could not extract readable content: {error}"))?;
+    readability
+        .parse()
+        .map_err(|error| format!("could not extract readable content: {error}"))
+}
+
+/// Case-insensitive ASCII substring search from byte offset `from`. Every
+/// match starts on an ASCII byte, so the returned offset is a char boundary.
+fn find_ci(haystack: &str, needle: &str, from: usize) -> Option<usize> {
+    let (haystack, needle) = (haystack.as_bytes(), needle.as_bytes());
+    if needle.is_empty() || from >= haystack.len() || needle.len() > haystack.len() - from {
+        return None;
+    }
+    (from..=haystack.len() - needle.len())
+        .find(|&start| haystack[start..start + needle.len()].eq_ignore_ascii_case(needle))
 }

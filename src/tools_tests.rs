@@ -132,6 +132,7 @@ fn request_user_input_is_not_in_common_builtins() {
     let (tools, _) = builtins_with_web_search(
         workspace.clone(),
         None,
+        None,
         SandboxPolicy::fixed(None),
         false,
         None,
@@ -196,6 +197,7 @@ fn request_compaction_registered_for_main_read_only_and_subagent_builds() {
     let (tools, _) = builtins_with_web_search(
         workspace.clone(),
         None,
+        None,
         SandboxPolicy::fixed(None),
         false,
         None,
@@ -210,6 +212,7 @@ fn request_compaction_registered_for_main_read_only_and_subagent_builds() {
     // Read-only main build without a sandbox (fail-closed bash).
     let (tools, _) = builtins_with_web_search(
         workspace.clone(),
+        None,
         None,
         SandboxPolicy::fixed(None),
         true,
@@ -259,6 +262,7 @@ fn request_compaction_registered_for_main_read_only_and_subagent_builds() {
     let (tools, _) = builtins_with_web_search(
         Workspace::new(temp.path()).unwrap(),
         None,
+        None,
         SandboxPolicy::fixed(None),
         false,
         None,
@@ -297,10 +301,13 @@ fn web_search_registration_requires_a_nonempty_key() {
         "read_output".to_string(),
         "history".to_string(),
     ];
+    // A blank search credential registers no web tool at all: the local
+    // `web_fetch` rides the search opt-in and does not stand alone.
     for key in [None, Some(WebSearchSource::Exa("   ".into()))] {
         let (tools, _) = builtins_with_web_search(
             workspace.clone(),
             key,
+            Some(WebFetchSource::Local),
             SandboxPolicy::fixed(None),
             false,
             None,
@@ -312,6 +319,7 @@ fn web_search_registration_requires_a_nonempty_key() {
     let (tools, _) = builtins_with_web_search(
         workspace,
         Some(WebSearchSource::Exa(" key ".into())),
+        Some(WebFetchSource::Local),
         SandboxPolicy::fixed(None),
         false,
         None,
@@ -330,6 +338,7 @@ fn web_search_registration_requires_a_nonempty_key() {
             "cancel_background_task",
             "bash",
             "web_search",
+            "web_fetch",
             "get_goal",
             "update_goal",
             "request_compaction",
@@ -348,6 +357,7 @@ fn searxng_registration_needs_no_key() {
     let (tools, _) = builtins_with_web_search(
         workspace.clone(),
         Some(WebSearchSource::Searxng("http://127.0.0.1:8088".into())),
+        Some(WebFetchSource::Local),
         SandboxPolicy::fixed(None),
         false,
         None,
@@ -361,6 +371,7 @@ fn searxng_registration_needs_no_key() {
     let (tools, _) = builtins_with_web_search(
         workspace,
         Some(WebSearchSource::Searxng("  ".into())),
+        Some(WebFetchSource::Local),
         SandboxPolicy::fixed(None),
         false,
         None,
@@ -497,36 +508,6 @@ fn request_parts(request: &[u8]) -> (String, Value) {
     (head, body)
 }
 
-#[test]
-fn web_search_source_priority_is_deepseek_then_searxng_then_exa() {
-    let resolve = |deepseek: Option<&str>, searxng: Option<&str>, exa: Option<&str>| {
-        web_search_source_from(
-            deepseek.map(str::to_owned),
-            searxng.map(str::to_owned),
-            exa.map(str::to_owned),
-        )
-    };
-    assert_eq!(
-        resolve(Some(" ds-key "), Some("http://sx"), Some("exa-key")),
-        Some(WebSearchSource::Deepseek("ds-key".into()))
-    );
-    assert_eq!(
-        resolve(None, Some("http://sx"), Some("exa-key")),
-        Some(WebSearchSource::Searxng("http://sx".into()))
-    );
-    assert_eq!(
-        resolve(None, None, Some("exa-key")),
-        Some(WebSearchSource::Exa("exa-key".into()))
-    );
-    // Blank values are ignored, so an unconfigured DeepSeek backend leaves
-    // the existing Exa/SearXNG behavior untouched.
-    assert_eq!(
-        resolve(Some("   "), Some("  "), Some("exa-key")),
-        Some(WebSearchSource::Exa("exa-key".into()))
-    );
-    assert_eq!(resolve(None, None, None), None);
-}
-
 /// Drift guard for the shared sandbox strip list: both sandbox backends read
 /// [`SANDBOX_SECRET_ENV`], so a credential that is missing here is inherited by
 /// a sandboxed `env`. It does not fork a sandbox; it proves the list contains
@@ -542,6 +523,13 @@ fn sandbox_secret_env_covers_the_internal_deepseek_key() {
         SANDBOX_SECRET_ENV.contains(&DEEPSEEK_API_KEY_ENV),
         "the internal DeepSeek transport key must be stripped too: {SANDBOX_SECRET_ENV:?}"
     );
+    // The provider selectors carry no credential, so `env` may print them.
+    for selector in [WEB_SEARCH_PROVIDER_ENV, WEB_FETCH_PROVIDER_ENV] {
+        assert!(
+            !SANDBOX_SECRET_ENV.contains(&selector),
+            "a non-credential selector must not be stripped: {selector}"
+        );
+    }
     let mut unique = SANDBOX_SECRET_ENV.to_vec();
     unique.sort_unstable();
     unique.dedup();
@@ -553,42 +541,163 @@ fn sandbox_secret_env_covers_the_internal_deepseek_key() {
 }
 
 #[test]
-fn deepseek_registration_registers_web_fetch_next_to_web_search() {
+fn every_usable_source_registers_web_fetch_next_to_web_search() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();
-    let tool_names = |source: Option<WebSearchSource>| -> Vec<String> {
-        let (tools, _) = builtins_with_web_search(
-            workspace.clone(),
-            source,
-            SandboxPolicy::fixed(None),
-            false,
-            None,
-            None,
-        );
-        tools.iter().map(|tool| tool.spec().name).collect()
-    };
+    let tool_names =
+        |search: Option<WebSearchSource>, fetch: Option<WebFetchSource>| -> Vec<String> {
+            let (tools, _) = builtins_with_web_search(
+                workspace.clone(),
+                search,
+                fetch,
+                SandboxPolicy::fixed(None),
+                false,
+                None,
+                None,
+            );
+            tools.iter().map(|tool| tool.spec().name).collect()
+        };
 
-    // DeepSeek registers the fetch tool right after web_search.
-    let names = tool_names(Some(WebSearchSource::Deepseek(" key ".into())));
-    let search_at = names
-        .iter()
-        .position(|name| name == "web_search")
-        .expect("deepseek registers web_search");
-    assert_eq!(names[search_at + 1], "web_fetch");
+    // All three search sources pair with the local fetch, in that order.
+    for source in [
+        WebSearchSource::Exa("key".into()),
+        WebSearchSource::Searxng("http://127.0.0.1:8088".into()),
+        WebSearchSource::Deepseek(" key ".into()),
+    ] {
+        let names = tool_names(Some(source), Some(WebFetchSource::Local));
+        let search_at = names
+            .iter()
+            .position(|name| name == "web_search")
+            .expect("a usable source registers web_search");
+        assert_eq!(names[search_at + 1], "web_fetch", "{names:?}");
+    }
 
-    // A blank key registers neither, exactly like a blank Exa key.
-    let names = tool_names(Some(WebSearchSource::Deepseek("   ".into())));
+    // `provider = "searxng"` + `fetch_provider = "deepseek"`: both tools, the
+    // search to SearXNG and the fetch to DeepSeek.
+    let names = tool_names(
+        Some(WebSearchSource::Searxng("http://127.0.0.1:8088".into())),
+        Some(WebFetchSource::Deepseek("key".into())),
+    );
+    let search_at = names.iter().position(|name| name == "web_search").unwrap();
+    assert_eq!(names[search_at + 1], "web_fetch", "{names:?}");
+
+    // A blank search value registers neither, exactly like a blank Exa key
+    // (the local fetch never stands alone).
+    for source in [
+        WebSearchSource::Exa("  ".into()),
+        WebSearchSource::Searxng("  ".into()),
+        WebSearchSource::Deepseek("   ".into()),
+    ] {
+        let names = tool_names(Some(source), Some(WebFetchSource::Local));
+        assert!(!names.iter().any(|name| name == "web_search"), "{names:?}");
+        assert!(!names.iter().any(|name| name == "web_fetch"), "{names:?}");
+    }
+
+    // No search source configured: neither tool.
+    let names = tool_names(None, Some(WebFetchSource::Local));
     assert!(!names.iter().any(|name| name == "web_search"), "{names:?}");
     assert!(!names.iter().any(|name| name == "web_fetch"), "{names:?}");
 
-    // Exa and SearXNG keep web_search only: no fetch backend exists for them.
-    for source in [
-        Some(WebSearchSource::Exa("key".into())),
-        Some(WebSearchSource::Searxng("http://127.0.0.1:8088".into())),
-    ] {
-        let names = tool_names(source);
-        assert!(names.iter().any(|name| name == "web_search"), "{names:?}");
-        assert!(!names.iter().any(|name| name == "web_fetch"), "{names:?}");
+    // A DeepSeek fetch has its own credential, so it registers without a
+    // usable search source; a blank one registers nothing.
+    let names = tool_names(None, Some(WebFetchSource::Deepseek("key".into())));
+    assert!(!names.iter().any(|name| name == "web_search"), "{names:?}");
+    assert!(names.iter().any(|name| name == "web_fetch"), "{names:?}");
+    let names = tool_names(None, Some(WebFetchSource::Deepseek("  ".into())));
+    assert!(!names.iter().any(|name| name == "web_fetch"), "{names:?}");
+}
+
+#[test]
+fn web_search_selector_beats_credential_precedence() {
+    let resolve = |selector: Option<&str>,
+                   deepseek: Option<&str>,
+                   searxng: Option<&str>,
+                   exa: Option<&str>| {
+        web_search_source_from(
+            selector.map(str::to_owned),
+            deepseek.map(str::to_owned),
+            searxng.map(str::to_owned),
+            exa.map(str::to_owned),
+        )
+    };
+
+    // The explicit selector wins even when another credential is present:
+    // a SearXNG search with a DeepSeek fetch key must not hit DeepSeek.
+    assert_eq!(
+        resolve(
+            Some("searxng"),
+            Some("ds-key"),
+            Some("http://sx"),
+            Some("exa-key")
+        ),
+        Some(WebSearchSource::Searxng("http://sx".into()))
+    );
+    assert_eq!(
+        resolve(
+            Some("exa"),
+            Some("ds-key"),
+            Some("http://sx"),
+            Some("exa-key")
+        ),
+        Some(WebSearchSource::Exa("exa-key".into()))
+    );
+    assert_eq!(
+        resolve(Some("deepseek"), Some(" ds-key "), None, Some("exa-key")),
+        Some(WebSearchSource::Deepseek("ds-key".into()))
+    );
+
+    // A selected backend without its credential resolves to nothing instead
+    // of silently falling back to another provider.
+    assert_eq!(
+        resolve(Some("deepseek"), None, Some("http://sx"), Some("exa")),
+        None
+    );
+    assert_eq!(
+        resolve(Some("exa"), Some("ds-key"), Some("http://sx"), Some("  ")),
+        None
+    );
+
+    // With no selector the legacy precedence still applies, so an
+    // EXA_API_KEY-only setup keeps working.
+    assert_eq!(
+        resolve(None, Some("ds-key"), Some("http://sx"), Some("exa-key")),
+        Some(WebSearchSource::Deepseek("ds-key".into()))
+    );
+    assert_eq!(
+        resolve(None, None, Some("http://sx"), Some("exa-key")),
+        Some(WebSearchSource::Searxng("http://sx".into()))
+    );
+    assert_eq!(
+        resolve(None, None, None, Some("exa-key")),
+        Some(WebSearchSource::Exa("exa-key".into()))
+    );
+    assert_eq!(
+        resolve(Some("   "), Some("   "), Some("  "), Some("exa-key")),
+        Some(WebSearchSource::Exa("exa-key".into()))
+    );
+    assert_eq!(resolve(None, None, None, None), None);
+}
+
+#[test]
+fn web_fetch_selector_defaults_to_local_and_requires_a_key_for_deepseek() {
+    let resolve = |selector: Option<&str>, deepseek: Option<&str>| {
+        web_fetch_source_from(selector.map(str::to_owned), deepseek.map(str::to_owned))
+    };
+    for selector in [None, Some(""), Some("local"), Some("  ")] {
+        assert_eq!(resolve(selector, None), Some(WebFetchSource::Local));
+        assert_eq!(
+            resolve(selector, Some("ds-key")),
+            Some(WebFetchSource::Local)
+        );
+    }
+    assert_eq!(
+        resolve(Some("deepseek"), Some(" ds-key ")),
+        Some(WebFetchSource::Deepseek("ds-key".into()))
+    );
+    // The remote fetch without its credential registers nothing: the choice
+    // is explicit, so it must not become a local fetch.
+    for key in [None, Some("   ")] {
+        assert_eq!(resolve(Some("deepseek"), key), None);
     }
 }
 
@@ -675,9 +784,450 @@ async fn deepseek_fetch_posts_the_url_and_returns_title_and_markdown() {
     assert_eq!(body, json!({"url": "https://example.test/page"}));
 }
 
+/// A response with an explicit content type, for the local-fetch tests.
+fn typed_http_response(status: &str, content_type: &str, body: impl AsRef<[u8]>) -> Vec<u8> {
+    let body = body.as_ref();
+    let mut response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    response.extend_from_slice(body);
+    response
+}
+
+/// Read one request head (GET has no body), for the local-fetch servers.
+async fn read_request_head(socket: &mut tokio::net::TcpStream) -> String {
+    let mut request = Vec::new();
+    let mut buffer = [0; 1024];
+    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+        let count = socket.read(&mut buffer).await.unwrap();
+        assert!(
+            count > 0,
+            "client closed before completing its request head"
+        );
+        request.extend_from_slice(&buffer[..count]);
+    }
+    String::from_utf8_lossy(&request).into_owned()
+}
+
+/// A one-shot GET server: serves `response` and returns the request head.
+async fn fetch_server(response: Vec<u8>) -> (String, tokio::task::JoinHandle<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/page", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let head = read_request_head(&mut socket).await;
+        let _ = socket.write_all(&response).await;
+        head
+    });
+    (url, task)
+}
+
+/// Serve `hops` redirects (`/hop0` → `/hop1` → ...) and then one HTML page.
+async fn redirect_server(
+    hops: usize,
+    final_body: &'static [u8],
+) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let redirect_base = base.clone();
+    let task = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for hop in 0..=hops {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            requests.push(read_request_head(&mut socket).await);
+            let response = if hop < hops {
+                redirect_response(&format!("{redirect_base}/hop{}", hop + 1))
+            } else {
+                typed_http_response("200 OK", "text/html; charset=utf-8", final_body)
+            };
+            let _ = socket.write_all(&response).await;
+        }
+        requests
+    });
+    (format!("{base}/hop0"), task)
+}
+
+#[tokio::test]
+async fn web_fetch_extracts_the_article_and_drops_chrome() {
+    let html = br#"<!DOCTYPE html>
+<html><head><title>Rust ownership explained</title>
+<script>var analytics = "script-body";</script>
+</head>
+<body>
+<nav><a href="/start">Getting started</a> <a href="/guide">The guide</a></nav>
+<header>Site header text</header>
+<div id="content">
+<h1>Rust ownership explained</h1>
+<p>Ownership is Rust's most distinctive feature. It enables memory safety
+guarantees without a garbage collector, and it is checked at compile time.</p>
+<h2>Rules</h2>
+<ul><li>Each value has an owner.</li><li>There is only one owner at a time.</li></ul>
+<p>When the owner goes out of scope the value is dropped, and its memory is
+reclaimed immediately. This is what makes ownership different from a
+reference-counted or garbage-collected design.</p>
+</div>
+<footer>Footer text</footer>
+</body></html>"#;
+    let (url, server) = fetch_server(typed_http_response(
+        "200 OK",
+        "text/html; charset=utf-8",
+        html,
+    ))
+    .await;
+    let result = WebFetch::local()
+        .execute(json!({"url": url}))
+        .await
+        .unwrap();
+    let content = result.content;
+    // The title leads, the article body follows, and the page chrome and
+    // scripts do not.
+    assert!(
+        content.starts_with("Rust ownership explained\n\n"),
+        "{content}"
+    );
+    assert!(
+        content.contains("Ownership is Rust's most distinctive feature"),
+        "{content}"
+    );
+    assert!(content.contains("Each value has an owner"), "{content}");
+    for absent in [
+        "script-body",
+        "Getting started",
+        "Site header text",
+        "Footer text",
+        "<p>",
+    ] {
+        assert!(!content.contains(absent), "{absent} in {content}");
+    }
+    let head = server.await.unwrap();
+    assert!(head.starts_with("GET /page HTTP/1.1\r\n"), "{head}");
+    assert!(!head.to_lowercase().contains("authorization"), "{head}");
+}
+
+/// A server that answers 403 unless the request carries a `User-Agent` — what
+/// Wikipedia and much of the web do to a UA-less client. Returns the request
+/// head it saw.
+async fn user_agent_gate_server() -> (String, tokio::task::JoinHandle<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/page", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let head = read_request_head(&mut socket).await;
+        // Header names arrive lowercase from reqwest's `HeaderMap`, so the
+        // whole head is lowercased before the comparison.
+        let response = if head.to_lowercase().contains(&format!(
+            "user-agent: {}\r\n",
+            WEB_FETCH_USER_AGENT.to_lowercase()
+        )) {
+            typed_http_response(
+                "200 OK",
+                "text/html",
+                "<title>Fetched</title><p>body text</p>",
+            )
+        } else {
+            typed_http_response("403 Forbidden", "text/plain", "no user agent")
+        };
+        let _ = socket.write_all(&response).await;
+        head
+    });
+    (url, task)
+}
+
+#[tokio::test]
+async fn web_fetch_sends_a_user_agent_and_so_passes_a_ua_gate() {
+    let (url, server) = user_agent_gate_server().await;
+    let result = WebFetch::local()
+        .execute(json!({"url": url}))
+        .await
+        .unwrap();
+    assert_eq!(result.content, "Fetched\n\nbody text");
+    // Still credential-free: the two browser headers are the only additions.
+    let head = server.await.unwrap();
+    assert!(!head.to_lowercase().contains("authorization"), "{head}");
+}
+
+#[tokio::test]
+async fn web_fetch_sends_the_browser_accept_header() {
+    let (url, server) = fetch_server(typed_http_response(
+        "200 OK",
+        "text/plain; charset=utf-8",
+        "ok",
+    ))
+    .await;
+    WebFetch::local()
+        .execute(json!({"url": url}))
+        .await
+        .unwrap();
+    let head = server.await.unwrap();
+    assert!(
+        head.contains(&format!("accept: {WEB_FETCH_ACCEPT}\r\n")),
+        "{head}"
+    );
+    // One value, not a second one appended by the client or the tool.
+    assert_eq!(head.matches("\r\naccept: ").count(), 1, "{head}");
+}
+
+#[tokio::test]
+async fn web_fetch_reports_the_transport_reason() {
+    // Port 0 can never be listened on, so this connect is always refused —
+    // unlike a released ephemeral port, which another test could re-bind. The
+    // model is told why instead of seeing a bare "request failed".
+    let error = WebFetch::local()
+        .execute(json!({"url": "http://127.0.0.1:0/page"}))
+        .await
+        .unwrap_err();
+    assert!(error.starts_with("web fetch request failed: "), "{error}");
+    assert!(!error.contains('\n'), "{error}");
+    let reason = error.to_lowercase();
+    assert!(reason.contains("connect"), "{error}");
+    assert!(reason.contains("refused"), "{error}");
+}
+
+#[tokio::test]
+async fn web_fetch_reports_the_body_read_reason() {
+    // A body shorter than its declared length: the read fails mid-body, and
+    // the cause reaches the model.
+    let (url, _server) = fetch_server(
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 100\r\nConnection: close\r\n\r\nshort"
+            .to_vec(),
+    )
+    .await;
+    let error = WebFetch::local()
+        .execute(json!({"url": url}))
+        .await
+        .unwrap_err();
+    assert!(
+        error.starts_with("web fetch response body failed: "),
+        "{error}"
+    );
+    assert!(!error.contains('\n'), "{error}");
+}
+
+#[tokio::test]
+async fn web_fetch_keeps_markdown_headings_lists_and_resolved_links() {
+    let html = br#"<html><head><title>Notes</title></head><body>
+<article>
+<h2>Install</h2>
+<p>Run the installer and wait for it to finish, then restart the shell so the
+new PATH is picked up by the next invocation. See the
+<a href="/rel">release notes</a> for the details.</p>
+<ul><li>first step</li><li>second step</li></ul>
+</article></body></html>"#;
+    let (url, _server) = fetch_server(typed_http_response("200 OK", "text/html", html)).await;
+    let base = url.trim_end_matches("/page").to_owned();
+    let result = WebFetch::local()
+        .execute(json!({"url": url}))
+        .await
+        .unwrap();
+    let content = result.content;
+    // Markdown mode keeps the structure the model can read best.
+    assert!(content.contains("## Install"), "{content}");
+    assert!(content.contains("- first step"), "{content}");
+    assert!(content.contains("- second step"), "{content}");
+    // The requested URL is the document base, so a relative link in the
+    // article comes back absolute.
+    assert!(
+        content.contains(&format!("[release notes]({base}/rel)")),
+        "{content}"
+    );
+}
+
+#[tokio::test]
+async fn web_fetch_errors_when_no_article_is_readable() {
+    // An empty document has no article to extract; the tool says so instead
+    // of returning an empty or tag-laden page.
+    let (url, _server) = fetch_server(typed_http_response(
+        "200 OK",
+        "text/html",
+        "<html><head><title>t</title></head><body></body></html>",
+    ))
+    .await;
+    let error = WebFetch::local()
+        .execute(json!({"url": url}))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        "could not extract readable content: failed to grab the article"
+    );
+}
+
+#[tokio::test]
+async fn web_fetch_decodes_a_gbk_page() {
+    let title = "中文页面的标题";
+    let paragraph = "这是一个中文段落的示例，用来验证 GBK 解码是否正确。如果解码错了，这段文字会变成乱码，模型就完全读不懂了。";
+    let html = format!(
+        "<html><head><title>{title}</title></head><body><article><h1>{title}</h1><p>{paragraph}</p><p>{paragraph}</p></article></body></html>"
+    );
+    let (gbk, _, had_errors) = encoding_rs::GBK.encode(&html);
+    assert!(!had_errors, "the fixture must be pure GBK");
+    let (url, _server) =
+        fetch_server(typed_http_response("200 OK", "text/html; charset=gbk", gbk)).await;
+    let result = WebFetch::local()
+        .execute(json!({"url": url}))
+        .await
+        .unwrap();
+    let content = result.content;
+    assert!(content.starts_with(title), "{content}");
+    assert!(content.contains(paragraph), "{content}");
+    // Lossy decoding would leave U+FFFD where a GBK byte pair was.
+    assert!(!content.contains('\u{fffd}'), "{content}");
+}
+
+#[test]
+fn web_fetch_sniffs_a_meta_charset_when_the_header_omits_one() {
+    for html in [
+        "<meta charset=gbk><p>你好，世界</p>",
+        "<meta http-equiv=\"content-type\" content=\"text/html; charset=gbk\"><p>你好，世界</p>",
+    ] {
+        let (gbk, _, _) = encoding_rs::GBK.encode(html);
+        assert_eq!(decode_body(&gbk, "text/html"), html);
+    }
+    // A declared charset wins over the sniff, and invalid bytes decode
+    // lossily instead of failing.
+    assert_eq!(
+        decode_body("你好".as_bytes(), "text/plain; charset=utf-8"),
+        "你好"
+    );
+    assert_eq!(decode_body(b"ok \xff", "text/plain"), "ok \u{fffd}");
+    assert_eq!(decode_body(b"plain", ""), "plain");
+}
+
+#[tokio::test]
+async fn web_fetch_follows_a_short_redirect_chain() {
+    let (url, server) = redirect_server(2, b"<title>Final</title><p>landed</p>").await;
+    let result = WebFetch::local()
+        .execute(json!({"url": url}))
+        .await
+        .unwrap();
+    assert_eq!(result.content, "Final\n\nlanded");
+    let requests = server.await.unwrap();
+    assert_eq!(requests.len(), 3, "two redirects and the final page");
+    assert!(
+        requests[0].starts_with("GET /hop0 HTTP/1.1\r\n"),
+        "{}",
+        requests[0]
+    );
+    assert!(
+        requests[2].starts_with("GET /hop2 HTTP/1.1\r\n"),
+        "{}",
+        requests[2]
+    );
+}
+
+#[tokio::test]
+async fn web_fetch_stops_a_redirect_chain_past_the_limit() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let redirect_base = base.clone();
+    let task = tokio::spawn(async move {
+        let mut served = 0;
+        // Every request is answered with one more redirect, forever: a client
+        // that does not stop would loop here instead of failing.
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = read_request_head(&mut socket).await;
+            served += 1;
+            let _ = socket
+                .write_all(&redirect_response(&format!("{redirect_base}/hop{served}")))
+                .await;
+        }
+    });
+    let error = WebFetch::local()
+        .execute(json!({"url": format!("{base}/hop0")}))
+        .await
+        .unwrap_err();
+    assert!(error.contains("web fetch request failed"), "{error}");
+    task.abort();
+}
+
+#[tokio::test]
+async fn web_fetch_returns_plain_text_verbatim() {
+    let body = "line one\nline two\n\n   indented & <not a tag>";
+    let (url, _server) = fetch_server(typed_http_response(
+        "200 OK",
+        "text/plain; charset=utf-8",
+        body,
+    ))
+    .await;
+    let result = WebFetch::local()
+        .execute(json!({"url": url}))
+        .await
+        .unwrap();
+    assert_eq!(result.content, body);
+
+    // An empty body has nothing to show; say so instead of returning "".
+    let (url, _server) = fetch_server(typed_http_response("200 OK", "text/plain", "")).await;
+    let result = WebFetch::local()
+        .execute(json!({"url": url}))
+        .await
+        .unwrap();
+    assert_eq!(result.content, "no content");
+}
+
+#[tokio::test]
+async fn web_fetch_rejects_an_unsupported_content_type() {
+    let (url, _server) = fetch_server(typed_http_response(
+        "200 OK",
+        "application/pdf",
+        b"%PDF-1.4 not text",
+    ))
+    .await;
+    let error = WebFetch::local()
+        .execute(json!({"url": url}))
+        .await
+        .unwrap_err();
+    assert!(error.contains("content type"), "{error}");
+    assert!(error.contains("application/pdf"), "{error}");
+}
+
+#[tokio::test]
+async fn web_fetch_rejects_a_body_over_two_mebibytes() {
+    let body = "x".repeat(WEB_FETCH_BODY_LIMIT + 1);
+    let (url, _server) = fetch_server(typed_http_response("200 OK", "text/html", body)).await;
+    let error = WebFetch::local()
+        .execute(json!({"url": url}))
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains(&format!(
+            "web fetch response body exceeds {WEB_FETCH_BODY_LIMIT} bytes"
+        )),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn web_fetch_reports_a_status_error_without_a_credential() {
+    let (url, server) = fetch_server(typed_http_response(
+        "500 Internal Server Error",
+        "text/plain",
+        "boom",
+    ))
+    .await;
+    let error = WebFetch::local()
+        .execute(json!({"url": url}))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        "web fetch failed with status 500 Internal Server Error: boom"
+    );
+    server.await.unwrap();
+}
+
 #[tokio::test]
 async fn web_fetch_spec_exposes_only_a_required_url() {
     let spec = WebFetch::deepseek("key".into()).spec();
+    let local = WebFetch::local().spec();
+    // The transport is a config choice, not a different tool: name and
+    // schema are identical, only the description states the local reach.
+    assert_eq!(local.name, spec.name);
+    assert_eq!(local.parameters, spec.parameters);
+    assert_ne!(local.description, spec.description);
+    assert!(local.description.contains("same reach as `bash`"));
     assert_eq!(spec.name, "web_fetch");
     assert_eq!(
         spec.parameters,
@@ -699,7 +1249,12 @@ async fn web_fetch_spec_exposes_only_a_required_url() {
 async fn web_fetch_validates_the_url_before_connecting() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    let tool = deepseek_fetch(base);
+    let tools = [
+        deepseek_fetch(base),
+        WebFetch::local(),
+        // The URL checks are shared, so a local fetch is covered too.
+        WebFetch::for_test("test-api-key".into(), String::new(), Duration::from_secs(1)),
+    ];
     for arguments in [
         json!({"url": ""}),
         json!({"url": "   "}),
@@ -708,8 +1263,12 @@ async fn web_fetch_validates_the_url_before_connecting() {
         json!({"url": "ftp://example.test/page"}),
         json!({"url": "file:///etc/passwd"}),
         json!({"url": format!("https://example.test/{}", "a".repeat(WEB_FETCH_URL_LIMIT))}),
-    ] {
-        assert!(tool.execute(arguments).await.is_err());
+    ]
+    .into_iter()
+    {
+        for tool in &tools {
+            assert!(tool.execute(arguments.clone()).await.is_err());
+        }
     }
     assert!(
         tokio::time::timeout(Duration::from_millis(50), listener.accept())
@@ -2439,6 +2998,7 @@ fn read_only_builtins_exclude_write_edit_and_bash_without_sandbox() {
     let (tools, _) = builtins_with_web_search(
         workspace,
         None,
+        None,
         SandboxPolicy::fixed(None),
         true,
         None,
@@ -2470,6 +3030,7 @@ fn read_only_builtins_keep_bash_with_a_narrowed_sandbox() {
     let (tools, _) = builtins_with_web_search(
         workspace,
         Some(WebSearchSource::Exa("key".into())),
+        Some(WebFetchSource::Local),
         SandboxPolicy::fixed(Some(crate::config::Sandbox {
             enabled: true,
             network: true,
@@ -2498,6 +3059,7 @@ fn read_only_builtins_keep_bash_with_a_narrowed_sandbox() {
             "cancel_background_task",
             shell_name,
             "web_search",
+            "web_fetch",
             "get_goal",
             "update_goal",
             "request_compaction",
@@ -7406,6 +7968,7 @@ fn goal_specs_are_closed_and_generic_specs_stay_open() {
     let workspace = Workspace::new(temp.path()).unwrap();
     let (tools, _) = builtins_with_web_search(
         workspace,
+        None,
         None,
         SandboxPolicy::fixed(None),
         false,
