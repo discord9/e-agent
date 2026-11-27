@@ -2323,8 +2323,20 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
     /// session has no row yet (brand-new session, or a subagent whose
     /// parent has not written its row yet).
     async fn load_meta_row(&self, session_id: &str) -> Result<Option<SessionMeta>, String> {
-        let refs = self.refs_projection(false);
         let conn = self.conn.lock().await;
+        self.load_meta_row_locked(&conn, session_id).await
+    }
+
+    /// The row read behind [`Self::load_meta_row`], on a connection the
+    /// caller already holds: a read-modify-write must see and write the
+    /// table under ONE lock, so no other operation on this connection can
+    /// delete the row between the check and the append.
+    async fn load_meta_row_locked(
+        &self,
+        conn: &turso::Connection,
+        session_id: &str,
+    ) -> Result<Option<SessionMeta>, String> {
+        let refs = self.refs_projection(false);
         let mut rows = conn
             .query(
                 &format!(
@@ -2349,13 +2361,23 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
     }
 
     async fn insert_meta(&self, meta: &mut SessionMeta) -> Result<(), String> {
+        let conn = self.conn.lock().await;
+        self.insert_meta_locked(&conn, meta).await
+    }
+
+    /// The append behind [`Self::insert_meta`], on a connection the caller
+    /// already holds (see [`Self::load_meta_row_locked`]).
+    async fn insert_meta_locked(
+        &self,
+        conn: &turso::Connection,
+        meta: &mut SessionMeta,
+    ) -> Result<(), String> {
         // Stamp the writer identity at insert time, not at construction
         // (P3): every snapshot row records the process that actually wrote
         // it, and a cross-process resume never replays a stale identity
         // from a row cached by another process. Callers construct with
         // `writer: None`; the stamped value is what lands in the column.
         meta.writer = Some(process_identity().to_owned());
-        let conn = self.conn.lock().await;
         if self.refs_available {
             // Encode the refs JSON before the statement: the column is one
             // JSON value, and its absence (NULL) and an empty list mean the
@@ -2697,12 +2719,20 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
                     .to_string(),
             );
         }
-        let meta = if session_id == self.session_id {
-            self.effective_meta().await?
-        } else {
-            self.load_meta_row(session_id).await?
-        };
-        let Some(mut meta) = meta else {
+        // Read the CURRENT row through this handle's own connection, never
+        // the cached snapshot: another handle may have deleted the row
+        // (e.g. the server's "hide session") since this store was built, and
+        // a cached read-then-insert would silently RESURRECT it. The read
+        // and the append hold one connection lock, so no other operation on
+        // this handle can slip between the check and the write either.
+        let conn = self.conn.lock().await;
+        let Some(mut meta) = self.load_meta_row_locked(&conn, session_id).await? else {
+            // The row is gone (another handle deleted it): drop the stale
+            // cached snapshot too, so a later cached touch cannot resurrect
+            // it either.
+            if session_id == self.session_id {
+                *self.cached_meta.lock().unwrap() = None;
+            }
             return Err(format!(
                 "session {session_id} has no metadata row to store links in"
             ));
@@ -2710,7 +2740,8 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
         mutate(&mut meta.refs)?;
         crate::session_store::dedup_refs(&mut meta.refs);
         meta.last_active_at = us_to_datetime(next_event_time_us());
-        self.insert_meta(&mut meta).await?;
+        self.insert_meta_locked(&conn, &mut meta).await?;
+        drop(conn);
         if session_id == self.session_id {
             *self.cached_meta.lock().unwrap() = Some(meta.clone());
         }

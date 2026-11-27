@@ -6606,3 +6606,50 @@ async fn schema_without_refs_column_keeps_sessions_usable_and_refuses_links() {
     assert_eq!(stored, vec![pr]);
     drop(dir);
 }
+
+/// A ref edit through a bound handle must never RESURRECT a metadata row
+/// another handle deleted: the write reads the CURRENT row through its own
+/// connection (check + append under one lock), so a vanished row fails
+/// loudly and stays gone.
+#[tokio::test]
+async fn update_refs_after_a_delete_elsewhere_fails_and_does_not_resurrect() {
+    let (dir, bound, sid) = fresh_session().await;
+    bound
+        .create_meta(&sid, Some("m"), Some("main"), None, None, None)
+        .await
+        .unwrap();
+    // The bound handle now carries the row in its cache; a cached read is
+    // exactly what used to let this edit re-insert it.
+    assert!(bound.cached_meta.lock().unwrap().is_some());
+    let db_path = dir.path().join("sessions.db");
+    let other = SqliteSession::connect(db_path.to_str().unwrap(), &workspace_id(), &sid)
+        .await
+        .unwrap();
+    other.delete_meta(&sid).await.unwrap();
+    assert!(other.list_meta().await.unwrap().is_empty(), "hidden");
+
+    let pr = crate::session_store::SessionRef::new("pr", "https://github.com/acme/widget/pull/14")
+        .unwrap();
+    let error = bound
+        .update_refs(&sid, |refs| {
+            refs.push(pr);
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+    assert!(error.contains("no metadata row"), "{error}");
+    assert!(
+        other.list_meta().await.unwrap().is_empty(),
+        "a failed edit must not restore the deleted row"
+    );
+    assert!(
+        SqliteSession::connect(db_path.to_str().unwrap(), &workspace_id(), &sid)
+            .await
+            .unwrap()
+            .list_meta()
+            .await
+            .unwrap()
+            .is_empty(),
+        "and the row stays gone for a fresh connection too"
+    );
+}
