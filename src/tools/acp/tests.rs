@@ -7,7 +7,9 @@
 //! accumulated.
 
 use super::*;
-use crate::agent::{Agent, AssistantMessage, Message, Model, ModelDeltaKind, ToolCall, Usage};
+use crate::agent::{
+    Agent, AgentEvent, AssistantMessage, Message, Model, ModelDeltaKind, ToolCall, Usage,
+};
 use crate::config::DEFAULT_ACP_ALLOW_KINDS;
 use crate::runner::{
     IdlePolicy, PromptSubmission, SessionResult, SessionRunner, SessionStatus, UserInputRequest,
@@ -113,6 +115,30 @@ fn stub_config(script: &str, log: &Path, load: &str) -> AcpConfig {
     tagged_config(script, log, load, "new")
 }
 
+/// The [`REPLAY_STUB`] config: `$3` selects where the replay happens (`new`
+/// or `load`, plus the `overflow` load mode) and `$4` is its length, so the
+/// overflow mode can cross [`REPLAY_LIMIT`].
+fn replay_config(script: &str, log: &Path, mode: &str) -> AcpConfig {
+    AcpConfig {
+        binary: "/bin/bash".into(),
+        args: vec![
+            "-c".into(),
+            script.into(),
+            "acp-stub".into(),
+            log.display().to_string(),
+            "ok".into(),
+            mode.into(),
+            (REPLAY_LIMIT + 50).to_string(),
+        ],
+        model: None,
+        allow_kinds: DEFAULT_ACP_ALLOW_KINDS
+            .iter()
+            .map(|kind| (*kind).to_owned())
+            .collect(),
+        danger: false,
+    }
+}
+
 /// Same stub, with a tag so two tools using separate logs get distinct ids.
 fn tagged_config(script: &str, log: &Path, load: &str, tag: &str) -> AcpConfig {
     AcpConfig {
@@ -134,10 +160,21 @@ fn tagged_config(script: &str, log: &Path, load: &str, tag: &str) -> AcpConfig {
     }
 }
 
-/// A tool bound to `session`, backed by a JSONL session store rooted at
-/// `root`. A metadata row is created first, because the store's ACP write
-/// never self-creates (`create_meta` is what the session factory does).
+/// A tool bound to `session`, with no MCP servers (an absent config), backed
+/// by a JSONL session store rooted at `root`. A metadata row is created
+/// first, because the store's ACP write never self-creates (`create_meta` is
+/// what the session factory does).
 async fn tool_with(root: &Path, config: AcpConfig, session: &str) -> Box<dyn Tool> {
+    tool_with_mcp(root, config, &HashMap::new(), session).await
+}
+
+/// The same tool, with the `[mcp.*]` servers the ACP agent should spawn.
+async fn tool_with_mcp(
+    root: &Path,
+    config: AcpConfig,
+    mcp: &HashMap<String, McpServerConfig>,
+    session: &str,
+) -> Box<dyn Tool> {
     let store = SessionStore::Jsonl;
     store
         .create_meta(root, session, Some("test-model"), None, None, None, None)
@@ -146,11 +183,13 @@ async fn tool_with(root: &Path, config: AcpConfig, session: &str) -> Box<dyn Too
     Box::new(AcpPrompt {
         workspace: Workspace::new(root).expect("workspace"),
         config,
+        mcp_servers: mcp_servers(mcp),
         store,
         root: root.to_path_buf(),
         session: session.to_owned(),
         cached: StdMutex::new(HashMap::new()),
         handle: None,
+        sender: None,
     })
 }
 
@@ -1037,4 +1076,418 @@ async fn an_answer_outside_the_offered_ids_and_an_abort_are_both_cancelled() {
         "{}",
         output.content
     );
+}
+
+// ---------------------------------------------------------------------------
+// Streaming progress: `session/update` kinds that a human can read as progress
+// become `AgentEvent::Display` lines while the prompt runs. The final result
+// is unchanged by streaming.
+// ---------------------------------------------------------------------------
+
+/// Streams progress: two `tool_call`s (the second repeats the first id),
+/// three `agent_message_chunk`s (two newline-terminated, one running past the
+/// coalescing cap) and one `agent_thought_chunk`.
+const STREAM_STUB: &str = r#"
+long=$(printf 'x%.0s' {1..250})
+upd() { printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":%s}}\n' "$1"; }
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{},"agentInfo":{"name":"stub-acp","version":"9.9.9"},"authMethods":[]}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess-stream"}}\n' "$id"
+      ;;
+    *'"method":"session/prompt"'*)
+      upd '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"alpha\n"}}'
+      upd '{"sessionUpdate":"tool_call","toolCallId":"t1","title":"run ls","kind":"execute","status":"pending","rawInput":{"command":"ls -la"}}'
+      upd '{"sessionUpdate":"tool_call_update","toolCallId":"t1","status":"in_progress"}'
+      upd '{"sessionUpdate":"tool_call","toolCallId":"t2","title":"read notes.md","kind":"read","status":"pending"}'
+      upd '{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"secret-thought"}}'
+      upd '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"beta\n"}}'
+      upd "{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"$long\"}}"
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      ;;
+  esac
+done
+"#;
+
+/// Every event the sender received, as display lines. A tool streams nothing
+/// but `Display`: an `AssistantDelta` here would corrupt the transcript.
+fn display_lines(events: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) -> Vec<String> {
+    std::iter::from_fn(|| events.try_recv().ok())
+        .map(|event| match event {
+            AgentEvent::Display(text) => text,
+            other => panic!("a tool streams only Display events, got {other:?}"),
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn progress_streams_as_display_lines_and_the_result_is_unchanged() {
+    let temp = tempfile::tempdir().unwrap();
+    let log = temp.path().join("frames.log");
+    let root = Workspace::new(temp.path()).unwrap().root().to_path_buf();
+    let mut tool = tool_with(&root, stub_config(STREAM_STUB, &log, "ok"), "session-a").await;
+    let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+    tool.set_event_sender(sender);
+
+    let streamed = tool.execute(json!({"prompt": "stream"})).await.unwrap();
+    let displays = display_lines(&mut events);
+
+    let long = "x".repeat(250);
+    assert_eq!(
+        displays,
+        vec![
+            // One line per newline-terminated message chunk.
+            "[acp] alpha".to_owned(),
+            // One line per DISTINCT tool id: the repeat update is dropped.
+            "[acp] run ls: ls -la".to_owned(),
+            "[acp] read notes.md".to_owned(),
+            "[acp] beta".to_owned(),
+            // No newline: the buffer is emitted only when it reaches 200 chars.
+            format!("[acp] {}", &long[..200]),
+        ],
+        "thoughts and repeated tool ids must stream nothing"
+    );
+    assert!(
+        !displays.iter().any(|line| line.contains("secret-thought")),
+        "{displays:?}"
+    );
+
+    // Streaming is additive: the same stub without a sender produces the very
+    // same tool result (and must not panic, error or hang).
+    let quiet_root = Workspace::new(temp.path()).unwrap().root().to_path_buf();
+    let quiet = tool_with(
+        &quiet_root,
+        stub_config(STREAM_STUB, &log, "ok"),
+        "session-b",
+    )
+    .await;
+    let unstreamed = quiet.execute(json!({"prompt": "stream"})).await.unwrap();
+    assert_eq!(streamed.content, unstreamed.content);
+    let content = streamed.content;
+    assert!(
+        content.starts_with("acp: stub-acp 9.9.9 · session sess-stream\n"),
+        "{content}"
+    );
+    assert!(
+        content.contains(&format!("alpha\nbeta\n{long}")),
+        "{content}"
+    );
+    assert!(!content.contains("secret-thought"), "{content}");
+    assert!(content.contains("stopReason: end_turn"), "{content}");
+    // The two tool calls and the repeat update are still only "ignored".
+    assert!(content.contains("ignored updates: 3"), "{content}");
+}
+
+#[tokio::test]
+async fn streaming_without_an_event_sender_is_a_no_op() {
+    let temp = tempfile::tempdir().unwrap();
+    let log = temp.path().join("frames.log");
+    let root = Workspace::new(temp.path()).unwrap().root().to_path_buf();
+    // No `set_event_sender`: a tool built outside the runner.
+    let tool = tool_with(&root, stub_config(STREAM_STUB, &log, "ok"), "session-a").await;
+
+    let output = tool.execute(json!({"prompt": "stream"})).await.unwrap();
+
+    assert!(
+        output.content.contains("stopReason: end_turn"),
+        "{output:?}"
+    );
+    assert!(output.content.contains("alpha\nbeta\n"), "{output:?}");
+}
+
+// ---------------------------------------------------------------------------
+// `session/load` replay gate: ACP replays the prior conversation as
+// `session/update` notifications BEFORE it answers `session/load`. Those are
+// not progress (e-agent holds its own transcript), so they must never become
+// Display lines, while `session/new` keeps streaming exactly as before.
+// ---------------------------------------------------------------------------
+
+/// Replays `$4` `agent_message_chunk`s (`replay-0`, `replay-1`, …) BEFORE
+/// answering `session/load`, then streams a live answer on `session/prompt`.
+/// `$3` selects the mode: `new` replays before `session/new` (the control),
+/// `load` before `session/load` (three chunks), and `overflow` before
+/// `session/load` with [`REPLAY_LIMIT`] + 50 chunks.
+const REPLAY_STUB: &str = r#"
+log="$1"
+mode="$3"
+count=3
+if [ "$mode" = "overflow" ]; then count="$4"; fi
+upd() { printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":%s}}\n' "$1"; }
+replay() {
+  i=0
+  while [ "$i" -lt "$count" ]; do
+    upd "{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"replay-$i\\n\"}}"
+    i=$((i + 1))
+  done
+}
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  printf '%s\n' "$line" >> "$log"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true},"agentInfo":{"name":"stub-acp","version":"9.9.9"},"authMethods":[]}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      if [ "$mode" = "new" ]; then replay; fi
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess-replay"}}\n' "$id"
+      ;;
+    *'"method":"session/load"'*)
+      if [ "$mode" = "load" ] || [ "$mode" = "overflow" ]; then replay; fi
+      sid=$(printf '%s' "$line" | grep -o '"sessionId":"[^"]*"' | head -1 | cut -d'"' -f4)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"%s"}}\n' "$id" "$sid"
+      ;;
+    *'"method":"session/prompt"'*)
+      upd '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"live one\n"}}'
+      upd '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"live two\n"}}'
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      ;;
+  esac
+done
+"#;
+
+#[tokio::test]
+async fn a_session_load_replay_never_streams() {
+    let temp = tempfile::tempdir().unwrap();
+    let log = temp.path().join("frames.log");
+    let root = Workspace::new(temp.path()).unwrap().root().to_path_buf();
+    let mut tool = tool_with(&root, replay_config(REPLAY_STUB, &log, "load"), "session-a").await;
+    let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+    tool.set_event_sender(sender);
+
+    // First call creates the session: its live answer streams normally.
+    tool.execute(json!({"prompt": "first"})).await.unwrap();
+    assert_eq!(
+        display_lines(&mut events),
+        ["[acp] live one", "[acp] live two"]
+    );
+
+    // Second call loads: three chunks arrive before the `session/load`
+    // response and must not stream. Exactly the live lines follow.
+    let output = tool.execute(json!({"prompt": "second"})).await.unwrap();
+
+    assert_eq!(
+        display_lines(&mut events),
+        ["[acp] live one", "[acp] live two"],
+        "the replayed chunks must not become Display events"
+    );
+    assert!(!output.content.contains("replay-"), "{}", output.content);
+    assert!(
+        output.content.contains("live one\nlive two"),
+        "{}",
+        output.content
+    );
+}
+
+#[tokio::test]
+async fn session_new_updates_still_stream_before_the_response() {
+    let temp = tempfile::tempdir().unwrap();
+    let log = temp.path().join("frames.log");
+    let root = Workspace::new(temp.path()).unwrap().root().to_path_buf();
+    let mut tool = tool_with(&root, replay_config(REPLAY_STUB, &log, "new"), "session-a").await;
+    let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+    tool.set_event_sender(sender);
+
+    let output = tool.execute(json!({"prompt": "first"})).await.unwrap();
+
+    // The control: the same pre-response chunks on `session/new` all stream;
+    // the gate is scoped to `session/load`.
+    assert_eq!(
+        display_lines(&mut events),
+        [
+            "[acp] replay-0",
+            "[acp] replay-1",
+            "[acp] replay-2",
+            "[acp] live one",
+            "[acp] live two",
+        ]
+    );
+    assert!(
+        output
+            .content
+            .contains("replay-0\nreplay-1\nreplay-2\nlive one\nlive two"),
+        "{}",
+        output.content
+    );
+}
+
+#[tokio::test]
+async fn replay_staging_overflow_drops_without_erroring_or_leaking() {
+    // The gate itself: past the bound it stops staging (dropping the staged
+    // entries) and keeps consuming replayed updates without failing.
+    let mut gate = ReplayGate::default();
+    gate.begin(7);
+    for _ in 0..REPLAY_LIMIT + 50 {
+        assert!(
+            gate.stage(&json!({"sessionUpdate": "agent_message_chunk"})),
+            "every update during the load is consumed"
+        );
+    }
+    assert!(gate.overflow, "the staging bound must trip");
+    assert!(
+        gate.staged.is_empty(),
+        "overflow drops the staged replay instead of growing"
+    );
+    gate.finish(7);
+    assert!(!gate.overflow);
+    assert!(
+        !gate.stage(&json!({"sessionUpdate": "agent_message_chunk"})),
+        "outside a load nothing is staged or dropped"
+    );
+
+    // End to end: a load replaying past the bound still finishes, streams
+    // only its live answer, and leaks no replayed text into the receipt.
+    let temp = tempfile::tempdir().unwrap();
+    let log = temp.path().join("frames.log");
+    let root = Workspace::new(temp.path()).unwrap().root().to_path_buf();
+    let mut tool = tool_with(
+        &root,
+        replay_config(REPLAY_STUB, &log, "overflow"),
+        "session-a",
+    )
+    .await;
+    let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+    tool.set_event_sender(sender);
+
+    // First call creates the session; its live answer is not the target.
+    tool.execute(json!({"prompt": "first"})).await.unwrap();
+    let _ = display_lines(&mut events);
+
+    let output = tool.execute(json!({"prompt": "second"})).await.unwrap();
+
+    assert_eq!(
+        display_lines(&mut events),
+        ["[acp] live one", "[acp] live two"],
+        "an overflowing replay must stay silent"
+    );
+    assert!(!output.content.contains("replay-"), "{}", output.content);
+    assert!(
+        output.content.contains("live one\nlive two"),
+        "{}",
+        output.content
+    );
+    assert!(
+        output.content.contains("stopReason: end_turn"),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn stream_text_coalesces_at_newlines_and_at_the_cap() {
+    let mut state = State::default();
+    // A chunk without a newline is buffered, not streamed token by token.
+    assert!(state.stream_text("one").is_empty());
+    // "one two" ends at the newline; "three" stays buffered.
+    assert_eq!(state.stream_text(" two\nthree"), ["[acp] one two"]);
+    assert!(state.stream_text("four").is_empty());
+    assert_eq!(state.pending, "threefour");
+    // 450 more characters: two cap-sized lines, the 59-character tail waits.
+    let tail = "y".repeat(450);
+    assert_eq!(
+        state.stream_text(&tail),
+        [
+            format!("[acp] threefour{}", "y".repeat(191)),
+            format!("[acp] {}", "y".repeat(200)),
+        ]
+    );
+    assert_eq!(state.pending, "y".repeat(59));
+    // A blank line is not progress: nothing is emitted for it.
+    let mut blank = State::default();
+    assert!(blank.stream_text("\n\n").is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// MCP: the ACP agent spawns e-agent's OWN config servers, so their
+// definitions ride on `session/new` and `session/load`.
+// ---------------------------------------------------------------------------
+
+/// Two servers the ACP agent must not receive (disabled / empty command) and
+/// one it must, with args and env.
+fn mcp_config() -> HashMap<String, McpServerConfig> {
+    let mut servers = HashMap::new();
+    servers.insert(
+        "off".into(),
+        McpServerConfig {
+            command: vec!["/bin/off".into()],
+            env: HashMap::new(),
+            cwd: None,
+            enabled: false,
+        },
+    );
+    servers.insert(
+        "blank".into(),
+        McpServerConfig {
+            command: Vec::new(),
+            env: HashMap::new(),
+            cwd: Some(PathBuf::from("/ignored")),
+            enabled: true,
+        },
+    );
+    servers.insert(
+        "engram".into(),
+        McpServerConfig {
+            command: vec!["/opt/engram".into(), "mcp".into(), "--tools=agent".into()],
+            env: HashMap::from([("B".into(), "2".into()), ("A".into(), "1".into())]),
+            // ACP has no `cwd` field: it is dropped, never invented.
+            cwd: Some(PathBuf::from("/ignored/too")),
+            enabled: true,
+        },
+    );
+    servers
+}
+
+#[tokio::test]
+async fn the_config_mcp_servers_ride_on_session_new_and_load() {
+    let temp = tempfile::tempdir().unwrap();
+    let log = temp.path().join("frames.log");
+    let root = Workspace::new(temp.path()).unwrap().root().to_path_buf();
+    let tool = tool_with_mcp(
+        &root,
+        stub_config(STUB, &log, "ok"),
+        &mcp_config(),
+        "session-a",
+    )
+    .await;
+
+    tool.execute(json!({"prompt": "first"})).await.unwrap();
+    tool.execute(json!({"prompt": "second"})).await.unwrap();
+
+    let wanted = json!([{
+        "name": "engram",
+        "command": "/opt/engram",
+        "args": ["mcp", "--tools=agent"],
+        "env": {"A": "1", "B": "2"},
+    }]);
+    let frames = logged_frames(&log);
+    let sent = |method: &str| -> Value {
+        let frame = frames
+            .iter()
+            .find(|frame| frame.contains(method))
+            .unwrap_or_else(|| panic!("no {method} frame: {}", frames.join("\n")));
+        let value: Value = serde_json::from_str(frame).expect("a JSON-RPC frame");
+        value["params"]["mcpServers"].clone()
+    };
+    assert_eq!(sent(r#""method":"session/new""#), wanted);
+    // A loaded session gets the same list: the agent reconnects its servers.
+    assert_eq!(sent(r#""method":"session/load""#), wanted);
+}
+
+#[tokio::test]
+async fn no_mcp_config_sends_an_empty_list_and_still_succeeds() {
+    let temp = tempfile::tempdir().unwrap();
+    let log = temp.path().join("frames.log");
+    let root = Workspace::new(temp.path()).unwrap().root().to_path_buf();
+    // No config file at all: the tool is built with no `[mcp.*]` servers.
+    let tool = tool_with(&root, stub_config(STUB, &log, "ok"), "session-a").await;
+
+    let output = tool.execute(json!({"prompt": "hi"})).await.unwrap();
+
+    let frames = logged_frames(&log);
+    let new: Value = serde_json::from_str(&frames[1]).expect("a JSON-RPC frame");
+    assert_eq!(new["params"]["mcpServers"], json!([]));
+    assert!(new["params"]["cwd"].is_string(), "{}", frames[1]);
+    assert!(output.content.contains("stopReason: end_turn"));
 }

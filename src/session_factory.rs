@@ -1500,10 +1500,14 @@ pub(crate) fn register_acp(
         return;
     };
     // The session id is bound up front: the ACP id belongs to THIS session's
-    // metadata row from the first call.
+    // metadata row from the first call. The `[mcp.*]` servers come from the
+    // same config: the ACP agent spawns them itself, so the tool ships their
+    // definitions (an absent config is an empty list, never a failure).
+    let mcp = config.map(|config| config.mcp.clone()).unwrap_or_default();
     tools.push(crate::tools::acp_tool(
         workspace.clone(),
         acp,
+        &mcp,
         store.clone(),
         root.to_path_buf(),
         session,

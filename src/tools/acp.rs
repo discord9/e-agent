@@ -61,16 +61,53 @@
 //! result. A child never asks: suspending there would park a turn nobody can
 //! answer.
 //!
-//! Non-goals (deliberately not implemented): a session/process pool, streaming
-//! `session/update` notifications to the UI (they are accumulated and returned
-//! as one result), MCP injection (`mcpServers` is always `[]`), a permission UI
-//! of its own (the request reuses the existing `WaitingInput` question
-//! frontends), remembered grants (every request is answered on its own),
-//! `session/close`, `session/cancel`, `session/set_mode`, several prompts
-//! inside one call, and any `session/list` based discovery (it cannot tell two
-//! concurrent e-agent sessions in one workspace apart).
+//! **Progress reaches the UI while the prompt runs.** `session/update` is
+//! still accumulated for the final result, but the kinds a human can read as
+//! progress also become `AgentEvent::Display` lines — the UI-only channel the
+//! poll guard uses, never `AssistantDelta`: this is a tool call, not a model
+//! turn, and assistant deltas outside one would corrupt the transcript
+//! projection. One line per DISTINCT `toolCallId` (`[acp] run ls: ls -la`,
+//! command cut to 120 characters — repeat updates for the same id are
+//! dropped, they only restate a status), and `agent_message_chunk` text
+//! coalesced into one line at a newline boundary or every 200 characters
+//! (`[acp] …`), never one line per token: a shorter unterminated tail stays
+//! buffered instead of becoming a line of its own (the result carries the
+//! text anyway). Thought chunks, usage updates, command lists and every other
+//! update stay silent — they are accumulated content, not progress — and a
+//! tool with no event sender (built outside the runner) streams nothing: the
+//! whole path is a no-op, never an error.
+//!
+//! **A `session/load` replay is not progress.** ACP answers `session/load`
+//! only after replaying the prior conversation as `session/update`
+//! notifications. e-agent already holds that transcript, so while a load is
+//! in flight those updates are staged in a bounded gate (and dropped once the
+//! bound is reached) instead of being displayed or accumulated; the
+//! `session/load` response closes the gate at the exact frame that carries
+//! it. `session/new` and `session/prompt` updates are never gated.
+//!
+//! **The ACP agent spawns e-agent's own MCP servers.** `session/new` and
+//! `session/load` carry the `[mcp.<name>]` servers from the CONFIG — not the
+//! ones this process happened to connect — because the child starts them
+//! itself: one `{name, command, args, env}` entry per ENABLED server,
+//! `command[0]` as `command` and the rest as `args`, sorted by name so the
+//! frame is deterministic, `env` exactly as configured (nothing is inherited
+//! from the parent). A server with an empty `command` is skipped (there is
+//! nothing to run) and `cwd` is dropped: ACP has no field for it, so such a
+//! server runs in the ACP agent's cwd. A config that cannot be read sends
+//! `[]` — the call never fails over its MCP list.
+//!
+//! Non-goals (deliberately not implemented): a session/process pool, a
+//! permission UI of its own (the request reuses the existing `WaitingInput`
+//! question frontends), remembered grants (every request is answered on its
+//! own), `session/close`, `session/cancel`, `session/set_mode`, several
+//! prompts inside one call, replaying a loaded conversation into the UI
+//! (e-agent holds its own transcript), and any `session/list` based discovery
+//! (it cannot tell two concurrent e-agent sessions in one workspace apart).
+//! MCP injection is one-way and description-only: e-agent sends its server
+//! definitions, it does not learn which MCP tools the ACP agent ended up
+//! with.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -81,11 +118,12 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 use super::spec;
-use crate::agent::{Tool, ToolOutput, ToolSpec};
+use crate::agent::{AgentEvent, Tool, ToolOutput, ToolSpec};
 use crate::config::AcpConfig;
+use crate::mcp::McpServerConfig;
 use crate::runner::{SessionHandle, UserInputRequest, UserOption, UserQuestion};
 use crate::session_store::SessionStore;
 use crate::workspace::Workspace;
@@ -109,6 +147,18 @@ const TEXT_LIMIT: usize = 64 * 1024;
 const SUMMARY_LIMIT: usize = 120;
 /// Cap on the `rawInput.command` quoted in a permission question.
 const COMMAND_LIMIT: usize = 200;
+/// Cap on the `rawInput.command` quoted in one streamed `tool_call` line.
+const STREAM_COMMAND_LIMIT: usize = 120;
+/// How much `agent_message_chunk` text one display line may carry before it
+/// is emitted without a newline (a shorter line waits for its newline).
+const STREAM_TEXT_LIMIT: usize = 200;
+/// Staging bound while a `session/load` replay is in flight: past this many
+/// replayed updates the gate stops staging and drops the rest, so a
+/// pathological agent cannot grow memory without limit while the response is
+/// pending. Replayed updates are never rendered anyway.
+const REPLAY_LIMIT: usize = 256;
+/// Longest `sessionUpdate` kind kept in a staged replay entry.
+const REPLAY_KIND_LIMIT: usize = 32;
 /// The question id every permission ask uses (one question per request).
 const PERMISSION_QUESTION: &str = "permission";
 /// Cache bucket of a tool that was never bound to an e-agent session (direct
@@ -117,10 +167,12 @@ const UNBOUND_SESSION: &str = "<unbound>";
 
 /// The registered `acp_prompt` tool. Main session only — the session factory
 /// decides (see `session_factory::register_acp`), so delegate/fork children
-/// never inherit it.
+/// never inherit it. `mcp` is the `[mcp.*]` config map: the ACP agent spawns
+/// those servers itself, so the tool ships them as its `mcpServers` array.
 pub(crate) fn acp_tool(
     workspace: Workspace,
     config: AcpConfig,
+    mcp: &HashMap<String, McpServerConfig>,
     store: SessionStore,
     root: PathBuf,
     session: &str,
@@ -128,11 +180,13 @@ pub(crate) fn acp_tool(
     Box::new(AcpPrompt {
         workspace,
         config,
+        mcp_servers: mcp_servers(mcp),
         store,
         root,
         session: session.to_owned(),
         cached: StdMutex::new(HashMap::new()),
         handle: None,
+        sender: None,
     })
 }
 
@@ -150,6 +204,10 @@ const DESCRIPTION: &str = "Run ONE prompt through an external ACP (Agent Client 
 struct AcpPrompt {
     workspace: Workspace,
     config: AcpConfig,
+    /// The ACP `mcpServers` array, resolved once from the `[mcp.*]` config at
+    /// construction (see [`mcp_servers`]). Sent with both `session/new` and
+    /// `session/load`: the ACP agent starts those servers itself.
+    mcp_servers: Vec<Value>,
     /// The session store holding `sessions.acp_session_id`: the ACP id is
     /// read from there on the first call of a session and written back after
     /// every `session/new` / `session/load`. The tool never opens a database
@@ -170,6 +228,10 @@ struct AcpPrompt {
     /// permission requests then keep the kind-based policy. A child
     /// (delegate/btw/fork) session refuses because it has no frontend.
     handle: Option<SessionHandle>,
+    /// The UI-only event sink (bound by `Agent::new`): `session/update`
+    /// progress becomes `AgentEvent::Display` lines through it. `None` (a
+    /// tool built outside a runner, tests) makes streaming a no-op.
+    sender: Option<mpsc::UnboundedSender<AgentEvent>>,
 }
 
 #[derive(Clone)]
@@ -249,6 +311,14 @@ impl Tool for AcpPrompt {
     fn set_session_handle(&mut self, session_id: &str, handle: crate::runner::SessionHandle) {
         self.session = session_id.to_owned();
         self.handle = Some(handle);
+    }
+
+    fn set_event_sender(&mut self, sender: mpsc::UnboundedSender<AgentEvent>) {
+        self.sender = Some(sender);
+    }
+
+    fn has_event_sender(&self) -> bool {
+        self.sender.is_some()
     }
 }
 
@@ -368,7 +438,15 @@ impl AcpPrompt {
         cwd: &Path,
         handle: Option<SessionHandle>,
     ) -> Result<String, String> {
-        let client = Client::connect(&self.config, cwd, &plan, handle).await?;
+        let client = Client::connect(
+            &self.config,
+            cwd,
+            &plan,
+            handle,
+            self.sender.as_ref(),
+            &self.mcp_servers,
+        )
+        .await?;
         // Remembered BEFORE the prompt: a failed prompt must not orphan a
         // freshly created session id.
         self.remember(cwd, &client.session_id).await;
@@ -408,6 +486,8 @@ struct Client {
     notices: Vec<Notice>,
     /// Bounded stderr tail, surfaced in error messages.
     stderr: Arc<StdMutex<String>>,
+    /// The `mcpServers` array sent with `session/new` and `session/load`.
+    mcp: Vec<Value>,
 }
 
 impl Client {
@@ -416,8 +496,10 @@ impl Client {
         cwd: &Path,
         plan: &Plan,
         handle: Option<SessionHandle>,
+        sender: Option<&mpsc::UnboundedSender<AgentEvent>>,
+        mcp: &[Value],
     ) -> Result<Self, String> {
-        let mut client = Self::spawn(config, cwd, plan, handle)?;
+        let mut client = Self::spawn(config, cwd, plan, handle, sender, mcp)?;
         if let Err(error) = client.handshake(config, cwd, &plan.open).await {
             // The child dies with `client` on this early return.
             return Err(client.describe(error));
@@ -431,6 +513,8 @@ impl Client {
         cwd: &Path,
         plan: &Plan,
         handle: Option<SessionHandle>,
+        sender: Option<&mpsc::UnboundedSender<AgentEvent>>,
+        mcp: &[Value],
     ) -> Result<Self, String> {
         let mut command = Command::new(&config.binary);
         command
@@ -459,9 +543,11 @@ impl Client {
             pending: Mutex::new(Pending::default()),
             next_id: AtomicU64::new(1),
             state: StdMutex::new(State::default()),
+            replay: StdMutex::new(ReplayGate::default()),
             allow_kinds: config.allow_kinds.clone(),
             danger: config.danger,
             handle,
+            sender: sender.cloned(),
         });
         tokio::spawn(read_loop(shared.clone(), stdout));
         Ok(Self {
@@ -471,6 +557,7 @@ impl Client {
             session_id: String::new(),
             notices: plan.notice.clone().into_iter().collect(),
             stderr,
+            mcp: mcp.to_vec(),
         })
     }
 
@@ -534,7 +621,7 @@ impl Client {
             .shared
             .request(
                 "session/new",
-                json!({"cwd": cwd, "mcpServers": []}),
+                json!({"cwd": cwd, "mcpServers": self.mcp.clone()}),
                 CALL_TIMEOUT,
             )
             .await?;
@@ -547,10 +634,11 @@ impl Client {
 
     async fn load_session(&self, id: &str, cwd: &str) -> Result<(), String> {
         self.shared
-            .request(
+            .request_replay(
                 "session/load",
-                json!({"sessionId": id, "cwd": cwd, "mcpServers": []}),
+                json!({"sessionId": id, "cwd": cwd, "mcpServers": self.mcp.clone()}),
                 CALL_TIMEOUT,
+                true,
             )
             .await
             .map(|_| ())
@@ -644,6 +732,71 @@ impl Drop for KillOnDrop {
 
 type Pending = HashMap<u64, oneshot::Sender<Result<Value, String>>>;
 
+/// The `session/load` replay gate. ACP replays a loaded session's whole prior
+/// conversation as `session/update` notifications BEFORE it answers
+/// `session/load`; e-agent already holds that transcript, so while the load
+/// is in flight those updates are staged (bounded by [`REPLAY_LIMIT`]) and
+/// never emitted or accumulated. The load response closes the gate at the
+/// exact frame that carries it; `session/new` / `session/prompt` are never
+/// gated.
+#[derive(Default)]
+struct ReplayGate {
+    /// Id of the in-flight `session/load`, if any.
+    loading: Option<u64>,
+    /// Kinds of the replayed updates staged so far. Only the kind (clipped to
+    /// [`REPLAY_KIND_LIMIT`] chars) is kept: the payload is deliberately
+    /// discarded, and the vector is bounded by [`REPLAY_LIMIT`].
+    staged: Vec<String>,
+    /// The staging bound was reached: further replayed updates are dropped
+    /// until the load response arrives.
+    overflow: bool,
+}
+
+impl ReplayGate {
+    /// Open the replay region BEFORE the `session/load` frame is written, so
+    /// no replayed notification can slip through.
+    fn begin(&mut self, id: u64) {
+        self.loading = Some(id);
+        self.staged.clear();
+        self.overflow = false;
+    }
+
+    /// `true` when `update` belongs to a load replay and was consumed; the
+    /// caller must not display or accumulate it. Staging is bounded: once
+    /// [`REPLAY_LIMIT`] is reached the staged entries are dropped and every
+    /// further replayed update is discarded too.
+    fn stage(&mut self, update: &Value) -> bool {
+        if self.loading.is_none() {
+            return false;
+        }
+        if self.overflow {
+            return true;
+        }
+        if self.staged.len() >= REPLAY_LIMIT {
+            self.overflow = true;
+            self.staged.clear();
+            return true;
+        }
+        let kind = update
+            .get("sessionUpdate")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        self.staged
+            .push(kind.chars().take(REPLAY_KIND_LIMIT).collect());
+        true
+    }
+
+    /// Close the replay region at the response frame (or when the request
+    /// fails): the staged replay is dropped, never rendered.
+    fn finish(&mut self, id: u64) {
+        if self.loading == Some(id) {
+            self.loading = None;
+            self.staged.clear();
+            self.overflow = false;
+        }
+    }
+}
+
 /// Everything the reader task and the request side both need: writes to the
 /// child, the in-flight request table, and the accumulated notification state.
 struct Shared {
@@ -651,6 +804,8 @@ struct Shared {
     pending: Mutex<Pending>,
     next_id: AtomicU64,
     state: StdMutex<State>,
+    /// The `session/load` replay gate (see [`ReplayGate`]).
+    replay: StdMutex<ReplayGate>,
     /// `[acp] allow_kinds`: tool kinds answered "allow once".
     allow_kinds: Vec<String>,
     /// `[acp] danger`: answer every permission request "allow once".
@@ -658,6 +813,10 @@ struct Shared {
     /// The e-agent session handle used to forward a permission request to the
     /// human as a question. `None` keeps the kind-based policy.
     handle: Option<SessionHandle>,
+    /// The UI-only event sink of the owning session: `session/update`
+    /// progress becomes `AgentEvent::Display` lines here. `None` (no
+    /// frontend channel) makes streaming a silent no-op.
+    sender: Option<mpsc::UnboundedSender<AgentEvent>>,
 }
 
 impl Shared {
@@ -667,15 +826,36 @@ impl Shared {
         params: Value,
         timeout: Duration,
     ) -> Result<Value, String> {
+        self.request_replay(method, params, timeout, false).await
+    }
+
+    /// One request; `replay` marks `session/load`, whose pre-response
+    /// `session/update` notifications are the prior conversation, not
+    /// progress. The gate opens BEFORE the frame is written so no replayed
+    /// notification can slip through, and [`Shared::dispatch`] closes it on
+    /// the response frame itself.
+    async fn request_replay(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+        replay: bool,
+    ) -> Result<Value, String> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = oneshot::channel();
         self.pending.lock().await.insert(id, sender);
+        if replay {
+            // Open the gate immediately before the frame is written: nothing
+            // the agent sends after this point can be pre-load traffic.
+            self.replay.lock().unwrap().begin(id);
+        }
         let message = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         if let Err(error) = self.send(&message).await {
             self.pending.lock().await.remove(&id);
+            self.replay.lock().unwrap().finish(id);
             return Err(error);
         }
-        match tokio::time::timeout(timeout, receiver).await {
+        let result = match tokio::time::timeout(timeout, receiver).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(format!(
                 "acp: the agent closed the connection during `{method}`"
@@ -687,7 +867,11 @@ impl Shared {
                     timeout.as_secs()
                 ))
             }
-        }
+        };
+        // A response already closed the gate in `dispatch`; this only covers
+        // the failure paths, and is a no-op when the response won.
+        self.replay.lock().unwrap().finish(id);
+        result
     }
 
     /// Write one JSON-RPC frame: the object, a newline, and a flush.
@@ -734,6 +918,9 @@ impl Shared {
             // order, so the id is the only routing key.
             (Some(id), None) => {
                 let Some(id) = id.as_u64() else { return };
+                // A response frame is the EXACT end of a `session/load`
+                // replay: every notification after this line is live again.
+                self.replay.lock().unwrap().finish(id);
                 let Some(sender) = self.pending.lock().await.remove(&id) else {
                     return;
                 };
@@ -839,8 +1026,13 @@ impl Shared {
         json!({"jsonrpc": "2.0", "id": id.clone(), "result": outcome})
     }
 
-    /// `session/update` notifications: message and thought chunks are
-    /// accumulated (kept apart), every other update kind is only counted.
+    /// `session/update` notifications, mapped in ONE place: message and
+    /// thought chunks are accumulated for the receipt (kept apart), the kinds
+    /// a human can read as progress also produce `AgentEvent::Display` lines,
+    /// and every non-text update is counted. While a `session/load` replay is
+    /// pending, the notification is consumed by the gate instead: the prior
+    /// conversation is not new information and must neither stream nor
+    /// pollute the receipt body.
     fn record_notification(&self, method: &str, params: Option<&Value>) {
         if method != "session/update" {
             return;
@@ -848,6 +1040,9 @@ impl Shared {
         let Some(update) = params.and_then(|params| params.get("update")) else {
             return;
         };
+        if self.replay.lock().unwrap().stage(update) {
+            return;
+        }
         let kind = update
             .get("sessionUpdate")
             .and_then(Value::as_str)
@@ -857,17 +1052,39 @@ impl Shared {
             .and_then(|content| content.get("text"))
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let mut state = self.state.lock().unwrap();
-        match kind {
-            "agent_message_chunk" => {
-                state.truncated |= push_bounded(&mut state.assistant, text, TEXT_LIMIT)
+        let lines = {
+            let mut state = self.state.lock().unwrap();
+            match kind {
+                "agent_message_chunk" => {
+                    state.truncated |= push_bounded(&mut state.assistant, text, TEXT_LIMIT);
+                    state.stream_text(text)
+                }
+                // A thought is audit material, not progress: accumulated for
+                // the receipt body fallback, never streamed to the UI.
+                "agent_thought_chunk" => {
+                    state.truncated |= push_bounded(&mut state.thought, text, TEXT_LIMIT);
+                    Vec::new()
+                }
+                // A tool call is progress, once per distinct call: the
+                // updates that follow restate its status.
+                "tool_call" | "tool_call_update" => {
+                    state.ignored += 1;
+                    state.stream_tool_call(update).into_iter().collect()
+                }
+                // usage_update / available_commands_update / plan / …:
+                // counted, not rendered.
+                _ => {
+                    state.ignored += 1;
+                    Vec::new()
+                }
             }
-            "agent_thought_chunk" => {
-                state.truncated |= push_bounded(&mut state.thought, text, TEXT_LIMIT)
+        };
+        // UI-only and best effort: no sender (a tool built outside a runner)
+        // or a closed channel must never fail the review.
+        if let Some(sender) = &self.sender {
+            for line in lines {
+                let _ = sender.send(AgentEvent::Display(line));
             }
-            // tool_call / tool_call_update / usage_update /
-            // available_commands_update / plan / …: counted, not rendered.
-            _ => state.ignored += 1,
         }
     }
 }
@@ -879,6 +1096,11 @@ struct State {
     assistant: String,
     /// `agent_thought_chunk` text, kept separate: only a fallback body.
     thought: String,
+    /// `agent_message_chunk` text not yet emitted as a display line: ended by
+    /// its newline or by reaching [`STREAM_TEXT_LIMIT`].
+    pending: String,
+    /// `toolCallId`s already streamed, so a status update is not a new line.
+    streamed_tools: HashSet<String>,
     /// How many non-text updates arrived (tool_call, usage_update, …).
     ignored: usize,
     /// One line per DENIED request: `denied <kind>: <summary>`.
@@ -887,6 +1109,54 @@ struct State {
     danger_allowed: bool,
     /// A text buffer hit [`TEXT_LIMIT`].
     truncated: bool,
+}
+
+impl State {
+    /// Coalesce one `agent_message_chunk` into display lines: every newline
+    /// ends a line, and a run of [`STREAM_TEXT_LIMIT`] characters without one
+    /// is emitted as a line of its own. Never one line per token, and a
+    /// blank line is not progress (nothing is emitted for it).
+    fn stream_text(&mut self, text: &str) -> Vec<String> {
+        self.pending.push_str(text);
+        let mut lines = Vec::new();
+        loop {
+            // `end` is the byte offset just past the line (the newline
+            // included) or the char boundary of the cap.
+            let end = match self.pending.find('\n') {
+                Some(end) => end + 1,
+                // No newline yet: wait for one until the cap is reached.
+                None if self.pending.chars().count() >= STREAM_TEXT_LIMIT => self
+                    .pending
+                    .char_indices()
+                    .nth(STREAM_TEXT_LIMIT)
+                    .map_or(self.pending.len(), |(cut, _)| cut),
+                None => break,
+            };
+            let line: String = self.pending.drain(..end).collect();
+            if !line.trim().is_empty() {
+                lines.push(format!("[acp] {}", line.trim_end()));
+            }
+        }
+        lines
+    }
+
+    /// One display line per DISTINCT `toolCallId`: `[acp] <title>: <command>`
+    /// (the command cut to [`STREAM_COMMAND_LIMIT`] characters). A repeat
+    /// update for an id already streamed yields nothing.
+    fn stream_tool_call(&mut self, update: &Value) -> Option<String> {
+        let id = text_field(Some(update), "toolCallId")?;
+        if !self.streamed_tools.insert(id.to_owned()) {
+            return None;
+        }
+        let title = text_field(Some(update), "title").unwrap_or(id);
+        Some(match command_of(Some(update)) {
+            Some(command) => format!(
+                "[acp] {title}: {}",
+                truncate_command(command, STREAM_COMMAND_LIMIT)
+            ),
+            None => format!("[acp] {title}"),
+        })
+    }
 }
 
 /// Render one session status line, with the session actually in use.
@@ -1061,7 +1331,7 @@ fn tool_call_summary(tool_call: Option<&Value>) -> String {
 fn permission_prompt(tool_call: Option<&Value>) -> String {
     let title = text_field(tool_call, "title").unwrap_or("an unknown tool call");
     match command_of(tool_call) {
-        Some(command) => format!("{title}: {}", truncate_command(command)),
+        Some(command) => format!("{title}: {}", truncate_command(command, COMMAND_LIMIT)),
         None => title.to_owned(),
     }
 }
@@ -1099,13 +1369,50 @@ fn command_of(tool_call: Option<&Value>) -> Option<&str> {
         .filter(|command| !command.is_empty())
 }
 
-/// Cut a command to [`COMMAND_LIMIT`] CHARACTERS on a char boundary, marking
-/// the cut so a truncated command is never mistaken for the whole one.
-fn truncate_command(command: &str) -> String {
-    match command.char_indices().nth(COMMAND_LIMIT) {
+/// Cut a command to `limit` CHARACTERS on a char boundary, marking the cut so
+/// a truncated command is never mistaken for the whole one.
+fn truncate_command(command: &str, limit: usize) -> String {
+    match command.char_indices().nth(limit) {
         Some((cut, _)) => format!("{}…", &command[..cut]),
         None => command.to_owned(),
     }
+}
+
+/// The ACP `mcpServers` array for the config's `[mcp.<name>]` servers, sorted
+/// by name so the frame is deterministic:
+/// `[{name, command: command[0], args: command[1..], env}]`.
+///
+/// Only ENABLED servers with a non-empty `command` are sent — there is
+/// otherwise nothing for the ACP agent to run. `env` is the configured map
+/// verbatim (nothing is inherited from this process). `cwd` is deliberately
+/// dropped: ACP has no field for it, so such a server runs in the ACP agent's
+/// cwd.
+fn mcp_servers(config: &HashMap<String, McpServerConfig>) -> Vec<Value> {
+    let mut names: Vec<&String> = config.keys().collect();
+    names.sort();
+    names
+        .into_iter()
+        .filter_map(|name| {
+            let server = &config[name];
+            // An empty `command` names no program: nothing to hand over.
+            let (command, args) = server.command.split_first()?;
+            if !server.enabled {
+                return None;
+            }
+            let mut env = serde_json::Map::new();
+            let mut keys: Vec<&String> = server.env.keys().collect();
+            keys.sort();
+            for key in keys {
+                env.insert(key.clone(), Value::String(server.env[key].clone()));
+            }
+            Some(json!({
+                "name": name,
+                "command": command,
+                "args": args,
+                "env": Value::Object(env),
+            }))
+        })
+        .collect()
 }
 
 /// One trimmed, non-empty string field of an optional JSON object: a
