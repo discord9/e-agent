@@ -3748,16 +3748,7 @@ impl SessionStore {
         mutate: impl FnOnce(&mut Vec<SessionRef>) -> Result<(), String>,
     ) -> Result<Vec<SessionRef>> {
         match self {
-            SessionStore::Jsonl => {
-                let Some(mut meta) = jsonl_read_meta_snapshot(root, session)? else {
-                    anyhow::bail!("session {session} has no metadata row to store links in");
-                };
-                mutate(&mut meta.refs).map_err(anyhow::Error::msg)?;
-                dedup_refs(&mut meta.refs);
-                meta.last_active_at = chrono::Utc::now().naive_utc();
-                jsonl_append_meta_snapshot(root, session, &mut meta)?;
-                Ok(meta.refs)
-            }
+            SessionStore::Jsonl => jsonl_update_refs(root, session, mutate),
             #[cfg(feature = "greptime")]
             SessionStore::Greptime {
                 session: greptime_session,
@@ -4223,6 +4214,35 @@ fn jsonl_meta_sidecar_path(root: &Path, session: &str) -> anyhow::Result<PathBuf
         .join(format!("{session}.meta.jsonl")))
 }
 
+/// Serialize read-modify-append of ONE session's metadata sidecar inside
+/// this process. The sidecar is a full-snapshot log: every mutation reads
+/// the newest line, mutates it, and appends a new line, so two concurrent
+/// writers (two ref edits, or an edit racing a turn-boundary touch) would
+/// otherwise both start from the same line and the later append would
+/// silently drop the earlier change. Keyed by sidecar path — unrelated
+/// sessions never contend; cross-process writers stay last-write-wins (the
+/// optimistic semantics the DB backends document). One tiny leaked mutex per
+/// session path, bounded by the sessions this process has written.
+fn jsonl_meta_lock(path: &Path) -> &'static std::sync::Mutex<()> {
+    type Locks = HashMap<PathBuf, &'static std::sync::Mutex<()>>;
+    static LOCKS: std::sync::OnceLock<std::sync::Mutex<Locks>> = std::sync::OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks
+        .entry(path.to_path_buf())
+        .or_insert_with(|| Box::leak(Box::new(std::sync::Mutex::new(()))))
+}
+
+/// Take the per-sidecar snapshot lock, ignoring poisoning (a panicking
+/// writer cannot leave the file half-updated: every append is one write).
+fn lock_jsonl_meta(path: &Path) -> std::sync::MutexGuard<'static, ()> {
+    jsonl_meta_lock(path)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Append one complete snapshot line to a session's metadata sidecar:
 /// O_APPEND + `sync_all`, 0600 on creation — the append discipline of
 /// `Session::append`, applied to metadata snapshots. Each line mirrors one
@@ -4338,6 +4358,7 @@ fn jsonl_create_meta(
     parent_task_id: Option<i64>,
     title: Option<&str>,
 ) -> anyhow::Result<()> {
+    let _guard = lock_jsonl_meta(&jsonl_meta_sidecar_path(root, session)?);
     if let Some(existing) = jsonl_read_meta_snapshot(root, session)? {
         // Row already exists (resume, or a backfill/btw/subagent row whose
         // model or parent link was unknown at write time): only ever
@@ -4402,12 +4423,35 @@ fn jsonl_update_meta(
     session: &str,
     mutate: impl FnOnce(&mut SessionMeta),
 ) -> anyhow::Result<()> {
+    let _guard = lock_jsonl_meta(&jsonl_meta_sidecar_path(root, session)?);
     let Some(mut meta) = jsonl_read_meta_snapshot(root, session)? else {
         return Ok(()); // R3: never self-create
     };
     mutate(&mut meta);
     meta.last_active_at = chrono::Utc::now().naive_utc();
     jsonl_append_meta_snapshot(root, session, &mut meta)
+}
+
+/// `update_refs` for the JSONL backend: read → mutate → append ONE snapshot
+/// line under the same per-session lock every other metadata writer takes,
+/// so two concurrent adds both survive instead of the later one overwriting
+/// the earlier read. Returns the stored (deduplicated) list. A missing
+/// sidecar is an error — a link handed to the store must not be dropped
+/// quietly (the flag setters' no-op would).
+fn jsonl_update_refs(
+    root: &Path,
+    session: &str,
+    mutate: impl FnOnce(&mut Vec<SessionRef>) -> Result<(), String>,
+) -> anyhow::Result<Vec<SessionRef>> {
+    let _guard = lock_jsonl_meta(&jsonl_meta_sidecar_path(root, session)?);
+    let Some(mut meta) = jsonl_read_meta_snapshot(root, session)? else {
+        anyhow::bail!("session {session} has no metadata row to store links in");
+    };
+    mutate(&mut meta.refs).map_err(anyhow::Error::msg)?;
+    dedup_refs(&mut meta.refs);
+    meta.last_active_at = chrono::Utc::now().naive_utc();
+    jsonl_append_meta_snapshot(root, session, &mut meta)?;
+    Ok(meta.refs)
 }
 
 /// `touch_meta` for the JSONL backend: append one fresh snapshot line with
@@ -4418,6 +4462,7 @@ fn jsonl_update_meta(
 /// of the DB's `next_seq`. Called synchronously at turn boundaries; the
 /// read is a few hundred KB at worst.
 fn jsonl_touch_meta(root: &Path, session: &str) -> anyhow::Result<()> {
+    let _guard = lock_jsonl_meta(&jsonl_meta_sidecar_path(root, session)?);
     let Some(mut meta) = jsonl_read_meta_snapshot(root, session)? else {
         return Ok(()); // R3: never self-create
     };
@@ -4498,6 +4543,10 @@ fn jsonl_list_meta_diagnostic(
 /// transcript, so hiding is scoped to the current server lifetime.
 fn jsonl_delete_meta(root: &Path, session: &str) -> anyhow::Result<()> {
     let path = jsonl_meta_sidecar_path(root, session)?;
+    // Same per-session snapshot lock as the writers: a delete must not be
+    // undone by an in-flight read-modify-append (which would recreate the
+    // sidecar with the snapshot it read before the delete).
+    let _guard = lock_jsonl_meta(&path);
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),

@@ -1138,3 +1138,116 @@ async fn update_refs_without_a_meta_row_fails_loudly() {
         "{error:#}"
     );
 }
+
+// ----------------------------------------------------------------------
+// concurrent snapshot mutations
+// ----------------------------------------------------------------------
+
+/// Concurrent ref edits must ALL survive: the sidecar is read-mutate-append,
+/// so every per-session metadata writer takes one snapshot lock. Sixteen
+/// simultaneous adds released by a barrier make the lost update certain on
+/// the unsynchronized code (each writer reads the same newest line and the
+/// last append wins); with the lock every URL is stored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_ref_edits_all_survive() {
+    const WRITERS: usize = 16;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    let session = format!("refs-race-{}", crate::session::new_id());
+    let store = SessionStore::Jsonl;
+    store
+        .create_meta(&root, &session, Some("m"), Some("main"), None, None, None)
+        .await
+        .unwrap();
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(WRITERS));
+    std::thread::scope(|scope| {
+        for writer in 0..WRITERS {
+            let root = root.clone();
+            let session = session.clone();
+            let barrier = barrier.clone();
+            scope.spawn(move || {
+                let url = format!("https://github.com/acme/widget/pull/{writer}");
+                let _ = barrier.wait();
+                jsonl_update_refs(&root, &session, |refs| {
+                    refs.push(SessionRef::new("pr", &url).unwrap());
+                    Ok(())
+                })
+                .expect("the edit is stored");
+            });
+        }
+    });
+
+    let stored = jsonl_read_meta_snapshot(&root, &session)
+        .unwrap()
+        .expect("sidecar")
+        .refs;
+    assert_eq!(
+        stored.len(),
+        WRITERS,
+        "every concurrent add must survive: {stored:?}"
+    );
+    let listed = store.list_meta(&root).await.unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .find(|meta| meta.session_id == session)
+            .expect("listed session")
+            .refs
+            .len(),
+        WRITERS,
+        "the list view sees every stored link too"
+    );
+}
+
+/// A metadata write waits for the per-session snapshot lock: while one
+/// writer holds it, another cannot read-mutate-append (the deterministic
+/// mechanism behind the concurrent-add test above).
+#[tokio::test]
+async fn metadata_writes_wait_for_the_per_session_lock() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    let session = format!("refs-lock-{}", crate::session::new_id());
+    let store = SessionStore::Jsonl;
+    store
+        .create_meta(&root, &session, Some("m"), Some("main"), None, None, None)
+        .await
+        .unwrap();
+    let path = jsonl_meta_sidecar_path(&root, &session).unwrap();
+
+    let started = AtomicBool::new(false);
+    let finished = AtomicBool::new(false);
+    let guard = lock_jsonl_meta(&path);
+    std::thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            started.store(true, Ordering::SeqCst);
+            jsonl_update_refs(&root, &session, |refs| {
+                refs.push(SessionRef::new("pr", "https://github.com/a/b/pull/1").unwrap());
+                Ok(())
+            })
+            .expect("the edit is stored");
+            finished.store(true, Ordering::SeqCst);
+        });
+        while !started.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !finished.load(Ordering::SeqCst),
+            "a second writer must not read-mutate-append while the lock is held"
+        );
+        drop(guard);
+        writer.join().unwrap();
+    });
+    assert!(finished.load(Ordering::SeqCst));
+    assert!(
+        jsonl_read_meta_snapshot(&root, &session)
+            .unwrap()
+            .unwrap()
+            .refs
+            .len()
+            == 1
+    );
+}

@@ -215,7 +215,35 @@ fn refs_group(refs_available: bool) -> &'static str {
     }
 }
 
+/// Serialize same-session metadata snapshot mutations inside this process.
+/// Greptime has no transactions/UPDATE: every mutator reads the newest
+/// snapshot, mutates it, and inserts a new row, so two concurrent writers
+/// (two ref edits, or an edit racing a turn-boundary touch) would otherwise
+/// both start from the same row and the later insert would silently drop
+/// the earlier change. The key is the backend instance + workspace +
+/// session, so unrelated sessions never contend; cross-process writers stay
+/// last-write-wins (the documented optimistic audit-table semantics).
+fn meta_write_lock(
+    backend_fp: &str,
+    workspace_id: &str,
+    session_id: &str,
+) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    type Locks = std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>;
+    static LOCKS: std::sync::OnceLock<std::sync::Mutex<Locks>> = std::sync::OnceLock::new();
+    let key = format!("{backend_fp}\u{0}{workspace_id}\u{0}{session_id}");
+    let mut locks = LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks.entry(key).or_default().clone()
+}
+
 impl GreptimeSession {
+    /// The per-session snapshot-mutation lock (see [`meta_write_lock`]).
+    fn session_meta_lock(&self, session_id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        meta_write_lock(&self.backend_fp, &self.workspace_id, session_id)
+    }
+
     async fn connect_client(conn: &str) -> Result<tokio_postgres::Client> {
         let (client, connection) = tokio_postgres::connect(conn, NoTls)
             .await
@@ -2471,6 +2499,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
         parent_task_id: Option<i64>,
         title: Option<&str>,
     ) -> Result<()> {
+        let _guard = self.session_meta_lock(session_id).lock_owned().await;
         if let Some(existing) = self.load_meta_row(session_id).await? {
             // Row already exists (resume, or a btw/subagent row whose
             // parent link was unknown at build time): only ever backfill
@@ -2527,6 +2556,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
     /// own row. Callers run this fire-and-forget at turn boundaries (R4);
     /// losing the final touch at process exit is acceptable.
     pub async fn touch_meta(&self) -> Result<()> {
+        let _guard = self.session_meta_lock(&self.session_id).lock_owned().await;
         let Some(meta) = self.effective_meta().await? else {
             return Ok(());
         };
@@ -2555,6 +2585,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
     /// (and refreshed) so the rename is immediately visible to later
     /// touches.
     pub async fn set_title(&self, session_id: &str, title: Option<&str>) -> Result<()> {
+        let _guard = self.session_meta_lock(session_id).lock_owned().await;
         let meta = if session_id == self.session_id {
             self.effective_meta().await?
         } else {
@@ -2589,6 +2620,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
     /// (and refreshed) so the change is immediately visible to later
     /// touches.
     pub async fn set_pinned(&self, session_id: &str, pinned: bool) -> Result<()> {
+        let _guard = self.session_meta_lock(session_id).lock_owned().await;
         let meta = if session_id == self.session_id {
             self.effective_meta().await?
         } else {
@@ -2624,6 +2656,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
     /// used (and refreshed) so the change is immediately visible to later
     /// touches.
     pub async fn set_archived(&self, session_id: &str, archived: bool) -> Result<()> {
+        let _guard = self.session_meta_lock(session_id).lock_owned().await;
         let meta = if session_id == self.session_id {
             self.effective_meta().await?
         } else {
@@ -2662,6 +2695,9 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
                  (the schema migration failed on this database)"
             );
         }
+        // Serialized against every other metadata writer for this session:
+        // the read-mutate-insert below is not atomic on its own.
+        let _guard = self.session_meta_lock(session_id).lock_owned().await;
         let meta = if session_id == self.session_id {
             self.effective_meta().await?
         } else {
@@ -3430,6 +3466,48 @@ mod tests {
             stored
         );
         session.delete_meta(&sid).await.unwrap();
+    }
+
+    /// Two concurrent additions through two handles for the SAME session must
+    /// both survive: Greptime has no transactions, so the read-mutate-insert
+    /// is serialized per session in this process (two unserialized handles
+    /// both read the same row and the later insert drops the earlier URL).
+    #[tokio::test]
+    async fn concurrent_ref_additions_both_survive() {
+        use crate::session_store::SessionRef;
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let sid = format!("test-gt-refs-race-{}", crate::session::new_id());
+        let a = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        let b = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        a.create_meta(&sid, Some("m"), Some("main"), None, None, None)
+            .await
+            .unwrap();
+        let pr = SessionRef::new("pr", "https://github.com/acme/widget/pull/14").unwrap();
+        let issue = SessionRef::new("issue", "https://github.com/acme/widget/issues/22").unwrap();
+        let (first, second) = tokio::join!(
+            a.update_refs(&sid, |refs| {
+                refs.push(pr.clone());
+                Ok(())
+            }),
+            b.update_refs(&sid, |refs| {
+                refs.push(issue.clone());
+                Ok(())
+            }),
+        );
+        first.unwrap();
+        second.unwrap();
+        let stored = a.load_meta_row(&sid).await.unwrap().unwrap().refs;
+        assert_eq!(
+            stored.len(),
+            2,
+            "both concurrent adds survive the read-mutate-insert: {stored:?}"
+        );
+        a.delete_meta(&sid).await.unwrap();
     }
 
     fn conn_str() -> String {
