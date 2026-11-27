@@ -147,8 +147,18 @@ impl Tool for ReadImage {
                     .store
                     .as_deref()
                     .ok_or("no image store: XDG_STATE_HOME or HOME is not set")?;
-                std::fs::read(store.join(hash))
-                    .map_err(|error| format!("cannot read stored image {hash}: {error}"))?
+                // Bounded read, like the budget's own store loader: a file
+                // larger than the cap is never materialized whole just to be
+                // rejected by the size check below.
+                let file = std::fs::File::open(store.join(hash))
+                    .map_err(|error| format!("cannot read stored image {hash}: {error}"))?;
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(
+                    &mut std::io::Read::take(file, crate::agent::IMAGE_MAX_BYTES as u64 + 1),
+                    &mut bytes,
+                )
+                .map_err(|error| format!("cannot read stored image {hash}: {error}"))?;
+                bytes
             }
             None => self.workspace.read(path)?,
         };

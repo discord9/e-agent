@@ -7762,6 +7762,24 @@ async fn read_image_recovers_an_offloaded_hash_named_store_file() {
 }
 
 #[tokio::test]
+async fn an_oversize_stored_image_is_refused_without_reading_it_whole() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = temp.path().join("images");
+    std::fs::create_dir_all(&store).unwrap();
+    // A store file larger than the cap: only e-agent writes this directory, so
+    // this is tampering, but the read must stay bounded and the error clear.
+    let hash = "a".repeat(64);
+    let file = std::fs::File::create(store.join(&hash)).unwrap();
+    file.set_len(crate::agent::IMAGE_MAX_BYTES as u64 + 4096)
+        .unwrap();
+    drop(file);
+
+    let tool = read_image_tool(&temp, &store);
+    let error = tool.execute(json!({"path": hash})).await.unwrap_err();
+    assert!(error.contains("exceeding the"), "{error}");
+}
+
+#[tokio::test]
 async fn read_image_sniffs_mime_from_extension_whitelist() {
     let temp = tempfile::tempdir().unwrap();
     let store = temp.path().join("images");
