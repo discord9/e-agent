@@ -1701,3 +1701,176 @@ async fn resume_opens_a_damaged_sidecar_without_the_optional_backfill() {
     assert_eq!(meta.model, None, "the refused backfill never landed");
     assert_eq!(meta.parent_session_id, None);
 }
+
+/// The check-then-write race a separate `meta_is_damaged` pre-check cannot
+/// survive: the check sees a healthy sidecar, a concurrent title edit then
+/// leaves a torn tail, and only afterwards does the factory's model/role
+/// backfill run. The optional entry point decides damage inside the same
+/// locked read that would append, so the interleaving still opens the
+/// session: nothing is written, provenance stays unknown (`link_ref` off),
+/// and the strict callers keep the named refusal.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn optional_backfill_skips_damage_that_arrives_after_a_healthy_read() {
+    let _env = crate::roles::XDG_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    let store = SessionStore::Jsonl;
+    let sid = format!("meta-race-{}", crate::session::new_id());
+    Session::append(&root, &sid, &entries()).unwrap();
+    // A bootstrap-backfilled row: model-less, so the factory's configured
+    // model is exactly the optional backfill it would attempt.
+    store
+        .create_meta(&root, &sid, None, Some("main"), None, None, None)
+        .await
+        .unwrap();
+    let path = sidecar(&root, &sid);
+    assert!(
+        !store.meta_is_damaged(&root, &sid).await.unwrap(),
+        "the pre-check the old factory performed would have seen a healthy row"
+    );
+
+    // The concurrent title edit's short write: a decodable snapshot plus a
+    // torn record that never got its newline, landing AFTER the healthy read.
+    let mut damaged = std::fs::read(&path).unwrap();
+    damaged.extend_from_slice(b"{\"session_id\":");
+    std::fs::write(&path, &damaged).unwrap();
+
+    // The old code called `create_meta` here and failed the resume; the
+    // optional entry point skips the write instead.
+    store
+        .create_meta_optional(&root, &sid, Some("gpt-x"), Some("main"), None, None, None)
+        .await
+        .expect("an optional backfill must skip damage that landed after the check");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        damaged,
+        "the skipped optional write leaves the bytes untouched"
+    );
+
+    // The real resume path opens the session, display-only: history intact,
+    // unknown provenance keeps `link_ref` off, and nothing is written.
+    let reopened = SessionFactory::test_factory(root.clone())
+        .build(
+            &sid,
+            None,
+            None,
+            IdlePolicy::FinishWhenIdle,
+            UnfinishedPolicy::Preserve,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("the session must still open: {error:#}"));
+    assert_eq!(Session::load(&root, &sid).unwrap().entries, entries());
+    let names = reopened.runner.tool_names_for_test();
+    assert!(
+        !names.iter().any(|name| name == "link_ref"),
+        "unknown provenance keeps link_ref off: {names:?}"
+    );
+    drop(reopened);
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        damaged,
+        "opening the session never attempts the optional backfill"
+    );
+
+    // Strict callers — the tool, the web endpoint, any explicit caller —
+    // still get the error and byte-identical bytes.
+    assert_write_refused(
+        store
+            .create_meta(&root, &sid, Some("gpt-x"), Some("main"), None, None, None)
+            .await,
+        &path,
+        &damaged,
+        "create_meta",
+    );
+}
+
+/// Optional mode does not mean "never write": a healthy snapshot behaves
+/// exactly like the strict entry point. Both creation modes write ONE
+/// snapshot, and a healthy optional backfill appends exactly ONE record.
+#[tokio::test]
+async fn healthy_optional_and_strict_creation_write_exactly_one_snapshot() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let store = SessionStore::Jsonl;
+
+    let optional = format!("meta-healthy-optional-{}", crate::session::new_id());
+    let strict = format!("meta-healthy-strict-{}", crate::session::new_id());
+    store
+        .create_meta_optional(
+            root,
+            &optional,
+            Some("gpt-optional"),
+            Some("main"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    store
+        .create_meta(
+            root,
+            &strict,
+            Some("gpt-strict"),
+            Some("main"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        sidecar_lines(root, &optional),
+        1,
+        "optional creation writes exactly one snapshot"
+    );
+    assert_eq!(
+        sidecar_lines(root, &strict),
+        1,
+        "strict creation writes exactly one snapshot"
+    );
+    assert_eq!(
+        sidecar_snapshots(root, &optional)[0].model.as_deref(),
+        Some("gpt-optional")
+    );
+    assert_eq!(
+        sidecar_snapshots(root, &strict)[0].model.as_deref(),
+        Some("gpt-strict")
+    );
+
+    // A healthy model-less row still gets its one optional backfill record.
+    let backfill = format!("meta-healthy-backfill-{}", crate::session::new_id());
+    store
+        .create_meta(root, &backfill, None, Some("main"), None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(sidecar_lines(root, &backfill), 1);
+    store
+        .create_meta_optional(
+            root,
+            &backfill,
+            Some("gpt-backfill"),
+            Some("main"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        sidecar_lines(root, &backfill),
+        2,
+        "the healthy optional backfill appends exactly one record"
+    );
+    assert_eq!(
+        sidecar_snapshots(root, &backfill)
+            .last()
+            .unwrap()
+            .model
+            .as_deref(),
+        Some("gpt-backfill")
+    );
+}

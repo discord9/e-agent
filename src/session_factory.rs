@@ -1283,32 +1283,34 @@ impl SessionFactory {
         // session (model/role from the factory configuration; parent links
         // are None for main sessions). A resumed session (`--session`,
         // server resume, fork-source reconnect) already has its row —
-        // create_meta is idempotent and appends nothing — and the runner's
+        // creation is idempotent and appends nothing — and the runner's
         // turn-boundary touch keeps it fresh.
         //
         // On an EXISTING row that call is only the OPTIONAL backfill of a
         // model/role the row was created without (a bootstrap-backfilled
-        // session has `model: None`), and a damaged sidecar refuses exactly
+        // session has `model: None`), and a damaged sidecar must not take
         // that append so unknown provenance is never rewritten into a clean
         // one. Refusing to open would make an interrupted write fatal to a
-        // resume whose transcript is intact, so ask first and skip the
-        // optional write: the session opens display-only, and `forked` above
-        // (unknown provenance counts as a fork) already kept `link_ref` off.
+        // resume whose transcript is intact, so the optional entry point
+        // skips the damaged write: the session opens display-only, and
+        // `forked` above (unknown provenance counts as a fork) already kept
+        // `link_ref` off. There is deliberately no `meta_is_damaged`
+        // pre-check here — it would race a concurrent writer that damages
+        // the sidecar between the check and this call; the optional entry
+        // point makes the decision in the same locked read that appends.
         // A fresh session has no sidecar, so it is never damaged and its
         // creation snapshot is still written.
-        if !store.meta_is_damaged(&self.root, &session).await? {
-            store
-                .create_meta(
-                    &self.root,
-                    &session,
-                    Some(&model_name),
-                    role_name.as_deref(),
-                    None,
-                    None,
-                    None, // main sessions keep manual naming; title is a subagent-spawn concern
-                )
-                .await?;
-        }
+        store
+            .create_meta_optional(
+                &self.root,
+                &session,
+                Some(&model_name),
+                role_name.as_deref(),
+                None,
+                None,
+                None, // main sessions keep manual naming; title is a subagent-spawn concern
+            )
+            .await?;
         let (runner, handle) = SessionRunner::new_with_bootstrap(
             agent,
             store.clone(),

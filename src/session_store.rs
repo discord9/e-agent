@@ -1223,6 +1223,20 @@ impl PersistedParent {
     }
 }
 
+/// Whether a metadata-creation call may SKIP an append because the JSONL
+/// sidecar is damaged. The mode never changes a healthy write; it only
+/// decides whether unknown provenance is refused or silently left alone.
+/// The SQL backends are transactional and never damaged, so they ignore it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MetaWriteMode {
+    /// An explicit caller asked for this record to land: a damaged tail is
+    /// an error naming the file.
+    Required,
+    /// A resume's best-effort model/role backfill: a damaged tail is
+    /// skipped and the intact transcript still opens.
+    OptionalBackfill,
+}
+
 impl SessionStore {
     pub fn is_jsonl(&self) -> bool {
         matches!(self, SessionStore::Jsonl)
@@ -3633,6 +3647,11 @@ impl SessionStore {
     /// btw subagents pass their task-panel label): on the existing-row
     /// backfill path an existing title is preserved and `None` means
     /// unnamed — a resume never rewrites a title.
+    ///
+    /// STRICT: a damaged JSONL sidecar is refused with an error naming the
+    /// file (see `jsonl_refuse_damaged_meta`), because an append would
+    /// rewrite unknown provenance into a clean one. The factory's optional
+    /// model/role backfill uses [`Self::create_meta_optional`] instead.
     #[allow(unused_variables, clippy::too_many_arguments)]
     pub async fn create_meta(
         &self,
@@ -3644,6 +3663,70 @@ impl SessionStore {
         parent_task_id: Option<i64>,
         title: Option<&str>,
     ) -> Result<()> {
+        self.create_meta_with_mode(
+            root,
+            session,
+            model,
+            role,
+            parent_session_id,
+            parent_task_id,
+            title,
+            MetaWriteMode::Required,
+        )
+        .await
+    }
+
+    /// [`Self::create_meta`] for an OPTIONAL backfill: the model/role
+    /// snapshot the factory writes while resuming a session.
+    ///
+    /// A healthy snapshot is treated exactly like `create_meta`: a brand-new
+    /// session gets its creation snapshot, and an existing row gets only the
+    /// fields it is missing (a second call appends nothing).
+    ///
+    /// A damaged snapshot (JSONL only) is SKIPPED silently, because the
+    /// factory's write is optional — it only fills a model/role the row was
+    /// created without — and a torn tail from an interrupted title edit must
+    /// not prevent an intact transcript from opening. The damage read happens
+    /// under the same sidecar lock as the append, so a concurrent writer
+    /// cannot damage the file between a health check and this call; there is
+    /// deliberately no separate pre-check. SQL backends are transactional
+    /// and never damaged.
+    #[allow(unused_variables, clippy::too_many_arguments)]
+    pub async fn create_meta_optional(
+        &self,
+        root: &Path,
+        session: &str,
+        model: Option<&str>,
+        role: Option<&str>,
+        parent_session_id: Option<&str>,
+        parent_task_id: Option<i64>,
+        title: Option<&str>,
+    ) -> Result<()> {
+        self.create_meta_with_mode(
+            root,
+            session,
+            model,
+            role,
+            parent_session_id,
+            parent_task_id,
+            title,
+            MetaWriteMode::OptionalBackfill,
+        )
+        .await
+    }
+
+    #[allow(unused_variables, clippy::too_many_arguments)]
+    async fn create_meta_with_mode(
+        &self,
+        root: &Path,
+        session: &str,
+        model: Option<&str>,
+        role: Option<&str>,
+        parent_session_id: Option<&str>,
+        parent_task_id: Option<i64>,
+        title: Option<&str>,
+        mode: MetaWriteMode,
+    ) -> Result<()> {
         match self {
             SessionStore::Jsonl => jsonl_create_meta(
                 root,
@@ -3653,6 +3736,7 @@ impl SessionStore {
                 parent_session_id,
                 parent_task_id,
                 title,
+                mode,
             ),
             #[cfg(feature = "greptime")]
             SessionStore::Greptime {
@@ -3692,16 +3776,17 @@ impl SessionStore {
 
     /// Whether this session's metadata is DAMAGED: the row/file exists but
     /// cannot prove a clean tail (an undecodable record, a final record with
-    /// no terminating newline, or no record at all). Every metadata writer
-    /// refuses such a row instead of rewriting unknown provenance into a
-    /// clean one (see `jsonl_refuse_damaged_meta`).
+    /// no terminating newline, or no record at all). The strict metadata
+    /// writers refuse such a row instead of rewriting unknown provenance
+    /// into a clean one (see `jsonl_refuse_damaged_meta`); the optional
+    /// backfill skips it.
     ///
-    /// The factory's resume path asks BEFORE its `create_meta` call: the
-    /// model/role backfill there is OPTIONAL (it only fills a field a row
-    /// written before the model was known is missing), so a damaged row must
-    /// still let the session OPEN — display-only, provenance unknown — rather
-    /// than fail a resume whose transcript is intact. A clean new session (no
-    /// sidecar at all) is not damaged, so its creation snapshot still lands.
+    /// This is a DIAGNOSTIC read, not a gate: metadata writers do not call it
+    /// before writing, because a separate pre-check races a concurrent writer
+    /// that damages the sidecar before the append. `create_meta` performs the
+    /// same read under the sidecar lock and refuses; `create_meta_optional`
+    /// performs it under the same lock and skips, which is what lets the
+    /// factory open an intact transcript whose metadata tail was torn.
     /// Greptime/SQLite rows are transactional and never damaged.
     pub async fn meta_is_damaged(&self, root: &Path, session: &str) -> Result<bool> {
         match self {
@@ -4674,8 +4759,15 @@ fn jsonl_count_transcript_entries(root: &Path, session: &str) -> anyhow::Result<
 /// A create with nothing to append stays an `Ok` no-op, so an intact
 /// transcript still reopens.
 ///
+/// [`MetaWriteMode::OptionalBackfill`] changes ONLY that damaged-tail case:
+/// a backfill that would otherwise be refused is skipped silently, because
+/// the caller's write is optional. A healthy write and the no-op resume are
+/// identical in both modes. The decision and the append share the lock
+/// taken above, so they are one critical section.
+///
 /// `entry_count` mirrors the DB backends' `next_seq` at creation: the
 /// transcript's current line count.
+#[allow(clippy::too_many_arguments)]
 fn jsonl_create_meta(
     root: &Path,
     session: &str,
@@ -4684,6 +4776,7 @@ fn jsonl_create_meta(
     parent_session_id: Option<&str>,
     parent_task_id: Option<i64>,
     title: Option<&str>,
+    mode: MetaWriteMode,
 ) -> anyhow::Result<()> {
     let path = jsonl_meta_sidecar_path(root, session)?;
     let _guard = lock_jsonl_meta(&path);
@@ -4701,8 +4794,16 @@ fn jsonl_create_meta(
                 // A decodable snapshot plus a torn tail: the append below
                 // would land after the damaged record. Refuse BEFORE writing
                 // (the old order tested `unknown` only on the no-snapshot
-                // path, so a torn tail was silently appended to).
-                return Err(jsonl_refuse_damaged_meta(&path));
+                // path, so a torn tail was silently appended to) — unless the
+                // write is an OPTIONAL backfill, in which case skipping is
+                // the point: the intact transcript still opens and the
+                // unknown provenance stays untouched. This uses the read
+                // above, inside the same lock as the append, so a concurrent
+                // writer cannot damage the file between the two.
+                return match mode {
+                    MetaWriteMode::Required => Err(jsonl_refuse_damaged_meta(&path)),
+                    MetaWriteMode::OptionalBackfill => Ok(()),
+                };
             }
             let mut meta = SessionMeta {
                 session_id: existing.session_id.clone(),
