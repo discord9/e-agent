@@ -185,6 +185,34 @@ pub struct GreptimeSession {
     /// row yet).
     /// Interior mutability because every touch path takes `&self`.
     cached_meta: std::sync::Mutex<Option<SessionMeta>>,
+    /// Whether the `sessions.refs` column exists. `false` = the migration
+    /// ALTER failed on this old database (or a read-only connection probed
+    /// it as missing): every read omits the column (links read as empty) and
+    /// every snapshot write omits it, so a failed migration takes away links
+    /// and NOTHING else — listing, creating and resuming sessions keep
+    /// working, and only an explicit ref edit fails loudly.
+    refs_available: bool,
+}
+
+/// The `refs` tail of every meta SELECT: the column when the migration
+/// succeeded, nothing at all when it did not. Either way the row decodes (a
+/// degraded old database reads links as empty instead of failing the whole
+/// session) — and the projection is what makes a FAILED migration take away
+/// links and nothing else. Free functions so the degraded shape is
+/// unit-testable without a database.
+fn refs_select(refs_available: bool) -> &'static str {
+    if refs_available { ", refs" } else { "" }
+}
+
+/// The same `refs` tail inside the `list_meta` dedup subquery (it is an
+/// aggregate expression there, not a bare column).
+fn refs_group(refs_available: bool) -> &'static str {
+    if refs_available {
+        ",
+                     last_value(ARRAY[refs] ORDER BY last_active_at)[1] AS refs"
+    } else {
+        ""
+    }
 }
 
 impl GreptimeSession {
@@ -209,6 +237,20 @@ impl GreptimeSession {
         session_id: &str,
     ) -> Result<Self> {
         let client = Self::connect_client(conn).await?;
+        // Read the schema, never migrate it: a read-only listing must know
+        // whether `sessions.refs` exists so an old database still lists (the
+        // SELECT omits the missing column instead of failing the whole list).
+        // A failed probe is not fatal — the list degrades to no links.
+        let refs_available = match Self::probe_refs_column(&client).await {
+            Ok(available) => available,
+            Err(error) => {
+                tracing::warn!(
+                    "e-agent: cannot inspect the sessions.refs column (session links may be \
+                     unavailable on this read-only listing): {error:#}"
+                );
+                false
+            }
+        };
         let backend_fp = crate::session_store::backend_instance_fingerprint("greptime", conn);
         Ok(Self {
             client,
@@ -217,7 +259,22 @@ impl GreptimeSession {
             session_id: session_id.to_owned(),
             backend_fp,
             cached_meta: std::sync::Mutex::new(None),
+            refs_available,
         })
+    }
+
+    /// Whether `sessions.refs` exists, asked of `information_schema` with no
+    /// DDL: the read-only listing path's substitute for the migration probe.
+    async fn probe_refs_column(client: &tokio_postgres::Client) -> Result<bool> {
+        let row = client
+            .query_one(
+                "SELECT COUNT(*) AS n FROM information_schema.columns \
+                 WHERE table_name = 'sessions' AND column_name = 'refs'",
+                &[],
+            )
+            .await
+            .context("cannot inspect sessions table schema")?;
+        Ok(row.get::<_, i64>("n") > 0)
     }
 
     /// Connect and ensure the table exists. `conn` is a tokio-postgres
@@ -454,26 +511,31 @@ impl GreptimeSession {
         // Cache the session's latest metadata snapshot (if any) so later
         // touches rewrite complete rows without re-reading immutable
         // columns. The table is append-only; the newest row per session
-        // wins (ORDER BY last_active_at DESC LIMIT 1).
+        // wins (ORDER BY last_active_at DESC LIMIT 1). Skipped only when a
+        // column OTHER than `refs` is unavailable: those cannot be projected
+        // away, while a missing `refs` is simply omitted — an old database
+        // whose refs ALTER failed still creates, lists and touches sessions.
         let cached_meta = if title_available
             && pinned_available
             && archived_available
             && writer_available
-            && refs_available
         {
+            let refs = if refs_available { ", refs" } else { "" };
             let meta_row = client
                 .query_opt(
-                    "SELECT created_at, last_active_at, model, \"role\", entry_count, \
-                        parent_session_id, parent_task_id, title, pinned, archived, writer, refs \
-                     FROM sessions \
-                     WHERE workspace_id = $1 AND session_id = $2 \
-                     ORDER BY last_active_at DESC LIMIT 1",
+                    &format!(
+                        "SELECT created_at, last_active_at, model, \"role\", entry_count, \
+                            parent_session_id, parent_task_id, title, pinned, archived, writer{refs} \
+                         FROM sessions \
+                         WHERE workspace_id = $1 AND session_id = $2 \
+                         ORDER BY last_active_at DESC LIMIT 1"
+                    ),
                     &[&workspace_id, &session_id],
                 )
                 .await
                 .context("cannot query session metadata")?;
             meta_row
-                .map(|row| Self::meta_from_row(&row, session_id))
+                .map(|row| Self::meta_from_row(&row, session_id, refs_available))
                 .transpose()?
         } else {
             None
@@ -487,6 +549,7 @@ impl GreptimeSession {
             session_id: session_id.to_string(),
             backend_fp,
             cached_meta: std::sync::Mutex::new(cached_meta),
+            refs_available,
         };
 
         // Seed next_seq from the DB's current max seq (see db_max_seq).
@@ -2190,8 +2253,14 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
 
     /// Decode one metadata row using the column list every meta SELECT
     /// shares. `refs` is one JSON column: NULL reads as empty, malformed
-    /// JSON fails loudly instead of silently dropping links.
-    fn meta_from_row(row: &tokio_postgres::Row, session_id: &str) -> Result<SessionMeta> {
+    /// JSON fails loudly instead of silently dropping links. When the column
+    /// is unavailable (`refs_available = false`) the SELECT omits it
+    /// entirely, so the row has no `refs` field and links read as empty.
+    fn meta_from_row(
+        row: &tokio_postgres::Row,
+        session_id: &str,
+        refs_available: bool,
+    ) -> Result<SessionMeta> {
         Ok(SessionMeta {
             session_id: session_id.to_owned(),
             created_at: row.get("created_at"),
@@ -2204,10 +2273,14 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             title: row.get("title"),
             pinned: row.get("pinned"),
             archived: row.get("archived"),
-            refs: crate::session_store::refs_from_json(
-                row.get::<_, Option<String>>("refs").as_deref(),
-            )
-            .map_err(anyhow::Error::msg)?,
+            refs: if refs_available {
+                crate::session_store::refs_from_json(
+                    row.get::<_, Option<String>>("refs").as_deref(),
+                )
+                .map_err(anyhow::Error::msg)?
+            } else {
+                Vec::new() // the column is missing: links unavailable, nothing to read
+            },
             writer: row.get("writer"),
             label: None, // label lives in running_tasks, resolved at list time
         })
@@ -2217,19 +2290,22 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
     /// session has no row yet (brand-new session, or a subagent whose
     /// parent has not written its row yet).
     async fn load_meta_row(&self, session_id: &str) -> Result<Option<SessionMeta>> {
+        let refs = refs_select(self.refs_available);
         let row = self
             .client
             .query_opt(
-                "SELECT created_at, last_active_at, model, \"role\", entry_count, \
-                        parent_session_id, parent_task_id, title, pinned, archived, writer, refs \
-                 FROM sessions \
-                 WHERE workspace_id = $1 AND session_id = $2 \
-                 ORDER BY last_active_at DESC LIMIT 1",
+                &format!(
+                    "SELECT created_at, last_active_at, model, \"role\", entry_count, \
+                            parent_session_id, parent_task_id, title, pinned, archived, writer{refs} \
+                     FROM sessions \
+                     WHERE workspace_id = $1 AND session_id = $2 \
+                     ORDER BY last_active_at DESC LIMIT 1"
+                ),
                 &[&self.workspace_id, &session_id],
             )
             .await
             .context("cannot query session metadata")?;
-        row.map(|row| Self::meta_from_row(&row, session_id))
+        row.map(|row| Self::meta_from_row(&row, session_id, self.refs_available))
             .transpose()
     }
 
@@ -2240,37 +2316,67 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
         // from a row cached by another process. Callers construct with
         // `writer: None`; the stamped value is what lands in the column.
         meta.writer = Some(process_identity().to_owned());
-        // One JSON value for the whole list; NULL when empty (the same value
-        // a pre-column row reads back as). Encoding happens before the
-        // statement so the parameter borrows a local that outlives it.
-        let refs_json =
-            crate::session_store::refs_to_json(&meta.refs).map_err(anyhow::Error::msg)?;
-        self.client
-            .execute(
-                "INSERT INTO sessions \
-                 (workspace_id, session_id, created_at, last_active_at, model, \"role\", \
-                  entry_count, parent_session_id, parent_task_id, title, pinned, archived, writer, \
-                  refs) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
-                &[
-                    &self.workspace_id,
-                    &meta.session_id,
-                    &meta.created_at,
-                    &meta.last_active_at,
-                    &meta.model,
-                    &meta.role,
-                    &meta.entry_count,
-                    &meta.parent_session_id,
-                    &meta.parent_task_id,
-                    &meta.title,
-                    &meta.pinned,
-                    &meta.archived,
-                    &meta.writer,
-                    &refs_json,
-                ],
-            )
-            .await
-            .context("cannot insert session metadata")?;
+        if self.refs_available {
+            // One JSON value for the whole list; NULL when empty (the same
+            // value a pre-column row reads back as). Encoding happens before
+            // the statement so the parameter borrows a local that outlives it.
+            let refs_json =
+                crate::session_store::refs_to_json(&meta.refs).map_err(anyhow::Error::msg)?;
+            self.client
+                .execute(
+                    "INSERT INTO sessions \
+                     (workspace_id, session_id, created_at, last_active_at, model, \"role\", \
+                      entry_count, parent_session_id, parent_task_id, title, pinned, archived, writer, \
+                      refs) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+                    &[
+                        &self.workspace_id,
+                        &meta.session_id,
+                        &meta.created_at,
+                        &meta.last_active_at,
+                        &meta.model,
+                        &meta.role,
+                        &meta.entry_count,
+                        &meta.parent_session_id,
+                        &meta.parent_task_id,
+                        &meta.title,
+                        &meta.pinned,
+                        &meta.archived,
+                        &meta.writer,
+                        &refs_json,
+                    ],
+                )
+                .await
+                .context("cannot insert session metadata")?;
+        } else {
+            // The column is missing (a failed migration): omit it instead of
+            // failing the whole snapshot — a degraded database keeps creating,
+            // touching and listing sessions; only links are unavailable.
+            self.client
+                .execute(
+                    "INSERT INTO sessions \
+                     (workspace_id, session_id, created_at, last_active_at, model, \"role\", \
+                      entry_count, parent_session_id, parent_task_id, title, pinned, archived, writer) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+                    &[
+                        &self.workspace_id,
+                        &meta.session_id,
+                        &meta.created_at,
+                        &meta.last_active_at,
+                        &meta.model,
+                        &meta.role,
+                        &meta.entry_count,
+                        &meta.parent_session_id,
+                        &meta.parent_task_id,
+                        &meta.title,
+                        &meta.pinned,
+                        &meta.archived,
+                        &meta.writer,
+                    ],
+                )
+                .await
+                .context("cannot insert session metadata")?;
+        }
         Ok(())
     }
 
@@ -2550,6 +2656,12 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             &mut Vec<crate::session_store::SessionRef>,
         ) -> std::result::Result<(), String>,
     ) -> Result<Vec<crate::session_store::SessionRef>> {
+        if !self.refs_available {
+            anyhow::bail!(
+                "session links are unavailable: the sessions.refs column is missing \
+                 (the schema migration failed on this database)"
+            );
+        }
         let meta = if session_id == self.session_id {
             self.effective_meta().await?
         } else {
@@ -2651,9 +2763,13 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
     ) -> Result<(Vec<SessionMeta>, crate::session_store::ListMetaDiagnostics)> {
         let query_started = std::time::Instant::now();
         let (filter_clause, live_ids) = sidebar_filter_clause(sidebar_filter);
+        let refs = refs_select(self.refs_available);
+        // The dedup subquery projects the same tail: a missing column is
+        // simply not selected, so a degraded old database still lists.
+        let refs_groups = refs_group(self.refs_available);
         let sql = format!(
             "SELECT session_id, created_at, last_active_at, model, \"role\", entry_count, \
-                    parent_session_id, parent_task_id, title, pinned, archived, writer, refs \
+                    parent_session_id, parent_task_id, title, pinned, archived, writer{refs} \
              FROM ( \
                  SELECT \
                      session_id, \
@@ -2667,8 +2783,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
                      last_value(ARRAY[title] ORDER BY last_active_at)[1] AS title, \
                      last_value(ARRAY[pinned] ORDER BY last_active_at)[1] AS pinned, \
                      last_value(ARRAY[archived] ORDER BY last_active_at)[1] AS archived, \
-                     last_value(ARRAY[writer] ORDER BY last_active_at)[1] AS writer, \
-                     last_value(ARRAY[refs] ORDER BY last_active_at)[1] AS refs \
+                     last_value(ARRAY[writer] ORDER BY last_active_at)[1] AS writer{refs_groups} \
                  FROM sessions \
                  WHERE workspace_id = $1 \
                  GROUP BY session_id \
@@ -2690,7 +2805,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             .iter()
             .map(|row| {
                 let session_id: String = row.get("session_id");
-                Self::meta_from_row(row, &session_id)
+                Self::meta_from_row(row, &session_id, self.refs_available)
             })
             .collect::<Result<Vec<_>>>()?;
         let decode_ms = decode_started.elapsed().as_millis();
@@ -2710,20 +2825,23 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
     /// activity first. This is the audit view — [`Self::list_meta`] shows
     /// only the latest snapshot per session.
     pub async fn audit_meta(&self, session_id: &str) -> Result<Vec<SessionMeta>> {
+        let refs = refs_select(self.refs_available);
         let rows = self
             .client
             .query(
-                "SELECT created_at, last_active_at, model, \"role\", entry_count, \
-                        parent_session_id, parent_task_id, title, pinned, archived, writer, refs \
-                 FROM sessions \
-                 WHERE workspace_id = $1 AND session_id = $2 \
-                 ORDER BY last_active_at ASC",
+                &format!(
+                    "SELECT created_at, last_active_at, model, \"role\", entry_count, \
+                            parent_session_id, parent_task_id, title, pinned, archived, writer{refs} \
+                     FROM sessions \
+                     WHERE workspace_id = $1 AND session_id = $2 \
+                     ORDER BY last_active_at ASC"
+                ),
                 &[&self.workspace_id, &session_id],
             )
             .await
             .context("cannot load session metadata audit trail")?;
         rows.iter()
-            .map(|row| Self::meta_from_row(row, session_id))
+            .map(|row| Self::meta_from_row(row, session_id, self.refs_available))
             .collect()
     }
 
@@ -3227,6 +3345,18 @@ mod tests {
         );
         assert_eq!(live.len(), 2);
         assert!(live.iter().all(|id| live_set.contains(id)));
+    }
+
+    /// A failed `refs` migration must be confined to links: every read then
+    /// OMITS the column (so the row still decodes with empty links) and every
+    /// write omits it in [`GreptimeSession::insert_meta`]. Unit-level because
+    /// the degraded schema would have to replace a live DB's table.
+    #[test]
+    fn refs_projection_omits_a_missing_column() {
+        assert_eq!(refs_select(true), ", refs");
+        assert_eq!(refs_select(false), "");
+        assert!(refs_group(true).contains("last_value(ARRAY[refs]"));
+        assert_eq!(refs_group(false), "");
     }
 
     /// `refs` is ONE nullable JSON column: NULL (a row written before the

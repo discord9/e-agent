@@ -6495,3 +6495,114 @@ async fn update_refs_without_a_meta_row_fails_loudly_on_sqlite() {
         .unwrap_err();
     assert!(error.contains("no metadata row"), "{error}");
 }
+
+// ----------------------------------------------------------------------
+// a failed `refs` migration stays confined to links
+// ----------------------------------------------------------------------
+
+/// An old database whose `sessions` table genuinely LACKS `refs` (the ALTER
+/// failed) must stay usable for everything except links: create, list,
+/// audit and read the transcript keep working, and a ref edit is refused
+/// with a clear error instead of breaking every metadata write.
+#[tokio::test]
+async fn schema_without_refs_column_keeps_sessions_usable_and_refuses_links() {
+    let (dir, path) = temp_db();
+    let wid = workspace_id();
+    let db_path = path.to_str().unwrap().to_owned();
+    // The pre-`refs` table shape: every other column, no `refs`.
+    {
+        let db = turso::Builder::new_local(&db_path)
+            .build()
+            .await
+            .expect("open legacy database");
+        let conn = db.connect().expect("connect legacy database");
+        conn.execute(
+            r#"CREATE TABLE sessions (
+                workspace_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                last_active_at INTEGER NOT NULL,
+                model TEXT NULL,
+                "role" TEXT NULL,
+                entry_count INTEGER NOT NULL DEFAULT 0,
+                parent_session_id TEXT NULL,
+                parent_task_id INTEGER NULL,
+                title TEXT NULL,
+                pinned INTEGER NULL,
+                archived INTEGER NULL,
+                writer TEXT NULL,
+                PRIMARY KEY (workspace_id, session_id, last_active_at)
+            )"#,
+            (),
+        )
+        .await
+        .expect("old sessions schema");
+    }
+    let sid = format!("test-sql-norefs-{}", crate::session::new_id());
+    let session = SqliteSession::connect_with_failed_refs_migration(&db_path, &wid, &sid)
+        .await
+        .expect("connect to the degraded database");
+    assert!(
+        !session.refs_available,
+        "the schema really has no refs column"
+    );
+
+    // 1. Creating a session appends a snapshot that omits the column; the
+    //    resume path re-reads it without error.
+    session
+        .create_meta(&sid, Some("m"), Some("main"), None, None, None)
+        .await
+        .expect("create_meta must not name the missing column");
+    session
+        .create_meta(&sid, Some("m"), Some("main"), None, None, None)
+        .await
+        .expect("a resume must not name the missing column either");
+
+    // 2. Listing and the audit trail still see the session, links empty.
+    let listed = session.list_meta().await.unwrap();
+    assert_eq!(listed.len(), 1, "the session is listed: {listed:?}");
+    assert_eq!(listed[0].session_id, sid);
+    assert!(listed[0].refs.is_empty());
+    let audit = session.audit_meta(&sid).await.unwrap();
+    assert_eq!(audit.len(), 1);
+    assert!(audit[0].refs.is_empty());
+
+    // 3. The transcript is untouched by the missing column.
+    let entries = test_entries();
+    session.append(&entries).await.unwrap();
+    assert_eq!(session.load().await.unwrap(), entries);
+
+    // 4. A ref edit is refused with a clear error and writes nothing.
+    let pr = crate::session_store::SessionRef::new("pr", "https://github.com/acme/widget/pull/14")
+        .unwrap();
+    let error = session
+        .update_refs(&sid, |refs| {
+            refs.push(pr.clone());
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("sessions.refs column is missing"),
+        "the refusal must name the missing column: {error}"
+    );
+    assert!(
+        session.list_meta().await.unwrap()[0].refs.is_empty(),
+        "a refused edit must not write a row"
+    );
+
+    // A later connect that CAN migrate adds the column: the rows written
+    // while it was missing read back unchanged and edits work again.
+    drop(session);
+    let repaired = SqliteSession::connect(&db_path, &wid, &sid).await.unwrap();
+    assert!(repaired.refs_available, "connect repairs the column");
+    let stored = repaired
+        .update_refs(&sid, |refs| {
+            refs.push(pr.clone());
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(stored, vec![pr]);
+    drop(dir);
+}

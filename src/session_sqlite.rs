@@ -200,6 +200,13 @@ pub struct SqliteSession {
     /// row yet).
     /// Interior mutability because every touch path takes `&self`.
     cached_meta: std::sync::Mutex<Option<SessionMeta>>,
+    /// Whether the `sessions.refs` column exists. `false` = the migration
+    /// ALTER failed on this old database: every read projects the column as
+    /// NULL (links read as empty) and every snapshot write omits it, so a
+    /// failed migration takes away links and NOTHING else — listing,
+    /// creating and resuming sessions keep working, and only an explicit
+    /// ref edit fails (loudly) instead of corrupting the row.
+    refs_available: bool,
 }
 
 /// Ensure the parent directory of the database file exists before turso
@@ -242,6 +249,29 @@ impl SqliteSession {
         db_path: &str,
         workspace_id: &str,
         session_id: &str,
+    ) -> Result<Self, String> {
+        Self::connect_inner(db_path, workspace_id, session_id, true).await
+    }
+
+    /// Test-only: open the database exactly like [`Self::connect`] but do
+    /// NOT repair a missing `sessions.refs` column, reproducing an old
+    /// database whose `ALTER` failed. The schema genuinely lacks the
+    /// column; the session then takes exactly the production degraded path
+    /// (`refs_available = false`).
+    #[cfg(test)]
+    pub(crate) async fn connect_with_failed_refs_migration(
+        db_path: &str,
+        workspace_id: &str,
+        session_id: &str,
+    ) -> Result<Self, String> {
+        Self::connect_inner(db_path, workspace_id, session_id, false).await
+    }
+
+    async fn connect_inner(
+        db_path: &str,
+        workspace_id: &str,
+        session_id: &str,
+        repair_refs_column: bool,
     ) -> Result<Self, String> {
         ensure_db_parent_dir(db_path)?;
         let db = turso::Builder::new_local(db_path)
@@ -359,6 +389,13 @@ impl SqliteSession {
             for (name, sql_type, feature, available) in migrations {
                 if columns.iter().any(|c| c == name) {
                     continue; // column already present (fresh DB or migrated)
+                }
+                if name == "refs" && !repair_refs_column {
+                    // Test seam only: an old database whose ALTER failed —
+                    // the column really is absent and the session must run
+                    // degraded instead of failing every metadata write.
+                    *available = false;
+                    continue;
                 }
                 let sql = format!("ALTER TABLE sessions ADD COLUMN {name} {sql_type}");
                 if let Err(error) = conn.execute(&sql, ()).await {
@@ -495,23 +532,27 @@ impl SqliteSession {
         // touches rewrite complete rows without re-reading immutable
         // columns. The table is append-only; the newest row per session
         // wins (ORDER BY last_active_at DESC LIMIT 1). Skipped when a
-        // feature column is unavailable (failed migration): the cache
-        // query references the columns and would error on an unmigrated
-        // table, exactly like Greptime's degraded mode.
+        // feature column OTHER than `refs` is unavailable (failed
+        // migration): those columns cannot be projected away. A missing
+        // `refs` column does NOT skip the cache — it is projected as NULL,
+        // so an old database whose refs ALTER failed still creates, lists
+        // and touches sessions.
         let cached_meta = if title_available
             && pinned_available
             && archived_available
             && writer_available
-            && refs_available
         {
+            let refs_col = if refs_available { "refs" } else { "NULL" };
             let mut rows = conn
                     .query(
-                        "SELECT created_at, last_active_at, model, \"role\", entry_count, \
-                                parent_session_id, parent_task_id, title, pinned, archived, writer, \
-                                refs \
-                         FROM sessions \
-                         WHERE workspace_id = ?1 AND session_id = ?2 \
-                         ORDER BY last_active_at DESC LIMIT 1",
+                        &format!(
+                            "SELECT created_at, last_active_at, model, \"role\", entry_count, \
+                                    parent_session_id, parent_task_id, title, pinned, archived, writer, \
+                                    {refs_col} \
+                             FROM sessions \
+                             WHERE workspace_id = ?1 AND session_id = ?2 \
+                             ORDER BY last_active_at DESC LIMIT 1"
+                        ),
                         (workspace_id, session_id),
                     )
                     .await
@@ -538,6 +579,7 @@ impl SqliteSession {
                 &crate::session_store::normalize_db_path(db_path),
             ),
             cached_meta: std::sync::Mutex::new(cached_meta),
+            refs_available,
         };
 
         // Seed next_seq from the DB's current max seq (see db_max_seq).
@@ -2264,18 +2306,34 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
         Ok(out)
     }
 
+    /// The `refs` projection every meta SELECT uses: the real column when
+    /// the migration succeeded, a literal `NULL` when it did not. It stays
+    /// ONE column wide either way, so the row decoders keep their positional
+    /// indices and a degraded old database reads links as empty instead of
+    /// failing the whole read.
+    fn refs_projection(&self, qualified: bool) -> &'static str {
+        match (self.refs_available, qualified) {
+            (true, true) => "s.refs",
+            (true, false) => "refs",
+            (false, _) => "NULL",
+        }
+    }
+
     /// Latest metadata snapshot for one session, or `None` when the
     /// session has no row yet (brand-new session, or a subagent whose
     /// parent has not written its row yet).
     async fn load_meta_row(&self, session_id: &str) -> Result<Option<SessionMeta>, String> {
+        let refs = self.refs_projection(false);
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT created_at, last_active_at, model, \"role\", entry_count, \
-                        parent_session_id, parent_task_id, title, pinned, archived, writer, refs \
-                 FROM sessions \
-                 WHERE workspace_id = ?1 AND session_id = ?2 \
-                 ORDER BY last_active_at DESC LIMIT 1",
+                &format!(
+                    "SELECT created_at, last_active_at, model, \"role\", entry_count, \
+                            parent_session_id, parent_task_id, title, pinned, archived, writer, {refs} \
+                     FROM sessions \
+                     WHERE workspace_id = ?1 AND session_id = ?2 \
+                     ORDER BY last_active_at DESC LIMIT 1"
+                ),
                 (self.workspace_id.as_str(), session_id),
             )
             .await
@@ -2297,36 +2355,65 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
         // from a row cached by another process. Callers construct with
         // `writer: None`; the stamped value is what lands in the column.
         meta.writer = Some(process_identity().to_owned());
-        // Encode the refs JSON before taking the connection lock: the
-        // column is one JSON value, and its absence (NULL) and an empty
-        // list mean the same thing on read.
-        let refs_json = crate::session_store::refs_to_json(&meta.refs)?;
         let conn = self.conn.lock().await;
-        conn.execute(
-            "INSERT INTO sessions \
-             (workspace_id, session_id, created_at, last_active_at, model, \"role\", \
-              entry_count, parent_session_id, parent_task_id, title, pinned, archived, writer, \
-              refs) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-            (
-                self.workspace_id.as_str(),
-                meta.session_id.as_str(),
-                datetime_to_us(meta.created_at),
-                datetime_to_us(meta.last_active_at),
-                meta.model.as_deref(),
-                meta.role.as_deref(),
-                meta.entry_count,
-                meta.parent_session_id.as_deref(),
-                meta.parent_task_id,
-                meta.title.as_deref(),
-                meta.pinned.map(|p| if p { 1 } else { 0 }),
-                meta.archived.map(|a| if a { 1 } else { 0 }),
-                meta.writer.as_deref(),
-                refs_json.as_deref(),
-            ),
-        )
-        .await
-        .map_err(|e| format!("cannot insert session metadata: {e}"))?;
+        if self.refs_available {
+            // Encode the refs JSON before the statement: the column is one
+            // JSON value, and its absence (NULL) and an empty list mean the
+            // same thing on read.
+            let refs_json = crate::session_store::refs_to_json(&meta.refs)?;
+            conn.execute(
+                "INSERT INTO sessions \
+                 (workspace_id, session_id, created_at, last_active_at, model, \"role\", \
+                  entry_count, parent_session_id, parent_task_id, title, pinned, archived, writer, \
+                  refs) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                (
+                    self.workspace_id.as_str(),
+                    meta.session_id.as_str(),
+                    datetime_to_us(meta.created_at),
+                    datetime_to_us(meta.last_active_at),
+                    meta.model.as_deref(),
+                    meta.role.as_deref(),
+                    meta.entry_count,
+                    meta.parent_session_id.as_deref(),
+                    meta.parent_task_id,
+                    meta.title.as_deref(),
+                    meta.pinned.map(|p| if p { 1 } else { 0 }),
+                    meta.archived.map(|a| if a { 1 } else { 0 }),
+                    meta.writer.as_deref(),
+                    refs_json.as_deref(),
+                ),
+            )
+            .await
+            .map_err(|e| format!("cannot insert session metadata: {e}"))?;
+        } else {
+            // The column is missing (a failed migration): omit it instead of
+            // failing the whole snapshot — a degraded database keeps creating,
+            // touching and listing sessions; only links are unavailable.
+            conn.execute(
+                "INSERT INTO sessions \
+                 (workspace_id, session_id, created_at, last_active_at, model, \"role\", \
+                  entry_count, parent_session_id, parent_task_id, title, pinned, archived, writer) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                (
+                    self.workspace_id.as_str(),
+                    meta.session_id.as_str(),
+                    datetime_to_us(meta.created_at),
+                    datetime_to_us(meta.last_active_at),
+                    meta.model.as_deref(),
+                    meta.role.as_deref(),
+                    meta.entry_count,
+                    meta.parent_session_id.as_deref(),
+                    meta.parent_task_id,
+                    meta.title.as_deref(),
+                    meta.pinned.map(|p| if p { 1 } else { 0 }),
+                    meta.archived.map(|a| if a { 1 } else { 0 }),
+                    meta.writer.as_deref(),
+                ),
+            )
+            .await
+            .map_err(|e| format!("cannot insert session metadata: {e}"))?;
+        }
         Ok(())
     }
 
@@ -2603,6 +2690,13 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
         session_id: &str,
         mutate: impl FnOnce(&mut Vec<crate::session_store::SessionRef>) -> Result<(), String>,
     ) -> Result<Vec<crate::session_store::SessionRef>, String> {
+        if !self.refs_available {
+            return Err(
+                "session links are unavailable: the sessions.refs column is missing \
+                 (the schema migration failed on this database)"
+                    .to_string(),
+            );
+        }
         let meta = if session_id == self.session_id {
             self.effective_meta().await?
         } else {
@@ -2653,10 +2747,11 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
         let connection_lock_wait_ms = lock_started.elapsed().as_millis();
         let query_started = std::time::Instant::now();
         let (filter_clause, live_ids) = sqlite_sidebar_filter_clause(sidebar_filter);
+        let refs = self.refs_projection(true);
         let sql = format!(
             "SELECT s.session_id, s.created_at, s.last_active_at, s.model, s.\"role\", \
                     s.entry_count, s.parent_session_id, s.parent_task_id, s.title, s.pinned, \
-                    s.archived, s.writer, s.refs \
+                    s.archived, s.writer, {refs} \
              FROM sessions s \
              WHERE s.workspace_id = ?1 \
                AND s.last_active_at = ( \
@@ -2712,14 +2807,17 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
     /// activity first. This is the audit view — [`Self::list_meta`] shows
     /// only the latest snapshot per session.
     pub async fn audit_meta(&self, session_id: &str) -> Result<Vec<SessionMeta>, String> {
+        let refs = self.refs_projection(false);
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT created_at, last_active_at, model, \"role\", entry_count, \
-                        parent_session_id, parent_task_id, title, pinned, archived, writer, refs \
-                 FROM sessions \
-                 WHERE workspace_id = ?1 AND session_id = ?2 \
-                 ORDER BY last_active_at ASC",
+                &format!(
+                    "SELECT created_at, last_active_at, model, \"role\", entry_count, \
+                            parent_session_id, parent_task_id, title, pinned, archived, writer, {refs} \
+                     FROM sessions \
+                     WHERE workspace_id = ?1 AND session_id = ?2 \
+                     ORDER BY last_active_at ASC"
+                ),
                 (self.workspace_id.as_str(), session_id),
             )
             .await
