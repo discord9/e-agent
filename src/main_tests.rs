@@ -9,6 +9,58 @@ fn repl_waiting_input_treats_exit_as_command_and_empty_as_retry() {
     assert!(!is_repl_exit("answer"));
 }
 
+fn option_request() -> e_agent::runner::UserInputRequest {
+    e_agent::runner::UserInputRequest {
+        call_id: "call-perm".into(),
+        questions: vec![e_agent::runner::UserQuestion {
+            id: "permission".into(),
+            prompt: "Allow read notes.md?".into(),
+            options: vec![
+                e_agent::runner::UserOption {
+                    id: " x ".into(),
+                    label: "Reject".into(),
+                    description: None,
+                },
+                e_agent::runner::UserOption {
+                    id: "x".into(),
+                    label: "Allow once".into(),
+                    description: None,
+                },
+            ],
+        }],
+    }
+}
+
+#[test]
+fn repl_reject_answer_submits_the_padded_option_id_exactly() {
+    let request = option_request();
+    let question = &request.questions[0];
+    // The line terminator is the only thing removed: the padded reject id is
+    // submitted as `" x "`, never repaired into `"x"` (Allow once).
+    assert_eq!(repl_answer(question, " x \n"), " x ");
+    assert_eq!(repl_answer(question, " x \r\n"), " x ");
+    assert_eq!(
+        repl_answer(question, " x "),
+        " x ",
+        "without a terminator the answer is untouched"
+    );
+    assert_eq!(repl_answer(question, "x\n"), "x");
+}
+
+#[test]
+fn repl_free_text_answer_still_trims() {
+    let question = e_agent::runner::UserQuestion {
+        id: "answer".into(),
+        prompt: "为什么？".into(),
+        options: Vec::new(),
+    };
+    assert_eq!(
+        repl_answer(&question, "  保留首尾空格 \r\n"),
+        "保留首尾空格"
+    );
+    assert_eq!(repl_answer(&question, "  没有换行  "), "没有换行");
+}
+
 #[test]
 fn test_version_requested() {
     assert!(version_requested(&["--version".into()]).unwrap());

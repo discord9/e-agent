@@ -1179,6 +1179,48 @@ async function main(){
       const ordinary = posts()[posts().length - 1];
       chk("idle prompt body omits call_id", ordinary.body === JSON.stringify({text:"普通消息"}), ordinary.body);
 
+      // 阻塞式固定选项：composer 不是回答路径，选项按钮提交各自的 id。
+      // " x "（Reject）必须原样进入 POST body，绝不能被 trim 成 "x"
+      //（Allow once）——这是本 PR 的核心回归点。
+      const waitingOptions = {status:"WaitingInput", call_id:"call-opt",
+        questions:[{id:"permission", prompt:"允许读取 notes.md？", options:[
+          {id:" x ", label:"Reject"}, {id:"x", label:"Allow once"}]}]};
+      applyStatus(waitingOptions);
+      const optButtons = elsById["waitingInputQuestions"].querySelectorAll("button");
+      chk("blocking fixed-option question renders buttons and locks composer",
+          optButtons.length === 2 && optButtons[0].textContent === "Reject"
+          && optButtons[1].textContent === "Allow once"
+          && pin.disabled && elsById["sendBtn"].disabled
+          && elsById["promptLabel"].textContent === "请选择上方选项");
+      const beforeFixed = posts().length;
+      pin.value = "x";
+      await sendPrompt(); await flush();
+      chk("composer text is not an answer to a fixed-option question",
+          posts().length === beforeFixed,
+          "posts=" + JSON.stringify(posts().slice(beforeFixed)));
+      optButtons[0]._listeners["click"][0]();
+      await flush();
+      chk("blocking Reject posts the padded id byte-for-byte",
+          posts().length === beforeFixed + 1
+          && posts()[beforeFixed].body === JSON.stringify({text:" x ", call_id:"call-opt"}),
+          "posts=" + JSON.stringify(posts().slice(beforeFixed)));
+
+      const retryOptions = {status:"WaitingInput", call_id:"call-opt-fail",
+        questions:[{id:"permission", prompt:"允许读取 notes.md？", options:[
+          {id:" x ", label:"Reject"}, {id:"x", label:"Allow once"}]}]};
+      applyStatus(retryOptions);
+      promptPostStatus = 409;
+      elsById["waitingInputQuestions"].querySelectorAll("button")[1]._listeners["click"][0]();
+      await flush();
+      const retryButtons = elsById["waitingInputQuestions"].querySelectorAll("button");
+      chk("failed fixed-option answer leaves the question retryable",
+          !elsById["waitingInputError"].hidden
+          && elsById["waitingInputError"].textContent.includes("HTTP 409")
+          && pin.disabled && elsById["sendBtn"].disabled
+          && retryButtons.length === 2 && retryButtons.every((button) => !button.disabled),
+          "error=" + elsById["waitingInputError"].textContent);
+      promptPostStatus = 202;
+
       sessionsData = [{id:"s1",status:"WaitingInput",entry_count:1,active:true,busy:false}];
       state.lastList = sessionsData; state.workspaceLists[state.workspace.id] = sessionsData;
       renderSidebarTree(true);

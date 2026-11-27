@@ -622,6 +622,14 @@ async fn repl(
         // waiting for Idle.
         if let SessionStatus::WaitingInput(request) = status.borrow().clone() {
             eprintln!("{}", request.questions[0].prompt);
+            for option in &request.questions[0].options {
+                match option.description.as_deref() {
+                    Some(description) => {
+                        eprintln!("  {} — {description} (id: {:?})", option.label, option.id)
+                    }
+                    None => eprintln!("  {} (id: {:?})", option.label, option.id),
+                }
+            }
             print!("answer> ");
             std::io::stdout().flush()?;
             let mut answer = String::new();
@@ -630,8 +638,8 @@ async fn repl(
                 Ok(_) => {}
                 Err(error) => return Err(error.into()),
             }
-            let answer = answer.trim();
-            if is_repl_exit(answer) {
+            let answer = repl_answer(&request.questions[0], &answer);
+            if is_repl_exit(&answer) {
                 break;
             }
             if answer.is_empty() {
@@ -778,6 +786,23 @@ async fn repl(
 
 fn is_repl_exit(line: &str) -> bool {
     matches!(line, "/exit" | "/quit")
+}
+
+/// Normalize one REPL answer line for the question it answers.
+///
+/// A question with fixed options is answered by an option id, and an id is an
+/// identity: strip only the line terminator (`\n` / `\r\n`) and keep every other
+/// byte, including surrounding spaces (`" x "` and `"x"` may be two different
+/// options). A free-text question has no identity to protect, so its answer
+/// keeps the existing trim.
+fn repl_answer(question: &e_agent::runner::UserQuestion, raw: &str) -> String {
+    let line = raw.strip_suffix('\n').unwrap_or(raw);
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    if question.options.is_empty() {
+        line.trim().to_owned()
+    } else {
+        line.to_owned()
+    }
 }
 
 fn next_value(arguments: &mut impl Iterator<Item = String>, flag: &str) -> anyhow::Result<String> {
