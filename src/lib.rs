@@ -3,6 +3,7 @@ pub mod codex;
 pub mod codex_auth;
 pub mod config;
 pub mod delegate;
+pub mod diff;
 pub mod markdown;
 pub mod mcp;
 pub mod model;

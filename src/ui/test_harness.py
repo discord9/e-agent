@@ -1575,6 +1575,72 @@ async function main(){
     chk("Finished disables pending question inputs", pqCards().length === 1
         && pqInput(0).disabled === true && pqButton(0).disabled === true);
 
+    // ---- 固定选项（问题带 options）：一张卡片一个选项一个按钮，点选提交该
+    //      选项的 id——与文本框 via submitPendingAnswer → POST /prompt 同一路径。
+    //      没有 options 键的旧 payload 仍走文本框（上面各条已覆盖）。 ----
+    const pqBtns = (i) => pqCards()[i].querySelectorAll(".pending-question-option");
+    applyStatus(pqFrame([{call_id: "c5", questions: [{id: "perm", prompt: "允许执行？", options: [
+      {id: "allow-once", label: "允许一次", description: "仅此一次"},
+      {id: "deny", label: "拒绝"},
+    ]}]}]));
+    chk("option question renders one button per option and no text box",
+        pqCards().length === 1 && pqBtns(0).length === 2
+        && pqBtns(0)[0].textContent === "允许一次" && pqBtns(0)[1].textContent === "拒绝"
+        && pqBtns(0)[0].getAttribute("data-option-id") === "allow-once"
+        && pqBtns(0)[0].title === "仅此一次"
+        && pqCards()[0].querySelector(".pending-question-input") === null
+        && pqCards()[0].querySelector(".pending-question-submit") === null
+        && pqList.textContent.includes("允许执行？"),
+        "btns=" + pqBtns(0).length);
+    const pqOptBefore = pqPosts().length;
+    promptPostDeferred = true;
+    for (const fn of pqBtns(0)[1]._listeners.click || []) fn();
+    await flush();
+    const pqOptPosted = pqPosts().slice(pqOptBefore);
+    chk("chosen option submits its id through the same /prompt path",
+        pqOptPosted.length === 1
+        && pqOptPosted[0].body === JSON.stringify({text: "deny", call_id: "c5"}),
+        "posts=" + JSON.stringify(pqOptPosted.map((x) => x.body)));
+    chk("option card is locked while its answer is in flight",
+        pqBtns(0)[0].disabled === true && pqBtns(0)[1].disabled === true
+        && pqBtns(0)[1].classList.contains("chosen")
+        && pqCards()[0].classList.contains("sending"));
+    promptPostResolve(resp(202, {}));
+    await flush();
+    chk("accepted option answer marks the card submitted",
+        pqCards()[0].classList.contains("submitted")
+        && pqBtns(0)[1].classList.contains("chosen")
+        && pqCards()[0].querySelector(".pending-question-status").textContent === "已提交"
+        && pqBtns(0)[0].disabled === true);
+    promptPostDeferred = false;
+
+    // 后端拒绝该 id（400 + 纯文本允许的 id）：既有 banner + 卡片恢复可点。
+    applyStatus(pqFrame([{call_id: "c6", questions: [{id: "perm", prompt: "再次请求？", options: [
+      {id: "allow-once", label: "允许一次"},
+      {id: "deny", label: "拒绝"},
+    ]}]}]));
+    chk("second option card still renders its options", pqBtns(0).length === 2
+        && pqCards()[0].getAttribute("data-call-id") === "c6");
+    promptPostStatus = 400;
+    for (const fn of pqBtns(0)[0]._listeners.click || []) fn();
+    await flush();
+    chk("rejected option answer keeps the card answerable",
+        pqBtns(0)[0].disabled === false && pqBtns(0)[0].classList.contains("chosen") === false
+        && elsById["bannerText"].textContent.includes("HTTP 400"),
+        "banner=" + elsById["bannerText"].textContent);
+    promptPostStatus = 202;
+    // 选项集合变化（同一 call_id）：重建卡片并保留节点顺序。
+    applyStatus(pqFrame([{call_id: "c6", questions: [{id: "perm", prompt: "再次请求？", options: [
+      {id: "allow-once", label: "允许一次（修改后）"},
+      {id: "deny", label: "拒绝"},
+      {id: "always", label: "总是允许"},
+    ]}]}]));
+    chk("changed options rebuild the card in place", pqBtns(0).length === 3
+        && pqBtns(0)[0].textContent === "允许一次（修改后）"
+        && pqCards().length === 1);
+    applyStatus(pqFrame([]));
+    chk("empty frame still clears the option cards", pqCards().length === 0);
+
     // openSession 清空面板（与 clearWaitingInput 同一会话切换路径）。
     applyStatus(pqFrame([{call_id: "c4", questions: [{id: "q4", prompt: "切走前？"}]}]));
     chk("pending card visible before session switch", pqPanel.hidden === false && pqCards().length === 1);
@@ -9644,6 +9710,16 @@ _pq_css_ok = bool(
     and re.search(r'\.pending-question-submit\s*\{[^}]*flex:\s*0 0 auto', _css)
     and _pq_list_rule and re.search(r'overflow-y:\s*auto', _pq_list_rule.group(1)))
 print(("PASS" if _pq_css_ok else "FAIL") + " pending questions cards cannot overflow at 390px")
+# 固定选项按钮行同样在 390px 下不横向溢出：可换行 + 可收缩 + 长标签折行。
+_pq_options_rule = re.search(r'\.pending-question-options\s*\{([^}]*)\}', _css)
+_pq_option_rule = re.search(r'\.pending-question-option\s*\{([^}]*)\}', _css)
+_pq_options_css_ok = bool(
+    _pq_options_rule and re.search(r'flex-wrap:\s*wrap', _pq_options_rule.group(1))
+    and re.search(r'min-width:\s*0', _pq_options_rule.group(1))
+    and _pq_option_rule and re.search(r'min-width:\s*0', _pq_option_rule.group(1))
+    and re.search(r'white-space:\s*normal', _pq_option_rule.group(1))
+    and re.search(r'overflow-wrap:\s*anywhere', _pq_option_rule.group(1)))
+print(("PASS" if _pq_options_css_ok else "FAIL") + " pending question option buttons wrap at 390px")
 # 状态 spinner（纯 CSS 伪元素）：busy/compacting 前置转圈，动画 + reduced-motion 降级
 _spin_ok = bool(re.search(r'\.composer-status\.busy::before[^{]*\{[^}]*animation:[^;}]*composer-status-spin', _css)
                 and re.search(r'@keyframes\s+composer-status-spin', _css)

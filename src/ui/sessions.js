@@ -1095,6 +1095,7 @@ function openSession(id, onReady, epoch, timeoutMs) {
   const wsId = state.workspace.id;    // 发起时的工作区（history/SSE 校验用）
   stopTaskRows();              // 会话行级 output interval / delegate SSE 不跨导航存活
   closeForkMenu();
+  closeDiffPanel();            // 工作区 diff 面板属于当前会话，切走即关闭
   saveSessionState();          // 切走：保存当前会话（消息/滚动/分页/草稿）
   // 方案 B：切走时把当前排队条快照存进 state.queues（wsId:sid 键，拷贝），
   // 供切回时由 openWith 恢复；队列为空则删掉旧快照（不留空/过期残留）。
@@ -1855,6 +1856,188 @@ async function compactSession() {
   } catch (e) {
     setBanner("⚠ 压缩失败：" + e.message);
   }
+}
+
+/* =====================================================================
+ * 工作区 diff 浏览器：GET /api/sessions/{id}/diff
+ * 服务端已完成 base 解析、路径/状态解析与响应裁剪（2 MiB / 200 文件）；
+ * 这里只把 hunks 铺成既有 .tool-diff / .diff-add / .diff-del 行样式，
+ * 不引入新的前端依赖或高亮器。
+ * ===================================================================*/
+const DIFF_PANEL_LINE_LIMIT = 500;   // 单文件最多渲染行数（超出时显式提示）
+const DIFF_STATUS_LABEL = { added: "新增", modified: "修改", deleted: "删除", renamed: "重命名" };
+let diffPanelRequest = 0;
+
+function diffPanelOpen() {
+  return !!(els.diffPanel && !els.diffPanel.hidden);
+}
+
+/* 关闭面板：递增请求序号，迟到的 diff 响应不会再绘画。切换会话时也调用
+   （openSession），避免把 A 的变更留在 B 的会话界面上。 */
+function closeDiffPanel() {
+  diffPanelRequest++;
+  if (!els.diffPanel) return;
+  els.diffPanel.hidden = true;
+  if (els.diffBtn) els.diffBtn.setAttribute("aria-expanded", "false");
+  if (els.diffPanelBody) els.diffPanelBody.innerHTML = "";
+  if (els.diffPanelStatus) els.diffPanelStatus.textContent = "";
+  if (els.diffPanelBase) els.diffPanelBase.textContent = "";
+  if (els.diffPanelSummary) els.diffPanelSummary.textContent = "";
+}
+
+function openDiffPanel() {
+  if (!state.sessionId || !els.diffPanel) return;
+  els.diffPanel.hidden = false;
+  if (els.diffBtn) els.diffBtn.setAttribute("aria-expanded", "true");
+  loadDiffPanel();
+}
+
+/* 读 diff 端点。捕获 (session, workspace) 并在每个 await 后复核：切走或
+   切 workspace 后，旧请求的结果一律丢弃（与 history/SSE 的守卫一致）。 */
+async function loadDiffPanel() {
+  if (!diffPanelOpen() || !state.sessionId) return;
+  const id = state.sessionId;
+  const ws = state.workspace;
+  const request = ++diffPanelRequest;
+  if (!workspaceToken(ws)) {
+    els.diffPanelStatus.textContent = "⚠ 未配置访问令牌：请在右上角输入 Token。";
+    return;
+  }
+  els.diffPanelStatus.textContent = "加载中…";
+  els.diffPanelBody.innerHTML = "";
+  els.diffPanelBase.textContent = "";
+  els.diffPanelSummary.textContent = "";
+  try {
+    const res = await apiFor(ws, "/api/sessions/" + encodeURIComponent(id) + "/diff");
+    if (request !== diffPanelRequest || state.sessionId !== id || state.workspace.id !== ws.id) return;
+    if (res.status === 401 || res.status === 403) {
+      els.diffPanelStatus.textContent = "认证失败：请检查 Token。";
+      return;
+    }
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    if (request !== diffPanelRequest || state.sessionId !== id || state.workspace.id !== ws.id) return;
+    renderDiffPanel(data);
+  } catch (e) {
+    if (request !== diffPanelRequest) return;
+    els.diffPanelStatus.textContent = "加载失败：" + e.message;
+  }
+}
+
+function diffStatusLabel(status) {
+  return DIFF_STATUS_LABEL[status] || status || "变更";
+}
+
+function renderDiffPanel(data) {
+  els.diffPanelBody.innerHTML = "";
+  els.diffPanelStatus.textContent = "";
+  if (!data || data.repository === false) {
+    els.diffPanelBase.textContent = "";
+    els.diffPanelSummary.textContent = "";
+    els.diffPanelStatus.textContent = (data && data.message) ||
+      "当前工作区不是 git 仓库，无法显示 diff。";
+    return;
+  }
+  const files = Array.isArray(data.files) ? data.files : [];
+  const untracked = Array.isArray(data.untracked) ? data.untracked : [];
+  let additions = 0;
+  let deletions = 0;
+  for (const file of files) {
+    additions += Number(file.additions) || 0;
+    deletions += Number(file.deletions) || 0;
+  }
+  // 需求指定的措辞：base 无法解析时明确显示 "base: uncommitted only"。
+  els.diffPanelBase.textContent = (data.uncommitted_only || !data.base)
+    ? "base: uncommitted only"
+    : "base: " + data.base + (data.base_commit
+      ? " @ " + String(data.base_commit).slice(0, 10) : "");
+  els.diffPanelSummary.textContent = files.length + " 个文件  +" + additions + " −" + deletions
+    + (untracked.length ? " · " + untracked.length + " 未跟踪" : "")
+    + (data.total_files > files.length ? " · 共 " + data.total_files + " 个" : "");
+  const notes = [];
+  if (data.message) notes.push(data.message);
+  if (data.truncated) {
+    notes.push("⚠ 响应已截断（" + (data.truncated_reason || "达到上限") + "）"
+      + (data.omitted_files ? "；已省略 " + data.omitted_files + " 个文件" : ""));
+  }
+  if (untracked.length) notes.push("未跟踪文件只列路径，不生成补丁内容。");
+  if (!files.length && !untracked.length) {
+    notes.push("工作区没有未提交的变更。");
+    els.diffPanelStatus.textContent = notes.join(" ");
+    return;
+  }
+  els.diffPanelStatus.textContent = notes.join(" ");
+  for (const file of files) els.diffPanelBody.appendChild(renderDiffFileCard(file));
+  if (untracked.length) {
+    els.diffPanelBody.appendChild(renderDiffUntrackedCard(untracked, data.untracked_truncated));
+  }
+}
+
+/* 一个文件卡片：头部（路径/状态/± 计数）+ 复用工具卡片的 .tool-diff 行
+   渲染（.diff-add 绿 / .diff-del 红 / .diff-ln 行号列不需要）。 */
+function renderDiffFileCard(file) {
+  const card = el("section", "tool-card diff-file-card");
+  const head = el("div", "diff-file-head");
+  const path = el("span", "diff-file-path", file.path || "(unknown)");
+  path.title = file.path || "";
+  head.appendChild(path);
+  if (file.old_path) head.appendChild(el("span", "diff-file-old", "← " + file.old_path));
+  head.appendChild(el("span", "diff-file-status", diffStatusLabel(file.status)));
+  if (file.binary) head.appendChild(el("span", "diff-file-status", "二进制"));
+  if (file.truncated) head.appendChild(el("span", "diff-file-status", "已截断"));
+  head.appendChild(el("span", "diff-file-count",
+    "+" + (Number(file.additions) || 0) + " −" + (Number(file.deletions) || 0)));
+  card.appendChild(head);
+
+  const body = el("div", "tool-result tool-diff");
+  const hunks = Array.isArray(file.hunks) ? file.hunks : [];
+  let total = 0;
+  for (const hunk of hunks) total += (hunk && Array.isArray(hunk.lines)) ? hunk.lines.length : 0;
+  if (!hunks.length) {
+    body.appendChild(el("div", "diff-head",
+      file.binary ? "二进制文件：不显示内容" : "没有可显示的 hunk（可能是纯改名/模式变更）"));
+    card.appendChild(body);
+    return card;
+  }
+  let shown = 0;
+  outer:
+  for (const hunk of hunks) {
+    body.appendChild(el("div", "diff-head", (hunk && hunk.header) || ""));
+    const lines = (hunk && Array.isArray(hunk.lines)) ? hunk.lines : [];
+    for (const line of lines) {
+      if (shown >= DIFF_PANEL_LINE_LIMIT) break outer;
+      shown++;
+      const first = line.charAt(0);
+      if (first === "+" || first === "-") {
+        body.appendChild(diffRow(first, null, line.slice(1)));
+      } else if (first === " ") {
+        body.appendChild(diffRow("", null, line.slice(1)));
+      } else {
+        body.appendChild(diffRow("", null, line));
+      }
+    }
+  }
+  if (total > shown) {
+    body.appendChild(el("div", "diff-more",
+      "… 还有 " + (total - shown) + " 行未显示（单文件渲染上限 " + DIFF_PANEL_LINE_LIMIT + " 行）"));
+  }
+  card.appendChild(body);
+  return card;
+}
+
+/* 未跟踪文件只列路径（服务端从不读取其内容）。 */
+function renderDiffUntrackedCard(paths, truncated) {
+  const card = el("section", "tool-card diff-file-card diff-untracked");
+  const head = el("div", "diff-file-head");
+  head.appendChild(el("span", "diff-file-path", "未跟踪文件"));
+  head.appendChild(el("span", "diff-file-status", String(paths.length)));
+  if (truncated) head.appendChild(el("span", "diff-file-status", "已截断"));
+  head.appendChild(el("span", "diff-file-count", "仅路径"));
+  card.appendChild(head);
+  const body = el("div", "tool-result tool-diff");
+  for (const path of paths) body.appendChild(diffRow("", null, path));
+  card.appendChild(body);
+  return card;
 }
 
 /* =====================================================================
@@ -2791,6 +2974,7 @@ function clearCurrentSession() {
   renderQueueBar();
   stopTaskRows();
   closeForkMenu();
+  closeDiffPanel();            // 会话清空：工作区 diff 面板一并关闭
   stopSSE();
   state.sessionId = null;
   state.sessionUsage = null;   // 关闭会话：清累计用量，防下次打开前残留

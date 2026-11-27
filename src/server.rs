@@ -12,6 +12,7 @@
 //! | GET    | `/api/sessions/{id}/history`      | segmented history (head or older)  |
 //! | GET    | `/api/sessions/{id}/summary`     | per-turn summary cache (desktop pet) |
 //! | GET    | `/api/sessions/{id}/usage`        | persisted token usage (session + subagents) |
+//! | GET    | `/api/sessions/{id}/diff`         | local workspace diff (bounded, base-resolved) |
 //! | POST   | `/api/sessions/{id}/prompt`       | queue a prompt                     |
 //! | POST   | `/api/sessions/{id}/btw`          | fork into a persistent subagent    |
 //! | GET    | `/api/sessions/{id}/fork-candidates` | turn boundaries to fork at (at/seq/preview) |
@@ -267,6 +268,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/history", get(session_history))
         .route("/api/sessions/{id}/summary", get(session_summary))
         .route("/api/sessions/{id}/usage", get(session_usage))
+        .route("/api/sessions/{id}/diff", get(session_diff))
         .route("/api/sessions/{id}/prompt", post(session_prompt))
         .route("/api/sessions/{id}/btw", post(session_btw))
         .route("/api/sessions/{id}/fork-candidates", get(fork_candidates))
@@ -1642,6 +1644,9 @@ async fn session_prompt(
             StatusCode::CONFLICT,
             format!("session {id} has finished"),
         )),
+        // Plain text naming the allowed option ids: the question stays
+        // answerable, so this is a client-side 400, not a conflict.
+        PromptSubmission::Invalid(detail) => Err(error(StatusCode::BAD_REQUEST, detail)),
     }
 }
 
@@ -3654,6 +3659,75 @@ async fn session_usage(
     }))
 }
 
+/// `GET /api/sessions/{id}/diff` — the local workspace's git diff for the
+/// session header's diff browser. Addressed under a session so an unknown id
+/// is a 404 like every other per-session read; the diff itself is the
+/// session's own workspace. A live subagent may have been given its own
+/// workspace (its `SessionEntry.cwd`), and that is the one it actually
+/// changed; a live main session runs in the factory workspace.
+///
+/// The live/known distinction is kept: a registry miss is a historical
+/// transcript, and a historical *child* has no recorded worktree, so it is
+/// `unavailable` — never another workspace's changes. A session whose own
+/// worktree is gone is `unavailable` for the same reason.
+///
+/// See [`crate::diff::workspace_diff`] for the inspection contract: status,
+/// patch and counts are scoped to the workspace pathspec, the base is the
+/// merge-base of `HEAD` with `refs/remotes/origin/main`, `refs/heads/main`,
+/// then `refs/heads/master` (reported, not swapped, when it is unrelated), and
+/// a repository whose configuration would execute a helper while git reads
+/// the worktree is refused as "cannot inspect safely" — a fixed argv does not
+/// make `git status`/`git diff` read-only. Every such payload is a normal 200
+/// with `repository: false` and an explanatory message, never a 500 and never
+/// a "no changes" claim.
+async fn session_diff(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<crate::diff::DiffReport>, (StatusCode, String)> {
+    let (store, historical) = resolve_session_store(&state, &id, true).await?;
+    let root = match live(&state, &id) {
+        Ok(SessionRef::Subagent { entry, .. }) => {
+            let cwd = PathBuf::from(&entry.cwd);
+            if !cwd.is_absolute() || !cwd.is_dir() {
+                return Ok(Json(crate::diff::unavailable(
+                    &cwd,
+                    format!(
+                        "session worktree is unavailable: {} (no diff to show)",
+                        cwd.display()
+                    ),
+                )));
+            }
+            cwd
+        }
+        Ok(SessionRef::Live(_)) => state.factory.workspace().root().to_path_buf(),
+        // A historical transcript: a main session ran in the factory
+        // workspace, but a finished child ran in a worktree that is not
+        // recorded anywhere once its delegate is gone. Reporting the factory
+        // root for it would show another workspace's changes under the
+        // child's name, so it is reported as unavailable instead.
+        Err(_) if historical => {
+            let metas = store
+                .list_meta(state.factory.root())
+                .await
+                .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+            let child = metas
+                .iter()
+                .any(|meta| meta.session_id == id && meta.parent_session_id.is_some());
+            if child {
+                return Ok(Json(crate::diff::unavailable(
+                    std::path::Path::new(""),
+                    format!(
+                        "session worktree is unavailable: finished child session {id} has no recorded workspace (no diff to show)"
+                    ),
+                )));
+            }
+            state.factory.workspace().root().to_path_buf()
+        }
+        Err(err) => return Err(err),
+    };
+    Ok(Json(crate::diff::workspace_diff(&root).await))
+}
+
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 // SSE
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -4769,6 +4843,7 @@ mod tests {
             questions: vec![crate::runner::UserQuestion {
                 id: "confirm".into(),
                 prompt: "Continue?".into(),
+                options: Vec::new(),
             }],
         };
         assert_eq!(
@@ -4776,6 +4851,71 @@ mod tests {
             json!({"status": "WaitingInput", "call_id": "call-7",
                    "questions": [{"id": "confirm", "prompt": "Continue?"}],
                    "pending_questions": []})
+        );
+    }
+
+    /// The wire shape the web JS reads: a question with options carries them
+    /// (both as the blocking `WaitingInput` questions and inside
+    /// `pending_questions`), while a question without options keeps exactly
+    /// the old shape — no `options` key at all.
+    #[test]
+    fn status_json_carries_question_options_only_when_present() {
+        use serde_json::json;
+        let optioned = crate::runner::UserQuestion {
+            id: "perm".into(),
+            prompt: "Allow?".into(),
+            options: vec![
+                crate::runner::UserOption {
+                    id: "allow-once".into(),
+                    label: "允许一次".into(),
+                    description: Some("仅此一次".into()),
+                },
+                crate::runner::UserOption {
+                    id: "deny".into(),
+                    label: "拒绝".into(),
+                    description: None,
+                },
+            ],
+        };
+        let request = UserInputRequest {
+            call_id: "call-perm".into(),
+            questions: vec![optioned],
+        };
+        assert_eq!(
+            status_json(&SessionStatus::WaitingInput(request.clone()), &[]),
+            json!({"status": "WaitingInput", "call_id": "call-perm",
+                   "questions": [{"id": "perm", "prompt": "Allow?", "options": [
+                       {"id": "allow-once", "label": "允许一次", "description": "仅此一次"},
+                       {"id": "deny", "label": "拒绝"}
+                   ]}],
+                   "pending_questions": []})
+        );
+        assert_eq!(
+            status_json(&SessionStatus::Idle, std::slice::from_ref(&request)),
+            json!({"status": "Idle", "pending_questions": [
+                {"call_id": "call-perm", "questions": [{"id": "perm", "prompt": "Allow?",
+                   "options": [
+                       {"id": "allow-once", "label": "允许一次", "description": "仅此一次"},
+                       {"id": "deny", "label": "拒绝"}
+                   ]}]}
+            ]})
+        );
+        // Old sessions (and free-text questions) never grow an empty key.
+        assert_eq!(
+            status_json(
+                &SessionStatus::Idle,
+                &[UserInputRequest {
+                    call_id: "call-text".into(),
+                    questions: vec![crate::runner::UserQuestion {
+                        id: "name".into(),
+                        prompt: "Your name?".into(),
+                        options: Vec::new(),
+                    }],
+                }]
+            ),
+            json!({"status": "Idle", "pending_questions": [
+                {"call_id": "call-text", "questions": [{"id": "name", "prompt": "Your name?"}]}
+            ]})
         );
     }
 
@@ -4791,6 +4931,7 @@ mod tests {
             questions: vec![crate::runner::UserQuestion {
                 id: "name".into(),
                 prompt: "Your name?".into(),
+                options: Vec::new(),
             }],
         };
         assert!(handle.pending_questions().is_empty());
@@ -4834,6 +4975,7 @@ mod tests {
             questions: vec![crate::runner::UserQuestion {
                 id: "q".into(),
                 prompt: "?".into(),
+                options: Vec::new(),
             }],
         }));
         state.registry.insert(
@@ -9216,6 +9358,214 @@ model = "deepseek-chat"
             StatusCode::OK,
             "right query token must pass"
         );
+    }
+
+    /// `GET /api/sessions/{id}/diff` sits under the same auth middleware as
+    /// every `/api/*` route: no token and a wrong token are both 401.
+    #[tokio::test]
+    async fn session_diff_requires_auth() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        let app = router(test_app_state("sekrit"));
+        for token in [None, Some("Bearer nope")] {
+            let mut request = Request::builder().uri("/api/sessions/any/diff");
+            if let Some(token) = token {
+                request = request.header(header::AUTHORIZATION, token);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    /// `GET /api/sessions/{id}/diff` is a 200 explanatory payload for a
+    /// non-repo workspace (never a 500), and an unknown session is a 404
+    /// like the other per-session reads.
+    #[tokio::test]
+    async fn session_diff_serves_non_repo_payload_and_404s_unknown() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        use crate::session::Session;
+
+        let (state, root) = fork_test_state("diff-endpoint");
+        let id = "web-diff-src";
+        Session::append(&root, id, &[user_message("hello")]).unwrap();
+        let app = router(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sessions/{id}/diff"))
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["repository"], serde_json::json!(false));
+        assert!(
+            value["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not a git repository"),
+            "{value}"
+        );
+        assert_eq!(value["files"], serde_json::json!([]));
+        assert_eq!(value["truncated"], serde_json::json!(false));
+
+        let unknown = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions/does-not-exist/diff")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A live subagent whose worktree is gone has no diff of its own: the
+    /// payload is an "unavailable" explanation for *that* path, never the
+    /// factory workspace's changes under the subagent's name.
+    #[tokio::test]
+    async fn session_diff_subagent_without_worktree_is_unavailable() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        let state = test_app_state("sekrit");
+        let (parent_id, parent) = live_session("web-parent");
+        let (handle, _emitter, _commands) = crate::runner::session_test_channel();
+        let missing =
+            std::env::temp_dir().join(format!("e-agent-gone-worktree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing);
+        let entry = Arc::new(crate::delegate::SessionEntry {
+            handle,
+            model: "sub-model".into(),
+            role: None,
+            cwd: missing.display().to_string(),
+            session_id: "sub-gone".into(),
+            context_window: None,
+            store: SessionStore::Jsonl,
+            local_permit: None,
+        });
+        parent.sessions.insert(11, entry);
+        state.registry.insert(parent_id, parent);
+        let factory_root = state.factory.workspace().root().to_path_buf();
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions/sub-gone/diff")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["repository"], serde_json::json!(false));
+        assert_eq!(
+            value["workspace"],
+            serde_json::json!(missing.display().to_string()),
+            "the payload must describe the missing worktree, not another workspace"
+        );
+        assert_ne!(
+            value["workspace"],
+            serde_json::json!(factory_root.display().to_string())
+        );
+        assert!(
+            value["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("worktree is unavailable"),
+            "{value}"
+        );
+        assert_eq!(value["files"], serde_json::json!([]));
+    }
+
+    /// A *finished* child whose delegate is gone has no recorded worktree: its
+    /// payload is unavailable, never the factory workspace's diff under the
+    /// child's name. The counterexample is the registry miss itself — the same
+    /// request used to resolve to the factory root.
+    #[tokio::test]
+    async fn session_diff_finished_child_without_worktree_is_unavailable() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        use crate::session::Session;
+
+        let (state, root) = fork_test_state("diff-finished-child");
+        let child = "web-finished-child";
+        Session::append(&root, child, &[user_message("hello")]).unwrap();
+        // A child row: the delegate recorded the parent, never a worktree.
+        crate::session_store::SessionStore::Jsonl
+            .create_meta(
+                &root,
+                child,
+                Some("sub-model"),
+                None,
+                Some("web-parent"),
+                Some(7),
+                None,
+            )
+            .await
+            .unwrap();
+        let factory_root = state.factory.workspace().root().to_path_buf();
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sessions/{child}/diff"))
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["repository"], serde_json::json!(false));
+        assert!(
+            value["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("worktree is unavailable"),
+            "{value}"
+        );
+        assert_eq!(value["files"], serde_json::json!([]));
+        assert_ne!(
+            value["workspace"],
+            serde_json::json!(factory_root.display().to_string()),
+            "a finished child must not be reported as another workspace"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// M5: `session_history` for an unknown session id returns 404 — the

@@ -766,6 +766,113 @@
   /* diff 容器的隐藏原文 span（copy 回退源）：不在视图中显示 */
   .tool-card .tool-result.tool-diff .expand-full { display: none; }
 
+  /* ---------- 工作区 diff 浏览器（会话头部「变更」按钮） ----------
+     全屏模态卡片。文件卡片刻意复用 .tool-card + .tool-result.tool-diff：
+     行底色/加号减号/长行换行全部沿用上面已有的 diff 样式，这里只补外层
+     布局、文件头与内容高度（工具卡片默认 14em 高度帽在浏览器里不适用）。 */
+  .diff-panel {
+    position: fixed;
+    inset: 0;
+    z-index: 60;              /* 高于顶栏(10)与额度浮层(20)，低于手机侧边栏(100) */
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    background: rgba(0, 43, 54, 0.42);
+  }
+  .diff-panel[hidden] { display: none; }
+  .diff-panel-card {
+    width: min(1100px, 100%);
+    max-height: min(88vh, 100%);
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    background: var(--base3);
+    color: var(--base02);
+    border: 1px solid var(--base1);
+    border-radius: 8px;
+    box-shadow: 0 18px 48px rgba(0, 43, 54, 0.4);
+  }
+  .diff-panel-head {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 4px 10px;
+    padding: 9px 12px;
+    background: var(--base2);
+    border-bottom: 1px solid var(--base1);
+  }
+  .diff-panel-head h2 { margin: 0; font-size: 15px; color: var(--base02); }
+  .diff-panel-base {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    color: var(--base02);
+    overflow-wrap: anywhere;
+  }
+  .diff-panel-summary { font-size: 12px; color: var(--base02); }
+  .diff-panel-head button { padding: 2px 8px; font-size: 11px; }
+  .diff-panel-head .diff-panel-close { margin-left: auto; padding: 0 7px; font-size: 16px; line-height: 1.2; }
+  .diff-panel-status {
+    padding: 7px 12px;
+    font-size: 12px;
+    color: var(--base01);
+    background: var(--base3);
+    border-bottom: 1px solid var(--base1);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  .diff-panel-status:empty { display: none; }
+  .diff-panel-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: auto;
+    padding: 10px 12px 16px;
+  }
+  .diff-panel .tool-card.diff-file-card {
+    max-width: 100%;
+    margin: 0 0 12px;
+    padding: 0;
+    border-left: 3px solid var(--blue);
+    overflow: hidden;
+  }
+  .diff-file-head {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 4px 8px;
+    padding: 5px 10px;
+    background: var(--base2);
+    border-bottom: 1px solid var(--base1);
+    font-size: 12px;
+  }
+  .diff-file-path { font-weight: bold; color: var(--base02); overflow-wrap: anywhere; }
+  .diff-file-old { color: var(--base02); overflow-wrap: anywhere; }
+  .diff-file-status {
+    padding: 0 6px;
+    font-size: 11px;
+    color: var(--base02);
+    border: 1px solid var(--base1);
+    border-radius: 8px;
+    white-space: nowrap;
+  }
+  .diff-file-count {
+    margin-left: auto;
+    color: var(--base02);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    white-space: nowrap;
+  }
+  .diff-panel .tool-card .tool-result.tool-diff { max-height: none; padding: 0; border-radius: 0; }
+  .diff-panel .tool-card .tool-result.tool-diff .diff-head { padding: 4px 10px; }
+  .diff-panel .tool-card .tool-result.tool-diff .diff-row { padding: 0 10px; }
+  .tool-card.diff-file-card.diff-untracked { border-left-color: var(--base1); }
+  @media (max-width: 640px) {
+    .diff-panel { padding: 0; }
+    .diff-panel-card { width: 100%; height: 100vh; max-height: 100vh; border-radius: 0; }
+    .diff-panel-head { padding: 7px 9px; }
+    .diff-panel-body { padding: 8px 6px 14px; }
+  }
+
   /* ---------- 工具参数紧凑渲染（文件工具 / web_search / delegate / bash 等） ----------
      主行（图标+路径/命令）+ 可选 chips；全部 textContent 渲染，无注入风险 */
   .tool-card .tool-args-compact {
@@ -1415,6 +1522,26 @@
     padding: 6px 10px;
   }
   .pending-question-submit:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
+  /* 固定选项卡片：沿用 pending-question-row 的一行布局，一个选项一个按钮。 */
+  .pending-question-options {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: stretch;
+    gap: 6px;
+    margin-top: 6px;
+    min-width: 0;
+  }
+  .pending-question-option {
+    flex: 1 1 auto;
+    min-width: 0;
+    max-width: 100%;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    text-align: left;
+    padding: 6px 10px;
+  }
+  .pending-question-option:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
+  .pending-question-option.chosen { border-color: var(--cyan); }
   .pending-question-status { margin: 5px 0 0; color: var(--base01); font-size: 12px; }
   .pending-question-status:empty { display: none; }
   .pending-question-card.submitted .pending-question-status {

@@ -14,7 +14,9 @@ impl Tool for RequestUserInput {
             description: "Ask the user one question. Blocking mode (the default) pauses this turn \
                           until the user answers. With `async: true` the call returns immediately \
                           with a receipt so you can continue; the user's answer arrives later as a \
-                          user message that quotes the original question."
+                          user message that quotes the original question. A question may carry \
+                          `options`: when present the user picks one and the answer is that \
+                          option's `id`; when absent the user types free text."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -25,7 +27,22 @@ impl Tool for RequestUserInput {
                             "type": "object",
                             "properties": {
                                 "id": {"type": "string"},
-                                "prompt": {"type": "string"}
+                                "prompt": {"type": "string"},
+                                "options": {
+                                    "type": "array",
+                                    "description": "Fixed choices. When present the user picks one and the answer is that option's `id`; when absent the user types free text.",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "id": {"type": "string"},
+                                            "label": {"type": "string"},
+                                            "description": {"type": "string"}
+                                        },
+                                        "required": ["id", "label"],
+                                        "additionalProperties": false
+                                    },
+                                    "minItems": 1
+                                }
                             },
                             "required": ["id", "prompt"],
                             "additionalProperties": false
@@ -85,7 +102,10 @@ pub(crate) fn parse_questions(arguments: &str) -> Result<ParsedQuestion, String>
     let question = questions[0]
         .as_object()
         .ok_or_else(|| "request_user_input question must be an object".to_owned())?;
-    if question.keys().any(|key| key != "id" && key != "prompt") {
+    if question
+        .keys()
+        .any(|key| key != "id" && key != "prompt" && key != "options")
+    {
         return Err("request_user_input question has unsupported fields".into());
     }
     let id = question
@@ -98,13 +118,70 @@ pub(crate) fn parse_questions(arguments: &str) -> Result<ParsedQuestion, String>
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| "request_user_input question prompt must be non-empty".to_owned())?;
+    let options = parse_options(question.get("options"))?;
     Ok(ParsedQuestion {
         question: crate::runner::UserQuestion {
             id: id.into(),
             prompt: prompt.into(),
+            options,
         },
         is_async,
     })
+}
+
+/// Parse the optional fixed `options` of one question. Absent means today's
+/// free-text question; a present list must be non-empty with unique,
+/// non-empty ids and non-empty labels.
+fn parse_options(value: Option<&Value>) -> Result<Vec<crate::runner::UserOption>, String> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let items = value
+        .as_array()
+        .ok_or_else(|| "request_user_input `options` must be an array".to_owned())?;
+    if items.is_empty() {
+        return Err("request_user_input `options` must contain at least one option".into());
+    }
+    let mut options: Vec<crate::runner::UserOption> = Vec::with_capacity(items.len());
+    for item in items {
+        let object = item
+            .as_object()
+            .ok_or_else(|| "request_user_input option must be an object".to_owned())?;
+        if object
+            .keys()
+            .any(|key| key != "id" && key != "label" && key != "description")
+        {
+            return Err("request_user_input option has unsupported fields".into());
+        }
+        let id = object
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "request_user_input option id must be non-empty".to_owned())?;
+        let label = object
+            .get("label")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "request_user_input option label must be non-empty".to_owned())?;
+        let description = match object.get("description") {
+            None => None,
+            Some(Value::String(text)) => Some(text.clone()),
+            Some(_) => {
+                return Err("request_user_input option description must be a string".into());
+            }
+        };
+        if options.iter().any(|option| option.id == id) {
+            return Err(format!(
+                "request_user_input option ids must be unique: {id}"
+            ));
+        }
+        options.push(crate::runner::UserOption {
+            id: id.into(),
+            label: label.into(),
+            description,
+        });
+    }
+    Ok(options)
 }
 
 fn is_safe_id_char(c: char) -> bool {
