@@ -3661,15 +3661,24 @@ async fn session_usage(
 
 /// `GET /api/sessions/{id}/diff` — the local workspace's git diff for the
 /// session header's diff browser. Addressed under a session so an unknown id
-/// is a 404 like every other per-session read; the diff itself is
-/// workspace-scoped. A live subagent may have been given its own workspace
-/// (its `SessionEntry.cwd`), and that is the one it actually changed; every
-/// other session resolves to the factory workspace.
+/// is a 404 like every other per-session read; the diff itself is the
+/// session's own workspace. A live subagent may have been given its own
+/// workspace (its `SessionEntry.cwd`), and that is the one it actually
+/// changed; every other session resolves to the factory workspace.
 ///
-/// The base is `merge-base HEAD origin/main`, falling back to `main`, then
-/// `master`; when none resolves the payload contains only uncommitted
-/// changes and says so. A non-repo workspace is a normal 200 payload with
-/// `repository: false` and a message, never a 500.
+/// A session whose own worktree is gone has no diff: the payload is
+/// `repository: false` with an "unavailable" message instead of another
+/// workspace's changes.
+///
+/// See [`crate::diff::workspace_diff`] for the inspection contract: status,
+/// patch and counts are scoped to the workspace pathspec, the base is the
+/// merge-base of `HEAD` with `refs/remotes/origin/main`, `refs/heads/main`,
+/// then `refs/heads/master` (reported, not swapped, when it is unrelated), and
+/// a repository whose configuration would execute a helper while git reads
+/// the worktree is refused as "cannot inspect safely" — a fixed argv does not
+/// make `git status`/`git diff` read-only. Every such payload is a normal 200
+/// with `repository: false` and an explanatory message, never a 500 and never
+/// a "no changes" claim.
 async fn session_diff(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -3678,11 +3687,16 @@ async fn session_diff(
     let root = match live(&state, &id) {
         Ok(SessionRef::Subagent { entry, .. }) => {
             let cwd = PathBuf::from(&entry.cwd);
-            if cwd.is_absolute() && cwd.exists() {
-                cwd
-            } else {
-                state.factory.workspace().root().to_path_buf()
+            if !cwd.is_absolute() || !cwd.is_dir() {
+                return Ok(Json(crate::diff::unavailable(
+                    &cwd,
+                    format!(
+                        "session worktree is unavailable: {} (no diff to show)",
+                        cwd.display()
+                    ),
+                )));
             }
+            cwd
         }
         _ => state.factory.workspace().root().to_path_buf(),
     };
@@ -9399,6 +9413,71 @@ model = "deepseek-chat"
             .unwrap();
         assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A live subagent whose worktree is gone has no diff of its own: the
+    /// payload is an "unavailable" explanation for *that* path, never the
+    /// factory workspace's changes under the subagent's name.
+    #[tokio::test]
+    async fn session_diff_subagent_without_worktree_is_unavailable() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        let state = test_app_state("sekrit");
+        let (parent_id, parent) = live_session("web-parent");
+        let (handle, _emitter, _commands) = crate::runner::session_test_channel();
+        let missing =
+            std::env::temp_dir().join(format!("e-agent-gone-worktree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing);
+        let entry = Arc::new(crate::delegate::SessionEntry {
+            handle,
+            model: "sub-model".into(),
+            role: None,
+            cwd: missing.display().to_string(),
+            session_id: "sub-gone".into(),
+            context_window: None,
+            store: SessionStore::Jsonl,
+            local_permit: None,
+        });
+        parent.sessions.insert(11, entry);
+        state.registry.insert(parent_id, parent);
+        let factory_root = state.factory.workspace().root().to_path_buf();
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions/sub-gone/diff")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["repository"], serde_json::json!(false));
+        assert_eq!(
+            value["workspace"],
+            serde_json::json!(missing.display().to_string()),
+            "the payload must describe the missing worktree, not another workspace"
+        );
+        assert_ne!(
+            value["workspace"],
+            serde_json::json!(factory_root.display().to_string())
+        );
+        assert!(
+            value["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("worktree is unavailable"),
+            "{value}"
+        );
+        assert_eq!(value["files"], serde_json::json!([]));
     }
 
     /// M5: `session_history` for an unknown session id returns 404 — the
