@@ -77,6 +77,14 @@
 //! tool with no event sender (built outside the runner) streams nothing: the
 //! whole path is a no-op, never an error.
 //!
+//! **A `session/load` replay is not progress.** ACP answers `session/load`
+//! only after replaying the prior conversation as `session/update`
+//! notifications. e-agent already holds that transcript, so while a load is
+//! in flight those updates are staged in a bounded gate (and dropped once the
+//! bound is reached) instead of being displayed or accumulated; the
+//! `session/load` response closes the gate at the exact frame that carries
+//! it. `session/new` and `session/prompt` updates are never gated.
+//!
 //! **The ACP agent spawns e-agent's own MCP servers.** `session/new` and
 //! `session/load` carry the `[mcp.<name>]` servers from the CONFIG — not the
 //! ones this process happened to connect — because the child starts them
@@ -92,10 +100,12 @@
 //! permission UI of its own (the request reuses the existing `WaitingInput`
 //! question frontends), remembered grants (every request is answered on its
 //! own), `session/close`, `session/cancel`, `session/set_mode`, several
-//! prompts inside one call, and any `session/list` based discovery (it cannot
-//! tell two concurrent e-agent sessions in one workspace apart). MCP injection
-//! is one-way and description-only: e-agent sends its server definitions, it
-//! does not learn which MCP tools the ACP agent ended up with.
+//! prompts inside one call, replaying a loaded conversation into the UI
+//! (e-agent holds its own transcript), and any `session/list` based discovery
+//! (it cannot tell two concurrent e-agent sessions in one workspace apart).
+//! MCP injection is one-way and description-only: e-agent sends its server
+//! definitions, it does not learn which MCP tools the ACP agent ended up
+//! with.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -142,6 +152,13 @@ const STREAM_COMMAND_LIMIT: usize = 120;
 /// How much `agent_message_chunk` text one display line may carry before it
 /// is emitted without a newline (a shorter line waits for its newline).
 const STREAM_TEXT_LIMIT: usize = 200;
+/// Staging bound while a `session/load` replay is in flight: past this many
+/// replayed updates the gate stops staging and drops the rest, so a
+/// pathological agent cannot grow memory without limit while the response is
+/// pending. Replayed updates are never rendered anyway.
+const REPLAY_LIMIT: usize = 256;
+/// Longest `sessionUpdate` kind kept in a staged replay entry.
+const REPLAY_KIND_LIMIT: usize = 32;
 /// The question id every permission ask uses (one question per request).
 const PERMISSION_QUESTION: &str = "permission";
 /// Cache bucket of a tool that was never bound to an e-agent session (direct
@@ -526,6 +543,7 @@ impl Client {
             pending: Mutex::new(Pending::default()),
             next_id: AtomicU64::new(1),
             state: StdMutex::new(State::default()),
+            replay: StdMutex::new(ReplayGate::default()),
             allow_kinds: config.allow_kinds.clone(),
             danger: config.danger,
             handle,
@@ -616,10 +634,11 @@ impl Client {
 
     async fn load_session(&self, id: &str, cwd: &str) -> Result<(), String> {
         self.shared
-            .request(
+            .request_replay(
                 "session/load",
                 json!({"sessionId": id, "cwd": cwd, "mcpServers": self.mcp.clone()}),
                 CALL_TIMEOUT,
+                true,
             )
             .await
             .map(|_| ())
@@ -713,6 +732,71 @@ impl Drop for KillOnDrop {
 
 type Pending = HashMap<u64, oneshot::Sender<Result<Value, String>>>;
 
+/// The `session/load` replay gate. ACP replays a loaded session's whole prior
+/// conversation as `session/update` notifications BEFORE it answers
+/// `session/load`; e-agent already holds that transcript, so while the load
+/// is in flight those updates are staged (bounded by [`REPLAY_LIMIT`]) and
+/// never emitted or accumulated. The load response closes the gate at the
+/// exact frame that carries it; `session/new` / `session/prompt` are never
+/// gated.
+#[derive(Default)]
+struct ReplayGate {
+    /// Id of the in-flight `session/load`, if any.
+    loading: Option<u64>,
+    /// Kinds of the replayed updates staged so far. Only the kind (clipped to
+    /// [`REPLAY_KIND_LIMIT`] chars) is kept: the payload is deliberately
+    /// discarded, and the vector is bounded by [`REPLAY_LIMIT`].
+    staged: Vec<String>,
+    /// The staging bound was reached: further replayed updates are dropped
+    /// until the load response arrives.
+    overflow: bool,
+}
+
+impl ReplayGate {
+    /// Open the replay region BEFORE the `session/load` frame is written, so
+    /// no replayed notification can slip through.
+    fn begin(&mut self, id: u64) {
+        self.loading = Some(id);
+        self.staged.clear();
+        self.overflow = false;
+    }
+
+    /// `true` when `update` belongs to a load replay and was consumed; the
+    /// caller must not display or accumulate it. Staging is bounded: once
+    /// [`REPLAY_LIMIT`] is reached the staged entries are dropped and every
+    /// further replayed update is discarded too.
+    fn stage(&mut self, update: &Value) -> bool {
+        if self.loading.is_none() {
+            return false;
+        }
+        if self.overflow {
+            return true;
+        }
+        if self.staged.len() >= REPLAY_LIMIT {
+            self.overflow = true;
+            self.staged.clear();
+            return true;
+        }
+        let kind = update
+            .get("sessionUpdate")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        self.staged
+            .push(kind.chars().take(REPLAY_KIND_LIMIT).collect());
+        true
+    }
+
+    /// Close the replay region at the response frame (or when the request
+    /// fails): the staged replay is dropped, never rendered.
+    fn finish(&mut self, id: u64) {
+        if self.loading == Some(id) {
+            self.loading = None;
+            self.staged.clear();
+            self.overflow = false;
+        }
+    }
+}
+
 /// Everything the reader task and the request side both need: writes to the
 /// child, the in-flight request table, and the accumulated notification state.
 struct Shared {
@@ -720,6 +804,8 @@ struct Shared {
     pending: Mutex<Pending>,
     next_id: AtomicU64,
     state: StdMutex<State>,
+    /// The `session/load` replay gate (see [`ReplayGate`]).
+    replay: StdMutex<ReplayGate>,
     /// `[acp] allow_kinds`: tool kinds answered "allow once".
     allow_kinds: Vec<String>,
     /// `[acp] danger`: answer every permission request "allow once".
@@ -740,15 +826,36 @@ impl Shared {
         params: Value,
         timeout: Duration,
     ) -> Result<Value, String> {
+        self.request_replay(method, params, timeout, false).await
+    }
+
+    /// One request; `replay` marks `session/load`, whose pre-response
+    /// `session/update` notifications are the prior conversation, not
+    /// progress. The gate opens BEFORE the frame is written so no replayed
+    /// notification can slip through, and [`Shared::dispatch`] closes it on
+    /// the response frame itself.
+    async fn request_replay(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+        replay: bool,
+    ) -> Result<Value, String> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = oneshot::channel();
         self.pending.lock().await.insert(id, sender);
+        if replay {
+            // Open the gate immediately before the frame is written: nothing
+            // the agent sends after this point can be pre-load traffic.
+            self.replay.lock().unwrap().begin(id);
+        }
         let message = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         if let Err(error) = self.send(&message).await {
             self.pending.lock().await.remove(&id);
+            self.replay.lock().unwrap().finish(id);
             return Err(error);
         }
-        match tokio::time::timeout(timeout, receiver).await {
+        let result = match tokio::time::timeout(timeout, receiver).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(format!(
                 "acp: the agent closed the connection during `{method}`"
@@ -760,7 +867,11 @@ impl Shared {
                     timeout.as_secs()
                 ))
             }
-        }
+        };
+        // A response already closed the gate in `dispatch`; this only covers
+        // the failure paths, and is a no-op when the response won.
+        self.replay.lock().unwrap().finish(id);
+        result
     }
 
     /// Write one JSON-RPC frame: the object, a newline, and a flush.
@@ -807,6 +918,9 @@ impl Shared {
             // order, so the id is the only routing key.
             (Some(id), None) => {
                 let Some(id) = id.as_u64() else { return };
+                // A response frame is the EXACT end of a `session/load`
+                // replay: every notification after this line is live again.
+                self.replay.lock().unwrap().finish(id);
                 let Some(sender) = self.pending.lock().await.remove(&id) else {
                     return;
                 };
@@ -915,7 +1029,10 @@ impl Shared {
     /// `session/update` notifications, mapped in ONE place: message and
     /// thought chunks are accumulated for the receipt (kept apart), the kinds
     /// a human can read as progress also produce `AgentEvent::Display` lines,
-    /// and every non-text update is counted.
+    /// and every non-text update is counted. While a `session/load` replay is
+    /// pending, the notification is consumed by the gate instead: the prior
+    /// conversation is not new information and must neither stream nor
+    /// pollute the receipt body.
     fn record_notification(&self, method: &str, params: Option<&Value>) {
         if method != "session/update" {
             return;
@@ -923,6 +1040,9 @@ impl Shared {
         let Some(update) = params.and_then(|params| params.get("update")) else {
             return;
         };
+        if self.replay.lock().unwrap().stage(update) {
+            return;
+        }
         let kind = update
             .get("sessionUpdate")
             .and_then(Value::as_str)

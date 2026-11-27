@@ -115,6 +115,30 @@ fn stub_config(script: &str, log: &Path, load: &str) -> AcpConfig {
     tagged_config(script, log, load, "new")
 }
 
+/// The [`REPLAY_STUB`] config: `$3` selects where the replay happens (`new`
+/// or `load`, plus the `overflow` load mode) and `$4` is its length, so the
+/// overflow mode can cross [`REPLAY_LIMIT`].
+fn replay_config(script: &str, log: &Path, mode: &str) -> AcpConfig {
+    AcpConfig {
+        binary: "/bin/bash".into(),
+        args: vec![
+            "-c".into(),
+            script.into(),
+            "acp-stub".into(),
+            log.display().to_string(),
+            "ok".into(),
+            mode.into(),
+            (REPLAY_LIMIT + 50).to_string(),
+        ],
+        model: None,
+        allow_kinds: DEFAULT_ACP_ALLOW_KINDS
+            .iter()
+            .map(|kind| (*kind).to_owned())
+            .collect(),
+        danger: false,
+    }
+}
+
 /// Same stub, with a tag so two tools using separate logs get distinct ids.
 fn tagged_config(script: &str, log: &Path, load: &str, tag: &str) -> AcpConfig {
     AcpConfig {
@@ -1173,6 +1197,182 @@ async fn streaming_without_an_event_sender_is_a_no_op() {
         "{output:?}"
     );
     assert!(output.content.contains("alpha\nbeta\n"), "{output:?}");
+}
+
+// ---------------------------------------------------------------------------
+// `session/load` replay gate: ACP replays the prior conversation as
+// `session/update` notifications BEFORE it answers `session/load`. Those are
+// not progress (e-agent holds its own transcript), so they must never become
+// Display lines, while `session/new` keeps streaming exactly as before.
+// ---------------------------------------------------------------------------
+
+/// Replays `$4` `agent_message_chunk`s (`replay-0`, `replay-1`, …) BEFORE
+/// answering `session/load`, then streams a live answer on `session/prompt`.
+/// `$3` selects the mode: `new` replays before `session/new` (the control),
+/// `load` before `session/load` (three chunks), and `overflow` before
+/// `session/load` with [`REPLAY_LIMIT`] + 50 chunks.
+const REPLAY_STUB: &str = r#"
+log="$1"
+mode="$3"
+count=3
+if [ "$mode" = "overflow" ]; then count="$4"; fi
+upd() { printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":%s}}\n' "$1"; }
+replay() {
+  i=0
+  while [ "$i" -lt "$count" ]; do
+    upd "{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"replay-$i\\n\"}}"
+    i=$((i + 1))
+  done
+}
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  printf '%s\n' "$line" >> "$log"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true},"agentInfo":{"name":"stub-acp","version":"9.9.9"},"authMethods":[]}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      if [ "$mode" = "new" ]; then replay; fi
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess-replay"}}\n' "$id"
+      ;;
+    *'"method":"session/load"'*)
+      if [ "$mode" = "load" ] || [ "$mode" = "overflow" ]; then replay; fi
+      sid=$(printf '%s' "$line" | grep -o '"sessionId":"[^"]*"' | head -1 | cut -d'"' -f4)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"%s"}}\n' "$id" "$sid"
+      ;;
+    *'"method":"session/prompt"'*)
+      upd '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"live one\n"}}'
+      upd '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"live two\n"}}'
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      ;;
+  esac
+done
+"#;
+
+#[tokio::test]
+async fn a_session_load_replay_never_streams() {
+    let temp = tempfile::tempdir().unwrap();
+    let log = temp.path().join("frames.log");
+    let root = Workspace::new(temp.path()).unwrap().root().to_path_buf();
+    let mut tool = tool_with(&root, replay_config(REPLAY_STUB, &log, "load"), "session-a").await;
+    let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+    tool.set_event_sender(sender);
+
+    // First call creates the session: its live answer streams normally.
+    tool.execute(json!({"prompt": "first"})).await.unwrap();
+    assert_eq!(
+        display_lines(&mut events),
+        ["[acp] live one", "[acp] live two"]
+    );
+
+    // Second call loads: three chunks arrive before the `session/load`
+    // response and must not stream. Exactly the live lines follow.
+    let output = tool.execute(json!({"prompt": "second"})).await.unwrap();
+
+    assert_eq!(
+        display_lines(&mut events),
+        ["[acp] live one", "[acp] live two"],
+        "the replayed chunks must not become Display events"
+    );
+    assert!(!output.content.contains("replay-"), "{}", output.content);
+    assert!(
+        output.content.contains("live one\nlive two"),
+        "{}",
+        output.content
+    );
+}
+
+#[tokio::test]
+async fn session_new_updates_still_stream_before_the_response() {
+    let temp = tempfile::tempdir().unwrap();
+    let log = temp.path().join("frames.log");
+    let root = Workspace::new(temp.path()).unwrap().root().to_path_buf();
+    let mut tool = tool_with(&root, replay_config(REPLAY_STUB, &log, "new"), "session-a").await;
+    let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+    tool.set_event_sender(sender);
+
+    let output = tool.execute(json!({"prompt": "first"})).await.unwrap();
+
+    // The control: the same pre-response chunks on `session/new` all stream;
+    // the gate is scoped to `session/load`.
+    assert_eq!(
+        display_lines(&mut events),
+        [
+            "[acp] replay-0",
+            "[acp] replay-1",
+            "[acp] replay-2",
+            "[acp] live one",
+            "[acp] live two",
+        ]
+    );
+    assert!(
+        output
+            .content
+            .contains("replay-0\nreplay-1\nreplay-2\nlive one\nlive two"),
+        "{}",
+        output.content
+    );
+}
+
+#[tokio::test]
+async fn replay_staging_overflow_drops_without_erroring_or_leaking() {
+    // The gate itself: past the bound it stops staging (dropping the staged
+    // entries) and keeps consuming replayed updates without failing.
+    let mut gate = ReplayGate::default();
+    gate.begin(7);
+    for _ in 0..REPLAY_LIMIT + 50 {
+        assert!(
+            gate.stage(&json!({"sessionUpdate": "agent_message_chunk"})),
+            "every update during the load is consumed"
+        );
+    }
+    assert!(gate.overflow, "the staging bound must trip");
+    assert!(
+        gate.staged.is_empty(),
+        "overflow drops the staged replay instead of growing"
+    );
+    gate.finish(7);
+    assert!(!gate.overflow);
+    assert!(
+        !gate.stage(&json!({"sessionUpdate": "agent_message_chunk"})),
+        "outside a load nothing is staged or dropped"
+    );
+
+    // End to end: a load replaying past the bound still finishes, streams
+    // only its live answer, and leaks no replayed text into the receipt.
+    let temp = tempfile::tempdir().unwrap();
+    let log = temp.path().join("frames.log");
+    let root = Workspace::new(temp.path()).unwrap().root().to_path_buf();
+    let mut tool = tool_with(
+        &root,
+        replay_config(REPLAY_STUB, &log, "overflow"),
+        "session-a",
+    )
+    .await;
+    let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+    tool.set_event_sender(sender);
+
+    // First call creates the session; its live answer is not the target.
+    tool.execute(json!({"prompt": "first"})).await.unwrap();
+    let _ = display_lines(&mut events);
+
+    let output = tool.execute(json!({"prompt": "second"})).await.unwrap();
+
+    assert_eq!(
+        display_lines(&mut events),
+        ["[acp] live one", "[acp] live two"],
+        "an overflowing replay must stay silent"
+    );
+    assert!(!output.content.contains("replay-"), "{}", output.content);
+    assert!(
+        output.content.contains("live one\nlive two"),
+        "{}",
+        output.content
+    );
+    assert!(
+        output.content.contains("stopReason: end_turn"),
+        "{output:?}"
+    );
 }
 
 #[test]
