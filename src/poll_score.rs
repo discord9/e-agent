@@ -6,9 +6,11 @@
 //! so an identical second call cannot change the answer. The file keeps its
 //! historical name; nothing here scores anything. Five BINARY detectors watch
 //! finished tool calls and the current turn's reasoning, and the first one to
-//! fire reports one [`Notice`]; the caller (`Agent::run_loop`) renders it as a
-//! single advisory `SessionEntry::Notice` on the next request. Nothing here
-//! edits a tool result, ends a turn, or keeps a score.
+//! fire reports one [`Notice`]; the caller — the runner's turn loop
+//! (`SessionRunner::run` in `src/runner.rs`), the one path a main session and
+//! every subagent actually take — renders it as a single advisory
+//! `SessionEntry::Notice` on the next request, through the session's one event
+//! fanout. Nothing here edits a tool result, ends a turn, or keeps a score.
 //!
 //! | detector | trigger | fires on |
 //! |----------|---------|----------|
@@ -33,6 +35,25 @@
 //! a `bash` shape match needs the arguments to differ by more than key order.
 //! The once-per-turn latch ([`PollWatch::arm`]) caps delivery at one notice per
 //! turn, so two detectors can never produce two notices in the same turn.
+//!
+//! ## Who owns a repeated poll
+//!
+//! The shipped unchanged-snapshot poll guard already answers a repeated
+//! `get_background_tasks` call (a reminder, then a termination), so the
+//! detectors never observe a result that guard answered: one repetition gets
+//! exactly one advisory, and it is the guard's. Everything else — repeated
+//! `bash` polls, repeated failures, shell waits, waiting talk — is the
+//! detectors' to report.
+//!
+//! ## Evidence, not excerpts
+//!
+//! A notice cites the events it observed — the round of the turn, the tool
+//! name, and the digest of the call's canonical arguments ([`arguments_digest`])
+//! — and never a copy or a clipped excerpt of tool output: the model already
+//! holds the real result, so an excerpt could only misreport it. Because such a
+//! citation names rounds, [`PollWatch::invalidate`] drops the whole chain when
+//! those rounds stop existing in context (after a compaction) or the session
+//! moves to another model.
 
 use serde_json::Value;
 
@@ -126,6 +147,18 @@ fn digest(text: &str) -> String {
         .collect()
 }
 
+/// The name of a call's arguments in a notice citation: the first 16 hex chars
+/// of the sha256 of their canonical form, so a notice can point at the exact
+/// arguments it observed without quoting them (or any tool output) back to the
+/// model.
+pub(crate) fn arguments_digest(arguments: &str) -> String {
+    let canonical = match serde_json::from_str::<Value>(arguments) {
+        Ok(value) => canonicalize_arguments(&value),
+        Err(_) => arguments.to_owned(),
+    };
+    digest(&canonical)
+}
+
 /// One observed call, reduced to what "the same call" means (detector A).
 #[derive(PartialEq, Eq)]
 struct Call {
@@ -201,14 +234,34 @@ pub struct PollWatch {
     /// Digest of the previous `get_background_tasks` result, so a changed
     /// running-task set is recognised as progress.
     poll: Option<String>,
+    /// The round of the current turn, counted by the runner's turn loop. Only
+    /// used to cite the event a notice refers to.
+    round: usize,
 }
 
 impl PollWatch {
+    /// The next round of this turn starts; returns its 1-based index for the
+    /// notice citation. Called once per provider request by the runner's turn
+    /// loop.
+    pub fn begin_round(&mut self) -> usize {
+        self.round = self.round.saturating_add(1);
+        self.round
+    }
+
+    /// Drop ALL state: the chains cite rounds of the context, and the context
+    /// that held them is gone. Called after a compaction and when the session
+    /// switches to another model, so a notice can never cite rounds that no
+    /// longer exist or claim a repeat across a rewritten history.
+    pub fn invalidate(&mut self) {
+        *self = Self::default();
+    }
+
     /// A new turn: the per-turn counters and the arming latch start over. The
     /// repeat and shape chains do NOT: a turn boundary is not evidence that the
     /// calls themselves changed.
     pub fn start_turn(&mut self) {
         self.armed = false;
+        self.round = 0;
         self.sleeps = 0;
         self.noops = 0;
         self.waits = 0;

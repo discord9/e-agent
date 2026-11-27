@@ -14,15 +14,18 @@
 //! is the detector expected to fire (`A`…`E` or `none`), and `id` defaults to
 //! the episode's position.
 //!
-//! The replay walks an episode exactly like `Agent::run_loop` does: one
-//! [`PollWatch::start_turn`] at the top, then per round the injected background
-//! completion ([`PollWatch::background_completed`], from `"completion": true`
-//! on that call), the round's reasoning ([`PollWatch::reasoning`], aligned with
-//! `calls` by index), and the round's finished tool calls
-//! ([`PollWatch::observe`], with `"background_started": true` forwarding
+//! The replay walks an episode exactly like the runner's turn loop
+//! (`SessionRunner::run`) does: one [`PollWatch::start_turn`] at the top, then
+//! per round the injected background completion
+//! ([`PollWatch::background_completed`], from `"completion": true` on that
+//! call), the round's reasoning ([`PollWatch::reasoning`], aligned with `calls`
+//! by index), and the round's finished tool calls ([`PollWatch::observe`],
+//! with `"background_started": true` forwarding
 //! [`crate::agent::ToolOutput::background_started`]). A call without `result`
 //! returns its own canonical arguments, so identical calls return identical
-//! text and different calls different text — what a poll-like tool does.
+//! text and different calls different text — what a poll-like tool does — and a
+//! call whose result was too long to record carries `"result_sha256"` instead
+//! (see [`digest_result`]).
 //!
 //! Point the loader at a real-log corpus without touching code:
 //!
@@ -81,6 +84,10 @@ struct EpisodeCall {
     /// The result text; defaults to the call's canonical arguments.
     #[serde(default)]
     result: Option<String>,
+    /// The digest of a result too long to record in the corpus (the miner
+    /// writes this instead of a clipped excerpt).
+    #[serde(default)]
+    result_sha256: Option<String>,
     /// A background completion is injected at the model-call boundary right
     /// before this call runs.
     #[serde(default)]
@@ -130,10 +137,11 @@ fn replay(episode: &Episode) -> Replayed {
         }
         // ... then its finished tool calls.
         let arguments = call.args.to_string();
-        let result = call
-            .result
-            .clone()
-            .unwrap_or_else(|| canonicalize_arguments(&call.args));
+        let result = match (&call.result, &call.result_sha256) {
+            (Some(result), _) => result.clone(),
+            (None, Some(sha256)) => digest_result(sha256),
+            (None, None) => canonicalize_arguments(&call.args),
+        };
         // `bash background: true` always starts a background task in the live
         // path, so the launch flag is inferred when a corpus only records the
         // argument.
@@ -155,6 +163,18 @@ fn replay(episode: &Episode) -> Replayed {
         replayed.record(watch.reasoning(Some(reasoning)), episode.calls.len());
     }
     replayed
+}
+
+/// The result stand-in for a call whose text was too long to record: a digest
+/// reference, deliberately longer than [`NEAR_RESULT_BYTES`] so detector B
+/// keeps comparing digests exactly (its branch for any result this long) and
+/// so nothing pretends to be an excerpt of the text. Two calls with the same
+/// full result produce the same marker; two different results never do.
+fn digest_result(sha256: &str) -> String {
+    format!(
+        "result text elided from the corpus (sha256 {sha256}); it is identified by this digest, \
+         so an identical result compares equal and a different one does not"
+    )
 }
 
 /// The letters used in the corpus for each detector.
@@ -310,12 +330,13 @@ fn report(source: &str, episodes: &[Episode]) -> Summary {
     let missing = episodes
         .iter()
         .flat_map(|episode| &episode.calls)
-        .filter(|call| call.result.is_none())
+        .filter(|call| call.result.is_none() && call.result_sha256.is_none())
         .count();
     if missing > 0 {
         println!(
-            "note: {missing} of {calls} call(s) carry no \"result\"; their canonical arguments are \
-             fed instead, so detector B's \"same answer\" test cannot be verified from this corpus"
+            "note: {missing} of {calls} call(s) carry neither \"result\" nor \"result_sha256\"; \
+             their canonical arguments are fed instead, so detector B's \"same answer\" test cannot \
+             be verified from this corpus"
         );
     }
     let mut summary = Summary::default();
@@ -455,7 +476,7 @@ fn corpus_from_env_replays_a_file_on_disk() {
 }
 
 /// The real-traffic corpus the log miner writes
-/// (`cargo test --lib poll_score::mine -- --nocapture`). Untracked scratch, so
+/// (`cargo test --lib poll_score::mine -- --ignored --nocapture`). Untracked scratch, so
 /// its presence is machine state, never a checked-in fixture.
 const REAL_CORPUS: &str = ".e-agent/corpus/real.jsonl";
 
@@ -502,5 +523,43 @@ fn real_corpus_replays_when_present() {
         summary.failures.len(),
         path.display(),
         summary.failures.join("\n")
+    );
+}
+
+/// A long result carried as a digest still compares exactly: three calls of one
+/// shape with the same digest are detector B's repeat, three different digests
+/// are not. The marker is longer than [`NEAR_RESULT_BYTES`], so B answers from
+/// the digest itself — never as if a clipped excerpt were the whole text.
+#[test]
+fn a_digested_result_replays_with_exact_equality() {
+    let sha = |bytes: &[u8]| crate::agent::image_sha256(bytes);
+    assert_eq!(sha(b"x").len(), 64);
+    assert!(
+        digest_result(&sha(b"x")).len() > NEAR_RESULT_BYTES,
+        "detector B must take the exact-digest branch"
+    );
+    let episode = |digests: [&str; 3]| -> Episode {
+        serde_json::from_value(serde_json::json!({
+            "id": "digest",
+            "calls": [
+                {"name": "bash", "args": {"command": "./probe --id 1"}, "result_sha256": digests[0]},
+                {"name": "bash", "args": {"command": "./probe --id 2"}, "result_sha256": digests[1]},
+                {"name": "bash", "args": {"command": "./probe --id 3"}, "result_sha256": digests[2]},
+            ],
+        }))
+        .expect("a digest corpus line parses")
+    };
+    let same = sha(b"the very same long result");
+    let repeated = replay(&episode([&same, &same, &same]));
+    assert_eq!(
+        repeated.fired.map(|(notice, _)| detector_name(notice)),
+        Some("B"),
+        "three calls with an identical full result are a repeat"
+    );
+    let other = sha(b"a different long result");
+    assert_eq!(
+        replay(&episode([&same, &other, &same])).fired,
+        None,
+        "a different result breaks the shape chain"
     );
 }

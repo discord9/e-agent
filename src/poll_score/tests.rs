@@ -9,6 +9,9 @@ use crate::agent::{
     REPEAT_CALL_NOTICE, REPEAT_SHAPE_NOTICE, SessionEntry, Tool, ToolCall, ToolOutput, ToolSpec,
     Usage, WAIT_COMMAND_NOTICE, WAIT_TALK_NOTICE,
 };
+use crate::runner::{IdlePolicy, SessionRunner};
+use crate::session_store::SessionStore;
+use tokio::sync::Notify;
 
 /// One `get_background_tasks` snapshot, exactly as the tool renders it.
 const SNAPSHOT: &str = "1 background task(s) running:\n#1: build (bash)";
@@ -869,13 +872,54 @@ fn answer(text: &str) -> AssistantMessage {
     }
 }
 
-/// How many `SessionEntry::Notice` entries carry exactly this text.
-fn notices(agent: &Agent, text: &str) -> usize {
-    agent
-        .history()
+/// Run one prompt through the REAL production path: `SessionRunner`, the loop a
+/// main session and every subagent actually take. `Agent::run` is a direct-API
+/// path no session uses, which is exactly why the detectors live in the runner.
+/// Returns the durable entries the turn wrote and the session's event log.
+async fn run_turn(
+    model: Box<dyn Model>,
+    tools: Vec<Box<dyn Tool>>,
+    context_window: Option<u64>,
+) -> (Vec<SessionEntry>, Vec<AgentEvent>) {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut agent = Agent::new(model, tools);
+    if let Some(window) = context_window {
+        agent.set_context_window(window);
+    }
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "poll-live".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let task = runner.start(Some("poll".into()));
+    tokio::time::timeout(std::time::Duration::from_secs(30), task.join())
+        .await
+        .expect("the session did not finish its turn")
+        .expect("the session task panicked");
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "poll-live")
+        .await
+        .expect("load the committed session")
+        .entries;
+    (entries, handle.snapshot())
+}
+
+/// How many committed `SessionEntry::Notice` entries start with this text.
+fn notices(entries: &[SessionEntry], text: &str) -> usize {
+    entries
         .iter()
-        .filter(|entry| matches!(entry, SessionEntry::Notice { text: notice } if notice == text))
+        .filter(|entry| matches!(entry, SessionEntry::Notice { text: notice } if notice.starts_with(text)))
         .count()
+}
+
+/// The one notice entry whose text starts with this body.
+fn notice_text(entries: &[SessionEntry], body: &str) -> Option<String> {
+    entries.iter().find_map(|entry| match entry {
+        SessionEntry::Notice { text } if text.starts_with(body) => Some(text.clone()),
+        _ => None,
+    })
 }
 
 /// Positions of the notice inside one provider request (it is user-SHAPED but
@@ -884,17 +928,118 @@ fn notice_positions(request: &[Message], text: &str) -> Vec<usize> {
     request
         .iter()
         .enumerate()
-        .filter(|(_, message)| matches!(message, Message::User { content, .. } if content == text))
+        .filter(|(_, message)| {
+            matches!(message, Message::User { content, .. } if content.starts_with(text))
+        })
         .map(|(index, _)| index)
         .collect()
 }
 
-/// The first repeat of a batch of identical polls arms ONE notice, which rides
-/// the next request as a user-shaped item — not a user message, not a prompt.
+/// The core bug, pinned on the production path: detection runs in the runner's
+/// turn loop, so a main session and every subagent get the one advisory notice
+/// as a session EVENT that rides the next request — not a side channel.
 #[tokio::test]
-async fn repeat_notice_rides_the_next_request_as_one_notice_entry() {
+async fn runner_emits_one_repeat_notice_as_an_event_on_the_next_request() {
     let requests = Arc::new(Mutex::new(Vec::new()));
-    let events = Arc::new(Mutex::new(Vec::new()));
+    let arguments = r#"{"command":"git status --short"}"#;
+    let model = ScriptedModel {
+        replies: vec![
+            assistant(
+                vec![
+                    tool_call("c1", "bash", arguments),
+                    tool_call("c2", "bash", arguments),
+                    tool_call("c3", "bash", arguments),
+                ],
+                None,
+            ),
+            answer("done"),
+        ],
+        requests: requests.clone(),
+    };
+    let (entries, events) =
+        run_turn(Box::new(model), vec![FixedTool::ok("bash", "clean")], None).await;
+
+    // One notice for the turn, whose ONE citation names the second call.
+    assert_eq!(notices(&entries, REPEAT_CALL_NOTICE), 1);
+    // A durable Notice entry, never a user message.
+    assert!(
+        !entries.iter().any(|entry| matches!(
+            entry,
+            SessionEntry::Message {
+                message: Message::User { content, .. }
+            } if content.starts_with(REPEAT_CALL_NOTICE)
+        )),
+        "{entries:?}"
+    );
+    // It is a session event on the one fanout path.
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Notice(text) if text.starts_with(REPEAT_CALL_NOTICE)
+        )),
+        "{events:?}"
+    );
+    // It rides the NEXT request, after the whole tool batch.
+    let requests = requests.lock().unwrap();
+    let request = &requests[1];
+    let positions = notice_positions(request, REPEAT_CALL_NOTICE);
+    let last_tool = request
+        .iter()
+        .rposition(|message| matches!(message, Message::Tool { .. }))
+        .expect("tool results in the second request");
+    assert_eq!(positions, vec![last_tool + 1], "{request:?}");
+}
+
+/// The evidence a notice carries is a reference to the events — round index,
+/// tool name, arguments digest — and never an excerpt of tool output: the model
+/// already holds the real result, and a clipped copy would misreport it.
+#[tokio::test]
+async fn repeat_notice_cites_the_event_and_never_pastes_the_result() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let arguments = r#"{"command":"cat build.log"}"#;
+    let huge = format!("{}TAIL-OF-THE-REAL-RESULT", "x".repeat(4_000));
+    let model = ScriptedModel {
+        replies: vec![
+            assistant(
+                vec![
+                    tool_call("c1", "bash", arguments),
+                    tool_call("c2", "bash", arguments),
+                ],
+                None,
+            ),
+            answer("done"),
+        ],
+        requests: requests.clone(),
+    };
+    let (entries, _) = run_turn(Box::new(model), vec![FixedTool::ok("bash", &huge)], None).await;
+
+    let text = notice_text(&entries, REPEAT_CALL_NOTICE).expect("one repeat notice");
+    assert!(text.starts_with(REPEAT_CALL_NOTICE));
+    // The events it observed: the round of the turn, the tool, the arguments.
+    assert!(text.contains("round 1"), "{text}");
+    assert!(text.contains("tool bash"), "{text}");
+    assert!(
+        text.contains(&arguments_digest(arguments)),
+        "the citation names the call's arguments: {text}"
+    );
+    // Never the result, clipped or otherwise.
+    assert!(!text.contains("xxxx"), "{text}");
+    assert!(!text.contains("TAIL-OF-THE-REAL-RESULT"), "{text}");
+    assert!(
+        text.chars().count() < 600,
+        "{} chars: {text}",
+        text.chars().count()
+    );
+}
+
+/// The shipped unchanged-snapshot poll guard owns a repeated poll: every result
+/// it answered is kept out of the detectors, so the same repetition never gets
+/// two advisories. The two guard answers below are byte-identical, which would
+/// otherwise be detector A's first repeat.
+#[tokio::test]
+async fn the_poll_guard_owns_a_repeated_poll_so_only_one_advisory_is_emitted() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let guarded = format!("{SNAPSHOT}\n\n{POLL_GUARD_ERROR}");
     let model = ScriptedModel {
         replies: vec![
             assistant(
@@ -909,77 +1054,36 @@ async fn repeat_notice_rides_the_next_request_as_one_notice_entry() {
         ],
         requests: requests.clone(),
     };
-    let mut agent = Agent::new(
-        Box::new(model),
-        vec![FixedTool::ok("get_background_tasks", SNAPSHOT)],
-    );
-    let captured = events.clone();
-    agent.set_event_handler(Box::new(move |event| {
-        captured.lock().unwrap().push(event);
-    }));
-    assert_eq!(agent.run("poll".into()).await.unwrap(), "done");
-
-    assert_eq!(notices(&agent, REPEAT_CALL_NOTICE), 1);
-    // The entry is a Notice, never a user message.
-    assert!(
-        !agent.history().iter().any(|entry| matches!(
-            entry,
-            SessionEntry::Message {
-                message: Message::User { content, .. }
-            } if content == REPEAT_CALL_NOTICE
-        )),
-        "{:?}",
-        agent.history()
-    );
-    // It rides the NEXT request, after the whole tool batch.
-    let requests = requests.lock().unwrap();
-    let request = &requests[1];
-    let positions = notice_positions(request, REPEAT_CALL_NOTICE);
-    let last_tool = request
-        .iter()
-        .rposition(|message| matches!(message, Message::Tool { .. }))
-        .expect("a tool result in the second request");
-    assert_eq!(positions, vec![last_tool + 1], "{request:?}");
-    drop(requests);
-    // And no UserPrompt was created for it.
-    assert!(
-        !events
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|event| matches!(event, AgentEvent::UserPrompt(_))),
-        "{:?}",
-        events.lock().unwrap()
-    );
-}
-
-/// The shipped snapshot guard wins: a result it already answered is not
-/// observed, so one call never produces two messages in one request.
-#[tokio::test]
-async fn a_guarded_result_is_never_observed() {
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let guarded = format!("{SNAPSHOT}\n\n{POLL_GUARD_ERROR}");
-    let model = ScriptedModel {
-        replies: vec![
-            assistant(
-                vec![
-                    tool_call("c1", "get_background_tasks", "{}"),
-                    tool_call("c2", "get_background_tasks", "{}"),
-                ],
-                None,
-            ),
-            answer("done"),
-        ],
-        requests: requests.clone(),
-    };
-    let mut agent = Agent::new(
+    let (entries, _) = run_turn(
         Box::new(model),
         vec![FixedTool::err("get_background_tasks", guarded)],
-    );
-    assert_eq!(agent.run("poll".into()).await.unwrap(), "done");
+        None,
+    )
+    .await;
 
-    // Two byte-identical results would otherwise be Detector A's first repeat.
-    assert_eq!(notices(&agent, REPEAT_CALL_NOTICE), 0);
+    // Exactly one mechanism advised the loop: the guard, in its own results.
+    assert_eq!(notices(&entries, REPEAT_CALL_NOTICE), 0);
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| matches!(entry, SessionEntry::Notice { .. }))
+            .count(),
+        0,
+        "the detector must stay silent when the shipped guard answered: {entries:?}"
+    );
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| matches!(
+                entry,
+                SessionEntry::Message {
+                    message: Message::Tool { content, .. }
+                } if content.contains(POLL_GUARD_ERROR)
+            ))
+            .count(),
+        3,
+        "the guard answered every unchanged poll"
+    );
     let requests = requests.lock().unwrap();
     assert!(notice_positions(&requests[1], REPEAT_CALL_NOTICE).is_empty());
 }
@@ -1002,16 +1106,16 @@ async fn sleep_wait_notice_rides_the_next_request() {
         ],
         requests: requests.clone(),
     };
-    let mut agent = Agent::new(Box::new(model), vec![FixedTool::ok("bash", "ok")]);
-    assert_eq!(agent.run("wait".into()).await.unwrap(), "done");
+    let (entries, _) = run_turn(Box::new(model), vec![FixedTool::ok("bash", "ok")], None).await;
 
-    assert_eq!(notices(&agent, WAIT_COMMAND_NOTICE), 1);
+    assert_eq!(notices(&entries, WAIT_COMMAND_NOTICE), 1);
     let requests = requests.lock().unwrap();
     assert_eq!(notice_positions(&requests[1], WAIT_COMMAND_NOTICE).len(), 1);
 }
 
-/// Detector E: the turn's reasoning is in scope where the guard runs, so
-/// sustained waiting talk arms exactly one notice on the next request.
+/// Detector E observes the round's reasoning at the model-call boundary, so
+/// sustained waiting talk arms exactly one notice on the next request; it cites
+/// its round, never a tool result.
 #[tokio::test]
 async fn wait_talk_notice_rides_the_next_request() {
     let requests = Arc::new(Mutex::new(Vec::new()));
@@ -1029,11 +1133,160 @@ async fn wait_talk_notice_rides_the_next_request() {
         ],
         requests: requests.clone(),
     };
-    let mut agent = Agent::new(Box::new(model), vec![FixedTool::ok("bash", "ok")]);
-    assert_eq!(agent.run("wait".into()).await.unwrap(), "done");
+    let (entries, _) = run_turn(Box::new(model), vec![FixedTool::ok("bash", "ok")], None).await;
 
-    assert_eq!(notices(&agent, WAIT_TALK_NOTICE), 1);
-    assert_eq!(notices(&agent, WAIT_COMMAND_NOTICE), 0);
+    assert_eq!(notices(&entries, WAIT_TALK_NOTICE), 1);
+    assert_eq!(notices(&entries, WAIT_COMMAND_NOTICE), 0);
+    let text = notice_text(&entries, WAIT_TALK_NOTICE).expect("one wait-talk notice");
+    assert!(text.contains("round 2"), "{text}");
     let requests = requests.lock().unwrap();
     assert_eq!(notice_positions(&requests[2], WAIT_TALK_NOTICE).len(), 1);
+}
+
+/// A scripted model that also reports token usage per reply: a reply whose
+/// input fills the context window makes the runner auto-compact before that
+/// round's tool calls run.
+struct MeteredModel {
+    replies: Vec<(AssistantMessage, Option<Usage>)>,
+}
+
+#[async_trait]
+impl Model for MeteredModel {
+    async fn complete(
+        &mut self,
+        _: &[Message],
+        _: &[ToolSpec],
+        _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        Ok(self.replies.remove(0))
+    }
+}
+
+fn usage(input_tokens: u64) -> Option<Usage> {
+    Some(Usage {
+        input_tokens,
+        ..Usage::default()
+    })
+}
+
+/// A compaction replaces the rounds a notice would cite, so the evidence is
+/// dropped: the byte-identical poll after it is the FIRST observation, not a
+/// repeat, and that poll cannot cite a round that no longer exists.
+#[tokio::test]
+async fn a_compaction_drops_the_evidence_of_the_rounds_it_replaced() {
+    let poll = || assistant(vec![tool_call("c1", "get_background_tasks", "{}")], None);
+    let model = MeteredModel {
+        replies: vec![
+            (poll(), usage(10)),
+            // 900 of a 1000-token window: ≥80%, so the runner auto-compacts
+            // before this round's poll executes.
+            (poll(), usage(900)),
+            (answer("summary of the compacted history"), None),
+            (answer("done"), None),
+        ],
+    };
+    let (entries, _) = run_turn(
+        Box::new(model),
+        vec![FixedTool::ok("get_background_tasks", SNAPSHOT)],
+        Some(1000),
+    )
+    .await;
+
+    assert!(
+        entries
+            .iter()
+            .any(|entry| matches!(entry, SessionEntry::Compaction { .. })),
+        "the auto-compaction ran: {entries:?}"
+    );
+    assert_eq!(
+        notices(&entries, REPEAT_CALL_NOTICE),
+        0,
+        "the round the repeat would cite was compacted away: {entries:?}"
+    );
+}
+
+/// A model that parks inside the model call with index `block_at` until
+/// released, so a `/model` switch can be queued while that call is in flight.
+struct BlockingModel {
+    replies: Vec<AssistantMessage>,
+    block_at: usize,
+    calls: usize,
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait]
+impl Model for BlockingModel {
+    async fn complete(
+        &mut self,
+        _: &[Message],
+        _: &[ToolSpec],
+        _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        if self.calls == self.block_at {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        self.calls += 1;
+        Ok((self.replies.remove(0), None))
+    }
+}
+
+/// Switching the model replaces the context the notices cite, so the evidence
+/// is dropped: the identical poll the new model sees is its FIRST observation,
+/// not a repeat of a round only the old model ever saw.
+#[tokio::test]
+async fn a_model_switch_drops_the_evidence_of_rounds_the_new_model_never_saw() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let old = BlockingModel {
+        replies: vec![
+            assistant(vec![tool_call("c1", "get_background_tasks", "{}")], None),
+            assistant(vec![tool_call("c2", "get_background_tasks", "{}")], None),
+        ],
+        block_at: 1,
+        calls: 0,
+        entered: entered.clone(),
+        release: release.clone(),
+    };
+    let agent = Agent::new(
+        Box::new(old),
+        vec![FixedTool::ok("get_background_tasks", SNAPSHOT)],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "poll-live".into(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let task = runner.start(Some("poll".into()));
+    // Round 2's provider call is in flight: the switch lands before its tool
+    // batch runs, so every round of this turn belongs to the old model.
+    entered.notified().await;
+    handle.switch_model(
+        "replacement",
+        Box::new(ScriptedModel {
+            replies: vec![answer("done")],
+            requests: Arc::new(Mutex::new(Vec::new())),
+        }),
+        None,
+    );
+    release.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(30), task.join())
+        .await
+        .expect("the switched session did not finish its turn")
+        .expect("the session task panicked");
+
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "poll-live")
+        .await
+        .expect("load the committed session")
+        .entries;
+    assert_eq!(
+        notices(&entries, REPEAT_CALL_NOTICE),
+        0,
+        "the rounds the repeat would cite were never in the new model's context: {entries:?}"
+    );
 }

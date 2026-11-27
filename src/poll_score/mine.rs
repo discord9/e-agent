@@ -32,12 +32,20 @@
 //! fed, not what is merely present in the file:
 //!
 //! - A call's `result` is the committed `Message::Tool` content, matched by
-//!   `call_id`, falling back to the oldest call still awaiting a result. The
-//!   text is recorded as-is (capped at [`MAX_RESULT_CHARS`], flagged with
-//!   `"result_truncated": true`), never replaced by the arguments: detector B
-//!   asks whether two calls came back with the same answer and detector F
-//!   asks whether three calls failed the same way, so a substituted
-//!   "result" would answer the wrong question.
+//!   `call_id`, falling back to the oldest call still awaiting a result. It is
+//!   never replaced by the arguments: detector B asks whether two calls came
+//!   back with the same answer and detector F asks whether three calls failed
+//!   the same way, so a substituted "result" would answer the wrong question.
+//! - Each call also carries its event reference: `round` (the round of the
+//!   turn it ran in) and `args_sha256` (the digest of its canonical
+//!   arguments), so an episode can be audited back to the call it came from.
+//! - A result too long to record is NOT pasted as a clipped blob: the call is
+//!   cited by its digest instead (`"result_sha256"` plus `"result_chars"`, with
+//!   `"result": null`). That is faithful — the harness reconstructs a marker
+//!   that is longer than [`super::NEAR_RESULT_BYTES`] from the digest, so two
+//!   calls with the same full result still compare equal and two different
+//!   ones still differ, which is the only thing any detector asks of a long
+//!   result.
 //! - The result's `is_error` flag rides along as `"error": true` (detector F
 //!   only sees failures; a corpus that omits the flag makes F unmeasurable).
 //! - A `synthetic` result (interrupted-turn placeholder) is dropped: the live
@@ -55,7 +63,9 @@
 //! - `background_started` cannot be read directly (`ToolOutput` is never
 //!   persisted); it is inferred at BATCH level from the
 //!   [`crate::agent::BACKGROUND_REMINDER`] notice the loop applies after a
-//!   batch that started background work, and applied to that batch's calls.
+//!   batch that started background work. Only the calls of THAT round are
+//!   marked — never the whole turn: an earlier round's `sleep`/poll was not
+//!   progress and must keep counting as waiting.
 //! - Reasoning is credited only to rounds that issued tool calls — a message
 //!   with none ends the turn and the live loop checks that before calling
 //!   `reasoning()`, so feeding it would fire on the closing message.
@@ -70,11 +80,17 @@
 //! Whether a message had NO reasoning is exact (`""`), because an absent
 //! reasoning field and an empty one both reset the streak.
 //!
-//! Run it over this machine's sessions (the summary prints to stdout, the
-//! corpus goes to `$POLL_MINE_OUT` or `.e-agent/corpus/real.jsonl`):
+//! ## Opt-in
+//!
+//! Reading the user's real session store is never part of a normal test run:
+//! [`mine_real_sessions_when_opted_in`] is `#[ignore]`d, so `cargo test` only
+//! compiles this file (and runs its synthetic fixtures). Run it explicitly over
+//! this machine's sessions when you want the measurement — the summary prints
+//! to stdout, the corpus goes to `$POLL_MINE_OUT` or
+//! `.e-agent/corpus/real.jsonl`:
 //!
 //! ```sh
-//! cargo test --lib poll_score::mine -- --nocapture
+//! cargo test --lib poll_score::mine -- --ignored --nocapture
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -92,24 +108,21 @@ use super::replay;
 /// unset. Untracked scratch: the corpus is a measurement input, not source.
 const REAL_CORPUS: &str = ".e-agent/corpus/real.jsonl";
 
-/// Cap on a recorded result's recorded length, mirroring the argument cap the
-/// corpus format uses. Counted in CHARS, never bytes, so a multi-byte result
-/// cannot be cut inside a code point; a truncated result says so with
-/// `"result_truncated": true`, which the harness ignores and the audit reads.
+/// Results up to this many CHARACTERS are recorded verbatim. A longer one is
+/// cited by its digest instead of being cut: a clipped blob reports something
+/// the tool never returned, while the digest keeps result equality exact. The
+/// harness rebuilds a marker longer than [`super::NEAR_RESULT_BYTES`] from it,
+/// so detector B stays on its exact-digest branch (where it already is for any
+/// result this long).
 const MAX_RESULT_CHARS: usize = 600;
-
-/// The first `max_chars` characters of `text`, and whether anything was cut.
-fn truncate(text: &str, max_chars: usize) -> (String, bool) {
-    match text.char_indices().nth(max_chars) {
-        Some((cut, _)) => (text[..cut].to_owned(), true),
-        None => (text.to_owned(), false),
-    }
-}
 
 /// One finished tool call, reduced to what the corpus format carries.
 struct MinedCall {
     /// The provider call id, used to pair the call with its result.
     id: String,
+    /// The round of its turn the call ran in (1-based), so an episode can be
+    /// audited back to the event it came from.
+    round: usize,
     name: String,
     args: Value,
     result: Option<String>,
@@ -130,6 +143,10 @@ struct MinedTurn {
     seq_start: usize,
     seq_end: usize,
     calls: Vec<MinedCall>,
+    /// Index in `calls` where the CURRENT round's batch starts: the
+    /// background reminder the loop writes after a batch belongs to that batch
+    /// only.
+    batch_start: usize,
     /// Aligned with `calls` by index (see the module docs).
     reasoning: Vec<String>,
     rounds: usize,
@@ -194,16 +211,27 @@ impl MinedTurn {
             .calls
             .iter()
             .map(|call| {
-                // The recorded text, never a substitute: `null` only when the
-                // session holds no result at all (see the module docs).
+                // The recorded text, never a substitute: `null` when the
+                // session holds no result at all, and when the result is too
+                // long to record (see the digest reference below).
                 let recorded = call.result.as_deref();
-                let shown = recorded.map(|text| truncate(text, MAX_RESULT_CHARS));
+                let shown = recorded.filter(|text| text.chars().count() <= MAX_RESULT_CHARS);
+                let digest = recorded.filter(|_| shown.is_none()).map(|text| {
+                    (
+                        crate::agent::image_sha256(text.as_bytes()),
+                        text.chars().count(),
+                    )
+                });
                 let mut call_json = json!({
+                    "round": call.round,
                     "name": call.name,
                     "args": call.args,
-                    "result": shown.as_ref().map_or(Value::Null, |(text, _)| {
-                        Value::String(text.clone())
-                    }),
+                    // The call's event reference: a notice/audit can name the
+                    // arguments without quoting them.
+                    "args_sha256": crate::agent::image_sha256(
+                        super::canonicalize_arguments(&call.args).as_bytes()
+                    ),
+                    "result": shown.map_or(Value::Null, |text| Value::String(text.to_owned())),
                     "error": call.error,
                 });
                 let object = call_json.as_object_mut().expect("json! built an object");
@@ -213,8 +241,11 @@ impl MinedTurn {
                 if call.background_started {
                     object.insert("background_started".to_owned(), Value::Bool(true));
                 }
-                if shown.is_some_and(|(_, truncated)| truncated) {
-                    object.insert("result_truncated".to_owned(), Value::Bool(true));
+                if let Some((sha256, chars)) = digest {
+                    // Too long to paste: reference the event by digest and
+                    // length instead of a clipped blob.
+                    object.insert("result_sha256".to_owned(), Value::String(sha256));
+                    object.insert("result_chars".to_owned(), Value::from(chars));
                 }
                 call_json
             })
@@ -279,6 +310,10 @@ fn mine_session(text: &str) -> (Vec<MinedTurn>, usize) {
                 if assistant.tool_calls.len() > 1 {
                     turn.batched_rounds += 1;
                 }
+                // This round's batch starts here: the reminder the loop writes
+                // after it belongs to these calls only.
+                turn.batch_start = turn.calls.len();
+                let round = turn.rounds;
                 let reasoning = assistant.reasoning.clone().unwrap_or_default();
                 if assistant.reasoning.is_some() {
                     turn.reasoning_messages += 1;
@@ -286,6 +321,7 @@ fn mine_session(text: &str) -> (Vec<MinedTurn>, usize) {
                 for (position, call) in assistant.tool_calls.iter().enumerate() {
                     turn.calls.push(MinedCall {
                         id: call.id.clone(),
+                        round,
                         name: call.name.clone(),
                         // A malformed argument string is kept verbatim as a
                         // JSON string, so two identical malformed calls still
@@ -349,9 +385,12 @@ fn mine_session(text: &str) -> (Vec<MinedTurn>, usize) {
                 turn.seq_end = line_no;
                 // Batch-level `ToolOutput::background_started`, the only trace
                 // the loop leaves: the reminder is applied after a batch that
-                // launched background work.
+                // launched background work. Only THAT round's calls are
+                // marked — an earlier round's `sleep`/poll was not progress
+                // and must keep counting as waiting.
                 if text == BACKGROUND_REMINDER {
-                    for call in &mut turn.calls {
+                    let batch = turn.batch_start.min(turn.calls.len());
+                    for call in &mut turn.calls[batch..] {
                         call.background_started = true;
                     }
                 }
@@ -436,8 +475,8 @@ struct Tally {
     /// not (`"result": null` — never a substitute).
     with_result: usize,
     without_result: usize,
-    /// Emitted calls whose result text was cut at [`MAX_RESULT_CHARS`].
-    truncated_results: usize,
+    /// Emitted calls whose result was too long to record: cited by digest.
+    elided_results: usize,
     /// Emitted calls the tool reported as errors (`"error": true`).
     error_calls: usize,
     /// Calls dropped because the detectors never observed them, by reason.
@@ -468,8 +507,8 @@ impl Tally {
             self.calls, self.batched_rounds
         );
         println!(
-            "  calls with a recorded result: {} ({} without); {} truncated to {MAX_RESULT_CHARS} chars",
-            self.with_result, self.without_result, self.truncated_results
+            "  calls with a recorded result: {} ({} without); {} longer than {MAX_RESULT_CHARS} chars, cited by sha256",
+            self.with_result, self.without_result, self.elided_results
         );
         println!(
             "  calls that failed (\"error\": true): {}",
@@ -506,7 +545,8 @@ impl Tally {
 /// skips instead of failing — host isolation is not a test failure — and
 /// `POLL_SESSIONS` points it at sessions the default roots miss.
 #[test]
-fn mine_real_sessions_when_readable() {
+#[ignore = "opt-in: reads the user's real session store; run with --ignored"]
+fn mine_real_sessions_when_opted_in() {
     let roots = session_roots();
     let files: Vec<PathBuf> = roots.iter().flat_map(|root| session_files(root)).collect();
     if files.is_empty() {
@@ -540,8 +580,8 @@ fn mine_real_sessions_when_readable() {
                 match &call.result {
                     Some(text) => {
                         tally.with_result += 1;
-                        if truncate(text, MAX_RESULT_CHARS).1 {
-                            tally.truncated_results += 1;
+                        if text.chars().count() > MAX_RESULT_CHARS {
+                            tally.elided_results += 1;
                         }
                     }
                     None => tally.without_result += 1,
@@ -841,6 +881,94 @@ mod extraction_tests {
                 None
             ],
             "detector per turn"
+        );
+    }
+
+    /// The reminder belongs to the round it follows: an earlier round's wait
+    /// made no progress and must keep counting as waiting.
+    #[test]
+    fn a_background_reminder_marks_only_the_round_it_follows() {
+        let entries = vec![
+            prompt("build it"),
+            // Round 1: a blocking wait — not progress for the detectors.
+            round(None, &[("bash", r#"{"command":"sleep 30"}"#)]),
+            result("call_0", "bash", "ok", false),
+            // Round 2: a background launch; the loop then writes one reminder.
+            round(
+                None,
+                &[("bash", r#"{"command":"cargo build","background":true}"#)],
+            ),
+            result(
+                "call_0",
+                "bash",
+                "started background task 1: cargo build",
+                false,
+            ),
+            SessionEntry::Notice {
+                text: BACKGROUND_REMINDER.to_owned(),
+            },
+        ];
+
+        let (turns, bad) = mine_session(&session_text(&entries));
+        assert_eq!(bad, 0, "every fixture line is a SessionEntry");
+        assert_eq!(turns.len(), 1);
+        let calls = &turns[0].calls;
+        assert_eq!(calls.len(), 2);
+        assert!(
+            !calls[0].background_started,
+            "an earlier round's sleep is still a wait, not progress"
+        );
+        assert!(
+            calls[1].background_started,
+            "the launching round is the one the reminder belongs to"
+        );
+        // The event reference: round index per call.
+        assert_eq!((calls[0].round, calls[1].round), (1, 2));
+    }
+
+    /// A result too long to record is cited by digest, never pasted as a
+    /// clipped blob; one that fits is recorded verbatim.
+    #[test]
+    fn a_long_result_is_referenced_by_digest_not_clipped() {
+        let long = format!("{}THE-END", "a".repeat(MAX_RESULT_CHARS + 50));
+        let entries = vec![
+            prompt("read it"),
+            round(None, &[("bash", r#"{"command":"cat big.log"}"#)]),
+            result("call_0", "bash", &long, false),
+            round(None, &[("bash", r#"{"command":"cat small.log"}"#)]),
+            result("call_0", "bash", "small", false),
+        ];
+
+        let (turns, bad) = mine_session(&session_text(&entries));
+        assert_eq!(bad, 0);
+        let episode = turns[0].to_json("fixture", "fixture.jsonl");
+        let calls = episode["calls"].as_array().expect("calls");
+        // The long result: a reference, not an excerpt.
+        assert_eq!(calls[0]["result"], Value::Null);
+        assert_eq!(
+            calls[0]["result_sha256"],
+            Value::String(crate::agent::image_sha256(long.as_bytes()))
+        );
+        assert_eq!(
+            calls[0]["result_chars"],
+            Value::from(long.chars().count() as u64)
+        );
+        assert!(
+            !calls[0].to_string().contains("aaaa"),
+            "no clipped blob: {}",
+            calls[0]
+        );
+        // The short one fits: recorded as it was.
+        assert_eq!(calls[1]["result"], Value::String("small".to_owned()));
+        assert_eq!(calls[1]["result_sha256"], Value::Null);
+        // Both carry their event reference (round + argument digest).
+        assert_eq!(calls[0]["round"], Value::from(1));
+        assert_eq!(calls[1]["round"], Value::from(2));
+        assert_eq!(
+            calls[0]["args_sha256"],
+            Value::String(crate::agent::image_sha256(
+                super::super::canonicalize_arguments(&calls[0]["args"]).as_bytes()
+            ))
         );
     }
 }
