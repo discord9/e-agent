@@ -4567,6 +4567,10 @@ fn jsonl_count_transcript_entries(root: &Path, session: &str) -> anyhow::Result<
 ///   resume — a second creation line would rewrite `created_at` and
 ///   pollute the audit file).
 ///
+/// An existing sidecar that holds no decodable record is left untouched,
+/// because appending a first line would turn unknown provenance into a
+/// parentless one.
+///
 /// `entry_count` mirrors the DB backends' `next_seq` at creation: the
 /// transcript's current line count.
 fn jsonl_create_meta(
@@ -4579,7 +4583,8 @@ fn jsonl_create_meta(
     title: Option<&str>,
 ) -> anyhow::Result<()> {
     let _guard = lock_jsonl_meta(&jsonl_meta_sidecar_path(root, session)?);
-    if let Some(existing) = jsonl_read_meta_snapshot(root, session)? {
+    let (existing, unknown) = jsonl_read_meta_snapshot_and_unknown(root, session)?;
+    if let Some(existing) = existing {
         // Row already exists (resume, or a backfill/btw/subagent row whose
         // model or parent link was unknown at write time): only ever
         // backfill what is MISSING — never overwrite an existing model or
@@ -4611,6 +4616,12 @@ fn jsonl_create_meta(
             return jsonl_append_meta_snapshot(root, session, &mut meta);
         }
         return Ok(()); // resume: nothing missing, never rewrite created_at
+    }
+    if unknown {
+        // The sidecar EXISTS but no record in it decodes: appending a first
+        // line would fabricate parentlessness the bytes never proved, so
+        // leave the file (and the unknown provenance) for a real repair.
+        return Ok(());
     }
     let now = chrono::Utc::now().naive_utc();
     let mut meta = SessionMeta {
@@ -4787,7 +4798,9 @@ fn jsonl_delete_meta(root: &Path, session: &str) -> anyhow::Result<()> {
 /// from the transcript file's mtime — the only recoverable activity signal
 /// for a pre-sidecar session. `entry_count` is the transcript line count.
 /// Legacy `.json` transcripts are excluded (they are rewritten to `.jsonl`
-/// on their next resume).
+/// on their next resume). A sidecar that exists but cannot decode is left
+/// untouched, because backfilling it would fabricate the parentlessness
+/// the interrupted write never recorded.
 fn jsonl_backfill_sessions(root: &Path) -> anyhow::Result<()> {
     let directory = root.join(".e-agent/sessions");
     let Ok(entries) = std::fs::read_dir(&directory) else {
@@ -4812,8 +4825,12 @@ fn jsonl_backfill_sessions(root: &Path) -> anyhow::Result<()> {
         // omit links that handle stored. Re-check under the lock.
         let path = jsonl_meta_sidecar_path(root, &session)?;
         let _guard = lock_jsonl_meta(&path);
-        if jsonl_read_meta_snapshot(root, &session)?.is_some() {
+        let (existing, unknown) = jsonl_read_meta_snapshot_and_unknown(root, &session)?;
+        if existing.is_some() {
             continue; // already has a snapshot (idempotent)
+        }
+        if unknown {
+            continue; // interrupted first write: never fabricate a first line
         }
         let mtime = std::fs::metadata(directory.join(format!("{session}.jsonl")))
             .and_then(|meta| meta.modified())

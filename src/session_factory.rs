@@ -4759,6 +4759,17 @@ mod link_ref_registration_tests {
         }
     }
 
+    /// The main role template resolves through the process-global
+    /// `XDG_CONFIG_HOME`/`HOME` layers, and another test parks a regular file
+    /// at `$XDG_CONFIG_HOME/e-agent` to prove a rejected reload. A reopen
+    /// that builds more than once must hold the same env lock the mutators
+    /// use, or that transient state fails an unrelated build.
+    fn lock_global_config_env() -> std::sync::MutexGuard<'static, ()> {
+        crate::roles::XDG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Provenance must cover every fork layout that exists on disk, not just
     /// the zero-copy leading marker: zero-copy children store the marker
     /// first (optionally after the frozen goal), while the older copy-based
@@ -4952,7 +4963,9 @@ mod link_ref_registration_tests {
     /// snapshot was truncated must not regain `link_ref`, and an older
     /// parentless line followed by a torn parent update is just as unknown.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn a_torn_sidecar_tail_never_proves_parentlessness() {
+        let _env = lock_global_config_env();
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_path_buf();
         let history = [user("q0"), assistant("a0")];
@@ -5001,26 +5014,38 @@ mod link_ref_registration_tests {
 
         let factory = SessionFactory::test_factory(root.clone());
         for id in ["torn-child", "torn-update-child"] {
-            let reopened = factory
-                .build(
-                    id,
-                    None,
-                    None,
-                    IdlePolicy::FinishWhenIdle,
-                    UnfinishedPolicy::Preserve,
-                )
-                .await
-                .unwrap_or_else(|error| panic!("{id} still opens: {error:#}"));
-            assert_eq!(
-                Session::load(&root, id).unwrap().entries,
-                history,
-                "{id} reopens with its history intact"
-            );
-            let names = reopened.runner.tool_names_for_test();
-            assert!(
-                !names.iter().any(|name| name == "link_ref"),
-                "{id} has unknown provenance, so link_ref must stay off: {names:?}"
-            );
+            let path = root
+                .join(".e-agent/sessions")
+                .join(format!("{id}.meta.jsonl"));
+            let torn_bytes = std::fs::read(&path).unwrap();
+            for build in 1..=2 {
+                let reopened = factory
+                    .build(
+                        id,
+                        None,
+                        None,
+                        IdlePolicy::FinishWhenIdle,
+                        UnfinishedPolicy::Preserve,
+                    )
+                    .await
+                    .unwrap_or_else(|error| panic!("{id} build {build} still opens: {error:#}"));
+                assert_eq!(
+                    Session::load(&root, id).unwrap().entries,
+                    history,
+                    "{id} build {build} reopens with its history intact"
+                );
+                let names = reopened.runner.tool_names_for_test();
+                assert!(
+                    !names.iter().any(|name| name == "link_ref"),
+                    "{id} build {build} has unknown provenance, so link_ref must stay off: {names:?}"
+                );
+                drop(reopened);
+                assert_eq!(
+                    std::fs::read(&path).unwrap(),
+                    torn_bytes,
+                    "{id} build {build} never rewrites the torn sidecar"
+                );
+            }
         }
     }
 
@@ -5075,9 +5100,13 @@ mod link_ref_registration_tests {
     /// snapshot, so an interruption between those two operations leaves a
     /// zero-byte sidecar. That is an interrupted first write, not evidence
     /// of "no parent": the session must still open with its history, and a
-    /// markerless child must stay without `link_ref`.
+    /// markerless child must stay without `link_ref`. Every reopen must also
+    /// leave the sidecar untouched — a first record written over the crash
+    /// would turn unknown provenance into a parentless one on the next read.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn a_zero_byte_sidecar_is_unknown_not_parentless() {
+        let _env = lock_global_config_env();
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_path_buf();
         let history = [user("q0"), assistant("a0")];
@@ -5096,33 +5125,38 @@ mod link_ref_registration_tests {
             .unwrap();
         // The crash: the file exists (created before the append) but its
         // first snapshot never landed.
-        std::fs::write(
-            root.join(".e-agent/sessions/empty-sidecar-child.meta.jsonl"),
-            "",
-        )
-        .unwrap();
+        let path = root.join(".e-agent/sessions/empty-sidecar-child.meta.jsonl");
+        std::fs::write(&path, "").unwrap();
 
         let factory = SessionFactory::test_factory(root.clone());
-        let reopened = factory
-            .build(
-                "empty-sidecar-child",
-                None,
-                None,
-                IdlePolicy::FinishWhenIdle,
-                UnfinishedPolicy::Preserve,
-            )
-            .await
-            .expect("a zero-byte sidecar must not block the session from opening");
-        assert_eq!(
-            Session::load(&root, "empty-sidecar-child").unwrap().entries,
-            history,
-            "the transcript still loads"
-        );
-        let names = reopened.runner.tool_names_for_test();
-        assert!(
-            !names.iter().any(|name| name == "link_ref"),
-            "an existing but empty sidecar is unknown provenance: {names:?}"
-        );
+        for build in 1..=3 {
+            let reopened = factory
+                .build(
+                    "empty-sidecar-child",
+                    None,
+                    None,
+                    IdlePolicy::FinishWhenIdle,
+                    UnfinishedPolicy::Preserve,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("build {build} must open: {error:#}"));
+            assert_eq!(
+                Session::load(&root, "empty-sidecar-child").unwrap().entries,
+                history,
+                "build {build}: the transcript still loads"
+            );
+            let names = reopened.runner.tool_names_for_test();
+            assert!(
+                !names.iter().any(|name| name == "link_ref"),
+                "build {build}: an existing but empty sidecar is unknown provenance: {names:?}"
+            );
+            drop(reopened);
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                b"",
+                "build {build}: the unknown sidecar is never rewritten into a parentless record"
+            );
+        }
     }
 
     /// Truncate the sidecar inside a multi-byte character of the title. A
@@ -5131,7 +5165,9 @@ mod link_ref_registration_tests {
     /// with its history, and the undecodable record is unknown provenance
     /// (no `link_ref` for a markerless child).
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn a_sidecar_torn_inside_a_multibyte_character_still_opens() {
+        let _env = lock_global_config_env();
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_path_buf();
         let history = [user("q0"), assistant("a0")];
@@ -5164,30 +5200,41 @@ mod link_ref_registration_tests {
             "the test must actually tear a multi-byte character"
         );
         std::fs::write(&path, torn).unwrap();
+        let torn_bytes = std::fs::read(&path).unwrap();
 
         let factory = SessionFactory::test_factory(root.clone());
-        let reopened = factory
-            .build(
-                "torn-multibyte-child",
-                None,
-                None,
-                IdlePolicy::FinishWhenIdle,
-                UnfinishedPolicy::Preserve,
-            )
-            .await
-            .expect("a mid-character tear must not block the session from opening");
-        assert_eq!(
-            Session::load(&root, "torn-multibyte-child")
-                .unwrap()
-                .entries,
-            history,
-            "the intact transcript opens despite the torn metadata"
-        );
-        let names = reopened.runner.tool_names_for_test();
-        assert!(
-            !names.iter().any(|name| name == "link_ref"),
-            "an undecodable record is unknown provenance: {names:?}"
-        );
+        for build in 1..=2 {
+            let reopened = factory
+                .build(
+                    "torn-multibyte-child",
+                    None,
+                    None,
+                    IdlePolicy::FinishWhenIdle,
+                    UnfinishedPolicy::Preserve,
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("build {build} of a mid-character tear must open: {error:#}")
+                });
+            assert_eq!(
+                Session::load(&root, "torn-multibyte-child")
+                    .unwrap()
+                    .entries,
+                history,
+                "build {build}: the intact transcript opens despite the torn metadata"
+            );
+            let names = reopened.runner.tool_names_for_test();
+            assert!(
+                !names.iter().any(|name| name == "link_ref"),
+                "build {build}: an undecodable record is unknown provenance: {names:?}"
+            );
+            drop(reopened);
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                torn_bytes,
+                "build {build}: the torn sidecar is never rewritten"
+            );
+        }
     }
 
     /// The positive case: a sidecar whose lines ALL decode to "no parent" is

@@ -243,6 +243,113 @@ async fn create_meta_after_transcript_counts_existing_entries() {
     assert_eq!(list[0].entry_count, 2 * entries().len() as i64);
 }
 
+/// An existing sidecar that holds no decodable record (a zero-byte file, or
+/// a lone torn line) is UNKNOWN provenance, so a creation call must not
+/// append a parentless first line over it: the next read would see only
+/// that clean record and call the session parentless. A fresh sidecar
+/// (`NotFound`) still gets its first line, and so does one created after
+/// the damaged file is actually removed (the real repair).
+#[tokio::test]
+async fn create_meta_never_writes_a_first_line_over_an_undecodable_sidecar() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = SessionStore::Jsonl;
+
+    // Zero-byte sidecar: the crash window between file creation and the
+    // first append.
+    let empty = format!("meta-empty-{}", crate::session::new_id());
+    std::fs::create_dir_all(sidecar(temp.path(), &empty).parent().unwrap()).unwrap();
+    std::fs::write(sidecar(temp.path(), &empty), "").unwrap();
+    store
+        .create_meta(
+            temp.path(),
+            &empty,
+            Some("gpt-x"),
+            Some("subagent"),
+            Some("parent-x"),
+            Some(1),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read(sidecar(temp.path(), &empty)).unwrap(),
+        b"",
+        "a zero-byte sidecar is never turned into a clean parentless record"
+    );
+
+    // A lone torn tail is the same unknown state: nothing to backfill from,
+    // so nothing may be appended.
+    let torn = format!("meta-torn-only-{}", crate::session::new_id());
+    std::fs::write(sidecar(temp.path(), &torn), b"{\"session_id\":").unwrap();
+    store
+        .create_meta(
+            temp.path(),
+            &torn,
+            Some("gpt-x"),
+            Some("subagent"),
+            Some("parent-x"),
+            Some(1),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read(sidecar(temp.path(), &torn)).unwrap(),
+        b"{\"session_id\":",
+        "a torn only record is never turned into a clean parentless record"
+    );
+
+    // The bootstrap backfill follows the same rule for a transcript whose
+    // sidecar is zero-byte: skip it, do not manufacture a first line.
+    Session::append(temp.path(), &empty, &entries()).unwrap();
+    store.backfill_sessions(temp.path()).await.unwrap();
+    assert_eq!(
+        std::fs::read(sidecar(temp.path(), &empty)).unwrap(),
+        b"",
+        "backfill leaves an interrupted first write alone"
+    );
+
+    // A sidecar that does not exist is still created normally.
+    let fresh = format!("meta-fresh-{}", crate::session::new_id());
+    store
+        .create_meta(
+            temp.path(),
+            &fresh,
+            Some("gpt-x"),
+            Some("main"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        sidecar_lines(temp.path(), &fresh),
+        1,
+        "a fresh sidecar gets exactly one first record"
+    );
+
+    // And a real repair (the damaged file removed) lets creation proceed.
+    std::fs::remove_file(sidecar(temp.path(), &empty)).unwrap();
+    store
+        .create_meta(
+            temp.path(),
+            &empty,
+            Some("gpt-x"),
+            Some("subagent"),
+            Some("parent-x"),
+            Some(1),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        sidecar_lines(temp.path(), &empty),
+        1,
+        "creation writes once the unknown sidecar is repaired"
+    );
+}
+
 /// DB parity (session_sqlite create_meta): when a row/sidecar already
 /// exists and the caller supplies a `model` or `parent_session_id` the
 /// existing snapshot lacks (e.g. a `backfill_sessions`-created first line
