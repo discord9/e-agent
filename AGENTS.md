@@ -7,10 +7,11 @@ Guidance for coding agents (and humans) working on e-agent.
 e-agent is a deliberately minimal Rust coding agent: single crate, streaming
 OpenAI-compatible Chat Completions plus ChatGPT Codex Responses, and a small
 built-in tool set for workspace files, notes, shell/background work, goals,
-and history/output receipts, plus conditional `web_search` (`web_fetch` too
-on the DeepSeek backend) and main-agent-only `delegate`. It has a text REPL,
-a ratatui TUI, a headless HTTP server (`--serve` / `web`) with a
-token-authenticated `/api` and a browser web UI, and session persistence over
+and history/output receipts, plus conditional `web_search` (`web_fetch` too:
+this process fetches the page by default, or DeepSeek's service does when
+`[web_search] fetch_provider = "deepseek"`) and main-agent-only `delegate`. It
+has a text REPL, a ratatui TUI, a headless HTTP server (`--serve` / `web`) with
+a token-authenticated `/api` and a browser web UI, and session persistence over
 three backends (SQLite default, JSONL, GreptimeDB). Keep it that way.
 
 ## Prime directive: do not over-design
@@ -121,12 +122,14 @@ result or user correction challenges an assumption.
   the child starts from the parent's completed-turn prefix on the parent's
   current model and reconnects the parent's MCP servers in its own workspace
   (the parent root unless the caller passes a different `workspace`, which then
-  gives up byte-identical prefix parity), and it still cannot delegate
-  further or ask the user questions. A same-workspace fork of a main session
-  that exposed `generate_image` omits that main-only tool schema (there is no
-  disabled placeholder), so that fork's tool array is not byte-identical. They
-  share the parent's unbounded running-task registry so nested background bash
-  stays visible. No
+  runs the child's tools/MCP elsewhere), and it still cannot delegate further
+  or ask the user questions. Its tool array is the subagent set, not the
+  parent's: a same-workspace fork of a main session that exposed
+  `generate_image` omits that main-only tool schema (there is no disabled
+  placeholder), so neither the tool array nor the provider prefix is promised
+  to be byte-identical — a prefix that matches can reuse the parent's prompt
+  cache, and that is all. They share the parent's unbounded running-task
+  registry so nested background bash stays visible. No
   arbitrary agent-to-agent messaging (only direct live parent/child `send_message`) or worker/concurrency pool. Process-level isolation
   (subagents as subprocesses) is the planned evolution but not implemented.
 

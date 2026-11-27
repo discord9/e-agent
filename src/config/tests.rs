@@ -546,6 +546,136 @@ provider = "deepseek"
     unsafe { std::env::remove_var("E_AGENT_TEST_WEB_SEARCH_KEY") };
 }
 
+/// The `[web_search] fetch_provider` field: `local` by default, `deepseek`
+/// by explicit opt-in, nothing else.
+#[test]
+fn web_fetch_provider_defaults_to_local_and_validates() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("key"), "key").unwrap();
+    let config_for = |section: &str| {
+        let path = write_config(
+            temp.path(),
+            &format!(
+                r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://x"
+api_key_file = "key"
+[models."kimi/k3"]
+model = "k3"
+{section}"#
+            ),
+        );
+        Config::from_path(&path).unwrap()
+    };
+
+    // Absent `[web_search]`: no fetch backend to report.
+    assert_eq!(config_for("").web_fetch_provider().unwrap(), None);
+
+    // Absent, blank and explicit `local` all mean this process.
+    for field in [
+        "",
+        "fetch_provider = \"\"\n",
+        "fetch_provider = \"local\"\n",
+    ] {
+        let config = config_for(&format!(
+            "[web_search]\nprovider = \"searxng\"\nbase_url = \"http://127.0.0.1:8088\"\n{field}"
+        ));
+        assert_eq!(
+            config.web_fetch_provider().unwrap(),
+            Some(WebFetchProvider::Local),
+            "{field}"
+        );
+    }
+
+    let config = config_for(
+        "[web_search]\nprovider = \"deepseek\"\napi_key_file = \"key\"\nfetch_provider = \"deepseek\"\n",
+    );
+    assert_eq!(
+        config.web_fetch_provider().unwrap(),
+        Some(WebFetchProvider::Deepseek)
+    );
+
+    // Unknown values are a config error, reported by both resolvers.
+    let config = config_for("[web_search]\nfetch_provider = \"remote\"\n");
+    for error in [
+        config.web_fetch_provider().unwrap_err().to_string(),
+        config.web_search_provider().unwrap_err().to_string(),
+    ] {
+        assert!(error.contains("`fetch_provider` `remote`"), "{error}");
+        assert!(error.contains("expected `local` or `deepseek`"), "{error}");
+    }
+}
+
+/// A SearXNG search may carry the credential a DeepSeek fetch needs, and
+/// nothing else may.
+#[test]
+fn searxng_allows_a_key_only_for_a_deepseek_fetch() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("ds-key"), "  deepseek-secret\n").unwrap();
+    let config_for = |field: &str| {
+        let path = write_config(
+            temp.path(),
+            &format!(
+                r#"
+default = "kimi/k3"
+[providers.kimi]
+base_url = "https://x"
+api_key_file = "ds-key"
+[models."kimi/k3"]
+model = "k3"
+[web_search]
+provider = "searxng"
+base_url = "http://127.0.0.1:8088"
+{field}"#
+            ),
+        );
+        Config::from_path(&path).unwrap()
+    };
+
+    // Allowed with `fetch_provider = "deepseek"`: search to SearXNG, fetch
+    // key resolved for DeepSeek.
+    let config = config_for("fetch_provider = \"deepseek\"\napi_key_file = \"ds-key\"\n");
+    assert_eq!(
+        config.web_search_provider().unwrap(),
+        Some(WebSearchProvider::Searxng {
+            base_url: "http://127.0.0.1:8088".into()
+        })
+    );
+    assert_eq!(
+        config.web_fetch_provider().unwrap(),
+        Some(WebFetchProvider::Deepseek)
+    );
+    assert_eq!(
+        config.web_search_key().unwrap(),
+        Some("deepseek-secret".into())
+    );
+
+    // Still forbidden without it, for both key fields.
+    for field in [
+        "api_key_file = \"ds-key\"\n",
+        "api_key_env = \"E_AGENT_TEST_FETCH_KEY\"\n",
+        "fetch_provider = \"local\"\napi_key_file = \"ds-key\"\n",
+    ] {
+        let config = config_for(field);
+        let error = config.web_search_provider().unwrap_err().to_string();
+        assert!(error.contains("must not set"), "{field}: {error}");
+        // The key resolver runs the same validation, so it rejects it too.
+        assert!(config.web_search_key().is_err(), "{field}");
+    }
+
+    // With no key field a SearXNG search needs no credential at all.
+    assert_eq!(config_for("").web_search_key().unwrap(), None);
+
+    // A DeepSeek fetch without any credential is a config error, not a
+    // silently local fetch.
+    let error = config_for("fetch_provider = \"deepseek\"\n")
+        .web_search_key()
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("exactly one"), "{error}");
+}
+
 #[test]
 fn resolves_role_routing_and_falls_back_when_unrouted() {
     let temp = tempfile::tempdir().unwrap();

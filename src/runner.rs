@@ -24,10 +24,25 @@ use tokio::{
     task::JoinHandle,
 };
 
+/// One fixed choice of a `request_user_input` question. The answer the user
+/// submits is the option's `id`; `label` is the human-facing text the model
+/// gets back alongside it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct UserOption {
+    pub id: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// One question. Empty `options` is the original free-text question and
+/// serializes exactly as before (no `options` key at all).
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct UserQuestion {
     pub id: String,
     pub prompt: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<UserOption>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -58,12 +73,46 @@ fn pending_questions(shared: &Shared) -> Vec<UserInputRequest> {
     requests
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PromptSubmission {
     Answered,
     Queued,
     Conflict,
     Closed,
+    /// The submitted text is not a valid answer to the open question (an id
+    /// that is not one of its options, or an empty answer). The plain message
+    /// names the allowed ids; the question stays answerable.
+    Invalid(String),
+}
+
+/// Resolve one submitted answer against its question — the single acceptance
+/// rule shared by the blocking and asynchronous paths.
+///
+/// * A free-text question (no options) keeps today's contract: any non-empty
+///   answer is accepted verbatim.
+/// * A question with options accepts exactly one of those option ids and
+///   yields the model-facing `Selected option: {id} ({label})`, so the model
+///   never has to remember the id → label mapping.
+fn resolve_answer(question: &UserQuestion, submitted: &str) -> Result<String, String> {
+    let answer = submitted.trim();
+    if answer.is_empty() {
+        return Err("answer must not be empty".into());
+    }
+    if question.options.is_empty() {
+        return Ok(submitted.to_owned());
+    }
+    let Some(option) = question.options.iter().find(|option| option.id == answer) else {
+        let allowed: Vec<&str> = question
+            .options
+            .iter()
+            .map(|option| option.id.as_str())
+            .collect();
+        return Err(format!(
+            "answer {answer:?} is not an option of this question; allowed ids: {}",
+            allowed.join(", ")
+        ));
+    };
+    Ok(format!("Selected option: {} ({})", option.id, option.label))
 }
 
 const EVENT_CAPACITY: usize = 256;
@@ -642,12 +691,20 @@ impl SessionHandle {
                 if shared.input_claimed {
                     return PromptSubmission::Conflict;
                 }
-                let id = request.questions[0].id.clone();
+                let Some(question) = request.questions.first() else {
+                    return PromptSubmission::Conflict;
+                };
+                let value = match resolve_answer(question, &prompt) {
+                    Ok(value) => value,
+                    Err(error) => return PromptSubmission::Invalid(error),
+                };
+                let answer_call_id = request.call_id.clone();
+                let id = question.id.clone();
                 if self
                     .commands
                     .send(SessionCommand::Answer {
-                        call_id: request.call_id.clone(),
-                        answers: vec![(id, prompt)],
+                        call_id: answer_call_id,
+                        answers: vec![(id, value)],
                     })
                     .is_err()
                 {
@@ -691,6 +748,8 @@ impl SessionHandle {
     /// Claim one process-local asynchronous question and send its answer
     /// command. `None` means no such unclaimed question (unknown id, already
     /// answered, or an empty answer that must leave the question answerable).
+    /// An answer that is not one of the question's option ids is rejected
+    /// (`Invalid`) without claiming it, so it stays answerable.
     fn claim_async_answer(
         &self,
         shared: &mut Shared,
@@ -704,13 +763,16 @@ impl SessionHandle {
             .pending_questions
             .get(call_id)
             .filter(|pending| !pending.claimed)
-            .and_then(|pending| pending.request.questions.first())
-            .map(|question| question.id.clone())?;
+            .and_then(|pending| pending.request.questions.first())?;
+        let (id, value) = match resolve_answer(question, &prompt) {
+            Ok(value) => (question.id.clone(), value),
+            Err(error) => return Some(PromptSubmission::Invalid(error)),
+        };
         if self
             .commands
             .send(SessionCommand::Answer {
                 call_id: call_id.to_owned(),
-                answers: vec![(question, prompt)],
+                answers: vec![(id, value)],
             })
             .is_err()
         {

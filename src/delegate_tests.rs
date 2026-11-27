@@ -3737,7 +3737,6 @@ fn fork_child_delegate_spec_matches_parent() {
             compaction_reminder: None,
             rust_sandbox: None,
             read_only: false,
-            protect_git: true,
             code_mode: false,
             mcp_servers: std::collections::HashMap::new(),
             goal: None,
@@ -3811,7 +3810,6 @@ fn forking_delegate(
             compaction_reminder: None,
             rust_sandbox: None,
             read_only: false,
-            protect_git: false,
             code_mode: false,
             mcp_servers: std::collections::HashMap::new(),
             goal: None,
@@ -4416,7 +4414,6 @@ fn fork_head(
         compaction_reminder: None,
         rust_sandbox: None,
         read_only: false,
-        protect_git: false,
         code_mode: false,
         mcp_servers: std::collections::HashMap::new(),
         goal,
@@ -4624,6 +4621,250 @@ async fn fork_accepts_an_omitted_workspace_and_uses_the_parent_root() {
     assert!(
         output.contains("omitted workspace answer"),
         "the fork must run in the parent workspace, got: {output}"
+    );
+}
+
+/// A fork's bash keeps the SUBAGENT `.git` protection even though the main
+/// session's own bash may write `.git`: forking the main session must not
+/// hand a child a wider shell than an ordinary subagent gets. Mirrors
+/// `protect_git_role_flag_reaches_the_subagent_bash_tool`: the assertion reads
+/// the protection marker out of the fork's own wire request (the marker comes
+/// from the resolved policy, so it holds without a working bwrap).
+#[tokio::test]
+async fn fork_bash_keeps_the_subagent_git_protection() {
+    // Marker text the sandboxed bash description carries exactly when
+    // protect_git = true (Linux: the .git ro-bind note; Windows: the
+    // fail-closed guidance).
+    #[cfg(windows)]
+    let protect_marker = "protect_git = false";
+    #[cfg(not(windows))]
+    let protect_marker = "prevent accidental corruption by fixer subagents";
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    seed_fork_parent(&root, "parent");
+    let sandbox = SandboxPolicy::fixed(Some(crate::config::Sandbox {
+        enabled: true,
+        network: true,
+        workspace_writable: true,
+        gpu: false,
+        writable_paths: Vec::new(),
+        readable_paths: Vec::new(),
+        readable_mounts: Vec::new(),
+        writable_mounts: Vec::new(),
+    }));
+    let (url, captured) = capturing_model().await;
+    let mut delegate = forking_delegate(
+        &root,
+        &fork_record(&root, "parent"),
+        chat_model(url, "fork-protect-model"),
+    )
+    .with_sandbox(sandbox.clone());
+    let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
+    delegate.set_event_sender(sender);
+    delegate.set_session_handle("parent", live_parent_endpoint());
+
+    delegate
+        .execute(json!({
+            "task": "git-backed work",
+            "fork": true,
+            "workspace": root.display().to_string()
+        }))
+        .await
+        .expect("the fork spawns");
+    let (status, output) = await_background_status(&mut completions).await;
+    assert_eq!(status.as_deref(), Some("completed"), "{output}");
+
+    let body = captured_request_body(&captured);
+    let bash_description = body["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .find(|tool| tool["function"]["name"] == "bash")
+        .and_then(|tool| tool["function"]["description"].as_str())
+        .expect("the fork exposes bash")
+        .to_owned();
+    assert!(
+        bash_description.contains(protect_marker),
+        "a forked child's bash must keep the subagent .git protection: {bash_description}"
+    );
+
+    // Main keeps its own policy: the same sandbox cell with the main-session
+    // `protect_git = false` never claims the protection, so the fork is
+    // strictly narrower than the parent that spawned it.
+    let workspace = Workspace::new(&root).unwrap();
+    let (main_tools, _background) = builtins(workspace, sandbox, false, None);
+    let main_bash = main_tools
+        .iter()
+        .find(|tool| tool.spec().name == "bash")
+        .expect("main exposes bash");
+    let main_description = main_bash.spec().description;
+    assert!(
+        !main_description.contains(protect_marker),
+        "main's own bash must keep writing .git: {main_description}"
+    );
+}
+
+/// The `.git` guard is a property of the SESSION: a role may opt an ordinary
+/// delegate out, a fork may never be opted out — a fork that already ended is
+/// resumed through `start_runner`, not `spawn_fork`, and must install the same
+/// guard the first run had.
+#[cfg(unix)]
+#[tokio::test]
+async fn resume_of_a_finished_fork_refuses_a_write_to_git() {
+    if !crate::tools::bwrap_available() {
+        eprintln!("bwrap unavailable; skipping sandbox test");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    std::fs::create_dir(root.join(".git")).unwrap();
+    std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    seed_fork_parent(&root, "parent");
+    // The workspace itself stays writable: only the fork's `.git` guard can
+    // refuse the write (exactly the main-session baseline other tests pin).
+    let sandbox = SandboxPolicy::fixed(Some(crate::config::Sandbox {
+        enabled: true,
+        network: true,
+        workspace_writable: true,
+        gpu: false,
+        writable_paths: Vec::new(),
+        readable_paths: Vec::new(),
+        readable_mounts: Vec::new(),
+        writable_mounts: Vec::new(),
+    }));
+
+    // 1. A real fork, so the resumed session carries the marker/inherited
+    //    prefix production writes (a hand-made transcript would not prove it).
+    let (fork_url, _captured) = capturing_model().await;
+    let mut fork = forking_delegate(
+        &root,
+        &fork_record(&root, "parent"),
+        chat_model(fork_url, "fork-model"),
+    )
+    .with_sandbox(sandbox.clone());
+    let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
+    fork.set_event_sender(sender);
+    fork.set_session_handle("parent", live_parent_endpoint());
+    let fork_id = fork
+        .execute(json!({
+            "task": "forked work",
+            "fork": true,
+            "workspace": root.display().to_string()
+        }))
+        .await
+        .expect("the fork spawns")
+        .content;
+    let (status, fork_output) = await_background_status(&mut completions).await;
+    assert_eq!(status.as_deref(), Some("completed"), "{fork_output}");
+
+    // 2. Resume the finished fork under a role that opts out of `protect_git`:
+    //    for an ordinary delegate that frontmatter would make `.git` writable,
+    //    a fork must keep the guard anyway.
+    let roles = root.join("agents");
+    std::fs::create_dir_all(&roles).unwrap();
+    std::fs::write(
+        roles.join("git-lenient.md"),
+        "---\nprotect_git = false\n---\nYou may rewrite Git metadata.\n",
+    )
+    .unwrap();
+    let resume_url = scripted_chat(vec![
+        (
+            bash_tool_call_delta(r#"{"command":"echo corrupted > .git/HEAD"}"#),
+            "tool_calls",
+        ),
+        (json!({"content": "the write was refused"}), "stop"),
+    ])
+    .await;
+    let mut resumed = delegate_with_url(&root, resume_url)
+        .persist_sessions(root.clone())
+        .with_roles_root(root.clone())
+        .with_sandbox(sandbox);
+    let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
+    resumed.set_event_sender(sender);
+    resumed
+        .execute(json!({
+            "task": "rewrite the Git metadata",
+            "role": "git-lenient",
+            "resume": fork_id.trim(),
+            "workspace": root.display().to_string()
+        }))
+        .await
+        .expect("the finished fork resumes");
+    let (status, output) = await_background_status(&mut completions).await;
+    assert_eq!(status.as_deref(), Some("completed"), "{output}");
+
+    // The write was attempted (the resumed transcript carries the call) and
+    // refused (the host metadata kept its bytes).
+    let transcript = std::fs::read_to_string(
+        root.join(".e-agent/sessions")
+            .join(format!("{}.jsonl", fork_id.trim())),
+    )
+    .unwrap();
+    assert!(
+        transcript.contains("corrupted"),
+        "the resumed fork must actually attempt the write: {transcript}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join(".git/HEAD")).unwrap(),
+        "ref: refs/heads/main\n",
+        "a resumed fork must not be able to write .git"
+    );
+}
+
+/// The guard decision itself, without a shell: fork-ness wins over a role's
+/// `protect_git = false`, and a resumed fork is recognised from the rows the
+/// fork spawn writes (inherited prefix or zero-copy marker).
+#[test]
+fn fork_session_keeps_the_git_guard_over_an_opting_out_role() {
+    assert!(
+        protect_git_for(true, false),
+        "a fork keeps the .git guard even when the resume names an opting-out role"
+    );
+    assert!(
+        protect_git_for(false, true),
+        "an ordinary delegate still follows its role's protect_git = true"
+    );
+    assert!(
+        !protect_git_for(false, false),
+        "an ordinary delegate may still opt out through its role"
+    );
+    let marker = crate::session_store::LoadedLocated {
+        entries: vec![crate::agent::SessionEntry::ForkedFrom {
+            source: "parent".into(),
+            at: None,
+            event_time: None,
+            seq: None,
+        }],
+        locations: vec![None],
+        legacy: false,
+        inherited: 0,
+        next_older: None,
+    };
+    assert!(loaded_is_fork(&marker), "a zero-copy marker marks a fork");
+    let plain = crate::session_store::LoadedLocated {
+        entries: vec![crate::agent::SessionEntry::Message {
+            message: Message::User {
+                content: "hi".into(),
+                images: vec![],
+            },
+        }],
+        locations: vec![None],
+        legacy: false,
+        inherited: 0,
+        next_older: None,
+    };
+    assert!(
+        !loaded_is_fork(&plain),
+        "an ordinary subagent is not a fork"
+    );
+    let inherited = crate::session_store::LoadedLocated {
+        inherited: 2,
+        ..plain
+    };
+    assert!(
+        loaded_is_fork(&inherited),
+        "an inherited prefix marks a fork too"
     );
 }
 

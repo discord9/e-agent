@@ -411,6 +411,27 @@ fn label_arg(args: &Value) -> Option<String> {
     args.get("label").and_then(Value::as_str).map(str::to_owned)
 }
 
+/// The `.git` read-only guard for a subagent's shell, decided by the SESSION:
+/// an ordinary delegate follows its role's `protect_git` frontmatter, a fork
+/// is always guarded. Forking a main session must not hand the child a shell
+/// that can write `.git` when main's own bash may — and neither may resuming
+/// that fork once it ended.
+fn protect_git_for(fork_session: bool, role_protect_git: bool) -> bool {
+    fork_session || role_protect_git
+}
+
+/// Whether the loaded rows mark this session as a fork: an inherited prefix or
+/// its zero-copy marker — exactly what `spawn_fork` writes for a
+/// `delegate { fork: true }` child (a `/btw` fork writes the marker too).
+/// This is what makes the guard follow the session instead of the spawn path.
+fn loaded_is_fork(loaded: &crate::session_store::LoadedLocated) -> bool {
+    loaded.inherited > 0
+        || loaded
+            .entries
+            .iter()
+            .any(|entry| matches!(entry, crate::agent::SessionEntry::ForkedFrom { .. }))
+}
+
 #[async_trait]
 impl Tool for DisabledTool {
     fn spec(&self) -> ToolSpec {
@@ -648,6 +669,15 @@ impl Delegate {
     ) -> Result<(SessionHandle, crate::runner::SessionTask), String> {
         let model_name = model.display_name().to_owned();
         let resumed = resume.is_some();
+        // The `.git` guard belongs to the SESSION, not to the path that
+        // started it: a role's frontmatter may opt an ordinary delegate out,
+        // but a fork never loses the guard — a resumed fork installs the same
+        // one `spawn_fork` installed, so finishing and resuming is never a way
+        // to widen a fork's shell into `.git`.
+        let protect_git = protect_git_for(
+            resume.as_ref().is_some_and(loaded_is_fork),
+            task.protect_git,
+        );
         let agents_instructions = workspace
             .read_to_string("AGENTS.md")
             .ok()
@@ -657,7 +687,7 @@ impl Delegate {
             background.clone(),
             task.sandbox,
             task.read_only,
-            task.protect_git,
+            protect_git,
             // The subagent itself is a delegate task in the parent's shared
             // registry; pass its own session id so get_background_tasks can
             // annotate which entry is "itself".
@@ -853,7 +883,14 @@ impl Delegate {
             // same policy a `/model`-switched or reloaded parent would.
             self.sandbox.clone(),
             head.read_only,
-            head.protect_git,
+            // A fork gets the `.git` guard because it IS a fork, never the
+            // parent's main-session value: main's own bash may write `.git`, a
+            // delegated child may not, and forking must not be a way around
+            // that boundary. Nothing about the inherited prefix needs the
+            // parent's shell policy, so the fork has no role to opt out — and
+            // `start_runner` re-derives the same answer from the session, so
+            // resuming this fork keeps the guard.
+            protect_git_for(true, false),
             Some(session_id.clone()),
         );
         #[cfg(target_os = "linux")]
@@ -882,8 +919,10 @@ impl Delegate {
         // The fork re-connects MCP in ITS OWN workspace, so its tool list may
         // legitimately differ from the parent's capture (another workspace
         // declares other servers, or one fails to connect and is skipped).
-        // No exact-match rule: a same-workspace fork is byte-identical by
-        // construction, a different-workspace fork simply is not.
+        // No exact-match rule: a same-workspace fork with the same MCP tool
+        // set is the closest to the parent's request, and nothing here
+        // promises the arrays are byte-identical (a main-only tool such as
+        // `generate_image` is absent from every fork).
         tools.extend(mcp_tools);
         let child_delegate = self.fork_child_delegate();
         tools.push(Box::new(SendMessage::child(
@@ -1493,7 +1532,7 @@ impl Tool for Delegate {
             "task": {"type": "string", "description": "complete, self-contained instructions for the subagent"}
         });
         if self.fork_head.is_some() {
-            properties["fork"] = json!({"type":"boolean", "description":"Continue from the parent's completed-turn prefix: the child inherits the parent's current model, system prompt, goal and tool schemas, except `generate_image`, which is main-only and absent from every fork (no placeholder is exposed, so a fork of a main session that exposed it has a different tool array). `workspace` defaults to the parent's root; with that default (apart from that one main-only tool, and with the same MCP tool set) the child's request is a byte-identical provider prefix and reuses the parent's prompt cache, while an explicit different `workspace` runs the child's tools/MCP elsewhere and loses that guarantee. Mutually exclusive with `role` and `resume`. The current in-flight turn is excluded, so put everything the child needs in `task`."});
+            properties["fork"] = json!({"type":"boolean", "description":"Continue from the parent's completed-turn prefix: the child runs on the parent's current model with the parent's system prompt, inherited history and goal, and the subagent tool set — delegation and user questions are refused, and a main-only tool the parent exposed (`generate_image`) is absent with no placeholder, so the child's tool array is not promised to match its main parent's request. `workspace` defaults to the parent's root; that default keeps the child's tools and MCP servers in the parent's workspace, and a prefix that matches the parent's request can reuse its prompt cache, while an explicit different `workspace` runs them elsewhere and gives that up. Mutually exclusive with `role` and `resume`. The current in-flight turn is excluded, so put everything the child needs in `task`."});
         }
         ToolSpec {
             name: "delegate".into(),
@@ -1566,8 +1605,8 @@ impl Tool for Delegate {
             // path (join relative paths with the parent root, then
             // reroot/canonicalize). A different workspace changes only where
             // the child's tools and MCP servers run — model, inherited
-            // history and goal stay the parent's — so such a request is no
-            // longer guaranteed to be a byte-identical provider prefix.
+            // history and goal stay the parent's — so such a request shares
+            // even less of the parent's provider prefix.
             let workspace_arg: Option<String> = arguments
                 .as_object()
                 .and_then(|args| args.get("workspace"))
