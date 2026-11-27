@@ -1285,17 +1285,30 @@ impl SessionFactory {
         // server resume, fork-source reconnect) already has its row —
         // create_meta is idempotent and appends nothing — and the runner's
         // turn-boundary touch keeps it fresh.
-        store
-            .create_meta(
-                &self.root,
-                &session,
-                Some(&model_name),
-                role_name.as_deref(),
-                None,
-                None,
-                None, // main sessions keep manual naming; title is a subagent-spawn concern
-            )
-            .await?;
+        //
+        // On an EXISTING row that call is only the OPTIONAL backfill of a
+        // model/role the row was created without (a bootstrap-backfilled
+        // session has `model: None`), and a damaged sidecar refuses exactly
+        // that append so unknown provenance is never rewritten into a clean
+        // one. Refusing to open would make an interrupted write fatal to a
+        // resume whose transcript is intact, so ask first and skip the
+        // optional write: the session opens display-only, and `forked` above
+        // (unknown provenance counts as a fork) already kept `link_ref` off.
+        // A fresh session has no sidecar, so it is never damaged and its
+        // creation snapshot is still written.
+        if !store.meta_is_damaged(&self.root, &session).await? {
+            store
+                .create_meta(
+                    &self.root,
+                    &session,
+                    Some(&model_name),
+                    role_name.as_deref(),
+                    None,
+                    None,
+                    None, // main sessions keep manual naming; title is a subagent-spawn concern
+                )
+                .await?;
+        }
         let (runner, handle) = SessionRunner::new_with_bootstrap(
             agent,
             store.clone(),

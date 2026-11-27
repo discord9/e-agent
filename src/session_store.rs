@@ -3690,6 +3690,29 @@ impl SessionStore {
         }
     }
 
+    /// Whether this session's metadata is DAMAGED: the row/file exists but
+    /// cannot prove a clean tail (an undecodable record, a final record with
+    /// no terminating newline, or no record at all). Every metadata writer
+    /// refuses such a row instead of rewriting unknown provenance into a
+    /// clean one (see `jsonl_refuse_damaged_meta`).
+    ///
+    /// The factory's resume path asks BEFORE its `create_meta` call: the
+    /// model/role backfill there is OPTIONAL (it only fills a field a row
+    /// written before the model was known is missing), so a damaged row must
+    /// still let the session OPEN — display-only, provenance unknown — rather
+    /// than fail a resume whose transcript is intact. A clean new session (no
+    /// sidecar at all) is not damaged, so its creation snapshot still lands.
+    /// Greptime/SQLite rows are transactional and never damaged.
+    pub async fn meta_is_damaged(&self, root: &Path, session: &str) -> Result<bool> {
+        match self {
+            SessionStore::Jsonl => Ok(jsonl_read_meta_snapshot_and_unknown(root, session)?.1),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { .. } => Ok(false),
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite { .. } => Ok(false),
+        }
+    }
+
     /// Find child sessions using each session's latest metadata snapshot.
     /// Greptime uses a targeted workspace-scoped query; other backends keep
     /// their existing list-and-filter behavior.
@@ -4418,7 +4441,10 @@ fn jsonl_meta_lock(path: &Path) -> &'static std::sync::Mutex<()> {
 }
 
 /// Take the per-sidecar snapshot lock, ignoring poisoning (a panicking
-/// writer cannot leave the file half-updated: every append is one write).
+/// writer can leave at most one truncated record: every append is one
+/// `write_all` of `<record>\n`, and [`jsonl_read_meta_snapshot_and_unknown`]
+/// treats a tail without that delimiter as damaged rather than as a
+/// snapshot).
 fn lock_jsonl_meta(path: &Path) -> std::sync::MutexGuard<'static, ()> {
     jsonl_meta_lock(path)
         .lock()
@@ -4436,6 +4462,13 @@ fn lock_jsonl_meta(path: &Path) -> std::sync::MutexGuard<'static, ()> {
 /// carries a snapshot forward never replays a stale identity from an
 /// earlier line. Callers construct with `writer: None`; the stamped value
 /// is what lands in the file.
+///
+/// The record AND its delimiter go into ONE buffer (not two `write_all`
+/// calls): a crash between two writes would leave a complete, decodable
+/// JSON object with no `\n`, which the next append would glue its own
+/// object onto. The reader still treats a missing delimiter as damage on
+/// its own (see [`jsonl_read_meta_snapshot_and_unknown`]), so the guard
+/// does not DEPEND on this write shape — it only removes the window.
 fn jsonl_append_meta_snapshot(
     root: &Path,
     session: &str,
@@ -4453,8 +4486,9 @@ fn jsonl_append_meta_snapshot(
         .append(true)
         .open(&path)
         .with_context(|| format!("cannot append session metadata {}", path.display()))?;
-    file.write_all(&serde_json::to_vec(meta)?)?;
-    file.write_all(b"\n")?;
+    let mut line = serde_json::to_vec(meta)?;
+    line.push(b'\n');
+    file.write_all(&line)?;
     file.sync_all()?;
     #[cfg(unix)]
     if created {
@@ -4482,15 +4516,29 @@ fn jsonl_read_meta_snapshot(root: &Path, session: &str) -> anyhow::Result<Option
 
 /// [`jsonl_read_meta_snapshot`] plus whether provenance must be treated as
 /// UNKNOWN: the sidecar exists but no record in it can prove parentlessness.
-/// That covers a record that failed to decode (a torn crash tail) and a
+/// That covers a record that failed to decode (a torn crash tail), a
 /// sidecar with no nonblank record at all — the writer creates the file
 /// BEFORE its first snapshot, so an interruption between those two
-/// operations leaves a zero-byte file, not "no sidecar".
+/// operations leaves a zero-byte file, not "no sidecar" — and a final
+/// record that left no terminating newline.
+///
+/// That last shape is the subtle one: the file is a log of `<record>\n`
+/// lines, so a last byte that is not `\n` means the file was not cleanly
+/// written, whether or not the trailing bytes happen to form a complete
+/// JSON object. A plain `split(b'\n')` tail read happily returns such an
+/// object, and it DECODES, so without this rule a crash between the record
+/// and its delimiter would look like a good snapshot and the next append
+/// would be glued onto it (`{...}{...}` on one line, which the next read
+/// cannot decode). A missing delimiter therefore makes the whole tail
+/// UNKNOWN for every WRITER, independent of whether the append happens to
+/// emit both in one `write` (an interrupted `write_all` can still stop on a
+/// boundary). The decoded value is still the newest snapshot for DISPLAY:
+/// the record bytes are complete, only its terminator is missing.
 ///
 /// The last good snapshot still opens the session for DISPLAY (a torn tail
 /// is a crash artifact), but provenance must know the read was incomplete:
-/// an undecodable or missing record means "unknown", never "this session has
-/// no parent".
+/// an undecodable, unterminated, or missing record means "unknown", never
+/// "this session has no parent".
 ///
 /// Records are read as BYTES, not with `lines()`: `lines()` requires every
 /// line to be valid UTF-8, so a write that stopped inside a multi-byte
@@ -4514,16 +4562,44 @@ fn jsonl_read_meta_snapshot_and_unknown(
     let mut latest: Option<SessionMeta> = None;
     let mut unknown = false;
     let mut saw_record = false;
-    for record in std::io::BufReader::new(file).split(b'\n') {
-        let record =
-            record.with_context(|| format!("cannot read session metadata {}", path.display()))?;
+    // `read_until` (not `BufRead::split`) so each chunk keeps the answer to
+    // "did this record get its delimiter?": `split` POPS it, leaving the
+    // final record of a clean file indistinguishable from a tail that never
+    // got one.
+    let mut reader = std::io::BufReader::new(file);
+    let mut record = Vec::new();
+    loop {
+        record.clear();
+        let read = reader
+            .read_until(b'\n', &mut record)
+            .with_context(|| format!("cannot read session metadata {}", path.display()))?;
+        if read == 0 {
+            break; // clean EOF at a record boundary
+        }
+        let terminated = record.last() == Some(&b'\n');
+        if terminated {
+            record.pop();
+        }
         if record.iter().all(u8::is_ascii_whitespace) {
+            // Whitespace after the last delimiter is still an unterminated
+            // tail (the writer only ever emits `<record>\n`), so it is
+            // damage even though it holds no record.
+            if !terminated {
+                unknown = true;
+                break;
+            }
             continue;
         }
         saw_record = true;
+        if !terminated {
+            unknown = true;
+        }
         match serde_json::from_slice::<SessionMeta>(&record) {
             Ok(meta) => latest = Some(meta),
             Err(_) => unknown = true,
+        }
+        if !terminated {
+            break; // EOF: the next `read_until` would return 0 anyway
         }
     }
     Ok((latest, unknown || !saw_record))
@@ -4531,16 +4607,18 @@ fn jsonl_read_meta_snapshot_and_unknown(
 
 /// The refusal every JSONL metadata WRITER returns when
 /// [`jsonl_read_meta_snapshot_and_unknown`] reports `unknown`: the sidecar
-/// holds a torn record (or no record at all), so its provenance is unknown
-/// and it is DISPLAY-only. Appending would either glue the new snapshot onto
-/// a torn tail (no trailing newline) or become the next snapshot a later
-/// read trusts — silently rewriting unknown provenance into a clean one.
-/// Repair is explicit (remove the file), never a metadata write, and the
-/// error names the file so the caller can act on it.
+/// holds a torn record (or no record at all), or its last record never got
+/// its newline, so its provenance is unknown and it is DISPLAY-only.
+/// Appending would either glue the new snapshot onto that unterminated tail
+/// or become the next snapshot a later read trusts — silently rewriting
+/// unknown provenance into a clean one. Repair is explicit (remove the
+/// file), never a metadata write, and the error names the file so the
+/// caller can act on it.
 fn jsonl_refuse_damaged_meta(path: &Path) -> anyhow::Error {
     anyhow::anyhow!(
-        "session metadata {} is damaged (an undecodable record from an interrupted write); \
-         refusing to append a new snapshot so its unknown provenance is not rewritten",
+        "session metadata {} is damaged (an undecodable or unterminated record from an \
+         interrupted write); refusing to append a new snapshot so its unknown provenance is \
+         not rewritten",
         path.display()
     )
 }

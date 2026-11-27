@@ -5,7 +5,9 @@
 
 use super::*;
 use crate::agent::{AssistantMessage, Message};
+use crate::runner::IdlePolicy;
 use crate::session::Session;
+use crate::session_factory::{SessionFactory, UnfinishedPolicy};
 
 fn entries() -> Vec<SessionEntry> {
     vec![
@@ -1392,8 +1394,13 @@ fn assert_write_refused(
 /// naming the file and leave the bytes byte-identical: an append would be
 /// glued onto the torn tail and the next read would trust it, laundering
 /// unknown provenance into a clean snapshot. The session still opens with
-/// its history and unknown provenance, so `link_ref` stays off.
+/// its history and unknown provenance, so `link_ref` stays off. Resume is
+/// exercised THROUGH THE FACTORY with a model name (what `--session`/web
+/// resume actually does), never by loading the transcript directly: passing
+/// `None` to `create_meta` skips the optional model backfill, which is the
+/// only write a damaged sidecar refuses.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn every_writer_refuses_a_torn_sidecar_tail() {
     let temp = tempfile::tempdir().unwrap();
     let store = SessionStore::Jsonl;
@@ -1460,16 +1467,40 @@ async fn every_writer_refuses_a_torn_sidecar_tail() {
         &torn,
         "create_meta backfill",
     );
-    // A create with nothing to backfill is still the idempotent reopen
-    // no-op: the refusal only guards appends.
-    store
-        .create_meta(root, &sid, None, None, None, None, None)
+    // The real resume path: the factory passes the CONFIGURED MODEL NAME,
+    // which is precisely the backfill this damaged sidecar refuses. It must
+    // still OPEN the session — skipping the optional write — instead of
+    // failing a resume whose transcript is intact.
+    let _env = crate::roles::XDG_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let reopened = SessionFactory::test_factory(temp.path().to_path_buf())
+        .build(
+            &sid,
+            None,
+            None,
+            IdlePolicy::FinishWhenIdle,
+            UnfinishedPolicy::Preserve,
+        )
         .await
-        .unwrap();
+        .unwrap_or_else(|error| {
+            panic!("a resume must open the damaged session, not fail it: {error:#}")
+        });
+    assert_eq!(
+        Session::load(root, &sid).unwrap().entries,
+        entries(),
+        "the intact transcript still opens"
+    );
+    let names = reopened.runner.tool_names_for_test();
+    assert!(
+        !names.iter().any(|name| name == "link_ref"),
+        "a torn record is unknown provenance, so link_ref must stay off: {names:?}"
+    );
+    drop(reopened);
     assert_eq!(
         std::fs::read(&path).unwrap(),
         torn,
-        "an idempotent resume never writes to the damaged sidecar"
+        "resume never writes to the damaged sidecar"
     );
 
     // Display still works: the last good snapshot renders, the history
@@ -1488,4 +1519,185 @@ async fn every_writer_refuses_a_torn_sidecar_tail() {
         store.metadata_parent(root, &sid).await.unwrap(),
         PersistedParent::Unknown
     ));
+}
+
+/// The shape a torn tail does NOT cover: the record itself is COMPLETE and
+/// decodes — only its terminating newline never landed (the append used to
+/// emit the record and its `\n` as two writes, so stopping between them left
+/// a fully decodable object as the file's last bytes). `split(b'\n')` hands
+/// that whole object back as the last record, so a naive tail read believes
+/// the file is clean: the next writer would glue its own object onto it, and
+/// `update_refs` even returned `Ok(new_links)` for an edit the NEXT reader
+/// cannot decode. A final record without its newline is therefore damage:
+/// every writer refuses, byte-identically, while display keeps the value.
+#[tokio::test]
+async fn a_final_record_without_its_newline_is_damaged() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let store = SessionStore::Jsonl;
+    let sid = format!("meta-newline-{}", crate::session::new_id());
+    Session::append(root, &sid, &entries()).unwrap();
+    store
+        .create_meta(
+            root,
+            &sid,
+            Some("gpt-x"),
+            Some("main"),
+            None,
+            None,
+            Some("kept title"),
+        )
+        .await
+        .unwrap();
+    let path = sidecar(root, &sid);
+    let clean = std::fs::read(&path).unwrap();
+    assert!(clean.ends_with(b"\n"), "the writer terminates the record");
+    assert!(
+        !store.meta_is_damaged(root, &sid).await.unwrap(),
+        "a cleanly closed sidecar is not damaged"
+    );
+
+    // The crash: the record is fully on disk, its delimiter is not.
+    let unterminated = &clean[..clean.len() - 1];
+    std::fs::write(&path, unterminated).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<SessionMeta>(unterminated)
+            .expect("the unterminated record still decodes")
+            .title
+            .as_deref(),
+        Some("kept title"),
+        "the test must leave a COMPLETE record, not a torn one"
+    );
+    assert!(
+        store.meta_is_damaged(root, &sid).await.unwrap(),
+        "a missing terminator is damage even though the record decodes"
+    );
+
+    // The edit the old code acknowledged while corrupting the file: the
+    // helper asserts the error names the file AND leaves the bytes
+    // byte-identical, so nothing was appended.
+    assert_write_refused(
+        store
+            .update_refs(root, &sid, |refs| {
+                refs.push(SessionRef::new("pr", "https://github.com/acme/widget/pull/14").unwrap());
+                Ok(())
+            })
+            .await
+            .map(|_| ()),
+        &path,
+        unterminated,
+        "update_refs",
+    );
+    // The other writers are guarded by the same read.
+    assert_write_refused(
+        store.set_title(root, &sid, Some("renamed")).await,
+        &path,
+        unterminated,
+        "set_title",
+    );
+    assert_write_refused(
+        jsonl_touch_meta(root, &sid),
+        &path,
+        unterminated,
+        "touch_meta",
+    );
+
+    // Display still renders the complete record: this is damage, not loss.
+    let listed = store.list_meta(root).await.unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .find(|meta| meta.session_id == sid)
+            .expect("the session still lists")
+            .title
+            .as_deref(),
+        Some("kept title")
+    );
+    assert_eq!(Session::load(root, &sid).unwrap().entries, entries());
+}
+
+/// Bootstrap legitimately creates a snapshot with `model: None` (the
+/// transcript backfill has no model to record). Interrupt a later title
+/// write mid-object and resume: the factory passes the configured model, so
+/// `create_meta` sees "existing row is missing its model" — exactly the
+/// OPTIONAL backfill a damaged sidecar refuses. Propagating that refusal made
+/// the session LIST but never OPEN. Resume must skip the optional write and
+/// still open it: history intact, provenance unknown (`link_ref` off), bytes
+/// untouched. The refusal itself stays for callers that asked for the write.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn resume_opens_a_damaged_sidecar_without_the_optional_backfill() {
+    let _env = crate::roles::XDG_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    let store = SessionStore::Jsonl;
+    let sid = format!("meta-resume-damaged-{}", crate::session::new_id());
+    Session::append(&root, &sid, &entries()).unwrap();
+    // A bootstrap-backfilled first snapshot: no model yet.
+    store
+        .create_meta(&root, &sid, None, Some("main"), None, None, None)
+        .await
+        .unwrap();
+    let path = sidecar(&root, &sid);
+    // The crash: a title write stopped mid-object, so a decodable snapshot
+    // is followed by a torn record with no trailing newline.
+    let mut damaged = std::fs::read(&path).unwrap();
+    damaged.extend_from_slice(b"{\"session_id\":\"");
+    std::fs::write(&path, &damaged).unwrap();
+
+    // The explicit backfill refusal is unchanged for a caller that ASKED for
+    // the model to be recorded.
+    assert_write_refused(
+        store
+            .create_meta(&root, &sid, Some("gpt-x"), Some("main"), None, None, None)
+            .await,
+        &path,
+        &damaged,
+        "create_meta backfill",
+    );
+    assert!(store.meta_is_damaged(&root, &sid).await.unwrap());
+
+    // The real resume path — factory, configured model name — opens it, and
+    // opens it again on a second reopen.
+    let factory = SessionFactory::test_factory(root.clone());
+    for build in 1..=2 {
+        let reopened = factory
+            .build(
+                &sid,
+                None,
+                None,
+                IdlePolicy::FinishWhenIdle,
+                UnfinishedPolicy::Preserve,
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!("build {build} of a damaged sidecar must open, not backfill: {error:#}")
+            });
+        assert_eq!(
+            Session::load(&root, &sid).unwrap().entries,
+            entries(),
+            "build {build}: the intact transcript still opens"
+        );
+        let names = reopened.runner.tool_names_for_test();
+        assert!(
+            !names.iter().any(|name| name == "link_ref"),
+            "build {build}: unknown provenance keeps link_ref off: {names:?}"
+        );
+        drop(reopened);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            damaged,
+            "build {build}: the optional backfill is never attempted"
+        );
+    }
+    // The row is still listed, still without a model: nothing was rewritten.
+    let listed = store.list_meta(&root).await.unwrap();
+    let meta = listed
+        .iter()
+        .find(|meta| meta.session_id == sid)
+        .expect("the session still lists");
+    assert_eq!(meta.model, None, "the refused backfill never landed");
+    assert_eq!(meta.parent_session_id, None);
 }
