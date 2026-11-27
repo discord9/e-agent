@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 
 use crate::model::ImageRejection;
 use crate::output_receipt::{FieldId, bound_field};
+use crate::poll_score;
 use crate::session_store::EntryLocation;
 
 /// Content of the synthetic error result inserted for every tool call left
@@ -33,12 +34,84 @@ pub(crate) const POLL_GUARD_SENTINEL: &str = "\u{0}poll-guard-terminate";
 pub(crate) const POLL_GUARD_TERMINATION_NOTICE: &str =
     "repeated get_background_tasks calls with an unchanged task list; ending this turn";
 
+// Advisory notices for a turn spent waiting instead of ending. Each one is
+// armed by exactly one detector in [`crate::poll_score`], at most once per
+// turn, and delivered by the runner's turn loop as ONE
+// `SessionEntry::Notice` on the NEXT provider request — never a tool error,
+// never a `UserPrompt`, never a turn end. The text names what was actually
+// observed plus a citation of the round/tool/arguments it observed (see
+// [`poll_score::Notice::cited_text`]), never an excerpt of tool output.
+
+/// Detector A: an identical tool call repeated (same tool, same canonical
+/// arguments, byte-identical result).
+pub(crate) const REPEAT_CALL_NOTICE: &str = "This call returned exactly the same text as the identical call before it, so repeating it cannot change the answer. Do not call it again. Use the result already in context, or end the turn and wait for the automatic [background task N completed] injection.";
+
+/// Detector B: three consecutive calls of the same digit-normalised shape.
+pub(crate) const REPEAT_SHAPE_NOTICE: &str = "Three calls in a row differ only by an incrementing number, so repeating the shape cannot change the answer. Do not poll with a counter: use the result already in context, or end the turn and wait for the automatic [background task N completed] injection.";
+
+/// Detectors C and D: shell-only waiting (`sleep`, `echo`, `date`, …). Both
+/// observe the same thing — a command that cannot advance the task — so they
+/// share one text.
+pub(crate) const WAIT_COMMAND_NOTICE: &str = "Waiting in the shell does not advance the background task: sleeping or echoing changes nothing it can observe. The completion is injected automatically at the next model call, so end the turn and wait for it, or do other work instead.";
+
+/// Detector E: the reasoning of a second assistant message in the turn keeps
+/// saying it will wait.
+pub(crate) const WAIT_TALK_NOTICE: &str = "Your reasoning keeps saying you will wait, but nothing advances while the turn stays open. The background completion is injected automatically at the next model call: end the turn and wait for it instead of narrating another wait.";
+
+/// Detector F: the same tool keeps failing with the same error, whatever the
+/// arguments were changed to.
+pub(crate) const SAME_ERROR_NOTICE: &str = "The same error came back again: a different path or argument does not change the reason, so retrying with another input cannot succeed. Act on the error, or stop and report it.";
+
+impl poll_score::Notice {
+    /// The constant text for what this detector actually observed.
+    pub(crate) fn text(self) -> &'static str {
+        match self {
+            poll_score::Notice::Repeat => REPEAT_CALL_NOTICE,
+            poll_score::Notice::Shape => REPEAT_SHAPE_NOTICE,
+            poll_score::Notice::Sleep | poll_score::Notice::Noop => WAIT_COMMAND_NOTICE,
+            poll_score::Notice::WaitTalk => WAIT_TALK_NOTICE,
+            poll_score::Notice::SameError => SAME_ERROR_NOTICE,
+        }
+    }
+
+    /// The notice the model receives: the constant text above plus a citation
+    /// of the events it was derived from — the round of the turn, and for a
+    /// tool call its name and the digest of its canonical arguments. The tool
+    /// RESULT is never quoted, not even clipped: the model already holds the
+    /// real text, so an excerpt would report something that did not happen.
+    /// `call` is `None` for the reasoning detector, which cites its round only.
+    pub(crate) fn cited_text(self, round: usize, call: Option<(&str, &str)>) -> String {
+        match call {
+            Some((tool, arguments)) => format!(
+                "{} [evidence: round {round}, tool {tool}, arguments sha256 {}]",
+                self.text(),
+                poll_score::arguments_digest(arguments)
+            ),
+            None => format!("{} [evidence: round {round}]", self.text()),
+        }
+    }
+}
+
 /// True when a tool result is the poll-guard termination result (an
 /// unchanged-snapshot poll at the configured termination threshold: 3rd for
 /// subagents, 5th for the main agent). Batch loops use this to set a local
 /// latch while retaining the complete result in history/UI.
 pub(crate) fn is_poll_guard_terminate(result: &Result<ToolOutput, String>) -> bool {
     matches!(result, Err(error) if error.ends_with(POLL_GUARD_SENTINEL))
+}
+
+/// True when the shipped `get_background_tasks` snapshot guard already
+/// answered this result — with its reminder text or its termination notice.
+/// The runner's turn loop must not feed such a result to the wait detectors:
+/// the shipped guard owns repeated polling, so one repetition never produces
+/// two advisories in one request.
+pub(crate) fn poll_guard_fired(result: &Result<ToolOutput, String>) -> bool {
+    let Err(error) = result else {
+        return false;
+    };
+    is_poll_guard_terminate(result)
+        || error.contains(POLL_GUARD_ERROR)
+        || error.contains(POLL_GUARD_TERMINATION_NOTICE)
 }
 
 /// Map a legacy sentinel to model-facing text and remove one current terminal
@@ -2690,6 +2763,9 @@ impl Agent {
             {
                 self.emit(AgentEvent::AssistantText(content.into()));
             }
+            // Detector E lives in the runner's turn loop (the one path main and
+            // subagent sessions take), not here: this direct-`run` path is
+            // only used by tests.
             self.push_message(Message::Assistant(assistant.clone()));
             // Poll guard: the terminating unchanged-snapshot
             // get_background_tasks poll (3rd for subagents, 5th for the

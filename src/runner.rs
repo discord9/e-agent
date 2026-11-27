@@ -4,9 +4,10 @@ use crate::{
     agent::{
         Agent, AgentEvent, BACKGROUND_REMINDER, CompactionOutput, GoalStatus, ImagePart, Message,
         Model, POLL_GUARD_TERMINATION_NOTICE, RoundOutput, SessionEntry, ToolCall, ToolOutput,
-        ToolSpec, is_poll_guard_terminate, tool_error_content,
+        ToolSpec, is_poll_guard_terminate, poll_guard_fired, tool_error_content,
     },
     model::{ImageRejection, image_rejection},
+    poll_score::PollWatch,
     session_store::{LocatedKey, SessionStore},
 };
 
@@ -1154,6 +1155,12 @@ pub struct SessionRunner {
     before_goal_notice_drain: Option<Box<dyn FnOnce() + Send>>,
     #[cfg(test)]
     before_read_only_tool: Option<Box<dyn FnOnce() + Send>>,
+    /// Wait-thrash detectors behind the advisory notices: consecutive-call
+    /// chains, per-turn wait counters, and the round being cited. Pure session
+    /// state — never persisted, never reconstructed from history — and dropped
+    /// by [`PollWatch::invalidate`] when the rounds it cites stop existing
+    /// (compaction) or the session moves to another model.
+    poll_watch: PollWatch,
 }
 
 impl Drop for SessionRunner {
@@ -1418,6 +1425,7 @@ impl SessionRunner {
                 maintenance_resume: false,
                 pending_regular_reaction: false,
                 goal_notice_unconsumed: false,
+                poll_watch: PollWatch::default(),
                 goal_continuation_remaining: None,
                 goal_continuation_usage_unavailable: false,
                 goal_continuation_armed: false,
@@ -2407,6 +2415,9 @@ impl SessionRunner {
                 // Instant, not queued: the new model applies to the next
                 // model call (a call already in flight keeps its model).
                 self.agent.set_model(model, context_window);
+                // A different model sees a different context: the rounds the
+                // wait detectors were citing no longer exist for it.
+                self.poll_watch.invalidate();
                 // The live routing identity a fork child must inherit; the
                 // request head captured at build time is stale from here on.
                 self.shared.lock().unwrap().live_model = Some((profile, context_window));
@@ -2518,6 +2529,13 @@ impl SessionRunner {
                 &entry,
                 SessionEntry::Notice { .. } | SessionEntry::BackgroundCompletion { .. }
             );
+            if child_id.is_some() {
+                // Waiting produced something: a second sleep/no-op after a
+                // completion is legitimate pacing for the NEXT task, so the
+                // per-turn wait counters start over (the cross-call chains do
+                // not: the calls themselves did not change).
+                self.poll_watch.background_completed();
+            }
             self.agent.apply_entry_located(entry, location);
             let mut shared = self.shared.lock().unwrap();
             shared.set_history_boundary(self.agent.history().len());
@@ -2623,6 +2641,10 @@ impl SessionRunner {
                     context_window,
                 } => {
                     self.agent.set_model(model, context_window);
+                    // A different model sees a different context: the rounds
+                    // the detectors were citing no longer exist for it, so
+                    // nothing may be carried across the switch.
+                    self.poll_watch.invalidate();
                     self.shared.lock().unwrap().live_model = Some((profile, context_window));
                 }
                 other => deferred.push(other),
@@ -2753,6 +2775,11 @@ impl SessionRunner {
                         return OperationFlow::Finished;
                     }
                 };
+                // The rounds the wait detectors cite were just replaced by the
+                // compaction summary: drop the chains, counters and latch so a
+                // notice can never refer to rounds that no longer exist in
+                // context (nor claim a repeat across a rewritten history).
+                self.poll_watch.invalidate();
                 // Publish the complete projection only after durable commit. Streaming
                 // deltas were sent live-only while the operation was in flight.
                 self.shared.lock().unwrap().emit_durable(projection);
@@ -3283,6 +3310,10 @@ impl SessionRunner {
             // never reset it.
             if !resume_turn {
                 self.agent.start_turn();
+                // A true turn starts the per-turn wait counters and the
+                // once-per-turn notice latch over; the cross-call repeat/shape
+                // chains deliberately do not reset here.
+                self.poll_watch.start_turn();
             }
             let specs = self.agent.tool_specs();
             // A valid answer is human-owned work required to complete the
@@ -3333,6 +3364,8 @@ impl SessionRunner {
                     self.pending_regular_reaction = false;
                 }
                 self.prepare_web_attach();
+                // One round per provider request: the index a notice cites.
+                let poll_round = self.poll_watch.begin_round();
                 let waited =
                     await_round(&mut self.agent, &specs, &mut self.commands, &self.shared).await;
                 let round = match waited.outcome {
@@ -3417,6 +3450,9 @@ impl SessionRunner {
                 }
                 let calls = assistant.tool_calls.clone();
                 let content = assistant.content.clone();
+                // Detector E needs this round's reasoning; captured before the
+                // assistant entry is committed (the message moves into it).
+                let reasoning = assistant.reasoning.clone();
                 if calls.is_empty() {
                     self.last_answer = content.clone();
                 }
@@ -3566,6 +3602,15 @@ impl SessionRunner {
                 // commit_backgrounds safe point.
                 let mut poll_terminate = false;
                 let mut requested_compaction = false;
+                // The wait detectors' armed notice for THIS sibling batch. A
+                // message with no tool calls ends the turn (checked above), so
+                // only rounds that keep working reach here: detector E's
+                // wait-talk has something to advise on.
+                let mut poll_notice = self.poll_watch.reasoning(reasoning.as_deref());
+                // The call a notice cites, when a tool call armed it (detector
+                // E cites its round only). Never the result: the notice names
+                // the event, it does not paste an excerpt of tool output.
+                let mut poll_cite: Option<(String, String)> = None;
                 // One do-not-wait reminder per sibling batch, however many
                 // calls started background work (coalesced below).
                 let mut background_started = false;
@@ -3938,6 +3983,26 @@ impl SessionRunner {
                         self.terminate(SessionResult::Failed(error), pending).await;
                         return;
                     }
+                    // Wait detectors A-D/F see the committed result text,
+                    // exactly what the model sees. A result the shipped
+                    // `get_background_tasks` snapshot guard already answered is
+                    // NOT observed: that guard owns repeated polling, so one
+                    // repetition never produces two advisories in one request.
+                    if !poll_guard_fired(&result) {
+                        let started = result
+                            .as_ref()
+                            .is_ok_and(|output| output.background_started);
+                        if let Some(notice) = self.poll_watch.observe(
+                            &call.name,
+                            &call.arguments,
+                            &tool_text,
+                            started,
+                            is_error,
+                        ) {
+                            poll_notice = Some(notice);
+                            poll_cite = Some((call.name.clone(), call.arguments.clone()));
+                        }
+                    }
                     self.sync_background_projection().await;
                     self.shared
                         .lock()
@@ -3981,6 +4046,30 @@ impl SessionRunner {
                     self.terminate(SessionResult::Failed(format!("{error:#}")), Vec::new())
                         .await;
                     return;
+                }
+                // A detector armed ONE advisory for this turn: durable now, so
+                // the NEXT provider request of this same turn carries it right
+                // after the real tool results. It is a session event on the one
+                // fanout path (`commit` -> `emit_durable`), never a side
+                // channel, never a tool error, never a turn end. When the
+                // shipped poll guard terminated this turn it already answered
+                // the repetition, so the detector stays silent.
+                if let Some(notice) = poll_notice
+                    && !poll_terminate
+                {
+                    let text = match &poll_cite {
+                        Some((tool, arguments)) => {
+                            notice.cited_text(poll_round, Some((tool, arguments)))
+                        }
+                        // Detector E observed the round's reasoning: cite the
+                        // round, never a tool result.
+                        None => notice.cited_text(poll_round, None),
+                    };
+                    if let Err(error) = self.commit(SessionEntry::Notice { text }).await {
+                        self.terminate(SessionResult::Failed(format!("{error:#}")), Vec::new())
+                            .await;
+                        return;
+                    }
                 }
                 // The assistant's full tool-result batch is durably
                 // committed: drain + durably commit any background
