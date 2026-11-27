@@ -3664,11 +3664,12 @@ async fn session_usage(
 /// is a 404 like every other per-session read; the diff itself is the
 /// session's own workspace. A live subagent may have been given its own
 /// workspace (its `SessionEntry.cwd`), and that is the one it actually
-/// changed; every other session resolves to the factory workspace.
+/// changed; a live main session runs in the factory workspace.
 ///
-/// A session whose own worktree is gone has no diff: the payload is
-/// `repository: false` with an "unavailable" message instead of another
-/// workspace's changes.
+/// The live/known distinction is kept: a registry miss is a historical
+/// transcript, and a historical *child* has no recorded worktree, so it is
+/// `unavailable` — never another workspace's changes. A session whose own
+/// worktree is gone is `unavailable` for the same reason.
 ///
 /// See [`crate::diff::workspace_diff`] for the inspection contract: status,
 /// patch and counts are scoped to the workspace pathspec, the base is the
@@ -3683,7 +3684,7 @@ async fn session_diff(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<crate::diff::DiffReport>, (StatusCode, String)> {
-    let _ = resolve_session_store(&state, &id, true).await?;
+    let (store, historical) = resolve_session_store(&state, &id, true).await?;
     let root = match live(&state, &id) {
         Ok(SessionRef::Subagent { entry, .. }) => {
             let cwd = PathBuf::from(&entry.cwd);
@@ -3698,7 +3699,31 @@ async fn session_diff(
             }
             cwd
         }
-        _ => state.factory.workspace().root().to_path_buf(),
+        Ok(SessionRef::Live(_)) => state.factory.workspace().root().to_path_buf(),
+        // A historical transcript: a main session ran in the factory
+        // workspace, but a finished child ran in a worktree that is not
+        // recorded anywhere once its delegate is gone. Reporting the factory
+        // root for it would show another workspace's changes under the
+        // child's name, so it is reported as unavailable instead.
+        Err(_) if historical => {
+            let metas = store
+                .list_meta(state.factory.root())
+                .await
+                .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+            let child = metas
+                .iter()
+                .any(|meta| meta.session_id == id && meta.parent_session_id.is_some());
+            if child {
+                return Ok(Json(crate::diff::unavailable(
+                    std::path::Path::new(""),
+                    format!(
+                        "session worktree is unavailable: finished child session {id} has no recorded workspace (no diff to show)"
+                    ),
+                )));
+            }
+            state.factory.workspace().root().to_path_buf()
+        }
+        Err(err) => return Err(err),
     };
     Ok(Json(crate::diff::workspace_diff(&root).await))
 }
@@ -9478,6 +9503,69 @@ model = "deepseek-chat"
             "{value}"
         );
         assert_eq!(value["files"], serde_json::json!([]));
+    }
+
+    /// A *finished* child whose delegate is gone has no recorded worktree: its
+    /// payload is unavailable, never the factory workspace's diff under the
+    /// child's name. The counterexample is the registry miss itself — the same
+    /// request used to resolve to the factory root.
+    #[tokio::test]
+    async fn session_diff_finished_child_without_worktree_is_unavailable() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        use crate::session::Session;
+
+        let (state, root) = fork_test_state("diff-finished-child");
+        let child = "web-finished-child";
+        Session::append(&root, child, &[user_message("hello")]).unwrap();
+        // A child row: the delegate recorded the parent, never a worktree.
+        crate::session_store::SessionStore::Jsonl
+            .create_meta(
+                &root,
+                child,
+                Some("sub-model"),
+                None,
+                Some("web-parent"),
+                Some(7),
+                None,
+            )
+            .await
+            .unwrap();
+        let factory_root = state.factory.workspace().root().to_path_buf();
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sessions/{child}/diff"))
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["repository"], serde_json::json!(false));
+        assert!(
+            value["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("worktree is unavailable"),
+            "{value}"
+        );
+        assert_eq!(value["files"], serde_json::json!([]));
+        assert_ne!(
+            value["workspace"],
+            serde_json::json!(factory_root.display().to_string()),
+            "a finished child must not be reported as another workspace"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// M5: `session_history` for an unknown session id returns 404 — the
