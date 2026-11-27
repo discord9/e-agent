@@ -947,6 +947,9 @@ impl SessionFactory {
             None
         };
         let mut store = SessionStore::connect(&self.backend, &self.root, &session).await?;
+        // Whether this build CONTINUES another session's transcript (CLI/TUI
+        // `--fork`, web fork) — captured before `fork_from` is consumed.
+        let forked = fork_from.is_some();
         if let Some((source, at)) = fork_from {
             // Zero-copy fork: the child's store receives ONLY its own frozen
             // goal plus the marker. The source prefix is read back read-only by
@@ -1075,15 +1078,22 @@ impl SessionFactory {
         register_run_rust(&mut tools, &tools_workspace, self.code_mode, self.read_only, self.rust_sandbox.clone());
         // Only the root/main session can pause for Web human input.
         add_root_user_input_tool(&mut tools);
-        // Main-session only: `link_ref` records PR/issue URLs on THIS
-        // session's metadata row through the store already open above (no
-        // second connection). Children/fork children build the common
-        // builtins, so they never see it.
-        tools.push(crate::tools::link_ref_tool(
-            store.clone(),
-            self.root.clone(),
-            session.clone(),
-        ));
+        // `link_ref` records PR/issue URLs on THIS session's metadata row
+        // through the store already open above (no second connection), so it
+        // belongs only to a session the human started from scratch: a
+        // user-created top-level session with no source transcript. A FORK is
+        // a top-level main session too (the user talks to it), but it
+        // continues another session's transcript — its links belong to the
+        // source it continues, so a fork must never rewrite them. Children
+        // (delegate/btw forks) build the common builtins and never see it
+        // either.
+        if !forked {
+            tools.push(crate::tools::link_ref_tool(
+                store.clone(),
+                self.root.clone(),
+                session.clone(),
+            ));
+        }
         // Main-agent only: `generate_image` (direct Codex image HTTP).
         // Read-only sessions skip it (it creates files), and so does a
         // workspace rooted at or below the canonical global skills
@@ -4696,6 +4706,76 @@ mod generate_image_registration_tests {
                 Some(&missing),
             )
             .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod link_ref_registration_tests {
+    use super::*;
+    use crate::agent::SessionEntry;
+    use crate::session::Session;
+
+    fn user(text: &str) -> SessionEntry {
+        crate::agent::Message::User {
+            content: text.to_owned(),
+            images: vec![],
+        }
+        .into()
+    }
+
+    fn assistant(text: &str) -> SessionEntry {
+        crate::agent::Message::Assistant(crate::agent::AssistantMessage {
+            content: Some(text.to_owned()),
+            tool_calls: vec![],
+            reasoning: None,
+        })
+        .into()
+    }
+
+    /// `link_ref` writes to THIS session's metadata row, so only a session the
+    /// human started from scratch gets it. A web fork goes through the same
+    /// factory path as a CLI fork (`build_fork` → `build_internal`) and IS a
+    /// new top-level main session, but it continues the SOURCE's transcript:
+    /// its links belong to the source, so it must not be able to relink them.
+    #[tokio::test]
+    async fn forked_sessions_are_built_without_link_ref() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        Session::append(&root, "refs-src", &[user("q0"), assistant("a0")]).unwrap();
+        let factory = SessionFactory::test_factory(root.clone());
+
+        let forked = factory
+            .build_fork(
+                "refs-fork",
+                "refs-src".to_owned(),
+                None,
+                IdlePolicy::FinishWhenIdle,
+                UnfinishedPolicy::Preserve,
+            )
+            .await
+            .expect("the web fork builds");
+        let names = forked.runner.tool_names_for_test();
+        assert!(
+            !names.iter().any(|name| name == "link_ref"),
+            "a fork must not relink the source it continues: {names:?}"
+        );
+        drop(forked);
+
+        let fresh = factory
+            .build(
+                "refs-main",
+                None,
+                None,
+                IdlePolicy::FinishWhenIdle,
+                UnfinishedPolicy::Preserve,
+            )
+            .await
+            .expect("the plain top-level session builds");
+        let names = fresh.runner.tool_names_for_test();
+        assert!(
+            names.iter().any(|name| name == "link_ref"),
+            "a user-created top-level session keeps link_ref: {names:?}"
         );
     }
 }
