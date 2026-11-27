@@ -7,7 +7,10 @@
 //! accumulated.
 
 use super::*;
-use crate::agent::{Agent, AssistantMessage, Message, Model, ModelDeltaKind, ToolCall, Usage};
+use crate::agent::{
+    Agent, AgentEvent, AssistantMessage, Message, Model, ModelDeltaKind, ToolCall, ToolOutput,
+    ToolSpec, Usage,
+};
 use crate::config::DEFAULT_ACP_ALLOW_KINDS;
 use crate::runner::{
     IdlePolicy, PromptSubmission, SessionResult, SessionRunner, SessionStatus, UserInputRequest,
@@ -107,6 +110,178 @@ const HANG_STUB: &str = r#"
 beat="$1"
 ( while :; do printf 'x' >> "$beat"; sleep 0.05; done ) &
 while IFS= read -r line; do :; done
+"#;
+
+/// Sends ONE permission request and exits without ever reading the answer:
+/// the child dies with the request still pending.
+const ASK_THEN_EXIT_STUB: &str = r#"
+log="$1"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  printf '%s\n' "$line" >> "$log"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true},"agentInfo":{"name":"stub-acp","version":"9.9.9"},"authMethods":[]}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess-exit-1"}}\n' "$id"
+      ;;
+    *'"method":"session/prompt"'*)
+      printf '{"jsonrpc":"2.0","id":9001,"method":"session/request_permission","params":{"sessionId":"sess-exit-1","toolCall":{"toolCallId":"r1","title":"read notes.md","kind":"read"},"options":[{"optionId":"allow-1","name":"Allow once","kind":"allow_once"}]}}\n'
+      exit 0
+      ;;
+  esac
+done
+"#;
+
+/// Advertises NO capabilities (`agentCapabilities` is empty), so
+/// `session/load` is not part of the negotiation. `session/load` is answered
+/// anyway, so a call must be visible in the log if one is (wrongly) made.
+const NO_LOAD_STUB: &str = r#"
+log="$1"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  printf '%s\n' "$line" >> "$log"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{},"agentInfo":{"name":"stub-acp","version":"9.9.9"},"authMethods":[]}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      n=$(grep -c '"method":"session/new"' "$log")
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess-noload-%s"}}\n' "$id" "$n"
+      ;;
+    *'"method":"session/load"'*)
+      sid=$(printf '%s' "$line" | grep -o '"sessionId":"[^"]*"' | head -1 | cut -d'"' -f4)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"%s"}}\n' "$id" "$sid"
+      ;;
+    *'"method":"session/prompt"'*)
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"fresh answer"}}}}\n'
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      ;;
+  esac
+done
+"#;
+
+/// Replays more restored history than [`TEXT_LIMIT`] allows as
+/// `agent_message_chunk`s on `session/load`, then answers the load and streams
+/// the real answer on the prompt.
+const REPLAY_STUB: &str = r#"
+log="$1"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  printf '%s\n' "$line" >> "$log"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true},"agentInfo":{"name":"stub-acp","version":"9.9.9"},"authMethods":[]}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess-replay"}}\n' "$id"
+      ;;
+    *'"method":"session/load"'*)
+      sid=$(printf '%s' "$line" | grep -o '"sessionId":"[^"]*"' | head -1 | cut -d'"' -f4)
+      i=0
+      while [ $i -lt 1500 ]; do
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"REPLAY-older-turn-"}}}}\n' "$sid"
+        i=$((i+1))
+      done
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"%s"}}\n' "$id" "$sid"
+      ;;
+    *'"method":"session/prompt"'*)
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"REAL ANSWER"}}}}\n'
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      ;;
+  esac
+done
+"#;
+
+/// Logs the cwd it was started in, then answers the handshake: proves which
+/// directory a (cold) reuse actually runs in.
+const CWD_STUB: &str = r#"
+log="$1"
+printf '{"stubPwd":"%s"}\n' "$(pwd)" >> "$log"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  printf '%s\n' "$line" >> "$log"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true},"agentInfo":{"name":"stub-acp","version":"9.9.9"},"authMethods":[]}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      n=$(grep -c '"method":"session/new"' "$log")
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess-cwd-%s"}}\n' "$id" "$n"
+      ;;
+    *'"method":"session/load"'*)
+      sid=$(printf '%s' "$line" | grep -o '"sessionId":"[^"]*"' | head -1 | cut -d'"' -f4)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"%s"}}\n' "$id" "$sid"
+      ;;
+    *'"method":"session/prompt"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      ;;
+  esac
+done
+"#;
+
+/// Asks ONE permission request (`allow_once` + `allow_always`) per prompt and
+/// logs the answer: one run per stub process, so two runs in one e-agent
+/// session reuse the same JSON-RPC id 9001.
+const ONE_ASK_STUB: &str = r#"
+log="$1"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  printf '%s\n' "$line" >> "$log"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true},"agentInfo":{"name":"stub-acp","version":"9.9.9"},"authMethods":[]}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      n=$(grep -c '"method":"session/new"' "$log")
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess-one-%s"}}\n' "$id" "$n"
+      ;;
+    *'"method":"session/load"'*)
+      sid=$(printf '%s' "$line" | grep -o '"sessionId":"[^"]*"' | head -1 | cut -d'"' -f4)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"%s"}}\n' "$id" "$sid"
+      ;;
+    *'"method":"session/prompt"'*)
+      printf '{"jsonrpc":"2.0","id":9001,"method":"session/request_permission","params":{"sessionId":"s","toolCall":{"toolCallId":"r1","title":"read notes.md","kind":"read"},"options":[{"optionId":"once-1","name":"Allow once","kind":"allow_once"},{"optionId":"always-1","name":"Always allow","kind":"allow_always"}]}}\n'
+      IFS= read -r answer
+      printf '%s\n' "$answer" >> "$log"
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"answered"}}}}\n'
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      ;;
+  esac
+done
+"#;
+
+/// Asks two permission requests: the first offers `allow_always` BEFORE
+/// `allow_once`, the second offers them the other way round, so the answer's
+/// `optionId` shows whether either kind was substituted for the other.
+const TWO_ALLOW_STUB: &str = r#"
+log="$1"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  printf '%s\n' "$line" >> "$log"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true},"agentInfo":{"name":"stub-acp","version":"9.9.9"},"authMethods":[]}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess-two-allow"}}\n' "$id"
+      ;;
+    *'"method":"session/load"'*)
+      sid=$(printf '%s' "$line" | grep -o '"sessionId":"[^"]*"' | head -1 | cut -d'"' -f4)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"%s"}}\n' "$id" "$sid"
+      ;;
+    *'"method":"session/prompt"'*)
+      printf '{"jsonrpc":"2.0","id":9001,"method":"session/request_permission","params":{"sessionId":"s","toolCall":{"toolCallId":"r1","title":"read notes.md","kind":"read"},"options":[{"optionId":"always-1","name":"Always allow","kind":"allow_always"},{"optionId":"once-1","name":"Allow once","kind":"allow_once"}]}}\n'
+      IFS= read -r answer
+      printf '%s\n' "$answer" >> "$log"
+      printf '{"jsonrpc":"2.0","id":9002,"method":"session/request_permission","params":{"sessionId":"s","toolCall":{"toolCallId":"r2","title":"read notes.md","kind":"read"},"options":[{"optionId":"once-2","name":"Allow once","kind":"allow_once"},{"optionId":"always-2","name":"Always allow","kind":"allow_always"}]}}\n'
+      IFS= read -r answer
+      printf '%s\n' "$answer" >> "$log"
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      ;;
+  esac
+done
 "#;
 
 fn stub_config(script: &str, log: &Path, load: &str) -> AcpConfig {
@@ -859,7 +1034,11 @@ async fn a_permission_request_asks_the_user_and_sends_the_chosen_option_id() {
     // Request 9001 (a `read`): ACP's own options become the question's
     // options, one-to-one, and the question names what the agent wants to do.
     let read = next_question(&mut status, "").await;
-    assert_eq!(read.call_id, "acp-permission-9001");
+    assert!(
+        read.call_id.starts_with("acp-permission-") && read.call_id.contains("-r1-"),
+        "the question id is the ask's identity (nonce + ACP tool call + digest): {}",
+        read.call_id
+    );
     assert_eq!(read.questions.len(), 1);
     assert_eq!(read.questions[0].prompt, "read notes.md");
     assert_eq!(
@@ -884,7 +1063,12 @@ async fn a_permission_request_asks_the_user_and_sends_the_chosen_option_id() {
 
     // Request 9002 (an `execute`): the title plus the raw command.
     let run = next_question(&mut status, &read.call_id).await;
-    assert_eq!(run.call_id, "acp-permission-9002");
+    assert!(
+        run.call_id.starts_with("acp-permission-") && run.call_id.contains("-t1-"),
+        "each ask has its own identity: {}",
+        run.call_id
+    );
+    assert_ne!(read.call_id, run.call_id);
     assert_eq!(run.questions[0].prompt, "run ls: ls -la");
     assert_eq!(
         handle.submit_prompt_with_call_id(Some(run.call_id.clone()), "reject-1".into()),
@@ -1011,10 +1195,11 @@ async fn an_answer_outside_the_offered_ids_and_an_abort_are_both_cancelled() {
     // A value that names none of the offered options (the runner rejects
     // those, so this is the defensive branch): never select an invented id.
     let bogus = answer_next_ask(&mut commands, Some("selected".into())).await;
-    assert_eq!(bogus.call_id, "acp-permission-9001");
+    assert!(bogus.call_id.contains("-r1-"), "{}", bogus.call_id);
     // An aborted ask (`None`) is the same outcome.
     let aborted = answer_next_ask(&mut commands, None).await;
-    assert_eq!(aborted.call_id, "acp-permission-9002");
+    assert!(aborted.call_id.contains("-t1-"), "{}", aborted.call_id);
+    assert_ne!(bogus.call_id, aborted.call_id);
 
     let output = tokio::time::timeout(Duration::from_secs(30), call)
         .await
@@ -1037,4 +1222,463 @@ async fn an_answer_outside_the_offered_ids_and_an_abort_are_both_cancelled() {
         "{}",
         output.content
     );
+}
+
+// ---------------------------------------------------------------------------
+// Structural guarantees: a dead child never parks the call, an answer is bound
+// to the ask it was given for, and reuse honours the negotiated capability.
+// ---------------------------------------------------------------------------
+
+/// `session/load`-free plan for a first call.
+fn open_new() -> Plan {
+    Plan {
+        open: Open::New,
+        notice: None,
+    }
+}
+
+/// Wait until `ready` holds, so an assertion never races a spawned task.
+async fn wait_until(mut ready: impl FnMut() -> bool, what: &str) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !ready() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{what}"));
+}
+
+#[tokio::test]
+async fn a_child_that_exits_with_a_permission_pending_fails_the_call() {
+    let temp = tempfile::tempdir().unwrap();
+    let log = temp.path().join("frames.log");
+    let root = Workspace::new(temp.path()).unwrap().root().to_path_buf();
+    let config = stub_config(ASK_THEN_EXIT_STUB, &log, "ok");
+    let (handle, emitter, _commands) = session_test_channel();
+    emitter.allow_user_input();
+    // A frontend exists, so the request becomes a question — and the test
+    // never answers it: only the child's death can resolve the wait.
+    let client = Client::connect(&config, &root, &open_new(), Some(handle))
+        .await
+        .expect("the stub completes the handshake");
+
+    let prompt = client.shared.request(
+        "session/prompt",
+        json!({"sessionId": "sess-exit-1", "prompt": [{"type": "text", "text": "hi"}]}),
+        PROMPT_TIMEOUT,
+    );
+    let error = tokio::time::timeout(Duration::from_secs(10), prompt)
+        .await
+        .expect("the prompt future must resolve when the child dies")
+        .expect_err("a dead child is an error, never an answer");
+    assert!(error.contains("exited during `session/prompt`"), "{error}");
+
+    // No entry survives: the parked ask is dropped, and so is every in-flight
+    // request (the reply can never arrive).
+    wait_until(
+        || client.shared.asking.lock().unwrap().current.is_none(),
+        "the parked permission ask was never dropped",
+    )
+    .await;
+    assert!(
+        client.shared.pending.lock().await.is_empty(),
+        "the in-flight request entries must be dropped"
+    );
+}
+
+#[test]
+fn a_permission_identity_is_unique_per_request_and_covers_the_action() {
+    let read = json!({
+        "toolCall": {"toolCallId": "r1", "title": "read notes.md", "kind": "read"},
+        "options": [{"optionId": "allow-1", "name": "Allow once", "kind": "allow_once"}],
+    });
+    let execute = json!({
+        "toolCall": {"toolCallId": "r1", "title": "run ls", "kind": "execute"},
+        "options": [{"optionId": "allow-1", "name": "Allow once", "kind": "allow_once"}],
+    });
+    let first = permission_identity(Some(&read));
+    let second = permission_identity(Some(&read));
+    assert_ne!(
+        first, second,
+        "two asks with the same JSON-RPC id, tool call, and action still get \
+         their own identity"
+    );
+    assert!(first.starts_with("acp-permission-"), "{first}");
+    assert!(
+        first.contains("-r1-"),
+        "the identity names the tool call: {first}"
+    );
+    // The digest is stable for identical content and differs for anything
+    // else: that is the part that covers the requested action.
+    assert_eq!(action_digest(Some(&read)), action_digest(Some(&read)));
+    assert_ne!(action_digest(Some(&read)), action_digest(Some(&execute)));
+}
+
+#[test]
+fn an_answer_for_a_superseded_ask_is_dropped_while_the_newer_ask_stays_pending() {
+    let mut pending = PendingPermission::default();
+    pending.claim("ask-1");
+    // A second run in one session registers its own ask (same JSON-RPC id in
+    // the stub, a different identity in the tool).
+    pending.claim("ask-2");
+    assert!(
+        !pending.release("ask-1"),
+        "run 1's late answer must not release run 2's pending entry"
+    );
+    assert_eq!(
+        pending.current.as_deref(),
+        Some("ask-2"),
+        "run 2 is pending"
+    );
+    assert!(pending.release("ask-2"), "run 2's own answer is used");
+    assert_eq!(pending.current, None);
+}
+
+/// A model that calls `acp_prompt` on the first provider round of EACH of two
+/// turns, so one e-agent session runs the tool twice.
+struct TwoRunModel {
+    rounds: usize,
+}
+
+#[async_trait]
+impl Model for TwoRunModel {
+    async fn complete(
+        &mut self,
+        _: &[Message],
+        _: &[ToolSpec],
+        _: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
+    ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
+        self.rounds += 1;
+        let (call, prompt) = match self.rounds {
+            1 => (Some("call-acp-1"), "first"),
+            3 => (Some("call-acp-2"), "second"),
+            _ => (None, ""),
+        };
+        let reply = match call {
+            Some(id) => AssistantMessage {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: id.into(),
+                    name: "acp_prompt".into(),
+                    arguments: json!({"prompt": prompt}).to_string(),
+                }],
+                reasoning: None,
+            },
+            None => AssistantMessage {
+                content: Some(format!("done-{}", self.rounds)),
+                tool_calls: Vec::new(),
+                reasoning: None,
+            },
+        };
+        Ok((reply, None))
+    }
+}
+
+/// Holds the session's background event sender: a `WaitForInput` runner whose
+/// background channel has no sender left terminates the session as `Closed`.
+struct KeepAlive {
+    sender: Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
+}
+
+#[async_trait]
+impl Tool for KeepAlive {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "keep_alive".into(),
+            description: "test only".into(),
+            parameters: json!({"type": "object"}),
+        }
+    }
+
+    async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
+        Ok(ToolOutput::text(String::new()))
+    }
+
+    fn set_event_sender(&mut self, sender: tokio::sync::mpsc::UnboundedSender<AgentEvent>) {
+        self.sender = Some(sender);
+    }
+
+    fn has_event_sender(&self) -> bool {
+        self.sender.is_some()
+    }
+}
+
+/// The runner with `acp_prompt` registered and an arbitrary model, keeping
+/// the session alive for the next turn (`WaitForInput`).
+fn runner_keeping_session(
+    root: &Path,
+    session: &str,
+    tool: Box<dyn Tool>,
+    model: Box<dyn Model>,
+) -> (
+    SessionRunner,
+    crate::runner::SessionHandle,
+    tokio::sync::watch::Receiver<SessionStatus>,
+) {
+    let agent = Agent::new(model, vec![tool, Box::new(KeepAlive { sender: None })]);
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        root.to_path_buf(),
+        session.to_owned(),
+        IdlePolicy::WaitForInput,
+    );
+    let (_, _events, status) = handle.attach();
+    (runner.with_user_input_allowed(), handle, status)
+}
+
+/// Wait for the runner to be idle again (turn finished, next prompt accepted).
+async fn idle(status: &mut tokio::sync::watch::Receiver<SessionStatus>) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if matches!(*status.borrow(), SessionStatus::Idle) {
+                return;
+            }
+            status.changed().await.expect("the runner keeps its status");
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the turn never finished; status={:?}", *status.borrow()))
+}
+
+#[tokio::test]
+async fn a_late_answer_to_run_one_cannot_answer_run_two() {
+    let temp = tempfile::tempdir().unwrap();
+    let log = temp.path().join("frames.log");
+    let root = Workspace::new(temp.path()).unwrap().root().to_path_buf();
+    let session = "session-stale";
+    let tool = tool_with(&root, stub_config(ONE_ASK_STUB, &log, "ok"), session).await;
+    let (runner, handle, mut status) =
+        runner_keeping_session(&root, session, tool, Box::new(TwoRunModel { rounds: 0 }));
+    let task = runner.start(Some("go".into()));
+
+    // Run 1: a real question, answered normally.
+    let first = next_question(&mut status, "").await;
+    assert!(
+        first.call_id.starts_with("acp-permission-"),
+        "the question carries the ask's identity: {}",
+        first.call_id
+    );
+    assert!(
+        first.call_id.contains("-r1-"),
+        "the identity names the ACP tool call: {}",
+        first.call_id
+    );
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some(first.call_id.clone()), "once-1".into()),
+        PromptSubmission::Answered
+    );
+    idle(&mut status).await;
+
+    // Run 2 reuses the same JSON-RPC id (9001) and the same tool-call id.
+    handle.prompt("again");
+    let second = next_question(&mut status, &first.call_id).await;
+    assert_ne!(
+        first.call_id, second.call_id,
+        "each ask gets its own identity, even with the same JSON-RPC id"
+    );
+    // Run 1's answer arrives now: rejected, and run 2 keeps waiting.
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some(first.call_id.clone()), "always-1".into()),
+        PromptSubmission::Conflict,
+        "a stale identity is never accepted"
+    );
+    match &*status.borrow() {
+        SessionStatus::WaitingInput(request) => assert_eq!(
+            request.call_id, second.call_id,
+            "run 2 is still the open question"
+        ),
+        other => panic!("run 2 must still be pending, status={other:?}"),
+    }
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some(second.call_id.clone()), "once-1".into()),
+        PromptSubmission::Answered
+    );
+    idle(&mut status).await;
+    drop(task);
+
+    // Both runs were answered with their OWN choice; the stale one never
+    // reached either stub.
+    let frames = logged_frames(&log);
+    let answers: Vec<&String> = frames
+        .iter()
+        .filter(|frame| frame.contains(r#""outcome":"selected""#))
+        .collect();
+    assert_eq!(answers.len(), 2, "one answer per run: {answers:?}");
+    for answer in answers {
+        assert!(answer.contains(r#""optionId":"once-1""#), "{answer}");
+    }
+    let second_receipt = tool_result(&root, session, "call-acp-2").await;
+    assert!(
+        !second_receipt.contains("denied"),
+        "run 2 was answered, not denied: {second_receipt}"
+    );
+}
+
+#[tokio::test]
+async fn a_load_that_was_not_negotiated_starts_a_new_session_and_stores_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let log = temp.path().join("frames.log");
+    let root = Workspace::new(temp.path()).unwrap().root().to_path_buf();
+    let tool = tool_with(&root, stub_config(NO_LOAD_STUB, &log, "ok"), "session-a").await;
+
+    tool.execute(json!({"prompt": "first"})).await.unwrap();
+    let output = tool.execute(json!({"prompt": "second"})).await.unwrap();
+
+    let frames = logged_frames(&log);
+    assert_eq!(
+        count(&frames, r#""method":"session/load""#),
+        0,
+        "`session/load` must not be called without `agentCapabilities.loadSession`"
+    );
+    assert_eq!(count(&frames, r#""method":"session/new""#), 2);
+    assert!(
+        output
+            .content
+            .starts_with("acp: stub-acp 9.9.9 · session sess-noload-2\n"),
+        "{}",
+        output.content
+    );
+    assert!(
+        output.content.contains("does not support `session/load`"),
+        "{}",
+        output.content
+    );
+    // The fresh id is persisted, so the next call reuses it.
+    assert_eq!(
+        stored(&root, "session-a").await.as_deref(),
+        Some("sess-noload-2")
+    );
+}
+
+#[tokio::test]
+async fn a_replayed_history_never_becomes_the_answer() {
+    let temp = tempfile::tempdir().unwrap();
+    let log = temp.path().join("frames.log");
+    let root = Workspace::new(temp.path()).unwrap().root().to_path_buf();
+    let tool = tool_with(&root, stub_config(REPLAY_STUB, &log, "ok"), "session-a").await;
+
+    tool.execute(json!({"prompt": "first"})).await.unwrap();
+    let output = tool.execute(json!({"prompt": "second"})).await.unwrap();
+
+    let frames = logged_frames(&log);
+    assert_eq!(
+        count(&frames, r#""method":"session/load""#),
+        1,
+        "the advertised capability is used"
+    );
+    // The whole replay is consumed, and none of it is the answer — even
+    // though it alone exceeds `TEXT_LIMIT`.
+    assert!(
+        output.content.contains("REAL ANSWER"),
+        "the answer must survive the replay: {}",
+        output.content
+    );
+    assert!(
+        !output.content.contains("REPLAY-older-turn-"),
+        "restored history must never be surfaced as the answer: {}",
+        output.content
+    );
+    assert!(
+        !output.content.contains("text truncated"),
+        "the replay must not fill the answer buffer: {}",
+        output.content
+    );
+    assert_eq!(
+        stored(&root, "session-a").await.as_deref(),
+        Some("sess-replay")
+    );
+}
+
+#[tokio::test]
+async fn a_cold_reuse_runs_in_the_cwd_of_the_current_call() {
+    let temp = tempfile::tempdir().unwrap();
+    let log = temp.path().join("frames.log");
+    let root = Workspace::new(temp.path()).unwrap().root().to_path_buf();
+    // First call at the workspace root, then a "restart": the next tool has no
+    // in-process cache, so the id can only come from the store — and the cwd
+    // can only come from the call that is running now.
+    let first = tool_with(&root, stub_config(CWD_STUB, &log, "ok"), "session-a").await;
+    first.execute(json!({"prompt": "before"})).await.unwrap();
+    assert_eq!(
+        stored(&root, "session-a").await.as_deref(),
+        Some("sess-cwd-1")
+    );
+    drop(first);
+    std::fs::create_dir(root.join("sub")).unwrap();
+
+    let restarted = tool_with(&root, stub_config(CWD_STUB, &log, "ok"), "session-a").await;
+    let output = restarted
+        .execute(json!({"prompt": "after", "workspace": "sub"}))
+        .await
+        .unwrap();
+
+    let sub = root.join("sub");
+    let frames = logged_frames(&log);
+    let load = frames
+        .iter()
+        .find(|frame| frame.contains(r#""method":"session/load""#))
+        .expect("the stored id is reused");
+    assert!(
+        load.contains(&format!(r#""cwd":"{}""#, sub.display())),
+        "the load must run in the current call's cwd: {load}"
+    );
+    // The process itself was started there too (the stub logs `$(pwd)`): one
+    // frame per spawned agent, and the reuse one is the call's cwd.
+    assert!(
+        frames
+            .iter()
+            .any(|frame| frame.contains(&format!(r#""stubPwd":"{}""#, sub.display()))),
+        "no agents ran in {}: {}",
+        sub.display(),
+        frames.join("\n")
+    );
+    assert!(
+        output.content.contains("session sess-cwd-1"),
+        "{}",
+        output.content
+    );
+}
+
+#[tokio::test]
+async fn an_allow_always_choice_is_sent_verbatim_never_downgraded() {
+    let temp = tempfile::tempdir().unwrap();
+    let log = temp.path().join("frames.log");
+    let root = Workspace::new(temp.path()).unwrap().root().to_path_buf();
+    let session = "session-allow-kinds";
+    let mut tool = tool_with(&root, stub_config(TWO_ALLOW_STUB, &log, "ok"), session).await;
+    let (handle, emitter, mut commands) = session_test_channel();
+    emitter.allow_user_input();
+    tool.set_session_handle(session, handle);
+    let call = tokio::spawn(async move { tool.execute(json!({"prompt": "hi"})).await });
+
+    // Request 9001 offers `allow_always` FIRST; the human picks it.
+    let always = answer_next_ask(&mut commands, Some("always-1".into())).await;
+    assert!(always.call_id.contains("-r1-"), "{}", always.call_id);
+    // Request 9002 offers `allow_once` first; the human picks that one.
+    let once = answer_next_ask(&mut commands, Some("once-2".into())).await;
+    assert!(once.call_id.contains("-r2-"), "{}", once.call_id);
+
+    let output = tokio::time::timeout(Duration::from_secs(30), call)
+        .await
+        .expect("both questions were answered")
+        .unwrap()
+        .expect("the stub resolves the prompt");
+    let frames = logged_frames(&log);
+    let answers: Vec<&String> = frames
+        .iter()
+        .filter(|frame| frame.contains(r#""outcome":"selected""#))
+        .collect();
+    assert_eq!(answers.len(), 2, "{answers:?}");
+    assert!(
+        answers[0].contains(r#""optionId":"always-1""#),
+        "an `allow_always` choice must not be rewritten: {}",
+        answers[0]
+    );
+    assert!(
+        answers[1].contains(r#""optionId":"once-2""#),
+        "an `allow_once` choice must not be widened: {}",
+        answers[1]
+    );
+    assert!(!output.content.contains("denied"), "{}", output.content);
 }

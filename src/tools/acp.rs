@@ -25,9 +25,11 @@
 //!
 //! 1. in-process cache hit for this session with the same `workspace` →
 //!    `session/load`.
-//! 2. else the stored `acp_session_id`: non-null → `session/load` (the row is
-//!    already scoped to this workspace); null (or a store error) →
-//!    `session/new` plus one line saying no saved session existed.
+//! 2. else the stored `acp_session_id`: non-null → `session/load` when the
+//!    agent advertises `agentCapabilities.loadSession` (the row is already
+//!    scoped to this workspace), else `session/new` with one line naming the
+//!    id that stays unused; null (or a store error) → `session/new` plus one
+//!    line saying no saved session existed.
 //! 3. `fresh: true` → `session/new` regardless, overwriting the stored value.
 //!
 //! The id is written after a successful `session/new` and after a successful
@@ -61,6 +63,36 @@
 //! result. A child never asks: suspending there would park a turn nobody can
 //! answer.
 //!
+//! **Every ask has its own identity, and a dead child never parks the tool.**
+//! The question's `call_id` is not the JSON-RPC id (every call spawns a fresh
+//! process, so an agent happily reuses `9001`): it is
+//! `acp-permission-<nonce>-<toolCallId>-<digest>` — a fresh random nonce per
+//! ask, the ACP tool-call id, and a digest of the requested action plus the
+//! offered options. A late answer therefore always names the ask it was given
+//! for; the tool keeps the identity of the ask still awaiting an answer and
+//! drops any answer that is not for it, so request N's approval can never
+//! authorize request N+1. The answer is awaited concurrently with the agent's
+//! exit and with cancellation (`tokio::select!`): the read loop never blocks on
+//! a human, so a child that dies with a request pending closes stdout, which
+//! wakes the parked ask, drops its pending entry, and fails the in-flight
+//! `session/prompt` — the tool returns a plain error string to the model
+//! instead of hanging until a timeout. An answer the tool decides by itself
+//! (the kind policy, `[acp] danger`) selects the agent's own "allow once"
+//! option; the human path sends the chosen `optionId` verbatim, so an
+//! `allow_always` choice is never rewritten into an `allow_once` grant (or the
+//! other way round) — every id is used exactly as the agent offered it.
+//!
+//! **`session/load` is used only when the agent advertises it.** The
+//! `agentCapabilities.loadSession` flag from `initialize` is recorded, and an
+//! agent that does not set it gets `session/new` (plus one visible line naming
+//! the id left unused) instead. A load replays the restored history as
+//! `session/update` notifications before its response; the read loop processes
+//! them in stream order ahead of that response, and every chunk that arrives
+//! while the replay phase is open is discarded, so restored history is never
+//! mistaken for — or allowed to crowd out — this call's answer. Reuse always
+//! runs in the `cwd` of the current call, cold (store-hit) reuse included: the
+//! agent is spawned in it and `session/load` is asked for it.
+//!
 //! Non-goals (deliberately not implemented): a session/process pool, streaming
 //! `session/update` notifications to the UI (they are accumulated and returned
 //! as one result), MCP injection (`mcpServers` is always `[]`), a permission UI
@@ -73,15 +105,16 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, oneshot, watch};
 
 use super::spec;
 use crate::agent::{Tool, ToolOutput, ToolSpec};
@@ -372,6 +405,10 @@ impl AcpPrompt {
         // Remembered BEFORE the prompt: a failed prompt must not orphan a
         // freshly created session id.
         self.remember(cwd, &client.session_id).await;
+        // A `session/load` replay is fully behind us once its response was
+        // used (the read loop reads in stream order), so from here on an
+        // update is this call's answer, never restored history.
+        client.replay_finished();
         let result = client
             .request(
                 "session/prompt",
@@ -399,10 +436,16 @@ struct Client {
     /// Kills the process group when the client drops: a finished prompt (one
     /// process per call) and a cancelled turn both end the child here.
     _child: KillOnDrop,
+    /// Dropped with the client: a parked permission answer sees the closed
+    /// channel and stops waiting, so a cancelled turn leaves nothing behind.
+    _cancel: watch::Sender<()>,
     shared: Arc<Shared>,
     /// `agentInfo.name` / `agentInfo.version` from `initialize`, so the
     /// receipt names the binary that actually answered.
     agent: (String, String),
+    /// `agentCapabilities.loadSession` from `initialize`: `session/load` is
+    /// only ever called when the agent advertised it.
+    load_supported: bool,
     session_id: String,
     /// Status lines the result must carry (abandoned or unknown sessions).
     notices: Vec<Notice>,
@@ -454,11 +497,17 @@ impl Client {
         let stdout = child.stdout.take().ok_or("acp: the agent has no stdout")?;
         let stderr = child.stderr.take().ok_or("acp: the agent has no stderr")?;
         let stderr = drain_stderr(stderr);
+        let (gone, _) = watch::channel(false);
+        let (cancel, cancelled) = watch::channel(());
         let shared = Arc::new(Shared {
             stdin: Mutex::new(stdin),
             pending: Mutex::new(Pending::default()),
             next_id: AtomicU64::new(1),
             state: StdMutex::new(State::default()),
+            asking: StdMutex::new(PendingPermission::default()),
+            replaying: AtomicBool::new(false),
+            gone,
+            cancel: cancelled,
             allow_kinds: config.allow_kinds.clone(),
             danger: config.danger,
             handle,
@@ -466,8 +515,10 @@ impl Client {
         tokio::spawn(read_loop(shared.clone(), stdout));
         Ok(Self {
             _child: KillOnDrop(child),
+            _cancel: cancel,
             shared,
             agent: ("unknown".into(), String::new()),
+            load_supported: false,
             session_id: String::new(),
             notices: plan.notice.clone().into_iter().collect(),
             stderr,
@@ -501,10 +552,18 @@ impl Client {
         if self.agent.0.is_empty() {
             self.agent.0 = "unknown".into();
         }
+        // Record the negotiated capability: `session/load` is not part of the
+        // protocol for an agent that does not advertise it, so asking anyway
+        // would be an unanswered (or erroring) request.
+        self.load_supported = initialize
+            .get("agentCapabilities")
+            .and_then(|caps| caps.get("loadSession"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let cwd_text = cwd.display().to_string();
         self.session_id = match open {
             Open::New => self.new_session(&cwd_text).await?,
-            Open::Load(id) => match self.load_session(id, &cwd_text).await {
+            Open::Load(id) if self.load_supported => match self.load_session(id, &cwd_text).await {
                 Ok(()) => id.clone(),
                 Err(reason) => {
                     // Visible fallback: the call continues on a NEW session,
@@ -516,6 +575,18 @@ impl Client {
                     self.new_session(&cwd_text).await?
                 }
             },
+            // The agent never advertised `session/load`: start a new session
+            // and say which id stays unused. The caller persists the fresh id
+            // exactly like any other new one.
+            Open::Load(id) => {
+                self.notices.push(Notice::LoadFailed {
+                    id: id.clone(),
+                    reason: "the agent does not support `session/load` \
+                             (`agentCapabilities.loadSession` is false)"
+                        .into(),
+                });
+                self.new_session(&cwd_text).await?
+            }
         };
         if let Some(model) = &config.model {
             self.shared
@@ -546,6 +617,12 @@ impl Client {
     }
 
     async fn load_session(&self, id: &str, cwd: &str) -> Result<(), String> {
+        // The replay phase opens BEFORE the request goes out and stays open
+        // until [`Self::replay_finished`]: every `session/update` chunk the
+        // agent sends to restore history arrives in this window, is read in
+        // stream order ahead of the load response, and is dropped instead of
+        // being accumulated as this call's answer.
+        self.shared.replaying.store(true, Ordering::Relaxed);
         self.shared
             .request(
                 "session/load",
@@ -554,6 +631,14 @@ impl Client {
             )
             .await
             .map(|_| ())
+    }
+
+    /// Close the replay phase: from here on, `session/update` text is this
+    /// call's answer. Called once the load response has been used (or a new
+    /// session started), right before `session/prompt` is sent — nothing else
+    /// can produce answer text in between.
+    fn replay_finished(&self) {
+        self.shared.replaying.store(false, Ordering::Relaxed);
     }
 
     async fn request(
@@ -642,7 +727,43 @@ impl Drop for KillOnDrop {
     }
 }
 
-type Pending = HashMap<u64, oneshot::Sender<Result<Value, String>>>;
+/// One in-flight request: the method (a dead child's error names it) and the
+/// channel its reply is delivered on.
+struct PendingRequest {
+    method: String,
+    sender: oneshot::Sender<Result<Value, String>>,
+}
+
+type Pending = HashMap<u64, PendingRequest>;
+
+/// The permission ask whose answer is still awaited. One slot: ACP answers one
+/// request at a time and the runner allows one open question, so the slot holds
+/// the *identity* of the ask — never just an id an agent may repeat — and an
+/// answer that arrives after a newer ask was registered is dropped instead of
+/// authorizing it.
+#[derive(Default)]
+struct PendingPermission {
+    current: Option<String>,
+}
+
+impl PendingPermission {
+    /// Make `identity` the only ask an answer may still resolve.
+    fn claim(&mut self, identity: &str) {
+        self.current = Some(identity.to_owned());
+    }
+
+    /// Release `identity` from the slot. `true` when it was still the ask
+    /// awaiting an answer; `false` means a newer ask owns the slot, so the
+    /// answer belongs to a superseded request and must be discarded.
+    fn release(&mut self, identity: &str) -> bool {
+        if self.current.as_deref() == Some(identity) {
+            self.current = None;
+            true
+        } else {
+            false
+        }
+    }
+}
 
 /// Everything the reader task and the request side both need: writes to the
 /// child, the in-flight request table, and the accumulated notification state.
@@ -651,6 +772,17 @@ struct Shared {
     pending: Mutex<Pending>,
     next_id: AtomicU64,
     state: StdMutex<State>,
+    /// The permission ask currently awaiting a human answer (its identity).
+    asking: StdMutex<PendingPermission>,
+    /// Set while a `session/load` replay may still be arriving: those
+    /// `session/update` chunks are restored history, never answer text.
+    replaying: AtomicBool,
+    /// Flipped when the child's stdout closes (the agent is gone): a parked
+    /// permission answer stops waiting and every in-flight request fails.
+    gone: watch::Sender<bool>,
+    /// Closed when the `Client` drops (the tool future was cancelled or the
+    /// call finished): a parked permission answer stops waiting.
+    cancel: watch::Receiver<()>,
     /// `[acp] allow_kinds`: tool kinds answered "allow once".
     allow_kinds: Vec<String>,
     /// `[acp] danger`: answer every permission request "allow once".
@@ -669,7 +801,13 @@ impl Shared {
     ) -> Result<Value, String> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = oneshot::channel();
-        self.pending.lock().await.insert(id, sender);
+        self.pending.lock().await.insert(
+            id,
+            PendingRequest {
+                method: method.to_owned(),
+                sender,
+            },
+        );
         let message = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         if let Err(error) = self.send(&message).await {
             self.pending.lock().await.remove(&id);
@@ -708,40 +846,47 @@ impl Shared {
 
     /// Route one received frame: a server request (only a permission request
     /// is expected), a response to one of our requests, or a notification.
-    async fn dispatch(&self, value: Value) {
+    async fn dispatch(self: &Arc<Self>, value: Value) {
         let id = value.get("id").cloned().filter(|id| !id.is_null());
         let method = value
             .get("method")
             .and_then(Value::as_str)
             .map(str::to_owned);
         match (id, method) {
-            // Server -> client request. An unanswered request would hang the
-            // agent, so anything unimplemented is refused with -32601.
+            // A permission request becomes one human question, awaited in its
+            // OWN task: the read loop must keep reading while a human decides,
+            // otherwise a child that dies with a request pending could never
+            // be noticed (its exit is only visible on stdout).
+            (Some(id), Some(method)) if method == "session/request_permission" => {
+                let shared = Arc::clone(self);
+                let params = value.get("params").cloned();
+                tokio::spawn(async move {
+                    let reply = shared.answer_permission_request(params, &id).await;
+                    let _ = shared.send(&reply).await;
+                });
+            }
+            // Any other server request: an unanswered request would hang the
+            // agent, so it is refused with -32601.
             (Some(id), Some(method)) => {
-                let reply = if method == "session/request_permission" {
-                    self.answer_permission_request(value.get("params"), &id)
-                        .await
-                } else {
-                    json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "error": {"code": -32601, "message": format!("method `{method}` is not supported")},
-                    })
-                };
+                let reply = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {"code": -32601, "message": format!("method `{method}` is not supported")},
+                });
                 let _ = self.send(&reply).await;
             }
             // A response to one of our requests. Replies may arrive out of
             // order, so the id is the only routing key.
             (Some(id), None) => {
                 let Some(id) = id.as_u64() else { return };
-                let Some(sender) = self.pending.lock().await.remove(&id) else {
+                let Some(request) = self.pending.lock().await.remove(&id) else {
                     return;
                 };
                 let result = match value.get("error") {
                     Some(error) => Err(rpc_error(error)),
                     None => Ok(value.get("result").cloned().unwrap_or(Value::Null)),
                 };
-                let _ = sender.send(result);
+                let _ = request.sender.send(result);
             }
             (None, Some(method)) => self.record_notification(&method, value.get("params")),
             (None, None) => {}
@@ -757,8 +902,11 @@ impl Shared {
     /// ACP receives back. Nothing is invented: a request that offers no usable
     /// option, an unanswerable one (no frontend, a child session, a dead
     /// session), and an answer that names no offered id all fall back to
-    /// `cancelled`/the kind policy rather than guessing.
-    async fn answer_permission_request(&self, params: Option<&Value>, id: &Value) -> Value {
+    /// `cancelled`/the kind policy rather than guessing. The answer is used
+    /// only while this ask is still the pending one, and it is awaited in its
+    /// own task so the read loop keeps reading.
+    async fn answer_permission_request(&self, params: Option<Value>, id: &Value) -> Value {
+        let params = params.as_ref();
         let tool_call = params.and_then(|params| params.get("toolCall"));
         let Some(handle) = &self.handle else {
             return self.answer_permission(params, id);
@@ -767,20 +915,49 @@ impl Shared {
             // ACP offered no usable option: there is nothing to ask.
             return self.answer_permission(params, id);
         };
+        // The question's id IS the ask's identity: unique per request (fresh
+        // nonce) and covering what is being authorized, so the answer the
+        // frontend sends back can only ever be an answer to THIS ask.
+        let identity = permission_identity(params);
         let request = UserInputRequest {
-            call_id: format!("acp-permission-{id}"),
+            call_id: identity.clone(),
             questions: vec![UserQuestion {
                 id: PERMISSION_QUESTION.to_owned(),
                 prompt: permission_prompt(tool_call),
                 options: options.clone(),
             }],
         };
+        self.asking.lock().unwrap().claim(&identity);
         // `ask_user` refuses (no frontend / not live): the kind policy owns
         // this request, and a child session never surfaces a question.
         let Ok(answer) = handle.ask_user(request) else {
+            self.asking.lock().unwrap().release(&identity);
             return self.answer_permission(params, id);
         };
-        let chosen = answer.await.unwrap_or(None);
+        // Wait for the answer CONCURRENTLY with the ways it can never arrive:
+        // the agent's exit (stdout closed) and the cancellation of this turn
+        // (the `Client`, hence the `cancel` sender, dropped). Either one drops
+        // the pending entry and answers `cancelled` instead of parking this
+        // ask — and the call — forever.
+        let chosen = tokio::select! {
+            biased;
+            answer = answer => answer.unwrap_or(None),
+            _ = self.agent_gone() => {
+                self.asking.lock().unwrap().release(&identity);
+                return cancelled_permission(id);
+            }
+            _ = self.cancelled() => {
+                self.asking.lock().unwrap().release(&identity);
+                return cancelled_permission(id);
+            }
+        };
+        if !self.asking.lock().unwrap().release(&identity) {
+            // A newer ask owns the slot: this answer belongs to a superseded
+            // request (an agent may reuse a JSON-RPC id and a tool-call id
+            // call after call), so it is dropped rather than allowed to
+            // authorize the request that is pending now.
+            return cancelled_permission(id);
+        }
         let kind = text_field(tool_call, "kind").unwrap_or("unknown");
         let summary = clip(&tool_call_summary(tool_call));
         let mut state = self.state.lock().unwrap();
@@ -804,6 +981,39 @@ impl Shared {
         json!({"jsonrpc": "2.0", "id": id.clone(), "result": outcome})
     }
 
+    /// Resolves once the agent's stdout closed (see [`Shared::child_gone`]).
+    async fn agent_gone(&self) {
+        let mut gone = self.gone.subscribe();
+        if *gone.borrow() {
+            return;
+        }
+        let _ = gone.changed().await;
+    }
+
+    /// Resolves when the `Client` is dropped: the tool future was cancelled
+    /// (turn cancel, deadline) or the call already finished.
+    async fn cancelled(&self) {
+        let mut cancel = self.cancel.clone();
+        let _ = cancel.changed().await;
+    }
+
+    /// The agent's stdout closed: the child is gone or going, so nothing that
+    /// waits for it may keep waiting. The parked permission ask is woken (its
+    /// pending entry is dropped by [`Self::answer_permission_request`]), and
+    /// every in-flight request fails with a plain error — a `session/prompt`
+    /// reply that can never arrive must reach the model as an error instead of
+    /// hanging until its timeout.
+    async fn child_gone(&self) {
+        self.gone.send_replace(true);
+        let mut pending = self.pending.lock().await;
+        for (_, request) in pending.drain() {
+            let _ = request.sender.send(Err(format!(
+                "acp: the agent exited during `{}`",
+                request.method
+            )));
+        }
+    }
+
     /// Answer one `session/request_permission` by tool kind: the kinds in
     /// `[acp] allow_kinds` (and every kind under `danger`) get the agent's
     /// "allow once" option, everything else is denied with `cancelled` and
@@ -815,7 +1025,7 @@ impl Shared {
         let allowed_kind =
             !kind.is_empty() && self.allow_kinds.iter().any(|allowed| allowed == kind);
         let option = (self.danger || allowed_kind)
-            .then(|| allow_once_option(params))
+            .then(|| auto_allow_option(params))
             .flatten();
         let mut state = self.state.lock().unwrap();
         let outcome = match option {
@@ -841,8 +1051,11 @@ impl Shared {
 
     /// `session/update` notifications: message and thought chunks are
     /// accumulated (kept apart), every other update kind is only counted.
+    /// Chunks that belong to a `session/load` replay are restored history and
+    /// are dropped entirely: they never become this call's answer, and a long
+    /// replay can therefore never crowd the answer out.
     fn record_notification(&self, method: &str, params: Option<&Value>) {
-        if method != "session/update" {
+        if method != "session/update" || self.replaying.load(Ordering::Relaxed) {
             return;
         }
         let Some(update) = params.and_then(|params| params.get("update")) else {
@@ -907,7 +1120,9 @@ fn render_notice(notice: &Notice, session_id: &str) -> String {
 }
 
 /// Read frames until the child closes stdout. Unparsable lines (a banner, a
-/// stray log line) are skipped rather than failing the call.
+/// stray log line) are skipped rather than failing the call. A permission
+/// answer is awaited in its own task (see `Shared::dispatch`), so closing
+/// stdout — the child exiting — is always observed right away.
 async fn read_loop(shared: Arc<Shared>, stdout: ChildStdout) {
     let mut lines = BufReader::new(stdout).lines();
     while let Ok(Some(line)) = lines.next_line().await {
@@ -916,6 +1131,9 @@ async fn read_loop(shared: Arc<Shared>, stdout: ChildStdout) {
         };
         shared.dispatch(value).await;
     }
+    // The connection is over: nothing that waits for the agent may keep
+    // waiting for a reply it can no longer send.
+    shared.child_gone().await;
 }
 
 /// Drain stderr so the child cannot block on a full pipe, keeping a bounded
@@ -1012,10 +1230,83 @@ fn rpc_error(error: &Value) -> String {
     }
 }
 
-/// The option id to select when a request is allowed: the agent's "allow
-/// once" option, then any other `allow_*` kind. None when the request offers
-/// no allow option, in which case it stays denied.
-fn allow_once_option(params: Option<&Value>) -> Option<String> {
+/// The identity of one permission ask — the `call_id` of the question the
+/// human answers: `acp-permission-<nonce>-<toolCallId>-<digest>`.
+///
+/// * `<nonce>` is a fresh random 64-bit value per ask, so two asks never share
+///   an identity — not inside one process (an agent reuses JSON-RPC ids call
+///   after call) and not across e-agent restarts.
+/// * `<toolCallId>` is the ACP tool call the request is about.
+/// * `<digest>` fingerprints the requested action and the offered options.
+///
+/// An answer that comes back therefore *names* the ask it was given for:
+/// request N's approval cannot authorize request N+1, and a stale answer is
+/// dropped by [`PendingPermission::release`].
+fn permission_identity(params: Option<&Value>) -> String {
+    let tool_call = params.and_then(|params| params.get("toolCall"));
+    format!(
+        "acp-permission-{:016x}-{}-{}",
+        rand::random::<u64>(),
+        id_token(text_field(tool_call, "toolCallId").unwrap_or("unknown")),
+        action_digest(params),
+    )
+}
+
+/// A bounded, id-safe form of an agent-supplied call id (spaces, `/`, and
+/// non-ASCII become `_`), so a question id stays one readable token.
+fn id_token(raw: &str) -> String {
+    let token: String = raw
+        .chars()
+        .take(32)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if token.is_empty() {
+        "unknown".into()
+    } else {
+        token
+    }
+}
+
+/// 64-bit hex fingerprint of the requested action: the `toolCall` plus the
+/// options ACP offered. Identical requests share it; anything else — another
+/// tool call, another command, another set of choices — does not.
+fn action_digest(params: Option<&Value>) -> String {
+    let field = |name: &str| {
+        params
+            .and_then(|params| params.get(name))
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(json!({"toolCall": field("toolCall"), "options": field("options")}).to_string());
+    hasher
+        .finalize()
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// The reply for a permission request nothing can answer any more (the agent
+/// is gone, the turn was cancelled, or the answer was stale): ACP is told
+/// `cancelled`, so the agent is never left waiting on a decision.
+fn cancelled_permission(id: &Value) -> Value {
+    json!({"jsonrpc": "2.0", "id": id.clone(), "result": {"outcome": {"outcome": "cancelled"}}})
+}
+
+/// The option id to select when the TOOL decides to allow a request (the kind
+/// policy, or `[acp] danger`): the agent's own "allow once" option, then any
+/// other `allow_*` option it offered — used verbatim, never substituted for a
+/// different id. A request offering neither stays denied. (When a human
+/// answers, the chosen `optionId` is sent back exactly as chosen, so an
+/// `allow_always` decision is never rewritten into an `allow_once` grant.)
+fn auto_allow_option(params: Option<&Value>) -> Option<String> {
     let options = params
         .and_then(|params| params.get("options"))
         .and_then(Value::as_array)?;

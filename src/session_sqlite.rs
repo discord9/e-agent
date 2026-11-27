@@ -200,7 +200,24 @@ pub struct SqliteSession {
     /// row yet).
     /// Interior mutability because every touch path takes `&self`.
     cached_meta: std::sync::Mutex<Option<SessionMeta>>,
+    /// `sessions.acp_session_id` exists (its migration at connect succeeded).
+    /// When it does not, metadata reads project `NULL` in its place and writes
+    /// omit the column: ACP session reuse degrades to "start a new ACP session
+    /// on every call" while ordinary session creation keeps working.
+    acp_available: bool,
 }
+
+/// The shared `sessions` metadata projection, in [`row_to_meta`] order.
+const META_COLUMNS: &str = "created_at, last_active_at, model, \"role\", entry_count, \
+     parent_session_id, parent_task_id, title, pinned, archived, writer, acp_session_id";
+
+/// The same projection for a database whose `sessions.acp_session_id`
+/// migration failed: `NULL` stands in for the missing column, so the column
+/// layout — and therefore [`row_to_meta`], `create_meta`, and every other
+/// metadata read — is unchanged and only the ACP reuse feature degrades.
+const META_COLUMNS_WITHOUT_ACP: &str = "created_at, last_active_at, model, \"role\", \
+     entry_count, parent_session_id, parent_task_id, title, pinned, archived, writer, \
+     NULL AS acp_session_id";
 
 /// Ensure the parent directory of the database file exists before turso
 /// opens it, so a configured `path = "~/.local/share/e-agent/sessions.db"`-style
@@ -542,6 +559,7 @@ impl SqliteSession {
                 &crate::session_store::normalize_db_path(db_path),
             ),
             cached_meta: std::sync::Mutex::new(cached_meta),
+            acp_available,
         };
 
         // Seed next_seq from the DB's current max seq (see db_max_seq).
@@ -2272,14 +2290,20 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
     /// session has no row yet (brand-new session, or a subagent whose
     /// parent has not written its row yet).
     async fn load_meta_row(&self, session_id: &str) -> Result<Option<SessionMeta>, String> {
+        let columns = if self.acp_available {
+            META_COLUMNS
+        } else {
+            META_COLUMNS_WITHOUT_ACP
+        };
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT created_at, last_active_at, model, \"role\", entry_count, \
-                        parent_session_id, parent_task_id, title, pinned, archived, writer, acp_session_id \
-                 FROM sessions \
-                 WHERE workspace_id = ?1 AND session_id = ?2 \
-                 ORDER BY last_active_at DESC LIMIT 1",
+                &format!(
+                    "SELECT {columns} \
+                     FROM sessions \
+                     WHERE workspace_id = ?1 AND session_id = ?2 \
+                     ORDER BY last_active_at DESC LIMIT 1"
+                ),
                 (self.workspace_id.as_str(), session_id),
             )
             .await
@@ -2302,31 +2326,60 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
         // `writer: None`; the stamped value is what lands in the column.
         meta.writer = Some(process_identity().to_owned());
         let conn = self.conn.lock().await;
-        conn.execute(
-            "INSERT INTO sessions \
-             (workspace_id, session_id, created_at, last_active_at, model, \"role\", \
-              entry_count, parent_session_id, parent_task_id, title, pinned, archived, writer, \
-              acp_session_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-            (
-                self.workspace_id.as_str(),
-                meta.session_id.as_str(),
-                datetime_to_us(meta.created_at),
-                datetime_to_us(meta.last_active_at),
-                meta.model.as_deref(),
-                meta.role.as_deref(),
-                meta.entry_count,
-                meta.parent_session_id.as_deref(),
-                meta.parent_task_id,
-                meta.title.as_deref(),
-                meta.pinned.map(|p| if p { 1 } else { 0 }),
-                meta.archived.map(|a| if a { 1 } else { 0 }),
-                meta.writer.as_deref(),
-                meta.acp_session_id.as_deref(),
-            ),
-        )
-        .await
-        .map_err(|e| format!("cannot insert session metadata: {e}"))?;
+        // The ACP id column is only named when its migration succeeded: on a
+        // database without it the row is written without that column, so a
+        // failed `sessions.acp_session_id` migration costs the ACP reuse
+        // feature and nothing else (session creation keeps working).
+        let written = if self.acp_available {
+            conn.execute(
+                "INSERT INTO sessions \
+                 (workspace_id, session_id, created_at, last_active_at, model, \"role\", \
+                  entry_count, parent_session_id, parent_task_id, title, pinned, archived, writer, \
+                  acp_session_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                (
+                    self.workspace_id.as_str(),
+                    meta.session_id.as_str(),
+                    datetime_to_us(meta.created_at),
+                    datetime_to_us(meta.last_active_at),
+                    meta.model.as_deref(),
+                    meta.role.as_deref(),
+                    meta.entry_count,
+                    meta.parent_session_id.as_deref(),
+                    meta.parent_task_id,
+                    meta.title.as_deref(),
+                    meta.pinned.map(|p| if p { 1 } else { 0 }),
+                    meta.archived.map(|a| if a { 1 } else { 0 }),
+                    meta.writer.as_deref(),
+                    meta.acp_session_id.as_deref(),
+                ),
+            )
+            .await
+        } else {
+            conn.execute(
+                "INSERT INTO sessions \
+                 (workspace_id, session_id, created_at, last_active_at, model, \"role\", \
+                  entry_count, parent_session_id, parent_task_id, title, pinned, archived, writer) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                (
+                    self.workspace_id.as_str(),
+                    meta.session_id.as_str(),
+                    datetime_to_us(meta.created_at),
+                    datetime_to_us(meta.last_active_at),
+                    meta.model.as_deref(),
+                    meta.role.as_deref(),
+                    meta.entry_count,
+                    meta.parent_session_id.as_deref(),
+                    meta.parent_task_id,
+                    meta.title.as_deref(),
+                    meta.pinned.map(|p| if p { 1 } else { 0 }),
+                    meta.archived.map(|a| if a { 1 } else { 0 }),
+                    meta.writer.as_deref(),
+                ),
+            )
+            .await
+        };
+        written.map_err(|e| format!("cannot insert session metadata: {e}"))?;
         Ok(())
     }
 
@@ -2676,14 +2729,20 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
     /// activity first. This is the audit view — [`Self::list_meta`] shows
     /// only the latest snapshot per session.
     pub async fn audit_meta(&self, session_id: &str) -> Result<Vec<SessionMeta>, String> {
+        let columns = if self.acp_available {
+            META_COLUMNS
+        } else {
+            META_COLUMNS_WITHOUT_ACP
+        };
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT created_at, last_active_at, model, \"role\", entry_count, \
-                        parent_session_id, parent_task_id, title, pinned, archived, writer, acp_session_id \
-                 FROM sessions \
-                 WHERE workspace_id = ?1 AND session_id = ?2 \
-                 ORDER BY last_active_at ASC",
+                &format!(
+                    "SELECT {columns} \
+                     FROM sessions \
+                     WHERE workspace_id = ?1 AND session_id = ?2 \
+                     ORDER BY last_active_at ASC"
+                ),
                 (self.workspace_id.as_str(), session_id),
             )
             .await
