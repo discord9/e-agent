@@ -486,7 +486,7 @@ fn image_part(
     if let Some(text) = budget.placeholder(&image.hash) {
         return json!({"type":"input_text","text":text});
     }
-    match crate::images::wire_image(image_store, image) {
+    match crate::images::wire_image(image_store, image, budget.is_newest(&image.hash)) {
         Ok((bytes, mime)) => {
             transmitted_images.push(image.hash.clone());
             json!({

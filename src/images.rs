@@ -3,19 +3,24 @@
 //! Two behaviours, both applied to the REQUEST COPY only (history, events,
 //! the session store and compaction never see either):
 //!
-//! 1. **Normalisation.** Every image about to be put on the wire is measured
-//!    with DeepSeek's published vision-token calculator (14px patches merged
-//!    3:1 per axis into one token cell, `tokens = grid_h * (grid_w + 1) + 2`,
-//!    see [`estimated_tokens`]) and scaled DOWN — never up — until the
-//!    estimate fits [`MAX_IMAGE_TOKENS`]. The re-encoded variant is cached
-//!    next to the original as `<hash>.n<WxH>.<ext>` plus a `.sha256` sidecar;
-//!    the stored original is never mutated. A cache entry is used only when
-//!    the source still hashes to `hash` AND the variant matches its sidecar,
-//!    so a stale or torn entry is re-encoded instead of trusted. An image
-//!    that already fits keeps its exact stored bytes and MIME type (no decode
-//!    of pixels, no re-encode). Stored files are read through a 10 MiB cap
-//!    and decoded buffers beyond `MAX_DECODE_BYTES` are rejected with a
-//!    clear error rather than risking an unbounded allocation.
+//! 1. **Normalisation.** Every image about to be put on the wire — EXCEPT
+//!    the images appended after the newest assistant message (the ones the
+//!    offload rule below never considers delivered) — is measured with
+//!    DeepSeek's published vision-token calculator (14px patches merged 3:1
+//!    per axis into one token cell, `tokens = grid_h * (grid_w + 1) + 2`, see
+//!    [`estimated_tokens`]) and scaled DOWN — never up — until the estimate
+//!    fits [`MAX_IMAGE_TOKENS`]. The re-encoded variant is cached next to the
+//!    original as `<hash>.n<WxH>.<ext>` plus a `.sha256` sidecar; the stored
+//!    original is never mutated. A cache entry is used only when the source
+//!    still hashes to `hash` AND the variant matches its sidecar, so a stale
+//!    or torn entry is re-encoded instead of trusted. An image that already
+//!    fits keeps its exact stored bytes and MIME type (no decode of pixels,
+//!    no re-encode). The newest images skip this step entirely: their stored
+//!    bytes and MIME go out unchanged, bounded only by the 10 MiB ingest cap
+//!    (the one case where a larger file is rejected with a clear error, never
+//!    silently resized). Stored files are read through that cap and decoded
+//!    buffers beyond `MAX_DECODE_BYTES` are rejected with a clear error
+//!    rather than risking an unbounded allocation.
 //!
 //! 2. **Offload.** When a request would carry more than `max_inline` DISTINCT
 //!    images that were ALREADY delivered, the oldest delivered ones (by first
@@ -23,7 +28,8 @@
 //!    their stored hash, so the model knows the image exists and how to get it
 //!    back. Images appended after the newest assistant message have never been
 //!    on the wire, so they are always kept: a fresh attachment gets at least
-//!    one send. [`ImageBudget::project`] is pure: the same messages always
+//!    one send, and it goes out at full size. [`ImageBudget::project`] is
+//!    pure: the same messages always
 //!    produce the same placeholders, in the same order, and therefore the same
 //!    request bytes.
 //!
@@ -46,7 +52,8 @@ const DOWNSAMPLE: u32 = 3;
 /// Edge of one vision-token cell, in pixels (`PATCH * DOWNSAMPLE`).
 const CELL: u32 = PATCH * DOWNSAMPLE;
 
-/// Hard cap on the estimated vision tokens of one outgoing image.
+/// Hard cap on the estimated vision tokens of one NORMALISED outgoing image.
+/// The newest images skip normalisation, so their only limit is the ingest cap.
 pub const MAX_IMAGE_TOKENS: u32 = 1024;
 
 /// Largest stored file the wire will read. This is the documented attachment
@@ -233,11 +240,17 @@ enum LoadError {
 }
 
 /// Wire bytes for one stored image: `(bytes, MIME)`, normalised to the token
-/// budget. `Err` is the model-facing text part that replaces the image (the
-/// existing `[image missing: <hash>]` degradation, or a clear too-large
-/// rejection); it never fails the whole request. Bytes this build cannot
-/// decode are forwarded unchanged.
-pub fn wire_image(store: Option<&Path>, image: &ImagePart) -> Result<(Vec<u8>, String), String> {
+/// budget. `full_size` bypasses [`normalise`] entirely for an image appended
+/// after the newest assistant message: its stored bytes and MIME go out
+/// unchanged (the 10 MiB ingest cap still applies). `Err` is the model-facing
+/// text part that replaces the image (the existing `[image missing: <hash>]`
+/// degradation, or a clear too-large rejection); it never fails the whole
+/// request. Bytes this build cannot decode are forwarded unchanged.
+pub fn wire_image(
+    store: Option<&Path>,
+    image: &ImagePart,
+    full_size: bool,
+) -> Result<(Vec<u8>, String), String> {
     let missing = || format!("[image missing: {}]", image.hash);
     let Some(store) = store else {
         return Err(missing());
@@ -247,6 +260,9 @@ pub fn wire_image(store: Option<&Path>, image: &ImagePart) -> Result<(Vec<u8>, S
         Err(LoadError::Missing) => return Err(missing()),
         Err(LoadError::TooLarge(len)) => return Err(too_large(&image.hash, len)),
     };
+    if full_size {
+        return Ok((original, image.mime.clone()));
+    }
     normalise(store, &image.hash, &image.mime, &original)
 }
 
@@ -328,6 +344,7 @@ fn write_cache(cache: &Path, bytes: &[u8]) {
 
 /// Normalise `original` (the stored bytes for `hash`, declared as `mime`) to
 /// the token budget. Returns the bytes to put on the wire and their MIME.
+/// [`wire_image`] skips this for the newest images (`full_size`).
 ///
 /// An image that already fits is returned byte-identical with its original
 /// MIME. Otherwise the re-encoded variant is cached as
@@ -432,13 +449,18 @@ fn placeholder(hash: &str, omitted: usize) -> String {
     format!("[image omitted: {omitted} older image(s); read again with read_image (hash {hash})]")
 }
 
-/// The offload half of the budget: which image occurrences become a text
-/// placeholder. Pure and deterministic — it depends only on the messages and
-/// `max_inline`, never on the clock, the image store, or earlier requests.
+/// The recency half of the budget: which image occurrences become a text
+/// placeholder, and which hashes were appended after the newest assistant
+/// message (and therefore go out at full size). Pure and deterministic — it
+/// depends only on the messages and `max_inline`, never on the clock, the
+/// image store, or earlier requests.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ImageBudget {
     /// Offloaded hash -> the placeholder text that replaces each occurrence.
     placeholders: BTreeMap<String, String>,
+    /// Hashes whose first occurrence is after the newest assistant message:
+    /// never delivered, never offloaded, and sent at full size.
+    newest: HashSet<String>,
 }
 
 impl ImageBudget {
@@ -451,13 +473,10 @@ impl ImageBudget {
     /// message. Everything after that message was appended during the current
     /// round (a fresh attachment, a tool result) and has never been on the
     /// wire, so it is NEVER offloaded — a newly attached image always gets at
-    /// least one send. This stays a pure function of the messages: it needs
-    /// no cross-request state, and identical messages still project to
-    /// identical request bytes.
+    /// least one send, at full size. This stays a pure function of the
+    /// messages: it needs no cross-request state, and identical messages still
+    /// project to identical request bytes.
     pub fn project(messages: &[Message], max_inline: usize) -> Self {
-        if max_inline == 0 {
-            return Self::default();
-        }
         let mut order: Vec<(&str, usize)> = Vec::new();
         let mut seen = HashSet::new();
         for (index, message) in messages.iter().enumerate() {
@@ -472,6 +491,19 @@ impl ImageBudget {
         let delivered_through = messages
             .iter()
             .rposition(|message| matches!(message, Message::Assistant(_)));
+        // Exactly the complement of `delivered` below: the offload rule never
+        // considers these, and `wire_image` sends them at full size.
+        let newest: HashSet<String> = order
+            .iter()
+            .filter(|(_, index)| delivered_through.is_none_or(|last| *index >= last))
+            .map(|(hash, _)| (*hash).to_owned())
+            .collect();
+        if max_inline == 0 {
+            return Self {
+                placeholders: BTreeMap::new(),
+                newest,
+            };
+        }
         let delivered: Vec<&str> = order
             .iter()
             .filter(|(_, index)| delivered_through.is_some_and(|last| *index < last))
@@ -483,12 +515,22 @@ impl ImageBudget {
             .iter()
             .map(|hash| ((*hash).to_owned(), placeholder(hash, dropped.len())))
             .collect();
-        Self { placeholders }
+        Self {
+            placeholders,
+            newest,
+        }
     }
 
     /// Placeholder text for an offloaded image hash, if it is offloaded.
     pub fn placeholder(&self, hash: &str) -> Option<&str> {
         self.placeholders.get(hash).map(String::as_str)
+    }
+
+    /// Whether `hash` was appended after the newest assistant message: the
+    /// images [`Self::project`] never considers delivered or offloadable, and
+    /// the only ones sent at full size.
+    pub fn is_newest(&self, hash: &str) -> bool {
+        self.newest.contains(hash)
     }
 }
 
