@@ -1202,6 +1202,25 @@ pub(crate) fn decode_history_rows(
     Ok(out)
 }
 
+/// What the persisted metadata says about a session's parent link.
+enum PersistedParent {
+    /// A decoded snapshot records a parent.
+    Parent,
+    /// Every snapshot line decoded and the newest one records no parent.
+    Parentless,
+    /// A snapshot line could not be decoded: provenance is UNKNOWN.
+    Unknown,
+}
+
+impl PersistedParent {
+    /// Whether provenance must keep `link_ref` off. Only a fully decoded
+    /// parentless session does not count as a fork; an undecodable line is
+    /// unknown and therefore fails closed.
+    fn is_fork(&self) -> bool {
+        !matches!(self, Self::Parentless)
+    }
+}
+
 impl SessionStore {
     pub fn is_jsonl(&self) -> bool {
         matches!(self, SessionStore::Jsonl)
@@ -2733,8 +2752,8 @@ impl SessionStore {
     ///
     /// Returns `(head, is_fork)`. The metadata parent is still part of the
     /// answer: a child whose own log carries no marker is a fork when its
-    /// sidecar/row records one, and an unreadable sidecar is an error, never
-    /// "no parent".
+    /// sidecar/row records one, and an unreadable or undecodable sidecar is
+    /// never "no parent".
     pub(crate) async fn load_fork_head_and_provenance(
         &self,
         root: &Path,
@@ -2742,15 +2761,15 @@ impl SessionStore {
     ) -> Result<(LoadedLocated, bool)> {
         match self {
             SessionStore::Jsonl => {
-                // Sidecar first: an unreadable parent link must fail this
-                // reopen instead of falling through to "ordinary session".
+                // Sidecar first: an unreadable parent link fails this reopen,
+                // and an undecodable line (a torn crash tail) is unknown.
                 let persisted_parent = self.metadata_parent(root, name).await?;
                 let loaded = Session::load_located(root, name)?;
                 let has_marker = loaded
                     .entries
                     .iter()
                     .any(|entry| matches!(entry, SessionEntry::ForkedFrom { .. }));
-                let is_fork = persisted_parent.is_some() || has_marker;
+                let is_fork = persisted_parent.is_fork() || has_marker;
                 let head = Self::jsonl_head(loaded, name);
                 Ok((self.resolve_fork_head(root, name, head).await?, is_fork))
             }
@@ -3148,29 +3167,46 @@ impl SessionStore {
     /// [`Self::load_fork_head_and_provenance`] and a long session is scanned
     /// once instead of twice.
     pub(crate) async fn has_fork_provenance(&self, root: &Path, name: &str) -> Result<bool> {
-        if self.metadata_parent(root, name).await?.is_some() {
+        if self.metadata_parent(root, name).await?.is_fork() {
             return Ok(true);
         }
         self.transcript_has_fork_marker(root, name).await
     }
 
-    /// The session's persisted parent link, when its metadata row records
-    /// one. One narrow read: the newest sidecar snapshot on JSONL, a
+    /// The session's persisted parent-link evidence. One narrow read: the
+    /// newest sidecar snapshot on JSONL (plus whether every line decoded), a
     /// single-row/single-column SELECT on the SQL backends.
-    async fn metadata_parent(&self, root: &Path, name: &str) -> Result<Option<String>> {
+    async fn metadata_parent(&self, root: &Path, name: &str) -> Result<PersistedParent> {
         match self {
             SessionStore::Jsonl => {
-                Ok(jsonl_read_meta_snapshot(root, name)?.and_then(|meta| meta.parent_session_id))
+                let (latest, torn) = jsonl_read_meta_snapshot_and_torn(root, name)?;
+                let parent = latest.and_then(|meta| meta.parent_session_id);
+                Ok(match (parent, torn) {
+                    (Some(_), _) => PersistedParent::Parent,
+                    (None, true) => PersistedParent::Unknown,
+                    (None, false) => PersistedParent::Parentless,
+                })
             }
             #[cfg(feature = "greptime")]
-            SessionStore::Greptime { session, .. } => session.parent_session_id().await,
+            SessionStore::Greptime { session, .. } => {
+                Ok(match session.parent_session_id().await? {
+                    Some(_) => PersistedParent::Parent,
+                    None => PersistedParent::Parentless,
+                })
+            }
             #[cfg(feature = "sqlite")]
-            SessionStore::Sqlite { session, .. } => session
-                .lock()
-                .await
-                .parent_session_id()
-                .await
-                .map_err(anyhow::Error::msg),
+            SessionStore::Sqlite { session, .. } => Ok(
+                match session
+                    .lock()
+                    .await
+                    .parent_session_id()
+                    .await
+                    .map_err(anyhow::Error::msg)?
+                {
+                    Some(_) => PersistedParent::Parent,
+                    None => PersistedParent::Parentless,
+                },
+            ),
         }
     }
 
@@ -4433,27 +4469,41 @@ fn jsonl_append_meta_snapshot(
 /// session without a parent (that is exactly how an unreadable child
 /// regained `link_ref`).
 fn jsonl_read_meta_snapshot(root: &Path, session: &str) -> anyhow::Result<Option<SessionMeta>> {
+    Ok(jsonl_read_meta_snapshot_and_torn(root, session)?.0)
+}
+
+/// [`jsonl_read_meta_snapshot`] plus whether any non-empty line failed to
+/// decode. The last good snapshot still opens the session for DISPLAY (a
+/// torn tail is a crash artifact), but provenance must know the read was
+/// incomplete: an undecodable line means "unknown", never "this session has
+/// no parent".
+fn jsonl_read_meta_snapshot_and_torn(
+    root: &Path,
+    session: &str,
+) -> anyhow::Result<(Option<SessionMeta>, bool)> {
     let path = jsonl_meta_sidecar_path(root, session)?;
     let file = match std::fs::File::open(&path) {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((None, false)),
         Err(error) => {
             return Err(error)
                 .with_context(|| format!("cannot read session metadata {}", path.display()));
         }
     };
     let mut latest: Option<SessionMeta> = None;
+    let mut torn = false;
     for line in std::io::BufReader::new(file).lines() {
         let line =
             line.with_context(|| format!("cannot read session metadata {}", path.display()))?;
         if line.trim().is_empty() {
             continue;
         }
-        if let Ok(meta) = serde_json::from_str::<SessionMeta>(&line) {
-            latest = Some(meta);
+        match serde_json::from_str::<SessionMeta>(&line) {
+            Ok(meta) => latest = Some(meta),
+            Err(_) => torn = true,
         }
     }
-    Ok(latest)
+    Ok((latest, torn))
 }
 
 /// Count a session's transcript entries by counting the non-empty lines of

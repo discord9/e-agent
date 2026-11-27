@@ -4933,6 +4933,223 @@ mod link_ref_registration_tests {
         );
     }
 
+    /// Delete the closing brace of the sidecar's LAST line: a crash artifact
+    /// that still reads, but no longer decodes.
+    fn tear_last_sidecar_line(root: &Path, session: &str) {
+        let path = root
+            .join(".e-agent/sessions")
+            .join(format!("{session}.meta.jsonl"));
+        let sidecar = std::fs::read_to_string(&path).unwrap();
+        let torn = sidecar
+            .strip_suffix("}\n")
+            .unwrap_or_else(|| panic!("{session} sidecar has no complete last line: {sidecar:?}"));
+        std::fs::write(&path, format!("{torn}\n")).unwrap();
+    }
+
+    /// A TORN metadata tail must not stop a session from opening — the last
+    /// good snapshot is enough for display — but it is not evidence of "no
+    /// parent". Provenance is unknown, so a child whose parent-bearing
+    /// snapshot was truncated must not regain `link_ref`, and an older
+    /// parentless line followed by a torn parent update is just as unknown.
+    #[tokio::test]
+    async fn a_torn_sidecar_tail_never_proves_parentlessness() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let history = [user("q0"), assistant("a0")];
+
+        Session::append(&root, "torn-child", &history).unwrap();
+        SessionStore::Jsonl
+            .create_meta(
+                &root,
+                "torn-child",
+                Some("m"),
+                Some("subagent"),
+                Some("parent-session"),
+                Some(7),
+                None,
+            )
+            .await
+            .unwrap();
+        tear_last_sidecar_line(&root, "torn-child");
+
+        Session::append(&root, "torn-update-child", &history).unwrap();
+        SessionStore::Jsonl
+            .create_meta(
+                &root,
+                "torn-update-child",
+                Some("m"),
+                Some("subagent"),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        SessionStore::Jsonl
+            .create_meta(
+                &root,
+                "torn-update-child",
+                Some("m"),
+                Some("subagent"),
+                Some("parent-session"),
+                Some(7),
+                None,
+            )
+            .await
+            .unwrap();
+        tear_last_sidecar_line(&root, "torn-update-child");
+
+        let factory = SessionFactory::test_factory(root.clone());
+        for id in ["torn-child", "torn-update-child"] {
+            let reopened = factory
+                .build(
+                    id,
+                    None,
+                    None,
+                    IdlePolicy::FinishWhenIdle,
+                    UnfinishedPolicy::Preserve,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{id} still opens: {error:#}"));
+            assert_eq!(
+                Session::load(&root, id).unwrap().entries,
+                history,
+                "{id} reopens with its history intact"
+            );
+            let names = reopened.runner.tool_names_for_test();
+            assert!(
+                !names.iter().any(|name| name == "link_ref"),
+                "{id} has unknown provenance, so link_ref must stay off: {names:?}"
+            );
+        }
+    }
+
+    /// A torn tail is not special-cased into "fork": an ordinary session
+    /// (no parent anywhere) still opens on its last good snapshot and keeps
+    /// `link_ref` off, because surviving the crash does not prove it is
+    /// parentless.
+    #[tokio::test]
+    async fn a_torn_sidecar_tail_on_an_ordinary_session_still_opens() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let history = [user("q0"), assistant("a0")];
+        Session::append(&root, "torn-ordinary", &history).unwrap();
+        SessionStore::Jsonl
+            .create_meta(
+                &root,
+                "torn-ordinary",
+                Some("m"),
+                Some("main"),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        tear_last_sidecar_line(&root, "torn-ordinary");
+
+        let factory = SessionFactory::test_factory(root.clone());
+        let reopened = factory
+            .build(
+                "torn-ordinary",
+                None,
+                None,
+                IdlePolicy::FinishWhenIdle,
+                UnfinishedPolicy::Preserve,
+            )
+            .await
+            .expect("an ordinary session still opens after a torn sidecar tail");
+        assert_eq!(
+            Session::load(&root, "torn-ordinary").unwrap().entries,
+            history,
+            "the torn sidecar never rewrites the transcript"
+        );
+        let names = reopened.runner.tool_names_for_test();
+        assert!(
+            !names.iter().any(|name| name == "link_ref"),
+            "unknown provenance fails closed: {names:?}"
+        );
+    }
+
+    /// The positive case: a sidecar whose lines ALL decode to "no parent" is
+    /// evidence, so an ordinary session keeps `link_ref`. A transcript
+    /// marker still overrides that answer.
+    #[tokio::test]
+    async fn a_fully_decodable_parentless_session_keeps_link_ref() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        Session::append(&root, "decoded-plain", &[user("q0"), assistant("a0")]).unwrap();
+        SessionStore::Jsonl
+            .create_meta(
+                &root,
+                "decoded-plain",
+                Some("m"),
+                Some("main"),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        // The copy-based fork layout: the marker sits behind stored prefix
+        // entries, and a parentless sidecar row is all the metadata says.
+        Session::append(
+            &root,
+            "decoded-marker",
+            &[
+                user("q0"),
+                assistant("a0"),
+                fork_marker("decoded-source", 2, 1),
+            ],
+        )
+        .unwrap();
+        SessionStore::Jsonl
+            .create_meta(
+                &root,
+                "decoded-marker",
+                Some("m"),
+                Some("main"),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let factory = SessionFactory::test_factory(root.clone());
+        let plain = factory
+            .build(
+                "decoded-plain",
+                None,
+                None,
+                IdlePolicy::FinishWhenIdle,
+                UnfinishedPolicy::Preserve,
+            )
+            .await
+            .expect("the decoded parentless session builds");
+        let names = plain.runner.tool_names_for_test();
+        assert!(
+            names.iter().any(|name| name == "link_ref"),
+            "a fully decoded parentless session keeps link_ref: {names:?}"
+        );
+
+        let fork = factory
+            .build(
+                "decoded-marker",
+                None,
+                None,
+                IdlePolicy::FinishWhenIdle,
+                UnfinishedPolicy::Preserve,
+            )
+            .await
+            .expect("the marker-bearing session builds");
+        let names = fork.runner.tool_names_for_test();
+        assert!(
+            !names.iter().any(|name| name == "link_ref"),
+            "a transcript marker still counts as a fork: {names:?}"
+        );
+    }
+
     /// `link_ref` writes to THIS session's metadata row, so only a session the
     /// human started from scratch gets it. A web fork goes through the same
     /// factory path as a CLI fork (`build_fork` → `build_internal`) and IS a
