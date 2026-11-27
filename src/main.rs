@@ -621,8 +621,11 @@ async fn repl(
         // seen before waiting for the runner: a prompt first wakes us on
         // `Busy`, so the blocking question arrives while we are INSIDE that
         // wait. Checking it only once before the wait would leave that
-        // question unanswered forever.
-        let current = status.borrow().clone();
+        // question unanswered forever. `borrow_and_update` marks the
+        // dispatched value seen: a plain `borrow` left a question read here
+        // unseen, so the `changed()` AFTER answering it returned immediately
+        // for that same question and the next pipe line was offered to it.
+        let current = status.borrow_and_update().clone();
         match current {
             // WaitingInput is readable by the REPL: consume one line as the
             // answer bound to the currently exposed request, rather than spin
