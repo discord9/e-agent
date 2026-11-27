@@ -3945,19 +3945,24 @@ async function main(){
       const cs = elsById["messages"].querySelectorAll("details.tool-card");
       return cs[cs.length - 1];
     };
-    const liveToolResult = (name, argsJson, content, isError) => {
+    // ids 是 ToolResult 的结构化字段（delegate 启动回执的 started_task_id /
+    // subagent_session_id）；省略即「旧持久化行」形态。
+    const liveToolResult = (name, argsJson, content, isError, ids) => {
       appendToolCall(name, argsJson, state.acc, null);
       const c = lastResultCard();
-      appendToolResult(isError || false, content, state.acc, null);
+      appendToolResult(isError || false, content, state.acc, null, undefined,
+        ids && ids.started_task_id, ids && ids.subagent_session_id);
       return c;
     };
     let _histSeq = 0;
-    const histToolResult = (name, argsJson, content, isError) => {
+    const histToolResult = (name, argsJson, content, isError, ids) => {
       const hc = "hrc" + (++_histSeq);
       const hmap = new Map();
       renderMessage({ Assistant: { content: "", reasoning: null,
         tool_calls: [{ id: hc, name, arguments: argsJson }] } }, state.acc, hmap);
-      renderMessage({ Tool: { call_id: hc, name, content, is_error: isError || false } },
+      renderMessage({ Tool: { call_id: hc, name, content, is_error: isError || false,
+        started_task_id: ids && ids.started_task_id,
+        subagent_session_id: ids && ids.subagent_session_id } },
         state.acc, hmap);
       return lastResultCard();
     };
@@ -3987,6 +3992,86 @@ async function main(){
           r.classList.contains("delegate-result")
           && resText(c).includes("后台运行") && resText(c).includes("任务 #7 看图")
           && resText(c).includes("子代理会话 sub-abc"),
+          "cls=" + r.className + " text=" + JSON.stringify(resText(c)));
+    }
+    // 【结构化字段】delegate 启动回执的机器事实来自 ToolResult 字段
+    // （started_task_id / subagent_session_id）：字段路径与旧行的正文正则
+    // 回退必须渲染出同样的文本；再给一条正则匹配不了的正文（缺第二行），
+    // 证明字段路径不需要从正文回收任务 id / 会话 id。
+    const dgReceipt = "started background task 7: 看图\nsubagent session: sub-abc";
+    const dgIds = { started_task_id: 7, subagent_session_id: "sub-abc" };
+    const dgFieldTexts = {};
+    for (const [path, c] of [
+      ["live", liveToolResult("delegate", JSON.stringify({ task: "t" }), dgReceipt, false, dgIds)],
+      ["history", histToolResult("delegate", JSON.stringify({ task: "t" }), dgReceipt, false, dgIds)],
+      ["live-legacy", liveToolResult("delegate", JSON.stringify({ task: "t" }), dgReceipt, false)],
+      ["history-legacy", histToolResult("delegate", JSON.stringify({ task: "t" }), dgReceipt, false)],
+    ]) {
+      const r = c.querySelector(".tool-result");
+      dgFieldTexts[path] = resText(c);
+      chk("delegate receipt from fields (" + path + ")",
+          r.classList.contains("delegate-result")
+          && resText(c).includes("后台运行") && resText(c).includes("任务 #7 看图")
+          && resText(c).includes("子代理会话 sub-abc"),
+          "cls=" + r.className + " text=" + JSON.stringify(resText(c)));
+    }
+    chk("delegate receipt: fields render exactly like the legacy prose fallback",
+        dgFieldTexts["live"] === dgFieldTexts["live-legacy"]
+        && dgFieldTexts["history"] === dgFieldTexts["history-legacy"]
+        && dgFieldTexts["live"] === dgFieldTexts["history"],
+        "texts=" + JSON.stringify(dgFieldTexts));
+    // 正则匹配不了（没有 "subagent session: …" 那一行）：字段仍在，渲染照旧。
+    for (const [path, c] of [
+      ["live", liveToolResult("delegate", JSON.stringify({ task: "t" }),
+        "started background task 7: 看图", false, dgIds)],
+      ["history", histToolResult("delegate", JSON.stringify({ task: "t" }),
+        "started background task 7: 看图", false, dgIds)],
+    ]) {
+      const r = c.querySelector(".tool-result");
+      chk("delegate receipt fields alone, regex disabled (" + path + ")",
+          r.classList.contains("delegate-result")
+          && resText(c) === dgFieldTexts["live"]
+          && r.querySelector(".delegate-session") !== null,
+          "cls=" + r.className + " text=" + JSON.stringify(resText(c))
+          + " want=" + JSON.stringify(dgFieldTexts["live"]));
+    }
+    // 旧持久化行（字段出现之前写下的 Tool 行）只有正文：正则回退仍然渲染。
+    // 该回退要等一次持久化格式迁移（回填旧行字段）之后才能删。
+    for (const [path, c] of [
+      ["history", histToolResult("delegate", JSON.stringify({ task: "t" }),
+        "started background task 9: legacy\nsubagent session: sub-legacy", false)],
+    ]) {
+      const r = c.querySelector(".tool-result");
+      chk("delegate legacy row without fields (" + path + ")",
+          r.classList.contains("delegate-result")
+          && resText(c).includes("任务 #9 legacy")
+          && resText(c).includes("子代理会话 sub-legacy"),
+          "cls=" + r.className + " text=" + JSON.stringify(resText(c)));
+    }
+    // fork 的工具结果正文只有裸会话 id（没有 "started background task …" 行）：
+    // 字段照旧渲染出「后台运行 任务 #N」+「子代理会话」，正文不重复出现 id。
+    for (const [path, c] of [
+      ["live", liveToolResult("delegate", JSON.stringify({ task: "t", fork: true }),
+        "sub-fork-1", false, { started_task_id: 3, subagent_session_id: "sub-fork-1" })],
+      ["history", histToolResult("delegate", JSON.stringify({ task: "t", fork: true }),
+        "sub-fork-1", false, { started_task_id: 3, subagent_session_id: "sub-fork-1" })],
+    ]) {
+      const r = c.querySelector(".tool-result");
+      chk("fork receipt from fields keeps the bare id once (" + path + ")",
+          r.classList.contains("delegate-result")
+          && resText(c) === "后台运行任务 #3子代理会话 sub-fork-1",
+          "cls=" + r.className + " text=" + JSON.stringify(resText(c)));
+    }
+    // bash 结果没有这两项：普通文本路径，卡片里不出现 delegate 结构。
+    for (const [path, c] of [
+      ["live", liveToolResult("bash", JSON.stringify({ command: "ls" }), "a.txt\nb.txt", false)],
+      ["history", histToolResult("bash", JSON.stringify({ command: "ls" }), "a.txt\nb.txt", false)],
+    ]) {
+      const r = c.querySelector(".tool-result");
+      chk("bash result stays plain (" + path + ")",
+          !r.classList.contains("delegate-result")
+          && r.querySelector(".delegate-session") === null
+          && resText(c) === "a.txt\nb.txt",
           "cls=" + r.className + " text=" + JSON.stringify(resText(c)));
     }
     // delegate 同步完成：子代理会话 + 答案 markdown

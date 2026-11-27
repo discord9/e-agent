@@ -161,12 +161,6 @@ pub type SubagentModelSource =
 pub type RoleModelSource =
     Arc<dyn Fn(&str) -> Option<(ConfiguredModel, Option<u64>)> + Send + Sync>;
 
-/// Live model resolver used by `fork`: resolves the parent's current model
-/// profile name to a concrete model plus context window, or `None` when the
-/// profile cannot be resolved (the fork then fails closed).
-pub type ForkModelSource =
-    Arc<dyn Fn(&str) -> Option<(ConfiguredModel, Option<u64>)> + Send + Sync>;
-
 /// Direct, live-only parent/child agent messaging. Endpoints are bound by a
 /// runner at construction time and are deliberately never reconstructed.
 pub struct SendMessage {
@@ -342,12 +336,6 @@ pub struct Delegate {
     /// Current live parent runner endpoint, installed after runner creation.
     parent_endpoint: Option<WeakSessionHandle>,
     fork_head: Option<Arc<dyn Fn() -> crate::session_factory::RequestHead + Send + Sync>>,
-    /// Live model resolver installed by the session factory: resolves a model
-    /// profile name at fork time, so a forked child runs on the parent's
-    /// CURRENT model after a runtime `/model` switch. `None` (a Delegate
-    /// constructed directly, e.g. in tests) can only fork on the request
-    /// head's model and fails closed otherwise.
-    fork_model_source: Option<ForkModelSource>,
     /// This tool's OWN background-completion sink (the pattern `Bash` uses):
     /// both delegate spawn paths deliver through it, so a fork's child
     /// delegate can never overwrite the parent's registered sender.
@@ -455,7 +443,6 @@ impl Delegate {
             persist_backend: self.persist_backend.clone(),
             parent_endpoint: self.parent_endpoint.clone(),
             fork_head: self.fork_head.clone(),
-            fork_model_source: self.fork_model_source.clone(),
             // Inherited, never re-registered: the child delegate is inert
             // (`fork_child` rejects delegation) and its already-set sink is
             // what keeps `Agent::new` from installing one over the parent's.
@@ -500,7 +487,6 @@ impl Delegate {
             persist_backend: SessionBackend::default(),
             parent_endpoint: None,
             fork_head: None,
-            fork_model_source: None,
             sender: None,
             fork_child: false,
         }
@@ -617,13 +603,6 @@ impl Delegate {
         head: Arc<dyn Fn() -> crate::session_factory::RequestHead + Send + Sync>,
     ) -> Self {
         self.fork_head = Some(head);
-        self
-    }
-
-    /// Resolve the fork's model from the parent's LIVE routing identity at
-    /// fork time (see [`ForkModelSource`]).
-    pub(crate) fn with_fork_model_source(mut self, source: ForkModelSource) -> Self {
-        self.fork_model_source = Some(source);
         self
     }
 
@@ -762,16 +741,22 @@ impl Delegate {
         Ok((handle, runner_task))
     }
 
-    /// The fork's model: the parent's CURRENT routing identity, not the
+    /// The fork's model: the parent's CURRENT EFFECTIVE model, not the
     /// request head captured when the parent was built. A runtime `/model`
     /// switch installs a new model on the parent's live agent only, so the
-    /// head's model is stale from then on. Resolution fails closed rather
-    /// than silently forking on the stale model.
+    /// head's model is stale from then on — even when the profile NAME is
+    /// unchanged (an effort override, or a profile definition edited and
+    /// reselected since the build). The switch therefore snapshots the
+    /// RESOLVED model plus its installed window, and this clones that
+    /// snapshot: it never reads config and never re-resolves, so a reload
+    /// between the switch and the fork cannot reroute the child. A model
+    /// installed programmatically has no snapshot and fails closed rather
+    /// than silently forking on a stale head.
     fn fork_model(
         &self,
         head: &crate::session_factory::RequestHead,
     ) -> Result<(ConfiguredModel, Option<u64>), String> {
-        let Some((profile, context_window)) = self
+        let Some(live) = self
             .parent_endpoint
             .as_ref()
             .and_then(WeakSessionHandle::live_model)
@@ -779,15 +764,10 @@ impl Delegate {
             // No runtime switch: the head still describes the live model.
             return Ok((head.model.clone(), head.context_window));
         };
-        if profile == head.model.profile_key() {
-            // Same profile: the head's model object was built from it; only
-            // the context window may have been re-declared by the switch.
-            return Ok((head.model.clone(), context_window));
+        match live.model {
+            Some(model) => Ok((model, live.context_window)),
+            None => Err("fork requires the parent's current model".to_string()),
         }
-        self.fork_model_source
-            .as_ref()
-            .and_then(|source| source(&profile))
-            .ok_or_else(|| "fork requires the parent's current model".to_string())
     }
 
     /// Spawn a forked child. `prefix` is the parent's materialized context
@@ -811,7 +791,7 @@ impl Delegate {
         cut: (String, crate::session_store::LocatedKey),
         head: crate::session_factory::RequestHead,
         workspace: Workspace,
-    ) -> Result<String, String> {
+    ) -> Result<(u64, String), String> {
         // Admission preflight: `execute` checked delivery before the awaited
         // parent-history load, so re-check here — nothing has been spawned
         // yet, and a closed channel must not leave an orphan runner/session.
@@ -820,6 +800,9 @@ impl Delegate {
         }
         // The parent's current model, never the head captured at build time.
         let (model, context_window) = self.fork_model(&head)?;
+        // The parent's live image-omission set, likewise never the build-time
+        // snapshot: installed on the child below, before its first request.
+        let omitted_images = head.omitted_images.clone();
         let session_id = crate::session::new_id_prefixed("sub-");
         let persist_root = self
             .persist_root
@@ -853,7 +836,12 @@ impl Delegate {
             // same policy a `/model`-switched or reloaded parent would.
             self.sandbox.clone(),
             head.read_only,
-            head.protect_git,
+            // A fork gets the SUBAGENT default, never the parent's
+            // main-session value: main's own bash may write `.git`, a
+            // delegated child may not, and forking must not be a way around
+            // that boundary. Nothing about the inherited prefix needs the
+            // parent's shell policy, so this is a plain subagent constant.
+            true,
             Some(session_id.clone()),
         );
         #[cfg(target_os = "linux")]
@@ -893,6 +881,11 @@ impl Delegate {
         )));
         tools.push(Box::new(child_delegate));
         let mut agent = Agent::new(Box::new(model.clone()), tools);
+        // Inherit the parent's live rejections BEFORE the first request: the
+        // child skips exactly the attachments the parent's provider already
+        // rejected, under the same cached-omission notice the parent's next
+        // request carries, so the two requests stay comparable.
+        agent.omit_images(omitted_images);
         if let Some(prefix) = head.context_prefix {
             agent.set_context_prefix(prefix);
         }
@@ -1000,7 +993,10 @@ impl Delegate {
         // resolved child workspace in the same string form the delegate path
         // passes, so the task panel says where this child is running.
         let display_workspace = workspace.root().display().to_string();
-        self.background
+        // The fork's tool result stays the bare child session id; the
+        // registry task id rides as a field for the scheduler's bookkeeping.
+        let (task_id, _) = self
+            .background
             .spawn_with_id_target(
                 self.sender.clone(),
                 title,
@@ -1062,7 +1058,7 @@ impl Delegate {
                 },
             )
             .map_err(|e| e.to_string())?;
-        Ok(session_id)
+        Ok((task_id, session_id))
     }
 
     async fn runner_result(
@@ -1439,12 +1435,14 @@ pub async fn spawn_btw_subagent(
 impl Tool for Delegate {
     fn spec(&self) -> ToolSpec {
         let mut description =
-            "The first argument MUST be workspace: emit its path (absolute, or relative to \
-                your own workspace root — e.g. `.e-agent/worktrees/wt-x`) before writing task. \
-                Spawn a subagent with a fresh context to work on a task. Use this for \
-                self-contained subtasks (searching, reading many files, focused edits) whose \
-                intermediate steps would clutter your own context. The subagent has the file and \
-                bash tools and, when configured, public web search, but cannot delegate further."
+            "For a non-`fork` delegate the first argument MUST be workspace: emit its path \
+                (absolute, or relative to your own workspace root — e.g. \
+                `.e-agent/worktrees/wt-x`) before writing task; only a `fork` omits it, to \
+                inherit the parent's root. Spawn a subagent with a fresh context to work on a \
+                task. Use this for self-contained subtasks (searching, reading many files, \
+                focused edits) whose intermediate steps would clutter your own context. The \
+                subagent has the file and bash tools and, when configured, public web search, \
+                but cannot delegate further."
                 .to_owned();
         let model = self.subagent_model.display_name();
         description.push_str(&format!(" The subagent runs on the `{model}` model."));
@@ -1488,8 +1486,25 @@ impl Tool for Delegate {
         } else {
             json!({"type": "string", "enum": roles, "description": format!("specialized role for the subagent; available roles: {}", role_disclosures.join(", "))})
         };
+        // A fork defaults its workspace to the parent's root, so `workspace`
+        // is only unconditionally required by a delegate that cannot fork
+        // (and, inside a fork-capable delegate, for a non-fork call such as
+        // `resume`: there is no `.` fallback, `execute` rejects it). The
+        // property description states that split; the `required` list can
+        // only name the unconditional case.
+        //
+        // Keyed on the head, not on `fork_child`: a forked child's own
+        // `delegate` must stay byte-identical to its parent's spec (its
+        // request has to be an identical provider prefix), and that tool is
+        // inert anyway — `execute` rejects every delegation from a fork.
+        let forks = self.fork_head.is_some();
+        let workspace_description = if forks {
+            "working directory for the subagent (e.g. /home/user/project or C:\\Users\\user\\project). REQUIRED for a non-fork delegate and for `resume`; a `fork` omits it to inherit the parent's root. May be absolute or relative: relative paths are resolved against YOUR workspace root (e.g. `.e-agent/worktrees/wt-x`) and must stay inside it or an authorized external directory."
+        } else {
+            "REQUIRED — working directory for the subagent (e.g. /home/user/project or C:\\Users\\user\\project). May be absolute or relative: relative paths are resolved against YOUR workspace root (e.g. `.e-agent/worktrees/wt-x`) and must stay inside it or an authorized external directory."
+        };
         let mut properties = json!({
-            "workspace": {"type": "string", "description": "REQUIRED — working directory for the subagent (e.g. /home/user/project or C:\\Users\\user\\project). May be absolute or relative: relative paths are resolved against YOUR workspace root (e.g. `.e-agent/worktrees/wt-x`) and must stay inside it or an authorized external directory."},
+            "workspace": {"type": "string", "description": workspace_description},
             "role": role_property,
             "label": {"type": "string", "description": "short (≤ 40 chars) human-readable title for the task panel; defaults to the role name or a preview of the task"},
             "resume": {"type": "string", "description": "id of a previous subagent session (sub-…) to continue from; its transcript becomes the starting context"},
@@ -1498,10 +1513,18 @@ impl Tool for Delegate {
         if self.fork_head.is_some() {
             properties["fork"] = json!({"type":"boolean", "description":"Continue from the parent's completed-turn prefix: the child inherits the parent's current model, system prompt, goal and tool schemas, except `generate_image`, which is main-only and absent from every fork (no placeholder is exposed, so a fork of a main session that exposed it has a different tool array). `workspace` defaults to the parent's root; with that default (apart from that one main-only tool, and with the same MCP tool set) the child's request is a byte-identical provider prefix and reuses the parent's prompt cache, while an explicit different `workspace` runs the child's tools/MCP elsewhere and loses that guarantee. Mutually exclusive with `role` and `resume`. The current in-flight turn is excluded, so put everything the child needs in `task`."});
         }
+        // `task` is always required; `workspace` is required unless this
+        // delegate can fork (a fork's workspace defaults to the parent's
+        // root, see the property description).
+        let required = if forks {
+            json!(["task"])
+        } else {
+            json!(["workspace", "task"])
+        };
         ToolSpec {
             name: "delegate".into(),
             description,
-            parameters: json!({"type":"object", "properties": properties, "required":["workspace","task"]}),
+            parameters: json!({"type":"object", "properties": properties, "required": required}),
         }
     }
 
@@ -1633,6 +1656,15 @@ impl Tool for Delegate {
                 next_older: cut.older.clone(),
             };
             let mut head = factory();
+            // Snapshot the parent's LIVE image-omission set into the head: the
+            // build-time head cannot know what this live session was rejected
+            // for, and a child that re-sent those attachments would diverge
+            // from the parent's own next request.
+            head.omitted_images = self
+                .parent_endpoint
+                .as_ref()
+                .map(WeakSessionHandle::omitted_images)
+                .unwrap_or_default();
             // Freeze the parent's LIVE goal projection (unchanged policy): the
             // newest durable goal state, even when the fork's cut prefix ends
             // before it. One bounded goal row is read; the history is not
@@ -1657,7 +1689,12 @@ impl Tool for Delegate {
                     workspace,
                 )
                 .await
-                .map(ToolOutput::text);
+                .map(|(task_id, session_id)| {
+                    // The child session id rides as a FIELD (its own spawn
+                    // result), never parsed back out of the receipt text.
+                    ToolOutput::started_task(session_id.clone(), task_id)
+                        .subagent_session(session_id)
+                });
         }
         let role = arguments
             .as_object()
@@ -1763,7 +1800,11 @@ impl Tool for Delegate {
         let label = task_label(raw_label, role.as_deref(), &task);
 
         // Resolve the (required) workspace: the subagent's working directory
-        // is an explicit parameter — there is no parent-workspace fallback.
+        // is an explicit parameter — there is no parent-workspace fallback,
+        // and `resume` is no exception: defaulting it to `.` would reroot the
+        // resumed transcript to the CALLER (a child that worked in a worktree
+        // would silently resume in the parent root). Only `fork` may omit it,
+        // and it does so deliberately to inherit the parent's root.
         // Absolute paths are used as-is; relative paths are resolved against
         // the CALLER's workspace root before reroot() canonicalizes and
         // enforces authorization (the resolved path must stay inside the
@@ -1777,13 +1818,17 @@ impl Tool for Delegate {
             .filter(|s| !s.is_empty());
         let workspace_arg = match workspace_arg {
             Some(path) => path,
-            None if resume_id_arg.is_some() => ".".to_owned(),
             None => {
-                return Err(
-                    "delegate requires a workspace parameter: path of the working directory \
-                     (absolute, or relative to this workspace's root)"
+                return Err(match resume_id_arg.as_deref() {
+                    Some(id) => format!(
+                        "`resume` requires a workspace parameter for session `{id}`: pass \
+                         the working directory it ran in (absolute, or relative to this \
+                         workspace's root)"
+                    ),
+                    None => "delegate requires a workspace parameter: path of the working \
+                             directory (absolute, or relative to this workspace's root)"
                         .into(),
-                );
+                });
             }
         };
         // Join relative inputs with the caller's root up front; reroot's
@@ -1956,7 +2001,7 @@ impl Tool for Delegate {
         // registry derives it from the absent shell name).
         let exit_slot = new_exit_slot();
         let work_exit = exit_slot.clone();
-        let started = self.background.spawn_with_id_target(
+        let (task_id, started) = self.background.spawn_with_id_target(
             self.sender.clone(),
             label,
             role,
@@ -2011,9 +2056,11 @@ impl Tool for Delegate {
                 }
             },
         )?;
-        Ok(ToolOutput::text(format!(
-            "{started}\nsubagent session: {session_id}"
-        )))
+        Ok(ToolOutput::started_task(
+            format!("{started}\nsubagent session: {session_id}"),
+            task_id,
+        )
+        .subagent_session(session_id))
     }
 
     fn set_event_sender(&mut self, sender: tokio::sync::mpsc::UnboundedSender<AgentEvent>) {

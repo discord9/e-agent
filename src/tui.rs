@@ -986,7 +986,15 @@ fn handle_model(command: ModelCommand, state: &mut TuiState, handle: &RunnerHand
                     state.effort_override = effort.filter(|value| {
                         !matches!(value, crate::session_factory::EffortOverride::Default)
                     });
-                    handle.switch_model(&name, Box::new(configured), context_window);
+                    // The RESOLVED model travels with the live identity, so a
+                    // fork inherits it — including `default` (the profile's
+                    // own configured effort) and `omit` (no effort at all) —
+                    // without re-resolving against a reloaded config.
+                    handle.switch_model(
+                        Box::new(configured.clone()),
+                        context_window,
+                        Some(configured),
+                    );
                     let acknowledgement = if clears_effort_override {
                         format!("已切换到 {name}（已清除 effort 覆盖，使用配置默认）")
                     } else {

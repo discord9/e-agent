@@ -81,6 +81,7 @@ The keys most configurations touch:
 | `[session].backend` | `sqlite` (default), `jsonl`, or `greptime` |
 | `[roles]` | role → model profile routing |
 | `[bash].timeout_secs`, `[background].timeout_secs` | command timeouts |
+| `[images].max_inline` | distinct inline images per request (default 6, `0` = never offload) |
 
 A workspace-level `.e-agent/config.toml` may add or override models, roles, MCP
 servers, `[bash]`, and `[background]`; it cannot define providers or the session
@@ -492,6 +493,41 @@ base64, and the wire re-reads the file when sending. The profile needs
 `vision = true`, otherwise the turn fails with a model-does-not-support-images
 error. `generate_image` (main session only, ChatGPT login) writes a PNG.
 
+### Image budget
+
+Both wires (chat and ChatGPT Responses) put at most **1024 estimated vision
+tokens per image** on the wire. Each outgoing image is measured with DeepSeek's
+published calculator — 14px patches, merged 3:1 per axis into 42px token cells,
+`tokens = grid_h * (grid_w + 1) + 2` — and scaled **down** (never up) until the
+estimate fits, keeping its aspect ratio in whole 14px patches. The provider's
+own 544x544 total-pixel floor is its accounting only: a small image is sent
+unchanged. The re-encoded variant is cached next to the original as
+`<hash>.n<WxH>.<ext>` (JPEG quality 85 for opaque images, PNG when the source
+has alpha) and reused on later requests; an image that already fits is sent
+byte-identical with its original MIME type and is never re-encoded.
+
+```toml
+[images]
+max_inline = 6      # distinct images kept inline per request; 0 = never offload
+```
+
+When one request would carry more than `max_inline` distinct images, the oldest
+by first appearance in request order are replaced by a text part in place of the
+image part:
+
+```text
+[image omitted: 4 older image(s); read again with read_image (hash <sha256>)]
+```
+
+The placeholder names the stored hash — the file name in the image store, which
+`read_image` can read again when the store is an authorized external root — so
+nothing is silently lost, only deferred. Offloading applies to user and tool
+images (the same messages the image-rejection classifier walks), and the newest
+`max_inline` are always kept. Because the projection is pure (same messages in,
+same request bytes out), it is deterministic, but replacing an old image part
+with text changes every byte after it: **offloading costs prompt-cache reuse
+from the first changed message onward**.
+
 ## SQLite session backend
 
 The default backend stores sessions in `<workspace>/.e-agent/sessions.db`
@@ -518,5 +554,7 @@ starts.
   background waits.
 - MCP is local stdio servers only; no remote HTTP/SSE, OAuth, resources,
   prompts, or server restart.
+- Image offload is positional only: no retention/expiry by wall-clock time, no
+  "recent turns" heuristic, no automatic re-read on offload, and no summariser.
 - The web server has no multi-user model: one token, one workspace per process.
 - Windows support is narrower than Linux (see the sandbox notes above).

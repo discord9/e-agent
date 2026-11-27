@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 use crate::agent::{Tool, ToolOutput, ToolSpec};
 use crate::workspace::Workspace;
 
+mod acp;
 mod background;
 mod bash;
 mod file;
@@ -28,6 +29,7 @@ use user_input::RequestUserInput;
 pub(crate) use user_input::parse_questions;
 use web::*;
 
+pub(crate) use acp::acp_tool;
 pub use background::{
     BackgroundTaskInfo, BackgroundTasks, ExitSlot, OutputSlot, SpoolWindow, TaskDisplayMeta,
     TaskExit, TaskSpool, new_exit_slot,

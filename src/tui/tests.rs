@@ -1228,6 +1228,8 @@ fn attached_view_replays_snapshot_and_marks_finished_on_completion() {
         content: "files".into(),
         images: vec![],
         call_id: None,
+        started_task_id: None,
+        subagent_session_id: None,
     });
     attach_test(&mut state, 7, "demo task", handle);
     let lines: Vec<_> = state
@@ -1257,6 +1259,7 @@ fn attached_view_replays_snapshot_and_marks_finished_on_completion() {
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         },
     });
     assert!(state.attached.as_ref().unwrap().finished);
@@ -1304,6 +1307,7 @@ fn attached_view_clears_spinner_on_background_completed_from_bridge() {
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         },
     });
     let attached = state.attached.as_ref().unwrap();
@@ -1328,6 +1332,7 @@ fn attach_after_completion_marks_finished_from_the_snapshot() {
         status: None,
         kind: None,
         cancellation_source: None,
+        subagent_session_id: None,
     });
     let mut state = TuiState::default();
     attach_test(&mut state, 3, "demo task", handle);
@@ -1384,6 +1389,74 @@ fn background_completion_notice_renders_as_dim_line() {
     assert_eq!(state.lines.last().unwrap().text, "you> hello");
 }
 
+/// The completion header takes the child session id from the STRUCTURED
+/// field: a `fork session:` child (and any future wording) is tagged exactly
+/// like a `subagent session:` one. Only rows persisted before the field
+/// existed fall back to the first-line prose.
+#[test]
+fn background_completion_header_prefers_the_structured_session_id() {
+    let lines = |entry: &SessionEntry| session_entry_to_lines(entry);
+    // Live event: reworded first line, the field still tags it.
+    let mut state = TuiState::default();
+    state.push_agent_event(AgentEvent::BackgroundCompletionNotice {
+        id: 5,
+        output: "child session: sub-forked\nanswer".into(),
+        label: Some("fork".into()),
+        started_at_ms: None,
+        duration_ms: None,
+        exit_code: None,
+        signal: None,
+        status: Some("completed".into()),
+        kind: Some("delegate".into()),
+        cancellation_source: None,
+        subagent_session_id: Some("sub-forked".into()),
+    });
+    assert_eq!(
+        state.lines[0].text,
+        "[background task 5 completed: fork] [session: sub-forked]"
+    );
+
+    // Persisted replay of a fork completion: the tag comes from the field.
+    let out = lines(&SessionEntry::BackgroundCompletion {
+        id: 9,
+        output: "fork session: sub-forked\nanswer".into(),
+        label: None,
+        started_at_ms: None,
+        duration_ms: None,
+        exit_code: None,
+        signal: None,
+        status: Some("completed".into()),
+        kind: Some("delegate".into()),
+        cancellation_source: None,
+        subagent_session_id: Some("sub-forked".into()),
+    });
+    assert_eq!(
+        out[0].text,
+        "[background task 9 completed] [session: sub-forked]"
+    );
+
+    // An old row (no field) still renders through the legacy first-line
+    // fallback; the fallback can only be deleted by a persisted-format
+    // migration, never by pointing at the live registry.
+    let out = lines(&SessionEntry::BackgroundCompletion {
+        id: 10,
+        output: "subagent session: sub-legacy\nanswer".into(),
+        label: None,
+        started_at_ms: None,
+        duration_ms: None,
+        exit_code: None,
+        signal: None,
+        status: None,
+        kind: Some("delegate".into()),
+        cancellation_source: None,
+        subagent_session_id: None,
+    });
+    assert_eq!(
+        out[0].text,
+        "[background task 10 completed] [session: sub-legacy]"
+    );
+}
+
 #[test]
 fn background_completion_notice_populates_finished_task_section() {
     // The structured notice (emitted only after the durable entry is
@@ -1401,6 +1474,7 @@ fn background_completion_notice_populates_finished_task_section() {
         status: Some("completed".into()),
         kind: Some("bash".into()),
         cancellation_source: None,
+        subagent_session_id: None,
     });
     assert_eq!(state.finished_tasks.len(), 1);
     assert_eq!(state.finished_tasks[0].id, 1);
@@ -1422,6 +1496,7 @@ fn background_completion_notice_populates_finished_task_section() {
         status: Some("failed".into()),
         kind: Some("delegate".into()),
         cancellation_source: None,
+        subagent_session_id: None,
     });
     assert_eq!(state.finished_tasks.len(), 2);
     assert_eq!(state.finished_tasks[0].id, 2, "newest first");
@@ -1494,6 +1569,7 @@ fn attached_enter_steers_and_ctrl_c_cancels_through_the_handle() {
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         },
     });
     state.handle_attached_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), 80);
@@ -1521,6 +1597,7 @@ fn attached_enter_on_finished_keeps_input_and_sends_nothing() {
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         },
     });
     {
@@ -1571,6 +1648,7 @@ fn finish_with_queued_prompts_notes_them_as_unanswered() {
             status: None,
             kind: None,
             cancellation_source: None,
+            subagent_session_id: None,
         },
     });
     let attached = state.attached.as_ref().unwrap();
@@ -2395,6 +2473,7 @@ fn attached_title_shows_finished_before_subagent_label() {
         status: None,
         kind: None,
         cancellation_source: None,
+        subagent_session_id: None,
     });
     let mut state = TuiState::default();
     let snapshot = _handle.snapshot();
@@ -3105,6 +3184,7 @@ fn background_completion_ends_stream_lane_so_next_delta_starts_fresh_line() {
         status: None,
         kind: None,
         cancellation_source: None,
+        subagent_session_id: None,
     });
     state.push_agent_event(AgentEvent::AssistantDelta("\nlet y = 2;\n```".into()));
 
@@ -3921,6 +4001,8 @@ fn scrolling_is_bounded_and_events_append_echo_lines() {
         content: "done".into(),
         images: vec![],
         call_id: None,
+        started_task_id: None,
+        subagent_session_id: None,
     });
     assert_eq!(state.lines.last().unwrap().text, "  ok: done");
     assert_eq!(state.lines.last().unwrap().kind, LineKind::ToolResult);
@@ -3933,6 +4015,8 @@ fn scrolling_is_bounded_and_events_append_echo_lines() {
         content: "failed".into(),
         images: vec![],
         call_id: None,
+        started_task_id: None,
+        subagent_session_id: None,
     });
     assert_eq!(state.lines.last().unwrap().text, "  error: failed");
     assert_eq!(state.lines.last().unwrap().kind, LineKind::ToolError);
@@ -3985,6 +4069,8 @@ fn edit_file_tool_calls_render_as_a_numbered_diff_on_result() {
         content: "file edited (line 7)".into(),
         images: vec![],
         call_id: None,
+        started_task_id: None,
+        subagent_session_id: None,
     });
     let lines: Vec<_> = state
         .lines
@@ -4226,6 +4312,8 @@ fn session_entry_to_lines_maps_persisted_entry_kinds() {
             content: "done".into(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         },
     });
@@ -4239,6 +4327,8 @@ fn session_entry_to_lines_maps_persisted_entry_kinds() {
             content: "boom".into(),
             is_error: true,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         },
     });
@@ -4286,6 +4376,7 @@ fn session_entry_to_lines_maps_persisted_entry_kinds() {
         status: None,
         kind: None,
         cancellation_source: None,
+        subagent_session_id: None,
     });
     assert_eq!(out.len(), 3);
     assert_eq!(out[0].text, "[background task 7 completed: demo]");
@@ -4305,6 +4396,7 @@ fn session_entry_to_lines_maps_persisted_entry_kinds() {
         status: None,
         kind: Some("delegate".into()),
         cancellation_source: None,
+        subagent_session_id: None,
     });
     assert_eq!(
         out[0].text,
@@ -4732,6 +4824,8 @@ fn fork_session_entries() -> Vec<SessionEntry> {
             content: "ok".into(),
             is_error: false,
             synthetic: false,
+            started_task_id: None,
+            subagent_session_id: None,
             images: vec![],
         }
         .into(),
