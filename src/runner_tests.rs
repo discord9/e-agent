@@ -907,8 +907,17 @@ fn option_answer_accepts_only_listed_ids_and_keeps_id_and_label() {
         PromptSubmission::Answered
     );
     match commands.try_recv().unwrap() {
-        SessionCommand::Answer { call_id, answers } => {
+        SessionCommand::Answer {
+            call_id,
+            answers,
+            option,
+        } => {
             assert_eq!(call_id, "call-perm");
+            assert_eq!(
+                option.as_deref(),
+                Some("allow-once"),
+                "the accepted id is carried, not re-derived from the text"
+            );
             assert_eq!(
                 answers,
                 vec![(
@@ -951,8 +960,13 @@ fn async_option_answer_uses_the_same_resolution() {
         PromptSubmission::Answered
     );
     match commands.try_recv().unwrap() {
-        SessionCommand::Answer { call_id, answers } => {
+        SessionCommand::Answer {
+            call_id,
+            answers,
+            option,
+        } => {
             assert_eq!(call_id, "call-async-perm");
+            assert_eq!(option.as_deref(), Some("deny"));
             assert_eq!(
                 answers,
                 vec![("perm".to_owned(), "Selected option: deny (拒绝)".to_owned())]
@@ -985,8 +999,13 @@ fn free_text_answer_still_accepts_any_non_empty_text() {
         PromptSubmission::Answered
     );
     match commands.try_recv().unwrap() {
-        SessionCommand::Answer { call_id, answers } => {
+        SessionCommand::Answer {
+            call_id,
+            answers,
+            option,
+        } => {
             assert_eq!(call_id, "call-text");
+            assert_eq!(option, None, "a free-text question names no option");
             assert_eq!(
                 answers,
                 vec![("answer".to_owned(), " Ada 你好 ".to_owned())]

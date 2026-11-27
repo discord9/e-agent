@@ -284,6 +284,114 @@ while IFS= read -r line; do
 done
 "#;
 
+/// Asks ONE permission request, then waits for the test's signal file
+/// (`$1.die`) before exiting WITHOUT reading the answer: the child dies with
+/// the request still pending, so only the runner can end the wait.
+const ASK_THEN_DIE_STUB: &str = r#"
+log="$1"
+die="$1.die"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  printf '%s\n' "$line" >> "$log"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true},"agentInfo":{"name":"stub-acp","version":"9.9.9"},"authMethods":[]}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess-die-1"}}\n' "$id"
+      ;;
+    *'"method":"session/prompt"'*)
+      printf '{"jsonrpc":"2.0","id":9001,"method":"session/request_permission","params":{"sessionId":"sess-die-1","toolCall":{"toolCallId":"r1","title":"read notes.md","kind":"read"},"options":[{"optionId":"allow-1","name":"Allow once","kind":"allow_once"}]}}\n'
+      while [ ! -f "$die" ]; do sleep 0.02; done
+      exit 0
+      ;;
+  esac
+done
+"#;
+
+/// Sends a `read` request, lets the human-facing side settle, then sends a
+/// SECOND `read` request while the first is still awaiting an answer (both
+/// `read`, i.e. kinds the no-frontend policy would allow), and logs both
+/// answers.
+const OVERLAP_STUB: &str = r#"
+log="$1"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  printf '%s\n' "$line" >> "$log"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true},"agentInfo":{"name":"stub-acp","version":"9.9.9"},"authMethods":[]}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess-overlap-1"}}\n' "$id"
+      ;;
+    *'"method":"session/prompt"'*)
+      printf '{"jsonrpc":"2.0","id":9001,"method":"session/request_permission","params":{"sessionId":"sess-overlap-1","toolCall":{"toolCallId":"r1","title":"read notes.md","kind":"read"},"options":[{"optionId":"allow-1","name":"Allow once","kind":"allow_once"},{"optionId":"reject-1","name":"Reject","kind":"reject_once"}]}}\n'
+      sleep 0.2
+      printf '{"jsonrpc":"2.0","id":9002,"method":"session/request_permission","params":{"sessionId":"sess-overlap-1","toolCall":{"toolCallId":"t1","title":"read secrets.md","kind":"read"},"options":[{"optionId":"allow-1","name":"Allow once","kind":"allow_once"},{"optionId":"reject-1","name":"Reject","kind":"reject_once"}]}}\n'
+      IFS= read -r answer
+      printf '%s\n' "$answer" >> "$log"
+      IFS= read -r answer
+      printf '%s\n' "$answer" >> "$log"
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      ;;
+  esac
+done
+"#;
+
+/// Offers two options whose ids differ only by surrounding spaces: `" x "`
+/// and `"x"`. The submission `"x"` must come back as the id `"x"`.
+const COLLIDING_STUB: &str = r#"
+log="$1"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  printf '%s\n' "$line" >> "$log"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true},"agentInfo":{"name":"stub-acp","version":"9.9.9"},"authMethods":[]}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess-collide-1"}}\n' "$id"
+      ;;
+    *'"method":"session/prompt"'*)
+      printf '{"jsonrpc":"2.0","id":9001,"method":"session/request_permission","params":{"sessionId":"sess-collide-1","toolCall":{"toolCallId":"r1","title":"read notes.md","kind":"read"},"options":[{"optionId":" x ","name":"Reject","kind":"reject_once"},{"optionId":"x","name":"Allow once","kind":"allow_once"}]}}\n'
+      IFS= read -r answer
+      printf '%s\n' "$answer" >> "$log"
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      ;;
+  esac
+done
+"#;
+
+/// Replays one chunk BEFORE the `session/load` response and one AFTER it (but
+/// before the prompt goes out): only the pre-response chunk is restored
+/// history.
+const REPLAY_LATE_STUB: &str = r#"
+log="$1"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  printf '%s\n' "$line" >> "$log"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true},"agentInfo":{"name":"stub-acp","version":"9.9.9"},"authMethods":[]}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess-replay-late"}}\n' "$id"
+      ;;
+    *'"method":"session/load"'*)
+      sid=$(printf '%s' "$line" | grep -o '"sessionId":"[^"]*"' | head -1 | cut -d'"' -f4)
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"REPLAY-older-turn-"}}}}\n' "$sid"
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"%s"}}\n' "$id" "$sid"
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"EARLY "}}}}\n' "$sid"
+      ;;
+    *'"method":"session/prompt"'*)
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"LATE"}}}}\n'
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      ;;
+  esac
+done
+"#;
+
 fn stub_config(script: &str, log: &Path, load: &str) -> AcpConfig {
     tagged_config(script, log, load, "new")
 }
@@ -343,6 +451,11 @@ fn logged_frames(log: &Path) -> Vec<String> {
         .lines()
         .map(str::to_owned)
         .collect()
+}
+
+/// The stub's frame log so far: an empty string until the stub writes it.
+fn log_text(log: &Path) -> String {
+    std::fs::read_to_string(log).unwrap_or_default()
 }
 
 fn count(frames: &[String], needle: &str) -> usize {
@@ -1315,23 +1428,32 @@ fn a_permission_identity_is_unique_per_request_and_covers_the_action() {
 }
 
 #[test]
-fn an_answer_for_a_superseded_ask_is_dropped_while_the_newer_ask_stays_pending() {
+fn an_overlapping_ask_cannot_steal_the_pending_slot() {
     let mut pending = PendingPermission::default();
-    pending.claim("ask-1");
-    // A second run in one session registers its own ask (same JSON-RPC id in
-    // the stub, a different identity in the tool).
-    pending.claim("ask-2");
+    assert!(pending.claim("ask-1"), "the first ask takes the free slot");
+    // A second request arrives while the first is still awaiting an answer: it
+    // is refused and must leave the slot — and so the first ask's answer —
+    // exactly as it was.
     assert!(
-        !pending.release("ask-1"),
-        "run 1's late answer must not release run 2's pending entry"
+        !pending.claim("ask-2"),
+        "the occupied slot is never overwritten"
     );
     assert_eq!(
         pending.current.as_deref(),
-        Some("ask-2"),
-        "run 2 is pending"
+        Some("ask-1"),
+        "the ask a human is looking at stays pending"
     );
-    assert!(pending.release("ask-2"), "run 2's own answer is used");
+    assert!(
+        !pending.release("ask-2"),
+        "a refused ask's answer must not release the open one"
+    );
+    assert_eq!(pending.current.as_deref(), Some("ask-1"));
+    assert!(
+        pending.release("ask-1"),
+        "the first ask's own answer is used"
+    );
     assert_eq!(pending.current, None);
+    assert!(pending.claim("ask-3"), "the slot is free again");
 }
 
 /// A model that calls `acp_prompt` on the first provider round of EACH of two
@@ -1646,24 +1768,36 @@ async fn an_allow_always_choice_is_sent_verbatim_never_downgraded() {
     let log = temp.path().join("frames.log");
     let root = Workspace::new(temp.path()).unwrap().root().to_path_buf();
     let session = "session-allow-kinds";
-    let mut tool = tool_with(&root, stub_config(TWO_ALLOW_STUB, &log, "ok"), session).await;
-    let (handle, emitter, mut commands) = session_test_channel();
-    emitter.allow_user_input();
-    tool.set_session_handle(session, handle);
-    let call = tokio::spawn(async move { tool.execute(json!({"prompt": "hi"})).await });
+    let tool = tool_with(&root, stub_config(TWO_ALLOW_STUB, &log, "ok"), session).await;
+    // A REAL runner answers both questions: the submitted text goes through
+    // the production conversion (`resolve_answer` → the option id), so this
+    // asserts the whole path, not a hand-written answer.
+    let (runner, handle, mut status) = runner_with_acp(&root, session, tool, true);
+    let task = runner.start(Some("go".into()));
 
     // Request 9001 offers `allow_always` FIRST; the human picks it.
-    let always = answer_next_ask(&mut commands, Some("always-1".into())).await;
+    let always = next_question(&mut status, "").await;
     assert!(always.call_id.contains("-r1-"), "{}", always.call_id);
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some(always.call_id.clone()), "always-1".into()),
+        PromptSubmission::Answered
+    );
     // Request 9002 offers `allow_once` first; the human picks that one.
-    let once = answer_next_ask(&mut commands, Some("once-2".into())).await;
+    let once = next_question(&mut status, &always.call_id).await;
     assert!(once.call_id.contains("-r2-"), "{}", once.call_id);
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some(once.call_id.clone()), "once-2".into()),
+        PromptSubmission::Answered
+    );
 
-    let output = tokio::time::timeout(Duration::from_secs(30), call)
-        .await
-        .expect("both questions were answered")
-        .unwrap()
-        .expect("the stub resolves the prompt");
+    assert!(
+        matches!(
+            finished(&mut status).await,
+            SessionResult::Completed(Some(_))
+        ),
+        "both questions were answered"
+    );
+    drop(task);
     let frames = logged_frames(&log);
     let answers: Vec<&String> = frames
         .iter()
@@ -1680,5 +1814,223 @@ async fn an_allow_always_choice_is_sent_verbatim_never_downgraded() {
         "an `allow_once` choice must not be widened: {}",
         answers[1]
     );
-    assert!(!output.content.contains("denied"), "{}", output.content);
+    let content = tool_result(&root, session, "call-acp").await;
+    assert!(!content.contains("denied"), "{content}");
+}
+
+/// Two option ids that differ only by surrounding spaces both answer to `"x"`.
+/// Choosing `"x"` must send back `"x"`: the id travels through the runner as
+/// the validated id it was accepted as, never re-derived from the display text
+/// (`"Selected option: x (Allow once)"` renders the same for both).
+#[tokio::test]
+async fn a_chosen_option_id_is_carried_verbatim_through_the_runner_conversion() {
+    let temp = tempfile::tempdir().unwrap();
+    let log = temp.path().join("frames.log");
+    let root = Workspace::new(temp.path()).unwrap().root().to_path_buf();
+    let session = "session-collide";
+    let tool = tool_with(&root, stub_config(COLLIDING_STUB, &log, "ok"), session).await;
+    let (runner, handle, mut status) = runner_with_acp(&root, session, tool, true);
+    let task = runner.start(Some("go".into()));
+
+    let ask = next_question(&mut status, "").await;
+    assert_eq!(
+        ask.questions[0]
+            .options
+            .iter()
+            .map(|option| option.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![" x ", "x"],
+        "both ids reach the frontend exactly as offered"
+    );
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some(ask.call_id.clone()), "x".into()),
+        PromptSubmission::Answered
+    );
+    assert!(matches!(
+        finished(&mut status).await,
+        SessionResult::Completed(Some(_))
+    ));
+    drop(task);
+
+    let frames = logged_frames(&log);
+    assert!(
+        frames.iter().any(|frame| frame
+            == r#"{"jsonrpc":"2.0","id":9001,"result":{"outcome":{"outcome":"selected","optionId":"x"}}}"#),
+        "the chosen id is sent back verbatim, never its look-alike: {frames:#?}"
+    );
+}
+
+/// Item 1: the runner is the one that must dismiss an ask whose requester
+/// disappeared. The agent dies with the request pending (no answer is ever
+/// given), so only the runner can end the wait: it must clear the question and
+/// carry the tool's failure into the turn instead of parking forever.
+#[tokio::test]
+async fn a_runner_dismisses_an_open_ask_when_the_agent_dies() {
+    let temp = tempfile::tempdir().unwrap();
+    let log = temp.path().join("frames.log");
+    let root = Workspace::new(temp.path()).unwrap().root().to_path_buf();
+    let session = "session-die";
+    let tool = tool_with(&root, stub_config(ASK_THEN_DIE_STUB, &log, "ok"), session).await;
+    let (runner, _handle, mut status) = runner_with_acp(&root, session, tool, true);
+    let task = runner.start(Some("go".into()));
+
+    // The turn really reaches `WaitingInput` before the agent dies.
+    let ask = next_question(&mut status, "").await;
+    assert!(ask.call_id.contains("-r1-"), "{}", ask.call_id);
+    // Now the child exits with the request still pending: nothing will ever
+    // answer this question.
+    std::fs::write(format!("{}.die", log.display()), b"").unwrap();
+
+    assert!(
+        matches!(
+            finished(&mut status).await,
+            SessionResult::Completed(Some(_))
+        ),
+        "the turn must continue with the tool's error, not park on the question"
+    );
+    drop(task);
+    let content = tool_result(&root, session, "call-acp").await;
+    assert!(
+        content.contains("the agent exited during `session/prompt`"),
+        "the model is told what happened: {content}"
+    );
+}
+
+/// Item 2: a request that arrives while another ask is still awaiting an
+/// answer must be REFUSED as overlapping — never decided by the kind policy
+/// (both requests here are `read`, i.e. kinds that policy would allow) and
+/// never at the cost of the open ask's own answer.
+#[tokio::test]
+async fn an_overlapping_ask_is_refused_never_granted_and_the_open_ask_keeps_its_answer() {
+    let temp = tempfile::tempdir().unwrap();
+    let log = temp.path().join("frames.log");
+    let root = Workspace::new(temp.path()).unwrap().root().to_path_buf();
+    let session = "session-overlap";
+    let tool = tool_with(&root, stub_config(OVERLAP_STUB, &log, "ok"), session).await;
+    let (runner, handle, mut status) = runner_with_acp(&root, session, tool, true);
+    let task = runner.start(Some("go".into()));
+
+    // Ask A is displayed.
+    let open = next_question(&mut status, "").await;
+    assert!(open.call_id.contains("-r1-"), "{}", open.call_id);
+    // Ask B arrives while A is STILL open (the human has not answered yet: the
+    // stub logs B's reply before A's answer can arrive) and is refused on the
+    // wire. It must never become this session's question — A stays the open
+    // one — and it must never be granted by the kind policy.
+    wait_until(
+        || log_text(&log).contains(r#""id":9002"#),
+        "the overlapping request was answered right away",
+    )
+    .await;
+    match &*status.borrow() {
+        SessionStatus::WaitingInput(request) => assert_eq!(
+            request.call_id, open.call_id,
+            "the overlapping ask never replaces the open one"
+        ),
+        other => panic!("ask A must still be the open question, status={other:?}"),
+    }
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some(open.call_id.clone()), "allow-1".into()),
+        PromptSubmission::Answered
+    );
+    assert!(matches!(
+        finished(&mut status).await,
+        SessionResult::Completed(Some(_))
+    ));
+    drop(task);
+
+    let frames = logged_frames(&log);
+    assert!(
+        frames.iter().any(|frame| frame
+            == r#"{"jsonrpc":"2.0","id":9001,"result":{"outcome":{"outcome":"selected","optionId":"allow-1"}}}"#),
+        "the open ask's own answer still applies: {frames:#?}"
+    );
+    assert!(
+        frames.iter().any(|frame| frame
+            == r#"{"jsonrpc":"2.0","id":9002,"result":{"outcome":{"outcome":"cancelled"}}}"#),
+        "the overlapping request is refused, never auto-granted: {frames:#?}"
+    );
+    let content = tool_result(&root, session, "call-acp").await;
+    assert!(
+        content.contains("refused read without asking: another permission request is still awaiting an answer: read secrets.md"),
+        "{content}"
+    );
+    assert!(
+        !content.contains("denied"),
+        "the request that WAS asked is not reported as denied: {content}"
+    );
+}
+
+/// Item 6: the replay window closes with the `session/load` RESPONSE, not with
+/// whatever the caller does afterwards — an update that arrives after the
+/// response (but before `session/prompt`) is this call's answer.
+#[tokio::test]
+async fn an_update_after_the_load_response_belongs_to_the_answer() {
+    let temp = tempfile::tempdir().unwrap();
+    let log = temp.path().join("frames.log");
+    let root = Workspace::new(temp.path()).unwrap().root().to_path_buf();
+    let tool = tool_with(
+        &root,
+        stub_config(REPLAY_LATE_STUB, &log, "ok"),
+        "session-a",
+    )
+    .await;
+
+    tool.execute(json!({"prompt": "first"})).await.unwrap();
+    let output = tool.execute(json!({"prompt": "second"})).await.unwrap();
+
+    assert_eq!(
+        count(&logged_frames(&log), r#""method":"session/load""#),
+        1,
+        "the advertised capability is used"
+    );
+    assert!(
+        !output.content.contains("REPLAY-older-turn-"),
+        "restored history is never the answer: {}",
+        output.content
+    );
+    assert!(
+        output.content.contains("EARLY LATE"),
+        "an update after the load response is this call's answer: {}",
+        output.content
+    );
+}
+
+/// Item 6: a persist failure is a failed turn. If the fresh ACP session id
+/// cannot be written, the OLD durable id survives and the next call would
+/// resume the wrong conversation — so the call stops before prompting.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_session_id_that_cannot_be_persisted_fails_the_call() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let log = temp.path().join("frames.log");
+    let root = Workspace::new(temp.path()).unwrap().root().to_path_buf();
+    let session = "session-readonly";
+    let tool = tool_with(&root, stub_config(STUB, &log, "ok"), session).await;
+    // The metadata sidecar stays readable (the id is loaded from it) but can
+    // no longer be appended to, so the fresh id cannot be persisted.
+    let sidecar = root
+        .join(".e-agent/sessions")
+        .join(format!("{session}.meta.jsonl"));
+    std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+    let error = tool
+        .execute(json!({"prompt": "review"}))
+        .await
+        .expect_err("an unpersistable session id must fail the call");
+    assert!(
+        error.contains("cannot persist ACP session id sess-new-1"),
+        "{error}"
+    );
+    assert!(
+        error.contains("the next call would resume the wrong"),
+        "the error says why it is fatal: {error}"
+    );
+    assert_eq!(
+        count(&logged_frames(&log), r#""method":"session/prompt""#),
+        0,
+        "the prompt is never sent with an id that could not be persisted"
+    );
 }

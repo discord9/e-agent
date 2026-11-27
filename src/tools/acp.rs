@@ -76,11 +76,28 @@
 //! a human, so a child that dies with a request pending closes stdout, which
 //! wakes the parked ask, drops its pending entry, and fails the in-flight
 //! `session/prompt` — the tool returns a plain error string to the model
-//! instead of hanging until a timeout. An answer the tool decides by itself
-//! (the kind policy, `[acp] danger`) selects the agent's own "allow once"
-//! option; the human path sends the chosen `optionId` verbatim, so an
-//! `allow_always` choice is never rewritten into an `allow_once` grant (or the
-//! other way round) — every id is used exactly as the agent offered it.
+//! instead of hanging until a timeout. The runner notices that the asker is
+//! gone the same way (a dropped answer receiver, or the tool finishing) and
+//! dismisses the question instead of parking the turn on it. An answer the
+//! tool decides by itself (the kind policy, `[acp] danger`) selects the
+//! agent's own "allow once" option; the human path sends the chosen
+//! `optionId` verbatim, so an `allow_always` choice is never rewritten into
+//! an `allow_once` grant (or the other way round) — every id is used exactly
+//! as the agent offered it. A request that overlaps the ask already awaiting
+//! an answer is refused (`cancelled` plus a receipt line), never decided by
+//! the kind policy: an approval no human was shown must not be granted.
+//!
+//! **What the identity binds, and what it does not.** The digest is a
+//! fingerprint of the JSON-RPC *request* as received — the `toolCall` object
+//! and the offered options — so an answer is bound to the request it was given
+//! for and cannot authorize a different one. It is NOT a verification of what
+//! the child goes on to execute: the question shows the tool call's title and,
+//! when present, at most [`COMMAND_LIMIT`] characters of
+//! `rawInput.command`, and e-agent replies with an option id from the
+//! request's own option list. Approving `run ls` therefore grants *that
+//! request as the agent described it*, not a checked-and-audited action: ACP
+//! decides what the command actually is, and this tool has no way to know
+//! whether the child ran it. The guarantee stops at the request.
 //!
 //! **`session/load` is used only when the agent advertises it.** The
 //! `agentCapabilities.loadSession` flag from `initialize` is recorded, and an
@@ -119,7 +136,7 @@ use tokio::sync::{Mutex, oneshot, watch};
 use super::spec;
 use crate::agent::{Tool, ToolOutput, ToolSpec};
 use crate::config::AcpConfig;
-use crate::runner::{SessionHandle, UserInputRequest, UserOption, UserQuestion};
+use crate::runner::{AskRefusal, SessionHandle, UserInputRequest, UserOption, UserQuestion};
 use crate::session_store::SessionStore;
 use crate::workspace::Workspace;
 
@@ -140,7 +157,10 @@ const STDERR_LIMIT: usize = 4 * 1024;
 const TEXT_LIMIT: usize = 64 * 1024;
 /// Cap on a `toolCall` summary quoted in a permission line.
 const SUMMARY_LIMIT: usize = 120;
-/// Cap on the `rawInput.command` quoted in a permission question.
+/// Cap on the `rawInput.command` quoted in a permission question. The human
+/// therefore sees a SUMMARY of the request (title + at most this many command
+/// characters), which is why the identity binds the request — the `toolCall`
+/// as received — and never claims to describe the execution.
 const COMMAND_LIMIT: usize = 200;
 /// The question id every permission ask uses (one question per request).
 const PERMISSION_QUESTION: &str = "permission";
@@ -176,9 +196,11 @@ const DESCRIPTION: &str = "Run ONE prompt through an external ACP (Agent Client 
      starts a new conversation, and the result says so. Each call still starts and kills its own \
      agent process, and the agent works with the same ambient authority as `bash` without the \
      sandbox — its file changes are NOT cap-std confined. A permission request is forwarded to the \
-     user as one question carrying the agent's own options when this session has a frontend; from a \
-     session without one (a subagent) only read-only tool kinds (read/search/fetch/think) are \
-     allowed, and edits, deletes, moves and command execution are denied and reported in the result.";
+     user as one question carrying the agent's own options when this session has a frontend (the \
+     approval covers that request as the agent described it — e-agent does not verify what the agent \
+     executes afterwards); from a session without one (a subagent) only read-only tool kinds \
+     (read/search/fetch/think) are allowed, and edits, deletes, moves and command execution are \
+     denied and reported in the result.";
 
 struct AcpPrompt {
     workspace: Workspace,
@@ -368,10 +390,15 @@ impl AcpPrompt {
         }
     }
 
-    /// Record the id in the in-process cache and in the session store. A
-    /// failed write is logged, never fatal: a review must not fail because
-    /// the mapping could not be saved.
-    async fn remember(&self, cwd: &Path, session_id: &str) {
+    /// Record the id in the in-process cache and in the session store.
+    ///
+    /// A failed STORE write fails the call. The store is the only durable
+    /// copy of which conversation this session continues: if the fresh id is
+    /// not written, the previously stored id stays behind and the next call
+    /// resumes a conversation the caller was just told is over. That is worse
+    /// than a failed review, so it is an error, not a warning. (The in-process
+    /// cache keeps the fresh id, so a retry inside this process is coherent.)
+    async fn remember(&self, cwd: &Path, session_id: &str) -> Result<(), String> {
         self.cached.lock().unwrap().insert(
             self.bucket().to_owned(),
             Cached {
@@ -381,15 +408,18 @@ impl AcpPrompt {
         );
         if self.session.is_empty() {
             // Unbound (direct `Agent::run`, tests): there is no row to write.
-            return;
+            return Ok(());
         }
-        if let Err(error) = self
-            .store
+        self.store
             .set_acp_session_id(&self.root, &self.session, Some(session_id))
             .await
-        {
-            tracing::warn!("e-agent: acp: cannot store the ACP session id: {error:#}");
-        }
+            .map_err(|error| {
+                format!(
+                    "acp: cannot persist ACP session id {session_id} for this session: {error:#}. \
+                     The stored id is now stale, so the next call would resume the wrong \
+                     conversation; this call is failed instead."
+                )
+            })
     }
 
     /// One process, one prompt: handshake (new or loaded session), remember
@@ -403,12 +433,11 @@ impl AcpPrompt {
     ) -> Result<String, String> {
         let client = Client::connect(&self.config, cwd, &plan, handle).await?;
         // Remembered BEFORE the prompt: a failed prompt must not orphan a
-        // freshly created session id.
-        self.remember(cwd, &client.session_id).await;
-        // A `session/load` replay is fully behind us once its response was
-        // used (the read loop reads in stream order), so from here on an
-        // update is this call's answer, never restored history.
-        client.replay_finished();
+        // freshly created session id. The write is REQUIRED: if the fresh id
+        // cannot be persisted, the old durable id survives and the next turn
+        // would silently resume a different conversation, so the call fails
+        // here instead of leaving that trap behind.
+        self.remember(cwd, &client.session_id).await?;
         let result = client
             .request(
                 "session/prompt",
@@ -617,11 +646,13 @@ impl Client {
     }
 
     async fn load_session(&self, id: &str, cwd: &str) -> Result<(), String> {
-        // The replay phase opens BEFORE the request goes out and stays open
-        // until [`Self::replay_finished`]: every `session/update` chunk the
-        // agent sends to restore history arrives in this window, is read in
-        // stream order ahead of the load response, and is dropped instead of
-        // being accumulated as this call's answer.
+        // The replay phase opens BEFORE the request goes out and is closed by
+        // the load RESPONSE itself (see `Shared::dispatch`): every
+        // `session/update` chunk the agent sends to restore history arrives in
+        // this window, is read in stream order ahead of that response, and is
+        // dropped instead of being accumulated as this call's answer — while
+        // anything after the response counts, even if it lands before the
+        // prompt goes out.
         self.shared.replaying.store(true, Ordering::Relaxed);
         self.shared
             .request(
@@ -631,14 +662,6 @@ impl Client {
             )
             .await
             .map(|_| ())
-    }
-
-    /// Close the replay phase: from here on, `session/update` text is this
-    /// call's answer. Called once the load response has been used (or a new
-    /// session started), right before `session/prompt` is sent — nothing else
-    /// can produce answer text in between.
-    fn replay_finished(&self) {
-        self.shared.replaying.store(false, Ordering::Relaxed);
     }
 
     async fn request(
@@ -747,14 +770,23 @@ struct PendingPermission {
 }
 
 impl PendingPermission {
-    /// Make `identity` the only ask an answer may still resolve.
-    fn claim(&mut self, identity: &str) {
+    /// Make `identity` the only ask an answer may still resolve. `false` means
+    /// another ask still owns the slot: it is left untouched, because an ask a
+    /// human is looking at must never be replaced by a newer one (its answer
+    /// would be dropped and the newer request would fall through to a policy
+    /// no human was asked about).
+    fn claim(&mut self, identity: &str) -> bool {
+        if self.current.is_some() {
+            return false;
+        }
         self.current = Some(identity.to_owned());
+        true
     }
 
     /// Release `identity` from the slot. `true` when it was still the ask
-    /// awaiting an answer; `false` means a newer ask owns the slot, so the
-    /// answer belongs to a superseded request and must be discarded.
+    /// awaiting an answer; `false` means some other ask owns the slot (only
+    /// possible for a defensive double release now that `claim` never
+    /// overwrites), so this answer must be discarded rather than used.
     fn release(&mut self, identity: &str) -> bool {
         if self.current.as_deref() == Some(identity) {
             self.current = None;
@@ -882,6 +914,15 @@ impl Shared {
                 let Some(request) = self.pending.lock().await.remove(&id) else {
                     return;
                 };
+                // The `session/load` response CLOSES the replay window: the
+                // read loop reads in stream order, so every `session/update`
+                // before this frame was restored history and every one after
+                // it belongs to this call. Closing it here (not after the
+                // caller's model setup and persistence) is what keeps an
+                // early update from being thrown away as a replay.
+                if request.method == "session/load" {
+                    self.replaying.store(false, Ordering::Relaxed);
+                }
                 let result = match value.get("error") {
                     Some(error) => Err(rpc_error(error)),
                     None => Ok(value.get("result").cloned().unwrap_or(Value::Null)),
@@ -900,11 +941,16 @@ impl Shared {
     /// question whose options ARE the ACP options (one-to-one: `optionId` →
     /// `id`, `name` → `label`, `kind` → `description`); the chosen id is what
     /// ACP receives back. Nothing is invented: a request that offers no usable
-    /// option, an unanswerable one (no frontend, a child session, a dead
-    /// session), and an answer that names no offered id all fall back to
-    /// `cancelled`/the kind policy rather than guessing. The answer is used
-    /// only while this ask is still the pending one, and it is awaited in its
-    /// own task so the read loop keeps reading.
+    /// option, a session with no frontend at all, and an answer that names no
+    /// offered id all fall back to `cancelled`/the kind policy rather than
+    /// guessing. The answer is used only while this ask is still the pending
+    /// one, and it is awaited in its own task so the read loop keeps reading.
+    ///
+    /// A request that arrives while another ask is still awaiting an answer is
+    /// REFUSED — `cancelled`, plus a receipt line naming the overlap — and the
+    /// open ask keeps both its slot and its answer. It is never decided by the
+    /// kind policy: that would grant an approval no human was asked about, on
+    /// the strength of an answer meant for a different request.
     async fn answer_permission_request(&self, params: Option<Value>, id: &Value) -> Value {
         let params = params.as_ref();
         let tool_call = params.and_then(|params| params.get("toolCall"));
@@ -927,12 +973,31 @@ impl Shared {
                 options: options.clone(),
             }],
         };
-        self.asking.lock().unwrap().claim(&identity);
-        // `ask_user` refuses (no frontend / not live): the kind policy owns
-        // this request, and a child session never surfaces a question.
-        let Ok(answer) = handle.ask_user(request) else {
-            self.asking.lock().unwrap().release(&identity);
-            return self.answer_permission(params, id);
+        // Claim the slot BEFORE asking, and only when it is free: a request
+        // that overlaps the one already waiting for a human never touches the
+        // slot, and is refused rather than decided by any policy.
+        if !self.asking.lock().unwrap().claim(&identity) {
+            return self.refuse_overlapping(id, tool_call);
+        }
+        let answer = match handle.ask_user(request) {
+            Ok(answer) => answer,
+            // The ONE refusal that licenses a policy of our own: no frontend
+            // exists, so nobody could ever answer (a child session never
+            // surfaces a question).
+            Err(AskRefusal::NoFrontend) => {
+                self.asking.lock().unwrap().release(&identity);
+                return self.answer_permission(params, id);
+            }
+            // Busy / closed are refusals, not a fallback: answering them from
+            // the kind policy would GRANT an approval no human was asked for.
+            Err(AskRefusal::Busy) => {
+                self.asking.lock().unwrap().release(&identity);
+                return self.refuse_overlapping(id, tool_call);
+            }
+            Err(AskRefusal::Closed) => {
+                self.asking.lock().unwrap().release(&identity);
+                return self.refuse_closed(id, tool_call);
+            }
         };
         // Wait for the answer CONCURRENTLY with the ways it can never arrive:
         // the agent's exit (stdout closed) and the cancellation of this turn
@@ -952,10 +1017,9 @@ impl Shared {
             }
         };
         if !self.asking.lock().unwrap().release(&identity) {
-            // A newer ask owns the slot: this answer belongs to a superseded
-            // request (an agent may reuse a JSON-RPC id and a tool-call id
-            // call after call), so it is dropped rather than allowed to
-            // authorize the request that is pending now.
+            // Defensive: only the ask that owns the slot may use an answer, so
+            // an answer that outlived its own registration can never authorize
+            // whatever request is pending now.
             return cancelled_permission(id);
         }
         let kind = text_field(tool_call, "kind").unwrap_or("unknown");
@@ -979,6 +1043,27 @@ impl Shared {
         };
         drop(state);
         json!({"jsonrpc": "2.0", "id": id.clone(), "result": outcome})
+    }
+
+    /// Refuse one request because another ask is still awaiting an answer:
+    /// ACP gets `cancelled`, and the receipt line says it was never asked.
+    fn refuse_overlapping(&self, id: &Value, tool_call: Option<&Value>) -> Value {
+        let kind = text_field(tool_call, "kind").unwrap_or("unknown");
+        let summary = clip(&tool_call_summary(tool_call));
+        self.state.lock().unwrap().permissions.push(format!(
+            "refused {kind} without asking: another permission request is still awaiting an answer: {summary}"
+        ));
+        cancelled_permission(id)
+    }
+
+    /// Refuse one request because the session stopped accepting questions.
+    fn refuse_closed(&self, id: &Value, tool_call: Option<&Value>) -> Value {
+        let kind = text_field(tool_call, "kind").unwrap_or("unknown");
+        let summary = clip(&tool_call_summary(tool_call));
+        self.state.lock().unwrap().permissions.push(format!(
+            "refused {kind} without asking: the session is no longer live: {summary}"
+        ));
+        cancelled_permission(id)
     }
 
     /// Resolves once the agent's stdout closed (see [`Shared::child_gone`]).
@@ -1237,11 +1322,18 @@ fn rpc_error(error: &Value) -> String {
 ///   an identity — not inside one process (an agent reuses JSON-RPC ids call
 ///   after call) and not across e-agent restarts.
 /// * `<toolCallId>` is the ACP tool call the request is about.
-/// * `<digest>` fingerprints the requested action and the offered options.
+/// * `<digest>` fingerprints the REQUEST as received: the `toolCall` object
+///   and the offered options. Identical requests share it; anything else does
+///   not.
 ///
 /// An answer that comes back therefore *names* the ask it was given for:
 /// request N's approval cannot authorize request N+1, and a stale answer is
 /// dropped by [`PendingPermission::release`].
+///
+/// This binds an answer to a REQUEST, never to an executed action. The human
+/// sees the tool call's title and at most [`COMMAND_LIMIT`] command
+/// characters, and the reply is one of the offered option ids; nothing here
+/// verifies what the child actually runs afterwards.
 fn permission_identity(params: Option<&Value>) -> String {
     let tool_call = params.and_then(|params| params.get("toolCall"));
     format!(
@@ -1346,9 +1438,11 @@ fn tool_call_summary(tool_call: Option<&Value>) -> String {
         .to_owned()
 }
 
-/// The question a permission request becomes: what the agent wants to do —
-/// `toolCall.title` plus, when present, the raw command (cut to
-/// [`COMMAND_LIMIT`] characters). Exactly one question per request.
+/// The question a permission request becomes: what the agent SAYS it wants to
+/// do — `toolCall.title` plus, when present, the raw command (cut to
+/// [`COMMAND_LIMIT`] characters, so a long command is summarised, not shown in
+/// full). Exactly one question per request. The reply approves this REQUEST;
+/// nothing here inspects or constrains what the child executes afterwards.
 fn permission_prompt(tool_call: Option<&Value>) -> String {
     let title = text_field(tool_call, "title").unwrap_or("an unknown tool call");
     match command_of(tool_call) {

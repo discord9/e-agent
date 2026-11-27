@@ -562,6 +562,11 @@ fn project_main_status(state: &mut TuiState, status: &SessionStatus) {
                 state.waiting_selection = 0;
             }
             state.waiting_options = options;
+            // The rendered list is answered with the id it was CAPTURED with,
+            // captured here, together with the options: a later status frame
+            // (another frontend answered this ask, a different one opened) must
+            // not retarget the keys the user is about to press.
+            state.waiting_call_id = Some(request.call_id.clone());
             None
         }
         SessionStatus::Idle | SessionStatus::Finished(_) => None,
@@ -569,6 +574,7 @@ fn project_main_status(state: &mut TuiState, status: &SessionStatus) {
     if !matches!(status, SessionStatus::WaitingInput(_)) {
         state.waiting_question = None;
         state.waiting_options.clear();
+        state.waiting_call_id = None;
         state.waiting_selection = 0;
     }
 }
@@ -639,9 +645,8 @@ where
     }
     // A pending question with fixed options replaces free-text input with a
     // selectable list, so these keys must be claimed before scroll handling.
-    if let Some(call_id) = waiting_call_id.clone()
-        && state.handle_option_key(key, &call_id, handle)
-    {
+    // The list answers with the call id it was captured with, not the live one.
+    if waiting_call_id.is_some() && state.handle_option_key(key, handle) {
         return Ok(KeyHandled::Continue);
     }
     if is_scroll_key(key) {
