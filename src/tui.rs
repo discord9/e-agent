@@ -551,12 +551,25 @@ fn project_main_status(state: &mut TuiState, status: &SessionStatus) {
         SessionStatus::Compacting => Some(BusyState::compacting()),
         SessionStatus::WaitingInput(request) => {
             state.waiting_question = request.questions.first().map(|q| q.prompt.clone());
+            let options = request
+                .questions
+                .first()
+                .map(|q| q.options.clone())
+                .unwrap_or_default();
+            // Keep the highlight on a status frame that re-publishes the SAME
+            // question (e.g. an async question registered meanwhile).
+            if options != state.waiting_options {
+                state.waiting_selection = 0;
+            }
+            state.waiting_options = options;
             None
         }
         SessionStatus::Idle | SessionStatus::Finished(_) => None,
     };
     if !matches!(status, SessionStatus::WaitingInput(_)) {
         state.waiting_question = None;
+        state.waiting_options.clear();
+        state.waiting_selection = 0;
     }
 }
 
@@ -623,6 +636,13 @@ where
     }
     if waiting_call_id.is_some() && is_exit(key) {
         return Ok(KeyHandled::Exit);
+    }
+    // A pending question with fixed options replaces free-text input with a
+    // selectable list, so these keys must be claimed before scroll handling.
+    if let Some(call_id) = waiting_call_id.clone()
+        && state.handle_option_key(key, &call_id, handle)
+    {
+        return Ok(KeyHandled::Continue);
     }
     if is_scroll_key(key) {
         state.handle_scroll(key);
@@ -920,6 +940,7 @@ fn handle_model(command: ModelCommand, state: &mut TuiState, handle: &RunnerHand
             let profile_effort = state.model.as_ref().and_then(|model| match &model.kind {
                 crate::model::ConfiguredModelKind::Chat(m) => m.reasoning_effort.as_deref(),
                 crate::model::ConfiguredModelKind::Codex(m) => m.reasoning_effort.as_deref(),
+                crate::model::ConfiguredModelKind::Acp(_) => None,
             });
             let effort = match state.effort_override.as_ref() {
                 Some(crate::session_factory::EffortOverride::Omit) => {

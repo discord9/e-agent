@@ -23,8 +23,9 @@ pub struct Config {
     /// exists; new roles are added where they are spawned.
     #[serde(default)]
     roles: HashMap<String, String>,
-    /// Optional `[web_search]` backend for the `web_search` tool: Exa
-    /// credentials (default) or a SearXNG base URL.
+    /// Optional `[web_search]` section: the `web_search` backend (Exa
+    /// credentials, a SearXNG base URL or DeepSeek) plus the independent
+    /// `web_fetch` backend (`fetch_provider`, local by default).
     #[serde(default)]
     web_search: Option<WebSearch>,
     /// Optional `[sandbox]` policy shared by bash mounts and file tools.
@@ -319,9 +320,16 @@ fn default_true() -> bool {
 struct WebSearch {
     /// Backend: `"exa"` (default when absent), `"searxng"` or `"deepseek"`.
     provider: Option<String>,
+    /// `web_fetch` backend, independent of `provider`: `"local"` (default
+    /// when absent; this process fetches the page) or `"deepseek"` (the
+    /// remote `tools/fetch`, which needs the credential below).
+    fetch_provider: Option<String>,
     /// SearXNG only: the base URL, e.g. `http://127.0.0.1:8088`.
     /// Rejected for `provider = "deepseek"`, whose endpoints are fixed.
     base_url: Option<String>,
+    /// The credential for Exa/DeepSeek search, and for a DeepSeek fetch. With
+    /// `provider = "searxng"` it is allowed only when
+    /// `fetch_provider = "deepseek"`, where it belongs to the fetch.
     api_key_file: Option<PathBuf>,
     api_key_env: Option<String>,
 }
@@ -333,9 +341,21 @@ pub enum WebSearchProvider {
     Exa,
     /// SearXNG: searches go to `{base_url}/search` with no credential.
     Searxng { base_url: String },
-    /// DeepSeek: `tools/search` plus `tools/fetch` at the fixed
-    /// `https://api.deepseek.com` endpoints; the credential comes from
-    /// `web_search_key`.
+    /// DeepSeek: `tools/search` at the fixed `https://api.deepseek.com`
+    /// endpoint; the credential comes from `web_search_key`.
+    Deepseek,
+}
+
+/// The `web_fetch` backend selected by `[web_search] fetch_provider`, which
+/// is independent of [`WebSearchProvider`]: a SearXNG search may pair with a
+/// DeepSeek fetch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WebFetchProvider {
+    /// The default: this process GETs the URL, so it reaches whatever the
+    /// process reaches (the same network as `bash`).
+    Local,
+    /// DeepSeek `tools/fetch` at the fixed endpoint; a credential is
+    /// required, from the same `api_key_file` / `api_key_env` fields.
     Deepseek,
 }
 
@@ -389,6 +409,17 @@ struct ModelProfile {
     /// default wire and are unaffected.
     #[serde(default)]
     deepseek_compat: Option<bool>,
+    /// Model wire: `"chat"` (default, OpenAI-compatible HTTP) or `"acp"` (an
+    /// external Agent Client Protocol agent process). ACP profiles need
+    /// `command` and neither `model` nor a provider `base_url`/credential.
+    #[serde(default)]
+    kind: Option<String>,
+    /// ACP only: the agent program to spawn.
+    #[serde(default)]
+    command: Option<String>,
+    /// ACP only: arguments passed to the agent program.
+    #[serde(default)]
+    args: Option<Vec<String>>,
 }
 
 #[derive(Debug)]
@@ -409,12 +440,19 @@ pub struct ResolvedModel {
     pub display: String,
     pub context_window: Option<u64>,
     pub vision: bool,
+    /// ACP only: the agent program to spawn.
+    pub command: Option<String>,
+    /// ACP only: arguments passed to the agent program.
+    pub args: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthMode {
     ApiKey,
     ChatGpt,
+    /// The profile launches an external ACP agent process; no HTTP endpoint or
+    /// credential is involved.
+    Acp,
 }
 
 #[derive(Debug)]
@@ -708,18 +746,26 @@ impl Config {
     /// The provider selected by `[web_search]`, or None when the section is
     /// absent; `exa` is the default when `provider` is unset. Validated
     /// without resolving credentials: `provider = "searxng"` requires
-    /// `base_url` and forbids `api_key_file` / `api_key_env`,
-    /// `provider = "deepseek"` forbids `base_url` (its endpoints are fixed),
-    /// and any other provider value is a config error. Credentials come from
-    /// [`Self::web_search_key`] for both `exa` and `deepseek`.
+    /// `base_url` and forbids `api_key_file` / `api_key_env` unless
+    /// `fetch_provider = "deepseek"` needs the credential, `provider =
+    /// "deepseek"` forbids `base_url` (its endpoints are fixed), and any
+    /// other provider value (for either field) is a config error.
+    /// Credentials come from [`Self::web_search_key`].
     pub fn web_search_provider(&self) -> anyhow::Result<Option<WebSearchProvider>> {
         let Some(web_search) = &self.web_search else {
             return Ok(None);
         };
+        // Validated here too, so a bad `fetch_provider` cannot slip through
+        // a caller that only asks about the search backend.
+        let fetch = self.web_fetch_provider()?;
         match web_search.provider.as_deref() {
             None | Some("exa") => Ok(Some(WebSearchProvider::Exa)),
             Some("searxng") => {
-                if web_search.api_key_file.is_some() || web_search.api_key_env.is_some() {
+                // A SearXNG search carries no credential; the fields are
+                // allowed only when they belong to a DeepSeek fetch.
+                if fetch != Some(WebFetchProvider::Deepseek)
+                    && (web_search.api_key_file.is_some() || web_search.api_key_env.is_some())
+                {
                     bail!(
                         "[web_search] provider `searxng` must not set `api_key_file` or `api_key_env`"
                     );
@@ -755,16 +801,43 @@ impl Config {
         }
     }
 
-    /// The web-search API key from `[web_search]` (Exa or DeepSeek), or None
-    /// when the section is absent or selects the SearXNG provider. Process
-    /// env `EXA_API_KEY` always wins over this for Exa (callers check it
-    /// first). Exactly one of `api_key_file` / `api_key_env` must be set for
-    /// the Exa and DeepSeek providers.
+    /// The `web_fetch` backend selected by `[web_search] fetch_provider`, or
+    /// None when the section is absent. `local` is the default when the field
+    /// is unset: this process fetches the URL, so the tool has the same
+    /// network reach as `bash`. `deepseek` keeps the remote `tools/fetch` and
+    /// is the only reason a `provider = "searxng"` section may carry
+    /// `api_key_file` / `api_key_env`. Any other value is a config error.
+    pub fn web_fetch_provider(&self) -> anyhow::Result<Option<WebFetchProvider>> {
+        let Some(web_search) = &self.web_search else {
+            return Ok(None);
+        };
+        match web_search.fetch_provider.as_deref().map(str::trim) {
+            None | Some("") | Some("local") => Ok(Some(WebFetchProvider::Local)),
+            Some("deepseek") => Ok(Some(WebFetchProvider::Deepseek)),
+            Some(fetch_provider) => bail!(
+                "[web_search] `fetch_provider` `{fetch_provider}` is not supported (expected `local` or `deepseek`)"
+            ),
+        }
+    }
+
+    /// The credential from `[web_search]`: the search key for the Exa and
+    /// DeepSeek providers, and the fetch key when `fetch_provider =
+    /// "deepseek"` (the only case where `provider = "searxng"` may carry
+    /// one). None when the section is absent or needs no credential, i.e. a
+    /// SearXNG search with a local fetch. Process env `EXA_API_KEY` always
+    /// wins over this for Exa (callers check it first). Exactly one of
+    /// `api_key_file` / `api_key_env` must be set whenever it is needed.
     pub fn web_search_key(&self) -> anyhow::Result<Option<String>> {
         match self.web_search_provider()? {
-            // SearXNG carries no credential; an absent section has nothing
-            // to resolve.
-            Some(WebSearchProvider::Searxng { .. }) | None => return Ok(None),
+            // SearXNG carries no credential for the search itself; the
+            // fields are resolved only when a DeepSeek fetch needs them.
+            Some(WebSearchProvider::Searxng { .. }) => {
+                if self.web_fetch_provider()? != Some(WebFetchProvider::Deepseek) {
+                    return Ok(None);
+                }
+            }
+            // An absent section has nothing to resolve.
+            None => return Ok(None),
             Some(WebSearchProvider::Exa) | Some(WebSearchProvider::Deepseek) => {}
         }
         let Some(web_search) = &self.web_search else {
@@ -856,6 +929,36 @@ impl Config {
             .models
             .get(profile)
             .ok_or_else(|| anyhow!("model profile `{profile}` is not defined"))?;
+        match model_profile.kind.as_deref().unwrap_or("chat") {
+            "chat" => {}
+            "acp" => {
+                // An ACP profile names an external agent: `command` is the
+                // only required field, and no provider/base_url/credential is
+                // involved (the agent authenticates itself).
+                let command = model_profile
+                    .command
+                    .as_deref()
+                    .filter(|command| !command.is_empty())
+                    .ok_or_else(|| {
+                        anyhow!("model profile `{profile}` with kind = \"acp\" requires `command`")
+                    })?;
+                return Ok(ResolvedModel {
+                    base_url: String::new(),
+                    api_key: String::new(),
+                    model: model_profile.model.clone().unwrap_or_default(),
+                    reasoning_effort: model_profile.reasoning_effort.clone(),
+                    thinking: model_profile.thinking.unwrap_or(false),
+                    deepseek_compat: model_profile.deepseek_compat.unwrap_or(false),
+                    auth: AuthMode::Acp,
+                    display: profile.to_owned(),
+                    context_window: model_profile.context_window,
+                    vision: model_profile.vision.unwrap_or(false),
+                    command: Some(command.to_owned()),
+                    args: model_profile.args.clone().unwrap_or_default(),
+                });
+            }
+            kind => bail!("model profile `{profile}` has unsupported kind `{kind}`"),
+        }
         let model = model_profile
             .model
             .as_deref()
@@ -890,6 +993,8 @@ impl Config {
                 display: profile.to_owned(),
                 context_window: model_profile.context_window,
                 vision: model_profile.vision.unwrap_or(false),
+                command: None,
+                args: Vec::new(),
             });
         }
         let base_url = provider
@@ -930,6 +1035,8 @@ impl Config {
             display: profile.to_owned(),
             context_window: model_profile.context_window,
             vision: model_profile.vision.unwrap_or(false),
+            command: None,
+            args: Vec::new(),
         })
     }
 

@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::acp_model::AcpModel;
 use crate::agent::{
     AssistantMessage, ImagePart, Message, Model, ModelDeltaKind, ToolCall, ToolSpec, Usage, preview,
 };
@@ -16,12 +17,15 @@ use crate::codex::{
     is_stream_decode_error, retry_backoff_ms,
 };
 
-/// The two concrete model wires e-agent supports. Keeping this enum concrete
+/// The concrete model wires e-agent supports. Keeping this enum concrete
 /// preserves the existing `Model` seam while making delegated clones exact.
 #[derive(Clone)]
 pub enum ConfiguredModelKind {
     Chat(OpenAiModel),
     Codex(CodexModel),
+    /// An external ACP agent process. Cloning gives a fresh, unspawned
+    /// conversation (each model instance owns its own child).
+    Acp(AcpModel),
 }
 
 /// A configured model with an optional display name (profile key) for UI
@@ -45,6 +49,13 @@ impl ConfiguredModel {
     pub fn codex(model: CodexModel) -> Self {
         Self {
             kind: ConfiguredModelKind::Codex(model),
+            display: None,
+        }
+    }
+
+    pub fn acp(model: AcpModel) -> Self {
+        Self {
+            kind: ConfiguredModelKind::Acp(model),
             display: None,
         }
     }
@@ -82,6 +93,7 @@ impl Model for ConfiguredModel {
         match &self.kind {
             ConfiguredModelKind::Chat(model) => model.name(),
             ConfiguredModelKind::Codex(model) => model.name(),
+            ConfiguredModelKind::Acp(model) => model.name(),
         }
     }
 
@@ -89,6 +101,7 @@ impl Model for ConfiguredModel {
         match &self.kind {
             ConfiguredModelKind::Chat(model) => model.supports_vision(),
             ConfiguredModelKind::Codex(model) => model.supports_vision(),
+            ConfiguredModelKind::Acp(model) => model.supports_vision(),
         }
     }
     async fn complete(
@@ -100,6 +113,7 @@ impl Model for ConfiguredModel {
         match &mut self.kind {
             ConfiguredModelKind::Chat(model) => model.complete(messages, tools, on_delta).await,
             ConfiguredModelKind::Codex(model) => model.complete(messages, tools, on_delta).await,
+            ConfiguredModelKind::Acp(model) => model.complete(messages, tools, on_delta).await,
         }
     }
 }

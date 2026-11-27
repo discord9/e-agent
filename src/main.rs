@@ -642,6 +642,9 @@ async fn repl(
                         eprintln!("e-agent: input request is stale")
                     }
                     e_agent::runner::PromptSubmission::Closed => break,
+                    e_agent::runner::PromptSubmission::Invalid(error) => {
+                        eprintln!("e-agent: {error}")
+                    }
                     e_agent::runner::PromptSubmission::Answered => {}
                     e_agent::runner::PromptSubmission::Queued => unreachable!(),
                 }

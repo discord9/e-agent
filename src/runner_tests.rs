@@ -585,6 +585,276 @@ async fn request_user_input_waits_answers_and_resumes_same_turn() {
     drop(task);
 }
 
+/// End-to-end blocking path with fixed options: an invalid id is rejected
+/// while the turn stays parked, and the accepted option reaches the model as
+/// `Selected option: {id} ({label})` inside the tool result.
+#[tokio::test]
+async fn blocking_option_question_answer_reaches_the_model_with_id_and_label() {
+    let temp = tempfile::tempdir().unwrap();
+    let agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: VecDeque::from(vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call-opt".into(),
+                        name: "request_user_input".into(),
+                        arguments: r#"{"questions":[{"id":"perm","prompt":"Allow?","options":[{"id":"allow-once","label":"允许一次"},{"id":"deny","label":"拒绝","description":"仅此一次"}]}]}"#.into(),
+                    }],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("decided".into()),
+                    tool_calls: Vec::new(),
+                    reasoning: None,
+                },
+            ]),
+        }),
+        vec![
+            Box::new(crate::tools::user_input::RequestUserInput),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "option-input".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let runner = runner.with_user_input_allowed();
+    let (_, _events, mut status) = handle.attach();
+    let task = runner.start(Some("start".into()));
+    let waiting = wait_for_status(&mut status, |status| {
+        matches!(status, SessionStatus::WaitingInput(_))
+    })
+    .await;
+    match waiting {
+        SessionStatus::WaitingInput(request) => {
+            assert_eq!(request.call_id, "call-opt");
+            assert_eq!(request.questions[0].options.len(), 2);
+        }
+        other => panic!("expected WaitingInput, got {other:?}"),
+    }
+    assert!(matches!(
+        handle.submit_prompt_with_call_id(Some("call-opt".into()), "allow".into()),
+        PromptSubmission::Invalid(error) if error.contains("allow-once") && error.contains("deny")
+    ));
+    assert!(
+        matches!(&*status.borrow(), SessionStatus::WaitingInput(request) if request.call_id == "call-opt"),
+        "a rejected id leaves the turn parked: {:?}",
+        *status.borrow()
+    );
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("call-opt".into()), "deny".into()),
+        PromptSubmission::Answered
+    );
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "decided"),
+    )
+    .await;
+    wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)).await;
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "option-input")
+        .await
+        .unwrap()
+        .entries;
+    match tool_entries(&entries)[0] {
+        Message::Tool {
+            call_id, content, ..
+        } => {
+            assert_eq!(call_id, "call-opt");
+            assert!(
+                content.contains("Selected option: deny (拒绝)"),
+                "model-facing answer: {content}"
+            );
+            assert!(content.contains("\"id\":\"perm\""), "{content}");
+        }
+        other => panic!("expected the tool result, got {other:?}"),
+    }
+    drop(task);
+}
+
+/// A question may carry fixed options. Only an option id is accepted, the
+/// rejection names the allowed ids, and the model-facing answer carries both
+/// the id and its label so no mapping has to be remembered.
+#[test]
+fn option_answer_accepts_only_listed_ids_and_keeps_id_and_label() {
+    let (handle, emitter, mut commands) = crate::runner::session_test_channel();
+    emitter.set_status(SessionStatus::WaitingInput(UserInputRequest {
+        call_id: "call-perm".into(),
+        questions: vec![option_question()],
+    }));
+    for submitted in ["allow", "允许一次"] {
+        match handle.submit_prompt_with_call_id(Some("call-perm".into()), submitted.into()) {
+            PromptSubmission::Invalid(error) => assert!(
+                error.contains("allow-once") && error.contains("deny"),
+                "{error}"
+            ),
+            other => panic!("accepted {submitted:?}: {other:?}"),
+        }
+    }
+    // A rejected answer never claims the question.
+    assert!(commands.try_recv().is_err());
+    // Trimming is only layout: the id itself is accepted and resolves to
+    // `Selected option: {id} ({label})`.
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("call-perm".into()), " allow-once ".into()),
+        PromptSubmission::Answered
+    );
+    match commands.try_recv().unwrap() {
+        SessionCommand::Answer { call_id, answers } => {
+            assert_eq!(call_id, "call-perm");
+            assert_eq!(
+                answers,
+                vec![(
+                    "perm".to_owned(),
+                    "Selected option: allow-once (允许一次)".to_owned()
+                )]
+            );
+        }
+        _ => panic!("expected the structured answer command"),
+    }
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("call-perm".into()), "deny".into()),
+        PromptSubmission::Conflict
+    );
+}
+
+/// The async path shares the same acceptance rule: the later user-shaped
+/// message (:Notice) carries the id and the label.
+#[test]
+fn async_option_answer_uses_the_same_resolution() {
+    let (handle, emitter, mut commands) = crate::runner::session_test_channel();
+    emitter.register_pending_question(UserInputRequest {
+        call_id: "call-async-perm".into(),
+        questions: vec![option_question()],
+    });
+    assert!(matches!(
+        handle.submit_prompt_with_call_id(Some("call-async-perm".into()), "allow".into()),
+        PromptSubmission::Invalid(error) if error.contains("allow-once, deny")
+    ));
+    assert_eq!(
+        handle.pending_questions(),
+        vec![UserInputRequest {
+            call_id: "call-async-perm".into(),
+            questions: vec![option_question()],
+        }],
+        "a rejected answer leaves the question answerable"
+    );
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("call-async-perm".into()), "deny".into()),
+        PromptSubmission::Answered
+    );
+    match commands.try_recv().unwrap() {
+        SessionCommand::Answer { call_id, answers } => {
+            assert_eq!(call_id, "call-async-perm");
+            assert_eq!(
+                answers,
+                vec![("perm".to_owned(), "Selected option: deny (拒绝)".to_owned())]
+            );
+        }
+        _ => panic!("expected the structured answer command"),
+    }
+}
+
+/// A free-text question keeps today's contract: any non-empty answer is
+/// accepted verbatim (no trimming, no rewriting).
+#[test]
+fn free_text_answer_still_accepts_any_non_empty_text() {
+    let (handle, emitter, mut commands) = crate::runner::session_test_channel();
+    emitter.set_status(SessionStatus::WaitingInput(UserInputRequest {
+        call_id: "call-text".into(),
+        questions: vec![UserQuestion {
+            id: "answer".into(),
+            prompt: "Your name?".into(),
+            options: Vec::new(),
+        }],
+    }));
+    assert!(matches!(
+        handle.submit_prompt_with_call_id(Some("call-text".into()), "  ".into()),
+        PromptSubmission::Invalid(_)
+    ));
+    assert!(commands.try_recv().is_err());
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("call-text".into()), " Ada 你好 ".into()),
+        PromptSubmission::Answered
+    );
+    match commands.try_recv().unwrap() {
+        SessionCommand::Answer { call_id, answers } => {
+            assert_eq!(call_id, "call-text");
+            assert_eq!(
+                answers,
+                vec![("answer".to_owned(), " Ada 你好 ".to_owned())]
+            );
+        }
+        _ => panic!("expected the structured answer command"),
+    }
+}
+
+/// A question with options serializes them; one without serializes exactly as
+/// before (no empty `options` key), which is what the frontends and the
+/// status payload rely on.
+#[test]
+fn user_question_serde_omits_empty_options() {
+    let with_options = UserQuestion {
+        id: "perm".into(),
+        prompt: "Allow?".into(),
+        options: vec![
+            UserOption {
+                id: "allow-once".into(),
+                label: "允许一次".into(),
+                description: Some("仅此一次".into()),
+            },
+            UserOption {
+                id: "deny".into(),
+                label: "拒绝".into(),
+                description: None,
+            },
+        ],
+    };
+    assert_eq!(
+        serde_json::to_value(&with_options).unwrap(),
+        serde_json::json!({
+            "id": "perm",
+            "prompt": "Allow?",
+            "options": [
+                {"id": "allow-once", "label": "允许一次", "description": "仅此一次"},
+                {"id": "deny", "label": "拒绝"}
+            ]
+        })
+    );
+    let plain = UserQuestion {
+        id: "name".into(),
+        prompt: "Your name?".into(),
+        options: Vec::new(),
+    };
+    assert_eq!(
+        serde_json::to_value(&plain).unwrap(),
+        serde_json::json!({"id": "name", "prompt": "Your name?"})
+    );
+}
+
+fn option_question() -> UserQuestion {
+    UserQuestion {
+        id: "perm".into(),
+        prompt: "Allow?".into(),
+        options: vec![
+            UserOption {
+                id: "allow-once".into(),
+                label: "允许一次".into(),
+                description: Some("仅此一次".into()),
+            },
+            UserOption {
+                id: "deny".into(),
+                label: "拒绝".into(),
+                description: None,
+            },
+        ],
+    }
+}
+
 /// A delegate/btw/fork session has no frontend that could answer a
 /// `request_user_input` question, so the interception must fail that call
 /// back to the model as an ordinary tool error and keep the SAME turn going
@@ -1280,6 +1550,7 @@ async fn async_request_user_input_receipts_and_keeps_the_turn_going() {
             questions: vec![UserQuestion {
                 id: "name".into(),
                 prompt: "Your name?".into(),
+                options: Vec::new(),
             }],
         }]
     );

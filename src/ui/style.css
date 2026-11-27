@@ -1415,6 +1415,26 @@
     padding: 6px 10px;
   }
   .pending-question-submit:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
+  /* 固定选项卡片：沿用 pending-question-row 的一行布局，一个选项一个按钮。 */
+  .pending-question-options {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: stretch;
+    gap: 6px;
+    margin-top: 6px;
+    min-width: 0;
+  }
+  .pending-question-option {
+    flex: 1 1 auto;
+    min-width: 0;
+    max-width: 100%;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    text-align: left;
+    padding: 6px 10px;
+  }
+  .pending-question-option:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
+  .pending-question-option.chosen { border-color: var(--cyan); }
   .pending-question-status { margin: 5px 0 0; color: var(--base01); font-size: 12px; }
   .pending-question-status:empty { display: none; }
   .pending-question-card.submitted .pending-question-status {

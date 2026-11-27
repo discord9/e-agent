@@ -1,3 +1,5 @@
+pub mod acp_client;
+pub mod acp_model;
 pub mod agent;
 pub mod codex;
 pub mod codex_auth;
