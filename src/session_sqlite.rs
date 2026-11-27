@@ -177,6 +177,15 @@ CREATE TABLE IF NOT EXISTS usage_entries (
 /// `(session_id, entry_count, created_at_us, last_active_at_us)`.
 type BackfillRow = (String, i64, i64, i64);
 
+/// The fork-provenance query: ONE physical matching row, and no `payload`
+/// column. It answers "is this session a fork?" without a logical head bound,
+/// so a legacy copy writer's marker (appended after the whole copied prefix)
+/// is found at any depth, and a normal long session never materializes a
+/// transcript page to answer it.
+const FORK_MARKER_SQL: &str = "SELECT 1 FROM session_entries \
+     WHERE workspace_id = ?1 AND session_id = ?2 AND entry_kind = 'forked_from' \
+     LIMIT 1";
+
 pub struct SqliteSession {
     /// The shared turso connection, guarded by an async mutex so every
     /// `&self` method can serialize its statements against concurrent
@@ -1508,6 +1517,28 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
         Ok(entries.into_iter().map(|(_, entry)| entry).collect())
     }
 
+    /// Does the stored transcript carry a `ForkedFrom` marker ANYWHERE?
+    ///
+    /// ONE matching row and NO payload ([`FORK_MARKER_SQL`]). A logical-key
+    /// head (the first `n` rows) is not an I/O bound — retries keep every
+    /// physical version — and a constant would silently miss a legacy copy
+    /// fork whose marker sits behind the whole copied prefix. `LIMIT 1`
+    /// bounds the query by the answer itself.
+    pub async fn has_fork_marker(&self) -> Result<bool, String> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                FORK_MARKER_SQL,
+                (self.workspace_id.as_str(), self.session_id.as_str()),
+            )
+            .await
+            .map_err(|e| format!("cannot query the fork marker: {e}"))?;
+        rows.next()
+            .await
+            .map(|row| row.is_some())
+            .map_err(|e| format!("cannot query the fork marker: {e}"))
+    }
+
     /// Load the selected bounded segment without physical locations.
     pub async fn load_older(
         &self,
@@ -2329,6 +2360,43 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
             (true, false) => "refs",
             (false, _) => "NULL",
         }
+    }
+
+    /// The parent link of this session's newest metadata snapshot, or `None`
+    /// when the row records none (including "no row yet"). ONE row, ONE
+    /// column: reopening a child session must not read its transcript to know
+    /// it is one. The connect-time cache answers without a query when the
+    /// table was readable then.
+    pub async fn parent_session_id(&self) -> Result<Option<String>, String> {
+        if let Some(parent) = self
+            .cached_meta
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|meta| meta.parent_session_id.clone())
+        {
+            return Ok(Some(parent));
+        }
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT parent_session_id FROM sessions \
+                 WHERE workspace_id = ?1 AND session_id = ?2 \
+                 ORDER BY last_active_at DESC LIMIT 1",
+                (self.workspace_id.as_str(), self.session_id.as_str()),
+            )
+            .await
+            .map_err(|e| format!("cannot query the session parent: {e}"))?;
+        rows.next()
+            .await
+            .map_err(|e| format!("cannot query the session parent: {e}"))?
+            .map(|row| {
+                row.get_value(0)
+                    .map_err(|e| format!("cannot query the session parent: {e}"))
+                    .map(|value| value.as_text().cloned())
+            })
+            .transpose()
+            .map(Option::flatten)
     }
 
     /// Latest metadata snapshot for one session, or `None` when the

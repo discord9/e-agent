@@ -1026,10 +1026,12 @@ impl SessionFactory {
                 );
             }
         }
-        // Persisted provenance, not just this build's request: a fork reopened
-        // by id (web resume, `--session`) passes `fork_from = None`, but its
-        // stored transcript still carries the `ForkedFrom` marker. `link_ref`
-        // must stay off for it exactly as it does for a fresh fork.
+        // Persisted provenance, not just this build's request: a fork or a
+        // child reopened by id (web resume, `--session`) passes
+        // `fork_from = None`, but its metadata row still records its parent
+        // and/or its stored transcript still carries the `ForkedFrom` marker
+        // (at whatever depth the layout put it). `link_ref` must stay off for
+        // it exactly as it does for a fresh fork.
         if !forked {
             forked = store
                 .has_fork_provenance(&self.root, &session)
@@ -4782,7 +4784,9 @@ mod link_ref_registration_tests {
         .unwrap();
         // Older copy-based layout: two and four stored prefix entries before
         // the marker (the four-entry one is the layout this repo actually
-        // still carries).
+        // still carries), plus the four-ordinary-turn case the reviewer
+        // constructed — the marker sits NINTH, behind the whole selected
+        // prefix, so a fixed head can never be the rule.
         Session::append(
             &root,
             "layout-copy2",
@@ -4805,9 +4809,29 @@ mod link_ref_registration_tests {
             ],
         )
         .unwrap();
+        let source4 = [
+            user("q0"),
+            assistant("a0"),
+            user("q1"),
+            assistant("a1"),
+            user("q2"),
+            assistant("a2"),
+            user("q3"),
+            assistant("a3"),
+        ];
+        Session::append(&root, "layout-src4", &source4).unwrap();
+        let mut copy8 = source4.to_vec();
+        copy8.push(fork_marker("layout-src4", source4.len(), 7));
+        Session::append(&root, "layout-copy8", &copy8).unwrap();
 
         let factory = SessionFactory::test_factory(root.clone());
-        for id in ["layout-zero", "layout-goal", "layout-copy2", "layout-copy4"] {
+        for id in [
+            "layout-zero",
+            "layout-goal",
+            "layout-copy2",
+            "layout-copy4",
+            "layout-copy8",
+        ] {
             let reopened = factory
                 .build(
                     id,
@@ -4840,6 +4864,67 @@ mod link_ref_registration_tests {
         assert!(
             names.iter().any(|name| name == "link_ref"),
             "a user-created top-level session still gets link_ref: {names:?}"
+        );
+
+        // A LONG ordinary session is not a fork either: provenance must not
+        // mistake depth for a marker. Its build still registers link_ref.
+        let long: Vec<SessionEntry> = (0..500)
+            .flat_map(|i| [user(&format!("q{i}")), assistant(&format!("a{i}"))])
+            .collect();
+        Session::append(&root, "layout-long", &long).unwrap();
+        let long = factory
+            .build(
+                "layout-long",
+                None,
+                None,
+                IdlePolicy::FinishWhenIdle,
+                UnfinishedPolicy::Preserve,
+            )
+            .await
+            .expect("a long ordinary session builds");
+        let names = long.runner.tool_names_for_test();
+        assert!(
+            names.iter().any(|name| name == "link_ref"),
+            "a long ordinary session still gets link_ref: {names:?}"
+        );
+    }
+
+    /// A resumed CHILD session (delegate/btw) records its parent in the
+    /// metadata row. Provenance takes that answer without reading the
+    /// transcript, so a child keeps building without `link_ref` even though
+    /// its own log carries no `ForkedFrom` marker.
+    #[tokio::test]
+    async fn a_resumed_child_session_takes_its_metadata_parent_as_provenance() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        Session::append(&root, "child-session", &[user("q0"), assistant("a0")]).unwrap();
+        SessionStore::Jsonl
+            .create_meta(
+                &root,
+                "child-session",
+                Some("m"),
+                Some("subagent"),
+                Some("parent-session"),
+                Some(7),
+                None,
+            )
+            .await
+            .unwrap();
+        let factory = SessionFactory::test_factory(root.clone());
+        let reopened = factory
+            .build(
+                "child-session",
+                None,
+                None,
+                IdlePolicy::FinishWhenIdle,
+                UnfinishedPolicy::Preserve,
+            )
+            .await
+            .expect("the child session builds");
+        let names = reopened.runner.tool_names_for_test();
+        assert!(
+            !names.iter().any(|name| name == "link_ref"),
+            "a persisted parent link is provenance: {names:?}"
         );
     }
 

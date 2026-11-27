@@ -3029,8 +3029,9 @@ impl SessionStore {
 
     /// The first `bound` stored entries through the backend's own bounded
     /// reader: JSONL stops reading after `bound` lines, the SQL backends
-    /// LIMIT their payload query. Every fork probe goes through this one
-    /// path, never through a full-transcript load.
+    /// LIMIT their payload query. Every LEADING-marker probe goes through
+    /// this one path; general fork provenance asks the marker query below
+    /// instead, because a legacy copy marker can sit behind the whole log.
     async fn load_first_entries(
         &self,
         root: &Path,
@@ -3058,29 +3059,64 @@ impl SessionStore {
         Ok(zero_copy_marker(&entries).map(|marker| entries[marker].clone()))
     }
 
-    /// Bounded probe: does the PERSISTED transcript mark this session as a
-    /// fork?
+    /// Whether the PERSISTED session is a fork.
     ///
-    /// A zero-copy child stores its `ForkedFrom` marker first (optionally
-    /// after the frozen goal), so the probe still answers after the child
-    /// compacted on its own. The older copy-based layout stores the copied
-    /// prefix BEFORE the marker, so "starts with a marker" is not the same
-    /// question as "is a fork": scan the bounded head for any `ForkedFrom`
-    /// entry instead. Reopening by id must not lose the provenance its build
-    /// request no longer carries.
+    /// 1. A persisted parent link (the metadata row a delegate / btw / fork
+    ///    child gets) decides it with no transcript read at all.
+    /// 2. Otherwise ask the stored log through the store's own marker query:
+    ///    a `ForkedFrom` at ANY depth — leading (zero-copy), after the frozen
+    ///    goal, or behind the whole copied prefix (the copy-based writer this
+    ///    repo shipped before `1edc53d`). SQL fetches ONE matching row and no
+    ///    payload; JSONL streams until the first marker and never parses a
+    ///    legacy `.json` document (it stores messages only).
+    ///
+    /// There is deliberately no fixed head bound: a constant would silently
+    /// answer "not a fork" for a marker it never looked at, which is exactly
+    /// how a reopened copy fork regained `link_ref`.
     pub(crate) async fn has_fork_provenance(&self, root: &Path, name: &str) -> Result<bool> {
-        // Deep enough for every marker layout this repo has ever written:
-        // leading, after a frozen goal, and after the old copy-based prefix
-        // (the four-entry layout is the deepest it stores). An ordinary
-        // long session still reads only this fixed head, never its whole
-        // transcript.
-        const PROVENANCE_DEPTH: usize = 8;
-        let entries = self
-            .load_first_entries(root, name, PROVENANCE_DEPTH)
-            .await?;
-        Ok(entries
-            .iter()
-            .any(|entry| matches!(entry, SessionEntry::ForkedFrom { .. })))
+        if self.metadata_parent(root, name).await?.is_some() {
+            return Ok(true);
+        }
+        self.transcript_has_fork_marker(root, name).await
+    }
+
+    /// The session's persisted parent link, when its metadata row records
+    /// one. One narrow read: the newest sidecar snapshot on JSONL, a
+    /// single-row/single-column SELECT on the SQL backends.
+    async fn metadata_parent(&self, root: &Path, name: &str) -> Result<Option<String>> {
+        match self {
+            SessionStore::Jsonl => {
+                Ok(jsonl_read_meta_snapshot(root, name)?.and_then(|meta| meta.parent_session_id))
+            }
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session, .. } => session.parent_session_id().await,
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite { session, .. } => session
+                .lock()
+                .await
+                .parent_session_id()
+                .await
+                .map_err(anyhow::Error::msg),
+        }
+    }
+
+    /// The store's own marker query: does the transcript contain a
+    /// `ForkedFrom` entry anywhere? The SQL backends match `entry_kind` and
+    /// `LIMIT 1` without selecting the payload, so the I/O is bounded by the
+    /// ANSWER (one row), not by a logical head count.
+    async fn transcript_has_fork_marker(&self, root: &Path, name: &str) -> Result<bool> {
+        match self {
+            SessionStore::Jsonl => Session::has_fork_marker(root, name),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session, .. } => session.has_fork_marker().await,
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite { session, .. } => session
+                .lock()
+                .await
+                .has_fork_marker()
+                .await
+                .map_err(anyhow::Error::msg),
+        }
     }
 
     /// Depth limit for a fork ancestry walk. A chain longer than this is
@@ -6332,9 +6368,8 @@ mod tests {
         }
     }
 
-    /// The provenance probe stops at its bound instead of parsing the whole
-    /// JSONL transcript: opening a long ordinary session must not pay for
-    /// every line just to decide whether it is a fork.
+    /// The LEADING-marker probe (`leading_fork_marker`) stops at its bound
+    /// instead of parsing the whole JSONL transcript.
     #[test]
     fn jsonl_load_first_reads_a_bounded_head() {
         let temp = tempfile::tempdir().unwrap();
@@ -6343,6 +6378,124 @@ mod tests {
         crate::session::Session::append(root, "bounded", &entries).unwrap();
         let first = crate::session::Session::load_first(root, "bounded", 3).unwrap();
         assert_eq!(first, entries[..3]);
+    }
+
+    /// The copy-based writer this repo shipped before `1edc53d` appended the
+    /// marker AFTER the whole selected prefix, so four ordinary turns put it
+    /// ninth. Provenance must find it there; a bounded head of eight answered
+    /// "not a fork", and the reopened fork regained `link_ref`.
+    #[tokio::test]
+    async fn jsonl_provenance_finds_a_copy_marker_behind_four_turns() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let prefix = fork_turns(4); // eight entries
+        crate::session::Session::append(root, "nine-parent", &prefix).unwrap();
+        let mut child = prefix.clone();
+        child.push(marker("nine-parent", prefix.len(), Some(7)));
+        crate::session::Session::append(root, "nine-fork", &child).unwrap();
+
+        assert!(
+            SessionStore::Jsonl
+                .has_fork_provenance(root, "nine-fork")
+                .await
+                .unwrap(),
+            "the ninth-entry marker is provenance, not a head-bound miss"
+        );
+    }
+
+    /// An ordinary long session is not a fork and still builds. JSONL has no
+    /// kind index, so the negative answer is one sequential pass; the scan
+    /// stops at the first marker (see the test below) and never parses a
+    /// legacy `.json` document.
+    #[tokio::test]
+    async fn jsonl_provenance_is_false_for_a_plain_long_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        crate::session::Session::append(root, "plain-long", &fork_turns(500)).unwrap();
+        assert!(
+            !SessionStore::Jsonl
+                .has_fork_provenance(root, "plain-long")
+                .await
+                .unwrap()
+        );
+    }
+
+    /// The marker scan stops at the first match: a corrupt line AFTER it is
+    /// never decoded by the probe (the loader reports it on a real load).
+    #[tokio::test]
+    async fn jsonl_provenance_stops_reading_at_the_first_marker() {
+        use std::io::Write as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let prefix = fork_turns(4);
+        crate::session::Session::append(root, "stop-parent", &prefix).unwrap();
+        let mut child = prefix;
+        child.push(marker("stop-parent", 8, Some(7)));
+        crate::session::Session::append(root, "stop-fork", &child).unwrap();
+        let path = root.join(".e-agent/sessions/stop-fork.jsonl");
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(file, "not json").unwrap();
+
+        assert!(
+            SessionStore::Jsonl
+                .has_fork_provenance(root, "stop-fork")
+                .await
+                .unwrap()
+        );
+    }
+
+    /// A persisted parent link answers "is this a fork" without touching the
+    /// transcript: the stored log here is not even valid JSON.
+    #[tokio::test]
+    async fn persisted_parent_link_answers_without_the_transcript() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        SessionStore::Jsonl
+            .create_meta(
+                root,
+                "meta-child",
+                Some("m"),
+                Some("subagent"),
+                Some("meta-parent"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        std::fs::write(
+            root.join(".e-agent/sessions/meta-child.jsonl"),
+            "not json\n",
+        )
+        .unwrap();
+
+        assert!(
+            SessionStore::Jsonl
+                .has_fork_provenance(root, "meta-child")
+                .await
+                .unwrap()
+        );
+    }
+
+    /// A legacy whole-document `.json` session stores `Message`s only, so it
+    /// can never carry a marker — the probe must not read (or fail on) it.
+    #[tokio::test]
+    async fn jsonl_provenance_never_parses_a_legacy_document() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let directory = root.join(".e-agent/sessions");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("legacy-only.json"), "{ this is not json").unwrap();
+
+        assert!(
+            !SessionStore::Jsonl
+                .has_fork_provenance(root, "legacy-only")
+                .await
+                .unwrap()
+        );
     }
 
     /// Only the two LEADING layouts are a zero-copy fork. A marker deeper in

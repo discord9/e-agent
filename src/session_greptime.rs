@@ -167,6 +167,15 @@ fn advance_cursor(cursor: &AtomicI64, next: i64) {
     cursor.fetch_max(next, Ordering::AcqRel);
 }
 
+/// The fork-provenance query: ONE physical matching row, and no `payload`
+/// column. It answers "is this session a fork?" without a logical head bound,
+/// so a legacy copy writer's marker (appended after the whole copied prefix)
+/// is found at any depth, and a normal long session never materializes a
+/// transcript page (or every physical retry version of one) to answer it.
+const FORK_MARKER_SQL: &str = "SELECT 1 FROM session_entries \
+     WHERE workspace_id = $1 AND session_id = $2 AND entry_kind = 'forked_from' \
+     LIMIT 1";
+
 pub struct GreptimeSession {
     client: tokio_postgres::Client,
     /// Next sequence number for appends within this session.
@@ -1444,6 +1453,22 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
         Ok(entries.into_iter().map(|(_, entry)| entry).collect())
     }
 
+    /// Does the stored transcript carry a `ForkedFrom` marker ANYWHERE?
+    ///
+    /// ONE matching row and NO payload ([`FORK_MARKER_SQL`]). Greptime keeps
+    /// every physical version of a seq, so a logical-key head (the first `n`
+    /// entries) is not an I/O bound; a constant would also silently miss a
+    /// legacy copy fork whose marker sits behind the whole copied prefix.
+    /// `LIMIT 1` bounds the query by the answer itself.
+    pub async fn has_fork_marker(&self) -> Result<bool> {
+        let row = self
+            .client
+            .query_opt(FORK_MARKER_SQL, &[&self.workspace_id, &self.session_id])
+            .await
+            .context("cannot query the fork marker")?;
+        Ok(row.is_some())
+    }
+
     /// Load the selected bounded segment without physical locations.
     pub async fn load_older(
         &self,
@@ -2325,6 +2350,34 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             writer: row.get("writer"),
             label: None, // label lives in running_tasks, resolved at list time
         })
+    }
+
+    /// The parent link of this session's newest metadata snapshot, or `None`
+    /// when the row records none (including "no row yet"). ONE row, ONE
+    /// column: reopening a child session must not read its transcript to know
+    /// it is one. The connect-time cache answers without a query when the
+    /// table was readable then.
+    pub async fn parent_session_id(&self) -> Result<Option<String>> {
+        if let Some(parent) = self
+            .cached_meta
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|meta| meta.parent_session_id.clone())
+        {
+            return Ok(Some(parent));
+        }
+        let row = self
+            .client
+            .query_opt(
+                "SELECT parent_session_id FROM sessions \
+                 WHERE workspace_id = $1 AND session_id = $2 \
+                 ORDER BY last_active_at DESC LIMIT 1",
+                &[&self.workspace_id, &self.session_id],
+            )
+            .await
+            .context("cannot query the session parent")?;
+        Ok(row.and_then(|row| row.get::<_, Option<String>>("parent_session_id")))
     }
 
     /// Latest metadata snapshot for one session, or `None` when the
@@ -3435,6 +3488,70 @@ mod tests {
         assert!(source.contains("ORDER BY seq DESC, event_time DESC LIMIT $5"));
         assert!(source.contains("ORDER BY seq DESC, event_time DESC LIMIT $4"));
         assert!(source.contains("pub async fn load_older_located"));
+    }
+
+    /// The provenance query is bounded in PAYLOAD ROWS, not logical keys: it
+    /// matches `entry_kind` and takes ONE row without selecting `payload`.
+    /// (Greptime keeps every physical version of a seq, so "the first N
+    /// logical entries" would not bound the I/O.)
+    #[test]
+    fn fork_marker_query_is_one_row_and_selects_no_payload() {
+        assert!(FORK_MARKER_SQL.contains("entry_kind = 'forked_from'"));
+        assert!(FORK_MARKER_SQL.contains("LIMIT 1"));
+        assert!(!FORK_MARKER_SQL.contains("payload"));
+    }
+
+    /// A legacy copy fork's marker sits behind the whole copied prefix; the
+    /// single-row marker query still finds it at an arbitrary seq, and a long
+    /// ordinary session answers `false`. Needs a live GreptimeDB
+    /// (`GREPTIME_PG`), like the other integration tests here; the query
+    /// shape itself is covered ungated above.
+    #[tokio::test]
+    async fn fork_marker_query_finds_a_deep_marker() {
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let sid = format!("test-gt-fork-marker-{}", crate::session::new_id());
+        let session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        let mut entries: Vec<SessionEntry> = (0..200)
+            .flat_map(|i| {
+                [
+                    Message::User {
+                        content: format!("q{i}"),
+                        images: vec![],
+                    }
+                    .into(),
+                    Message::Assistant(AssistantMessage {
+                        content: Some(format!("a{i}")),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    })
+                    .into(),
+                ]
+            })
+            .collect();
+        let at = entries.len();
+        entries.push(SessionEntry::ForkedFrom {
+            source: "live-parent".into(),
+            at: Some(at),
+            event_time: None,
+            seq: None,
+        });
+        session.append(&entries).await.unwrap();
+        assert!(
+            session.has_fork_marker().await.unwrap(),
+            "a marker behind 200 turns is still provenance"
+        );
+
+        let plain_id = format!("test-gt-plain-{}", crate::session::new_id());
+        let plain = GreptimeSession::connect(&conn, &wid, &plain_id)
+            .await
+            .unwrap();
+        plain.append(&entries[..400]).await.unwrap();
+        assert!(!plain.has_fork_marker().await.unwrap());
     }
 
     #[test]

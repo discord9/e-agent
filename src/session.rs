@@ -207,12 +207,11 @@ impl Session {
 
     /// The first `bound` entries of the stored log.
     ///
-    /// JSONL is read line by line and STOPS at `bound`, so a provenance
+    /// JSONL is read line by line and STOPS at `bound`, so a leading-marker
     /// probe over a long session never parses the whole transcript. The
-    /// legacy whole-document fallback is no better off (it is one JSON
-    /// value), but it stores only messages — never a `ForkedFrom` marker —
-    /// so callers probing fork provenance still pay only for a legacy
-    /// session, not for an ordinary JSONL one.
+    /// legacy whole-document fallback stores only messages — never a
+    /// `ForkedFrom` marker — so provenance uses [`Self::has_fork_marker`]
+    /// instead of loading it.
     pub fn load_first(root: &Path, name: &str, bound: usize) -> anyhow::Result<Vec<SessionEntry>> {
         if bound == 0 {
             return Ok(Vec::new());
@@ -247,6 +246,46 @@ impl Session {
             }
         }
         Ok(entries)
+    }
+
+    /// Whether the stored log carries a [`SessionEntry::ForkedFrom`] marker
+    /// ANYWHERE.
+    ///
+    /// This is the provenance question the marker-aware loader answers when
+    /// it replays a fork: the marker may lead (zero-copy children), follow
+    /// the frozen goal, or — for the copy-based writer this repo shipped
+    /// before `1edc53d` — sit behind the entire copied prefix. There is no
+    /// positional cutoff: lines are decoded oldest-first and the scan stops
+    /// at the first marker, so a fork pays only for its prefix and an
+    /// ordinary session pays one sequential pass (a plain append-only log
+    /// has no kind index to ask instead).
+    ///
+    /// A legacy whole-document `.json` session stores `Message`s only and
+    /// can never carry a marker, so it is deliberately NOT read here.
+    pub(crate) fn has_fork_marker(root: &Path, name: &str) -> anyhow::Result<bool> {
+        let jsonl = session_path(root, name, "jsonl")?;
+        if !jsonl.exists() {
+            return Ok(false);
+        }
+        let file = std::fs::File::open(&jsonl)
+            .with_context(|| format!("cannot open session {}", jsonl.display()))?;
+        for (index, line) in std::io::BufReader::new(file).lines().enumerate() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let entry = serde_json::from_str::<SessionEntry>(&line).with_context(|| {
+                format!(
+                    "cannot decode session {} line {}",
+                    jsonl.display(),
+                    index + 1
+                )
+            })?;
+            if matches!(entry, SessionEntry::ForkedFrom { .. }) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Append new entries to the JSONL log, creating the file (0600) if needed.

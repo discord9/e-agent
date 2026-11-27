@@ -5963,6 +5963,141 @@ async fn head_page_probe_folds_duplicate_versions_before_the_physical_limit() {
     assert_eq!(page.next_before_seq, None);
 }
 
+/// Fork provenance is ONE marker row, not a bounded logical head: the legacy
+/// copy writer appended the marker after the whole copied prefix, so it may
+/// sit arbitrarily deep. The query matches `entry_kind` with `LIMIT 1` and
+/// never selects a payload, so a normal long session does not materialize a
+/// transcript page to answer it.
+#[tokio::test]
+async fn fork_provenance_finds_a_deep_marker_and_bounds_the_query() {
+    use crate::session_store::SessionStore;
+
+    fn turns(n: usize) -> Vec<SessionEntry> {
+        (0..n)
+            .flat_map(|i| {
+                [
+                    Message::User {
+                        content: format!("q{i}"),
+                        images: vec![],
+                    }
+                    .into(),
+                    Message::Assistant(AssistantMessage {
+                        content: Some(format!("a{i}")),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    })
+                    .into(),
+                ]
+            })
+            .collect()
+    }
+
+    let (dir, path) = temp_db();
+    let root = dir.path();
+    let backend = crate::config::SessionBackend::Sqlite {
+        path: Some(path.to_string_lossy().into_owned()),
+    };
+    let child = SessionStore::connect(&backend, root, "sql-copy-fork")
+        .await
+        .unwrap();
+    let mut copy = turns(200);
+    let prefix = copy.len();
+    copy.push(SessionEntry::ForkedFrom {
+        source: "sql-copy-parent".into(),
+        at: Some(prefix),
+        event_time: None,
+        seq: Some(prefix as i64 - 1),
+    });
+    child.append(root, "sql-copy-fork", &copy).await.unwrap();
+    assert!(
+        child
+            .has_fork_provenance(root, "sql-copy-fork")
+            .await
+            .unwrap(),
+        "a marker behind 200 turns is still provenance"
+    );
+
+    let plain = SessionStore::connect(&backend, root, "sql-plain-long")
+        .await
+        .unwrap();
+    plain
+        .append(root, "sql-plain-long", &turns(200))
+        .await
+        .unwrap();
+    assert!(
+        !plain
+            .has_fork_provenance(root, "sql-plain-long")
+            .await
+            .unwrap(),
+        "an ordinary long session is not a fork"
+    );
+
+    // The bound is the QUERY: one physical matching row, no payload column.
+    assert!(FORK_MARKER_SQL.contains("entry_kind = 'forked_from'"));
+    assert!(FORK_MARKER_SQL.contains("LIMIT 1"));
+    assert!(!FORK_MARKER_SQL.contains("payload"));
+}
+
+/// A persisted parent link (a delegate/btw/fork child) decides provenance
+/// with no marker in the child's own transcript and no transcript page read.
+#[tokio::test]
+async fn fork_provenance_takes_a_persisted_parent_link() {
+    use crate::session_store::SessionStore;
+
+    let (dir, path) = temp_db();
+    let root = dir.path();
+    let backend = crate::config::SessionBackend::Sqlite {
+        path: Some(path.to_string_lossy().into_owned()),
+    };
+    let child = SessionStore::connect(&backend, root, "sql-child")
+        .await
+        .unwrap();
+    child
+        .append(
+            root,
+            "sql-child",
+            &[
+                Message::User {
+                    content: "q0".into(),
+                    images: vec![],
+                }
+                .into(),
+                Message::Assistant(AssistantMessage {
+                    content: Some("a0".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                })
+                .into(),
+            ],
+        )
+        .await
+        .unwrap();
+    child
+        .create_meta(
+            root,
+            "sql-child",
+            Some("m"),
+            Some("subagent"),
+            Some("sql-parent"),
+            Some(3),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Reconnect so the metadata cache is populated from the stored row, the
+    // way a resume does; no marker exists in the child's own log.
+    let reopened = SessionStore::connect(&backend, root, "sql-child")
+        .await
+        .unwrap();
+    assert!(
+        reopened
+            .has_fork_provenance(root, "sql-child")
+            .await
+            .unwrap()
+    );
+}
+
 /// Sequences can be SPARSE: a child may store its `GoalUpdated` at seq 0 and
 /// its `ForkedFrom` marker at seq 10. A numeric `seq < n` probe cutoff would
 /// see only the goal and bypass resolution, losing the inherited prefix; the
