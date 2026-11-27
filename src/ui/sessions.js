@@ -1141,6 +1141,10 @@ function renderChatRefs(s, id) {
 async function editSessionRef(kind, url, remove) {
   const id = state.sessionId;
   if (!id) return false;
+  // 发起时的身份快照：POST 期间用户可能切了工作区或会话，响应回来时
+  // state.workspace / state.sessionId / state.lastList 都可能已经指向别处。
+  const wsId = state.workspace.id;
+  const wsKey = workspaceIdentityKey(state.workspace, workspaceToken(state.workspace));
   if (!workspaceToken(state.workspace)) { setBanner("⚠ 请先输入 Token。", true); return false; }
   try {
     const res = await api("/api/sessions/" + encodeURIComponent(id) + "/refs",
@@ -1159,11 +1163,22 @@ async function editSessionRef(kind, url, remove) {
       return false;
     }
     const body = await res.json().catch(() => ({}));
+    // 工作区已切换：state.lastList 此刻是另一个工作区的列表，同 id 的行
+    // 可能是另一条会话。这份响应只属于发起它的那个工作区，整条丢弃——
+    // 新工作区的列表本来就是最新拉到的，不需要也不允许用旧响应去改。
+    if (state.workspace.id !== wsId
+        || workspaceIdentityKey(state.workspace, workspaceToken(state.workspace)) !== wsKey) {
+      return true;
+    }
     const s = (state.lastList || []).find((x) => x.id === id);
     if (s) {
       s.prs = Array.isArray(body.prs) ? body.prs : [];
       s.issues = Array.isArray(body.issues) ? body.issues : [];
     }
+    // 会话已切换：只把响应写回它自己的列表缓存（上一段），绝不用 A 的
+    // 响应重画 B 的头部（下面的 renderChatSessionId/renderChatRefs 读的
+    // 是「当前可见会话」）。切回 A 时头部由缓存/轮询重建。
+    if (state.sessionId !== id) return true;
     renderChatSessionId(id);
     return true;
   } catch (e) {
