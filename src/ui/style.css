@@ -1928,7 +1928,6 @@
   /* ---------- 会话链接 chips（PR / issue） ----------
      标签来自 URL 自身形状（`PR #14` / `issue #22`，否则 host+path）；
      只做展示 + 打开，不分组/过滤/按编号排序。 */
-  .tree-refs,
   .chat-refs {
     display: flex;
     flex-wrap: wrap;
@@ -1936,7 +1935,6 @@
     gap: 4px;
     min-width: 0;
   }
-  .tree-refs { margin: 2px 0 0; }
   .ref-chip {
     display: inline-block;
     max-width: 22em;

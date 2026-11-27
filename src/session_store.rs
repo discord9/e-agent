@@ -825,13 +825,6 @@ pub enum SessionRefKind {
 }
 
 impl SessionRefKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Pr => "pr",
-            Self::Issue => "issue",
-        }
-    }
-
     /// Parse the model/HTTP surface spelling (`"pr"` | `"issue"`).
     pub fn parse(value: &str) -> Result<Self, String> {
         match value {

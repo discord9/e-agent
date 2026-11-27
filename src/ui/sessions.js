@@ -1051,7 +1051,7 @@ function syncChatRefs(s) {
   renderChatRefs(s, state.sessionId);
 }
 
-/* 一个 chip。`onRemove` 非空时附带 ×（只在会话头部提供）。 */
+/* 会话头部的一个 chip：点击新标签页打开，附带 × 移除。 */
 function refChip(link, onRemove) {
   const a = el("a", "ref-chip " + link.kind, refChipLabel(link.url));
   a.href = link.url;
@@ -1059,8 +1059,7 @@ function refChip(link, onRemove) {
   a.rel = "noopener noreferrer";
   a.title = link.url;
   a.draggable = false;
-  a.addEventListener("click", (ev) => ev.stopPropagation());   // 不触发切换会话/拖拽排序
-  if (!onRemove) return a;
+  a.addEventListener("click", (ev) => ev.stopPropagation());   // 不触发切换会话
   const wrap = el("span", "ref-chip-wrap");
   wrap.append(a);
   const rm = el("button", "ref-chip-remove", "×");
@@ -1074,15 +1073,6 @@ function refChip(link, onRemove) {
   });
   wrap.append(rm);
   return wrap;
-}
-
-/* 侧边栏行的 chips（只展示/打开，没有 ×）；没有链接时返回 null，不占行高。 */
-function renderRefChips(s) {
-  const links = sessionRefLinks(s);
-  if (!links.length) return null;
-  const row = el("div", "tree-refs");
-  for (const link of links) row.append(refChip(link));
-  return row;
 }
 
 /* 会话头部的 chips + 手工编辑（＋ 展开：kind 选择 + URL 输入 + 添加）。 */
@@ -1175,7 +1165,6 @@ async function editSessionRef(kind, url, remove) {
       s.issues = Array.isArray(body.issues) ? body.issues : [];
     }
     renderChatSessionId(id);
-    renderSidebarTree(true);   // 侧边栏也显示 chips：立即反映
     return true;
   } catch (e) {
     setBanner("⚠ 链接更新失败：" + e.message, true);
@@ -2528,9 +2517,7 @@ function enablePinnedPointerDrag(row, node, wsId, sid) {
   }, true);
   row.addEventListener("pointerdown", (ev) => {
     if (ev.button !== undefined && ev.button !== 0) return;
-    // Links (session ref chips) behave like buttons: a tap must open the URL,
-    // never start a pin drag.
-    const onButton = !!(ev.target && ev.target.closest && ev.target.closest("button, a"));
+    const onButton = !!(ev.target && ev.target.closest && ev.target.closest("button"));
     // 鼠标点按钮保持原交互；触屏按钮仍记录 pointer，以便手指从按钮起滑时
     // 手动滚动（row 的 touch-action:none 是可靠接管纵向拖拽所必需）。
     if (onButton && ev.pointerType !== "touch") return;
@@ -2634,7 +2621,6 @@ function sidebarTreeSig() {
         s.id, s.title || "", s.label || "", s.status, s.busy ? 1 : 0, s.active === false ? 0 : 1,
         s.entry_count ?? null, s.parent_session_id || "", s.pinned === true ? 1 : 0,
         s.archived === true ? 1 : 0, s.model || "",
-        Array.isArray(s.prs) ? s.prs.join(" ") : "", Array.isArray(s.issues) ? s.issues.join(" ") : "",
       ])));
   }
   return state.sessionId + "|" + JSON.stringify(readPinOrder()) + "|" + parts.join("|")
@@ -3146,8 +3132,6 @@ function buildTreeRoot(s, kids, wsId) {
     ? String(summary.short || "").trim() : "";
   const main = el("div", "tree-main");
   main.append(titleEl);
-  const refChips = renderRefChips(s);
-  if (refChips) main.append(refChips);
   if (activityShort) {
     const activity = el("div", "tree-activity", activityShort);
     activity.title = String(summary.full || activityShort);   // 完整 30 字摘要留给 hover
