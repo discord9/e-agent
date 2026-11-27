@@ -496,12 +496,16 @@ error. `generate_image` (main session only, ChatGPT login) writes a PNG.
 ### Image budget
 
 Both wires (chat and ChatGPT Responses) put at most **1024 estimated vision
-tokens per image** on the wire. Each outgoing image is measured with DeepSeek's
-published calculator — 14px patches, merged 3:1 per axis into 42px token cells,
-`tokens = grid_h * (grid_w + 1) + 2` — and scaled **down** (never up) until the
-estimate fits, keeping its aspect ratio in whole 14px patches. The provider's
-own 544x544 total-pixel floor is its accounting only: a small image is sent
-unchanged. The re-encoded variant is cached next to the original as
+tokens per image** on the wire — except the newest images: the ones appended
+after the newest assistant message (exactly the images the offload rule below
+never drops). Those skip normalisation and go out with their original bytes and
+MIME type, bounded only by the 10 MiB ingest cap (a larger file is rejected with
+a clear error, never silently resized). Every older image is measured with
+DeepSeek's published calculator — 14px patches, merged 3:1 per axis into 42px
+token cells, `tokens = grid_h * (grid_w + 1) + 2` — and scaled **down** (never
+up) until the estimate fits, keeping its aspect ratio in whole 14px patches. The
+provider's own 544x544 total-pixel floor is its accounting only: a small image
+is sent unchanged. The re-encoded variant is cached next to the original as
 `<hash>.n<WxH>.<ext>` (JPEG quality 85 for opaque images, PNG when the source
 has alpha) and reused on later requests; an image that already fits is sent
 byte-identical with its original MIME type and is never re-encoded.

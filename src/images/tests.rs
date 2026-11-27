@@ -345,7 +345,7 @@ fn an_oversize_stored_file_is_rejected_with_a_clear_error() {
         hash: "huge".into(),
         mime: "image/png".into(),
     };
-    let error = wire_image(Some(store.path()), &image).unwrap_err();
+    let error = wire_image(Some(store.path()), &image, false).unwrap_err();
     assert!(error.contains("image too large"), "{error}");
     assert!(error.contains("huge"), "{error}");
     assert!(
@@ -358,7 +358,7 @@ fn an_oversize_stored_file_is_rejected_with_a_clear_error() {
         mime: "image/png".into(),
     };
     assert_eq!(
-        wire_image(Some(store.path()), &missing).unwrap_err(),
+        wire_image(Some(store.path()), &missing, false).unwrap_err(),
         "[image missing: nope]"
     );
     // The same cap is enforced when bytes are handed in directly.
@@ -486,9 +486,10 @@ fn a_new_image_is_never_offloaded_before_it_is_sent() {
         .map(|index| user_with(&format!("h{index}")))
         .collect();
     let fresh = ImageBudget::project(&messages, 6);
-    assert_eq!(fresh, ImageBudget::default(), "nothing is evictable yet");
+    assert!(fresh.placeholders.is_empty(), "nothing is evictable yet");
     for index in 0..10 {
         assert_eq!(fresh.placeholder(&format!("h{index}")), None);
+        assert!(fresh.is_newest(&format!("h{index}")), "all are undelivered");
     }
 
     // After a response all ten count as delivered: the oldest four are
@@ -622,4 +623,157 @@ fn a_tool_batch_of_new_images_is_never_offloaded() {
     }
     assert_eq!(later.placeholder("t5"), None);
     assert_eq!(later.placeholder("t6"), None);
+}
+
+/// The production decision for one image: `ImageBudget::project` decides
+/// whether it is newest, and `wire_image` serializes it accordingly.
+fn wire_with_budget(
+    store: &Path,
+    messages: &[Message],
+    hash: &str,
+    max_inline: usize,
+) -> Result<(Vec<u8>, String), String> {
+    let budget = ImageBudget::project(messages, max_inline);
+    wire_image(
+        Some(store),
+        &ImagePart {
+            hash: hash.into(),
+            mime: "image/png".into(),
+        },
+        budget.is_newest(hash),
+    )
+}
+
+/// The newest image goes out exactly as stored; the same image before the
+/// newest assistant message keeps the old resize-and-cache behaviour.
+#[test]
+fn the_newest_image_is_byte_identical_to_the_store_and_an_older_one_is_resized() {
+    let store = tempfile::tempdir().unwrap();
+    let original = png(1920, 1080, false);
+    let hash = digest(&original);
+    std::fs::write(store.path().join(&hash), &original).unwrap();
+
+    // Appended after the newest assistant message: never delivered.
+    let fresh = vec![assistant_text("seen"), user_with(&hash)];
+    let (bytes, mime) = wire_with_budget(store.path(), &fresh, &hash, DEFAULT_MAX_INLINE).unwrap();
+    assert_eq!(bytes, original, "newest: the stored bytes, untouched");
+    assert_eq!(mime, "image/png", "newest: the original MIME");
+    assert_eq!(
+        std::fs::read_dir(store.path()).unwrap().count(),
+        1,
+        "no variant is written for a full-size send"
+    );
+
+    // Before the newest assistant message the same image is delivered and
+    // normalised exactly as before.
+    let today = normalise(store.path(), &hash, "image/png", &original).unwrap();
+    let delivered = vec![user_with(&hash), assistant_text("seen")];
+    let (bytes, mime) =
+        wire_with_budget(store.path(), &delivered, &hash, DEFAULT_MAX_INLINE).unwrap();
+    assert_eq!((bytes, mime), today, "delivered: unchanged behaviour");
+    assert_eq!(today.1, "image/jpeg");
+    let decoded = image::load_from_memory(&today.0).unwrap();
+    assert_eq!((decoded.width(), decoded.height()), (1708, 966));
+}
+
+/// Every image after the newest assistant message is full size, not just the
+/// last one.
+#[test]
+fn every_image_in_the_newest_window_is_sent_full_size() {
+    let store = tempfile::tempdir().unwrap();
+    let first = png_rgb(1920, 1080, [200, 30, 30]);
+    let second = png_rgb(1920, 1080, [30, 30, 200]);
+    let (first_hash, second_hash) = (digest(&first), digest(&second));
+    std::fs::write(store.path().join(&first_hash), &first).unwrap();
+    std::fs::write(store.path().join(&second_hash), &second).unwrap();
+    let messages = vec![
+        assistant_text("seen"),
+        user_with(&first_hash),
+        user_with(&second_hash),
+    ];
+    let budget = ImageBudget::project(&messages, DEFAULT_MAX_INLINE);
+    assert!(budget.is_newest(&first_hash) && budget.is_newest(&second_hash));
+
+    for (hash, original) in [(&first_hash, &first), (&second_hash, &second)] {
+        let (bytes, mime) =
+            wire_with_budget(store.path(), &messages, hash, DEFAULT_MAX_INLINE).unwrap();
+        assert_eq!(&bytes, original, "both newest images are byte-identical");
+        assert_eq!(mime, "image/png");
+    }
+}
+
+/// Recency is not a permanent exemption: once a turn completes, the image
+/// that was newest becomes delivered and is resized on the next request.
+#[test]
+fn a_new_assistant_message_makes_the_previously_newest_image_old() {
+    let store = tempfile::tempdir().unwrap();
+    let original = png(1920, 1080, false);
+    let hash = digest(&original);
+    std::fs::write(store.path().join(&hash), &original).unwrap();
+    let mut messages = vec![user_with(&hash)];
+
+    // No assistant message yet: the image has never been on the wire.
+    let (bytes, mime) =
+        wire_with_budget(store.path(), &messages, &hash, DEFAULT_MAX_INLINE).unwrap();
+    assert_eq!(bytes, original);
+    assert_eq!(mime, "image/png");
+
+    // The turn completes; the next request must apply the ordinary budget.
+    messages.push(assistant_text("seen"));
+    let (bytes, mime) =
+        wire_with_budget(store.path(), &messages, &hash, DEFAULT_MAX_INLINE).unwrap();
+    assert_ne!(bytes, original);
+    assert_eq!(mime, "image/jpeg");
+    let decoded = image::load_from_memory(&bytes).unwrap();
+    assert_eq!((decoded.width(), decoded.height()), (1708, 966));
+}
+
+/// A full-size send and a resized send never share a cache entry: the full
+/// size path ignores the variant, and the resized path never reads the
+/// original as if it were a full-size entry.
+#[test]
+fn a_full_size_send_never_reads_a_resized_cache_variant() {
+    let store = tempfile::tempdir().unwrap();
+    let original = png(4000, 3000, false);
+    let hash = digest(&original);
+    std::fs::write(store.path().join(&hash), &original).unwrap();
+    // A valid cached variant that a delivered send would reuse.
+    let sentinel = jpeg_rgb(1512, 1134, [200, 30, 30]);
+    let cache = store.path().join(format!("{hash}.n1512x1134.jpg"));
+    std::fs::write(&cache, &sentinel).unwrap();
+    std::fs::write(cache_digest_path(&cache), digest(&sentinel)).unwrap();
+
+    let newest = vec![assistant_text("seen"), user_with(&hash)];
+    let (bytes, mime) = wire_with_budget(store.path(), &newest, &hash, DEFAULT_MAX_INLINE).unwrap();
+    assert_eq!(bytes, original, "full size ignores the resized variant");
+    assert_eq!(mime, "image/png");
+    assert_eq!(std::fs::read(&cache).unwrap(), sentinel, "cache untouched");
+
+    // A later delivered send reads the resized entry, never the original.
+    let delivered = vec![user_with(&hash), assistant_text("seen")];
+    let (bytes, mime) =
+        wire_with_budget(store.path(), &delivered, &hash, DEFAULT_MAX_INLINE).unwrap();
+    assert_eq!(bytes, sentinel);
+    assert_eq!(mime, "image/jpeg");
+}
+
+/// A newest image over the ingest cap is still rejected with the existing
+/// clear error; the full-size path never silently resizes it.
+#[test]
+fn an_over_cap_newest_image_is_still_rejected() {
+    let store = tempfile::tempdir().unwrap();
+    let hash = "newest";
+    let file = std::fs::File::create(store.path().join(hash)).unwrap();
+    file.set_len(MAX_IMAGE_BYTES as u64 + 1).unwrap();
+    let messages = vec![assistant_text("seen"), user_with(hash)];
+    let budget = ImageBudget::project(&messages, DEFAULT_MAX_INLINE);
+    assert!(
+        budget.is_newest(hash),
+        "it is newest, but the cap still wins"
+    );
+
+    let error = wire_with_budget(store.path(), &messages, hash, DEFAULT_MAX_INLINE).unwrap_err();
+    assert!(error.contains("image too large"), "{error}");
+    assert!(error.contains(hash), "{error}");
+    assert!(error.contains(&MAX_IMAGE_BYTES.to_string()), "{error}");
 }

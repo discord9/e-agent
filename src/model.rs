@@ -939,7 +939,7 @@ impl WireContent {
                 parts.push(json!({"type": "text", "text": text}));
                 continue;
             }
-            match crate::images::wire_image(image_store, image) {
+            match crate::images::wire_image(image_store, image, budget.is_newest(&image.hash)) {
                 Ok((bytes, mime)) => {
                     transmitted_images.push(image.hash.clone());
                     parts.push(json!({

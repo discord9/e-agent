@@ -879,6 +879,88 @@ fn tiny_png() -> Vec<u8> {
     bytes
 }
 
+/// A 1920x1080 PNG over the token budget: normalises to 1708x966.
+fn wide_png(rgb: [u8; 3]) -> Vec<u8> {
+    let image =
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(1920, 1080, image::Rgb(rgb)));
+    let mut bytes = Vec::new();
+    image
+        .write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+    bytes
+}
+
+/// The Responses wire applies the newest-image rule too: the image appended
+/// after the newest assistant message goes out byte-identical with its MIME,
+/// while the delivered one before it keeps the ordinary resize.
+#[test]
+fn responses_wire_sends_the_newest_image_full_size_and_resizes_the_old_one() {
+    let store = tempfile::tempdir().unwrap();
+    let old = wide_png([200, 30, 30]);
+    let new = wide_png([30, 30, 200]);
+    let (old_hash, new_hash) = (
+        crate::agent::image_sha256(&old),
+        crate::agent::image_sha256(&new),
+    );
+    std::fs::write(store.path().join(&old_hash), &old).unwrap();
+    std::fs::write(store.path().join(&new_hash), &new).unwrap();
+    let messages = vec![
+        Message::User {
+            content: "old".into(),
+            images: vec![ImagePart {
+                hash: old_hash,
+                mime: "image/png".into(),
+            }],
+        },
+        Message::Assistant(AssistantMessage {
+            content: Some("seen".into()),
+            tool_calls: Vec::new(),
+            reasoning: None,
+        }),
+        Message::User {
+            content: "new".into(),
+            images: vec![ImagePart {
+                hash: new_hash,
+                mime: "image/png".into(),
+            }],
+        },
+    ];
+    let request = ResponsesRequest::from_internal(
+        "codex",
+        None,
+        &messages,
+        &[],
+        Some(store.path()),
+        crate::images::DEFAULT_MAX_INLINE,
+    );
+    let value = serde_json::to_value(&request).unwrap();
+    let input = value["input"].as_array().unwrap();
+    let data = |part: &serde_json::Value| {
+        let url = part["image_url"].as_str().unwrap();
+        let (mime, payload) = url
+            .strip_prefix("data:")
+            .unwrap()
+            .split_once(";base64,")
+            .unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .unwrap();
+        (mime.to_owned(), bytes)
+    };
+
+    let (mime, resized) = data(&input[0]["content"].as_array().unwrap()[1]);
+    assert_eq!(mime, "image/jpeg", "the older image keeps the budget");
+    let decoded = image::load_from_memory(&resized).unwrap();
+    assert_eq!((decoded.width(), decoded.height()), (1708, 966));
+
+    let (mime, full) = data(&input[2]["content"].as_array().unwrap()[1]);
+    assert_eq!(mime, "image/png", "the newest image keeps its MIME");
+    assert_eq!(full, new, "the newest image is byte-identical to the store");
+}
+
 /// Ten distinct user images in one request: the serialized Responses body
 /// keeps the newest six as `input_image` parts and replaces the oldest four
 /// with recovery placeholders, in place.
