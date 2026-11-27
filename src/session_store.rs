@@ -867,6 +867,23 @@ impl SessionRef {
                 "`{url}` contains whitespace; a ref URL must be one absolute http(s) URL"
             ));
         }
+        // Require an explicit `scheme://` in the ORIGINAL string. `Url::parse`
+        // REPAIRS a scheme without an authority (`https:example.org/pull/14`
+        // becomes the path `example.org/pull/14` on host "https"), so the
+        // checks below would see a host and pass while the raw string — the
+        // one stored in `href` and resolved against the UI origin by the
+        // browser — has none. Only a string whose scheme is followed by `//`
+        // and a non-empty authority is accepted; the exact string is kept.
+        let lower = url.to_ascii_lowercase();
+        let authority = lower
+            .strip_prefix("http://")
+            .or_else(|| lower.strip_prefix("https://"))
+            .ok_or_else(|| format!("`{url}` must use an explicit http:// or https:// authority"))?;
+        if authority.is_empty() || authority.starts_with(&['/', '?', '#'][..]) {
+            return Err(format!(
+                "`{url}` must name an authority (host) right after the scheme"
+            ));
+        }
         let parsed = url::Url::parse(url)
             .map_err(|error| format!("`{url}` is not an absolute URL: {error}"))?;
         if !matches!(parsed.scheme(), "http" | "https") {
@@ -5322,6 +5339,39 @@ mod shared_helpers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A ref URL must carry an EXPLICIT `scheme://` authority in the original
+    /// string. `Url::parse` REPAIRS a scheme without one (`https:example.org/
+    /// pull/14` becomes the path `example.org/pull/14` on host "https"), so the
+    /// old checks saw a host and passed while the raw string — the one stored
+    /// in `href` and resolved against the UI origin by the browser — had no
+    /// origin at all. Every malformed form is refused; an accepted URL keeps
+    /// its exact string (the URL is the identity).
+    #[test]
+    fn ref_urls_require_an_explicit_authority_and_keep_their_exact_string() {
+        for (bad, why) in [
+            ("https:example.org/pull/14", "scheme without `//`"),
+            ("http:example.org/x", "scheme without `//`"),
+            ("https:/example.org/x", "single slash"),
+            ("https:///example.org/x", "empty authority"),
+            ("https://", "no authority"),
+            ("//example.org/x", "no scheme"),
+            ("example.org/pull/14", "relative path"),
+            ("ftp://example.org/x", "wrong scheme"),
+            ("https://user:pw@example.org/x", "credentials"),
+            ("https://example.org /x", "whitespace"),
+            ("", "empty"),
+        ] {
+            let error = SessionRef::new("pr", bad).expect_err(why);
+            assert!(!error.is_empty(), "{why}: {error}");
+        }
+        let accepted = "https://Example.org/PULL/14";
+        assert_eq!(
+            SessionRef::new("pr", accepted).unwrap().url,
+            accepted,
+            "an accepted URL keeps its exact string"
+        );
+    }
 
     /// JSONL `load_older` pages by ABSOLUTE position (there is no seq
     /// column): `before_seq` is the 0-based file position, the returned
