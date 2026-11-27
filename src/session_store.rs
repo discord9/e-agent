@@ -3674,6 +3674,7 @@ impl SessionStore {
             MetaWriteMode::Required,
         )
         .await
+        .map(|_damaged| ())
     }
 
     /// [`Self::create_meta`] for an OPTIONAL backfill: the model/role
@@ -3691,6 +3692,12 @@ impl SessionStore {
     /// cannot damage the file between a health check and this call; there is
     /// deliberately no separate pre-check. SQL backends are transactional
     /// and never damaged.
+    ///
+    /// Returns whether the locked read OBSERVED damage (and therefore wrote
+    /// nothing), so a caller can keep damage-sensitive tools off. A skipped
+    /// damaged sidecar and a damaged empty one both report `true`; a healthy
+    /// creation or backfill reports `false`. SQL rows can never be damaged,
+    /// so they always report `false`.
     #[allow(unused_variables, clippy::too_many_arguments)]
     pub async fn create_meta_optional(
         &self,
@@ -3701,7 +3708,7 @@ impl SessionStore {
         parent_session_id: Option<&str>,
         parent_task_id: Option<i64>,
         title: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         self.create_meta_with_mode(
             root,
             session,
@@ -3726,7 +3733,7 @@ impl SessionStore {
         parent_task_id: Option<i64>,
         title: Option<&str>,
         mode: MetaWriteMode,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         match self {
             SessionStore::Jsonl => jsonl_create_meta(
                 root,
@@ -3742,18 +3749,17 @@ impl SessionStore {
             SessionStore::Greptime {
                 session: greptime_session,
                 ..
-            } => {
-                greptime_session
-                    .create_meta(
-                        session,
-                        model,
-                        role,
-                        parent_session_id,
-                        parent_task_id,
-                        title,
-                    )
-                    .await
-            }
+            } => greptime_session
+                .create_meta(
+                    session,
+                    model,
+                    role,
+                    parent_session_id,
+                    parent_task_id,
+                    title,
+                )
+                .await
+                .map(|()| false),
             #[cfg(feature = "sqlite")]
             SessionStore::Sqlite {
                 session: sqlite_session,
@@ -3770,6 +3776,7 @@ impl SessionStore {
                     title,
                 )
                 .await
+                .map(|()| false)
                 .map_err(anyhow::Error::msg),
         }
     }
@@ -4750,20 +4757,25 @@ fn jsonl_count_transcript_entries(root: &Path, session: &str) -> anyhow::Result<
 ///   resume — a second creation line would rewrite `created_at` and
 ///   pollute the audit file).
 ///
-/// An existing sidecar that holds no decodable record is left untouched,
-/// because appending a first line would turn unknown provenance into a
-/// parentless one. A sidecar that DOES hold a decodable snapshot followed by
-/// a torn one is display-only too: a backfill append would make the damaged
-/// tail look repaired (and without a trailing newline it would be glued onto
-/// that tail), so the backfill is refused with an error naming the file.
-/// A create with nothing to append stays an `Ok` no-op, so an intact
-/// transcript still reopens.
+/// An existing sidecar that holds no decodable record (an empty file from a
+/// `create` whose first `write_all` never ran, or a lone torn line) is
+/// left untouched, because appending a first line would turn unknown
+/// provenance into a parentless one. That is not an idempotent resume of an
+/// existing snapshot, so [`MetaWriteMode::Required`] REFUSES it with an
+/// error naming the file rather than reporting a creation that never
+/// landed. A sidecar that DOES hold a decodable snapshot followed by a torn
+/// one is display-only too: a backfill append would make the damaged tail
+/// look repaired (and without a trailing newline it would be glued onto
+/// that tail), so the strict create is refused there as well. A create with
+/// an existing decodable snapshot and nothing to append stays an `Ok` no-op,
+/// so an intact transcript still reopens.
 ///
-/// [`MetaWriteMode::OptionalBackfill`] changes ONLY that damaged-tail case:
-/// a backfill that would otherwise be refused is skipped silently, because
-/// the caller's write is optional. A healthy write and the no-op resume are
-/// identical in both modes. The decision and the append share the lock
-/// taken above, so they are one critical section.
+/// [`MetaWriteMode::OptionalBackfill`] changes ONLY those damaged cases: a
+/// backfill that would otherwise be refused is skipped silently, because
+/// the caller's write is optional, and reports the observed damage as
+/// `true`. A healthy write and the no-op resume are identical in both modes
+/// and report `false`. The decision and the append share the lock taken
+/// above, so they are one critical section.
 ///
 /// `entry_count` mirrors the DB backends' `next_seq` at creation: the
 /// transcript's current line count.
@@ -4777,7 +4789,7 @@ fn jsonl_create_meta(
     parent_task_id: Option<i64>,
     title: Option<&str>,
     mode: MetaWriteMode,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let path = jsonl_meta_sidecar_path(root, session)?;
     let _guard = lock_jsonl_meta(&path);
     let (existing, unknown) = jsonl_read_meta_snapshot_and_unknown(root, session)?;
@@ -4802,7 +4814,7 @@ fn jsonl_create_meta(
                 // writer cannot damage the file between the two.
                 return match mode {
                     MetaWriteMode::Required => Err(jsonl_refuse_damaged_meta(&path)),
-                    MetaWriteMode::OptionalBackfill => Ok(()),
+                    MetaWriteMode::OptionalBackfill => Ok(true),
                 };
             }
             let mut meta = SessionMeta {
@@ -4825,15 +4837,25 @@ fn jsonl_create_meta(
                 writer: None, // stamped by jsonl_append_meta_snapshot with the writing process
                 label: None, // label lives in running_tasks / background records, resolved at list time
             };
-            return jsonl_append_meta_snapshot(root, session, &mut meta);
+            return jsonl_append_meta_snapshot(root, session, &mut meta).map(|()| false);
         }
-        return Ok(()); // resume: nothing missing, never rewrite created_at
+        // Resume: nothing missing, never rewrite `created_at`. The read may
+        // still have observed a torn tail after that snapshot; report the
+        // damage so the caller does not treat the session as fully healthy.
+        return Ok(unknown);
     }
     if unknown {
-        // The sidecar EXISTS but no record in it decodes: appending a first
-        // line would fabricate parentlessness the bytes never proved, so
-        // leave the file (and the unknown provenance) for a real repair.
-        return Ok(());
+        // The sidecar EXISTS but no record in it decodes — notably the
+        // empty file an interrupted `create` leaves between creating the
+        // file and its first `write_all`. That is the crash window this
+        // series calls damage, not an idempotent resume of an existing
+        // snapshot: an explicit create must fail naming the file instead
+        // of reporting a success that never landed. The optional resume
+        // backfill has nothing to backfill from and skips it.
+        return match mode {
+            MetaWriteMode::Required => Err(jsonl_refuse_damaged_meta(&path)),
+            MetaWriteMode::OptionalBackfill => Ok(true),
+        };
     }
     let now = chrono::Utc::now().naive_utc();
     let mut meta = SessionMeta {
@@ -4852,7 +4874,7 @@ fn jsonl_create_meta(
         writer: None, // stamped by jsonl_append_meta_snapshot with the writing process
         label: None,  // label lives in running_tasks / background records, resolved at list time
     };
-    jsonl_append_meta_snapshot(root, session, &mut meta)
+    jsonl_append_meta_snapshot(root, session, &mut meta).map(|()| false)
 }
 
 /// Shared read-tail → mutate → append for the flag setters (title, pin,

@@ -246,11 +246,16 @@ async fn create_meta_after_transcript_counts_existing_entries() {
 }
 
 /// An existing sidecar that holds no decodable record (a zero-byte file, or
-/// a lone torn line) is UNKNOWN provenance, so a creation call must not
-/// append a parentless first line over it: the next read would see only
-/// that clean record and call the session parentless. A fresh sidecar
-/// (`NotFound`) still gets its first line, and so does one created after
-/// the damaged file is actually removed (the real repair).
+/// a lone torn line) is UNKNOWN provenance. A `Required` creation must not
+/// report success over it: an empty file is the crash window left by a
+/// `create` whose first `write_all` never ran, not an idempotent resume of
+/// an existing snapshot, so the call fails naming the file and leaves the
+/// bytes untouched. The optional resume backfill skips it (nothing to
+/// backfill from) and reports the observed damage. Neither mode may append
+/// a parentless first line: the next read would see only that clean record
+/// and call the session parentless. A fresh sidecar (`NotFound`) still gets
+/// its first line, and so does one created after the damaged file is
+/// actually removed (the real repair).
 #[tokio::test]
 async fn create_meta_never_writes_a_first_line_over_an_undecodable_sidecar() {
     let temp = tempfile::tempdir().unwrap();
@@ -261,18 +266,39 @@ async fn create_meta_never_writes_a_first_line_over_an_undecodable_sidecar() {
     let empty = format!("meta-empty-{}", crate::session::new_id());
     std::fs::create_dir_all(sidecar(temp.path(), &empty).parent().unwrap()).unwrap();
     std::fs::write(sidecar(temp.path(), &empty), "").unwrap();
-    store
-        .create_meta(
-            temp.path(),
-            &empty,
-            Some("gpt-x"),
-            Some("subagent"),
-            Some("parent-x"),
-            Some(1),
-            None,
-        )
-        .await
-        .unwrap();
+    assert_write_refused(
+        store
+            .create_meta(
+                temp.path(),
+                &empty,
+                Some("gpt-x"),
+                Some("subagent"),
+                Some("parent-x"),
+                Some(1),
+                None,
+            )
+            .await,
+        &sidecar(temp.path(), &empty),
+        b"",
+        "create_meta over an empty sidecar",
+    );
+    // The optional mode over the same empty file: opens (skips) and writes
+    // nothing, but reports the damage it observed.
+    assert!(
+        store
+            .create_meta_optional(
+                temp.path(),
+                &empty,
+                Some("gpt-x"),
+                Some("subagent"),
+                Some("parent-x"),
+                Some(1),
+                None,
+            )
+            .await
+            .expect("the optional mode must skip an empty sidecar, not fail"),
+        "the optional mode observed the empty sidecar's damage"
+    );
     assert_eq!(
         std::fs::read(sidecar(temp.path(), &empty)).unwrap(),
         b"",
@@ -280,21 +306,25 @@ async fn create_meta_never_writes_a_first_line_over_an_undecodable_sidecar() {
     );
 
     // A lone torn tail is the same unknown state: nothing to backfill from,
-    // so nothing may be appended.
+    // so nothing may be appended and the strict create reports the file.
     let torn = format!("meta-torn-only-{}", crate::session::new_id());
     std::fs::write(sidecar(temp.path(), &torn), b"{\"session_id\":").unwrap();
-    store
-        .create_meta(
-            temp.path(),
-            &torn,
-            Some("gpt-x"),
-            Some("subagent"),
-            Some("parent-x"),
-            Some(1),
-            None,
-        )
-        .await
-        .unwrap();
+    assert_write_refused(
+        store
+            .create_meta(
+                temp.path(),
+                &torn,
+                Some("gpt-x"),
+                Some("subagent"),
+                Some("parent-x"),
+                Some(1),
+                None,
+            )
+            .await,
+        &sidecar(temp.path(), &torn),
+        b"{\"session_id\":",
+        "create_meta over a torn-only sidecar",
+    );
     assert_eq!(
         std::fs::read(sidecar(temp.path(), &torn)).unwrap(),
         b"{\"session_id\":",
@@ -1703,12 +1733,14 @@ async fn resume_opens_a_damaged_sidecar_without_the_optional_backfill() {
 }
 
 /// The check-then-write race a separate `meta_is_damaged` pre-check cannot
-/// survive: the check sees a healthy sidecar, a concurrent title edit then
-/// leaves a torn tail, and only afterwards does the factory's model/role
-/// backfill run. The optional entry point decides damage inside the same
-/// locked read that would append, so the interleaving still opens the
-/// session: nothing is written, provenance stays unknown (`link_ref` off),
-/// and the strict callers keep the named refusal.
+/// survive, driven INSIDE one factory build: the provenance read finds a
+/// healthy, model-less, parentless row (so it would register `link_ref` and
+/// attempt the optional model backfill), a concurrent title edit then
+/// leaves a torn tail, and only afterwards does the optional backfill take
+/// its lock. The optional entry point decides damage inside the same locked
+/// read that would append and reports it, so the tool set is finalized
+/// without `link_ref`: the session opens, nothing is written, and the
+/// strict callers keep the named refusal.
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn optional_backfill_skips_damage_that_arrives_after_a_healthy_read() {
@@ -1733,25 +1765,19 @@ async fn optional_backfill_skips_damage_that_arrives_after_a_healthy_read() {
     );
 
     // The concurrent title edit's short write: a decodable snapshot plus a
-    // torn record that never got its newline, landing AFTER the healthy read.
+    // torn record that never got its newline. It lands INSIDE the build,
+    // after the provenance read and before the optional backfill.
     let mut damaged = std::fs::read(&path).unwrap();
     damaged.extend_from_slice(b"{\"session_id\":");
-    std::fs::write(&path, &damaged).unwrap();
-
-    // The old code called `create_meta` here and failed the resume; the
-    // optional entry point skips the write instead.
-    store
-        .create_meta_optional(&root, &sid, Some("gpt-x"), Some("main"), None, None, None)
-        .await
-        .expect("an optional backfill must skip damage that landed after the check");
-    assert_eq!(
-        std::fs::read(&path).unwrap(),
-        damaged,
-        "the skipped optional write leaves the bytes untouched"
-    );
+    let hook_path = path.clone();
+    let hook_bytes = damaged.clone();
+    crate::session_factory::build_probe::arm_after_provenance(&sid, move || {
+        std::fs::write(&hook_path, &hook_bytes).unwrap();
+    });
 
     // The real resume path opens the session, display-only: history intact,
-    // unknown provenance keeps `link_ref` off, and nothing is written.
+    // the damage observed during the build keeps `link_ref` off (even though
+    // provenance alone had seen no reason to), and nothing is written.
     let reopened = SessionFactory::test_factory(root.clone())
         .build(
             &sid,
@@ -1766,13 +1792,13 @@ async fn optional_backfill_skips_damage_that_arrives_after_a_healthy_read() {
     let names = reopened.runner.tool_names_for_test();
     assert!(
         !names.iter().any(|name| name == "link_ref"),
-        "unknown provenance keeps link_ref off: {names:?}"
+        "damage observed during the build keeps link_ref off: {names:?}"
     );
     drop(reopened);
     assert_eq!(
         std::fs::read(&path).unwrap(),
         damaged,
-        "opening the session never attempts the optional backfill"
+        "the skipped optional write leaves the in-build damage untouched"
     );
 
     // Strict callers — the tool, the web endpoint, any explicit caller —

@@ -147,6 +147,37 @@ impl Drop for LocalSessionPermit {
     }
 }
 
+/// Test-only interleaving point inside ONE build: a hook armed for one
+/// session id runs after that build's persisted-provenance read and before
+/// its optional metadata backfill, so a test can place a concurrent
+/// writer's damage in exactly the window the locked operation must detect.
+/// Scoped to the session id so builds in parallel tests never fire it.
+#[cfg(test)]
+pub(crate) mod build_probe {
+    use std::sync::Mutex;
+
+    type Hook = Box<dyn FnOnce() + Send>;
+    static AFTER_PROVENANCE: Mutex<Option<(String, Hook)>> = Mutex::new(None);
+
+    pub(crate) fn arm_after_provenance(session: &str, hook: impl FnOnce() + Send + 'static) {
+        *AFTER_PROVENANCE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some((session.to_owned(), Box::new(hook)));
+    }
+
+    pub(crate) fn after_provenance_read(session: &str) {
+        let mut slot = AFTER_PROVENANCE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot.as_ref().is_some_and(|(armed, _)| armed == session) {
+            let (_, hook) = slot.take().expect("checked above");
+            drop(slot);
+            hook();
+        }
+    }
+}
+
 /// Everything resolved once at startup and shared by every built session.
 #[derive(Clone)]
 pub struct SessionFactory {
@@ -1085,6 +1116,47 @@ impl SessionFactory {
             crate::config::resolve_background_timeout(config.as_ref(), &self.root).unwrap_or(None);
         let bash_timeout =
             crate::config::resolve_bash_timeout(config.as_ref(), &self.root).unwrap_or(None);
+        // Sessions metadata: write the creation snapshot for a brand-new
+        // session (model/role from the factory configuration; parent links
+        // are None for main sessions). A resumed session (`--session`,
+        // server resume, fork-source reconnect) already has its row —
+        // creation is idempotent and appends nothing — and the runner's
+        // turn-boundary touch keeps it fresh.
+        //
+        // On an EXISTING row that call is only the OPTIONAL backfill of a
+        // model/role the row was created without (a bootstrap-backfilled
+        // session has `model: None`), and a damaged sidecar must not take
+        // that append so unknown provenance is never rewritten into a clean
+        // one. Refusing to open would make an interrupted write fatal to a
+        // resume whose transcript is intact, so the optional entry point
+        // skips the damaged write and REPORTS that it observed damage. The
+        // tool set below is finalized only after that answer: a damage that
+        // lands after the provenance read (a concurrent title edit) must
+        // still keep `link_ref` off, because its links belong to the
+        // metadata row the damage prevents us from trusting. There is
+        // deliberately no `meta_is_damaged` pre-check here — it would race a
+        // concurrent writer that damages the sidecar between the check and
+        // this call; the optional entry point makes the decision in the same
+        // locked read that appends. A fresh session has no sidecar, so it is
+        // never damaged and its creation snapshot is still written.
+        let model_name = main_model.profile_key();
+        let main_role = crate::roles::role_prompt(&self.root, crate::roles::MAIN_ROLE)?;
+        let role_name = main_role
+            .as_ref()
+            .map(|_| crate::roles::MAIN_ROLE.to_owned());
+        #[cfg(test)]
+        build_probe::after_provenance_read(&session);
+        let metadata_damaged = store
+            .create_meta_optional(
+                &self.root,
+                &session,
+                Some(&model_name),
+                role_name.as_deref(),
+                None,
+                None,
+                None, // main sessions keep manual naming; title is a subagent-spawn concern
+            )
+            .await?;
         #[rustfmt::skip]
         let tools_workspace = self.skills_workspace.clone().unwrap_or_else(|| self.workspace.clone());
         let (mut tools, background) = builtins_with_bash_timeout(
@@ -1108,8 +1180,10 @@ impl SessionFactory {
         // continues another session's transcript — its links belong to the
         // source it continues, so a fork must never rewrite them. Children
         // (delegate/btw forks) build the common builtins and never see it
-        // either.
-        if !forked {
+        // either. Metadata damage observed by the optional backfill above
+        // keeps it off too: a torn row is not a trustworthy place to record
+        // links, even when the provenance read happened before the damage.
+        if !forked && !metadata_damaged {
             tools.push(crate::tools::link_ref_tool(
                 store.clone(),
                 self.root.clone(),
@@ -1199,16 +1273,12 @@ impl SessionFactory {
         // The main agent's orchestrator template resolves through the same role
         // layers as delegated roles; the highest-priority available template
         // leads and tells the model to decompose work and delegate.
-        let role_name = match crate::roles::role_prompt(&self.root, crate::roles::MAIN_ROLE)? {
-            Some(orchestrator) => {
-                if let Some(reminder) = crate::roles::core_directive(&orchestrator) {
-                    agent.set_compaction_reminder(reminder);
-                }
-                context.push(orchestrator);
-                Some(crate::roles::MAIN_ROLE.to_owned())
+        if let Some(orchestrator) = main_role {
+            if let Some(reminder) = crate::roles::core_directive(&orchestrator) {
+                agent.set_compaction_reminder(reminder);
             }
-            None => None,
-        };
+            context.push(orchestrator);
+        }
         if let Some(instructions) = &self.agents_instructions {
             context.push(format!("## AGENTS.md\n\n{instructions}"));
         }
@@ -1278,39 +1348,6 @@ impl SessionFactory {
             agent.set_context_window(window);
         }
 
-        let model_name = main_model.profile_key();
-        // Sessions metadata: write the creation snapshot for a brand-new
-        // session (model/role from the factory configuration; parent links
-        // are None for main sessions). A resumed session (`--session`,
-        // server resume, fork-source reconnect) already has its row —
-        // creation is idempotent and appends nothing — and the runner's
-        // turn-boundary touch keeps it fresh.
-        //
-        // On an EXISTING row that call is only the OPTIONAL backfill of a
-        // model/role the row was created without (a bootstrap-backfilled
-        // session has `model: None`), and a damaged sidecar must not take
-        // that append so unknown provenance is never rewritten into a clean
-        // one. Refusing to open would make an interrupted write fatal to a
-        // resume whose transcript is intact, so the optional entry point
-        // skips the damaged write: the session opens display-only, and
-        // `forked` above (unknown provenance counts as a fork) already kept
-        // `link_ref` off. There is deliberately no `meta_is_damaged`
-        // pre-check here — it would race a concurrent writer that damages
-        // the sidecar between the check and this call; the optional entry
-        // point makes the decision in the same locked read that appends.
-        // A fresh session has no sidecar, so it is never damaged and its
-        // creation snapshot is still written.
-        store
-            .create_meta_optional(
-                &self.root,
-                &session,
-                Some(&model_name),
-                role_name.as_deref(),
-                None,
-                None,
-                None, // main sessions keep manual naming; title is a subagent-spawn concern
-            )
-            .await?;
         let (runner, handle) = SessionRunner::new_with_bootstrap(
             agent,
             store.clone(),
