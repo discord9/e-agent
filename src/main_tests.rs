@@ -44,7 +44,15 @@ fn repl_reject_answer_submits_the_padded_option_id_exactly() {
         " x ",
         "without a terminator the answer is untouched"
     );
+    // A final line at EOF has no `\n`, so its trailing `\r` is part of the id,
+    // not a terminator: `"x\r"` is a different option than `"x"`.
+    assert_eq!(
+        repl_answer(question, "x\r"),
+        "x\r",
+        "a lone trailing `\\r` is not a terminator"
+    );
     assert_eq!(repl_answer(question, "x\n"), "x");
+    assert_eq!(repl_answer(question, "x\r\n"), "x");
 }
 
 #[test]

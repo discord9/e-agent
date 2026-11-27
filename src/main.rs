@@ -617,55 +617,67 @@ async fn repl(
     // Image attached via `/image <path>`; rides along with the next prompt.
     let mut pending_image: Option<(String, ImagePart)> = None;
     loop {
-        // WaitingInput is readable by the REPL: consume one line as the
-        // answer bound to the currently exposed request, rather than spin
-        // waiting for Idle.
-        if let SessionStatus::WaitingInput(request) = status.borrow().clone() {
-            eprintln!("{}", request.questions[0].prompt);
-            for option in &request.questions[0].options {
-                match option.description.as_deref() {
-                    Some(description) => {
-                        eprintln!("  {} — {description} (id: {:?})", option.label, option.id)
+        // Dispatch the status we are IN on EVERY iteration, not only the one
+        // seen before waiting for the runner: a prompt first wakes us on
+        // `Busy`, so the blocking question arrives while we are INSIDE that
+        // wait. Checking it only once before the wait would leave that
+        // question unanswered forever.
+        let current = status.borrow().clone();
+        match current {
+            // WaitingInput is readable by the REPL: consume one line as the
+            // answer bound to the currently exposed request, rather than spin
+            // waiting for Idle.
+            SessionStatus::WaitingInput(request) => {
+                eprintln!("{}", request.questions[0].prompt);
+                for option in &request.questions[0].options {
+                    match option.description.as_deref() {
+                        Some(description) => {
+                            eprintln!("  {} — {description} (id: {:?})", option.label, option.id)
+                        }
+                        None => eprintln!("  {} (id: {:?})", option.label, option.id),
                     }
-                    None => eprintln!("  {} (id: {:?})", option.label, option.id),
                 }
-            }
-            print!("answer> ");
-            std::io::stdout().flush()?;
-            let mut answer = String::new();
-            match stdin.read_line(&mut answer) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(error) => return Err(error.into()),
-            }
-            let answer = repl_answer(&request.questions[0], &answer);
-            if is_repl_exit(&answer) {
-                break;
-            }
-            if answer.is_empty() {
-                eprintln!("e-agent: answer must not be empty");
-            } else {
-                match handle.submit_prompt_with_call_id(Some(request.call_id), answer.to_owned()) {
-                    e_agent::runner::PromptSubmission::Conflict => {
-                        eprintln!("e-agent: input request is stale")
-                    }
-                    e_agent::runner::PromptSubmission::Closed => break,
-                    e_agent::runner::PromptSubmission::Invalid(error) => {
-                        eprintln!("e-agent: {error}")
-                    }
-                    e_agent::runner::PromptSubmission::Answered => {}
-                    e_agent::runner::PromptSubmission::Queued => unreachable!(),
+                print!("answer> ");
+                std::io::stdout().flush()?;
+                let mut answer = String::new();
+                match stdin.read_line(&mut answer) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(error) => return Err(error.into()),
                 }
+                let answer = repl_answer(&request.questions[0], &answer);
+                if is_repl_exit(&answer) {
+                    break;
+                }
+                if answer.is_empty() {
+                    eprintln!("e-agent: answer must not be empty");
+                } else {
+                    match handle
+                        .submit_prompt_with_call_id(Some(request.call_id), answer.to_owned())
+                    {
+                        e_agent::runner::PromptSubmission::Conflict => {
+                            eprintln!("e-agent: input request is stale")
+                        }
+                        e_agent::runner::PromptSubmission::Closed => break,
+                        e_agent::runner::PromptSubmission::Invalid(error) => {
+                            eprintln!("e-agent: {error}")
+                        }
+                        // The runner leaves WaitingInput (Busy) when it takes
+                        // the answer: consume that transition here, so the next
+                        // iteration reads a PROMPT line instead of offering the
+                        // same stale question a second answer.
+                        e_agent::runner::PromptSubmission::Answered => status.changed().await?,
+                        e_agent::runner::PromptSubmission::Queued => unreachable!(),
+                    }
+                }
+                continue;
             }
-            continue;
-        }
-        // Wait for the runner to become idle again. Finished is a terminal
-        // state: the watch channel gets no further values, so waiting for
-        // Idle would hang forever. Report a failure and end the REPL.
-        while !matches!(*status.borrow(), SessionStatus::Idle) {
-            if let SessionStatus::Finished(result) = &*status.borrow() {
+            // Finished is a terminal state: the watch channel gets no further
+            // values, so waiting for Idle would hang forever. Report a failure
+            // and end the REPL.
+            SessionStatus::Finished(result) => {
                 if let SessionResult::Failed(text) = result {
-                    match friendly_failure(text) {
+                    match friendly_failure(&text) {
                         Some(friendly) => eprintln!("{friendly}"),
                         None => eprintln!("e-agent: session failed: {text}"),
                     }
@@ -675,7 +687,13 @@ async fn repl(
                 render.abort();
                 return Ok(());
             }
-            status.changed().await?;
+            // Anything else is a turn in flight: wait for the next status and
+            // dispatch THAT one (it may be the question).
+            SessionStatus::Idle => {}
+            SessionStatus::Busy | SessionStatus::Compacting => {
+                status.changed().await?;
+                continue;
+            }
         }
         print!("e-agent> ");
         std::io::stdout().flush()?;
@@ -791,13 +809,16 @@ fn is_repl_exit(line: &str) -> bool {
 /// Normalize one REPL answer line for the question it answers.
 ///
 /// A question with fixed options is answered by an option id, and an id is an
-/// identity: strip only the line terminator (`\n` / `\r\n`) and keep every other
-/// byte, including surrounding spaces (`" x "` and `"x"` may be two different
-/// options). A free-text question has no identity to protect, so its answer
-/// keeps the existing trim.
+/// identity: strip only a COMPLETE line terminator (`\r\n` or `\n`) and keep
+/// every other byte, including surrounding spaces (`" x "` and `"x"` may be
+/// two different options). A final unterminated line (a piped `--repl` at EOF)
+/// has no terminator, so its trailing `\r` belongs to the id. A free-text
+/// question has no identity to protect, so its answer keeps the existing trim.
 fn repl_answer(question: &e_agent::runner::UserQuestion, raw: &str) -> String {
-    let line = raw.strip_suffix('\n').unwrap_or(raw);
-    let line = line.strip_suffix('\r').unwrap_or(line);
+    let line = raw
+        .strip_suffix("\r\n")
+        .or_else(|| raw.strip_suffix('\n'))
+        .unwrap_or(raw);
     if question.options.is_empty() {
         line.trim().to_owned()
     } else {
