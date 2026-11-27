@@ -361,6 +361,52 @@ async fn connect_migrates_legacy_sessions_table_missing_feature_columns() {
     drop((dir, session2));
 }
 
+/// The `sessions.acp_session_id` migration is the ONE feature column whose
+/// loss the caller must see. When it failed, every write omits the column:
+/// ordinary metadata writes must keep working (degrade that feature only),
+/// while the ACP-specific setter must NOT report success — the ACP layer reads
+/// `Ok` as "the id is durable" and would otherwise resume a conversation that
+/// was never recorded.
+#[tokio::test]
+async fn acp_session_id_write_fails_loudly_when_its_column_is_unavailable() {
+    let (_dir, mut session, sid) = fresh_session().await;
+    session
+        .create_meta(&sid, Some("m"), Some("main"), None, None, None)
+        .await
+        .unwrap();
+    // The degraded state the failed migration leaves behind.
+    session.acp_available = false;
+
+    let error = session
+        .set_acp_session_id(&sid, Some("acp-1"))
+        .await
+        .expect_err("a write that cannot persist the id must not report success");
+    assert!(
+        error.contains("acp_session_id") && error.contains("NOT written"),
+        "the error names the missing column and the lost write: {error}"
+    );
+
+    // The same degraded state still writes ordinary metadata.
+    session
+        .set_title(&sid, Some("still writable"))
+        .await
+        .unwrap();
+    session.set_archived(&sid, true).await.unwrap();
+    let meta = session
+        .load_meta_row(&sid)
+        .await
+        .unwrap()
+        .expect("the metadata row still exists");
+    assert_eq!(meta.title.as_deref(), Some("still writable"));
+    assert_eq!(meta.archived, Some(true));
+    // ... and the read path still projects NULL instead of failing.
+    assert_eq!(session.acp_session_id(&sid).await.unwrap(), None);
+    assert!(
+        meta.acp_session_id.is_none(),
+        "the refused write left no ACP id behind"
+    );
+}
+
 // ----------------------------------------------------------------------
 // append / load round-trips
 // ----------------------------------------------------------------------

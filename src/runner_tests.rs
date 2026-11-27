@@ -788,6 +788,197 @@ async fn a_tool_question_without_a_frontend_is_refused_instead_of_parking() {
     );
 }
 
+/// A tool that asks THREE questions: two at once (the shape that used to be
+/// told `Ok` twice because `ask_user` only enqueued) and one after the first
+/// was answered (the slot must be free again by then).
+struct DoubleAskTool {
+    handle: Option<SessionHandle>,
+    /// Whether the second, concurrent ask was refused `Busy` (the honest
+    /// answer) and the later one was admitted.
+    second_busy: Arc<Mutex<Option<bool>>>,
+    third_ok: Arc<Mutex<Option<bool>>>,
+}
+
+#[async_trait]
+impl Tool for DoubleAskTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "double_ask".into(),
+            description: "test only".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+    async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
+        let handle = self.handle.as_ref().expect("the runner binds a handle");
+        let request = |call_id: &str| UserInputRequest {
+            call_id: call_id.into(),
+            questions: vec![UserQuestion {
+                id: "permission".into(),
+                prompt: "Allow the tool to run?".into(),
+                options: vec![UserOption {
+                    id: "allow".into(),
+                    label: "Allow".into(),
+                    description: None,
+                }],
+            }],
+        };
+        let first = handle.ask_user(request("tool-ask-1"));
+        let second = handle.ask_user(request("tool-ask-2"));
+        *self.second_busy.lock().unwrap() = Some(matches!(second, Err(AskRefusal::Busy)));
+        let first_answer = match first {
+            Ok(answer) => answer.await.ok().flatten(),
+            Err(_) => None,
+        };
+        // The slot is free again once the first question was answered, so this
+        // ask must be admitted (and its answer delivered).
+        let third = handle.ask_user(request("tool-ask-3"));
+        *self.third_ok.lock().unwrap() = Some(third.is_ok());
+        let third_answer = match third {
+            Ok(answer) => answer.await.ok().flatten(),
+            Err(_) => None,
+        };
+        Ok(ToolOutput::text(format!(
+            "first {first_answer:?} third {third_answer:?}"
+        )))
+    }
+    fn set_session_handle(&mut self, _session_id: &str, handle: SessionHandle) {
+        self.handle = Some(handle);
+    }
+}
+
+/// The session's mid-call ask slot is reserved at `ask_user` time, not when the
+/// runner publishes the question: of two concurrent generic callers exactly one
+/// is admitted, the other is refused `Busy` deterministically — and the slot is
+/// free again once the admitted ask was answered.
+#[tokio::test]
+async fn a_second_mid_call_ask_is_refused_while_the_first_is_still_queued() {
+    let temp = tempfile::tempdir().unwrap();
+    let second_busy = Arc::new(Mutex::new(None));
+    let third_ok = Arc::new(Mutex::new(None));
+    let agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: VecDeque::from(vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call-double".into(),
+                        name: "double_ask".into(),
+                        arguments: "{}".into(),
+                    }],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("done".into()),
+                    tool_calls: Vec::new(),
+                    reasoning: None,
+                },
+            ]),
+        }),
+        vec![Box::new(DoubleAskTool {
+            handle: None,
+            second_busy: second_busy.clone(),
+            third_ok: third_ok.clone(),
+        })],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "double-ask".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let runner = runner.with_user_input_allowed();
+    let (_, mut events, mut status) = handle.attach();
+    let task = runner.start(Some("start".into()));
+
+    let request = wait_for_question(&mut status).await;
+    assert_eq!(
+        request.call_id, "tool-ask-1",
+        "the admitted ask is the one published"
+    );
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some(request.call_id.clone()), "allow".into()),
+        PromptSubmission::Answered
+    );
+
+    // The later ask is surfaced only after the first was answered. Wait for
+    // THAT question (the status may still hold the previous one for a moment).
+    let later = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let SessionStatus::WaitingInput(request) = &*status.borrow()
+                && request.call_id == "tool-ask-3"
+            {
+                return request.clone();
+            }
+            status.changed().await.expect("the runner keeps its status");
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the second ask was not surfaced; status={:?}",
+            *status.borrow()
+        )
+    });
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some(later.call_id.clone()), "allow".into()),
+        PromptSubmission::Answered
+    );
+    wait_for_tool_result(&mut events, "call-double").await;
+
+    assert_eq!(
+        *second_busy.lock().unwrap(),
+        Some(true),
+        "two concurrent callers must never both be told the slot is theirs"
+    );
+    assert_eq!(
+        *third_ok.lock().unwrap(),
+        Some(true),
+        "the slot must be released once the admitted question was answered"
+    );
+    drop(task);
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "double-ask")
+        .await
+        .unwrap()
+        .entries;
+    assert!(
+        entries.iter().any(|entry| matches!(
+            entry,
+            SessionEntry::Message {
+                message: Message::Tool { call_id, content, .. }
+            } if call_id == "call-double"
+                && content == "first Some(\"allow\") third Some(\"allow\")"
+        )),
+        "both admitted asks received their answer"
+    );
+}
+
+/// `NoFrontend` is the ONE refusal that licenses a caller's own policy, so a
+/// dead handle must be `Closed` instead: nothing may apply a fallback on
+/// behalf of a session that is gone.
+#[test]
+fn a_closed_handle_refuses_as_closed_before_it_calls_itself_frontendless() {
+    let (handle, _emitter, commands) = session_test_channel();
+    drop(commands);
+    let refusal = match handle.ask_user(UserInputRequest {
+        call_id: "ask-closed".into(),
+        questions: vec![UserQuestion {
+            id: "permission".into(),
+            prompt: "Allow the tool to run?".into(),
+            options: vec![UserOption {
+                id: "allow".into(),
+                label: "Allow".into(),
+                description: None,
+            }],
+        }],
+    }) {
+        Ok(_) => panic!("a dead handle must refuse the ask"),
+        Err(refusal) => refusal,
+    };
+    assert_eq!(refusal, AskRefusal::Closed);
+}
+
 /// End-to-end blocking path with fixed options: an invalid id is rejected
 /// while the turn stays parked, and the accepted option reaches the model as
 /// `Selected option: {id} ({label})` inside the tool result.
@@ -879,9 +1070,9 @@ async fn blocking_option_question_answer_reaches_the_model_with_id_and_label() {
     drop(task);
 }
 
-/// A question may carry fixed options. Only an option id is accepted, the
-/// rejection names the allowed ids, and the model-facing answer carries both
-/// the id and its label so no mapping has to be remembered.
+/// A question may carry fixed options. Only an exact option id is accepted,
+/// the rejection names the allowed ids, and the model-facing answer carries
+/// both the id and its label so no mapping has to be remembered.
 #[test]
 fn option_answer_accepts_only_listed_ids_and_keeps_id_and_label() {
     let (handle, emitter, mut commands) = crate::runner::session_test_channel();
@@ -889,7 +1080,11 @@ fn option_answer_accepts_only_listed_ids_and_keeps_id_and_label() {
         call_id: "call-perm".into(),
         questions: vec![option_question()],
     }));
-    for submitted in ["allow", "允许一次"] {
+    // A label, a translated name and a padded id are all NOT ids: an option id
+    // is an identity the asking tool sends back verbatim, so `" allow-once "`
+    // is a different id from `"allow-once"` (`" x "` vs `"x"` may both be
+    // offered). Never trim, case-fold, or otherwise guess.
+    for submitted in ["allow", "允许一次", " allow-once ", "ALLOW-ONCE"] {
         match handle.submit_prompt_with_call_id(Some("call-perm".into()), submitted.into()) {
             PromptSubmission::Invalid(error) => assert!(
                 error.contains("allow-once") && error.contains("deny"),
@@ -900,10 +1095,10 @@ fn option_answer_accepts_only_listed_ids_and_keeps_id_and_label() {
     }
     // A rejected answer never claims the question.
     assert!(commands.try_recv().is_err());
-    // Trimming is only layout: the id itself is accepted and resolves to
+    // The exact id is accepted and resolves to
     // `Selected option: {id} ({label})`.
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("call-perm".into()), " allow-once ".into()),
+        handle.submit_prompt_with_call_id(Some("call-perm".into()), "allow-once".into()),
         PromptSubmission::Answered
     );
     match commands.try_recv().unwrap() {
@@ -976,8 +1171,8 @@ fn async_option_answer_uses_the_same_resolution() {
     }
 }
 
-/// A free-text question keeps today's contract: any non-empty answer is
-/// accepted verbatim (no trimming, no rewriting).
+/// A free-text question has no id to protect, so its answer is accepted as its
+/// trimmed text (layout dropped, nothing rewritten).
 #[test]
 fn free_text_answer_still_accepts_any_non_empty_text() {
     let (handle, emitter, mut commands) = crate::runner::session_test_channel();
@@ -1006,10 +1201,7 @@ fn free_text_answer_still_accepts_any_non_empty_text() {
         } => {
             assert_eq!(call_id, "call-text");
             assert_eq!(option, None, "a free-text question names no option");
-            assert_eq!(
-                answers,
-                vec![("answer".to_owned(), " Ada 你好 ".to_owned())]
-            );
+            assert_eq!(answers, vec![("answer".to_owned(), "Ada 你好".to_owned())]);
         }
         _ => panic!("expected the structured answer command"),
     }

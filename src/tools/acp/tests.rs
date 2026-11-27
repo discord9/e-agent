@@ -392,6 +392,33 @@ while IFS= read -r line; do
 done
 "#;
 
+/// Answers `initialize` / `session/new`, replays one restored-history chunk on
+/// `session/load` but NEVER answers it (the load is abandoned by its deadline),
+/// then streams the real answer on the prompt: the shape where a stale replay
+/// region would swallow the fallback session's chunks.
+const LOAD_TIMEOUT_STUB: &str = r#"
+log="$1"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  printf '%s\n' "$line" >> "$log"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true},"agentInfo":{"name":"stub-acp","version":"9.9.9"},"authMethods":[]}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess-fresh-1"}}\n' "$id"
+      ;;
+    *'"method":"session/load"'*)
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-old","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"REPLAY-older-turn-"}}}}\n'
+      ;;
+    *'"method":"session/prompt"'*)
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-fresh-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"fresh answer"}}}}\n'
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      ;;
+  esac
+done
+"#;
+
 fn stub_config(script: &str, log: &Path, load: &str) -> AcpConfig {
     tagged_config(script, log, load, "new")
 }
@@ -1285,8 +1312,8 @@ async fn answer_next_ask(
         .expect("the tool must ask the user")
         .expect("the session command channel stays open");
     match ask {
-        crate::runner::SessionCommand::AskUser { request, reply } => {
-            reply.send(answer).expect("the tool is still waiting");
+        crate::runner::SessionCommand::AskUser { request, mut reply } => {
+            reply.send(answer);
             request
         }
         _ => panic!("expected a tool question"),
@@ -1860,6 +1887,56 @@ async fn a_chosen_option_id_is_carried_verbatim_through_the_runner_conversion() 
     );
 }
 
+/// The merge blocker: `" x "` is the REJECT id and `"x"` is Allow once. A
+/// human choosing Reject submits `" x "`, and the runner must send back the id
+/// it was given — trimming it would match Allow and answer a refusal with an
+/// approval. This goes through the runner (submit → `resolve_answer` → the
+/// tool's ask) and asserts the actual wire frame.
+#[tokio::test]
+async fn rejecting_the_padded_option_sends_the_padded_id_to_the_wire() {
+    let temp = tempfile::tempdir().unwrap();
+    let log = temp.path().join("frames.log");
+    let root = Workspace::new(temp.path()).unwrap().root().to_path_buf();
+    let session = "session-reject-padded";
+    let tool = tool_with(&root, stub_config(COLLIDING_STUB, &log, "ok"), session).await;
+    let (runner, handle, mut status) = runner_with_acp(&root, session, tool, true);
+    let task = runner.start(Some("go".into()));
+
+    let ask = next_question(&mut status, "").await;
+    assert_eq!(
+        ask.questions[0]
+            .options
+            .iter()
+            .map(|option| (option.id.as_str(), option.label.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(" x ", "Reject"), ("x", "Allow once")],
+        "the padded id is the reject option, exactly as ACP offered it"
+    );
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some(ask.call_id.clone()), " x ".into()),
+        PromptSubmission::Answered,
+        "the reject id is a valid answer to this question"
+    );
+    assert!(matches!(
+        finished(&mut status).await,
+        SessionResult::Completed(Some(_))
+    ));
+    drop(task);
+
+    let frames = logged_frames(&log);
+    assert!(
+        frames.iter().any(|frame| frame
+            == r#"{"jsonrpc":"2.0","id":9001,"result":{"outcome":{"outcome":"selected","optionId":" x "}}}"#),
+        "Reject must reach ACP as the padded id it offered: {frames:#?}"
+    );
+    assert!(
+        !frames
+            .iter()
+            .any(|frame| frame.contains(r#""optionId":"x""#)),
+        "a padded reject must never be answered as Allow once: {frames:#?}"
+    );
+}
+
 /// Item 1: the runner is the one that must dismiss an ask whose requester
 /// disappeared. The agent dies with the request pending (no answer is ever
 /// given), so only the runner can end the wait: it must clear the question and
@@ -1993,6 +2070,56 @@ async fn an_update_after_the_load_response_belongs_to_the_answer() {
         output.content.contains("EARLY LATE"),
         "an update after the load response is this call's answer: {}",
         output.content
+    );
+}
+
+/// Item 2: a load that is ABANDONED (here: its deadline) must end the replay
+/// region too. The response never arrives, so nothing else closes it — and the
+/// `session/new` fallback's chunks would then be dropped for the rest of the
+/// call. The load deadline is passed in (production uses `CALL_TIMEOUT`), so
+/// the sequence runs in milliseconds instead of 30 seconds.
+#[tokio::test]
+async fn an_abandoned_load_ends_its_replay_region_before_the_fallback_runs() {
+    let temp = tempfile::tempdir().unwrap();
+    let log = temp.path().join("frames.log");
+    let root = Workspace::new(temp.path()).unwrap().root().to_path_buf();
+    let config = stub_config(LOAD_TIMEOUT_STUB, &log, "ok");
+    let cwd = root.display().to_string();
+    let mut client =
+        Client::spawn(&config, &root, &open_new(), None).expect("the stub agent must start");
+    client
+        .handshake(&config, &root, &Open::New)
+        .await
+        .expect("the fresh handshake succeeds");
+
+    // The load is abandoned by its deadline; nothing answers it.
+    let load = client
+        .load_session("sess-old", &cwd, Duration::from_millis(300))
+        .await;
+    assert!(
+        load.is_err_and(|error| error.contains("session/load` timed out")),
+        "the stub never answers the load, so its deadline fires"
+    );
+
+    // ... and `handshake`'s fallback for an abandoned load: a fresh session.
+    let session_id = client
+        .new_session(&cwd)
+        .await
+        .expect("the fallback session starts");
+    assert_eq!(session_id, "sess-fresh-1");
+    client
+        .request(
+            "session/prompt",
+            json!({"sessionId": session_id, "prompt": [{"type": "text", "text": "go"}]}),
+            CALL_TIMEOUT,
+        )
+        .await
+        .expect("the fallback session answers the prompt");
+
+    let assistant = client.shared.state.lock().unwrap().assistant.clone();
+    assert!(
+        assistant.contains("fresh answer"),
+        "the fallback session's chunks are this call's answer, never replay: {assistant:?}"
     );
 }
 

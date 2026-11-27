@@ -592,18 +592,20 @@ impl Client {
         let cwd_text = cwd.display().to_string();
         self.session_id = match open {
             Open::New => self.new_session(&cwd_text).await?,
-            Open::Load(id) if self.load_supported => match self.load_session(id, &cwd_text).await {
-                Ok(()) => id.clone(),
-                Err(reason) => {
-                    // Visible fallback: the call continues on a NEW session,
-                    // and the result says which id was abandoned.
-                    self.notices.push(Notice::LoadFailed {
-                        id: id.clone(),
-                        reason: one_line(&reason),
-                    });
-                    self.new_session(&cwd_text).await?
+            Open::Load(id) if self.load_supported => {
+                match self.load_session(id, &cwd_text, CALL_TIMEOUT).await {
+                    Ok(()) => id.clone(),
+                    Err(reason) => {
+                        // Visible fallback: the call continues on a NEW
+                        // session, and the result says which id was abandoned.
+                        self.notices.push(Notice::LoadFailed {
+                            id: id.clone(),
+                            reason: one_line(&reason),
+                        });
+                        self.new_session(&cwd_text).await?
+                    }
                 }
-            },
+            }
             // The agent never advertised `session/load`: start a new session
             // and say which id stays unused. The caller persists the fresh id
             // exactly like any other new one.
@@ -645,23 +647,37 @@ impl Client {
             .ok_or_else(|| "acp: `session/new` returned no `sessionId`".to_owned())
     }
 
-    async fn load_session(&self, id: &str, cwd: &str) -> Result<(), String> {
-        // The replay phase opens BEFORE the request goes out and is closed by
-        // the load RESPONSE itself (see `Shared::dispatch`): every
-        // `session/update` chunk the agent sends to restore history arrives in
-        // this window, is read in stream order ahead of that response, and is
-        // dropped instead of being accumulated as this call's answer — while
-        // anything after the response counts, even if it lands before the
-        // prompt goes out.
+    /// Ask the agent to restore session `id` — a phase, not just a request.
+    ///
+    /// The replay phase opens BEFORE the request goes out and is closed by the
+    /// load RESPONSE itself (see `Shared::dispatch`): every `session/update`
+    /// chunk the agent sends to restore history arrives in this window, is
+    /// read in stream order ahead of that response, and is dropped instead of
+    /// being accumulated as this call's answer — while anything after the
+    /// response counts, even if it lands before the prompt goes out.
+    ///
+    /// `timeout` is the load's own deadline (`CALL_TIMEOUT` in production). It
+    /// is a parameter so the abandonment path is testable without a 30-second
+    /// wait.
+    async fn load_session(&self, id: &str, cwd: &str, timeout: Duration) -> Result<(), String> {
         self.shared.replaying.store(true, Ordering::Relaxed);
-        self.shared
+        let result = self
+            .shared
             .request(
                 "session/load",
                 json!({"sessionId": id, "cwd": cwd, "mcpServers": []}),
-                CALL_TIMEOUT,
+                timeout,
             )
-            .await
-            .map(|_| ())
+            .await;
+        // EVERY way out of the load ends the replay region, not only the
+        // response: a timeout drops the pending entry (so a late response can
+        // no longer close the window), a send error and a transport error never
+        // produce a response at all — and the caller's `session/new` fallback
+        // would then have its answer chunks silently discarded for the rest of
+        // the call. Closing it here is what leaves no state behind that can
+        // swallow them.
+        self.shared.replaying.store(false, Ordering::Relaxed);
+        result.map(|_| ())
     }
 
     async fn request(

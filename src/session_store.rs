@@ -3646,6 +3646,9 @@ impl SessionStore {
     /// Record (or clear) the ACP session id on the session's metadata row:
     /// appends one full snapshot row, exactly like [`Self::set_title`]. Never
     /// self-creates (R3): a session with no metadata row is a no-op `Ok`.
+    /// A backend that cannot persist the value — SQLite without its
+    /// `sessions.acp_session_id` column — fails instead of reporting a write
+    /// that did not happen.
     #[allow(unused_variables)]
     pub async fn set_acp_session_id(
         &self,

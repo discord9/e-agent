@@ -101,6 +101,50 @@ pub enum AskRefusal {
     Closed,
 }
 
+/// The runner-side half of one admitted mid-call ask, carrying the session's
+/// ask-slot reservation for its whole life.
+///
+/// `SessionHandle::ask_user` only ENQUEUES the question — the runner publishes
+/// it later — so the reservation is what makes a second caller refused
+/// deterministically instead of being queued behind the first. It lives
+/// exactly as long as this sender: queued (nothing answered it yet), parked on
+/// a human, or dropped (the runner dismissed it, the caller stopped waiting,
+/// or the command never reached the runner). Dropping it therefore frees the
+/// slot on every path, with no per-call-site release to forget.
+pub struct AskSender {
+    sender: Option<oneshot::Sender<Option<String>>>,
+    shared: Arc<Mutex<Shared>>,
+    /// The `call_id` this reservation belongs to: a later ask may already own
+    /// the slot, and then this drop must not clear it.
+    call_id: String,
+}
+
+impl AskSender {
+    /// Deliver the answer (`None` = cancelled / aborted).
+    pub fn send(&mut self, answer: Option<String>) {
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(answer);
+        }
+    }
+
+    /// Resolves when the caller stopped waiting (its receiver was dropped):
+    /// the question can then be dismissed instead of parking the turn on it.
+    pub async fn closed(&mut self) {
+        if let Some(sender) = self.sender.as_mut() {
+            sender.closed().await;
+        }
+    }
+}
+
+impl Drop for AskSender {
+    fn drop(&mut self) {
+        let mut shared = self.shared.lock().unwrap();
+        if shared.ask_reserved.as_deref() == Some(self.call_id.as_str()) {
+            shared.ask_reserved = None;
+        }
+    }
+}
+
 /// One accepted answer: what the model reads, plus — for a question with
 /// fixed options — the id of the option it names.
 struct ResolvedAnswer {
@@ -118,30 +162,37 @@ struct ResolvedAnswer {
 /// Resolve one submitted answer against its question — the single acceptance
 /// rule shared by the blocking and asynchronous paths.
 ///
-/// * A free-text question (no options) keeps today's contract: any non-empty
-///   answer is accepted verbatim.
+/// * A free-text question (no options) accepts any non-empty answer and keeps
+///   its trimmed text: there is no identity to protect, only layout to drop.
 /// * A question with options accepts exactly one of those option ids and
 ///   yields the model-facing `Selected option: {id} ({label})`, so the model
-///   never has to remember the id → label mapping.
+///   never has to remember the id → label mapping. The id is compared byte for
+///   byte — no trimming, case folding, or other normalisation: an id is an
+///   identity the asking tool sends back verbatim, so `" x "` and `"x"` are two
+///   different options and a trimmed match would answer the wrong one.
 fn resolve_answer(question: &UserQuestion, submitted: &str) -> Result<ResolvedAnswer, String> {
-    let answer = submitted.trim();
-    if answer.is_empty() {
-        return Err("answer must not be empty".into());
-    }
     if question.options.is_empty() {
+        let answer = submitted.trim();
+        if answer.is_empty() {
+            return Err("answer must not be empty".into());
+        }
         return Ok(ResolvedAnswer {
-            value: submitted.to_owned(),
+            value: answer.to_owned(),
             option: None,
         });
     }
-    let Some(option) = question.options.iter().find(|option| option.id == answer) else {
+    let Some(option) = question
+        .options
+        .iter()
+        .find(|option| option.id == submitted)
+    else {
         let allowed: Vec<&str> = question
             .options
             .iter()
             .map(|option| option.id.as_str())
             .collect();
         return Err(format!(
-            "answer {answer:?} is not an option of this question; allowed ids: {}",
+            "answer {submitted:?} is not an option of this question; allowed ids: {}",
             allowed.join(", ")
         ));
     };
@@ -337,7 +388,7 @@ where
                     .await;
                     match asked {
                         AskOutcome::Answered(answer) => {
-                            let _ = reply.send(answer);
+                            reply.send(answer);
                         }
                         AskOutcome::Finished(value) => {
                             // The tool finished while its question was open
@@ -401,7 +452,7 @@ async fn ask_user_while_waiting<F, T>(
     commands: &mut mpsc::UnboundedReceiver<SessionCommand>,
     shared: &Arc<Mutex<Shared>>,
     request: UserInputRequest,
-    reply: &mut oneshot::Sender<Option<String>>,
+    reply: &mut AskSender,
     operation: &mut std::pin::Pin<Box<F>>,
     pending: &mut Vec<SessionCommand>,
 ) -> AskOutcome<T>
@@ -412,6 +463,10 @@ where
     let question = request.questions.first().cloned();
     {
         let mut state = shared.lock().unwrap();
+        // The ask is published now, so the published question IS the slot:
+        // the reservation's job (refusing a second caller before the runner
+        // gets here) is done, and `waiting_input` refuses from now on.
+        state.ask_reserved = None;
         state.input_claimed = false;
         state.waiting_input = Some(request.clone());
         state
@@ -515,7 +570,7 @@ pub enum SessionCommand {
     /// tool never fakes a suspension of its own.
     AskUser {
         request: UserInputRequest,
-        reply: oneshot::Sender<Option<String>>,
+        reply: AskSender,
     },
 }
 
@@ -611,6 +666,13 @@ struct Shared {
     /// into two winners.
     waiting_input: Option<UserInputRequest>,
     input_claimed: bool,
+    /// The mid-call ask this session has already admitted but not published
+    /// yet: `ask_user` only ENQUEUES the question, so without this reservation
+    /// two callers would both be told `Ok` and the runner would surface them
+    /// one after the other. Holds the request's `call_id`; the runner consumes
+    /// it when it publishes the question (the slot is then `waiting_input`),
+    /// and every path that drops an enqueued ask releases it again.
+    ask_reserved: Option<String>,
     /// Process-local asynchronous questions (`request_user_input` with
     /// `async: true`), keyed by the tool call id. Nothing here is durable: a
     /// restart drops unanswered questions.
@@ -994,27 +1056,47 @@ impl SessionHandle {
     /// policy of the tool's own. A refusal because another question is open
     /// must NEVER be answered by such a policy — that is how an unasked
     /// approval would be granted — so it is a distinct variant, not a string.
+    ///
+    /// The slot is reserved HERE, not when the runner publishes the question:
+    /// this call only enqueues it, so two callers would otherwise both be told
+    /// `Ok` and be surfaced one after the other. The second caller is refused
+    /// `Busy` deterministically until the first question has been published
+    /// and answered (or dismissed).
     pub fn ask_user(
         &self,
         request: UserInputRequest,
     ) -> Result<oneshot::Receiver<Option<String>>, AskRefusal> {
         let mut shared = self.shared.lock().unwrap();
-        if !shared.user_input_allowed {
-            return Err(AskRefusal::NoFrontend);
-        }
-        if shared.waiting_input.is_some() {
-            return Err(AskRefusal::Busy);
-        }
+        // Liveness first: `NoFrontend` licenses a policy fallback of the
+        // caller's own, so it must never be the answer for a handle whose
+        // session is already gone — nothing would apply that policy.
         if !shared.commands_open || self.commands.is_closed() {
             return Err(AskRefusal::Closed);
         }
+        if !shared.user_input_allowed {
+            return Err(AskRefusal::NoFrontend);
+        }
+        if shared.waiting_input.is_some() || shared.ask_reserved.is_some() {
+            return Err(AskRefusal::Busy);
+        }
+        let call_id = request.call_id.clone();
         let (reply, answer) = oneshot::channel();
-        if self
+        shared.ask_reserved = Some(call_id.clone());
+        let reply = AskSender {
+            sender: Some(reply),
+            shared: Arc::clone(&self.shared),
+            call_id,
+        };
+        // Never hold this mutex across a value whose `Drop` re-locks it.
+        drop(shared);
+        let closed = self
             .commands
             .send(SessionCommand::AskUser { request, reply })
-            .is_err()
-        {
-            shared.commands_open = false;
+            .is_err();
+        if closed {
+            // A failed send drops the command, and with it the reservation, so
+            // the second caller of `ask_user` is not blocked by a dead hold.
+            self.shared.lock().unwrap().commands_open = false;
             return Err(AskRefusal::Closed);
         }
         Ok(answer)
@@ -1266,6 +1348,7 @@ pub(crate) fn session_test_channel() -> (
         user_input_allowed: false,
         waiting_input: None,
         input_claimed: false,
+        ask_reserved: None,
         pending_questions: std::collections::HashMap::new(),
         goal: None,
         live_model: None,
@@ -1681,6 +1764,7 @@ impl SessionRunner {
             user_input_allowed: false,
             waiting_input: None,
             input_claimed: false,
+            ask_reserved: None,
             pending_questions: std::collections::HashMap::new(),
             goal,
             live_model: None,
@@ -2739,8 +2823,10 @@ impl SessionRunner {
             SessionCommand::AskUser { .. } => {
                 // A tool question only ever arrives while the runner waits on
                 // that tool (`wait_for_operation` answers it inline). One that
-                // reaches the queue has no parked tool left: dropping its reply
-                // resolves the ask as cancelled instead of waiting forever.
+                // reaches the queue has no parked tool left: dropping the
+                // command resolves the ask as cancelled instead of waiting
+                // forever — and its sender releases the ask-slot reservation on
+                // the way out, so the next ask is admitted.
                 Steering::None
             }
         }

@@ -202,8 +202,9 @@ pub struct SqliteSession {
     cached_meta: std::sync::Mutex<Option<SessionMeta>>,
     /// `sessions.acp_session_id` exists (its migration at connect succeeded).
     /// When it does not, metadata reads project `NULL` in its place and writes
-    /// omit the column: ACP session reuse degrades to "start a new ACP session
-    /// on every call" while ordinary session creation keeps working.
+    /// omit the column: ordinary session creation keeps working, while
+    /// [`Self::set_acp_session_id`] fails instead of reporting a write it
+    /// cannot make (the ACP layer treats `Ok` as "the id is durable").
     acp_available: bool,
 }
 
@@ -2793,11 +2794,24 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
     /// with the new value and a fresh `last_active_at`, exactly like
     /// [`Self::set_title`]. Never self-creates (R3): a session with no
     /// metadata row is a no-op `Ok`.
+    ///
+    /// A database whose `sessions.acp_session_id` migration failed has no
+    /// column to write. The ordinary metadata writes keep working in that
+    /// state (they simply omit the column), but THIS write must not report a
+    /// success it cannot deliver: the ACP layer treats `Ok` as "the id is
+    /// durable" and would resume a conversation that was never recorded, so it
+    /// fails loudly instead.
     pub async fn set_acp_session_id(
         &self,
         session_id: &str,
         acp_session_id: Option<&str>,
     ) -> Result<(), String> {
+        if !self.acp_available {
+            return Err(format!(
+                "cannot persist the ACP session id: this database has no `sessions.acp_session_id` \
+                 column (its migration failed), so the id for `{session_id}` was NOT written"
+            ));
+        }
         let meta = if session_id == self.session_id {
             self.effective_meta().await?
         } else {
