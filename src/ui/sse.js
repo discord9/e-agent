@@ -786,10 +786,15 @@ if (els.tasksToggleBar) {
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && state.sidebar.open) closeSidebar();
   if (e.key === "Escape" && tokenBoxOpen) setTokenBoxOpen(false);   // Esc 收起 token 输入框
+  if (e.key === "Escape" && diffPanelOpen()) closeDiffPanel();      // Esc 关闭工作区 diff 面板
 });
 els.sendBtn.addEventListener("click", sendPrompt);
 els.cancelBtn.addEventListener("click", cancelTurn);
 els.compactBtn.addEventListener("click", compactSession);
+/* 工作区 diff 浏览器：元素只在完整 UI 中存在；DOM 桩/旧页面缺失时静默跳过 */
+if (els.diffBtn) els.diffBtn.addEventListener("click", openDiffPanel);
+if (els.diffCloseBtn) els.diffCloseBtn.addEventListener("click", closeDiffPanel);
+if (els.diffRefreshBtn) els.diffRefreshBtn.addEventListener("click", loadDiffPanel);
 els.promptInput.addEventListener("keydown", (e) => {
   // 空 composer 的 ↑ 恢复当前会话最近一条用户消息。与 sendPrompt 一样用
   // trim 判空；IME、任意修饰键和菜单导航均保持浏览器/既有行为。仅在确实

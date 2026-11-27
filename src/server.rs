@@ -12,6 +12,7 @@
 //! | GET    | `/api/sessions/{id}/history`      | segmented history (head or older)  |
 //! | GET    | `/api/sessions/{id}/summary`     | per-turn summary cache (desktop pet) |
 //! | GET    | `/api/sessions/{id}/usage`        | persisted token usage (session + subagents) |
+//! | GET    | `/api/sessions/{id}/diff`         | local workspace diff (bounded, base-resolved) |
 //! | POST   | `/api/sessions/{id}/prompt`       | queue a prompt                     |
 //! | POST   | `/api/sessions/{id}/btw`          | fork into a persistent subagent    |
 //! | GET    | `/api/sessions/{id}/fork-candidates` | turn boundaries to fork at (at/seq/preview) |
@@ -267,6 +268,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/history", get(session_history))
         .route("/api/sessions/{id}/summary", get(session_summary))
         .route("/api/sessions/{id}/usage", get(session_usage))
+        .route("/api/sessions/{id}/diff", get(session_diff))
         .route("/api/sessions/{id}/prompt", post(session_prompt))
         .route("/api/sessions/{id}/btw", post(session_btw))
         .route("/api/sessions/{id}/fork-candidates", get(fork_candidates))
@@ -3655,6 +3657,36 @@ async fn session_usage(
         "output_tokens": output,
         "rows": rows_json,
     }))
+}
+
+/// `GET /api/sessions/{id}/diff` — the local workspace's git diff for the
+/// session header's diff browser. Addressed under a session so an unknown id
+/// is a 404 like every other per-session read; the diff itself is
+/// workspace-scoped. A live subagent may have been given its own workspace
+/// (its `SessionEntry.cwd`), and that is the one it actually changed; every
+/// other session resolves to the factory workspace.
+///
+/// The base is `merge-base HEAD origin/main`, falling back to `main`, then
+/// `master`; when none resolves the payload contains only uncommitted
+/// changes and says so. A non-repo workspace is a normal 200 payload with
+/// `repository: false` and a message, never a 500.
+async fn session_diff(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<crate::diff::DiffReport>, (StatusCode, String)> {
+    let _ = resolve_session_store(&state, &id, true).await?;
+    let root = match live(&state, &id) {
+        Ok(SessionRef::Subagent { entry, .. }) => {
+            let cwd = PathBuf::from(&entry.cwd);
+            if cwd.is_absolute() && cwd.exists() {
+                cwd
+            } else {
+                state.factory.workspace().root().to_path_buf()
+            }
+        }
+        _ => state.factory.workspace().root().to_path_buf(),
+    };
+    Ok(Json(crate::diff::workspace_diff(&root).await))
 }
 
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -9287,6 +9319,86 @@ model = "deepseek-chat"
             StatusCode::OK,
             "right query token must pass"
         );
+    }
+
+    /// `GET /api/sessions/{id}/diff` sits under the same auth middleware as
+    /// every `/api/*` route: no token and a wrong token are both 401.
+    #[tokio::test]
+    async fn session_diff_requires_auth() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        let app = router(test_app_state("sekrit"));
+        for token in [None, Some("Bearer nope")] {
+            let mut request = Request::builder().uri("/api/sessions/any/diff");
+            if let Some(token) = token {
+                request = request.header(header::AUTHORIZATION, token);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    /// `GET /api/sessions/{id}/diff` is a 200 explanatory payload for a
+    /// non-repo workspace (never a 500), and an unknown session is a 404
+    /// like the other per-session reads.
+    #[tokio::test]
+    async fn session_diff_serves_non_repo_payload_and_404s_unknown() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        use crate::session::Session;
+
+        let (state, root) = fork_test_state("diff-endpoint");
+        let id = "web-diff-src";
+        Session::append(&root, id, &[user_message("hello")]).unwrap();
+        let app = router(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sessions/{id}/diff"))
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["repository"], serde_json::json!(false));
+        assert!(
+            value["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not a git repository"),
+            "{value}"
+        );
+        assert_eq!(value["files"], serde_json::json!([]));
+        assert_eq!(value["truncated"], serde_json::json!(false));
+
+        let unknown = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions/does-not-exist/diff")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// M5: `session_history` for an unknown session id returns 404 — the

@@ -105,6 +105,7 @@
     <span id="chatStatus" class="status-chip idle">空闲</span>
     <span id="usageInfo" class="dim"></span>
     <!-- 压缩是低频操作：放顶部信息栏最右侧，避免与取消/发送相邻误触 -->
+    <button id="diffBtn" class="compact-head" title="查看当前工作区的 git 变更" aria-controls="diffPanel" aria-expanded="false">变更</button>
     <button id="compactBtn" class="compact-head" title="压缩上下文（释放 token）">压缩</button>
   </div>
   <div id="chatEmpty" class="chat-empty" role="status">
@@ -158,6 +159,21 @@
     </div>
   </div>
 </main>
+
+<!-- ============ 工作区 diff 浏览器（会话顶部「变更」按钮打开） ============ -->
+<section id="diffPanel" class="diff-panel" role="dialog" aria-modal="true" aria-labelledby="diffPanelTitle" hidden>
+  <div class="diff-panel-card">
+    <header class="diff-panel-head">
+      <h2 id="diffPanelTitle">工作区变更</h2>
+      <span id="diffPanelBase" class="diff-panel-base"></span>
+      <span id="diffPanelSummary" class="diff-panel-summary"></span>
+      <button id="diffRefreshBtn" type="button" title="重新读取工作区变更">刷新</button>
+      <button id="diffCloseBtn" type="button" class="diff-panel-close" title="关闭（Esc）" aria-label="关闭">×</button>
+    </header>
+    <div id="diffPanelStatus" class="diff-panel-status" role="status" aria-live="polite"></div>
+    <div id="diffPanelBody" class="diff-panel-body"></div>
+  </div>
+</section>
 
 <!-- ============ 用量仪表盘（独立视图，不改变聊天会话状态） ============ -->
 <main id="usageDashboard" class="usage-dashboard" hidden aria-labelledby="usageTitle">
