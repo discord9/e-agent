@@ -4466,7 +4466,11 @@ fn jsonl_append_meta_snapshot(
 /// The newest snapshot of a session's metadata sidecar, or `None` when the
 /// sidecar does not exist or holds no decodable record. Corrupt records are
 /// skipped: the file is append-only and only the tail matters (a corrupt
-/// tail is treated as "no newer snapshot").
+/// tail is treated as "no newer snapshot"). This is the DISPLAY/listing
+/// read — every mutating writer must use
+/// [`jsonl_read_meta_snapshot_and_unknown`] instead, because this lossy
+/// version cannot tell a repaired file from a torn one and would let an
+/// append land on top of a damaged tail.
 ///
 /// ONLY `NotFound` means "no sidecar". Any other open/read error is
 /// propagated: fork provenance must never read an unreadable sidecar as a
@@ -4525,6 +4529,22 @@ fn jsonl_read_meta_snapshot_and_unknown(
     Ok((latest, unknown || !saw_record))
 }
 
+/// The refusal every JSONL metadata WRITER returns when
+/// [`jsonl_read_meta_snapshot_and_unknown`] reports `unknown`: the sidecar
+/// holds a torn record (or no record at all), so its provenance is unknown
+/// and it is DISPLAY-only. Appending would either glue the new snapshot onto
+/// a torn tail (no trailing newline) or become the next snapshot a later
+/// read trusts — silently rewriting unknown provenance into a clean one.
+/// Repair is explicit (remove the file), never a metadata write, and the
+/// error names the file so the caller can act on it.
+fn jsonl_refuse_damaged_meta(path: &Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "session metadata {} is damaged (an undecodable record from an interrupted write); \
+         refusing to append a new snapshot so its unknown provenance is not rewritten",
+        path.display()
+    )
+}
+
 /// Count a session's transcript entries by counting the non-empty lines of
 /// `<id>.jsonl` (one serde-JSON entry per line, so no embedded raw
 /// newlines). Missing transcript = 0. This is the JSONL equivalent of the
@@ -4569,7 +4589,12 @@ fn jsonl_count_transcript_entries(root: &Path, session: &str) -> anyhow::Result<
 ///
 /// An existing sidecar that holds no decodable record is left untouched,
 /// because appending a first line would turn unknown provenance into a
-/// parentless one.
+/// parentless one. A sidecar that DOES hold a decodable snapshot followed by
+/// a torn one is display-only too: a backfill append would make the damaged
+/// tail look repaired (and without a trailing newline it would be glued onto
+/// that tail), so the backfill is refused with an error naming the file.
+/// A create with nothing to append stays an `Ok` no-op, so an intact
+/// transcript still reopens.
 ///
 /// `entry_count` mirrors the DB backends' `next_seq` at creation: the
 /// transcript's current line count.
@@ -4582,7 +4607,8 @@ fn jsonl_create_meta(
     parent_task_id: Option<i64>,
     title: Option<&str>,
 ) -> anyhow::Result<()> {
-    let _guard = lock_jsonl_meta(&jsonl_meta_sidecar_path(root, session)?);
+    let path = jsonl_meta_sidecar_path(root, session)?;
+    let _guard = lock_jsonl_meta(&path);
     let (existing, unknown) = jsonl_read_meta_snapshot_and_unknown(root, session)?;
     if let Some(existing) = existing {
         // Row already exists (resume, or a backfill/btw/subagent row whose
@@ -4593,6 +4619,13 @@ fn jsonl_create_meta(
         let backfill_parent = parent_session_id.is_some() && existing.parent_session_id.is_none();
         let backfill_model = model.is_some() && existing.model.is_none();
         if backfill_parent || backfill_model {
+            if unknown {
+                // A decodable snapshot plus a torn tail: the append below
+                // would land after the damaged record. Refuse BEFORE writing
+                // (the old order tested `unknown` only on the no-snapshot
+                // path, so a torn tail was silently appended to).
+                return Err(jsonl_refuse_damaged_meta(&path));
+            }
             let mut meta = SessionMeta {
                 session_id: existing.session_id.clone(),
                 created_at: existing.created_at,
@@ -4645,17 +4678,26 @@ fn jsonl_create_meta(
 
 /// Shared read-tail → mutate → append for the flag setters (title, pin,
 /// archive). Never self-creates (R3): a missing sidecar is a no-op `Ok`,
-/// mirroring the DB backends. A fresh `last_active_at` is stamped here and
-/// `entry_count` is carried from the tail snapshot (the DB backends bump
-/// only `last_active_at` on these writes — the touch additionally
-/// refreshes `entry_count`, which is why it has its own function).
+/// mirroring the DB backends. A sidecar whose provenance is UNKNOWN (a torn
+/// record after the last good snapshot) is display-only: the write is
+/// REFUSED with an error naming the file, so a rename/pin/archive the user
+/// asked for never reports success without having landed. A fresh
+/// `last_active_at` is stamped here and `entry_count` is carried from the
+/// tail snapshot (the DB backends bump only `last_active_at` on these
+/// writes — the touch additionally refreshes `entry_count`, which is why it
+/// has its own function).
 fn jsonl_update_meta(
     root: &Path,
     session: &str,
     mutate: impl FnOnce(&mut SessionMeta),
 ) -> anyhow::Result<()> {
-    let _guard = lock_jsonl_meta(&jsonl_meta_sidecar_path(root, session)?);
-    let Some(mut meta) = jsonl_read_meta_snapshot(root, session)? else {
+    let path = jsonl_meta_sidecar_path(root, session)?;
+    let _guard = lock_jsonl_meta(&path);
+    let (existing, unknown) = jsonl_read_meta_snapshot_and_unknown(root, session)?;
+    if unknown {
+        return Err(jsonl_refuse_damaged_meta(&path));
+    }
+    let Some(mut meta) = existing else {
         return Ok(()); // R3: never self-create
     };
     mutate(&mut meta);
@@ -4668,14 +4710,21 @@ fn jsonl_update_meta(
 /// so two concurrent adds both survive instead of the later one overwriting
 /// the earlier read. Returns the stored (deduplicated) list. A missing
 /// sidecar is an error — a link handed to the store must not be dropped
-/// quietly (the flag setters' no-op would).
+/// quietly (the flag setters' no-op would). A damaged sidecar (a torn
+/// record) is an error too: the link did NOT persist, and the caller/model
+/// must learn that instead of seeing an acknowledged no-op.
 fn jsonl_update_refs(
     root: &Path,
     session: &str,
     mutate: impl FnOnce(&mut Vec<SessionRef>) -> Result<(), String>,
 ) -> anyhow::Result<Vec<SessionRef>> {
-    let _guard = lock_jsonl_meta(&jsonl_meta_sidecar_path(root, session)?);
-    let Some(mut meta) = jsonl_read_meta_snapshot(root, session)? else {
+    let path = jsonl_meta_sidecar_path(root, session)?;
+    let _guard = lock_jsonl_meta(&path);
+    let (existing, unknown) = jsonl_read_meta_snapshot_and_unknown(root, session)?;
+    if unknown {
+        return Err(jsonl_refuse_damaged_meta(&path));
+    }
+    let Some(mut meta) = existing else {
         anyhow::bail!("session {session} has no metadata row to store links in");
     };
     mutate(&mut meta.refs).map_err(anyhow::Error::msg)?;
@@ -4688,13 +4737,21 @@ fn jsonl_update_refs(
 /// `touch_meta` for the JSONL backend: append one fresh snapshot line with
 /// `last_active_at = now` and `entry_count` = the current transcript line
 /// count, or no-op when no sidecar exists (R3 — a sidecar-less session
-/// must not fabricate its own row). The transcript is re-counted on every
-/// call: the store is stateless, and the count is the exact JSONL analogue
-/// of the DB's `next_seq`. Called synchronously at turn boundaries; the
-/// read is a few hundred KB at worst.
+/// must not fabricate its own row). A damaged sidecar (a torn record) is an
+/// error, never an append: the caller (the runner's fire-and-forget touch)
+/// logs the refusal instead of advancing a metadata tail whose provenance
+/// is unknown. The transcript is re-counted on every call: the store is
+/// stateless, and the count is the exact JSONL analogue of the DB's
+/// `next_seq`. Called synchronously at turn boundaries; the read is a few
+/// hundred KB at worst.
 fn jsonl_touch_meta(root: &Path, session: &str) -> anyhow::Result<()> {
-    let _guard = lock_jsonl_meta(&jsonl_meta_sidecar_path(root, session)?);
-    let Some(mut meta) = jsonl_read_meta_snapshot(root, session)? else {
+    let path = jsonl_meta_sidecar_path(root, session)?;
+    let _guard = lock_jsonl_meta(&path);
+    let (existing, unknown) = jsonl_read_meta_snapshot_and_unknown(root, session)?;
+    if unknown {
+        return Err(jsonl_refuse_damaged_meta(&path));
+    }
+    let Some(mut meta) = existing else {
         return Ok(()); // R3: never self-create
     };
     meta.last_active_at = chrono::Utc::now().naive_utc();

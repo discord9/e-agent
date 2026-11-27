@@ -1358,3 +1358,134 @@ async fn metadata_writes_wait_for_the_per_session_lock() {
             == 1
     );
 }
+
+// ----------------------------------------------------------------------
+// damaged sidecars: display-only, every writer refuses
+// ----------------------------------------------------------------------
+
+/// One writer attempted against a damaged sidecar must return an error that
+/// names the file, and must leave the file byte-identical.
+fn assert_write_refused(
+    result: anyhow::Result<()>,
+    path: &std::path::Path,
+    bytes: &[u8],
+    writer: &str,
+) {
+    let error = match result {
+        Ok(()) => panic!("{writer} must refuse a damaged sidecar"),
+        Err(error) => error,
+    };
+    assert!(
+        format!("{error:#}").contains(&path.display().to_string()),
+        "{writer} must name the damaged file: {error:#}"
+    );
+    assert_eq!(
+        std::fs::read(path).unwrap(),
+        bytes,
+        "{writer} must leave the damaged sidecar byte-identical"
+    );
+}
+
+/// A good snapshot followed by a torn tail (an interrupted append with NO
+/// trailing newline) is display-only. Every writer — rename/pin/archive,
+/// refs, touch and the create-time backfill — must refuse with an error
+/// naming the file and leave the bytes byte-identical: an append would be
+/// glued onto the torn tail and the next read would trust it, laundering
+/// unknown provenance into a clean snapshot. The session still opens with
+/// its history and unknown provenance, so `link_ref` stays off.
+#[tokio::test]
+async fn every_writer_refuses_a_torn_sidecar_tail() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = SessionStore::Jsonl;
+    let root = temp.path();
+    let sid = format!("meta-torn-writer-{}", crate::session::new_id());
+    Session::append(root, &sid, &entries()).unwrap();
+    // No model: the create-backfill below has something to record.
+    store
+        .create_meta(root, &sid, None, Some("main"), None, None, None)
+        .await
+        .unwrap();
+    let path = sidecar(root, &sid);
+    // The crash: one complete snapshot, then a partial record with no
+    // trailing newline (the append stopped mid-write).
+    let mut torn = std::fs::read(&path).unwrap();
+    torn.extend_from_slice(b"{\"session_id\":");
+    std::fs::write(&path, &torn).unwrap();
+
+    let url = "https://github.com/acme/widget/pull/14";
+    assert_write_refused(
+        store.set_title(root, &sid, Some("renamed")).await,
+        &path,
+        &torn,
+        "set_title",
+    );
+    assert_write_refused(
+        store.set_pinned(root, &sid, true).await,
+        &path,
+        &torn,
+        "set_pinned",
+    );
+    assert_write_refused(
+        store.set_archived(root, &sid, true).await,
+        &path,
+        &torn,
+        "set_archived",
+    );
+    assert_write_refused(
+        store
+            .update_refs(root, &sid, |refs| {
+                refs.push(SessionRef::new("pr", url).unwrap());
+                Ok(())
+            })
+            .await
+            .map(|_| ()),
+        &path,
+        &torn,
+        "update_refs",
+    );
+    // `SessionStore::touch_meta` is fire-and-forget (it logs the refusal),
+    // so the writer itself carries the error the runner logs.
+    store.touch_meta(root, &sid);
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        torn,
+        "a turn-boundary touch must not append to the torn tail"
+    );
+    assert_write_refused(jsonl_touch_meta(root, &sid), &path, &torn, "touch_meta");
+    assert_write_refused(
+        store
+            .create_meta(root, &sid, Some("gpt-x"), Some("main"), None, None, None)
+            .await,
+        &path,
+        &torn,
+        "create_meta backfill",
+    );
+    // A create with nothing to backfill is still the idempotent reopen
+    // no-op: the refusal only guards appends.
+    store
+        .create_meta(root, &sid, None, None, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        torn,
+        "an idempotent resume never writes to the damaged sidecar"
+    );
+
+    // Display still works: the last good snapshot renders, the history
+    // opens, and unknown provenance keeps `link_ref` off.
+    assert_eq!(store.list_meta(root).await.unwrap()[0].title, None);
+    assert_eq!(Session::load(root, &sid).unwrap().entries, entries());
+    let (_head, is_fork) = store
+        .load_fork_head_and_provenance(root, &sid)
+        .await
+        .unwrap();
+    assert!(
+        is_fork,
+        "a torn record is unknown provenance, so link_ref must stay off"
+    );
+    assert!(matches!(
+        store.metadata_parent(root, &sid).await.unwrap(),
+        PersistedParent::Unknown
+    ));
+}
