@@ -28,6 +28,12 @@ function validateSession(s) {
   if (s.label !== undefined && s.label !== null && typeof s.label !== "string") problems.push("label 非字符串");
   if (s.pinned !== undefined && s.pinned !== null && typeof s.pinned !== "boolean") problems.push("pinned 非布尔");
   if (s.archived !== undefined && s.archived !== null && typeof s.archived !== "boolean") problems.push("archived 非布尔");
+  for (const key of ["prs", "issues"]) {
+    if (s[key] !== undefined && s[key] !== null
+        && (!Array.isArray(s[key]) || s[key].some((u) => typeof u !== "string"))) {
+      problems.push(key + " 非字符串数组");
+    }
+  }
   return problems;
 }
 
@@ -165,6 +171,7 @@ function afterPollRound() {
       updateCurrentSessionBusy();
       syncDocumentTitle();   // 服务端后台生成的标题在轮询后同步到标签页
       const cur = (state.lastList || []).find((s) => s.id === state.sessionId);
+      syncChatRefs(cur);
       // 临时重试已安装（onclick 非空）：无论当前行是否存在/是否有父，都必须
       // 保持可用——否则一次轮询就会把重试控件藏掉。只在恢复父信息或导航时清。
       const retryHandler = els.backParentBtn.onclick;
@@ -985,6 +992,194 @@ function renderChatSessionId(id) {
   if (title) {
     const idline = el("span", "chat-sid-id", id);
     el0.append(idline);
+  }
+  renderChatRefs(s, id);
+}
+
+/* =====================================================================
+ * 会话链接（PR / issue）：标签只由 URL 自身形状决定——路径能解析成
+ * `/owner/repo/pull/14`（或 `/-/merge_requests/14`）、`/owner/repo/issues/22`
+ * 时显示 `PR #14` / `issue #22`，否则回退 `host + path`。点击开新标签页。
+ * 手工编辑在会话头部：按 kind 添加/移除，走 POST /api/sessions/{id}/refs。
+ * 这里不做任何分组/过滤/按编号排序。
+ * ===================================================================*/
+let refEditorOpen = false;      // 头部「＋」展开的添加表单（切会话时收起）
+let refEditorSession = null;    // 表单归属的会话 id
+let chatRefsSig = "";           // 头部 chips 的签名：轮询只在链接变化时重绘
+
+/* URL 的展示标签：能解析出编号就用 `PR #n` / `issue #n`，否则 host+path。 */
+function refChipLabel(url) {
+  try {
+    const u = new URL(url);
+    const segs = u.pathname.split("/").filter(Boolean);
+    if (segs.length >= 2) {
+      const number = segs[segs.length - 1];
+      const marker = segs[segs.length - 2].toLowerCase();
+      if (/^\d+$/.test(number)) {
+        if (marker === "pull" || marker === "pulls" || marker === "merge_requests") return "PR #" + number;
+        if (marker === "issue" || marker === "issues") return "issue #" + number;
+      }
+    }
+    return u.host + u.pathname.replace(/\/$/, "");
+  } catch (e) {
+    return String(url || "");
+  }
+}
+
+/* 会话对象上的两个列表 → 有序的 [kind, url] 对（pr 在前，保持后端顺序）。 */
+function sessionRefLinks(s) {
+  const out = [];
+  for (const [kind, urls] of [["pr", s && s.prs], ["issue", s && s.issues]]) {
+    if (!Array.isArray(urls)) continue;
+    for (const url of urls) {
+      if (typeof url === "string" && url) out.push({ kind, url });
+    }
+  }
+  return out;
+}
+
+/* 链接列表的签名（顺序敏感）：用于「只有变化才重绘」，避免轮询打断输入。 */
+function refsSignature(links) {
+  return links.map((link) => link.kind + " " + link.url).join("\n");
+}
+
+/* 轮询后同步头部 chips：agent 在 turn 里新增/移除链接时，下一次轮询就反映
+   出来（侧边栏靠树签名自动重绘）；签名不变绝不重绘，正在输入的表单不受影响。 */
+function syncChatRefs(s) {
+  if (!state.sessionId) return;
+  if (refsSignature(sessionRefLinks(s)) === chatRefsSig) return;
+  renderChatRefs(s, state.sessionId);
+}
+
+/* 一个 chip。`onRemove` 非空时附带 ×（只在会话头部提供）。 */
+function refChip(link, onRemove) {
+  const a = el("a", "ref-chip " + link.kind, refChipLabel(link.url));
+  a.href = link.url;
+  a.target = "_blank";
+  a.rel = "noopener noreferrer";
+  a.title = link.url;
+  a.draggable = false;
+  a.addEventListener("click", (ev) => ev.stopPropagation());   // 不触发切换会话/拖拽排序
+  if (!onRemove) return a;
+  const wrap = el("span", "ref-chip-wrap");
+  wrap.append(a);
+  const rm = el("button", "ref-chip-remove", "×");
+  rm.type = "button";
+  rm.title = "移除 " + link.url;
+  rm.setAttribute("aria-label", rm.title);
+  rm.addEventListener("click", (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    editSessionRef(link.kind, link.url, true);
+  });
+  wrap.append(rm);
+  return wrap;
+}
+
+/* 侧边栏行的 chips（只展示/打开，没有 ×）；没有链接时返回 null，不占行高。 */
+function renderRefChips(s) {
+  const links = sessionRefLinks(s);
+  if (!links.length) return null;
+  const row = el("div", "tree-refs");
+  for (const link of links) row.append(refChip(link));
+  return row;
+}
+
+/* 会话头部的 chips + 手工编辑（＋ 展开：kind 选择 + URL 输入 + 添加）。 */
+function renderChatRefs(s, id) {
+  const host = els.chatRefs;
+  if (!host) return;
+  if (refEditorSession !== id) {      // 切会话：收起表单，避免输入落到别的会话
+    refEditorSession = id;
+    refEditorOpen = false;
+  }
+  // 重绘（轮询/改名）不丢正在输入的表单：先记下草稿，重建后填回。
+  const draftUrl = host.querySelector(".ref-url");
+  const draftKind = host.querySelector(".ref-kind");
+  const draft = draftUrl ? draftUrl.value : "";
+  const draftValue = draftKind ? draftKind.value : "pr";
+  host.innerHTML = "";
+  if (!id) return;
+  const links = sessionRefLinks(s);
+  for (const link of links) host.append(refChip(link, true));
+  chatRefsSig = refsSignature(links);
+  const add = el("button", "ref-add-btn", "＋");
+  add.type = "button";
+  add.title = refEditorOpen ? "收起添加链接" : "添加 PR / issue 链接";
+  add.setAttribute("aria-label", add.title);
+  add.setAttribute("aria-expanded", String(refEditorOpen));
+  add.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    refEditorOpen = !refEditorOpen;
+    renderChatRefs(s, id);
+  });
+  host.append(add);
+  if (!refEditorOpen) return;
+  const form = el("span", "ref-editor");
+  const kind = el("select", "ref-kind");
+  kind.title = "链接类型";
+  for (const [value, label] of [["pr", "PR"], ["issue", "issue"]]) {
+    const option = el("option", "", label);
+    option.value = value;
+    kind.append(option);
+  }
+  kind.value = draftValue;
+  const url = el("input", "ref-url");
+  url.value = draft;
+  url.placeholder = "https://github.com/owner/repo/pull/14";
+  url.autocomplete = "off";
+  url.spellcheck = false;
+  url.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") { ev.preventDefault(); submit(); }
+    else if (ev.key === "Escape") { refEditorOpen = false; renderChatRefs(s, id); }
+  });
+  const submit = () => {
+    const value = url.value.trim();
+    if (!value) return;
+    editSessionRef(kind.value, value, false);
+  };
+  const addBtn = el("button", "ref-add-submit", "添加");
+  addBtn.type = "button";
+  addBtn.addEventListener("click", (ev) => { ev.stopPropagation(); submit(); });
+  form.append(kind, url, addBtn);
+  host.append(form);
+  url.focus();
+}
+
+/* POST /api/sessions/{id}/refs {kind, url, remove}；成功后把响应里的两个
+   列表写回会话对象并重绘头部/侧边栏（响应即服务器存储的真值）。 */
+async function editSessionRef(kind, url, remove) {
+  const id = state.sessionId;
+  if (!id) return false;
+  if (!workspaceToken(state.workspace)) { setBanner("⚠ 请先输入 Token。", true); return false; }
+  try {
+    const res = await api("/api/sessions/" + encodeURIComponent(id) + "/refs",
+      { method: "POST", body: JSON.stringify({ kind, url, remove }) });
+    if (res.status === 401 || res.status === 403) {
+      setBanner("⚠ 认证失败：请检查 Token。");
+      return false;
+    }
+    if (!res.ok) {
+      if (res.status === 404 || res.status === 405) {
+        setBanner("⚠ 服务器不支持会话链接编辑。", true);
+      } else {
+        const detail = (await res.text().catch(() => "")).trim();
+        setBanner("⚠ 链接更新失败：" + (detail || ("HTTP " + res.status)), true);
+      }
+      return false;
+    }
+    const body = await res.json().catch(() => ({}));
+    const s = (state.lastList || []).find((x) => x.id === id);
+    if (s) {
+      s.prs = Array.isArray(body.prs) ? body.prs : [];
+      s.issues = Array.isArray(body.issues) ? body.issues : [];
+    }
+    renderChatSessionId(id);
+    renderSidebarTree(true);   // 侧边栏也显示 chips：立即反映
+    return true;
+  } catch (e) {
+    setBanner("⚠ 链接更新失败：" + e.message, true);
+    return false;
   }
 }
 
@@ -2333,7 +2528,9 @@ function enablePinnedPointerDrag(row, node, wsId, sid) {
   }, true);
   row.addEventListener("pointerdown", (ev) => {
     if (ev.button !== undefined && ev.button !== 0) return;
-    const onButton = !!(ev.target && ev.target.closest && ev.target.closest("button"));
+    // Links (session ref chips) behave like buttons: a tap must open the URL,
+    // never start a pin drag.
+    const onButton = !!(ev.target && ev.target.closest && ev.target.closest("button, a"));
     // 鼠标点按钮保持原交互；触屏按钮仍记录 pointer，以便手指从按钮起滑时
     // 手动滚动（row 的 touch-action:none 是可靠接管纵向拖拽所必需）。
     if (onButton && ev.pointerType !== "touch") return;
@@ -2437,6 +2634,7 @@ function sidebarTreeSig() {
         s.id, s.title || "", s.label || "", s.status, s.busy ? 1 : 0, s.active === false ? 0 : 1,
         s.entry_count ?? null, s.parent_session_id || "", s.pinned === true ? 1 : 0,
         s.archived === true ? 1 : 0, s.model || "",
+        Array.isArray(s.prs) ? s.prs.join(" ") : "", Array.isArray(s.issues) ? s.issues.join(" ") : "",
       ])));
   }
   return state.sessionId + "|" + JSON.stringify(readPinOrder()) + "|" + parts.join("|")
@@ -2948,6 +3146,8 @@ function buildTreeRoot(s, kids, wsId) {
     ? String(summary.short || "").trim() : "";
   const main = el("div", "tree-main");
   main.append(titleEl);
+  const refChips = renderRefChips(s);
+  if (refChips) main.append(refChips);
   if (activityShort) {
     const activity = el("div", "tree-activity", activityShort);
     activity.title = String(summary.full || activityShort);   // 完整 30 字摘要留给 hover

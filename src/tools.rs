@@ -10,6 +10,7 @@ mod bash;
 mod file;
 pub(crate) mod history;
 mod image_generation;
+mod link_ref;
 mod notes;
 pub mod output;
 #[cfg(target_os = "linux")]
@@ -35,6 +36,7 @@ pub use background::{
 pub use bash::bash_tool;
 pub use file::{file_tools, undo_file_op};
 pub(crate) use image_generation::{AuthResolver, generate_image_tool};
+pub(crate) use link_ref::link_ref_tool;
 #[cfg(target_os = "linux")]
 pub(crate) use rust::resolve_rustc;
 #[cfg(target_os = "linux")]

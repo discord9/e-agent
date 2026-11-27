@@ -1075,6 +1075,15 @@ impl SessionFactory {
         register_run_rust(&mut tools, &tools_workspace, self.code_mode, self.read_only, self.rust_sandbox.clone());
         // Only the root/main session can pause for Web human input.
         add_root_user_input_tool(&mut tools);
+        // Main-session only: `link_ref` records PR/issue URLs on THIS
+        // session's metadata row through the store already open above (no
+        // second connection). Children/fork children build the common
+        // builtins, so they never see it.
+        tools.push(crate::tools::link_ref_tool(
+            store.clone(),
+            self.root.clone(),
+            session.clone(),
+        ));
         // Main-agent only: `generate_image` (direct Codex image HTTP).
         // Read-only sessions skip it (it creates files), and so does a
         // workspace rooted at or below the canonical global skills

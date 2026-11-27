@@ -814,6 +814,123 @@ pub struct LocatedHistoryPage {
     pub next_older_session: Option<String>,
 }
 
+/// Kind of one [`SessionRef`]. A future kind can be added here without a
+/// storage migration: the column carries one JSON value, so only this enum
+/// grows.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionRefKind {
+    Pr,
+    Issue,
+}
+
+impl SessionRefKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pr => "pr",
+            Self::Issue => "issue",
+        }
+    }
+
+    /// Parse the model/HTTP surface spelling (`"pr"` | `"issue"`).
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "pr" => Ok(Self::Pr),
+            "issue" => Ok(Self::Issue),
+            other => Err(format!(
+                "unknown ref kind `{other}`: expected `pr` or `issue`"
+            )),
+        }
+    }
+}
+
+/// One external link a session carries (a pull request or an issue). The URL
+/// IS the identity: the same `#14` in two repositories is two different
+/// refs, so nothing is reduced to a number.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SessionRef {
+    pub kind: SessionRefKind,
+    pub url: String,
+}
+
+impl SessionRef {
+    /// Validate and build one link. `url` must be an absolute `http(s)` URL
+    /// without credentials or whitespace; the exact string is preserved (the
+    /// link must open, and dedup is by exact URL). Errors are plain strings.
+    pub fn new(kind: &str, url: &str) -> Result<Self, String> {
+        let kind = SessionRefKind::parse(kind)?;
+        if url.is_empty() {
+            return Err("ref `url` must not be empty".to_owned());
+        }
+        if url.chars().any(char::is_whitespace) {
+            return Err(format!(
+                "`{url}` contains whitespace; a ref URL must be one absolute http(s) URL"
+            ));
+        }
+        let parsed = url::Url::parse(url)
+            .map_err(|error| format!("`{url}` is not an absolute URL: {error}"))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(format!(
+                "`{url}` must use http or https, not `{}`",
+                parsed.scheme()
+            ));
+        }
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(format!("`{url}` must not carry credentials"));
+        }
+        if parsed.host_str().is_none() {
+            return Err(format!("`{url}` must name a host"));
+        }
+        Ok(Self {
+            kind,
+            url: url.to_owned(),
+        })
+    }
+}
+
+/// Drop exact-duplicate `(kind, url)` pairs, preserving insertion order: a
+/// URL is unique within its kind, never across kinds.
+pub fn dedup_refs(refs: &mut Vec<SessionRef>) {
+    let mut seen = HashSet::new();
+    refs.retain(|link| seen.insert((link.kind, link.url.clone())));
+}
+
+/// The wire/storage projection of [`SessionMeta::refs`]: PR URLs then issue
+/// URLs, each in insertion order.
+pub fn split_refs(refs: &[SessionRef]) -> (Vec<String>, Vec<String>) {
+    let mut prs = Vec::new();
+    let mut issues = Vec::new();
+    for link in refs {
+        match link.kind {
+            SessionRefKind::Pr => prs.push(link.url.clone()),
+            SessionRefKind::Issue => issues.push(link.url.clone()),
+        }
+    }
+    (prs, issues)
+}
+
+/// Serialize refs for one JSON column; an empty list stores NULL (the same
+/// value a row written before the column existed reads back as).
+pub(crate) fn refs_to_json(refs: &[SessionRef]) -> Result<Option<String>, String> {
+    if refs.is_empty() {
+        return Ok(None);
+    }
+    serde_json::to_string(refs)
+        .map(Some)
+        .map_err(|error| format!("cannot encode session refs: {error}"))
+}
+
+/// Parse the JSON column back. NULL/blank reads as empty (tolerant, like the
+/// other nullable metadata columns); malformed JSON fails loudly instead of
+/// silently dropping the session's links.
+pub(crate) fn refs_from_json(text: Option<&str>) -> Result<Vec<SessionRef>, String> {
+    match text.map(str::trim) {
+        None | Some("") => Ok(Vec::new()),
+        Some(text) => serde_json::from_str(text)
+            .map_err(|error| format!("cannot decode session refs JSON: {error}")),
+    }
+}
+
 /// One session's metadata snapshot from the `sessions` audit table
 /// (Greptime and SQLite backends only). Every row is a COMPLETE snapshot —
 /// Greptime has no UPDATE and SQLite follows the same append-only audit
@@ -849,6 +966,15 @@ pub struct SessionMeta {
     /// `Some(false)` = explicitly restored, `None` = never touched (reads
     /// as unarchived).
     pub archived: Option<bool>,
+    /// Pull-request and issue links, stored as ONE JSON value (a list of
+    /// `{"kind","url"}` objects) so a future kind needs no migration. Rows
+    /// written before the field existed — the JSONL sidecar lines and the
+    /// `refs` column's NULL — read back as empty. `#[serde(default)]` is
+    /// REQUIRED: the sidecar tail-read parses each line as `SessionMeta` and
+    /// silently skips lines that fail to parse, so a missing default would
+    /// hide every pre-existing session from `list_meta`.
+    #[serde(default)]
+    pub refs: Vec<SessionRef>,
     /// Writer process identity of this snapshot row
     /// (`pid@hostname#nonce`, see [`process_identity`]): the process whose
     /// insert appended the row (the audit table / sidecar records every
@@ -3607,6 +3733,49 @@ impl SessionStore {
         }
     }
 
+    /// Read → mutate → append the session's PR/issue links, returning the
+    /// value that was actually stored (post [`dedup_refs`]). Both writers —
+    /// the `link_ref` tool and the web endpoint — go through this one path,
+    /// and both reuse the handle already open (never a second connection).
+    ///
+    /// A missing metadata row fails loudly instead of silently dropping a
+    /// link (`set_title` is a no-op there; a link must not be lost quietly).
+    #[allow(unused_variables)]
+    pub async fn update_refs(
+        &self,
+        root: &Path,
+        session: &str,
+        mutate: impl FnOnce(&mut Vec<SessionRef>) -> Result<(), String>,
+    ) -> Result<Vec<SessionRef>> {
+        match self {
+            SessionStore::Jsonl => {
+                let Some(mut meta) = jsonl_read_meta_snapshot(root, session)? else {
+                    anyhow::bail!("session {session} has no metadata row to store links in");
+                };
+                mutate(&mut meta.refs).map_err(anyhow::Error::msg)?;
+                dedup_refs(&mut meta.refs);
+                meta.last_active_at = chrono::Utc::now().naive_utc();
+                jsonl_append_meta_snapshot(root, session, &mut meta)?;
+                Ok(meta.refs)
+            }
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime {
+                session: greptime_session,
+                ..
+            } => greptime_session.update_refs(session, mutate).await,
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite {
+                session: sqlite_session,
+                ..
+            } => sqlite_session
+                .lock()
+                .await
+                .update_refs(session, mutate)
+                .await
+                .map_err(anyhow::Error::msg),
+        }
+    }
+
     /// One-time bootstrap migration: create metadata rows for sessions
     /// that predate the `sessions` table (they have `session_entries` but
     /// no metadata row). Idempotent: sessions that already have a row are
@@ -4194,6 +4363,7 @@ fn jsonl_create_meta(
                 title: existing.title.clone(),
                 pinned: existing.pinned,
                 archived: existing.archived,
+                refs: existing.refs.clone(), // links are never rewritten by a resume
                 writer: None, // stamped by jsonl_append_meta_snapshot with the writing process
                 label: None, // label lives in running_tasks / background records, resolved at list time
             };
@@ -4214,6 +4384,7 @@ fn jsonl_create_meta(
         title: title.map(str::to_owned), // a fresh session may be named at creation (subagent label)
         pinned: None,                    // a fresh session is unpinned until the user pins it
         archived: None,                  // a fresh session is unarchived until the user archives it
+        refs: Vec::new(),                // no PR/issue links until the tool or the owner adds them
         writer: None, // stamped by jsonl_append_meta_snapshot with the writing process
         label: None,  // label lives in running_tasks / background records, resolved at list time
     };
@@ -4382,10 +4553,11 @@ fn jsonl_backfill_sessions(root: &Path) -> anyhow::Result<()> {
             entry_count: jsonl_count_transcript_entries(root, &session)?,
             parent_session_id: None,
             parent_task_id: None,
-            title: None,    // pre-sidecar sessions have no user-assigned name
-            pinned: None,   // pre-sidecar sessions are unpinned
-            archived: None, // pre-sidecar sessions are unarchived
-            writer: None,   // stamped by jsonl_append_meta_snapshot with the writing process
+            title: None,      // pre-sidecar sessions have no user-assigned name
+            pinned: None,     // pre-sidecar sessions are unpinned
+            archived: None,   // pre-sidecar sessions are unarchived
+            refs: Vec::new(), // pre-sidecar sessions carry no PR/issue links
+            writer: None,     // stamped by jsonl_append_meta_snapshot with the writing process
             label: None, // label lives in running_tasks / background records, resolved at list time
         };
         jsonl_append_meta_snapshot(root, &session, &mut meta)?;

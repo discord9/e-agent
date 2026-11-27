@@ -2425,6 +2425,10 @@ fn backfill_meta_snapshot_preserves_immutable_columns() {
         title: Some("a title".into()),
         pinned: Some(true),
         archived: Some(true),
+        refs: vec![
+            crate::session_store::SessionRef::new("pr", "https://github.com/acme/widget/pull/14")
+                .unwrap(),
+        ],
         writer: None,
         label: None,
     };
@@ -2459,6 +2463,10 @@ fn backfill_meta_snapshot_preserves_immutable_columns() {
     assert_eq!(backfilled.title.as_deref(), Some("a title"));
     assert_eq!(backfilled.pinned, Some(true));
     assert_eq!(backfilled.archived, Some(true));
+    assert_eq!(
+        backfilled.refs, existing.refs,
+        "a resume carries the session's links"
+    );
     assert_eq!(backfilled.writer, None, "writer is stamped by insert_meta");
 
     // Model-only backfill leaves the (absent) links untouched.
@@ -2474,6 +2482,7 @@ fn backfill_meta_snapshot_preserves_immutable_columns() {
         title: None,
         pinned: None,
         archived: None,
+        refs: Vec::new(),
         writer: None,
         label: None,
     };
@@ -4685,6 +4694,9 @@ impl<'a> SnapshotRow<'a> {
             title: self.title.map(str::to_owned),
             pinned: self.pinned.map(|flag| flag == 1),
             archived: self.archived.map(|flag| flag == 1),
+            // The synthetic INSERT omits the `refs` column entirely, so this
+            // doubles as the "row without the field reads as empty" contract.
+            refs: Vec::new(),
             writer: self.writer.map(str::to_owned),
             label: None,
         }
@@ -6366,4 +6378,120 @@ async fn head_page_widening_respects_the_limit() {
     }
     seen.sort_unstable();
     assert_eq!(seen, vec![0, 1, 2, 3, 4, 5, 6], "the chain loses no row");
+}
+
+// ----------------------------------------------------------------------
+// refs (PR / issue links)
+// ----------------------------------------------------------------------
+
+/// A fresh metadata row stores `refs` as NULL (the value a pre-column row
+/// has) and reads back as empty — the tolerant-column contract.
+#[tokio::test]
+async fn meta_row_without_refs_column_value_reads_as_empty() {
+    let (dir, session, sid) = fresh_session().await;
+    session
+        .create_meta(&sid, Some("m"), Some("main"), None, None, None)
+        .await
+        .unwrap();
+    {
+        let conn = session.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT refs FROM sessions WHERE workspace_id = ?1 AND session_id = ?2",
+                (session.workspace_id.as_str(), sid.as_str()),
+            )
+            .await
+            .expect("select refs");
+        let row = rows.next().await.expect("row").expect("metadata row");
+        assert!(
+            row.get_value(0).expect("refs value").as_text().is_none(),
+            "an empty list is stored as NULL, exactly like a pre-column row"
+        );
+    }
+    assert!(
+        session.list_meta().await.unwrap()[0].refs.is_empty(),
+        "NULL refs read as empty"
+    );
+    assert!(
+        session
+            .load_meta_row(&sid)
+            .await
+            .unwrap()
+            .unwrap()
+            .refs
+            .is_empty()
+    );
+    drop(dir);
+}
+
+/// Both kinds round-trip through the JSON column, deduplicate by exact URL
+/// within a kind, and survive a reconnect (a new SqliteSession bound to the
+/// same file reads the same links).
+#[tokio::test]
+async fn refs_round_trip_and_deduplicate_on_sqlite() {
+    let (dir, session, sid) = fresh_session().await;
+    session
+        .create_meta(&sid, Some("m"), Some("main"), None, None, None)
+        .await
+        .unwrap();
+    let pr = crate::session_store::SessionRef::new("pr", "https://github.com/acme/widget/pull/14")
+        .unwrap();
+    let other_pr =
+        crate::session_store::SessionRef::new("pr", "https://github.com/acme/gadget/pull/14")
+            .unwrap();
+    let issue =
+        crate::session_store::SessionRef::new("issue", "https://github.com/acme/widget/issues/22")
+            .unwrap();
+    let stored = session
+        .update_refs(&sid, |refs| {
+            refs.push(pr.clone());
+            refs.push(issue.clone());
+            refs.push(pr.clone()); // duplicate collapses
+            refs.push(other_pr.clone());
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(stored, vec![pr.clone(), issue.clone(), other_pr.clone()]);
+    assert_eq!(session.list_meta().await.unwrap()[0].refs, stored);
+
+    // Round-trip through a second connection to the same database file.
+    let reopened = SqliteSession::connect(
+        dir.path().join("sessions.db").to_str().unwrap(),
+        &workspace_id(),
+        &sid,
+    )
+    .await
+    .expect("reconnect");
+    assert_eq!(
+        reopened.load_meta_row(&sid).await.unwrap().unwrap().refs,
+        stored
+    );
+
+    // Removing one PR keeps the other PR and the issue.
+    let removed = session
+        .update_refs(&sid, |refs| {
+            refs.retain(|link| link != &pr);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(removed, vec![issue, other_pr]);
+    assert_eq!(
+        reopened.list_meta().await.unwrap()[0].refs,
+        removed,
+        "the newest snapshot wins, links included"
+    );
+}
+
+/// A link for a session with no metadata row is an error, never a silent
+/// drop.
+#[tokio::test]
+async fn update_refs_without_a_meta_row_fails_loudly_on_sqlite() {
+    let (_dir, session, _sid) = fresh_session().await;
+    let error = session
+        .update_refs("sql-refs-ghost", |_| Ok(()))
+        .await
+        .unwrap_err();
+    assert!(error.contains("no metadata row"), "{error}");
 }

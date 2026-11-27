@@ -113,6 +113,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     pinned BOOLEAN NULL,
     archived BOOLEAN NULL,
     writer STRING NULL,
+    refs STRING NULL,
     entry_count BIGINT NOT NULL DEFAULT 0,
     parent_session_id STRING NULL,
     parent_task_id BIGINT NULL,
@@ -243,7 +244,7 @@ impl GreptimeSession {
             .context("cannot create usage_entries table")?;
 
         // Idempotent schema migration for the `title`, `pinned`,
-        // `archived` and `writer` columns — a table-structure evolution:
+        // `archived`, `writer` and `refs` columns — a table-structure evolution:
         // `sessions` shipped without them, so pre-existing databases need
         // an ALTER (fresh databases already have them via
         // CREATE_TABLE_SESSIONS above). There are no historical rows to
@@ -258,6 +259,7 @@ impl GreptimeSession {
         let mut pinned_available = true;
         let mut archived_available = true;
         let mut writer_available = true;
+        let mut refs_available = true;
         let columns: Vec<String> = client
             .query(
                 "SELECT column_name FROM information_schema.columns \
@@ -324,6 +326,21 @@ impl GreptimeSession {
                     writer_available = false;
                     tracing::warn!(
                         "e-agent: cannot add sessions.writer column (writer audit unavailable): \
+                         {error:#}"
+                    );
+                }
+            }
+        }
+        if !columns.iter().any(|c| c == "refs") {
+            match client
+                .execute("ALTER TABLE sessions ADD COLUMN refs STRING NULL", &[])
+                .await
+            {
+                Ok(_) => {}
+                Err(error) => {
+                    refs_available = false;
+                    tracing::warn!(
+                        "e-agent: cannot add sessions.refs column (session links unavailable): \
                          {error:#}"
                     );
                 }
@@ -438,37 +455,29 @@ impl GreptimeSession {
         // touches rewrite complete rows without re-reading immutable
         // columns. The table is append-only; the newest row per session
         // wins (ORDER BY last_active_at DESC LIMIT 1).
-        let cached_meta =
-            if title_available && pinned_available && archived_available && writer_available {
-                let meta_row = client
-                    .query_opt(
-                        "SELECT created_at, last_active_at, model, \"role\", entry_count, \
-                            parent_session_id, parent_task_id, title, pinned, archived, writer \
+        let cached_meta = if title_available
+            && pinned_available
+            && archived_available
+            && writer_available
+            && refs_available
+        {
+            let meta_row = client
+                .query_opt(
+                    "SELECT created_at, last_active_at, model, \"role\", entry_count, \
+                        parent_session_id, parent_task_id, title, pinned, archived, writer, refs \
                      FROM sessions \
                      WHERE workspace_id = $1 AND session_id = $2 \
                      ORDER BY last_active_at DESC LIMIT 1",
-                        &[&workspace_id, &session_id],
-                    )
-                    .await
-                    .context("cannot query session metadata")?;
-                meta_row.map(|row| SessionMeta {
-                    session_id: session_id.to_string(),
-                    created_at: row.get("created_at"),
-                    last_active_at: row.get("last_active_at"),
-                    model: row.get("model"),
-                    role: row.get("role"),
-                    entry_count: row.get("entry_count"),
-                    parent_session_id: row.get("parent_session_id"),
-                    parent_task_id: row.get("parent_task_id"),
-                    title: row.get("title"),
-                    pinned: row.get("pinned"),
-                    archived: row.get("archived"),
-                    writer: row.get("writer"),
-                    label: None, // label lives in running_tasks, resolved at list time
-                })
-            } else {
-                None
-            };
+                    &[&workspace_id, &session_id],
+                )
+                .await
+                .context("cannot query session metadata")?;
+            meta_row
+                .map(|row| Self::meta_from_row(&row, session_id))
+                .transpose()?
+        } else {
+            None
+        };
 
         let backend_fp = crate::session_store::backend_instance_fingerprint("greptime", conn);
         let session = Self {
@@ -2179,23 +2188,11 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
     // deduplicates per session taking the latest last_active_at. There is
     // no partial-row rewrite, so a touch can never wipe immutable columns.
 
-    /// Latest metadata snapshot for one session, or `None` when the
-    /// session has no row yet (brand-new session, or a subagent whose
-    /// parent has not written its row yet).
-    async fn load_meta_row(&self, session_id: &str) -> Result<Option<SessionMeta>> {
-        let row = self
-            .client
-            .query_opt(
-                "SELECT created_at, last_active_at, model, \"role\", entry_count, \
-                        parent_session_id, parent_task_id, title, pinned, archived, writer \
-                 FROM sessions \
-                 WHERE workspace_id = $1 AND session_id = $2 \
-                 ORDER BY last_active_at DESC LIMIT 1",
-                &[&self.workspace_id, &session_id],
-            )
-            .await
-            .context("cannot query session metadata")?;
-        Ok(row.map(|row| SessionMeta {
+    /// Decode one metadata row using the column list every meta SELECT
+    /// shares. `refs` is one JSON column: NULL reads as empty, malformed
+    /// JSON fails loudly instead of silently dropping links.
+    fn meta_from_row(row: &tokio_postgres::Row, session_id: &str) -> Result<SessionMeta> {
+        Ok(SessionMeta {
             session_id: session_id.to_owned(),
             created_at: row.get("created_at"),
             last_active_at: row.get("last_active_at"),
@@ -2207,9 +2204,33 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             title: row.get("title"),
             pinned: row.get("pinned"),
             archived: row.get("archived"),
+            refs: crate::session_store::refs_from_json(
+                row.get::<_, Option<String>>("refs").as_deref(),
+            )
+            .map_err(anyhow::Error::msg)?,
             writer: row.get("writer"),
             label: None, // label lives in running_tasks, resolved at list time
-        }))
+        })
+    }
+
+    /// Latest metadata snapshot for one session, or `None` when the
+    /// session has no row yet (brand-new session, or a subagent whose
+    /// parent has not written its row yet).
+    async fn load_meta_row(&self, session_id: &str) -> Result<Option<SessionMeta>> {
+        let row = self
+            .client
+            .query_opt(
+                "SELECT created_at, last_active_at, model, \"role\", entry_count, \
+                        parent_session_id, parent_task_id, title, pinned, archived, writer, refs \
+                 FROM sessions \
+                 WHERE workspace_id = $1 AND session_id = $2 \
+                 ORDER BY last_active_at DESC LIMIT 1",
+                &[&self.workspace_id, &session_id],
+            )
+            .await
+            .context("cannot query session metadata")?;
+        row.map(|row| Self::meta_from_row(&row, session_id))
+            .transpose()
     }
 
     async fn insert_meta(&self, meta: &mut SessionMeta) -> Result<()> {
@@ -2219,12 +2240,18 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
         // from a row cached by another process. Callers construct with
         // `writer: None`; the stamped value is what lands in the column.
         meta.writer = Some(process_identity().to_owned());
+        // One JSON value for the whole list; NULL when empty (the same value
+        // a pre-column row reads back as). Encoding happens before the
+        // statement so the parameter borrows a local that outlives it.
+        let refs_json =
+            crate::session_store::refs_to_json(&meta.refs).map_err(anyhow::Error::msg)?;
         self.client
             .execute(
                 "INSERT INTO sessions \
                  (workspace_id, session_id, created_at, last_active_at, model, \"role\", \
-                  entry_count, parent_session_id, parent_task_id, title, pinned, archived, writer) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+                  entry_count, parent_session_id, parent_task_id, title, pinned, archived, writer, \
+                  refs) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
                 &[
                     &self.workspace_id,
                     &meta.session_id,
@@ -2239,6 +2266,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
                     &meta.pinned,
                     &meta.archived,
                     &meta.writer,
+                    &refs_json,
                 ],
             )
             .await
@@ -2299,8 +2327,9 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             title: existing.title.clone(),
             pinned: existing.pinned,
             archived: existing.archived,
-            writer: None, // stamped by insert_meta with the writing process
-            label: None,  // label lives in running_tasks, resolved at list time
+            refs: existing.refs.clone(), // links are never rewritten by a resume
+            writer: None,                // stamped by insert_meta with the writing process
+            label: None,                 // label lives in running_tasks, resolved at list time
         }
     }
 
@@ -2372,6 +2401,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             title: title.map(str::to_owned), // a fresh session may be named at creation (subagent label)
             pinned: None,                    // a fresh session is unpinned until the user pins it
             archived: None, // a fresh session is unarchived until the user archives it
+            refs: Vec::new(), // no PR/issue links until the tool or the owner adds them
             writer: None,   // stamped by insert_meta with the writing process
             label: None,    // label lives in running_tasks, resolved at list time
         };
@@ -2505,6 +2535,39 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
         Ok(())
     }
 
+    /// Read → mutate → append the session's PR/issue links: one full snapshot
+    /// row carrying the new `refs` JSON and a fresh `last_active_at`, exactly
+    /// like [`Self::set_archived`]. Returns the stored (deduplicated) list.
+    ///
+    /// Never self-creates, and — unlike the flag setters' silent `Ok` — a
+    /// missing row is an error: a link handed to the store must not be
+    /// dropped quietly (the same "fail loudly" rule that applies when this
+    /// backend cannot carry the column at all).
+    pub async fn update_refs(
+        &self,
+        session_id: &str,
+        mutate: impl FnOnce(
+            &mut Vec<crate::session_store::SessionRef>,
+        ) -> std::result::Result<(), String>,
+    ) -> Result<Vec<crate::session_store::SessionRef>> {
+        let meta = if session_id == self.session_id {
+            self.effective_meta().await?
+        } else {
+            self.load_meta_row(session_id).await?
+        };
+        let Some(mut meta) = meta else {
+            anyhow::bail!("session {session_id} has no metadata row to store links in");
+        };
+        mutate(&mut meta.refs).map_err(anyhow::Error::msg)?;
+        crate::session_store::dedup_refs(&mut meta.refs);
+        meta.last_active_at = us_to_datetime(next_event_time_us());
+        self.insert_meta(&mut meta).await?;
+        if session_id == self.session_id {
+            *self.cached_meta.lock().unwrap() = Some(meta.clone());
+        }
+        Ok(meta.refs)
+    }
+
     /// Return sessions whose latest metadata snapshot points at `parent_session_id`.
     ///
     /// This is intentionally narrower than [`Self::list_meta`]: callers that
@@ -2590,7 +2653,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
         let (filter_clause, live_ids) = sidebar_filter_clause(sidebar_filter);
         let sql = format!(
             "SELECT session_id, created_at, last_active_at, model, \"role\", entry_count, \
-                    parent_session_id, parent_task_id, title, pinned, archived, writer \
+                    parent_session_id, parent_task_id, title, pinned, archived, writer, refs \
              FROM ( \
                  SELECT \
                      session_id, \
@@ -2604,7 +2667,8 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
                      last_value(ARRAY[title] ORDER BY last_active_at)[1] AS title, \
                      last_value(ARRAY[pinned] ORDER BY last_active_at)[1] AS pinned, \
                      last_value(ARRAY[archived] ORDER BY last_active_at)[1] AS archived, \
-                     last_value(ARRAY[writer] ORDER BY last_active_at)[1] AS writer \
+                     last_value(ARRAY[writer] ORDER BY last_active_at)[1] AS writer, \
+                     last_value(ARRAY[refs] ORDER BY last_active_at)[1] AS refs \
                  FROM sessions \
                  WHERE workspace_id = $1 \
                  GROUP BY session_id \
@@ -2624,22 +2688,11 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
         let decode_started = std::time::Instant::now();
         let out = rows
             .iter()
-            .map(|row| SessionMeta {
-                session_id: row.get("session_id"),
-                created_at: row.get("created_at"),
-                last_active_at: row.get("last_active_at"),
-                model: row.get("model"),
-                role: row.get("role"),
-                entry_count: row.get("entry_count"),
-                parent_session_id: row.get("parent_session_id"),
-                parent_task_id: row.get("parent_task_id"),
-                title: row.get("title"),
-                pinned: row.get("pinned"),
-                archived: row.get("archived"),
-                writer: row.get("writer"),
-                label: None, // label lives in running_tasks, resolved at list time
+            .map(|row| {
+                let session_id: String = row.get("session_id");
+                Self::meta_from_row(row, &session_id)
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         let decode_ms = decode_started.elapsed().as_millis();
         Ok((
             out.clone(),
@@ -2661,7 +2714,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             .client
             .query(
                 "SELECT created_at, last_active_at, model, \"role\", entry_count, \
-                        parent_session_id, parent_task_id, title, pinned, archived, writer \
+                        parent_session_id, parent_task_id, title, pinned, archived, writer, refs \
                  FROM sessions \
                  WHERE workspace_id = $1 AND session_id = $2 \
                  ORDER BY last_active_at ASC",
@@ -2669,24 +2722,9 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             )
             .await
             .context("cannot load session metadata audit trail")?;
-        Ok(rows
-            .iter()
-            .map(|row| SessionMeta {
-                session_id: session_id.to_owned(),
-                created_at: row.get("created_at"),
-                last_active_at: row.get("last_active_at"),
-                model: row.get("model"),
-                role: row.get("role"),
-                entry_count: row.get("entry_count"),
-                parent_session_id: row.get("parent_session_id"),
-                parent_task_id: row.get("parent_task_id"),
-                title: row.get("title"),
-                pinned: row.get("pinned"),
-                archived: row.get("archived"),
-                writer: row.get("writer"),
-                label: None, // label lives in running_tasks, resolved at list time
-            })
-            .collect())
+        rows.iter()
+            .map(|row| Self::meta_from_row(row, session_id))
+            .collect()
     }
 
     /// Hide a session from the sessions list: delete ALL of its metadata
@@ -2755,11 +2793,12 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
                 entry_count: row.get("entry_count"),
                 parent_session_id: None,
                 parent_task_id: None,
-                title: None,    // pre-table sessions have no user-assigned name
-                pinned: None,   // pre-table sessions are unpinned
-                archived: None, // pre-table sessions are unarchived
-                writer: None,   // stamped by insert_meta with the writing process
-                label: None,    // label lives in running_tasks, resolved at list time
+                title: None,      // pre-table sessions have no user-assigned name
+                pinned: None,     // pre-table sessions are unpinned
+                archived: None,   // pre-table sessions are unarchived
+                refs: Vec::new(), // pre-table sessions carry no PR/issue links
+                writer: None,     // stamped by insert_meta with the writing process
+                label: None,      // label lives in running_tasks, resolved at list time
             })
             .await?;
         }
@@ -3188,6 +3227,79 @@ mod tests {
         );
         assert_eq!(live.len(), 2);
         assert!(live.iter().all(|id| live_set.contains(id)));
+    }
+
+    /// `refs` is ONE nullable JSON column: NULL (a row written before the
+    /// column existed) reads as empty, and the stored value is the same
+    /// `{"kind","url"}` list the other two backends carry. Unit-level because
+    /// the live round-trip below needs a database.
+    #[test]
+    fn refs_column_null_reads_as_empty_and_json_round_trips() {
+        use crate::session_store::{SessionRef, refs_from_json};
+        assert!(refs_from_json(None).unwrap().is_empty());
+        assert!(refs_from_json(Some("")).unwrap().is_empty());
+        let refs = refs_from_json(Some(
+            r#"[{"kind":"pr","url":"https://github.com/acme/widget/pull/14"}]"#,
+        ))
+        .unwrap();
+        assert_eq!(
+            refs,
+            vec![SessionRef::new("pr", "https://github.com/acme/widget/pull/14").unwrap()]
+        );
+        assert!(
+            refs_from_json(Some("not json")).is_err(),
+            "a malformed column fails loudly instead of dropping links"
+        );
+    }
+
+    /// Both kinds round-trip through the single JSON column and deduplicate by
+    /// exact URL within a kind (needs a live GreptimeDB, like the other
+    /// integration tests here).
+    #[tokio::test]
+    async fn refs_round_trip() {
+        use crate::session_store::SessionRef;
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let sid = format!("test-gt-refs-{}", crate::session::new_id());
+        let session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        session
+            .create_meta(&sid, Some("m"), Some("main"), None, None, None)
+            .await
+            .unwrap();
+        assert!(
+            session
+                .load_meta_row(&sid)
+                .await
+                .unwrap()
+                .unwrap()
+                .refs
+                .is_empty(),
+            "a fresh row has a NULL refs column and reads back as empty"
+        );
+        let pr = SessionRef::new("pr", "https://github.com/acme/widget/pull/14").unwrap();
+        let issue = SessionRef::new("issue", "https://github.com/acme/widget/issues/22").unwrap();
+        let stored = session
+            .update_refs(&sid, |refs| {
+                refs.push(pr.clone());
+                refs.push(issue.clone());
+                refs.push(pr.clone()); // duplicate collapses
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(stored, vec![pr, issue]);
+        let listed = session.list_meta().await.unwrap();
+        let mine = listed.iter().find(|m| m.session_id == sid).unwrap();
+        assert_eq!(mine.refs, stored);
+        assert_eq!(
+            session.audit_meta(&sid).await.unwrap().last().unwrap().refs,
+            stored
+        );
+        session.delete_meta(&sid).await.unwrap();
     }
 
     fn conn_str() -> String {
@@ -6372,6 +6484,13 @@ mod tests {
             title: Some("a title".into()),
             pinned: Some(true),
             archived: Some(true),
+            refs: vec![
+                crate::session_store::SessionRef::new(
+                    "pr",
+                    "https://github.com/acme/widget/pull/14",
+                )
+                .unwrap(),
+            ],
             writer: None,
             label: None,
         };
@@ -6410,6 +6529,10 @@ mod tests {
         assert_eq!(backfilled.pinned, Some(true));
         assert_eq!(backfilled.archived, Some(true));
         assert_eq!(
+            backfilled.refs, existing.refs,
+            "a resume carries the session's links"
+        );
+        assert_eq!(
             backfilled.writer, None,
             "writer is stamped by insert_meta, never by the constructor"
         );
@@ -6428,6 +6551,7 @@ mod tests {
             title: None,
             pinned: None,
             archived: None,
+            refs: Vec::new(),
             writer: None,
             label: None,
         };

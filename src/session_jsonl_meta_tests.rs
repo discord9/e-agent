@@ -1013,3 +1013,128 @@ async fn invalid_session_names_are_rejected() {
     );
     assert!(store.delete_meta(temp.path(), "").await.is_err());
 }
+
+// ----------------------------------------------------------------------
+// refs (PR / issue links)
+// ----------------------------------------------------------------------
+
+/// The single most dangerous compatibility case: a sidecar line written
+/// BEFORE the `refs` field existed. The tail-read parses each line as
+/// `SessionMeta` and silently skips unparseable lines, so a missing
+/// `#[serde(default)]` would hide every pre-existing session from
+/// `list_meta`. The session must list, with empty lists.
+#[tokio::test]
+async fn meta_line_without_refs_field_lists_as_empty() {
+    let temp = tempfile::tempdir().unwrap();
+    let sid = format!("meta-legacy-{}", crate::session::new_id());
+    let path = sidecar(temp.path(), &sid);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // Build the exact snapshot the pre-change writer emitted, then drop the
+    // new key: every other field (including `label`) stays byte-identical to
+    // a real legacy line, so this cannot drift from the real record shape.
+    let now = chrono::Utc::now().naive_utc();
+    let mut legacy = serde_json::to_value(SessionMeta {
+        session_id: sid.clone(),
+        created_at: now,
+        last_active_at: now,
+        model: Some("gpt-x".into()),
+        role: Some("main".into()),
+        entry_count: 3,
+        parent_session_id: None,
+        parent_task_id: None,
+        title: Some("legacy".into()),
+        pinned: None,
+        archived: None,
+        refs: Vec::new(),
+        writer: Some("1@host#abc".into()),
+        label: None,
+    })
+    .unwrap();
+    legacy
+        .as_object_mut()
+        .expect("snapshot is an object")
+        .remove("refs");
+    std::fs::write(&path, format!("{legacy}\n")).unwrap();
+
+    let store = SessionStore::Jsonl;
+    let list = store.list_meta(temp.path()).await.unwrap();
+    let meta = list
+        .iter()
+        .find(|meta| meta.session_id == sid)
+        .expect("a pre-refs snapshot must still list (serde default, not a skip)");
+    assert_eq!(meta.title.as_deref(), Some("legacy"));
+    assert!(meta.refs.is_empty(), "absent refs read as empty");
+}
+
+/// Both kinds round-trip through the sidecar as ONE JSON value, deduplicate by
+/// exact URL within a kind, and removing leaves the other kind intact.
+#[tokio::test]
+async fn refs_round_trip_through_the_sidecar() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = SessionStore::Jsonl;
+    let sid = format!("meta-refs-{}", crate::session::new_id());
+    store
+        .create_meta(temp.path(), &sid, None, None, None, None, None)
+        .await
+        .unwrap();
+
+    let pr = SessionRef::new("pr", "https://github.com/acme/widget/pull/14").unwrap();
+    let issue = SessionRef::new("issue", "https://github.com/acme/widget/issues/22").unwrap();
+    let stored = store
+        .update_refs(temp.path(), &sid, |refs| {
+            refs.push(pr.clone());
+            refs.push(issue.clone());
+            refs.push(pr.clone()); // duplicate collapses
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(stored, vec![pr.clone(), issue.clone()]);
+    let listed = store.list_meta(temp.path()).await.unwrap();
+    assert_eq!(listed[0].refs, vec![pr.clone(), issue.clone()]);
+
+    // One JSON value on the row: the tail line carries `refs` as an array of
+    // {"kind","url"} objects (a future kind needs no migration).
+    let tail = std::fs::read_to_string(sidecar(temp.path(), &sid)).unwrap();
+    let last = tail.lines().rfind(|l| !l.trim().is_empty()).unwrap();
+    let value: serde_json::Value = serde_json::from_str(last).unwrap();
+    assert_eq!(
+        value["refs"],
+        serde_json::json!([
+            {"kind": "pr", "url": "https://github.com/acme/widget/pull/14"},
+            {"kind": "issue", "url": "https://github.com/acme/widget/issues/22"}
+        ])
+    );
+
+    let after_remove = store
+        .update_refs(temp.path(), &sid, |refs| {
+            refs.retain(|link| link != &pr);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(after_remove, vec![issue]);
+    assert_eq!(
+        store.list_meta(temp.path()).await.unwrap()[0].refs,
+        after_remove
+    );
+}
+
+/// A link can only be stored when the session has a metadata row: silently
+/// returning an empty list would look like success and lose the link.
+#[tokio::test]
+async fn update_refs_without_a_meta_row_fails_loudly() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = SessionStore::Jsonl;
+    let error = store
+        .update_refs(temp.path(), "meta-refs-ghost", |refs| {
+            refs.push(SessionRef::new("pr", "https://github.com/a/b/pull/1").unwrap());
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("no metadata row"),
+        "{error:#}"
+    );
+}

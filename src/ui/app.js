@@ -128,7 +128,7 @@ const els = {
   banner: $("banner"), bannerText: $("bannerText"), bannerClose: $("bannerClose"),
   tokenInput: $("tokenInput"), tokenToggle: $("tokenToggle"),
   chatView: $("chatView"), chatEmpty: $("chatEmpty"),
-  chatBusy: $("chatBusy"), chatSessionId: $("chatSessionId"),
+  chatBusy: $("chatBusy"), chatSessionId: $("chatSessionId"), chatRefs: $("chatRefs"),
   chatStatus: $("chatStatus"), usageInfo: $("usageInfo"),
   messages: $("messages"), promptInput: $("promptInput"), queueBar: $("queueBar"),
   goalBar: $("goalBar"),

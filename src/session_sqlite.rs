@@ -125,6 +125,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     pinned INTEGER NULL,
     archived INTEGER NULL,
     writer TEXT NULL,
+    refs TEXT NULL,
     PRIMARY KEY (workspace_id, session_id, last_active_at)
 )
 "#;
@@ -285,7 +286,7 @@ impl SqliteSession {
             .map_err(|e| format!("cannot create usage_entries table: {e}"))?;
 
         // Idempotent schema migration for the `title`, `pinned`,
-        // `archived` and `writer` columns — a table-structure evolution:
+        // `archived`, `writer` and `refs` columns — a table-structure evolution:
         // the `sessions` table shipped without them, so pre-existing
         // databases need an ALTER (fresh databases already have them via
         // CREATE_TABLE_SESSIONS above; `CREATE TABLE IF NOT EXISTS` never
@@ -309,6 +310,7 @@ impl SqliteSession {
         let mut pinned_available = true;
         let mut archived_available = true;
         let mut writer_available = true;
+        let mut refs_available = true;
         {
             let mut rows = conn
                 .query("PRAGMA table_info(sessions)", ())
@@ -337,7 +339,7 @@ impl SqliteSession {
             // trailing `NULL` as NOT NULL (CREATE TABLE is unaffected —
             // fresh DBs keep nullable columns), so the ALTER must OMIT the
             // constraint; ADD COLUMN defaults to nullable anyway.
-            let migrations: [(&str, &str, &str, &mut bool); 4] = [
+            let migrations: [(&str, &str, &str, &mut bool); 5] = [
                 ("title", "TEXT", "session titles", &mut title_available),
                 (
                     "pinned",
@@ -352,6 +354,7 @@ impl SqliteSession {
                     &mut archived_available,
                 ),
                 ("writer", "TEXT", "writer audit", &mut writer_available),
+                ("refs", "TEXT", "session refs", &mut refs_available),
             ];
             for (name, sql_type, feature, available) in migrations {
                 if columns.iter().any(|c| c == name) {
@@ -495,12 +498,17 @@ impl SqliteSession {
         // feature column is unavailable (failed migration): the cache
         // query references the columns and would error on an unmigrated
         // table, exactly like Greptime's degraded mode.
-        let cached_meta =
-            if title_available && pinned_available && archived_available && writer_available {
-                let mut rows = conn
+        let cached_meta = if title_available
+            && pinned_available
+            && archived_available
+            && writer_available
+            && refs_available
+        {
+            let mut rows = conn
                     .query(
                         "SELECT created_at, last_active_at, model, \"role\", entry_count, \
-                                parent_session_id, parent_task_id, title, pinned, archived, writer \
+                                parent_session_id, parent_task_id, title, pinned, archived, writer, \
+                                refs \
                          FROM sessions \
                          WHERE workspace_id = ?1 AND session_id = ?2 \
                          ORDER BY last_active_at DESC LIMIT 1",
@@ -508,17 +516,17 @@ impl SqliteSession {
                     )
                     .await
                     .map_err(|e| format!("cannot query session metadata: {e}"))?;
-                match rows
-                    .next()
-                    .await
-                    .map_err(|e| format!("cannot query session metadata: {e}"))?
-                {
-                    Some(row) => Some(row_to_meta(&row, session_id)?),
-                    None => None,
-                }
-            } else {
-                None
-            };
+            match rows
+                .next()
+                .await
+                .map_err(|e| format!("cannot query session metadata: {e}"))?
+            {
+                Some(row) => Some(row_to_meta(&row, session_id)?),
+                None => None,
+            }
+        } else {
+            None
+        };
 
         let session = Self {
             conn: Arc::new(tokio::sync::Mutex::new(conn)),
@@ -2264,7 +2272,7 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
         let mut rows = conn
             .query(
                 "SELECT created_at, last_active_at, model, \"role\", entry_count, \
-                        parent_session_id, parent_task_id, title, pinned, archived, writer \
+                        parent_session_id, parent_task_id, title, pinned, archived, writer, refs \
                  FROM sessions \
                  WHERE workspace_id = ?1 AND session_id = ?2 \
                  ORDER BY last_active_at DESC LIMIT 1",
@@ -2289,12 +2297,17 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
         // from a row cached by another process. Callers construct with
         // `writer: None`; the stamped value is what lands in the column.
         meta.writer = Some(process_identity().to_owned());
+        // Encode the refs JSON before taking the connection lock: the
+        // column is one JSON value, and its absence (NULL) and an empty
+        // list mean the same thing on read.
+        let refs_json = crate::session_store::refs_to_json(&meta.refs)?;
         let conn = self.conn.lock().await;
         conn.execute(
             "INSERT INTO sessions \
              (workspace_id, session_id, created_at, last_active_at, model, \"role\", \
-              entry_count, parent_session_id, parent_task_id, title, pinned, archived, writer) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+              entry_count, parent_session_id, parent_task_id, title, pinned, archived, writer, \
+              refs) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             (
                 self.workspace_id.as_str(),
                 meta.session_id.as_str(),
@@ -2309,6 +2322,7 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
                 meta.pinned.map(|p| if p { 1 } else { 0 }),
                 meta.archived.map(|a| if a { 1 } else { 0 }),
                 meta.writer.as_deref(),
+                refs_json.as_deref(),
             ),
         )
         .await
@@ -2367,8 +2381,9 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
             title: existing.title.clone(),
             pinned: existing.pinned,
             archived: existing.archived,
-            writer: None, // stamped by insert_meta with the writing process
-            label: None,  // label lives in running_tasks, resolved at list time
+            refs: existing.refs.clone(), // links are never rewritten by a resume
+            writer: None,                // stamped by insert_meta with the writing process
+            label: None,                 // label lives in running_tasks, resolved at list time
         }
     }
 
@@ -2440,6 +2455,7 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
             title: title.map(str::to_owned), // a fresh session may be named at creation (subagent label)
             pinned: None,                    // a fresh session is unpinned until the user pins it
             archived: None, // a fresh session is unarchived until the user archives it
+            refs: Vec::new(), // no PR/issue links until the tool or the owner adds them
             writer: None,   // stamped by insert_meta with the writing process
             label: None,    // label lives in running_tasks, resolved at list time
         };
@@ -2571,6 +2587,42 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
         Ok(())
     }
 
+    /// Read → mutate → append the session's PR/issue links: one full snapshot
+    /// row carrying the new `refs` JSON and a fresh `last_active_at`, exactly
+    /// like [`Self::set_title`]. Returns the stored (deduplicated) list.
+    ///
+    /// Never self-creates, and — unlike the flag setters' silent `Ok` — a
+    /// missing row is an error: a link handed to the store must not be
+    /// dropped quietly.
+    ///
+    /// `session_id` is explicit like the other metadata mutators so a
+    /// workspace-scoped meta store can edit historical sessions it is not
+    /// bound to; the bound session's cached snapshot is refreshed.
+    pub async fn update_refs(
+        &self,
+        session_id: &str,
+        mutate: impl FnOnce(&mut Vec<crate::session_store::SessionRef>) -> Result<(), String>,
+    ) -> Result<Vec<crate::session_store::SessionRef>, String> {
+        let meta = if session_id == self.session_id {
+            self.effective_meta().await?
+        } else {
+            self.load_meta_row(session_id).await?
+        };
+        let Some(mut meta) = meta else {
+            return Err(format!(
+                "session {session_id} has no metadata row to store links in"
+            ));
+        };
+        mutate(&mut meta.refs)?;
+        crate::session_store::dedup_refs(&mut meta.refs);
+        meta.last_active_at = us_to_datetime(next_event_time_us());
+        self.insert_meta(&mut meta).await?;
+        if session_id == self.session_id {
+            *self.cached_meta.lock().unwrap() = Some(meta.clone());
+        }
+        Ok(meta.refs)
+    }
+
     /// Latest metadata snapshot per session, newest activity first.
     ///
     /// The table is append-only, so one session has many rows; the list
@@ -2604,7 +2656,7 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
         let sql = format!(
             "SELECT s.session_id, s.created_at, s.last_active_at, s.model, s.\"role\", \
                     s.entry_count, s.parent_session_id, s.parent_task_id, s.title, s.pinned, \
-                    s.archived, s.writer \
+                    s.archived, s.writer, s.refs \
              FROM sessions s \
              WHERE s.workspace_id = ?1 \
                AND s.last_active_at = ( \
@@ -2664,7 +2716,7 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
         let mut rows = conn
             .query(
                 "SELECT created_at, last_active_at, model, \"role\", entry_count, \
-                        parent_session_id, parent_task_id, title, pinned, archived, writer \
+                        parent_session_id, parent_task_id, title, pinned, archived, writer, refs \
                  FROM sessions \
                  WHERE workspace_id = ?1 AND session_id = ?2 \
                  ORDER BY last_active_at ASC",
@@ -2817,11 +2869,12 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
                 entry_count,
                 parent_session_id: None,
                 parent_task_id: None,
-                title: None,    // pre-table sessions have no user-assigned name
-                pinned: None,   // pre-table sessions are unpinned
-                archived: None, // pre-table sessions are unarchived
-                writer: None,   // stamped by insert_meta with the writing process
-                label: None,    // label lives in running_tasks, resolved at list time
+                title: None,      // pre-table sessions have no user-assigned name
+                pinned: None,     // pre-table sessions are unpinned
+                archived: None,   // pre-table sessions are unarchived
+                refs: Vec::new(), // pre-table sessions carry no PR/issue links
+                writer: None,     // stamped by insert_meta with the writing process
+                label: None,      // label lives in running_tasks, resolved at list time
             })
             .await?;
         }
@@ -3532,6 +3585,12 @@ fn row_to_meta(row: &turso::Row, session_id: &str) -> Result<SessionMeta, String
         title,
         pinned,
         archived,
+        refs: crate::session_store::refs_from_json(
+            row.get_value(11)
+                .map_err(|e| format!("cannot query session metadata: {e}"))?
+                .as_text()
+                .map(String::as_str),
+        )?,
         writer: row
             .get_value(10)
             .map_err(|e| format!("cannot query session metadata: {e}"))?
@@ -3544,7 +3603,8 @@ fn row_to_meta(row: &turso::Row, session_id: &str) -> Result<SessionMeta, String
 /// Map a `list_meta` row (session_id already extracted as column 0) to a
 /// [`SessionMeta`]. Column layout of the list SELECT: `session_id,
 /// created_at, last_active_at, model, "role", entry_count,
-/// parent_session_id, parent_task_id, title, pinned, archived, writer`.
+/// parent_session_id, parent_task_id, title, pinned, archived, writer,
+/// refs`.
 fn meta_from_row_values(row: &turso::Row, session_id: &str) -> Result<SessionMeta, String> {
     let created_at = us_to_datetime(
         row.get_value(1)
@@ -3630,6 +3690,12 @@ fn meta_from_row_values(row: &turso::Row, session_id: &str) -> Result<SessionMet
         title,
         pinned,
         archived,
+        refs: crate::session_store::refs_from_json(
+            row.get_value(12)
+                .map_err(|e| format!("cannot list session metadata: {e}"))?
+                .as_text()
+                .map(String::as_str),
+        )?,
         writer: row
             .get_value(11)
             .map_err(|e| format!("cannot list session metadata: {e}"))?
