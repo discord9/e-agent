@@ -85,34 +85,121 @@ pub enum PromptSubmission {
     Invalid(String),
 }
 
+/// Why a tool's mid-call question ([`SessionHandle::ask_user`]) was refused.
+/// The reason decides the tool's next step, so it is a type: only
+/// [`Self::NoFrontend`] lets a tool apply a policy of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AskRefusal {
+    /// This session has no user-facing frontend (a delegate / btw / fork
+    /// child, or a tool bound outside the runner): nobody could answer, so
+    /// the tool keeps its own policy.
+    NoFrontend,
+    /// Another question is already open. Refuse this request; answering it
+    /// from a fallback policy would grant something no human was asked.
+    Busy,
+    /// The session is no longer live.
+    Closed,
+}
+
+/// The runner-side half of one admitted mid-call ask, carrying the session's
+/// ask-slot reservation for its whole life.
+///
+/// `SessionHandle::ask_user` only ENQUEUES the question — the runner publishes
+/// it later — so the reservation is what makes a second caller refused
+/// deterministically instead of being queued behind the first. It lives
+/// exactly as long as this sender: queued (nothing answered it yet), parked on
+/// a human, or dropped (the runner dismissed it, the caller stopped waiting,
+/// or the command never reached the runner). Dropping it therefore frees the
+/// slot on every path, with no per-call-site release to forget.
+pub struct AskSender {
+    sender: Option<oneshot::Sender<Option<String>>>,
+    shared: Arc<Mutex<Shared>>,
+    /// The `call_id` this reservation belongs to: a later ask may already own
+    /// the slot, and then this drop must not clear it.
+    call_id: String,
+}
+
+impl AskSender {
+    /// Deliver the answer (`None` = cancelled / aborted).
+    pub fn send(&mut self, answer: Option<String>) {
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(answer);
+        }
+    }
+
+    /// Resolves when the caller stopped waiting (its receiver was dropped):
+    /// the question can then be dismissed instead of parking the turn on it.
+    pub async fn closed(&mut self) {
+        if let Some(sender) = self.sender.as_mut() {
+            sender.closed().await;
+        }
+    }
+}
+
+impl Drop for AskSender {
+    fn drop(&mut self) {
+        let mut shared = self.shared.lock().unwrap();
+        if shared.ask_reserved.as_deref() == Some(self.call_id.as_str()) {
+            shared.ask_reserved = None;
+        }
+    }
+}
+
+/// One accepted answer: what the model reads, plus — for a question with
+/// fixed options — the id of the option it names.
+struct ResolvedAnswer {
+    /// The model-facing text: the submitted answer verbatim for a free-text
+    /// question, `Selected option: {id} ({label})` for a fixed-option one.
+    value: String,
+    /// The chosen option's id. It is carried as a value and never re-derived
+    /// from `value`: display text is not an identity (`" x "` and `"x"` both
+    /// answer to `"x"`, and two options can render to the same sentence), so
+    /// re-parsing it is exactly how a frontend's `"x"` would become a tool's
+    /// `" x "`.
+    option: Option<String>,
+}
+
 /// Resolve one submitted answer against its question — the single acceptance
 /// rule shared by the blocking and asynchronous paths.
 ///
-/// * A free-text question (no options) keeps today's contract: any non-empty
-///   answer is accepted verbatim.
+/// * A free-text question (no options) accepts any non-empty answer and keeps
+///   its trimmed text: there is no identity to protect, only layout to drop.
 /// * A question with options accepts exactly one of those option ids and
 ///   yields the model-facing `Selected option: {id} ({label})`, so the model
-///   never has to remember the id → label mapping.
-fn resolve_answer(question: &UserQuestion, submitted: &str) -> Result<String, String> {
-    let answer = submitted.trim();
-    if answer.is_empty() {
-        return Err("answer must not be empty".into());
-    }
+///   never has to remember the id → label mapping. The id is compared byte for
+///   byte — no trimming, case folding, or other normalisation: an id is an
+///   identity the asking tool sends back verbatim, so `" x "` and `"x"` are two
+///   different options and a trimmed match would answer the wrong one.
+fn resolve_answer(question: &UserQuestion, submitted: &str) -> Result<ResolvedAnswer, String> {
     if question.options.is_empty() {
-        return Ok(submitted.to_owned());
+        let answer = submitted.trim();
+        if answer.is_empty() {
+            return Err("answer must not be empty".into());
+        }
+        return Ok(ResolvedAnswer {
+            value: answer.to_owned(),
+            option: None,
+        });
     }
-    let Some(option) = question.options.iter().find(|option| option.id == answer) else {
+    let Some(option) = question
+        .options
+        .iter()
+        .find(|option| option.id == submitted)
+    else {
         let allowed: Vec<&str> = question
             .options
             .iter()
             .map(|option| option.id.as_str())
             .collect();
         return Err(format!(
-            "answer {answer:?} is not an option of this question; allowed ids: {}",
+            "answer {submitted:?} is not an option of this question; allowed ids: {}",
             allowed.join(", ")
         ));
     };
-    Ok(format!("Selected option: {} ({})", option.id, option.label))
+    Ok(ResolvedAnswer {
+        value: format!("Selected option: {} ({})", option.id, option.label),
+        option: Some(option.id.clone()),
+    })
 }
 
 const EVENT_CAPACITY: usize = 256;
@@ -284,11 +371,150 @@ where
                 Some(SessionCommand::Cancel) => {
                     return WaitResult { outcome: WaitOutcome::Released, pending };
                 }
+                Some(SessionCommand::AskUser { request, mut reply }) => {
+                    // A tool asked the human mid-call. Surface it as this
+                    // session's blocking question — the same `WaitingInput`
+                    // state and structured answer every frontend already
+                    // renders — while the tool future stays parked on its
+                    // receiver.
+                    let asked = ask_user_while_waiting(
+                        commands,
+                        shared,
+                        request,
+                        &mut reply,
+                        operation,
+                        &mut pending,
+                    )
+                    .await;
+                    match asked {
+                        AskOutcome::Answered(answer) => {
+                            reply.send(answer);
+                        }
+                        AskOutcome::Finished(value) => {
+                            // The tool finished while its question was open
+                            // (it stopped waiting, so the answer could no
+                            // longer be delivered). Take its result and carry
+                            // on with the turn instead of parking on a
+                            // question nobody can receive.
+                            while let Ok(command) = commands.try_recv() {
+                                pending.push(command);
+                            }
+                            return WaitResult { outcome: WaitOutcome::Completed(value), pending };
+                        }
+                        AskOutcome::Abandoned => {}
+                        AskOutcome::Released => {
+                            return WaitResult { outcome: WaitOutcome::Released, pending };
+                        }
+                        AskOutcome::Closed => {
+                            return WaitResult { outcome: WaitOutcome::Closed, pending };
+                        }
+                    }
+                }
                 Some(command) => pending.push(command),
                 None => return WaitResult { outcome: WaitOutcome::Closed, pending },
             }
         }
     }
+}
+
+/// How a running tool's mid-call question ended.
+enum AskOutcome<T> {
+    /// The question closed with (`Some(chosen option id)`) or without
+    /// (`None` = cancelled) an answer; the tool is told either way.
+    Answered(Option<String>),
+    /// The tool that asked is gone: it finished its operation, or it dropped
+    /// the answer receiver (a dead agent, a cancelled child). Nothing can use
+    /// an answer, so the question is dismissed and the turn keeps going.
+    Abandoned,
+    /// The tool operation finished while the question was open; its result is
+    /// the wait's result and the turn continues with it.
+    Finished(T),
+    /// The turn was cancelled while the question was open: the in-flight
+    /// tool future (and its agent child) is released.
+    Released,
+    /// The command channel closed: the session is ending.
+    Closed,
+}
+
+/// Surface one tool's question as this session's blocking request and wait
+/// for the structured answer — the same `WaitingInput` state, first-answer
+/// claim, and option-id validation the `request_user_input` interception
+/// uses, so no frontend needs a second question path. `pending` collects
+/// every other command for the caller, exactly like the outer wait.
+///
+/// The wait is a THREE-way one, because a question is only answerable while
+/// the tool that asked is still there: the operation itself is polled (so its
+/// own timeout can fire), and a dropped answer receiver means the requester
+/// left. Either one dismisses the question instead of parking a turn on it —
+/// the reported bug was stdout EOF failing `session/prompt` while the runner
+/// waited for a human forever.
+async fn ask_user_while_waiting<F, T>(
+    commands: &mut mpsc::UnboundedReceiver<SessionCommand>,
+    shared: &Arc<Mutex<Shared>>,
+    request: UserInputRequest,
+    reply: &mut AskSender,
+    operation: &mut std::pin::Pin<Box<F>>,
+    pending: &mut Vec<SessionCommand>,
+) -> AskOutcome<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    let call_id = request.call_id.clone();
+    let question = request.questions.first().cloned();
+    {
+        let mut state = shared.lock().unwrap();
+        // The ask is published now, so the published question IS the slot:
+        // the reservation's job (refusing a second caller before the runner
+        // gets here) is done, and `waiting_input` refuses from now on.
+        state.ask_reserved = None;
+        state.input_claimed = false;
+        state.waiting_input = Some(request.clone());
+        state
+            .status
+            .send_replace(SessionStatus::WaitingInput(request));
+    }
+    let outcome = loop {
+        tokio::select! {
+            biased;
+            // The tool finished: it can no longer use an answer.
+            value = operation.as_mut() => break AskOutcome::Finished(value),
+            // The tool dropped the receiver it asked on: same thing, and the
+            // only signal when only the ask itself ended (a dead agent makes
+            // the ACP tool answer `cancelled` by itself).
+            _ = reply.closed() => break AskOutcome::Abandoned,
+            command = commands.recv() => match command {
+                Some(SessionCommand::Answer {
+                    call_id: answered,
+                    answers,
+                    option,
+                }) if answered == call_id => {
+                    // A question with options answers with the OPTION ID the
+                    // submission named (validated when it was accepted); a
+                    // free-text one answers with its text.
+                    let answer = match question.as_ref() {
+                        Some(question) if !question.options.is_empty() => option,
+                        _ => answers.into_iter().next().map(|(_, value)| value),
+                    };
+                    break AskOutcome::Answered(answer);
+                }
+                Some(SessionCommand::WebAttach(reply)) => {
+                    // WaitingInput is a stable runner boundary: answer the
+                    // attach from the head frozen before this wait.
+                    respond_web_attach_shared(shared, reply)
+                }
+                Some(SessionCommand::Cancel) => break AskOutcome::Released,
+                Some(command) => pending.push(command),
+                None => break AskOutcome::Closed,
+            },
+        }
+    };
+    {
+        let mut state = shared.lock().unwrap();
+        state.waiting_input = None;
+        state.input_claimed = false;
+        state.status.send_replace(SessionStatus::Busy);
+    }
+    outcome
 }
 
 /// Steering commands accepted by a session's command channel. Not
@@ -322,6 +548,11 @@ pub enum SessionCommand {
     Answer {
         call_id: String,
         answers: Vec<(String, String)>,
+        /// The option id the answer names, when the question offered options
+        /// (see [`ResolvedAnswer::option`]). A tool-facing question is
+        /// answered from this id — never by inverting the display text in
+        /// `answers`.
+        option: Option<String>,
     },
     /// Arm the in-memory continuation driver; `None` means indefinite.
     Continue(Option<u64>),
@@ -332,6 +563,14 @@ pub enum SessionCommand {
     AgentMessage {
         source: String,
         body: String,
+    },
+    /// A tool asking the human mid-call (`SessionHandle::ask_user`). The
+    /// runner surfaces `request` as this session's blocking question and
+    /// answers `reply` with the chosen option id (`None` = cancelled), so a
+    /// tool never fakes a suspension of its own.
+    AskUser {
+        request: UserInputRequest,
+        reply: AskSender,
     },
 }
 
@@ -427,6 +666,13 @@ struct Shared {
     /// into two winners.
     waiting_input: Option<UserInputRequest>,
     input_claimed: bool,
+    /// The mid-call ask this session has already admitted but not published
+    /// yet: `ask_user` only ENQUEUES the question, so without this reservation
+    /// two callers would both be told `Ok` and the runner would surface them
+    /// one after the other. Holds the request's `call_id`; the runner consumes
+    /// it when it publishes the question (the slot is then `waiting_input`),
+    /// and every path that drops an enqueued ask releases it again.
+    ask_reserved: Option<String>,
     /// Process-local asynchronous questions (`request_user_input` with
     /// `async: true`), keyed by the tool call id. Nothing here is durable: a
     /// restart drops unanswered questions.
@@ -437,6 +683,13 @@ struct Shared {
     latest_usage: Option<AgentEvent>,
     usage_pre_compaction: bool,
     commands_open: bool,
+    /// Whether this session may suspend on a question and wait for a human
+    /// answer. Only the root/main session installs its single
+    /// `WaitingInput` frontend (`with_user_input_allowed`); delegate, btw and
+    /// fork runners keep `false`, so `request_user_input` fails back to their
+    /// model and a tool's mid-call ask (`SessionHandle::ask_user`) refuses
+    /// instead of parking a turn nobody can answer.
+    user_input_allowed: bool,
     /// Latest goal snapshot, mirrored from the runner for UI reads
     /// (REPL `/goal`, TUI GoalBar, web `GET /api/sessions/{id}/goal`).
     goal: Option<crate::agent::GoalSnapshot>,
@@ -694,8 +947,8 @@ impl SessionHandle {
                 let Some(question) = request.questions.first() else {
                     return PromptSubmission::Conflict;
                 };
-                let value = match resolve_answer(question, &prompt) {
-                    Ok(value) => value,
+                let resolved = match resolve_answer(question, &prompt) {
+                    Ok(resolved) => resolved,
                     Err(error) => return PromptSubmission::Invalid(error),
                 };
                 let answer_call_id = request.call_id.clone();
@@ -704,7 +957,8 @@ impl SessionHandle {
                     .commands
                     .send(SessionCommand::Answer {
                         call_id: answer_call_id,
-                        answers: vec![(id, value)],
+                        answers: vec![(id, resolved.value)],
+                        option: resolved.option,
                     })
                     .is_err()
                 {
@@ -764,15 +1018,16 @@ impl SessionHandle {
             .get(call_id)
             .filter(|pending| !pending.claimed)
             .and_then(|pending| pending.request.questions.first())?;
-        let (id, value) = match resolve_answer(question, &prompt) {
-            Ok(value) => (question.id.clone(), value),
+        let resolved = match resolve_answer(question, &prompt) {
+            Ok(resolved) => resolved,
             Err(error) => return Some(PromptSubmission::Invalid(error)),
         };
         if self
             .commands
             .send(SessionCommand::Answer {
                 call_id: call_id.to_owned(),
-                answers: vec![(id, value)],
+                answers: vec![(question.id.clone(), resolved.value)],
+                option: resolved.option,
             })
             .is_err()
         {
@@ -783,6 +1038,68 @@ impl SessionHandle {
             pending.claimed = true;
         }
         Some(PromptSubmission::Answered)
+    }
+
+    /// Ask the human ONE question from inside a running tool call.
+    ///
+    /// Only the runner may suspend a turn, so this sends the question through
+    /// the session's own command channel and returns the receiver the tool
+    /// awaits: the runner parks the turn exactly like the blocking
+    /// `request_user_input` interception (`WaitingInput` + first-answer claims
+    /// it, and the answer must name one of the question's option ids). The
+    /// reply is the chosen option id; `None` means cancelled — and the
+    /// receiver resolves the same way if the session drops the question (its
+    /// turn was cancelled, or this tool stopped waiting for it).
+    ///
+    /// `Err` means this call must NOT wait, and the reason decides what the
+    /// caller may do next: only [`AskRefusal::NoFrontend`] licenses a fallback
+    /// policy of the tool's own. A refusal because another question is open
+    /// must NEVER be answered by such a policy — that is how an unasked
+    /// approval would be granted — so it is a distinct variant, not a string.
+    ///
+    /// The slot is reserved HERE, not when the runner publishes the question:
+    /// this call only enqueues it, so two callers would otherwise both be told
+    /// `Ok` and be surfaced one after the other. The second caller is refused
+    /// `Busy` deterministically until the first question has been published
+    /// and answered (or dismissed).
+    pub fn ask_user(
+        &self,
+        request: UserInputRequest,
+    ) -> Result<oneshot::Receiver<Option<String>>, AskRefusal> {
+        let mut shared = self.shared.lock().unwrap();
+        // Liveness first: `NoFrontend` licenses a policy fallback of the
+        // caller's own, so it must never be the answer for a handle whose
+        // session is already gone — nothing would apply that policy.
+        if !shared.commands_open || self.commands.is_closed() {
+            return Err(AskRefusal::Closed);
+        }
+        if !shared.user_input_allowed {
+            return Err(AskRefusal::NoFrontend);
+        }
+        if shared.waiting_input.is_some() || shared.ask_reserved.is_some() {
+            return Err(AskRefusal::Busy);
+        }
+        let call_id = request.call_id.clone();
+        let (reply, answer) = oneshot::channel();
+        shared.ask_reserved = Some(call_id.clone());
+        let reply = AskSender {
+            sender: Some(reply),
+            shared: Arc::clone(&self.shared),
+            call_id,
+        };
+        // Never hold this mutex across a value whose `Drop` re-locks it.
+        drop(shared);
+        let closed = self
+            .commands
+            .send(SessionCommand::AskUser { request, reply })
+            .is_err();
+        if closed {
+            // A failed send drops the command, and with it the reservation, so
+            // the second caller of `ask_user` is not blocked by a dead hold.
+            self.shared.lock().unwrap().commands_open = false;
+            return Err(AskRefusal::Closed);
+        }
+        Ok(answer)
     }
 
     /// Queue a prompt with an image attached; the image rides along as a
@@ -986,6 +1303,11 @@ impl TestSessionEmitter {
         shared.input_claimed = false;
         shared.status.send_replace(status);
     }
+    /// Test-only: let this ad-hoc handle answer questions exactly like a root
+    /// session (the real gate is installed by `with_user_input_allowed`).
+    pub(crate) fn allow_user_input(&self) {
+        self.shared.lock().unwrap().user_input_allowed = true;
+    }
     /// Test-only: register one process-local asynchronous question exactly as
     /// the runner does, so status/answer tests can exercise the map without
     /// driving a full turn.
@@ -1023,8 +1345,10 @@ pub(crate) fn session_test_channel() -> (
         latest_usage: None,
         usage_pre_compaction: false,
         commands_open: true,
+        user_input_allowed: false,
         waiting_input: None,
         input_claimed: false,
+        ask_reserved: None,
         pending_questions: std::collections::HashMap::new(),
         goal: None,
         live_model: None,
@@ -1179,12 +1503,6 @@ pub struct SessionRunner {
     pending: VecDeque<PendingCommand>,
     pending_web_attaches: Vec<oneshot::Sender<WebAttach>>,
     policy: IdlePolicy,
-    /// Whether this session may suspend on `request_user_input` and wait for
-    /// a human answer. Only the root/main session has a frontend that can
-    /// answer, so `false` (the default) makes the interception fail that call
-    /// back to the model instead of parking the turn in `WaitingInput` with
-    /// nobody to answer — a delegate, btw or fork child has no such frontend.
-    user_input_allowed: bool,
     last_answer: Option<String>,
     /// Internal trigger for the next turn; Goal is the in-memory driver mount.
     armed_trigger: Option<RunnerTrigger>,
@@ -1299,13 +1617,14 @@ impl SessionRunner {
         self
     }
 
-    /// Let this session suspend on `request_user_input` until a human answers.
-    /// Only the root/main session installs this: it owns the single
+    /// Let this session suspend on `request_user_input` (and on a tool's
+    /// mid-call ask, `SessionHandle::ask_user`) until a human answers. Only the
+    /// root/main session installs this: it owns the single
     /// `WaitingInput`/answer frontend. Delegate, btw and fork runners keep the
     /// `false` default, so the tool fails back to their model instead of
     /// waiting for an answer nobody can give.
-    pub(crate) fn with_user_input_allowed(mut self) -> Self {
-        self.user_input_allowed = true;
+    pub(crate) fn with_user_input_allowed(self) -> Self {
+        self.shared.lock().unwrap().user_input_allowed = true;
         self
     }
 
@@ -1313,7 +1632,7 @@ impl SessionRunner {
     /// session classes may park in `WaitingInput` without driving the tool.
     #[cfg(test)]
     pub(crate) fn user_input_allowed_for_test(&self) -> bool {
-        self.user_input_allowed
+        self.shared.lock().unwrap().user_input_allowed
     }
 
     /// The live goal projection a resumed session built its request from. A
@@ -1442,8 +1761,10 @@ impl SessionRunner {
             latest_usage,
             usage_pre_compaction: false,
             commands_open: true,
+            user_input_allowed: false,
             waiting_input: None,
             input_claimed: false,
+            ask_reserved: None,
             pending_questions: std::collections::HashMap::new(),
             goal,
             live_model: None,
@@ -1473,7 +1794,6 @@ impl SessionRunner {
                 pending: VecDeque::new(),
                 pending_web_attaches: Vec::new(),
                 policy,
-                user_input_allowed: false,
                 last_answer: None,
                 armed_trigger: None,
                 turn_just_ended: false,
@@ -2227,7 +2547,9 @@ impl SessionRunner {
         let mut pending = Vec::new();
         loop {
             match self.commands.recv().await {
-                Some(SessionCommand::Answer { call_id, answers }) if call_id == call.id => {
+                Some(SessionCommand::Answer {
+                    call_id, answers, ..
+                }) if call_id == call.id => {
                     return WaitResult {
                         outcome: WaitOutcome::Completed(Ok(answers)),
                         pending,
@@ -2483,7 +2805,9 @@ impl SessionRunner {
                 self.invalidate_trigger_for_cancel();
                 self.release_steering()
             }
-            SessionCommand::Answer { call_id, answers } => {
+            SessionCommand::Answer {
+                call_id, answers, ..
+            } => {
                 // A blocking answer never reaches here (`await_input_answer`
                 // consumes the matching command); this is an asynchronous
                 // answer, committed as a durable Notice at the next safe
@@ -2494,6 +2818,15 @@ impl SessionRunner {
             }
             SessionCommand::WebAttach(reply) => {
                 self.pending_web_attaches.push(reply);
+                Steering::None
+            }
+            SessionCommand::AskUser { .. } => {
+                // A tool question only ever arrives while the runner waits on
+                // that tool (`wait_for_operation` answers it inline). One that
+                // reaches the queue has no parked tool left: dropping the
+                // command resolves the ask as cancelled instead of waiting
+                // forever — and its sender releases the ask-slot reservation on
+                // the way out, so the next ask is admitted.
                 Steering::None
             }
         }
@@ -3644,7 +3977,7 @@ impl SessionRunner {
                         // fork session has none: suspending there would park the
                         // turn forever, so the call fails back to the model as a
                         // normal tool error and the loop continues.
-                        if !self.user_input_allowed {
+                        if !self.shared.lock().unwrap().user_input_allowed {
                             let result = Err(USER_INPUT_UNAVAILABLE.to_owned());
                             match self.finish_intercepted_tool(&call, result).await {
                                 Ok(Steering::None) => {}

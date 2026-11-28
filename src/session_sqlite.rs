@@ -125,6 +125,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     pinned INTEGER NULL,
     archived INTEGER NULL,
     writer TEXT NULL,
+    acp_session_id TEXT NULL,
     PRIMARY KEY (workspace_id, session_id, last_active_at)
 )
 "#;
@@ -199,7 +200,25 @@ pub struct SqliteSession {
     /// row yet).
     /// Interior mutability because every touch path takes `&self`.
     cached_meta: std::sync::Mutex<Option<SessionMeta>>,
+    /// `sessions.acp_session_id` exists (its migration at connect succeeded).
+    /// When it does not, metadata reads project `NULL` in its place and writes
+    /// omit the column: ordinary session creation keeps working, while
+    /// [`Self::set_acp_session_id`] fails instead of reporting a write it
+    /// cannot make (the ACP layer treats `Ok` as "the id is durable").
+    acp_available: bool,
 }
+
+/// The shared `sessions` metadata projection, in [`row_to_meta`] order.
+const META_COLUMNS: &str = "created_at, last_active_at, model, \"role\", entry_count, \
+     parent_session_id, parent_task_id, title, pinned, archived, writer, acp_session_id";
+
+/// The same projection for a database whose `sessions.acp_session_id`
+/// migration failed: `NULL` stands in for the missing column, so the column
+/// layout — and therefore [`row_to_meta`], `create_meta`, and every other
+/// metadata read — is unchanged and only the ACP reuse feature degrades.
+const META_COLUMNS_WITHOUT_ACP: &str = "created_at, last_active_at, model, \"role\", \
+     entry_count, parent_session_id, parent_task_id, title, pinned, archived, writer, \
+     NULL AS acp_session_id";
 
 /// Ensure the parent directory of the database file exists before turso
 /// opens it, so a configured `path = "~/.local/share/e-agent/sessions.db"`-style
@@ -309,6 +328,7 @@ impl SqliteSession {
         let mut pinned_available = true;
         let mut archived_available = true;
         let mut writer_available = true;
+        let mut acp_available = true;
         {
             let mut rows = conn
                 .query("PRAGMA table_info(sessions)", ())
@@ -337,7 +357,7 @@ impl SqliteSession {
             // trailing `NULL` as NOT NULL (CREATE TABLE is unaffected —
             // fresh DBs keep nullable columns), so the ALTER must OMIT the
             // constraint; ADD COLUMN defaults to nullable anyway.
-            let migrations: [(&str, &str, &str, &mut bool); 4] = [
+            let migrations: [(&str, &str, &str, &mut bool); 5] = [
                 ("title", "TEXT", "session titles", &mut title_available),
                 (
                     "pinned",
@@ -352,6 +372,12 @@ impl SqliteSession {
                     &mut archived_available,
                 ),
                 ("writer", "TEXT", "writer audit", &mut writer_available),
+                (
+                    "acp_session_id",
+                    "TEXT",
+                    "ACP session reuse",
+                    &mut acp_available,
+                ),
             ];
             for (name, sql_type, feature, available) in migrations {
                 if columns.iter().any(|c| c == name) {
@@ -495,12 +521,16 @@ impl SqliteSession {
         // feature column is unavailable (failed migration): the cache
         // query references the columns and would error on an unmigrated
         // table, exactly like Greptime's degraded mode.
-        let cached_meta =
-            if title_available && pinned_available && archived_available && writer_available {
-                let mut rows = conn
+        let cached_meta = if title_available
+            && pinned_available
+            && archived_available
+            && writer_available
+            && acp_available
+        {
+            let mut rows = conn
                     .query(
                         "SELECT created_at, last_active_at, model, \"role\", entry_count, \
-                                parent_session_id, parent_task_id, title, pinned, archived, writer \
+                                parent_session_id, parent_task_id, title, pinned, archived, writer, acp_session_id \
                          FROM sessions \
                          WHERE workspace_id = ?1 AND session_id = ?2 \
                          ORDER BY last_active_at DESC LIMIT 1",
@@ -508,17 +538,17 @@ impl SqliteSession {
                     )
                     .await
                     .map_err(|e| format!("cannot query session metadata: {e}"))?;
-                match rows
-                    .next()
-                    .await
-                    .map_err(|e| format!("cannot query session metadata: {e}"))?
-                {
-                    Some(row) => Some(row_to_meta(&row, session_id)?),
-                    None => None,
-                }
-            } else {
-                None
-            };
+            match rows
+                .next()
+                .await
+                .map_err(|e| format!("cannot query session metadata: {e}"))?
+            {
+                Some(row) => Some(row_to_meta(&row, session_id)?),
+                None => None,
+            }
+        } else {
+            None
+        };
 
         let session = Self {
             conn: Arc::new(tokio::sync::Mutex::new(conn)),
@@ -530,6 +560,7 @@ impl SqliteSession {
                 &crate::session_store::normalize_db_path(db_path),
             ),
             cached_meta: std::sync::Mutex::new(cached_meta),
+            acp_available,
         };
 
         // Seed next_seq from the DB's current max seq (see db_max_seq).
@@ -2260,14 +2291,20 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
     /// session has no row yet (brand-new session, or a subagent whose
     /// parent has not written its row yet).
     async fn load_meta_row(&self, session_id: &str) -> Result<Option<SessionMeta>, String> {
+        let columns = if self.acp_available {
+            META_COLUMNS
+        } else {
+            META_COLUMNS_WITHOUT_ACP
+        };
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT created_at, last_active_at, model, \"role\", entry_count, \
-                        parent_session_id, parent_task_id, title, pinned, archived, writer \
-                 FROM sessions \
-                 WHERE workspace_id = ?1 AND session_id = ?2 \
-                 ORDER BY last_active_at DESC LIMIT 1",
+                &format!(
+                    "SELECT {columns} \
+                     FROM sessions \
+                     WHERE workspace_id = ?1 AND session_id = ?2 \
+                     ORDER BY last_active_at DESC LIMIT 1"
+                ),
                 (self.workspace_id.as_str(), session_id),
             )
             .await
@@ -2290,29 +2327,60 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
         // `writer: None`; the stamped value is what lands in the column.
         meta.writer = Some(process_identity().to_owned());
         let conn = self.conn.lock().await;
-        conn.execute(
-            "INSERT INTO sessions \
-             (workspace_id, session_id, created_at, last_active_at, model, \"role\", \
-              entry_count, parent_session_id, parent_task_id, title, pinned, archived, writer) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-            (
-                self.workspace_id.as_str(),
-                meta.session_id.as_str(),
-                datetime_to_us(meta.created_at),
-                datetime_to_us(meta.last_active_at),
-                meta.model.as_deref(),
-                meta.role.as_deref(),
-                meta.entry_count,
-                meta.parent_session_id.as_deref(),
-                meta.parent_task_id,
-                meta.title.as_deref(),
-                meta.pinned.map(|p| if p { 1 } else { 0 }),
-                meta.archived.map(|a| if a { 1 } else { 0 }),
-                meta.writer.as_deref(),
-            ),
-        )
-        .await
-        .map_err(|e| format!("cannot insert session metadata: {e}"))?;
+        // The ACP id column is only named when its migration succeeded: on a
+        // database without it the row is written without that column, so a
+        // failed `sessions.acp_session_id` migration costs the ACP reuse
+        // feature and nothing else (session creation keeps working).
+        let written = if self.acp_available {
+            conn.execute(
+                "INSERT INTO sessions \
+                 (workspace_id, session_id, created_at, last_active_at, model, \"role\", \
+                  entry_count, parent_session_id, parent_task_id, title, pinned, archived, writer, \
+                  acp_session_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                (
+                    self.workspace_id.as_str(),
+                    meta.session_id.as_str(),
+                    datetime_to_us(meta.created_at),
+                    datetime_to_us(meta.last_active_at),
+                    meta.model.as_deref(),
+                    meta.role.as_deref(),
+                    meta.entry_count,
+                    meta.parent_session_id.as_deref(),
+                    meta.parent_task_id,
+                    meta.title.as_deref(),
+                    meta.pinned.map(|p| if p { 1 } else { 0 }),
+                    meta.archived.map(|a| if a { 1 } else { 0 }),
+                    meta.writer.as_deref(),
+                    meta.acp_session_id.as_deref(),
+                ),
+            )
+            .await
+        } else {
+            conn.execute(
+                "INSERT INTO sessions \
+                 (workspace_id, session_id, created_at, last_active_at, model, \"role\", \
+                  entry_count, parent_session_id, parent_task_id, title, pinned, archived, writer) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                (
+                    self.workspace_id.as_str(),
+                    meta.session_id.as_str(),
+                    datetime_to_us(meta.created_at),
+                    datetime_to_us(meta.last_active_at),
+                    meta.model.as_deref(),
+                    meta.role.as_deref(),
+                    meta.entry_count,
+                    meta.parent_session_id.as_deref(),
+                    meta.parent_task_id,
+                    meta.title.as_deref(),
+                    meta.pinned.map(|p| if p { 1 } else { 0 }),
+                    meta.archived.map(|a| if a { 1 } else { 0 }),
+                    meta.writer.as_deref(),
+                ),
+            )
+            .await
+        };
+        written.map_err(|e| format!("cannot insert session metadata: {e}"))?;
         Ok(())
     }
 
@@ -2367,6 +2435,7 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
             title: existing.title.clone(),
             pinned: existing.pinned,
             archived: existing.archived,
+            acp_session_id: existing.acp_session_id.clone(),
             writer: None, // stamped by insert_meta with the writing process
             label: None,  // label lives in running_tasks, resolved at list time
         }
@@ -2440,6 +2509,7 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
             title: title.map(str::to_owned), // a fresh session may be named at creation (subagent label)
             pinned: None,                    // a fresh session is unpinned until the user pins it
             archived: None, // a fresh session is unarchived until the user archives it
+            acp_session_id: None, // no ACP conversation until `acp_prompt` runs
             writer: None,   // stamped by insert_meta with the writing process
             label: None,    // label lives in running_tasks, resolved at list time
         };
@@ -2660,14 +2730,20 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
     /// activity first. This is the audit view — [`Self::list_meta`] shows
     /// only the latest snapshot per session.
     pub async fn audit_meta(&self, session_id: &str) -> Result<Vec<SessionMeta>, String> {
+        let columns = if self.acp_available {
+            META_COLUMNS
+        } else {
+            META_COLUMNS_WITHOUT_ACP
+        };
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT created_at, last_active_at, model, \"role\", entry_count, \
-                        parent_session_id, parent_task_id, title, pinned, archived, writer \
-                 FROM sessions \
-                 WHERE workspace_id = ?1 AND session_id = ?2 \
-                 ORDER BY last_active_at ASC",
+                &format!(
+                    "SELECT {columns} \
+                     FROM sessions \
+                     WHERE workspace_id = ?1 AND session_id = ?2 \
+                     ORDER BY last_active_at ASC"
+                ),
                 (self.workspace_id.as_str(), session_id),
             )
             .await
@@ -2699,6 +2775,56 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
         .map_err(|e| format!("cannot delete session metadata: {e}"))?;
         if session_id == self.session_id {
             *self.cached_meta.lock().unwrap() = None;
+        }
+        Ok(())
+    }
+
+    /// The ACP session id this session last used, or `None` when it never
+    /// ran `acp_prompt` (also `None` for a session with no metadata row).
+    /// Reads the newest snapshot row, so a value written by another process
+    /// on the same database file is visible.
+    pub async fn acp_session_id(&self, session_id: &str) -> Result<Option<String>, String> {
+        Ok(self
+            .load_meta_row(session_id)
+            .await?
+            .and_then(|meta| meta.acp_session_id))
+    }
+
+    /// Record (or clear) the ACP session id: appends one full snapshot row
+    /// with the new value and a fresh `last_active_at`, exactly like
+    /// [`Self::set_title`]. Never self-creates (R3): a session with no
+    /// metadata row is a no-op `Ok`.
+    ///
+    /// A database whose `sessions.acp_session_id` migration failed has no
+    /// column to write. The ordinary metadata writes keep working in that
+    /// state (they simply omit the column), but THIS write must not report a
+    /// success it cannot deliver: the ACP layer treats `Ok` as "the id is
+    /// durable" and would resume a conversation that was never recorded, so it
+    /// fails loudly instead.
+    pub async fn set_acp_session_id(
+        &self,
+        session_id: &str,
+        acp_session_id: Option<&str>,
+    ) -> Result<(), String> {
+        if !self.acp_available {
+            return Err(format!(
+                "cannot persist the ACP session id: this database has no `sessions.acp_session_id` \
+                 column (its migration failed), so the id for `{session_id}` was NOT written"
+            ));
+        }
+        let meta = if session_id == self.session_id {
+            self.effective_meta().await?
+        } else {
+            self.load_meta_row(session_id).await?
+        };
+        let Some(mut meta) = meta else {
+            return Ok(());
+        };
+        meta.acp_session_id = acp_session_id.map(str::to_owned);
+        meta.last_active_at = us_to_datetime(next_event_time_us());
+        self.insert_meta(&mut meta).await?;
+        if session_id == self.session_id {
+            *self.cached_meta.lock().unwrap() = Some(meta);
         }
         Ok(())
     }
@@ -2817,11 +2943,12 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
                 entry_count,
                 parent_session_id: None,
                 parent_task_id: None,
-                title: None,    // pre-table sessions have no user-assigned name
-                pinned: None,   // pre-table sessions are unpinned
-                archived: None, // pre-table sessions are unarchived
-                writer: None,   // stamped by insert_meta with the writing process
-                label: None,    // label lives in running_tasks, resolved at list time
+                title: None,          // pre-table sessions have no user-assigned name
+                pinned: None,         // pre-table sessions are unpinned
+                archived: None,       // pre-table sessions are unarchived
+                acp_session_id: None, // pre-table sessions have no ACP conversation
+                writer: None,         // stamped by insert_meta with the writing process
+                label: None,          // label lives in running_tasks, resolved at list time
             })
             .await?;
         }
@@ -3537,6 +3664,11 @@ fn row_to_meta(row: &turso::Row, session_id: &str) -> Result<SessionMeta, String
             .map_err(|e| format!("cannot query session metadata: {e}"))?
             .as_text()
             .cloned(),
+        acp_session_id: row
+            .get_value(11)
+            .map_err(|e| format!("cannot query session metadata: {e}"))?
+            .as_text()
+            .cloned(),
         label: None, // label lives in running_tasks, resolved at list time
     })
 }
@@ -3630,6 +3762,9 @@ fn meta_from_row_values(row: &turso::Row, session_id: &str) -> Result<SessionMet
         title,
         pinned,
         archived,
+        // The list projection selects a fixed column set and does not carry
+        // the ACP session id.
+        acp_session_id: None,
         writer: row
             .get_value(11)
             .map_err(|e| format!("cannot list session metadata: {e}"))?

@@ -1543,12 +1543,22 @@ async function selectForkItem(i) {
   }
 }
 
-async function submitWaitingAnswer() {
+async function submitWaitingAnswer(optionId) {
   const waiting = state.waitingInput;
-  const text = els.promptInput.value.trim();
-  if (!waiting || !waiting.valid || !text || !state.sessionId || state.waitingSubmit) return;
+  if (!waiting || !waiting.valid || !state.sessionId || state.waitingSubmit) return;
+  const options = questionOptions(waiting.questions[0]);
+  const fixed = options.length > 0;
+  if (fixed) {
+    // 固定选项只能由选项按钮提交，且必须原样是本次提供的 id：绝不 trim、
+    // 也绝不把问题文本当选项 id（" x " 与 "x" 可能是两个不同的选项）。
+    if (typeof optionId !== "string" || !options.some((option) => option.id === optionId)) return;
+  } else if (optionId !== undefined) {
+    return;
+  }
+  const text = fixed ? optionId : els.promptInput.value.trim();
+  if (!text) return;
   const captured = {
-    callId: waiting.callId, text, sid: state.sessionId,
+    callId: waiting.callId, text, optionId: fixed ? optionId : null, sid: state.sessionId,
     wid: state.workspace.id, epoch: sessionOpenEpoch,
   };
   state.waitingSubmit = captured;
@@ -1578,9 +1588,18 @@ async function submitWaitingAnswer() {
   } finally {
     if (!captured.accepted && state.waitingSubmit === captured) state.waitingSubmit = null;
     if (stillDisplayed()) {
-      els.promptInput.disabled = !!captured.accepted;
-      els.sendBtn.disabled = !!captured.accepted;
-      els.sendBtn.textContent = captured.accepted ? "已回答" : "回答";
+      if (!captured.accepted && fixed) {
+        // 固定选项提交失败后问题仍然有效：重新启用按钮，composer 继续
+        // 保持不可回答（固定选项只能走按钮，且 id 必须原样）。
+        for (const button of els.waitingInputQuestions.querySelectorAll("button")) {
+          button.disabled = false;
+          button.classList.remove("chosen");
+        }
+      }
+      els.promptInput.disabled = fixed || !!captured.accepted;
+      els.sendBtn.disabled = fixed || !!captured.accepted;
+      els.sendBtn.textContent = captured.accepted
+        ? "已回答" : fixed ? "请选择选项" : "回答";
     }
   }
 }

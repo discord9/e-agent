@@ -160,8 +160,17 @@ async fn main_option_question_moves_selection_and_submits_the_chosen_id() {
     // Enter submits the HIGHLIGHTED option's id.
     press!(KeyCode::Enter);
     match commands.try_recv().unwrap() {
-        crate::runner::SessionCommand::Answer { call_id, answers } => {
+        crate::runner::SessionCommand::Answer {
+            call_id,
+            answers,
+            option,
+        } => {
             assert_eq!(call_id, "perm-call");
+            assert_eq!(
+                option.as_deref(),
+                Some("deny"),
+                "the id travels with the answer"
+            );
             assert_eq!(
                 answers,
                 vec![("perm".to_owned(), "Selected option: deny (拒绝)".to_owned())]
@@ -190,6 +199,73 @@ async fn main_option_question_moves_selection_and_submits_the_chosen_id() {
     press!(KeyCode::Char('x'));
     assert!(state.input.text.is_empty());
     assert!(commands.try_recv().is_err());
+}
+
+/// A key is answered with the call id the rendered list was CAPTURED with,
+/// never the one that happens to be live: another frontend can answer ask A
+/// and ask B can open before the next redraw, and a key meant for A must never
+/// approve B.
+#[tokio::test]
+async fn main_option_submission_uses_the_captured_call_id_not_the_live_one() {
+    let (handle, emitter, mut commands) = crate::runner::session_test_channel();
+    let shown = option_request();
+    emitter.set_status(SessionStatus::WaitingInput(shown.clone()));
+    let mut state = TuiState::default();
+    project_main_status(&mut state, &SessionStatus::WaitingInput(shown.clone()));
+    assert_eq!(state.waiting_call_id.as_deref(), Some("perm-call"));
+    // Ask B opens before the redraw: the screen still shows A's list.
+    let fresh = crate::runner::UserInputRequest {
+        call_id: "perm-call-2".into(),
+        questions: shown.questions.clone(),
+    };
+    emitter.set_status(SessionStatus::WaitingInput(fresh.clone()));
+    assert!(
+        matches!(
+            &*handle.status().borrow(),
+            SessionStatus::WaitingInput(request) if request.call_id == "perm-call-2"
+        ),
+        "the live question is B"
+    );
+
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+    let mut events =
+        futures_util::stream::iter(Vec::<Result<crossterm::event::Event, std::io::Error>>::new())
+            .peekable();
+    let sessions = Sessions::default();
+    let (sender, _receiver) = mpsc::unbounded_channel();
+    handle_pressed_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        &handle,
+        &handle.status(),
+        &sessions,
+        &sender,
+        &mut terminal,
+        &mut events,
+    )
+    .await
+    .unwrap();
+    // The key answers A, the ask the user was looking at. A is no longer open,
+    // so the runner refuses it — and B is never answered with A's option.
+    assert!(
+        commands.try_recv().is_err(),
+        "a key meant for A must never approve the live ask B"
+    );
+    // Proof that B was untouched: it is still answerable with its own id.
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("perm-call-2".into()), "deny".into()),
+        crate::runner::PromptSubmission::Answered
+    );
+    match commands.try_recv().unwrap() {
+        crate::runner::SessionCommand::Answer { call_id, .. } => {
+            assert_eq!(call_id, "perm-call-2")
+        }
+        _ => panic!("expected the structured answer command"),
+    }
+
+    // Once B is drawn, the capture follows it.
+    project_main_status(&mut state, &SessionStatus::WaitingInput(fresh));
+    assert_eq!(state.waiting_call_id.as_deref(), Some("perm-call-2"));
 }
 
 /// The list replaces the free-text buffer inside the SAME input box; the
@@ -279,6 +355,7 @@ fn main_status_projection_clears_waiting_question_for_all_non_waiting_states() {
     ] {
         project_main_status(&mut state, &status);
         assert!(state.waiting_question.is_none());
+        assert!(state.waiting_call_id.is_none(), "no id outlives its list");
     }
     project_main_status(&mut state, &SessionStatus::Busy);
     assert!(state.waiting_question.is_none());

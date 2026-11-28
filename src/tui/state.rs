@@ -171,6 +171,12 @@ pub(crate) struct TuiState {
     /// Fixed choices of the pending blocking question (`WaitingInput`). Empty
     /// for a free-text question, which keeps today's input-box behaviour.
     pub(crate) waiting_options: Vec<crate::runner::UserOption>,
+    /// The `call_id` the list above was captured WITH. A key is answered with
+    /// THIS id, never with the id of whatever question is live at the moment
+    /// the key is handled: another frontend can answer that question and a
+    /// different one can open before the next redraw, and the user's key
+    /// belongs to the list they were looking at.
+    pub(crate) waiting_call_id: Option<String>,
     /// Highlighted index into `waiting_options` (clamped on render/submit).
     pub(crate) waiting_selection: usize,
     pub(crate) streamed: bool,
@@ -981,12 +987,12 @@ impl TuiState {
     /// ↑/↓ move the highlight, Enter submits it, and 1..9 submit that option
     /// directly. Returns false for keys the list does not own, so the caller
     /// keeps its normal handling (cancel, exit, scrolling when nothing waits).
-    pub(crate) fn handle_option_key(
-        &mut self,
-        key: KeyEvent,
-        call_id: &str,
-        handle: &RunnerHandle,
-    ) -> bool {
+    ///
+    /// The submitted `call_id` is the one captured WITH these options (see
+    /// [`Self::waiting_call_id`]), never the live status id: the runner then
+    /// accepts the answer only if that exact ask is still open, so a key meant
+    /// for A can never approve B.
+    pub(crate) fn handle_option_key(&mut self, key: KeyEvent, handle: &RunnerHandle) -> bool {
         let count = self.waiting_options.len();
         if count == 0 {
             return false;
@@ -1002,14 +1008,14 @@ impl TuiState {
                 true
             }
             KeyCode::Enter => {
-                self.submit_option(call_id, self.waiting_selection.min(last), handle);
+                self.submit_option(self.waiting_selection.min(last), handle);
                 true
             }
             KeyCode::Char(digit @ '1'..='9') if key.modifiers.is_empty() => {
                 let index = usize::from(digit as u8 - b'1');
                 if index <= last {
                     self.waiting_selection = index;
-                    self.submit_option(call_id, index, handle);
+                    self.submit_option(index, handle);
                 }
                 true
             }
@@ -1026,13 +1032,16 @@ impl TuiState {
 
     /// Submit one fixed option through the SAME `submit_prompt_with_call_id`
     /// path the free-text answer uses; the runner validates the id.
-    fn submit_option(&mut self, call_id: &str, index: usize, handle: &RunnerHandle) {
-        let Some(option) = self.waiting_options.get(index) else {
+    fn submit_option(&mut self, index: usize, handle: &RunnerHandle) {
+        let (Some(call_id), Some(option)) = (
+            self.waiting_call_id.clone(),
+            self.waiting_options.get(index),
+        ) else {
             return;
         };
         let id = option.id.clone();
         if let crate::runner::PromptSubmission::Invalid(error) =
-            handle.submit_prompt_with_call_id(Some(call_id.to_owned()), id)
+            handle.submit_prompt_with_call_id(Some(call_id), id)
         {
             self.push_line(error, LineKind::Dim);
         }

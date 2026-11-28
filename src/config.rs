@@ -40,6 +40,11 @@ pub struct Config {
     /// Optional `[bash]` policy (foreground bash timeout).
     #[serde(default)]
     bash: Option<BashConfig>,
+    /// Optional `[acp]` section: the external ACP (Agent Client Protocol)
+    /// stdio agent behind the main session's `acp_prompt` tool. Absent = no
+    /// tool (opt-in, like a `[web_search]` without a usable credential).
+    #[serde(default)]
+    acp: Option<Acp>,
     #[serde(default)]
     code_mode: Option<CodeModeConfig>,
     /// Optional `[tui]` submit/newline key mapping. A project-level
@@ -316,6 +321,54 @@ fn default_true() -> bool {
     true
 }
 
+/// Default `[acp] binary`: the ACP-capable agent CLI.
+pub const DEFAULT_ACP_BINARY: &str = "agy";
+
+/// Default `[acp] args`: speak ACP over stdio.
+pub const DEFAULT_ACP_ARGS: [&str; 2] = ["acp", "--stdio"];
+
+/// Default `[acp] allow_kinds`: the read-only tool kinds the reviewer may do
+/// freely. Everything else (edit / delete / move / execute / unknown) is
+/// denied by default: an oracle that silently edits the workspace is not an
+/// oracle.
+pub const DEFAULT_ACP_ALLOW_KINDS: [&str; 4] = ["read", "search", "fetch", "think"];
+
+/// The `[acp]` config section: ONE external ACP stdio agent the main session
+/// may prompt through the `acp_prompt` tool. Global-only, matching
+/// `[web_search]` / `[session]`: a project `[acp]` is a parse error, because
+/// the section names a program to spawn and `<workspace>/.e-agent/config.toml`
+/// is untrusted input.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Acp {
+    /// Program to spawn; [`DEFAULT_ACP_BINARY`] when absent.
+    binary: Option<PathBuf>,
+    /// Program arguments; [`DEFAULT_ACP_ARGS`] when absent. An explicit
+    /// empty list means "no arguments".
+    args: Option<Vec<String>>,
+    /// Model id applied with `session/set_model` after `session/new`;
+    /// absent = leave the agent's own model choice alone.
+    model: Option<String>,
+    /// Tool kinds answered "allow once" on a `session/request_permission`
+    /// request; [`DEFAULT_ACP_ALLOW_KINDS`] when absent. An explicit empty
+    /// list denies everything.
+    allow_kinds: Option<Vec<String>>,
+    /// Answer EVERY permission request "allow once", whatever its tool kind.
+    /// The only effect of this flag.
+    #[serde(default)]
+    danger: bool,
+}
+
+/// Resolved `[acp]` settings handed to the `acp_prompt` tool.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcpConfig {
+    pub binary: String,
+    pub args: Vec<String>,
+    pub model: Option<String>,
+    pub allow_kinds: Vec<String>,
+    pub danger: bool,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct WebSearch {
     /// Backend: `"exa"` (default when absent), `"searxng"` or `"deepseek"`.
@@ -577,7 +630,10 @@ impl Config {
     /// the project file themselves and apply per-key overrides. The
     /// remaining sections (`providers`, `web_search`, `session`) stay
     /// global-only — a project file that carries them is accepted for
-    /// compatibility but the sections are ignored.
+    /// compatibility but the sections are ignored. `[acp]` is global-only
+    /// too, but is NOT white-listed: it names a program to spawn, so a
+    /// project `[acp]` fails `deny_unknown_fields` instead of being
+    /// silently dropped.
     ///
     /// The project file is parsed with `deny_unknown_fields` (see
     /// [`ProjectConfig`]): an unknown section is a parse error, refusing
@@ -848,6 +904,55 @@ impl Config {
             bail!("credential for [web_search] is empty");
         }
         Ok(Some(key))
+    }
+
+    /// The resolved `[acp]` settings, or None when the section is absent —
+    /// the `acp_prompt` tool is then not registered at all (opt-in, exactly
+    /// like a `[web_search]` without a usable credential). A blank `binary`
+    /// or `model` falls back to the default / "leave the agent's model
+    /// alone"; an explicit `args = []` is honored as "no arguments", and an
+    /// explicit `allow_kinds = []` as "deny every tool kind".
+    pub fn acp(&self) -> Option<AcpConfig> {
+        let acp = self.acp.as_ref()?;
+        let binary = acp
+            .binary
+            .as_deref()
+            .map(|binary| binary.to_string_lossy().trim().to_owned())
+            .filter(|binary| !binary.is_empty())
+            .unwrap_or_else(|| DEFAULT_ACP_BINARY.to_owned());
+        let args = acp.args.clone().unwrap_or_else(|| {
+            DEFAULT_ACP_ARGS
+                .iter()
+                .map(|arg| (*arg).to_owned())
+                .collect()
+        });
+        let model = acp
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_owned);
+        // Kinds are matched verbatim against the agent's `toolCall.kind`, so
+        // they are normalized once here (`"Read"` == `"read"`); an explicit
+        // empty list stays empty (deny everything).
+        let allow_kinds = acp.allow_kinds.clone().unwrap_or_else(|| {
+            DEFAULT_ACP_ALLOW_KINDS
+                .iter()
+                .map(|kind| (*kind).to_owned())
+                .collect()
+        });
+        let allow_kinds = allow_kinds
+            .iter()
+            .map(|kind| kind.trim().to_ascii_lowercase())
+            .filter(|kind| !kind.is_empty())
+            .collect();
+        Some(AcpConfig {
+            binary,
+            args,
+            model,
+            allow_kinds,
+            danger: acp.danger,
+        })
     }
 
     /// Resolve the shared bash/file path policy for a workspace.
@@ -1306,6 +1411,8 @@ pub fn resolve_background_timeout(
 /// `[session]` are white-listed for compatibility — they parse but stay
 /// global-only and are silently ignored by the project layer (a project
 /// file that carried them before this strictness was added keeps starting).
+/// `[acp]` is deliberately absent from this list: it names a program to
+/// spawn, so a project file carrying it is refused rather than ignored.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProjectConfig {
@@ -1987,7 +2094,10 @@ fn classify_source_edit_with_snapshots(
         }
         return ("effective", None);
     }
-    if matches!(section, "session" | "web_search" | "code_mode" | "tui") {
+    if matches!(
+        section,
+        "session" | "web_search" | "code_mode" | "tui" | "acp"
+    ) {
         return ("shadowed", Some("setting requires restart"));
     }
     if section == "providers"

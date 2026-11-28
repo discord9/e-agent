@@ -1715,6 +1715,8 @@ function renderWaitingInput(payload) {
   const questions = Array.isArray(payload.questions) ? payload.questions : [];
   const valid = !!callId && questions.length === 1
     && questions.every((q) => q && typeof q.id === "string" && typeof q.prompt === "string");
+  const options = valid ? questionOptions(questions[0]) : [];
+  const fixed = options.length > 0;
   const changed = previous && previous.callId !== callId;
   if (changed) state.waitingDrafts[waitingDraftKey(previous.callId)] = els.promptInput.value;
   if (state.waitingSubmit && state.waitingSubmit.callId !== callId) state.waitingSubmit = null;
@@ -1727,6 +1729,32 @@ function renderWaitingInput(payload) {
   for (const question of questions) {
     const item = el("div", "waiting-input-question", question && question.prompt ? question.prompt : "");
     els.waitingInputQuestions.appendChild(item);
+  }
+  if (fixed) {
+    // 固定选项：选项按钮就是唯一回答路径。文本框只服务没有选项的自由
+    // 文本问题；选项 id 原样提交（" x " 与 "x" 是两个不同的选项）。
+    const list = el("div", "pending-question-options");
+    list.setAttribute("role", "group");
+    list.setAttribute("aria-label", "选项：" + questions[0].prompt);
+    for (const option of options) {
+      const choice = document.createElement("button");
+      choice.type = "button";
+      choice.className = "pending-question-option primary";
+      choice.textContent = typeof option.label === "string" && option.label
+        ? option.label : option.id;
+      choice.setAttribute("data-option-id", option.id);
+      if (typeof option.description === "string" && option.description) {
+        choice.title = option.description;
+        choice.setAttribute("aria-description", option.description);
+      }
+      choice.disabled = !valid || !!state.waitingSubmit;
+      choice.classList.toggle("chosen", !!state.waitingSubmit
+        && state.waitingSubmit.callId === callId
+        && state.waitingSubmit.optionId === option.id);
+      choice.addEventListener("click", () => submitWaitingAnswer(option.id));
+      list.appendChild(choice);
+    }
+    els.waitingInputQuestions.appendChild(list);
   }
   els.waitingInputPanel.hidden = false;
   els.waitingInputError.hidden = true;
@@ -1742,13 +1770,15 @@ function renderWaitingInput(payload) {
     els.promptInput.value = state.waitingDrafts[waitingDraftKey(callId)] || "";
     autosizeInput();
   }
-  els.promptLabel.textContent = "回答当前问题";
-  els.promptInput.placeholder = "输入回答：Enter 提交，Shift+Enter 换行…";
+  els.promptLabel.textContent = fixed ? "请选择上方选项" : "回答当前问题";
+  els.promptInput.placeholder = fixed
+    ? "请点击上方选项作答（选项 id 原样提交）"
+    : "输入回答：Enter 提交，Shift+Enter 换行…";
   els.sendBtn.textContent = state.waitingSubmit
     ? state.waitingSubmit.accepted ? "已回答" : "提交中…"
-    : "回答";
-  els.sendBtn.disabled = !valid || !!state.waitingSubmit;
-  els.promptInput.disabled = !valid || !!state.waitingSubmit;
+    : fixed ? "请选择选项" : "回答";
+  els.sendBtn.disabled = fixed || !valid || !!state.waitingSubmit;
+  els.promptInput.disabled = fixed || !valid || !!state.waitingSubmit;
 }
 
 function clearWaitingInput(restoreDraft = true) {

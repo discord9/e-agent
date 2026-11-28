@@ -302,6 +302,29 @@ async fn connect_migrates_legacy_sessions_table_missing_feature_columns() {
     assert_eq!(meta.pinned, None, "old rows read pinned back as NULL");
     assert_eq!(meta.title, None, "old rows read title back as NULL");
     assert_eq!(meta.writer, None, "old rows read writer back as NULL");
+    assert_eq!(
+        meta.acp_session_id, None,
+        "old rows read acp_session_id back as NULL (no ACP conversation yet)"
+    );
+    assert_eq!(
+        session
+            .acp_session_id("legacy-1")
+            .await
+            .expect("read the migrated acp_session_id"),
+        None,
+        "the per-session ACP read works on a migrated table"
+    );
+    // The ACP id is a nullable per-session column, written like the other
+    // feature columns (one full snapshot row) and read back through the same
+    // path `acp_prompt` uses.
+    session
+        .set_acp_session_id("legacy-1", Some("70bd9ad0-acp"))
+        .await
+        .expect("store the ACP session id on the migrated table");
+    assert_eq!(
+        session.acp_session_id("legacy-1").await.unwrap().as_deref(),
+        Some("70bd9ad0-acp")
+    );
 
     session
         .set_archived("legacy-1", true)
@@ -336,6 +359,52 @@ async fn connect_migrates_legacy_sessions_table_missing_feature_columns() {
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].archived, Some(true));
     drop((dir, session2));
+}
+
+/// The `sessions.acp_session_id` migration is the ONE feature column whose
+/// loss the caller must see. When it failed, every write omits the column:
+/// ordinary metadata writes must keep working (degrade that feature only),
+/// while the ACP-specific setter must NOT report success — the ACP layer reads
+/// `Ok` as "the id is durable" and would otherwise resume a conversation that
+/// was never recorded.
+#[tokio::test]
+async fn acp_session_id_write_fails_loudly_when_its_column_is_unavailable() {
+    let (_dir, mut session, sid) = fresh_session().await;
+    session
+        .create_meta(&sid, Some("m"), Some("main"), None, None, None)
+        .await
+        .unwrap();
+    // The degraded state the failed migration leaves behind.
+    session.acp_available = false;
+
+    let error = session
+        .set_acp_session_id(&sid, Some("acp-1"))
+        .await
+        .expect_err("a write that cannot persist the id must not report success");
+    assert!(
+        error.contains("acp_session_id") && error.contains("NOT written"),
+        "the error names the missing column and the lost write: {error}"
+    );
+
+    // The same degraded state still writes ordinary metadata.
+    session
+        .set_title(&sid, Some("still writable"))
+        .await
+        .unwrap();
+    session.set_archived(&sid, true).await.unwrap();
+    let meta = session
+        .load_meta_row(&sid)
+        .await
+        .unwrap()
+        .expect("the metadata row still exists");
+    assert_eq!(meta.title.as_deref(), Some("still writable"));
+    assert_eq!(meta.archived, Some(true));
+    // ... and the read path still projects NULL instead of failing.
+    assert_eq!(session.acp_session_id(&sid).await.unwrap(), None);
+    assert!(
+        meta.acp_session_id.is_none(),
+        "the refused write left no ACP id behind"
+    );
 }
 
 // ----------------------------------------------------------------------
@@ -2425,6 +2494,7 @@ fn backfill_meta_snapshot_preserves_immutable_columns() {
         title: Some("a title".into()),
         pinned: Some(true),
         archived: Some(true),
+        acp_session_id: None,
         writer: None,
         label: None,
     };
@@ -2474,6 +2544,7 @@ fn backfill_meta_snapshot_preserves_immutable_columns() {
         title: None,
         pinned: None,
         archived: None,
+        acp_session_id: None,
         writer: None,
         label: None,
     };
@@ -4685,6 +4756,7 @@ impl<'a> SnapshotRow<'a> {
             title: self.title.map(str::to_owned),
             pinned: self.pinned.map(|flag| flag == 1),
             archived: self.archived.map(|flag| flag == 1),
+            acp_session_id: None,
             writer: self.writer.map(str::to_owned),
             label: None,
         }
