@@ -2399,7 +2399,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             parent_session_id: parent_session_id.map(str::to_owned),
             parent_task_id,
             title: title.map(str::to_owned), // a fresh session may be named at creation (subagent label)
-            acp_session_id: None,            // no ACP conversation until `acp_prompt` runs
+            acp_session_id: None,            // no ACP conversation until a driver opens one
             pinned: None,                    // a fresh session is unpinned until the user pins it
             archived: None, // a fresh session is unarchived until the user archives it
             writer: None,   // stamped by insert_meta with the writing process
@@ -2467,7 +2467,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
     }
 
     /// The ACP session id this session last used, or `None` when it never
-    /// ran `acp_prompt` (also `None` for a session with no metadata row).
+    /// ran an ACP session (also `None` for a session with no metadata row).
     pub async fn acp_session_id(&self, session_id: &str) -> Result<Option<String>> {
         Ok(self
             .load_meta_row(session_id)

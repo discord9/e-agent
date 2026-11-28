@@ -41,8 +41,8 @@ pub struct Config {
     #[serde(default)]
     bash: Option<BashConfig>,
     /// Optional `[acp]` section: the external ACP (Agent Client Protocol)
-    /// stdio agent behind the main session's `acp_prompt` tool. Absent = no
-    /// tool (opt-in, like a `[web_search]` without a usable credential).
+    /// stdio agent that `delegate { agent: "…" }` launches. Absent = an agent
+    /// is still launchable by bare name, with default stdio arguments.
     #[serde(default)]
     acp: Option<Acp>,
     #[serde(default)]
@@ -327,14 +327,8 @@ pub const DEFAULT_ACP_BINARY: &str = "agy";
 /// Default `[acp] args`: speak ACP over stdio.
 pub const DEFAULT_ACP_ARGS: [&str; 2] = ["acp", "--stdio"];
 
-/// Default `[acp] allow_kinds`: the read-only tool kinds the reviewer may do
-/// freely. Everything else (edit / delete / move / execute / unknown) is
-/// denied by default: an oracle that silently edits the workspace is not an
-/// oracle.
-pub const DEFAULT_ACP_ALLOW_KINDS: [&str; 4] = ["read", "search", "fetch", "think"];
-
-/// The `[acp]` config section: ONE external ACP stdio agent the main session
-/// may prompt through the `acp_prompt` tool. Global-only, matching
+/// The `[acp]` config section: ONE external ACP stdio agent that
+/// `delegate { agent: "…" }` can run a child session on. Global-only, matching
 /// `[web_search]` / `[session]`: a project `[acp]` is a parse error, because
 /// the section names a program to spawn and `<workspace>/.e-agent/config.toml`
 /// is untrusted input.
@@ -349,24 +343,17 @@ struct Acp {
     /// Model id applied with `session/set_model` after `session/new`;
     /// absent = leave the agent's own model choice alone.
     model: Option<String>,
-    /// Tool kinds answered "allow once" on a `session/request_permission`
-    /// request; [`DEFAULT_ACP_ALLOW_KINDS`] when absent. An explicit empty
-    /// list denies everything.
-    allow_kinds: Option<Vec<String>>,
-    /// Answer EVERY permission request "allow once", whatever its tool kind.
-    /// The only effect of this flag.
-    #[serde(default)]
-    danger: bool,
 }
 
-/// Resolved `[acp]` settings handed to the `acp_prompt` tool.
+/// Resolved `[acp]` settings used to launch an ACP child session. There is no
+/// permission POLICY here on purpose: every `session/request_permission` is
+/// answered by the session's own question frontend, or refused — never
+/// auto-allowed behind the user's back.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AcpConfig {
     pub binary: String,
     pub args: Vec<String>,
     pub model: Option<String>,
-    pub allow_kinds: Vec<String>,
-    pub danger: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -906,12 +893,11 @@ impl Config {
         Ok(Some(key))
     }
 
-    /// The resolved `[acp]` settings, or None when the section is absent —
-    /// the `acp_prompt` tool is then not registered at all (opt-in, exactly
-    /// like a `[web_search]` without a usable credential). A blank `binary`
-    /// or `model` falls back to the default / "leave the agent's model
-    /// alone"; an explicit `args = []` is honored as "no arguments", and an
-    /// explicit `allow_kinds = []` as "deny every tool kind".
+    /// The resolved `[acp]` settings, or `None` when the section is absent (a
+    /// `delegate { agent: "name" }` call then launches that name with the
+    /// default stdio arguments). A blank `binary` or `model` falls back to the
+    /// default / "leave the agent's model alone"; an explicit `args = []` is
+    /// honored as "no arguments".
     pub fn acp(&self) -> Option<AcpConfig> {
         let acp = self.acp.as_ref()?;
         let binary = acp
@@ -932,26 +918,10 @@ impl Config {
             .map(str::trim)
             .filter(|model| !model.is_empty())
             .map(str::to_owned);
-        // Kinds are matched verbatim against the agent's `toolCall.kind`, so
-        // they are normalized once here (`"Read"` == `"read"`); an explicit
-        // empty list stays empty (deny everything).
-        let allow_kinds = acp.allow_kinds.clone().unwrap_or_else(|| {
-            DEFAULT_ACP_ALLOW_KINDS
-                .iter()
-                .map(|kind| (*kind).to_owned())
-                .collect()
-        });
-        let allow_kinds = allow_kinds
-            .iter()
-            .map(|kind| kind.trim().to_ascii_lowercase())
-            .filter(|kind| !kind.is_empty())
-            .collect();
         Some(AcpConfig {
             binary,
             args,
             model,
-            allow_kinds,
-            danger: acp.danger,
         })
     }
 

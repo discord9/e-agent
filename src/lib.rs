@@ -1,3 +1,4 @@
+pub mod acp;
 pub mod agent;
 pub mod codex;
 pub mod codex_auth;

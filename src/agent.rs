@@ -1268,7 +1268,7 @@ impl ContextItem {
 /// selection and `history_end` the frozen logical end (`history.len()`, not the
 /// last selected row), so `returned_boundaries` maps every logical boundary in
 /// `history_start..=history_end` — trailing unselected rows included.
-type WebHeadPage = (
+pub(crate) type WebHeadPage = (
     Vec<SessionEntry>,
     Vec<Option<EntryLocation>>,
     Option<i64>,

@@ -833,7 +833,11 @@ fn spec_exposes_no_background_parameter() {
         .keys()
         .map(String::as_str)
         .collect::<Vec<_>>();
-    assert_eq!(keys, ["workspace", "role", "label", "resume", "task"]);
+    assert_eq!(
+        keys,
+        ["workspace", "role", "label", "resume", "task", "agent"],
+        "`agent` selects the ACP driver; it is the only added parameter"
+    );
     let workspace = &spec.parameters["properties"]["workspace"];
     assert_eq!(workspace["type"], "string");
     assert!(

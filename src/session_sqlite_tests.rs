@@ -316,7 +316,7 @@ async fn connect_migrates_legacy_sessions_table_missing_feature_columns() {
     );
     // The ACP id is a nullable per-session column, written like the other
     // feature columns (one full snapshot row) and read back through the same
-    // path `acp_prompt` uses.
+    // path the ACP driver uses.
     session
         .set_acp_session_id("legacy-1", Some("70bd9ad0-acp"))
         .await

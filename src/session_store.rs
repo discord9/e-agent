@@ -849,12 +849,13 @@ pub struct SessionMeta {
     /// `Some(false)` = explicitly restored, `None` = never touched (reads
     /// as unarchived).
     pub archived: Option<bool>,
-    /// The ACP (Agent Client Protocol) session id this e-agent session last
-    /// used, so `acp_prompt` can resume its reviewer conversation after an
-    /// e-agent restart. `None` = no ACP conversation yet; every row written
-    /// before the column existed reads as NULL, which is the same "start a
-    /// new one" behaviour. The list projections do not select it — only the
-    /// per-session read does.
+    /// The ACP (Agent Client Protocol) session id an ACP session driver last
+    /// opened for this e-agent session. `None` = no ACP conversation yet;
+    /// every row written before the column existed reads as NULL, which is
+    /// the same "start a new one" behaviour. Cross-process `session/load` is
+    /// a milestone non-goal, so no driver reads it back yet: the column and
+    /// its per-backend accessors stay for that step. The list projections do
+    /// not select it — only the per-session read does.
     #[serde(default)]
     pub acp_session_id: Option<String>,
     /// Writer process identity of this snapshot row
@@ -3616,7 +3617,7 @@ impl SessionStore {
     }
 
     /// The ACP session id this e-agent session last used, or `None` when it
-    /// never ran `acp_prompt`. The backend reads the newest metadata snapshot
+    /// never ran an ACP session. The backend reads the newest metadata snapshot
     /// for the session, so the value survives a restart (and is visible to
     /// another process sharing the same database file).
     #[allow(unused_variables)]
@@ -4290,7 +4291,7 @@ fn jsonl_create_meta(
         title: title.map(str::to_owned), // a fresh session may be named at creation (subagent label)
         pinned: None,                    // a fresh session is unpinned until the user pins it
         archived: None,                  // a fresh session is unarchived until the user archives it
-        acp_session_id: None,            // no ACP conversation until `acp_prompt` runs
+        acp_session_id: None,            // no ACP conversation until a driver opens one
         writer: None, // stamped by jsonl_append_meta_snapshot with the writing process
         label: None,  // label lives in running_tasks / background records, resolved at list time
     };

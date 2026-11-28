@@ -353,6 +353,11 @@ pub struct Delegate {
     /// delegate can never overwrite the parent's registered sender.
     sender: Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
     fork_child: bool,
+    /// The global `[acp]` settings: the ONE external ACP agent a
+    /// `delegate { agent: "…" }` child may converse with. `None` still allows
+    /// an agent by bare name (default stdio arguments), so the parameter works
+    /// without any `[acp]` section.
+    acp: Option<crate::config::AcpConfig>,
 }
 
 /// Where a subagent writes its own session file.
@@ -461,6 +466,7 @@ impl Delegate {
             // what keeps `Agent::new` from installing one over the parent's.
             sender: self.sender.clone(),
             fork_child: true,
+            acp: self.acp.clone(),
         }
     }
 
@@ -503,6 +509,7 @@ impl Delegate {
             fork_model_source: None,
             sender: None,
             fork_child: false,
+            acp: None,
         }
     }
 
@@ -561,6 +568,14 @@ impl Delegate {
     /// the role layers. Without this, `delegate` has no roles.
     pub fn with_roles_root(mut self, root: std::path::PathBuf) -> Self {
         self.roles_root = Some(root);
+        self
+    }
+
+    /// Install the global `[acp]` settings used by `delegate { agent: "…" }`.
+    /// Without them an agent is still launchable by name; the section only
+    /// adds the configured program path, arguments, and model id.
+    pub fn with_acp_agents(mut self, acp: Option<crate::config::AcpConfig>) -> Self {
+        self.acp = acp;
         self
     }
 
@@ -1490,7 +1505,8 @@ impl Tool for Delegate {
             "role": role_property,
             "label": {"type": "string", "description": "short (≤ 40 chars) human-readable title for the task panel; defaults to the role name or a preview of the task"},
             "resume": {"type": "string", "description": "id of a previous subagent session (sub-…) to continue from; its transcript becomes the starting context"},
-            "task": {"type": "string", "description": "complete, self-contained instructions for the subagent"}
+            "task": {"type": "string", "description": "complete, self-contained instructions for the subagent"},
+            "agent": {"type": "string", "description": "run the child as an external ACP agent (e.g. `agy`) instead of an e-model subagent: the child is a persistent, conversable session driven by that agent's own conversation. Mutually exclusive with `role`, `resume` and `fork`. The child keeps its process while idle and ends on an explicit stop."}
         });
         if self.fork_head.is_some() {
             properties["fork"] = json!({"type":"boolean", "description":"Continue from the parent's completed-turn prefix: the child inherits the parent's current model, system prompt, goal and tool schemas, except `generate_image`, which is main-only and absent from every fork (no placeholder is exposed, so a fork of a main session that exposed it has a different tool array). `workspace` defaults to the parent's root; with that default (apart from that one main-only tool, and with the same MCP tool set) the child's request is a byte-identical provider prefix and reuses the parent's prompt cache, while an explicit different `workspace` runs the child's tools/MCP elsewhere and loses that guarantee. Mutually exclusive with `role` and `resume`. The current in-flight turn is excluded, so put everything the child needs in `task`."});
@@ -1517,7 +1533,15 @@ impl Tool for Delegate {
                         .into(),
                 );
             }
-            const KNOWN: &[&str] = &["task", "role", "label", "resume", "workspace", "fork"];
+            const KNOWN: &[&str] = &[
+                "task",
+                "role",
+                "label",
+                "resume",
+                "workspace",
+                "fork",
+                "agent",
+            ];
             for key in args.keys() {
                 if !KNOWN.contains(&key.as_str()) {
                     return Err(format!(
@@ -1541,6 +1565,23 @@ impl Tool for Delegate {
         // child session exists, not after one has already been started.
         if !self.delivery_available() {
             return Err("background task delivery is unavailable".into());
+        }
+        // An ACP child is driven by the external agent's conversation, so the
+        // role template, a resumed e-model transcript and a fork's inherited
+        // provider prefix are all inapplicable. Rejected BEFORE any spawn.
+        let agent_name = arguments
+            .as_object()
+            .and_then(|args| args.get("agent"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned);
+        if agent_name.is_some() {
+            for other in ["role", "resume", "fork"] {
+                if arguments.get(other).is_some() {
+                    return Err(format!("`agent` and `{other}` are mutually exclusive"));
+                }
+            }
         }
         let fork = arguments
             .get("fork")
@@ -1880,7 +1921,6 @@ impl Tool for Delegate {
         let meta_store = SessionStore::connect(&persist.backend, &persist.root, &session_id)
             .await
             .map_err(|error| format!("subagent failed: {error:#}"))?;
-        let meta_model = model_name.clone();
         let meta_role = role.clone();
         let parent_session_id = self.record_in.as_ref().map(|record| record.session.clone());
         let persist_root = persist.root.clone();
@@ -1892,28 +1932,59 @@ impl Tool for Delegate {
         // wrapper's work is released, so a running child is always visible to
         // a fresh automatic Goal turn.
         let goal_registration = self.parent_endpoint.clone();
-        let (handle, runner_task) = Self::start_runner(
-            model,
-            context_window,
-            workspace.clone(),
-            self.background.clone(),
-            DelegatedTask {
-                task,
-                role_prompt,
-                compaction_reminder,
-                read_only,
-                protect_git,
-                sandbox: task_sandbox,
-                interactive: false,
-            },
-            persist,
-            resume,
-            None,
-            IdlePolicy::FinishWhenIdle,
-            CompactionMode::SingleTask,
-            parent_endpoint,
-        )
-        .await?;
+        // The one place a delegation picks its session driver. Everything
+        // after this point (registry entry, task panel, wrapper completion,
+        // web child view) is driver-agnostic: an ACP child IS a session.
+        // The audit row names the model (or ACP agent) actually in use.
+        let (handle, runner_task, model_name) = match agent_name {
+            Some(name) => {
+                let launch = crate::acp::AgentLaunch::resolve(&name, self.acp.as_ref())?;
+                let driver = crate::acp::AcpDriver::connect(&launch, workspace.root()).await?;
+                // The audit row names the agent that actually answered.
+                let model_name = format!("acp:{}", driver.name());
+                let (runner, handle) = SessionRunner::new_acp(
+                    driver,
+                    meta_store.clone(),
+                    persist.root.clone(),
+                    session_id.clone(),
+                    // An ACP child stays alive and conversable after its turn:
+                    // the running-task panel keeps it, the process keeps
+                    // running, and only an explicit stop ends it.
+                    IdlePolicy::WaitForInput,
+                );
+                let runner_task = runner.start(None);
+                // The task is the child's first prompt, delivered through the
+                // ordinary command channel (never through a second transport).
+                handle.prompt(task);
+                (handle, runner_task, model_name)
+            }
+            None => {
+                let (handle, runner_task) = Self::start_runner(
+                    model,
+                    context_window,
+                    workspace.clone(),
+                    self.background.clone(),
+                    DelegatedTask {
+                        task,
+                        role_prompt,
+                        compaction_reminder,
+                        read_only,
+                        protect_git,
+                        sandbox: task_sandbox,
+                        interactive: false,
+                    },
+                    persist,
+                    resume,
+                    None,
+                    IdlePolicy::FinishWhenIdle,
+                    CompactionMode::SingleTask,
+                    parent_endpoint,
+                )
+                .await?;
+                (handle, runner_task, model_name)
+            }
+        };
+        let meta_model = model_name.clone();
         let sessions = self.sessions.clone();
         let slot = Arc::new(Mutex::new(None::<u64>));
         let slot_in_hook = slot.clone();

@@ -130,6 +130,19 @@ result or user correction challenges an assumption.
   stays visible. No
   arbitrary agent-to-agent messaging (only direct live parent/child `send_message`) or worker/concurrency pool. Process-level isolation
   (subagents as subprocesses) is the planned evolution but not implemented.
+- A delegation runs on one of two session DRIVERS, chosen at construction and
+  owned by the runner (`src/runner.rs`, `SessionDriver`): the model/tool loop
+  (`Agent`) or an external ACP conversation (`src/acp.rs`, `delegate { agent:
+  "agy" }`). There is no `Model` impl for ACP and no `is_acp` flag at call
+  sites: everything generic (event fanout, `WaitingInput` questions, transcript
+  append, cancellation, registry entry, task panel, web view) is shared, and
+  only the driver differs. An ACP child keeps one `agy acp` process for its
+  lifetime, is idle (not finished) when a prompt ends, and ends on an explicit
+  stop; its `session/request_permission` becomes that child's own question,
+  answered by the offered option id verbatim or refused — never auto-approved.
+  Non-goals: tool-call cards for the agent's own calls, usage accounting,
+  `/model`, compaction, cross-process `session/load`, MCP passthrough, TUI
+  parity, queued prompts, ACP session discovery.
 
 ## Commands
 

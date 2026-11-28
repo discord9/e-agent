@@ -4,7 +4,7 @@ use crate::{
     agent::{
         Agent, AgentEvent, BACKGROUND_REMINDER, CompactionOutput, GoalStatus, ImagePart, Message,
         Model, POLL_GUARD_TERMINATION_NOTICE, RoundOutput, SessionEntry, ToolCall, ToolOutput,
-        ToolSpec, is_poll_guard_terminate, tool_error_content,
+        ToolSpec, WebHeadPage, is_poll_guard_terminate, tool_error_content,
     },
     model::{ImageRejection, image_rejection},
     session_store::{LocatedKey, SessionStore},
@@ -1286,8 +1286,10 @@ impl SessionHandle {
 pub(crate) struct TestSessionEmitter {
     shared: Arc<Mutex<Shared>>,
 }
+
 #[cfg(test)]
 impl TestSessionEmitter {
+    /// Test-only: publish one event through the session's single fanout.
     pub(crate) fn emit(&self, event: AgentEvent) {
         self.shared.lock().unwrap().emit_durable(event);
     }
@@ -1302,11 +1304,6 @@ impl TestSessionEmitter {
         };
         shared.input_claimed = false;
         shared.status.send_replace(status);
-    }
-    /// Test-only: let this ad-hoc handle answer questions exactly like a root
-    /// session (the real gate is installed by `with_user_input_allowed`).
-    pub(crate) fn allow_user_input(&self) {
-        self.shared.lock().unwrap().user_input_allowed = true;
     }
     /// Test-only: register one process-local asynchronous question exactly as
     /// the runner does, so status/answer tests can exercise the map without
@@ -1490,8 +1487,98 @@ pub(crate) struct SessionBootstrap {
     pub(crate) initial_entries: Vec<SessionEntry>,
 }
 
+/// What drives a session's turns: our own model/tool loop, or an external ACP
+/// conversation. The runner owns exactly ONE of them, chosen at construction;
+/// no call site passes a flag, and `run` dispatches once on it.
+pub(crate) enum SessionDriver {
+    Agent(Box<Agent>),
+    Acp(Box<crate::acp::AcpDriver>),
+}
+
+/// What woke the model loop's idle wait.
+enum IdleWake {
+    /// The background-projection tick.
+    Tick,
+    /// A steering command, or the command channel closed.
+    Command(Option<SessionCommand>),
+    /// A background completion was folded into the agent (`false` = the
+    /// agent's background channel closed).
+    Background(bool),
+}
+
+/// One awaited ACP-session step: a driver signal or a steering command.
+enum AcpStep {
+    Event(Option<crate::acp::DriverEvent>),
+    Command(Option<SessionCommand>),
+}
+
+/// What one handled turn event does next.
+enum AcpFlow {
+    /// Keep the turn running.
+    Continue,
+    /// The turn is over (its stop reason arrived, or it was cancelled): the
+    /// session returns to idle and stays usable.
+    TurnOver,
+    /// The whole session ends with this terminal result.
+    Session(SessionResult),
+}
+
+/// The turn in flight: the assistant text accumulated from
+/// `agent_message_chunk` (committed once, at the end) and the permission
+/// question currently awaiting an answer.
+#[derive(Default)]
+struct AcpTurn {
+    text: String,
+    ask: Option<OpenAsk>,
+}
+
+/// One open permission question: the call id this session published, the
+/// JSON-RPC id it must be answered on, and the options the agent offered.
+struct OpenAsk {
+    call_id: String,
+    id: serde_json::Value,
+    prompt: String,
+    options: Vec<UserOption>,
+}
+
+/// The one terminal report for a dead agent, shared by the turn and idle
+/// paths so both word it identically.
+fn turn_failure(reason: String) -> String {
+    if reason.contains("acp:") {
+        reason
+    } else {
+        format!("acp: {reason}")
+    }
+}
+
+/// A steering command's name for the "not supported by an ACP session" line.
+fn command_name(command: &SessionCommand) -> &'static str {
+    match command {
+        SessionCommand::Prompt(_) => "prompt",
+        SessionCommand::PromptWithImage { .. } => "image prompt",
+        SessionCommand::Cancel => "cancel",
+        SessionCommand::Compact => "compaction",
+        SessionCommand::SwitchModel { .. } => "model switching",
+        SessionCommand::Goal(_) => "goal control",
+        SessionCommand::Answer { .. } => "answer",
+        SessionCommand::Continue(_) => "goal continuation",
+        SessionCommand::WebAttach(_) => "attach",
+        SessionCommand::AgentMessage { .. } => "agent message",
+        SessionCommand::AskUser { .. } => "user question",
+    }
+}
+
 pub struct SessionRunner {
-    agent: Agent,
+    driver: SessionDriver,
+    /// Display transcript for a NON-`Agent` driver: an ACP session keeps its
+    /// conversation in the agent (authoritative for execution) and this vec is
+    /// ours (authoritative for display). Always empty for `Agent`, whose own
+    /// history is the transcript.
+    display_history: Vec<(SessionEntry, Option<crate::session_store::EntryLocation>)>,
+    /// Driver signals for a non-`Agent` driver (the ACP reader's updates).
+    /// `None` for `Agent`, whose events arrive through `Agent::emit`.
+    driver_events: Option<mpsc::UnboundedReceiver<crate::acp::DriverEvent>>,
+
     store: SessionStore,
     root: PathBuf,
     session: String,
@@ -1538,7 +1625,13 @@ pub struct SessionRunner {
 
 impl Drop for SessionRunner {
     fn drop(&mut self) {
-        self.shared.lock().unwrap().commands_open = false;
+        let mut shared = self.shared.lock().unwrap();
+        shared.commands_open = false;
+        // An aborted ACP session must not leave a phantom question behind for
+        // a handle that outlives its runner (the web view would keep offering
+        // an answer nobody can apply any more).
+        shared.waiting_input = None;
+        shared.input_claimed = false;
     }
 }
 
@@ -1607,7 +1700,165 @@ fn respond_web_attach_locked(shared: &Shared, reply: oneshot::Sender<WebAttach>)
     });
 }
 
+/// The panic a model-only path hits when an ACP session reaches it: a broken
+/// driver boundary must be loud and name the session, never silently drive a
+/// session nobody owns. Cold + never inlined because it only runs on a bug.
+#[cold]
+#[inline(never)]
+fn unreachable_model_loop(session: &str) -> ! {
+    panic!("session `{session}`: model-loop path reached by an ACP session")
+}
+
+/// The driver-agnostic session core: ONE `Shared` fanout (every event of every
+/// session goes through `Shared::emit_agent`), one command channel, one
+/// frontend handle. `new` (model loop) and `new_acp` (ACP conversation) build
+/// exactly this, so the two drivers differ only in what drives their turns.
+fn session_core(
+    replay: Vec<LogEvent>,
+    history_boundary: usize,
+    goal: Option<crate::agent::GoalSnapshot>,
+) -> (
+    Arc<Mutex<Shared>>,
+    SessionHandle,
+    mpsc::UnboundedReceiver<SessionCommand>,
+) {
+    let (events, _) = broadcast::channel(EVENT_CAPACITY);
+    let (status, _) = watch::channel(SessionStatus::Idle);
+    // Resume has no live producer yet; seed the explicit web projection from
+    // durable typed events without interpreting display text.
+    let latest_usage = replay.iter().rev().find_map(|item| match &item.event {
+        AgentEvent::Usage { .. } => Some(item.event.clone()),
+        _ => None,
+    });
+    let shared = Arc::new(Mutex::new(Shared {
+        log: replay,
+        history_boundary,
+        web_head: None,
+        events,
+        status,
+        compaction_streaming: false,
+        latest_usage,
+        usage_pre_compaction: false,
+        commands_open: true,
+        user_input_allowed: false,
+        waiting_input: None,
+        input_claimed: false,
+        ask_reserved: None,
+        pending_questions: std::collections::HashMap::new(),
+        goal,
+        live_model: None,
+        goal_children: std::collections::HashSet::new(),
+    }));
+    let (tx, commands) = mpsc::unbounded_channel();
+    let handle = SessionHandle {
+        shared: shared.clone(),
+        commands: tx,
+    };
+    (shared, handle, commands)
+}
+
 impl SessionRunner {
+    /// The model-loop driver's own `Agent`.
+    ///
+    /// UNREACHABLE BY DESIGN: `run` dispatches on the driver before any
+    /// model-loop path can execute, so an ACP session never gets here. If this
+    /// ever panics, the boundary was broken (a model-only call was reached
+    /// through a non-model driver) — loudly, naming the session, instead of
+    /// silently driving a session nobody owns.
+    fn agent(&mut self) -> &mut Agent {
+        if let SessionDriver::Agent(agent) = &mut self.driver {
+            return agent;
+        }
+        unreachable_model_loop(&self.session)
+    }
+
+    /// Whether the driver can consume an image. An ACP session cannot in this
+    /// milestone, and asking its driver would reach the model-only agent.
+    fn supports_vision(&mut self) -> bool {
+        if let SessionDriver::Agent(agent) = &mut self.driver {
+            return agent.supports_vision();
+        }
+        false
+    }
+
+    /// The model-loop agent through a shared borrow (read-only predicates).
+    fn agent_ro(&self) -> &Agent {
+        if let SessionDriver::Agent(agent) = &self.driver {
+            return agent;
+        }
+        unreachable_model_loop(&self.session)
+    }
+
+    /// Apply one entry with its exact physical key and return the new
+    /// transcript length (the session's display history boundary). For the
+    /// model loop this is the agent's history; for an ACP conversation it is
+    /// our own display transcript — the agent keeps its own history for
+    /// execution and never sees ours.
+    fn apply_entry_located(
+        &mut self,
+        entry: SessionEntry,
+        location: Option<crate::session_store::EntryLocation>,
+    ) -> usize {
+        if let SessionDriver::Agent(agent) = &mut self.driver {
+            agent.apply_entry_located(entry, location);
+            return agent.history().len();
+        }
+        self.display_history.push((entry, location));
+        self.display_history.len()
+    }
+
+    /// Apply one entry with no physical key (a failed append's fallback).
+    fn apply_entry_unlocated(&mut self, entry: SessionEntry) -> usize {
+        if let SessionDriver::Agent(agent) = &mut self.driver {
+            agent.apply_entry(entry);
+            return agent.history().len();
+        }
+        self.display_history.push((entry, None));
+        self.display_history.len()
+    }
+
+    /// The whole loaded transcript (owned, for the legacy-rewrite path only).
+    fn history_entries(&self) -> Vec<SessionEntry> {
+        match &self.driver {
+            SessionDriver::Agent(agent) => agent.history().to_vec(),
+            SessionDriver::Acp(_) => self
+                .display_history
+                .iter()
+                .map(|(entry, _)| entry.clone())
+                .collect(),
+        }
+    }
+
+    /// The authoritative bounded head a web attach replays. The model loop
+    /// derives it from the agent's located history (compaction-aware paging);
+    /// a non-`Agent` driver's transcript is small and fully returned.
+    fn head_page(&self, limit: usize, jsonl: bool) -> WebHeadPage {
+        if let SessionDriver::Agent(agent) = &self.driver {
+            return agent.web_head_page(limit, jsonl);
+        }
+        let mut entries = Vec::new();
+        let mut locations = Vec::new();
+        let mut returned_boundaries = vec![0];
+        for (entry, location) in &self.display_history {
+            // Same rule as the agent page: an unlocated Error row is display
+            // only and never enters a returned page.
+            if !matches!(entry, SessionEntry::Error { .. }) || location.is_some() {
+                entries.push(entry.clone());
+                locations.push(location.clone());
+            }
+            returned_boundaries.push(entries.len());
+        }
+        (
+            entries,
+            locations,
+            None,
+            None,
+            0,
+            self.display_history.len(),
+            returned_boundaries,
+        )
+    }
+
     pub(crate) fn with_background_tasks(
         mut self,
         background: crate::tools::BackgroundTasks,
@@ -1640,7 +1891,10 @@ impl SessionRunner {
     /// separate goal restore reached the agent.
     #[cfg(test)]
     pub(crate) fn goal_projection_for_test(&self) -> (Option<crate::agent::GoalSnapshot>, bool) {
-        (self.agent.goal(), self.agent.goal_cleared())
+        match &self.driver {
+            SessionDriver::Agent(agent) => (agent.goal(), agent.goal_cleared()),
+            SessionDriver::Acp(_) => (None, false),
+        }
     }
 
     async fn sync_background_projection(&mut self) -> bool {
@@ -1667,7 +1921,7 @@ impl SessionRunner {
             return false;
         };
         let live: HashSet<u64> = self
-            .agent
+            .agent_ro()
             .background_task_ids()
             .iter()
             .copied()
@@ -1729,8 +1983,8 @@ impl SessionRunner {
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
         agent.set_request_session_id(request_session_id);
-        let (events, _) = broadcast::channel(EVENT_CAPACITY);
-        let (status, _) = watch::channel(SessionStatus::Idle);
+        // Replay and the goal projection are the driver's own history; the
+        // core below is driver-agnostic, so an ACP session seeds both empty.
         let replay: Vec<LogEvent> = agent
             .history()
             .iter()
@@ -1745,44 +1999,78 @@ impl SessionRunner {
         // the agent (resume fold: newest GoalUpdated wins — reuse the
         // agent's own fold instead of a second reverse scan).
         let goal = agent.goal();
-        // Resume has no live producer yet; seed the explicit web projection
-        // from durable typed events without interpreting display text.
-        let latest_usage = replay.iter().rev().find_map(|item| match &item.event {
-            AgentEvent::Usage { .. } => Some(item.event.clone()),
-            _ => None,
-        });
-        let shared = Arc::new(Mutex::new(Shared {
-            log: replay,
-            history_boundary: agent.history().len(),
-            web_head: None,
-            events,
-            status,
-            compaction_streaming: false,
-            latest_usage,
-            usage_pre_compaction: false,
-            commands_open: true,
-            user_input_allowed: false,
-            waiting_input: None,
-            input_claimed: false,
-            ask_reserved: None,
-            pending_questions: std::collections::HashMap::new(),
-            goal,
-            live_model: None,
-            goal_children: std::collections::HashSet::new(),
-        }));
+        let (shared, handle, commands) = session_core(replay, agent.history().len(), goal);
         let handler_shared = shared.clone();
         agent.set_event_handler(Box::new(move |event| {
             handler_shared.lock().unwrap().emit_agent(event)
         }));
-        let (tx, commands) = mpsc::unbounded_channel();
-        let handle = SessionHandle {
-            shared: shared.clone(),
-            commands: tx,
-        };
         agent.set_session_handle(&session, handle.clone());
         (
             Self {
-                agent,
+                driver: SessionDriver::Agent(Box::new(agent)),
+                display_history: Vec::new(),
+                driver_events: None,
+                store,
+                root,
+                session,
+                shared,
+                background: None,
+                projected_background: None,
+                bootstrap_projection_pending: true,
+                commands,
+                pending: VecDeque::new(),
+                pending_web_attaches: Vec::new(),
+                policy,
+                last_answer: None,
+                armed_trigger: None,
+                turn_just_ended: false,
+                maintenance_resume: false,
+                pending_regular_reaction: false,
+                goal_notice_unconsumed: false,
+                goal_continuation_remaining: None,
+                goal_continuation_usage_unavailable: false,
+                goal_continuation_armed: false,
+                bootstrap: None,
+                #[cfg(test)]
+                before_finalize: None,
+                #[cfg(test)]
+                before_goal_notice_drain: None,
+                #[cfg(test)]
+                before_read_only_tool: None,
+            },
+            handle,
+        )
+    }
+
+    /// Build a session whose turns are an external ACP conversation. The
+    /// driver (`AcpDriver`) already owns a live agent process and its ACP
+    /// session; this constructor gives it the SAME session core the model loop
+    /// gets — one fanout, one handle, one command channel — so every generic
+    /// piece (web view, task panel, question plumbing, transcript append,
+    /// cancellation) works unchanged. No `Agent`, no model, no provider.
+    pub(crate) fn new_acp(
+        mut driver: crate::acp::AcpDriver,
+        store: SessionStore,
+        root: PathBuf,
+        session: String,
+        policy: IdlePolicy,
+    ) -> (Self, SessionHandle) {
+        tracing::info!(
+            "e-agent: acp child `{}` opened ACP session {}",
+            driver.name(),
+            driver.session_id()
+        );
+        let (shared, handle, commands) = session_core(Vec::new(), 0, None);
+        // An ACP session is answerable: its agent asks the client for
+        // permission mid-turn, and that question IS this session's question.
+        // Scoped here, never by enabling questions for other drivers.
+        shared.lock().unwrap().user_input_allowed = true;
+        let events = Some(driver.take_events());
+        (
+            Self {
+                driver: SessionDriver::Acp(Box::new(driver)),
+                display_history: Vec::new(),
+                driver_events: events,
                 store,
                 root,
                 session,
@@ -1835,7 +2123,7 @@ impl SessionRunner {
         };
         if bootstrap.legacy {
             self.store
-                .rewrite(&self.root, &self.session, self.agent.history())
+                .rewrite(&self.root, &self.session, &self.history_entries())
                 .await?;
         }
         for entry in bootstrap.initial_entries {
@@ -1950,11 +2238,11 @@ impl SessionRunner {
             }
             _ => None,
         };
-        self.agent.apply_entry_located(entry, location);
+        let history_len = self.apply_entry_located(entry, location);
         self.shared
             .lock()
             .unwrap()
-            .set_history_boundary(self.agent.history().len());
+            .set_history_boundary(history_len);
         if let Some(event) = event {
             // Background notices become live only after their durable entry
             // exists; using Agent's normal event path prevents a second UI-only
@@ -1974,7 +2262,7 @@ impl SessionRunner {
         // image, and committing it would poison every later model call via
         // the vision gate. Reject loudly — the caller surfaces the error to
         // the user and keeps the session alive.
-        if image.is_some() && !self.agent.supports_vision() {
+        if image.is_some() && !self.supports_vision() {
             anyhow::bail!("当前模型不支持图片输入");
         }
         let entry: SessionEntry = Message::User {
@@ -1987,9 +2275,9 @@ impl SessionRunner {
             .append_located(&self.root, &self.session, std::slice::from_ref(&entry))
             .await?;
         let location = locations.into_iter().next();
-        self.agent.apply_entry_located(entry, location);
+        let history_len = self.apply_entry_located(entry, location);
         let mut shared = self.shared.lock().unwrap();
-        shared.set_history_boundary(self.agent.history().len());
+        shared.set_history_boundary(history_len);
         for (queued, prompt) in consumed {
             if queued {
                 // Queue state is presentation-only: consuming it must not
@@ -2029,22 +2317,21 @@ impl SessionRunner {
             .await
         {
             Ok(mut locations) => {
-                self.agent
-                    .apply_entry_located(entry, locations.drain(..).next());
+                let history_len = self.apply_entry_located(entry, locations.drain(..).next());
                 self.shared
                     .lock()
                     .unwrap()
-                    .set_history_boundary(self.agent.history().len());
+                    .set_history_boundary(history_len);
             }
             Err(error) => {
                 tracing::warn!("e-agent: cannot persist session error: {error:#}");
                 // No SessionEntry exists on disk: this fallback is a
                 // presentation event, never a fake durable projection.
-                self.agent.apply_entry(entry);
+                let history_len = self.apply_entry_unlocated(entry);
                 self.shared
                     .lock()
                     .unwrap()
-                    .set_history_boundary(self.agent.history().len());
+                    .set_history_boundary(history_len);
                 self.shared
                     .lock()
                     .unwrap()
@@ -2062,7 +2349,7 @@ impl SessionRunner {
     /// ephemeral: it is never represented in history or reconstructed.
     fn arm_goal_continuation(&mut self, budget: Option<u64>) {
         if !matches!(
-            self.agent.goal().as_ref().map(|goal| goal.status),
+            self.agent().goal().as_ref().map(|goal| goal.status),
             Some(GoalStatus::Active)
         ) {
             self.goal_continuation_armed = false;
@@ -2114,7 +2401,7 @@ impl SessionRunner {
     /// is the admission linearization point — work registered after it does
     /// not revoke the request, it only blocks the next fresh turn.
     fn goal_owned_background_outstanding(&self) -> bool {
-        self.agent.has_blocking_background()
+        self.agent_ro().has_blocking_background()
             || !self.shared.lock().unwrap().goal_children.is_empty()
     }
 
@@ -2139,14 +2426,14 @@ impl SessionRunner {
                 success_criteria,
             } => {
                 let goal = crate::agent::create_goal(
-                    self.agent.goal().as_ref(),
+                    self.agent().goal().as_ref(),
                     objective,
                     success_criteria,
                 )?;
                 SessionEntry::GoalUpdated { goal: Some(goal) }
             }
             GoalCommand::Action(action) => {
-                let current = self.agent.goal();
+                let current = self.agent().goal();
                 let Some(goal) = &current else {
                     return Err("no goal is set for this session".into());
                 };
@@ -2172,7 +2459,7 @@ impl SessionRunner {
             self.armed_trigger = Some(RunnerTrigger::Background);
         }
         if !matches!(
-            self.agent.goal().as_ref().map(|goal| goal.status),
+            self.agent().goal().as_ref().map(|goal| goal.status),
             Some(GoalStatus::Active)
         ) {
             self.goal_continuation_armed = false;
@@ -2230,7 +2517,7 @@ impl SessionRunner {
                     .as_object()
                     .ok_or("get_goal arguments must be a JSON object")?;
                 reject_unknown_goal_fields(object, &[], "get_goal")?;
-                Ok(ToolOutput::text(match self.agent.goal() {
+                Ok(ToolOutput::text(match self.agent().goal() {
                     Some(goal) => crate::agent::goal_snapshot_json(&goal),
                     None => "No goal is set for this session. Goals are created by the user \
                              (/goal set …); you can update an existing one with update_goal."
@@ -2317,7 +2604,7 @@ impl SessionRunner {
                 let success_criteria = string_array(object, "success_criteria")?;
                 let evidence = string_array(object, "evidence")?.unwrap_or_default();
                 let next = crate::agent::transition_goal(
-                    self.agent.goal().as_ref(),
+                    self.agent().goal().as_ref(),
                     &id,
                     revision,
                     &action,
@@ -2365,7 +2652,7 @@ impl SessionRunner {
         if !object.is_empty() {
             return Err("get_context_usage accepts no arguments".into());
         }
-        let (context_window, input) = self.agent.context_usage();
+        let (context_window, input) = self.agent().context_usage();
         let headroom = match (context_window, input) {
             (Some(window), Some(input)) => Some(window.saturating_sub(input)),
             _ => None,
@@ -2587,7 +2874,7 @@ impl SessionRunner {
             history_start,
             history_end,
             returned_boundaries,
-        ) = self.agent.web_head_page(200, self.store.is_jsonl());
+        ) = self.head_page(200, self.store.is_jsonl());
         // Normalize the page contract at the source: `None` means "this
         // session". A head-only resume whose own compaction opened the head
         // carries a cursor tagged with the session's OWN id (its earlier rows
@@ -2790,7 +3077,7 @@ impl SessionRunner {
             } => {
                 // Instant, not queued: the new model applies to the next
                 // model call (a call already in flight keeps its model).
-                self.agent.set_model(model, context_window);
+                self.agent().set_model(model, context_window);
                 // The live routing identity a fork child must inherit; the
                 // request head captured at build time is stale from here on.
                 self.shared.lock().unwrap().live_model = Some((profile, context_window));
@@ -2857,8 +3144,8 @@ impl SessionRunner {
             // previous entry's store append is awaiting must not be left in
             // the channel past this flush — it would miss this safety
             // boundary (the next provider call would not see it).
-            self.agent.drain_background_ready();
-            let Some(entry) = self.agent.peek_background_entry() else {
+            self.agent().drain_background_ready();
+            let Some(entry) = self.agent().peek_background_entry() else {
                 return Ok(any);
             };
             // Persist the completion first, then drop the id from the live
@@ -2877,7 +3164,7 @@ impl SessionRunner {
                 .append_located(&self.root, &self.session, std::slice::from_ref(&entry))
                 .await?;
             let location = locations.into_iter().next();
-            self.agent.ack_background_entry();
+            self.agent().ack_background_entry();
             if let Some(id) = child_id {
                 self.shared.lock().unwrap().goal_children.remove(&id);
             }
@@ -2913,9 +3200,9 @@ impl SessionRunner {
                 &entry,
                 SessionEntry::Notice { .. } | SessionEntry::BackgroundCompletion { .. }
             );
-            self.agent.apply_entry_located(entry, location);
+            let history_len = self.apply_entry_located(entry, location);
             let mut shared = self.shared.lock().unwrap();
-            shared.set_history_boundary(self.agent.history().len());
+            shared.set_history_boundary(history_len);
             shared.emit_durable(event);
             if fresh_ingress {
                 // Arm only after append + owner acknowledgement + apply. A
@@ -3017,7 +3304,7 @@ impl SessionRunner {
                     model,
                     context_window,
                 } => {
-                    self.agent.set_model(model, context_window);
+                    self.agent().set_model(model, context_window);
                     self.shared.lock().unwrap().live_model = Some((profile, context_window));
                 }
                 other => deferred.push(other),
@@ -3099,7 +3386,12 @@ impl SessionRunner {
         self.status(SessionStatus::Compacting);
         self.prepare_web_attach();
         self.shared.lock().unwrap().compaction_streaming = true;
-        let waited = await_compaction(&mut self.agent, &mut self.commands, &self.shared).await;
+        let waited = match &mut self.driver {
+            SessionDriver::Agent(agent) => {
+                await_compaction(agent, &mut self.commands, &self.shared).await
+            }
+            SessionDriver::Acp(_) => unreachable_model_loop(&self.session),
+        };
         self.shared.lock().unwrap().compaction_streaming = false;
         match waited.outcome {
             WaitOutcome::Completed(Ok(out)) => {
@@ -3159,7 +3451,7 @@ impl SessionRunner {
                 // 时重新检查 last_context_input —— 该轮翻篇后新基线 <80% 不再
                 // 触发；当前轮仍巨大则下一轮结束后再评估一次，同一轮内不会反复
                 // 压缩。
-                self.agent.clear_auto_compacted();
+                self.agent().clear_auto_compacted();
                 // 压缩用量落盘（kind="compact"）。与 agent.rs 的 `Agent::compact`
                 // （直接调用路径，无 store 访问权）不是同一事件：runner 走的是
                 // `prepare_compaction`，生产环境压缩只经此处落盘，不会重复写入。
@@ -3168,13 +3460,14 @@ impl SessionRunner {
                 // the provider omitted usage for this operation.
                 self.shared.lock().unwrap().usage_pre_compaction = true;
                 if let Some(usage) = usage {
-                    self.agent.apply_usage(Some(usage.clone()), false);
+                    self.agent().apply_usage(Some(usage.clone()), false);
+                    let model_name = self.agent().model_name();
                     if let Err(error) = self
                         .store
                         .append_usage(
                             &self.root,
                             &self.session,
-                            &self.agent.model_name(),
+                            &model_name,
                             "compact",
                             committed_seq,
                             &usage,
@@ -3190,7 +3483,7 @@ impl SessionRunner {
                 OperationFlow::Done(steering, true)
             }
             WaitOutcome::Completed(Err(error)) => {
-                self.agent.reset_auto_compact_request();
+                self.agent().reset_auto_compact_request();
                 if charge_goal_continuation {
                     self.goal_continuation_armed = false;
                     self.goal_continuation_remaining = None;
@@ -3217,7 +3510,7 @@ impl SessionRunner {
                 // by wait_for_operation); classify from what is now queued.
                 self.intake_after_cancel(waited.pending);
                 let steering = self.release_steering();
-                self.agent.reset_auto_compact_request();
+                self.agent().reset_auto_compact_request();
                 self.shared
                     .lock()
                     .unwrap()
@@ -3236,6 +3529,422 @@ impl SessionRunner {
     }
 
     async fn run(&mut self) {
+        // The single dispatch point: the runner knows which driver it has, and
+        // nothing downstream is told. Every generic piece (fanout, questions,
+        // transcript append, cancellation, registry entry, web view) is shared.
+        if matches!(self.driver, SessionDriver::Acp(_)) {
+            self.run_acp_loop().await
+        } else {
+            self.run_model_loop().await
+        }
+    }
+
+    // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    // ACP driver: sessions whose turns are an external ACP conversation
+    // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    /// The ACP driver. Unreachable for a model-loop runner; `run` dispatches
+    /// on the driver first, so this never crosses drivers.
+    fn acp(&mut self) -> &mut crate::acp::AcpDriver {
+        if let SessionDriver::Acp(driver) = &mut self.driver {
+            return driver;
+        }
+        unreachable_model_loop(&self.session)
+    }
+
+    /// Await exactly one of: a driver signal, or a steering command. Awaits
+    /// only — the borrows end before the caller acts, so command handling can
+    /// take `&mut self`.
+    async fn next_acp_step(&mut self) -> AcpStep {
+        let events = self
+            .driver_events
+            .as_mut()
+            .expect("an ACP session owns its driver events");
+        let commands = &mut self.commands;
+        tokio::select! {
+            // Cancel and answers must not wait behind a delta burst, so the
+            // order is randomized rather than preferring events.
+            event = events.recv() => AcpStep::Event(event),
+            command = commands.recv() => AcpStep::Command(command),
+        }
+    }
+
+    /// The ACP session loop. Idle is a real, persistent state: the process
+    /// stays alive and the task stays registered after a turn, so the session
+    /// remains conversable (another prompt, another question) until an
+    /// explicit stop. Exactly one terminal report leaves this function.
+    async fn run_acp_loop(&mut self) {
+        debug_assert!(
+            matches!(self.driver, SessionDriver::Acp(_)),
+            "session `{}`: ACP loop reached by a model-loop session",
+            self.session
+        );
+        self.status(SessionStatus::Idle);
+        loop {
+            match self.next_acp_step().await {
+                AcpStep::Command(Some(command)) => {
+                    if let Some(result) = self.acp_idle_command(command).await {
+                        self.finish_acp(result).await;
+                        return;
+                    }
+                }
+                AcpStep::Command(None) => {
+                    // Every frontend handle is gone: the session is over.
+                    self.finish_acp(SessionResult::Closed).await;
+                    return;
+                }
+                // The agent is gone (or its stdout closed). One terminal
+                // report, never a silent idle session that cannot answer.
+                AcpStep::Event(Some(crate::acp::DriverEvent::Died(reason))) => {
+                    self.finish_acp(SessionResult::Failed(turn_failure(reason)))
+                        .await;
+                    return;
+                }
+                AcpStep::Event(None) => {
+                    self.finish_acp(SessionResult::Failed(
+                        "acp: the agent closed the connection".into(),
+                    ))
+                    .await;
+                    return;
+                }
+                // A stray update outside a turn (a late chunk of a cancelled
+                // turn): nothing to attach it to.
+                AcpStep::Event(Some(_)) => {}
+            }
+        }
+    }
+
+    /// End an ACP session: kill and reap the agent process, then publish the
+    /// ONE terminal result through the ordinary path (the spawner's wrapper
+    /// turns it into a single completion report).
+    async fn finish_acp(&mut self, result: SessionResult) {
+        self.acp().shutdown().await;
+        // No question can be answered once the session is over: drop the
+        // pending ask so a late answer is refused instead of claimed.
+        {
+            let mut shared = self.shared.lock().unwrap();
+            shared.waiting_input = None;
+            shared.input_claimed = false;
+        }
+        self.terminate(result, Vec::new()).await;
+    }
+
+    /// Handle one command while the session is idle. `Some(result)` ends the
+    /// session (with exactly one terminal report); `None` keeps it alive.
+    async fn acp_idle_command(&mut self, command: SessionCommand) -> Option<SessionResult> {
+        match command {
+            SessionCommand::Prompt(text) => self.acp_turn(text).await,
+            SessionCommand::WebAttach(reply) => {
+                self.prepare_web_attach();
+                respond_web_attach_shared(&self.shared, reply);
+                None
+            }
+            SessionCommand::AgentMessage { source, body } => {
+                match self.commit_agent_message(source, body).await {
+                    Ok(()) => None,
+                    Err(error) => Some(SessionResult::Failed(format!("{error:#}"))),
+                }
+            }
+            // An explicit stop: an idle ACP session has no turn to release, so
+            // this is the one command that ends it, and it reports once to the
+            // spawner through the ordinary wrapper path.
+            SessionCommand::Cancel => Some(SessionResult::Cancelled),
+            SessionCommand::Answer { call_id, .. } => {
+                self.shared
+                    .lock()
+                    .unwrap()
+                    .emit_presentation(AgentEvent::Display(format!(
+                        "[acp] ignored an answer for `{call_id}`: no permission request is open"
+                    )));
+                None
+            }
+            other => {
+                self.shared
+                    .lock()
+                    .unwrap()
+                    .emit_presentation(AgentEvent::Display(format!(
+                        "[acp] {} is not supported by an ACP session",
+                        command_name(&other)
+                    )));
+                None
+            }
+        }
+    }
+
+    /// Run ONE turn: commit the prompt, send `session/prompt`, and stream the
+    /// agent's answer until the prompt response's stop reason. `Some(result)`
+    /// ends the session; `None` returns it to idle.
+    async fn acp_turn(&mut self, prompt: String) -> Option<SessionResult> {
+        let mut turn = AcpTurn::default();
+        let entry = Message::User {
+            content: prompt.clone(),
+            images: Vec::new(),
+        };
+        if let Err(error) = self.commit(entry.into()).await {
+            return Some(SessionResult::Failed(format!("{error:#}")));
+        }
+        self.status(SessionStatus::Busy);
+        self.acp().prompt(&prompt);
+        loop {
+            match self.next_acp_step().await {
+                AcpStep::Event(Some(event)) => match self.acp_event(&mut turn, event).await {
+                    AcpFlow::Continue => {}
+                    AcpFlow::TurnOver => return None,
+                    AcpFlow::Session(result) => return Some(result),
+                },
+                AcpStep::Event(None) => {
+                    return Some(SessionResult::Failed(
+                        "acp: the agent closed the connection during the turn".into(),
+                    ));
+                }
+                AcpStep::Command(Some(command)) => {
+                    match self.acp_command(&mut turn, command).await {
+                        AcpFlow::Continue => {}
+                        AcpFlow::TurnOver => return None,
+                        AcpFlow::Session(result) => return Some(result),
+                    }
+                }
+                AcpStep::Command(None) => return Some(SessionResult::Closed),
+            }
+        }
+    }
+
+    /// One driver signal during a turn.
+    async fn acp_event(&mut self, turn: &mut AcpTurn, event: crate::acp::DriverEvent) -> AcpFlow {
+        use crate::acp::DriverEvent;
+        match event {
+            DriverEvent::Delta(chunk) => {
+                turn.text.push_str(&chunk);
+                self.shared
+                    .lock()
+                    .unwrap()
+                    .emit_agent(AgentEvent::AssistantDelta(chunk));
+                AcpFlow::Continue
+            }
+            DriverEvent::Thought(chunk) => {
+                self.shared
+                    .lock()
+                    .unwrap()
+                    .emit_agent(AgentEvent::ReasoningDelta(chunk));
+                AcpFlow::Continue
+            }
+            DriverEvent::Permission(request) => {
+                self.acp_permission(turn, request).await;
+                AcpFlow::Continue
+            }
+            DriverEvent::Finished { stop_reason } => {
+                let text = std::mem::take(&mut turn.text);
+                self.acp_end_turn(turn, text, &stop_reason).await
+            }
+            DriverEvent::Died(reason) => {
+                // The process died mid-turn: one terminal report, no hang and
+                // no silent success. The wrapper carries it to the spawner.
+                AcpFlow::Session(SessionResult::Failed(turn_failure(reason)))
+            }
+        }
+    }
+
+    /// One steering command during a turn.
+    async fn acp_command(&mut self, turn: &mut AcpTurn, command: SessionCommand) -> AcpFlow {
+        match command {
+            SessionCommand::Answer {
+                call_id,
+                answers,
+                option,
+            } => {
+                self.acp_answer(turn, call_id, option, answers).await;
+                AcpFlow::Continue
+            }
+            SessionCommand::Cancel => {
+                // Release: tell the agent to stop, refuse any open permission
+                // request, and end the turn where it is.
+                self.acp().cancel();
+                if let Some(ask) = turn.ask.take() {
+                    self.acp().refuse_permission(&ask.id);
+                    self.clear_waiting_input(SessionStatus::Busy);
+                }
+                self.shared
+                    .lock()
+                    .unwrap()
+                    .emit_presentation(AgentEvent::Display("turn cancelled".into()));
+                let text = std::mem::take(&mut turn.text);
+                self.acp_end_turn(turn, text, "cancelled").await
+            }
+            SessionCommand::WebAttach(reply) => {
+                self.prepare_web_attach();
+                respond_web_attach_shared(&self.shared, reply);
+                AcpFlow::Continue
+            }
+            // Exactly one prompt at a time (milestone non-goal): refuse the
+            // extra one visibly instead of queueing it behind the turn.
+            SessionCommand::Prompt(_) | SessionCommand::PromptWithImage { .. } => {
+                self.shared
+                    .lock()
+                    .unwrap()
+                    .emit_presentation(AgentEvent::PromptConsumed);
+                self.shared
+                    .lock()
+                    .unwrap()
+                    .emit_presentation(AgentEvent::Display(
+                    "[acp] this session runs one prompt at a time; the extra prompt was not sent"
+                        .into(),
+                ));
+                AcpFlow::Continue
+            }
+            SessionCommand::AgentMessage { source, body } => {
+                if let Err(error) = self.commit_agent_message(source, body).await {
+                    return AcpFlow::Session(SessionResult::Failed(format!("{error:#}")));
+                }
+                AcpFlow::Continue
+            }
+            other => {
+                self.shared
+                    .lock()
+                    .unwrap()
+                    .emit_presentation(AgentEvent::Display(format!(
+                        "[acp] {} is not supported by an ACP session",
+                        command_name(&other)
+                    )));
+                AcpFlow::Continue
+            }
+        }
+    }
+
+    /// Publish one permission request as THIS session's blocking question, or
+    /// refuse it when it cannot be answered (nothing offered, or another
+    /// request already owns the open question). Nothing here ever grants a
+    /// request on its own.
+    async fn acp_permission(&mut self, turn: &mut AcpTurn, request: crate::acp::PermissionRequest) {
+        let Some(options) = crate::acp::question_options(&request.params) else {
+            self.acp().refuse_permission(&request.id);
+            self.note(format!(
+                "[acp] refused a permission request that offered no usable option: {}",
+                crate::acp::refusal_line(&request.params)
+            ));
+            return;
+        };
+        if turn.ask.is_some() {
+            self.acp().refuse_permission(&request.id);
+            self.note(
+                "[acp] refused an overlapping permission request: the open question keeps its answer"
+                    .into(),
+            );
+            return;
+        }
+        let call_id = crate::acp::permission_identity(&request.params);
+        let prompt = crate::acp::permission_prompt(&request.params);
+        turn.ask = Some(OpenAsk {
+            call_id: call_id.clone(),
+            id: request.id,
+            prompt: prompt.clone(),
+            options: options.clone(),
+        });
+        self.begin_waiting_input(UserInputRequest {
+            call_id,
+            questions: vec![UserQuestion {
+                id: crate::acp::PERMISSION_QUESTION.to_owned(),
+                prompt,
+                options,
+            }],
+        });
+    }
+
+    /// Answer the open permission question. The answer must be an option id
+    /// THIS request offered, byte for byte; anything else (a stale id, another
+    /// request's answer, an abort) is refused and the request stays open — an
+    /// unasked approval must never be granted.
+    async fn acp_answer(
+        &mut self,
+        turn: &mut AcpTurn,
+        call_id: String,
+        option: Option<String>,
+        answers: Vec<(String, String)>,
+    ) {
+        let Some(ask) = turn.ask.as_ref().filter(|ask| ask.call_id == call_id) else {
+            self.note(format!(
+                "[acp] ignored an answer for `{call_id}`: that permission request is not the one open now"
+            ));
+            return;
+        };
+        let chosen = option.filter(|id| ask.options.iter().any(|offered| &offered.id == id));
+        let Some(chosen) = chosen else {
+            self.note(format!(
+                "[acp] refused an answer for `{call_id}`: it names no option the agent offered"
+            ));
+            return;
+        };
+        // Exactly the id the agent offered: never rewritten into another grant.
+        self.acp().select_permission(&ask.id, &chosen);
+        let question = ask.prompt.clone();
+        turn.ask = None;
+        self.clear_waiting_input(SessionStatus::Busy);
+        // The receipt is OURS (display/audit): the agent's own history already
+        // records the decision, and our transcript is never sent back.
+        let receipt = answers
+            .first()
+            .map(|(_, value)| value.clone())
+            .unwrap_or_else(|| format!("Selected option: {chosen}"));
+        let text = format!("[question {call_id}]\nQuestion: {question}\n[answer]\n{receipt}");
+        if let Err(error) = self.commit(SessionEntry::Notice { text }).await {
+            self.note(format!("cannot persist the permission receipt: {error:#}"));
+        }
+    }
+
+    /// End one turn: commit the agent's text as OUR display transcript (the
+    /// agent's own history is what executes), record a non-`end_turn` stop
+    /// reason, and return the session to idle.
+    async fn acp_end_turn(
+        &mut self,
+        turn: &mut AcpTurn,
+        text: String,
+        stop_reason: &str,
+    ) -> AcpFlow {
+        if let Some(ask) = turn.ask.take() {
+            // No turn can continue with a question still open.
+            self.acp().refuse_permission(&ask.id);
+            self.clear_waiting_input(SessionStatus::Busy);
+        }
+        if !text.trim().is_empty() {
+            self.shared
+                .lock()
+                .unwrap()
+                .emit_agent(AgentEvent::AssistantText(text.clone()));
+            let entry = Message::Assistant(crate::agent::AssistantMessage {
+                content: Some(text.clone()),
+                tool_calls: Vec::new(),
+                reasoning: None,
+            });
+            if let Err(error) = self.commit(entry.into()).await {
+                return AcpFlow::Session(SessionResult::Failed(format!("{error:#}")));
+            }
+            self.last_answer = Some(text);
+        }
+        if stop_reason != "end_turn" {
+            let text = format!("[acp] the agent ended the turn (`{stop_reason}`)");
+            if let Err(error) = self.commit(SessionEntry::Notice { text }).await {
+                return AcpFlow::Session(SessionResult::Failed(format!("{error:#}")));
+            }
+        }
+        self.status(SessionStatus::Idle);
+        AcpFlow::TurnOver
+    }
+
+    /// A presentation-only line (the live view sees it; the transcript is not
+    /// polluted with mechanics).
+    fn note(&self, text: String) {
+        self.shared
+            .lock()
+            .unwrap()
+            .emit_presentation(AgentEvent::Display(text));
+    }
+
+    /// The model/tool loop (the historical runner body, unchanged).
+    async fn run_model_loop(&mut self) {
+        debug_assert!(
+            matches!(self.driver, SessionDriver::Agent(_)),
+            "session `{}`: model-loop path reached by an ACP session",
+            self.session
+        );
         loop {
             // An armed Goal has a single precedence boundary: commands that
             // are already ready get first refusal. Compact/Goal commands are
@@ -3442,7 +4151,7 @@ impl SessionRunner {
                     !self.maintenance_resume && self.goal_owned_background_outstanding();
                 let eligible = self.goal_continuation_armed
                     && matches!(
-                        self.agent.goal().as_ref().map(|goal| goal.status),
+                        self.agent().goal().as_ref().map(|goal| goal.status),
                         Some(GoalStatus::Active)
                     )
                     && !owned_background_blocks
@@ -3495,7 +4204,7 @@ impl SessionRunner {
                 // goal by itself never arms it.
                 if self.turn_just_ended && self.goal_continuation_armed {
                     let goal_active = matches!(
-                        self.agent.goal().as_ref().map(|goal| goal.status),
+                        self.agent().goal().as_ref().map(|goal| goal.status),
                         Some(GoalStatus::Active)
                     );
                     if goal_active
@@ -3517,7 +4226,7 @@ impl SessionRunner {
                 }
                 self.status(SessionStatus::Idle);
                 if self.policy == IdlePolicy::FinishWhenIdle
-                    && !self.agent.has_blocking_background()
+                    && !self.agent().has_blocking_background()
                 {
                     let result = SessionResult::Completed(self.last_answer.clone());
                     if self.finalize_when_idle(result) {
@@ -3532,30 +4241,46 @@ impl SessionRunner {
                 // its first tick immediately and spin this loop. Sleeping a
                 // real second keeps the durable projection fresh while the
                 // session waits for a blocking background completion.
+                // The wait borrows only the agent (`self.driver`), the command
+                // channel and the background cell, so the branches below can
+                // still take `&mut self` after it resolves.
                 let projection_tick = tokio::time::sleep(std::time::Duration::from_secs(1));
-                tokio::select! { biased;
-                    _ = projection_tick, if self.background.is_some() => { self.sync_background_projection().await; continue; },
-                    command = self.commands.recv() => match command {
-                        Some(command) => {
-                            let first = self.queue(command);
-                            let drained = self.drain_ready_commands();
-                            let steering = self.merge_steering(first, drained);
-                            self.publish_web_attaches();
-                            if steering != Steering::None
-                                && !self.has_prompt_work()
-                                && self.release_after_preempt(steering)
-                            {
-                                return;
-                            }
-                            continue;
-                        }
-                        None => {
-                            self.terminate(SessionResult::Closed, Vec::new()).await;
+                let wake = {
+                    let SessionDriver::Agent(agent) = &mut self.driver else {
+                        unreachable_model_loop(&self.session)
+                    };
+                    let commands = &mut self.commands;
+                    let has_background = self.background.is_some();
+                    tokio::select! { biased;
+                        _ = projection_tick, if has_background => IdleWake::Tick,
+                        command = commands.recv() => IdleWake::Command(command),
+                        ready = agent.wait_background_ready() => IdleWake::Background(ready),
+                    }
+                };
+                match wake {
+                    IdleWake::Tick => {
+                        self.sync_background_projection().await;
+                        continue;
+                    }
+                    IdleWake::Command(Some(command)) => {
+                        let first = self.queue(command);
+                        let drained = self.drain_ready_commands();
+                        let steering = self.merge_steering(first, drained);
+                        self.publish_web_attaches();
+                        if steering != Steering::None
+                            && !self.has_prompt_work()
+                            && self.release_after_preempt(steering)
+                        {
                             return;
                         }
-                    },
-                    ready = self.agent.wait_background_ready() => {
-                        if ready { continue; }
+                        continue;
+                    }
+                    IdleWake::Command(None) => {
+                        self.terminate(SessionResult::Closed, Vec::new()).await;
+                        return;
+                    }
+                    IdleWake::Background(true) => continue,
+                    IdleWake::Background(false) => {
                         self.terminate(SessionResult::Closed, Vec::new()).await;
                         return;
                     }
@@ -3574,7 +4299,7 @@ impl SessionRunner {
 
             self.status(SessionStatus::Busy);
             if !consumed.is_empty() {
-                let image_rejected = image.is_some() && !self.agent.supports_vision();
+                let image_rejected = image.is_some() && !self.agent().supports_vision();
                 if let Err(error) = self.commit_user_batch(prompt, image, consumed).await {
                     if image_rejected {
                         // Explicit `/image` on a non-vision model is a
@@ -3663,8 +4388,8 @@ impl SessionRunner {
                     // admission — it gates the next automatic turn.
                     continue;
                 }
-                self.agent.drain_background_ready();
-                if self.agent.peek_background_entry().is_some() {
+                self.agent().drain_background_ready();
+                if self.agent().peek_background_entry().is_some() {
                     // Fresh durable ingress must not be consumed by an
                     // automatic Goal call: its ordinary reaction goes first.
                     self.armed_trigger = Some(RunnerTrigger::Background);
@@ -3677,9 +4402,9 @@ impl SessionRunner {
             // Model rounds, mid-tool-batch, and manual/auto compaction
             // never reset it.
             if !resume_turn {
-                self.agent.start_turn();
+                self.agent().start_turn();
             }
-            let specs = self.agent.tool_specs();
+            let specs = self.agent().tool_specs();
             // A valid answer is human-owned work required to complete the
             // already-committed tool call. It may make one (or more tool-
             // coupled) model rounds even when the Goal driver's cap stopped.
@@ -3728,8 +4453,12 @@ impl SessionRunner {
                     self.pending_regular_reaction = false;
                 }
                 self.prepare_web_attach();
-                let waited =
-                    await_round(&mut self.agent, &specs, &mut self.commands, &self.shared).await;
+                let waited = match &mut self.driver {
+                    SessionDriver::Agent(agent) => {
+                        await_round(agent, &specs, &mut self.commands, &self.shared).await
+                    }
+                    SessionDriver::Acp(_) => unreachable_model_loop(&self.session),
+                };
                 let round = match waited.outcome {
                     WaitOutcome::Completed(Ok(round)) => round,
                     WaitOutcome::Completed(Err(error)) => {
@@ -3828,14 +4557,15 @@ impl SessionRunner {
                 if usage.is_some() {
                     self.shared.lock().unwrap().usage_pre_compaction = false;
                 }
-                self.agent.apply_usage(usage.clone(), true);
+                self.agent().apply_usage(usage.clone(), true);
+                let model_name = self.agent().model_name();
                 if let Some(usage) = usage
                     && let Err(error) = self
                         .store
                         .append_usage(
                             &self.root,
                             &self.session,
-                            &self.agent.model_name(),
+                            &model_name,
                             "regular",
                             committed_seq,
                             &usage,
@@ -3897,7 +4627,7 @@ impl SessionRunner {
                     || human_required_continuation
                     || (self.goal_continuation_remaining != Some(0)
                         && !self.goal_continuation_usage_unavailable);
-                if auto_compaction_allowed && self.agent.take_auto_compact_request() {
+                if auto_compaction_allowed && self.agent().take_auto_compact_request() {
                     self.shared
                         .lock()
                         .unwrap()
@@ -4232,8 +4962,8 @@ impl SessionRunner {
                         if let Some(hook) = self.before_read_only_tool.take() {
                             hook();
                         }
-                        // These runner-bound, read-only tools still use the
-                        // normal operation wait so attach/cancel remain live.
+                        // These runner-bound tools still use the normal
+                        // operation wait so attach/cancel remain live.
                         // Own the binding in the future to avoid borrowing the
                         // runner while its command receiver is mutably borrowed.
                         let store = self.store.clone();
@@ -4259,7 +4989,12 @@ impl SessionRunner {
                         });
                         wait_for_operation(&mut operation, &mut self.commands, &self.shared).await
                     } else {
-                        await_tool(&mut self.agent, &call, &mut self.commands, &self.shared).await
+                        match &mut self.driver {
+                            SessionDriver::Agent(agent) => {
+                                await_tool(agent, &call, &mut self.commands, &self.shared).await
+                            }
+                            SessionDriver::Acp(_) => unreachable_model_loop(&self.session),
+                        }
                     };
                     let result = match waited.outcome {
                         WaitOutcome::Completed(result) => result,
@@ -4329,7 +5064,7 @@ impl SessionRunner {
                             .await;
                         return;
                     }
-                    if let Err(error) = self.agent.after_tool_entry(&call, &result).await {
+                    if let Err(error) = self.agent().after_tool_entry(&call, &result).await {
                         self.terminate(SessionResult::Failed(error), pending).await;
                         return;
                     }
@@ -4424,7 +5159,7 @@ impl SessionRunner {
                 // can hand the turn off. A valid answer may still resume its
                 // own tool turn; ordinary Goal work stops after this batch.
                 let goal_inactive = !matches!(
-                    self.agent.goal().as_ref().map(|goal| goal.status),
+                    self.agent().goal().as_ref().map(|goal| goal.status),
                     Some(GoalStatus::Active)
                 );
                 if goal_inactive && self.goal_continuation_armed {
