@@ -155,6 +155,47 @@ pub fn validate_session_name(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Test-only counters for the factory reopen path. A reopen must answer
+/// fork provenance from the ONE JSONL decode the history load performs, not
+/// from a second full scan of a long transcript. Only session names starting
+/// `once-` are counted, so unrelated tests running in parallel cannot move
+/// these counters.
+#[cfg(test)]
+pub(crate) mod reopen_decode_probe {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static LOAD_LOCATED: AtomicUsize = AtomicUsize::new(0);
+    static HAS_FORK_MARKER: AtomicUsize = AtomicUsize::new(0);
+
+    fn tracked(name: &str) -> bool {
+        name.starts_with("once-")
+    }
+
+    pub(crate) fn record_load_located(name: &str) {
+        if tracked(name) {
+            LOAD_LOCATED.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    pub(crate) fn record_has_fork_marker(name: &str) {
+        if tracked(name) {
+            HAS_FORK_MARKER.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    pub(crate) fn reset() {
+        LOAD_LOCATED.store(0, Ordering::SeqCst);
+        HAS_FORK_MARKER.store(0, Ordering::SeqCst);
+    }
+
+    pub(crate) fn counts() -> (usize, usize) {
+        (
+            LOAD_LOCATED.load(Ordering::SeqCst),
+            HAS_FORK_MARKER.load(Ordering::SeqCst),
+        )
+    }
+}
+
 pub struct Session;
 
 impl Session {
@@ -203,6 +244,99 @@ impl Session {
             entries: saved.messages.into_iter().map(SessionEntry::from).collect(),
             legacy: true,
         })
+    }
+
+    /// The first `bound` entries of the stored log.
+    ///
+    /// JSONL is read line by line and STOPS at `bound`, so a leading-marker
+    /// probe over a long session never parses the whole transcript. The
+    /// legacy whole-document fallback stores only messages — never a
+    /// `ForkedFrom` marker — so provenance uses [`Self::has_fork_marker`]
+    /// instead of loading it.
+    pub fn load_first(root: &Path, name: &str, bound: usize) -> anyhow::Result<Vec<SessionEntry>> {
+        if bound == 0 {
+            return Ok(Vec::new());
+        }
+        let jsonl = session_path(root, name, "jsonl")?;
+        if !jsonl.exists() {
+            return Ok(Self::load(root, name)?
+                .entries
+                .into_iter()
+                .take(bound)
+                .collect());
+        }
+        let file = std::fs::File::open(&jsonl)
+            .with_context(|| format!("cannot open session {}", jsonl.display()))?;
+        let mut entries = Vec::new();
+        for (index, line) in std::io::BufReader::new(file).lines().enumerate() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            entries.push(
+                serde_json::from_str::<SessionEntry>(&line).with_context(|| {
+                    format!(
+                        "cannot decode session {} line {}",
+                        jsonl.display(),
+                        index + 1
+                    )
+                })?,
+            );
+            if entries.len() == bound {
+                break;
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Whether the stored log carries a [`SessionEntry::ForkedFrom`] marker
+    /// ANYWHERE.
+    ///
+    /// This is the provenance question the marker-aware loader answers when
+    /// it replays a fork: the marker may lead (zero-copy children), follow
+    /// the frozen goal, or — for the copy-based writer this repo shipped
+    /// before `1edc53d` — sit behind the entire copied prefix. There is no
+    /// positional cutoff: lines are decoded oldest-first and the scan stops
+    /// at the first marker, so a fork pays only for its prefix and an
+    /// ordinary session pays one sequential pass (a plain append-only log
+    /// has no kind index to ask instead).
+    ///
+    /// A legacy whole-document `.json` session stores `Message`s only and
+    /// can never carry a marker, so it is deliberately NOT read here.
+    ///
+    /// ONLY `NotFound` means "no transcript". Any other open/read error is
+    /// propagated: provenance must never read an unreadable log as an
+    /// ordinary session (that is how an unreadable child regained
+    /// `link_ref`).
+    pub(crate) fn has_fork_marker(root: &Path, name: &str) -> anyhow::Result<bool> {
+        #[cfg(test)]
+        reopen_decode_probe::record_has_fork_marker(name);
+        let jsonl = session_path(root, name, "jsonl")?;
+        let file = match std::fs::File::open(&jsonl) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("cannot open session {}", jsonl.display()));
+            }
+        };
+        for (index, line) in std::io::BufReader::new(file).lines().enumerate() {
+            let line = line.with_context(|| format!("cannot read session {}", jsonl.display()))?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let entry = serde_json::from_str::<SessionEntry>(&line).with_context(|| {
+                format!(
+                    "cannot decode session {} line {}",
+                    jsonl.display(),
+                    index + 1
+                )
+            })?;
+            if matches!(entry, SessionEntry::ForkedFrom { .. }) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Append new entries to the JSONL log, creating the file (0600) if needed.
@@ -262,15 +396,24 @@ impl Session {
         root: &Path,
         name: &str,
     ) -> anyhow::Result<crate::session_store::LoadedLocated> {
+        #[cfg(test)]
+        reopen_decode_probe::record_load_located(name);
         let jsonl = session_path(root, name, "jsonl")?;
-        if jsonl.exists() {
-            let file = std::fs::File::open(&jsonl)
-                .with_context(|| format!("cannot open session {}", jsonl.display()))?;
+        let file = match std::fs::File::open(&jsonl) {
+            Ok(file) => Some(file),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("cannot open session {}", jsonl.display()));
+            }
+        };
+        if let Some(file) = file {
             let fingerprint = crate::session_store::workspace_root_fingerprint(root);
             let mut entries = Vec::new();
             let mut locations = Vec::new();
             for (index, line) in std::io::BufReader::new(file).lines().enumerate() {
-                let line = line?;
+                let line =
+                    line.with_context(|| format!("cannot read session {}", jsonl.display()))?;
                 if line.trim().is_empty() {
                     continue;
                 }
@@ -305,20 +448,26 @@ impl Session {
             });
         }
         let legacy = session_path(root, name, "json")?;
-        if !legacy.exists() {
-            return Ok(crate::session_store::LoadedLocated {
-                entries: Vec::new(),
-                locations: Vec::new(),
-                legacy: false,
-                inherited: 0,
-                next_older: None,
-            });
-        }
-        let saved: LegacySession = serde_json::from_slice(
-            &std::fs::read(&legacy)
-                .with_context(|| format!("cannot read session {}", legacy.display()))?,
-        )
-        .with_context(|| format!("cannot decode session {}", legacy.display()))?;
+        // ONLY `NotFound` means there is no transcript; a failed stat/read
+        // must not masquerade as an empty (ordinary) session.
+        let bytes = match std::fs::read(&legacy) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(crate::session_store::LoadedLocated {
+                    entries: Vec::new(),
+                    locations: Vec::new(),
+                    legacy: false,
+                    inherited: 0,
+                    next_older: None,
+                });
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("cannot read session {}", legacy.display()));
+            }
+        };
+        let saved: LegacySession = serde_json::from_slice(&bytes)
+            .with_context(|| format!("cannot decode session {}", legacy.display()))?;
         if saved.version != LEGACY_VERSION {
             anyhow::bail!("unsupported session version {}", saved.version);
         }
@@ -1056,6 +1205,29 @@ mod tests {
         let loaded = Session::load(temp.path(), "work").unwrap();
         assert!(!loaded.legacy);
         assert_eq!(loaded.entries, all);
+    }
+
+    /// An unreadable transcript is not an absent one: provenance and the
+    /// located load must surface the open/read error instead of returning
+    /// "no marker"/"empty ordinary session". A directory at the path is an
+    /// unreadable file on every platform (Unix opens it, then the first read
+    /// fails; Windows refuses the open).
+    #[test]
+    fn unreadable_transcript_errors_are_not_absence() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(".e-agent/sessions/blocked.jsonl");
+        std::fs::create_dir_all(&path).unwrap();
+
+        let marker_error = Session::has_fork_marker(temp.path(), "blocked").unwrap_err();
+        assert!(
+            format!("{marker_error:#}").contains("blocked.jsonl"),
+            "{marker_error:#}"
+        );
+        let load_error = Session::load_located(temp.path(), "blocked").unwrap_err();
+        assert!(
+            format!("{load_error:#}").contains("blocked.jsonl"),
+            "{load_error:#}"
+        );
     }
 
     #[cfg(unix)]

@@ -26,6 +26,7 @@
 //! | GET    | `/api/sessions/{id}/goal`         | current goal snapshot (or null)     |
 //! | POST   | `/api/sessions/{id}/goal`         | create / pause / resume / clear / continue the goal |
 //! | PUT    | `/api/sessions/{id}/title`        | rename a session                  |
+//! | POST   | `/api/sessions/{id}/refs`         | add/remove a PR or issue URL      |
 //! | DELETE | `/api/sessions/{id}`              | cancel + remove from the registry  |
 //! | GET    | `/api/tasks`                        | running background tasks, all sessions |
 //! | DELETE | `/api/sessions/{id}/tasks/{task_id}` | cancel one background task          |
@@ -286,6 +287,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/title", put(session_title))
         .route("/api/sessions/{id}/pin", put(session_pin))
         .route("/api/sessions/{id}/archive", put(session_archive))
+        .route("/api/sessions/{id}/refs", post(session_refs))
         .route("/api/sessions/{id}", delete(delete_session))
         .route("/api/tasks", get(list_tasks))
         .route("/api/tasks/finished", get(finished_tasks))
@@ -686,6 +688,12 @@ pub struct SessionMeta {
     /// DTO itself carries no archive flag), so live archives show up on
     /// the next list.
     pub archived: Option<bool>,
+    /// Pull-request URLs recorded by the `link_ref` tool or the owner's
+    /// manual edit (this session only). Registry sessions have none of
+    /// their own; the merge fills both lists from the metadata row.
+    pub prs: Vec<String>,
+    /// Issue URLs, same provenance as [`Self::prs`].
+    pub issues: Vec<String>,
     /// Task-panel label of the delegate task that spawned this subagent
     /// (`running_tasks.label`, newest surviving row — the sessions metadata
     /// table does not store it). `None` = no live delegate task carries
@@ -730,6 +738,10 @@ async fn session_meta(id: &str, session: &LiveSession, root: &std::path::Path) -
         // The registry DTO has no archive flag; the merge fills it from
         // the session's metadata-table snapshot like the pin.
         archived: None,
+        // Links live in the metadata row; the merge fills both lists from
+        // the session's snapshot like the title/pin/archive flags.
+        prs: Vec::new(),
+        issues: Vec::new(),
         // The label lives in running_tasks; `list_sessions` fills it for
         // subagent items after the merge.
         label: None,
@@ -850,6 +862,14 @@ fn merge_session_metas(
                 if occupied.get().archived.is_none() {
                     occupied.get_mut().archived = meta.archived;
                 }
+                // Same for the links: a live session's PR/issue lists come
+                // from its metadata row, so an empty live entry never hides
+                // a link the tool or the owner just recorded.
+                if occupied.get().prs.is_empty() && occupied.get().issues.is_empty() {
+                    let (prs, issues) = crate::session_store::split_refs(&meta.refs);
+                    occupied.get_mut().prs = prs;
+                    occupied.get_mut().issues = issues;
+                }
                 // Same for the parent link: a resumed subagent's live entry
                 // must stay recognizable as a subagent so `list_sessions`
                 // can fill its label from `running_tasks`.
@@ -858,6 +878,7 @@ fn merge_session_metas(
                 }
             }
             std::collections::hash_map::Entry::Vacant(vacant) => {
+                let (prs, issues) = crate::session_store::split_refs(&meta.refs);
                 vacant.insert(SessionMeta {
                     id: meta.session_id,
                     model: meta.model.unwrap_or_default(),
@@ -880,6 +901,8 @@ fn merge_session_metas(
                     title: meta.title,
                     pinned: meta.pinned,
                     archived: meta.archived,
+                    prs,
+                    issues,
                     // Label lives in running_tasks; `list_sessions` fills it.
                     label: None,
                 });
@@ -2229,6 +2252,69 @@ async fn session_archive(
         .await
         .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct RefBody {
+    /// The frontend sends `JSON.stringify({ kind, url, remove })`. `kind`
+    /// defaults to `"pr"`; `remove` defaults to false (add).
+    kind: Option<String>,
+    url: String,
+    #[serde(default)]
+    remove: bool,
+}
+
+/// `POST /api/sessions/{id}/refs` — the owner's manual edit of a session's
+/// PR/issue links. Body `{"kind": "pr"|"issue", "url": "...", "remove":
+/// true|false}`; the same validation as the `link_ref` tool applies (absolute
+/// http(s), no credentials, no whitespace), 400 on a refused value. Responds
+/// with the session's current lists: `{"prs": [...], "issues": [...]}`.
+///
+/// Works for live sessions and live subagents (via their session-bound store)
+/// and historical sessions (via the workspace-scoped `meta_store`); 404 when
+/// the id is neither live nor present in the metadata table.
+async fn session_refs(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<RefBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let link =
+        crate::session_store::SessionRef::new(body.kind.as_deref().unwrap_or("pr"), &body.url)
+            .map_err(|message| error(StatusCode::BAD_REQUEST, message))?;
+    let root = state.factory.root();
+    let store = match live(&state, &id) {
+        Ok(SessionRef::Live(session)) => session.store.clone(),
+        Ok(SessionRef::Subagent { entry, .. }) => entry.store.clone(),
+        Err(_) => {
+            let store = meta_store(&state)
+                .await
+                .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+            let historical = store
+                .list_meta(root)
+                .await
+                .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+            if !historical.iter().any(|m| m.session_id == id) {
+                return Err(error(
+                    StatusCode::NOT_FOUND,
+                    format!("session {id} not found"),
+                ));
+            }
+            store
+        }
+    };
+    let refs = store
+        .update_refs(root, &id, |refs| {
+            if body.remove {
+                refs.retain(|existing| existing != &link);
+            } else {
+                refs.push(link.clone());
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let (prs, issues) = crate::session_store::split_refs(&refs);
+    Ok(Json(serde_json::json!({ "prs": prs, "issues": issues })))
 }
 
 async fn delete_session(
@@ -4197,6 +4283,8 @@ mod tests {
             title: None,
             pinned: Some(pinned),
             archived: Some(archived),
+            prs: Vec::new(),
+            issues: Vec::new(),
             label: None,
         }
     }
@@ -7496,10 +7584,14 @@ model = "deepseek-chat"
             "title",
             "pinned",
             "archived",
+            "prs",
+            "issues",
             "label",
         ] {
             assert!(value.get(key).is_some(), "missing field {key}");
         }
+        assert_eq!(value["prs"], serde_json::json!([]));
+        assert_eq!(value["issues"], serde_json::json!([]));
         assert_eq!(value["status"], "Idle");
         assert_eq!(value["busy"], false);
         assert_eq!(value["active"], true, "registry sessions are active");
@@ -7532,6 +7624,8 @@ model = "deepseek-chat"
             title: None,
             pinned: None,
             archived: None,
+            prs: Vec::new(),
+            issues: Vec::new(),
             label: None,
         };
         let history = |id: &str, created: i64, count: i64, title: Option<&str>| HistoryMeta {
@@ -7546,6 +7640,7 @@ model = "deepseek-chat"
             title: title.map(str::to_owned),
             pinned: None,
             archived: None,
+            refs: Vec::new(), // these fixtures predate the refs column
             acp_session_id: None,
             writer: None,
             label: None,
@@ -7658,6 +7753,8 @@ model = "deepseek-chat"
             title: None,
             pinned: None,
             archived: None,
+            prs: Vec::new(),
+            issues: Vec::new(),
             label: None,
         };
         let history = |id: &str, created: i64, count: i64, archived: Option<bool>| HistoryMeta {
@@ -7672,6 +7769,7 @@ model = "deepseek-chat"
             title: None,
             pinned: None,
             archived,
+            refs: Vec::new(), // these fixtures predate the refs column
             acp_session_id: None,
             writer: None,
             label: None,
@@ -7747,6 +7845,8 @@ model = "deepseek-chat"
             title: None,
             pinned: None,
             archived: None,
+            prs: Vec::new(),
+            issues: Vec::new(),
             label: None,
         };
         let mut live = meta(false);
@@ -7819,6 +7919,7 @@ model = "deepseek-chat"
             title: None,
             pinned: None,
             archived: None,
+            refs: Vec::new(), // these fixtures predate the refs column
             acp_session_id: None,
             writer: None,
             label: None,
@@ -8059,6 +8160,8 @@ model = "deepseek-chat"
             title: None,
             pinned,
             archived,
+            prs: Vec::new(),
+            issues: Vec::new(),
             label: None,
         };
         // Archived unpinned (main or child) → excluded.
@@ -11560,5 +11663,145 @@ model = "deepseek-chat"
             .unwrap_err();
         assert!(error.contains("already live locally"), "{error}");
         drop(built);
+    }
+
+    /// `POST /api/sessions/{id}/refs`: 401 without a token (exactly like the
+    /// other `/api` routes), 400 for a refused URL, and an authenticated edit
+    /// writes the metadata row, answers with both lists, and shows up in
+    /// `GET /api/sessions` (the historical merge carries `prs`/`issues`).
+    #[tokio::test]
+    async fn session_refs_endpoint_edits_links_and_requires_auth() {
+        use axum::body::Body;
+        use axum::http::{Request, header};
+        use tower::util::ServiceExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let state = Arc::new(AppState {
+            factory: crate::session_factory::SessionFactory::test_factory(
+                temp.path().to_path_buf(),
+            ),
+            registry: Arc::new(SessionRegistry::default()),
+            token: "sekrit".to_owned(),
+            meta_store: SessionStore::Jsonl,
+            summaries: Arc::new(Mutex::new(HashMap::new())),
+            summary_pending: Arc::new(SummaryPending(Mutex::new(HashSet::new()))),
+            shutdown: watch::channel(()).0,
+        });
+        let root = state.factory.root().to_path_buf();
+        let sid = "web-refs";
+        SessionStore::Jsonl
+            .create_meta(&root, sid, Some("m"), Some("main"), None, None, None)
+            .await
+            .unwrap();
+        let app = router(state);
+        let edit = |body: &'static str, authorized: bool| {
+            let app = app.clone();
+            async move {
+                let mut builder = Request::builder()
+                    .uri(format!("/api/sessions/{sid}/refs"))
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json");
+                if authorized {
+                    builder = builder.header(header::AUTHORIZATION, "Bearer sekrit");
+                }
+                app.oneshot(builder.body(Body::from(body)).unwrap())
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // No token: the same 401 every other authenticated route answers.
+        let unauth = edit(
+            r#"{"url": "https://github.com/acme/widget/pull/14"}"#,
+            false,
+        )
+        .await;
+        assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+        // A refused URL is a 400 and writes nothing.
+        let refused = edit(r#"{"url": "ftp://github.com/acme/widget/pull/14"}"#, true).await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+
+        let added = edit(r#"{"url": "https://github.com/acme/widget/pull/14"}"#, true).await;
+        assert_eq!(added.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(added.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({
+                "prs": ["https://github.com/acme/widget/pull/14"],
+                "issues": []
+            })
+        );
+
+        let issue = edit(
+            r#"{"kind": "issue", "url": "https://github.com/acme/widget/issues/22"}"#,
+            true,
+        )
+        .await;
+        assert_eq!(issue.status(), StatusCode::OK);
+        // Duplicate URL collapses.
+        let duplicate = edit(r#"{"url": "https://github.com/acme/widget/pull/14"}"#, true).await;
+        let body = axum::body::to_bytes(duplicate.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({
+                "prs": ["https://github.com/acme/widget/pull/14"],
+                "issues": ["https://github.com/acme/widget/issues/22"]
+            })
+        );
+
+        // The list view carries the same two lists on the wire.
+        let list = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(list.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let row = value
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == sid)
+            .expect("the edited session is listed");
+        assert_eq!(
+            row["prs"],
+            serde_json::json!(["https://github.com/acme/widget/pull/14"])
+        );
+        assert_eq!(
+            row["issues"],
+            serde_json::json!(["https://github.com/acme/widget/issues/22"])
+        );
+
+        // Removing the PR leaves the issue.
+        let removed = edit(
+            r#"{"url": "https://github.com/acme/widget/pull/14", "remove": true}"#,
+            true,
+        )
+        .await;
+        assert_eq!(removed.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(removed.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({
+                "prs": [],
+                "issues": ["https://github.com/acme/widget/issues/22"]
+            })
+        );
     }
 }

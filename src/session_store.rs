@@ -814,6 +814,137 @@ pub struct LocatedHistoryPage {
     pub next_older_session: Option<String>,
 }
 
+/// Kind of one [`SessionRef`]. A future kind can be added here without a
+/// storage migration: the column carries one JSON value, so only this enum
+/// grows.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionRefKind {
+    Pr,
+    Issue,
+}
+
+impl SessionRefKind {
+    /// Parse the model/HTTP surface spelling (`"pr"` | `"issue"`).
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "pr" => Ok(Self::Pr),
+            "issue" => Ok(Self::Issue),
+            other => Err(format!(
+                "unknown ref kind `{other}`: expected `pr` or `issue`"
+            )),
+        }
+    }
+}
+
+/// One external link a session carries (a pull request or an issue). The URL
+/// IS the identity: the same `#14` in two repositories is two different
+/// refs, so nothing is reduced to a number.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SessionRef {
+    pub kind: SessionRefKind,
+    pub url: String,
+}
+
+impl SessionRef {
+    /// Validate and build one link. `url` must be an absolute `http(s)` URL
+    /// without credentials or whitespace; the exact string is preserved (the
+    /// link must open, and dedup is by exact URL). Errors are plain strings.
+    pub fn new(kind: &str, url: &str) -> Result<Self, String> {
+        let kind = SessionRefKind::parse(kind)?;
+        if url.is_empty() {
+            return Err("ref `url` must not be empty".to_owned());
+        }
+        if url.chars().any(char::is_whitespace) {
+            return Err(format!(
+                "`{url}` contains whitespace; a ref URL must be one absolute http(s) URL"
+            ));
+        }
+        // Require an explicit `scheme://` in the ORIGINAL string. `Url::parse`
+        // REPAIRS a scheme without an authority (`https:example.org/pull/14`
+        // becomes the path `example.org/pull/14` on host "https"), so the
+        // checks below would see a host and pass while the raw string — the
+        // one stored in `href` and resolved against the UI origin by the
+        // browser — has none. Only a string whose scheme is followed by `//`
+        // and a non-empty authority is accepted; the exact string is kept.
+        let lower = url.to_ascii_lowercase();
+        let authority = lower
+            .strip_prefix("http://")
+            .or_else(|| lower.strip_prefix("https://"))
+            .ok_or_else(|| format!("`{url}` must use an explicit http:// or https:// authority"))?;
+        // A leading backslash is a malformed authority too: the `url` crate
+        // repairs `https://\example.org/x` to host `example.org`, so the raw
+        // check must refuse it before the stored string keeps a backslash
+        // the browser could resolve against the UI origin.
+        if authority.is_empty() || authority.starts_with(&['/', '?', '#', '\\'][..]) {
+            return Err(format!(
+                "`{url}` must name an authority (host) right after the scheme"
+            ));
+        }
+        let parsed = url::Url::parse(url)
+            .map_err(|error| format!("`{url}` is not an absolute URL: {error}"))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(format!(
+                "`{url}` must use http or https, not `{}`",
+                parsed.scheme()
+            ));
+        }
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(format!("`{url}` must not carry credentials"));
+        }
+        if parsed.host_str().is_none() {
+            return Err(format!("`{url}` must name a host"));
+        }
+        Ok(Self {
+            kind,
+            url: url.to_owned(),
+        })
+    }
+}
+
+/// Drop exact-duplicate `(kind, url)` pairs, preserving insertion order: a
+/// URL is unique within its kind, never across kinds.
+pub fn dedup_refs(refs: &mut Vec<SessionRef>) {
+    let mut seen = HashSet::new();
+    refs.retain(|link| seen.insert((link.kind, link.url.clone())));
+}
+
+/// The wire/storage projection of [`SessionMeta::refs`]: PR URLs then issue
+/// URLs, each in insertion order.
+pub fn split_refs(refs: &[SessionRef]) -> (Vec<String>, Vec<String>) {
+    let mut prs = Vec::new();
+    let mut issues = Vec::new();
+    for link in refs {
+        match link.kind {
+            SessionRefKind::Pr => prs.push(link.url.clone()),
+            SessionRefKind::Issue => issues.push(link.url.clone()),
+        }
+    }
+    (prs, issues)
+}
+
+/// Serialize refs for one JSON column; an empty list stores NULL (the same
+/// value a row written before the column existed reads back as).
+pub(crate) fn refs_to_json(refs: &[SessionRef]) -> Result<Option<String>, String> {
+    if refs.is_empty() {
+        return Ok(None);
+    }
+    serde_json::to_string(refs)
+        .map(Some)
+        .map_err(|error| format!("cannot encode session refs: {error}"))
+}
+
+/// Parse the JSON column back. NULL/blank reads as empty (tolerant, like the
+/// other nullable metadata columns); malformed JSON fails loudly instead of
+/// silently dropping the session's links.
+pub(crate) fn refs_from_json(text: Option<&str>) -> Result<Vec<SessionRef>, String> {
+    match text.map(str::trim) {
+        None | Some("") => Ok(Vec::new()),
+        Some(text) => serde_json::from_str(text)
+            .map_err(|error| format!("cannot decode session refs JSON: {error}")),
+    }
+}
+
 /// One session's metadata snapshot from the `sessions` audit table
 /// (Greptime and SQLite backends only). Every row is a COMPLETE snapshot —
 /// Greptime has no UPDATE and SQLite follows the same append-only audit
@@ -849,6 +980,15 @@ pub struct SessionMeta {
     /// `Some(false)` = explicitly restored, `None` = never touched (reads
     /// as unarchived).
     pub archived: Option<bool>,
+    /// Pull-request and issue links, stored as ONE JSON value (a list of
+    /// `{"kind","url"}` objects) so a future kind needs no migration. Rows
+    /// written before the field existed — the JSONL sidecar lines and the
+    /// `refs` column's NULL — read back as empty. `#[serde(default)]` is
+    /// REQUIRED: the sidecar tail-read parses each line as `SessionMeta` and
+    /// silently skips lines that fail to parse, so a missing default would
+    /// hide every pre-existing session from `list_meta`.
+    #[serde(default)]
+    pub refs: Vec<SessionRef>,
     /// The ACP (Agent Client Protocol) session id this e-agent session last
     /// used, so `acp_prompt` can resume its reviewer conversation after an
     /// e-agent restart. `None` = no ACP conversation yet; every row written
@@ -1068,6 +1208,41 @@ pub(crate) fn decode_history_rows(
         });
     }
     Ok(out)
+}
+
+/// What the persisted metadata says about a session's parent link.
+enum PersistedParent {
+    /// A decoded snapshot records a parent.
+    Parent,
+    /// Every snapshot line decoded and the newest one records no parent.
+    Parentless,
+    /// The sidecar exists but cannot prove parentlessness: a record failed
+    /// to decode, or it holds no nonblank record at all (an interrupted
+    /// first append). Provenance is UNKNOWN.
+    Unknown,
+}
+
+impl PersistedParent {
+    /// Whether provenance must keep `link_ref` off. Only a fully decoded
+    /// parentless session does not count as a fork; an undecodable line is
+    /// unknown and therefore fails closed.
+    fn is_fork(&self) -> bool {
+        !matches!(self, Self::Parentless)
+    }
+}
+
+/// Whether a metadata-creation call may SKIP an append because the JSONL
+/// sidecar is damaged. The mode never changes a healthy write; it only
+/// decides whether unknown provenance is refused or silently left alone.
+/// The SQL backends are transactional and never damaged, so they ignore it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MetaWriteMode {
+    /// An explicit caller asked for this record to land: a damaged tail is
+    /// an error naming the file.
+    Required,
+    /// A resume's best-effort model/role backfill: a damaged tail is
+    /// skipped and the intact transcript still opens.
+    OptionalBackfill,
 }
 
 impl SessionStore {
@@ -2511,26 +2686,7 @@ impl SessionStore {
     /// is always parsed in full — only what is RETURNED is bounded there.
     pub async fn load_head_located(&self, root: &Path, name: &str) -> Result<LoadedLocated> {
         match self {
-            SessionStore::Jsonl => {
-                let loaded = Session::load_located(root, name)?;
-                if loaded.legacy {
-                    return Ok(loaded);
-                }
-                let start = loaded
-                    .entries
-                    .iter()
-                    .rposition(|entry| matches!(entry, SessionEntry::Compaction { .. }))
-                    .unwrap_or(0);
-                let mut head = LoadedLocated {
-                    entries: loaded.entries[start..].to_vec(),
-                    locations: loaded.locations[start..].to_vec(),
-                    legacy: false,
-                    inherited: 0,
-                    next_older: None,
-                };
-                head.next_older = (start > 0).then(|| (name.to_owned(), start as i64));
-                Ok(head)
-            }
+            SessionStore::Jsonl => Ok(Self::jsonl_head(Session::load_located(root, name)?, name)),
             #[cfg(feature = "greptime")]
             SessionStore::Greptime { session, .. } => {
                 let (rows, cursor) = session.load_older_located(HEAD_OPEN_SENTINEL, None).await?;
@@ -2567,6 +2723,28 @@ impl SessionStore {
         }
     }
 
+    /// Slice a fully decoded JSONL session to its physical head: the last
+    /// `Compaction` and everything after it. The caller must ask any
+    /// whole-log question (fork provenance) BEFORE this slice, because the
+    /// rows below the cut are dropped here.
+    fn jsonl_head(loaded: LoadedLocated, name: &str) -> LoadedLocated {
+        if loaded.legacy {
+            return loaded;
+        }
+        let start = loaded
+            .entries
+            .iter()
+            .rposition(|entry| matches!(entry, SessionEntry::Compaction { .. }))
+            .unwrap_or(0);
+        LoadedLocated {
+            entries: loaded.entries[start..].to_vec(),
+            locations: loaded.locations[start..].to_vec(),
+            legacy: false,
+            inherited: 0,
+            next_older: (start > 0).then(|| (name.to_owned(), start as i64)),
+        }
+    }
+
     /// HEAD-oriented marker-aware load: the model context this session
     /// initializes from, without materializing the whole transcript.
     ///
@@ -2584,6 +2762,73 @@ impl SessionStore {
     /// required (fork-boundary scans, explicit `--at` resolution).
     pub async fn load_fork_head_located(&self, root: &Path, name: &str) -> Result<LoadedLocated> {
         let head = self.load_head_located(root, name).await?;
+        self.resolve_fork_head(root, name, head).await
+    }
+
+    /// The factory's reopen load: [`Self::load_fork_head_located`] PLUS the
+    /// persisted session's fork provenance, from ONE JSONL decode.
+    ///
+    /// JSONL has no kind index, so the head load already decodes every entry
+    /// before slicing at the last compaction. Answering provenance from those
+    /// entries (before the slice) keeps a large ordinary transcript to one
+    /// sequential pass instead of scanning it a second time. The SQL backends
+    /// keep their bounded `LIMIT 1` marker query.
+    ///
+    /// Returns `(head, is_fork)`. The metadata parent is still part of the
+    /// answer: a child whose own log carries no marker is a fork when its
+    /// sidecar/row records one, and an unreadable, undecodable, or
+    /// never-written sidecar is never "no parent".
+    pub(crate) async fn load_fork_head_and_provenance(
+        &self,
+        root: &Path,
+        name: &str,
+    ) -> Result<(LoadedLocated, bool)> {
+        match self {
+            SessionStore::Jsonl => {
+                // Sidecar first: an unreadable parent link fails this reopen,
+                // and an undecodable record or an empty sidecar (an
+                // interrupted first append) is unknown.
+                let persisted_parent = self.metadata_parent(root, name).await?;
+                let loaded = Session::load_located(root, name)?;
+                let has_marker = loaded
+                    .entries
+                    .iter()
+                    .any(|entry| matches!(entry, SessionEntry::ForkedFrom { .. }));
+                let is_fork = persisted_parent.is_fork() || has_marker;
+                let head = Self::jsonl_head(loaded, name);
+                Ok((self.resolve_fork_head(root, name, head).await?, is_fork))
+            }
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { .. } => {
+                self.load_fork_head_and_query_provenance(root, name).await
+            }
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite { .. } => {
+                self.load_fork_head_and_query_provenance(root, name).await
+            }
+        }
+    }
+
+    /// Bounded-backend half of [`Self::load_fork_head_and_provenance`].
+    async fn load_fork_head_and_query_provenance(
+        &self,
+        root: &Path,
+        name: &str,
+    ) -> Result<(LoadedLocated, bool)> {
+        let head = self.load_fork_head_located(root, name).await?;
+        let is_fork = self.has_fork_provenance(root, name).await?;
+        Ok((head, is_fork))
+    }
+
+    /// Prepend a zero-copy child's inherited context to its own physical
+    /// head. Shared by [`Self::load_fork_head_located`] and the factory's
+    /// one-decode reopen load.
+    async fn resolve_fork_head(
+        &self,
+        root: &Path,
+        name: &str,
+        head: LoadedLocated,
+    ) -> Result<LoadedLocated> {
         if head.legacy {
             // A legacy whole-document session has no physical head to page.
             return Ok(head);
@@ -2895,27 +3140,119 @@ impl SessionStore {
         Ok(page)
     }
 
-    /// The session's own leading zero-copy marker, if it has one. Bounded: only
-    /// the FIRST few logical rows are read.
-    async fn leading_fork_marker(&self, root: &Path, name: &str) -> Result<Option<SessionEntry>> {
-        let bound = 3;
-        let entries = match self {
-            SessionStore::Jsonl => Session::load(root, name)?
-                .entries
-                .into_iter()
-                .take(bound)
-                .collect(),
+    /// The first `bound` stored entries through the backend's own bounded
+    /// reader: JSONL stops reading after `bound` lines, the SQL backends
+    /// LIMIT their payload query. Every LEADING-marker probe goes through
+    /// this one path; general fork provenance asks the marker query below
+    /// instead, because a legacy copy marker can sit behind the whole log.
+    async fn load_first_entries(
+        &self,
+        root: &Path,
+        name: &str,
+        bound: usize,
+    ) -> Result<Vec<SessionEntry>> {
+        match self {
+            SessionStore::Jsonl => Session::load_first(root, name, bound),
             #[cfg(feature = "greptime")]
-            SessionStore::Greptime { session, .. } => session.load_first(bound).await?,
+            SessionStore::Greptime { session, .. } => session.load_first(bound).await,
             #[cfg(feature = "sqlite")]
             SessionStore::Sqlite { session, .. } => session
                 .lock()
                 .await
                 .load_first(bound)
                 .await
-                .map_err(anyhow::Error::msg)?,
-        };
+                .map_err(anyhow::Error::msg),
+        }
+    }
+
+    /// The session's own leading zero-copy marker, if it has one. Bounded: only
+    /// the FIRST few logical rows are read.
+    async fn leading_fork_marker(&self, root: &Path, name: &str) -> Result<Option<SessionEntry>> {
+        let entries = self.load_first_entries(root, name, 3).await?;
         Ok(zero_copy_marker(&entries).map(|marker| entries[marker].clone()))
+    }
+
+    /// Whether the PERSISTED session is a fork.
+    ///
+    /// 1. A persisted parent link (the metadata row a delegate / btw / fork
+    ///    child gets) decides it with no transcript read at all.
+    /// 2. Otherwise ask the stored log through the store's own marker query:
+    ///    a `ForkedFrom` at ANY depth — leading (zero-copy), after the frozen
+    ///    goal, or behind the whole copied prefix (the copy-based writer this
+    ///    repo shipped before `1edc53d`). SQL fetches ONE matching row and no
+    ///    payload; JSONL streams until the first marker and never parses a
+    ///    legacy `.json` document (it stores messages only).
+    ///
+    /// There is deliberately no fixed head bound: a constant would silently
+    /// answer "not a fork" for a marker it never looked at, which is exactly
+    /// how a reopened copy fork regained `link_ref`.
+    ///
+    /// The factory's reopen path does NOT call this on JSONL: its head load
+    /// already decodes the transcript, so it uses
+    /// [`Self::load_fork_head_and_provenance`] and a long session is scanned
+    /// once instead of twice.
+    pub(crate) async fn has_fork_provenance(&self, root: &Path, name: &str) -> Result<bool> {
+        if self.metadata_parent(root, name).await?.is_fork() {
+            return Ok(true);
+        }
+        self.transcript_has_fork_marker(root, name).await
+    }
+
+    /// The session's persisted parent-link evidence. One narrow read: the
+    /// newest sidecar snapshot on JSONL (plus whether the sidecar can prove
+    /// parentlessness at all), a single-row/single-column SELECT on the SQL
+    /// backends.
+    async fn metadata_parent(&self, root: &Path, name: &str) -> Result<PersistedParent> {
+        match self {
+            SessionStore::Jsonl => {
+                let (latest, unknown) = jsonl_read_meta_snapshot_and_unknown(root, name)?;
+                let parent = latest.and_then(|meta| meta.parent_session_id);
+                Ok(match (parent, unknown) {
+                    (Some(_), _) => PersistedParent::Parent,
+                    (None, true) => PersistedParent::Unknown,
+                    (None, false) => PersistedParent::Parentless,
+                })
+            }
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session, .. } => {
+                Ok(match session.parent_session_id().await? {
+                    Some(_) => PersistedParent::Parent,
+                    None => PersistedParent::Parentless,
+                })
+            }
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite { session, .. } => Ok(
+                match session
+                    .lock()
+                    .await
+                    .parent_session_id()
+                    .await
+                    .map_err(anyhow::Error::msg)?
+                {
+                    Some(_) => PersistedParent::Parent,
+                    None => PersistedParent::Parentless,
+                },
+            ),
+        }
+    }
+
+    /// The store's own marker query: does the transcript contain a
+    /// `ForkedFrom` entry anywhere? The SQL backends match `entry_kind` and
+    /// `LIMIT 1` without selecting the payload, so the I/O is bounded by the
+    /// ANSWER (one row), not by a logical head count.
+    async fn transcript_has_fork_marker(&self, root: &Path, name: &str) -> Result<bool> {
+        match self {
+            SessionStore::Jsonl => Session::has_fork_marker(root, name),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session, .. } => session.has_fork_marker().await,
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite { session, .. } => session
+                .lock()
+                .await
+                .has_fork_marker()
+                .await
+                .map_err(anyhow::Error::msg),
+        }
     }
 
     /// Depth limit for a fork ancestry walk. A chain longer than this is
@@ -2955,22 +3292,7 @@ impl SessionStore {
     /// probe and hide the leading marker (a segment page would: its LIMIT
     /// counts physical versions).
     async fn has_leading_fork_marker(&self, root: &Path, name: &str, bound: usize) -> Result<bool> {
-        let entries = match self {
-            SessionStore::Jsonl => Session::load(root, name)?
-                .entries
-                .into_iter()
-                .take(bound)
-                .collect(),
-            #[cfg(feature = "greptime")]
-            SessionStore::Greptime { session, .. } => session.load_first(bound).await?,
-            #[cfg(feature = "sqlite")]
-            SessionStore::Sqlite { session, .. } => session
-                .lock()
-                .await
-                .load_first(bound)
-                .await
-                .map_err(anyhow::Error::msg)?,
-        };
+        let entries = self.load_first_entries(root, name, bound).await?;
         Ok(zero_copy_marker(&entries).is_some())
     }
 
@@ -3333,6 +3655,11 @@ impl SessionStore {
     /// btw subagents pass their task-panel label): on the existing-row
     /// backfill path an existing title is preserved and `None` means
     /// unnamed — a resume never rewrites a title.
+    ///
+    /// STRICT: a damaged JSONL sidecar is refused with an error naming the
+    /// file (see `jsonl_refuse_damaged_meta`), because an append would
+    /// rewrite unknown provenance into a clean one. The factory's optional
+    /// model/role backfill uses [`Self::create_meta_optional`] instead.
     #[allow(unused_variables, clippy::too_many_arguments)]
     pub async fn create_meta(
         &self,
@@ -3344,6 +3671,77 @@ impl SessionStore {
         parent_task_id: Option<i64>,
         title: Option<&str>,
     ) -> Result<()> {
+        self.create_meta_with_mode(
+            root,
+            session,
+            model,
+            role,
+            parent_session_id,
+            parent_task_id,
+            title,
+            MetaWriteMode::Required,
+        )
+        .await
+        .map(|_damaged| ())
+    }
+
+    /// [`Self::create_meta`] for an OPTIONAL backfill: the model/role
+    /// snapshot the factory writes while resuming a session.
+    ///
+    /// A healthy snapshot is treated exactly like `create_meta`: a brand-new
+    /// session gets its creation snapshot, and an existing row gets only the
+    /// fields it is missing (a second call appends nothing).
+    ///
+    /// A damaged snapshot (JSONL only) is SKIPPED silently, because the
+    /// factory's write is optional — it only fills a model/role the row was
+    /// created without — and a torn tail from an interrupted title edit must
+    /// not prevent an intact transcript from opening. The damage read happens
+    /// under the same sidecar lock as the append, so a concurrent writer
+    /// cannot damage the file between a health check and this call; there is
+    /// deliberately no separate pre-check. SQL backends are transactional
+    /// and never damaged.
+    ///
+    /// Returns whether the locked read OBSERVED damage (and therefore wrote
+    /// nothing), so a caller can keep damage-sensitive tools off. A skipped
+    /// damaged sidecar and a damaged empty one both report `true`; a healthy
+    /// creation or backfill reports `false`. SQL rows can never be damaged,
+    /// so they always report `false`.
+    #[allow(unused_variables, clippy::too_many_arguments)]
+    pub async fn create_meta_optional(
+        &self,
+        root: &Path,
+        session: &str,
+        model: Option<&str>,
+        role: Option<&str>,
+        parent_session_id: Option<&str>,
+        parent_task_id: Option<i64>,
+        title: Option<&str>,
+    ) -> Result<bool> {
+        self.create_meta_with_mode(
+            root,
+            session,
+            model,
+            role,
+            parent_session_id,
+            parent_task_id,
+            title,
+            MetaWriteMode::OptionalBackfill,
+        )
+        .await
+    }
+
+    #[allow(unused_variables, clippy::too_many_arguments)]
+    async fn create_meta_with_mode(
+        &self,
+        root: &Path,
+        session: &str,
+        model: Option<&str>,
+        role: Option<&str>,
+        parent_session_id: Option<&str>,
+        parent_task_id: Option<i64>,
+        title: Option<&str>,
+        mode: MetaWriteMode,
+    ) -> Result<bool> {
         match self {
             SessionStore::Jsonl => jsonl_create_meta(
                 root,
@@ -3353,23 +3751,23 @@ impl SessionStore {
                 parent_session_id,
                 parent_task_id,
                 title,
+                mode,
             ),
             #[cfg(feature = "greptime")]
             SessionStore::Greptime {
                 session: greptime_session,
                 ..
-            } => {
-                greptime_session
-                    .create_meta(
-                        session,
-                        model,
-                        role,
-                        parent_session_id,
-                        parent_task_id,
-                        title,
-                    )
-                    .await
-            }
+            } => greptime_session
+                .create_meta(
+                    session,
+                    model,
+                    role,
+                    parent_session_id,
+                    parent_task_id,
+                    title,
+                )
+                .await
+                .map(|()| false),
             #[cfg(feature = "sqlite")]
             SessionStore::Sqlite {
                 session: sqlite_session,
@@ -3386,7 +3784,32 @@ impl SessionStore {
                     title,
                 )
                 .await
+                .map(|()| false)
                 .map_err(anyhow::Error::msg),
+        }
+    }
+
+    /// Whether this session's metadata is DAMAGED: the row/file exists but
+    /// cannot prove a clean tail (an undecodable record, a final record with
+    /// no terminating newline, or no record at all). The strict metadata
+    /// writers refuse such a row instead of rewriting unknown provenance
+    /// into a clean one (see `jsonl_refuse_damaged_meta`); the optional
+    /// backfill skips it.
+    ///
+    /// This is a DIAGNOSTIC read, not a gate: metadata writers do not call it
+    /// before writing, because a separate pre-check races a concurrent writer
+    /// that damages the sidecar before the append. `create_meta` performs the
+    /// same read under the sidecar lock and refuses; `create_meta_optional`
+    /// performs it under the same lock and skips, which is what lets the
+    /// factory open an intact transcript whose metadata tail was torn.
+    /// Greptime/SQLite rows are transactional and never damaged.
+    pub async fn meta_is_damaged(&self, root: &Path, session: &str) -> Result<bool> {
+        match self {
+            SessionStore::Jsonl => Ok(jsonl_read_meta_snapshot_and_unknown(root, session)?.1),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { .. } => Ok(false),
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite { .. } => Ok(false),
         }
     }
 
@@ -3677,6 +4100,40 @@ impl SessionStore {
                 .lock()
                 .await
                 .set_acp_session_id(session, acp_session_id)
+                .await
+                .map_err(anyhow::Error::msg),
+        }
+    }
+
+    /// Read → mutate → append the session's PR/issue links, returning the
+    /// value that was actually stored (post [`dedup_refs`]). Both writers —
+    /// the `link_ref` tool and the web endpoint — go through this one path,
+    /// and both reuse the handle already open (never a second connection).
+    ///
+    /// A missing metadata row fails loudly instead of silently dropping a
+    /// link (`set_title` is a no-op there; a link must not be lost quietly).
+    #[allow(unused_variables)]
+    pub async fn update_refs(
+        &self,
+        root: &Path,
+        session: &str,
+        mutate: impl FnOnce(&mut Vec<SessionRef>) -> Result<(), String>,
+    ) -> Result<Vec<SessionRef>> {
+        match self {
+            SessionStore::Jsonl => jsonl_update_refs(root, session, mutate),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime {
+                session: greptime_session,
+                ..
+            } => greptime_session.update_refs(session, mutate).await,
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite {
+                session: sqlite_session,
+                ..
+            } => sqlite_session
+                .lock()
+                .await
+                .update_refs(session, mutate)
                 .await
                 .map_err(anyhow::Error::msg),
         }
@@ -4129,6 +4586,38 @@ fn jsonl_meta_sidecar_path(root: &Path, session: &str) -> anyhow::Result<PathBuf
         .join(format!("{session}.meta.jsonl")))
 }
 
+/// Serialize read-modify-append of ONE session's metadata sidecar inside
+/// this process. The sidecar is a full-snapshot log: every mutation reads
+/// the newest line, mutates it, and appends a new line, so two concurrent
+/// writers (two ref edits, or an edit racing a turn-boundary touch) would
+/// otherwise both start from the same line and the later append would
+/// silently drop the earlier change. Keyed by sidecar path — unrelated
+/// sessions never contend; cross-process writers stay last-write-wins (the
+/// optimistic semantics the DB backends document). One tiny leaked mutex per
+/// session path, bounded by the sessions this process has written.
+fn jsonl_meta_lock(path: &Path) -> &'static std::sync::Mutex<()> {
+    type Locks = HashMap<PathBuf, &'static std::sync::Mutex<()>>;
+    static LOCKS: std::sync::OnceLock<std::sync::Mutex<Locks>> = std::sync::OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks
+        .entry(path.to_path_buf())
+        .or_insert_with(|| Box::leak(Box::new(std::sync::Mutex::new(()))))
+}
+
+/// Take the per-sidecar snapshot lock, ignoring poisoning (a panicking
+/// writer can leave at most one truncated record: every append is one
+/// `write_all` of `<record>\n`, and [`jsonl_read_meta_snapshot_and_unknown`]
+/// treats a tail without that delimiter as damaged rather than as a
+/// snapshot).
+fn lock_jsonl_meta(path: &Path) -> std::sync::MutexGuard<'static, ()> {
+    jsonl_meta_lock(path)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Append one complete snapshot line to a session's metadata sidecar:
 /// O_APPEND + `sync_all`, 0600 on creation — the append discipline of
 /// `Session::append`, applied to metadata snapshots. Each line mirrors one
@@ -4140,6 +4629,13 @@ fn jsonl_meta_sidecar_path(root: &Path, session: &str) -> anyhow::Result<PathBuf
 /// carries a snapshot forward never replays a stale identity from an
 /// earlier line. Callers construct with `writer: None`; the stamped value
 /// is what lands in the file.
+///
+/// The record AND its delimiter go into ONE buffer (not two `write_all`
+/// calls): a crash between two writes would leave a complete, decodable
+/// JSON object with no `\n`, which the next append would glue its own
+/// object onto. The reader still treats a missing delimiter as damage on
+/// its own (see [`jsonl_read_meta_snapshot_and_unknown`]), so the guard
+/// does not DEPEND on this write shape — it only removes the window.
 fn jsonl_append_meta_snapshot(
     root: &Path,
     session: &str,
@@ -4157,8 +4653,9 @@ fn jsonl_append_meta_snapshot(
         .append(true)
         .open(&path)
         .with_context(|| format!("cannot append session metadata {}", path.display()))?;
-    file.write_all(&serde_json::to_vec(meta)?)?;
-    file.write_all(b"\n")?;
+    let mut line = serde_json::to_vec(meta)?;
+    line.push(b'\n');
+    file.write_all(&line)?;
     file.sync_all()?;
     #[cfg(unix)]
     if created {
@@ -4168,27 +4665,129 @@ fn jsonl_append_meta_snapshot(
 }
 
 /// The newest snapshot of a session's metadata sidecar, or `None` when the
-/// sidecar does not exist or holds no parseable line. Corrupt lines are
+/// sidecar does not exist or holds no decodable record. Corrupt records are
 /// skipped: the file is append-only and only the tail matters (a corrupt
-/// tail is treated as "no newer snapshot").
+/// tail is treated as "no newer snapshot"). This is the DISPLAY/listing
+/// read — every mutating writer must use
+/// [`jsonl_read_meta_snapshot_and_unknown`] instead, because this lossy
+/// version cannot tell a repaired file from a torn one and would let an
+/// append land on top of a damaged tail.
+///
+/// ONLY `NotFound` means "no sidecar". Any other open/read error is
+/// propagated: fork provenance must never read an unreadable sidecar as a
+/// session without a parent (that is exactly how an unreadable child
+/// regained `link_ref`).
 fn jsonl_read_meta_snapshot(root: &Path, session: &str) -> anyhow::Result<Option<SessionMeta>> {
+    Ok(jsonl_read_meta_snapshot_and_unknown(root, session)?.0)
+}
+
+/// [`jsonl_read_meta_snapshot`] plus whether provenance must be treated as
+/// UNKNOWN: the sidecar exists but no record in it can prove parentlessness.
+/// That covers a record that failed to decode (a torn crash tail), a
+/// sidecar with no nonblank record at all — the writer creates the file
+/// BEFORE its first snapshot, so an interruption between those two
+/// operations leaves a zero-byte file, not "no sidecar" — and a final
+/// record that left no terminating newline.
+///
+/// That last shape is the subtle one: the file is a log of `<record>\n`
+/// lines, so a last byte that is not `\n` means the file was not cleanly
+/// written, whether or not the trailing bytes happen to form a complete
+/// JSON object. A plain `split(b'\n')` tail read happily returns such an
+/// object, and it DECODES, so without this rule a crash between the record
+/// and its delimiter would look like a good snapshot and the next append
+/// would be glued onto it (`{...}{...}` on one line, which the next read
+/// cannot decode). A missing delimiter therefore makes the whole tail
+/// UNKNOWN for every WRITER, independent of whether the append happens to
+/// emit both in one `write` (an interrupted `write_all` can still stop on a
+/// boundary). The decoded value is still the newest snapshot for DISPLAY:
+/// the record bytes are complete, only its terminator is missing.
+///
+/// The last good snapshot still opens the session for DISPLAY (a torn tail
+/// is a crash artifact), but provenance must know the read was incomplete:
+/// an undecodable, unterminated, or missing record means "unknown", never
+/// "this session has no parent".
+///
+/// Records are read as BYTES, not with `lines()`: `lines()` requires every
+/// line to be valid UTF-8, so a write that stopped inside a multi-byte
+/// character would fail the whole reopen and block a session whose history
+/// is intact. `serde_json::from_slice` puts a mid-character tear in the same
+/// "torn record" bucket as a torn brace, while genuine I/O errors still
+/// propagate.
+fn jsonl_read_meta_snapshot_and_unknown(
+    root: &Path,
+    session: &str,
+) -> anyhow::Result<(Option<SessionMeta>, bool)> {
     let path = jsonl_meta_sidecar_path(root, session)?;
-    let Ok(file) = std::fs::File::open(&path) else {
-        return Ok(None);
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((None, false)),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("cannot read session metadata {}", path.display()));
+        }
     };
     let mut latest: Option<SessionMeta> = None;
-    for line in std::io::BufReader::new(file)
-        .lines()
-        .map_while(|line| line.ok())
-    {
-        if line.trim().is_empty() {
+    let mut unknown = false;
+    let mut saw_record = false;
+    // `read_until` (not `BufRead::split`) so each chunk keeps the answer to
+    // "did this record get its delimiter?": `split` POPS it, leaving the
+    // final record of a clean file indistinguishable from a tail that never
+    // got one.
+    let mut reader = std::io::BufReader::new(file);
+    let mut record = Vec::new();
+    loop {
+        record.clear();
+        let read = reader
+            .read_until(b'\n', &mut record)
+            .with_context(|| format!("cannot read session metadata {}", path.display()))?;
+        if read == 0 {
+            break; // clean EOF at a record boundary
+        }
+        let terminated = record.last() == Some(&b'\n');
+        if terminated {
+            record.pop();
+        }
+        if record.iter().all(u8::is_ascii_whitespace) {
+            // Whitespace after the last delimiter is still an unterminated
+            // tail (the writer only ever emits `<record>\n`), so it is
+            // damage even though it holds no record.
+            if !terminated {
+                unknown = true;
+                break;
+            }
             continue;
         }
-        if let Ok(meta) = serde_json::from_str::<SessionMeta>(&line) {
-            latest = Some(meta);
+        saw_record = true;
+        if !terminated {
+            unknown = true;
+        }
+        match serde_json::from_slice::<SessionMeta>(&record) {
+            Ok(meta) => latest = Some(meta),
+            Err(_) => unknown = true,
+        }
+        if !terminated {
+            break; // EOF: the next `read_until` would return 0 anyway
         }
     }
-    Ok(latest)
+    Ok((latest, unknown || !saw_record))
+}
+
+/// The refusal every JSONL metadata WRITER returns when
+/// [`jsonl_read_meta_snapshot_and_unknown`] reports `unknown`: the sidecar
+/// holds a torn record (or no record at all), or its last record never got
+/// its newline, so its provenance is unknown and it is DISPLAY-only.
+/// Appending would either glue the new snapshot onto that unterminated tail
+/// or become the next snapshot a later read trusts — silently rewriting
+/// unknown provenance into a clean one. Repair is explicit (remove the
+/// file), never a metadata write, and the error names the file so the
+/// caller can act on it.
+fn jsonl_refuse_damaged_meta(path: &Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "session metadata {} is damaged (an undecodable or unterminated record from an \
+         interrupted write); refusing to append a new snapshot so its unknown provenance is \
+         not rewritten",
+        path.display()
+    )
 }
 
 /// Count a session's transcript entries by counting the non-empty lines of
@@ -4233,8 +4832,29 @@ fn jsonl_count_transcript_entries(root: &Path, session: &str) -> anyhow::Result<
 ///   resume — a second creation line would rewrite `created_at` and
 ///   pollute the audit file).
 ///
+/// An existing sidecar that holds no decodable record (an empty file from a
+/// `create` whose first `write_all` never ran, or a lone torn line) is
+/// left untouched, because appending a first line would turn unknown
+/// provenance into a parentless one. That is not an idempotent resume of an
+/// existing snapshot, so [`MetaWriteMode::Required`] REFUSES it with an
+/// error naming the file rather than reporting a creation that never
+/// landed. A sidecar that DOES hold a decodable snapshot followed by a torn
+/// one is display-only too: a backfill append would make the damaged tail
+/// look repaired (and without a trailing newline it would be glued onto
+/// that tail), so the strict create is refused there as well. A create with
+/// an existing decodable snapshot and nothing to append stays an `Ok` no-op,
+/// so an intact transcript still reopens.
+///
+/// [`MetaWriteMode::OptionalBackfill`] changes ONLY those damaged cases: a
+/// backfill that would otherwise be refused is skipped silently, because
+/// the caller's write is optional, and reports the observed damage as
+/// `true`. A healthy write and the no-op resume are identical in both modes
+/// and report `false`. The decision and the append share the lock taken
+/// above, so they are one critical section.
+///
 /// `entry_count` mirrors the DB backends' `next_seq` at creation: the
 /// transcript's current line count.
+#[allow(clippy::too_many_arguments)]
 fn jsonl_create_meta(
     root: &Path,
     session: &str,
@@ -4243,8 +4863,12 @@ fn jsonl_create_meta(
     parent_session_id: Option<&str>,
     parent_task_id: Option<i64>,
     title: Option<&str>,
-) -> anyhow::Result<()> {
-    if let Some(existing) = jsonl_read_meta_snapshot(root, session)? {
+    mode: MetaWriteMode,
+) -> anyhow::Result<bool> {
+    let path = jsonl_meta_sidecar_path(root, session)?;
+    let _guard = lock_jsonl_meta(&path);
+    let (existing, unknown) = jsonl_read_meta_snapshot_and_unknown(root, session)?;
+    if let Some(existing) = existing {
         // Row already exists (resume, or a backfill/btw/subagent row whose
         // model or parent link was unknown at write time): only ever
         // backfill what is MISSING — never overwrite an existing model or
@@ -4253,6 +4877,21 @@ fn jsonl_create_meta(
         let backfill_parent = parent_session_id.is_some() && existing.parent_session_id.is_none();
         let backfill_model = model.is_some() && existing.model.is_none();
         if backfill_parent || backfill_model {
+            if unknown {
+                // A decodable snapshot plus a torn tail: the append below
+                // would land after the damaged record. Refuse BEFORE writing
+                // (the old order tested `unknown` only on the no-snapshot
+                // path, so a torn tail was silently appended to) — unless the
+                // write is an OPTIONAL backfill, in which case skipping is
+                // the point: the intact transcript still opens and the
+                // unknown provenance stays untouched. This uses the read
+                // above, inside the same lock as the append, so a concurrent
+                // writer cannot damage the file between the two.
+                return match mode {
+                    MetaWriteMode::Required => Err(jsonl_refuse_damaged_meta(&path)),
+                    MetaWriteMode::OptionalBackfill => Ok(true),
+                };
+            }
             let mut meta = SessionMeta {
                 session_id: existing.session_id.clone(),
                 created_at: existing.created_at,
@@ -4269,13 +4908,30 @@ fn jsonl_create_meta(
                 title: existing.title.clone(),
                 pinned: existing.pinned,
                 archived: existing.archived,
+                refs: existing.refs.clone(), // links are never rewritten by a resume
                 acp_session_id: existing.acp_session_id.clone(),
                 writer: None, // stamped by jsonl_append_meta_snapshot with the writing process
                 label: None, // label lives in running_tasks / background records, resolved at list time
             };
-            return jsonl_append_meta_snapshot(root, session, &mut meta);
+            return jsonl_append_meta_snapshot(root, session, &mut meta).map(|()| false);
         }
-        return Ok(()); // resume: nothing missing, never rewrite created_at
+        // Resume: nothing missing, never rewrite `created_at`. The read may
+        // still have observed a torn tail after that snapshot; report the
+        // damage so the caller does not treat the session as fully healthy.
+        return Ok(unknown);
+    }
+    if unknown {
+        // The sidecar EXISTS but no record in it decodes — notably the
+        // empty file an interrupted `create` leaves between creating the
+        // file and its first `write_all`. That is the crash window this
+        // series calls damage, not an idempotent resume of an existing
+        // snapshot: an explicit create must fail naming the file instead
+        // of reporting a success that never landed. The optional resume
+        // backfill has nothing to backfill from and skips it.
+        return match mode {
+            MetaWriteMode::Required => Err(jsonl_refuse_damaged_meta(&path)),
+            MetaWriteMode::OptionalBackfill => Ok(true),
+        };
     }
     let now = chrono::Utc::now().naive_utc();
     let mut meta = SessionMeta {
@@ -4290,25 +4946,36 @@ fn jsonl_create_meta(
         title: title.map(str::to_owned), // a fresh session may be named at creation (subagent label)
         pinned: None,                    // a fresh session is unpinned until the user pins it
         archived: None,                  // a fresh session is unarchived until the user archives it
+        refs: Vec::new(),                // no PR/issue links until the tool or the owner adds them
         acp_session_id: None,            // no ACP conversation until `acp_prompt` runs
         writer: None, // stamped by jsonl_append_meta_snapshot with the writing process
         label: None,  // label lives in running_tasks / background records, resolved at list time
     };
-    jsonl_append_meta_snapshot(root, session, &mut meta)
+    jsonl_append_meta_snapshot(root, session, &mut meta).map(|()| false)
 }
 
 /// Shared read-tail → mutate → append for the flag setters (title, pin,
 /// archive). Never self-creates (R3): a missing sidecar is a no-op `Ok`,
-/// mirroring the DB backends. A fresh `last_active_at` is stamped here and
-/// `entry_count` is carried from the tail snapshot (the DB backends bump
-/// only `last_active_at` on these writes — the touch additionally
-/// refreshes `entry_count`, which is why it has its own function).
+/// mirroring the DB backends. A sidecar whose provenance is UNKNOWN (a torn
+/// record after the last good snapshot) is display-only: the write is
+/// REFUSED with an error naming the file, so a rename/pin/archive the user
+/// asked for never reports success without having landed. A fresh
+/// `last_active_at` is stamped here and `entry_count` is carried from the
+/// tail snapshot (the DB backends bump only `last_active_at` on these
+/// writes — the touch additionally refreshes `entry_count`, which is why it
+/// has its own function).
 fn jsonl_update_meta(
     root: &Path,
     session: &str,
     mutate: impl FnOnce(&mut SessionMeta),
 ) -> anyhow::Result<()> {
-    let Some(mut meta) = jsonl_read_meta_snapshot(root, session)? else {
+    let path = jsonl_meta_sidecar_path(root, session)?;
+    let _guard = lock_jsonl_meta(&path);
+    let (existing, unknown) = jsonl_read_meta_snapshot_and_unknown(root, session)?;
+    if unknown {
+        return Err(jsonl_refuse_damaged_meta(&path));
+    }
+    let Some(mut meta) = existing else {
         return Ok(()); // R3: never self-create
     };
     mutate(&mut meta);
@@ -4316,15 +4983,53 @@ fn jsonl_update_meta(
     jsonl_append_meta_snapshot(root, session, &mut meta)
 }
 
+/// `update_refs` for the JSONL backend: read → mutate → append ONE snapshot
+/// line under the same per-session lock every other metadata writer takes,
+/// so two concurrent adds both survive instead of the later one overwriting
+/// the earlier read. Returns the stored (deduplicated) list. A missing
+/// sidecar is an error — a link handed to the store must not be dropped
+/// quietly (the flag setters' no-op would). A damaged sidecar (a torn
+/// record) is an error too: the link did NOT persist, and the caller/model
+/// must learn that instead of seeing an acknowledged no-op.
+fn jsonl_update_refs(
+    root: &Path,
+    session: &str,
+    mutate: impl FnOnce(&mut Vec<SessionRef>) -> Result<(), String>,
+) -> anyhow::Result<Vec<SessionRef>> {
+    let path = jsonl_meta_sidecar_path(root, session)?;
+    let _guard = lock_jsonl_meta(&path);
+    let (existing, unknown) = jsonl_read_meta_snapshot_and_unknown(root, session)?;
+    if unknown {
+        return Err(jsonl_refuse_damaged_meta(&path));
+    }
+    let Some(mut meta) = existing else {
+        anyhow::bail!("session {session} has no metadata row to store links in");
+    };
+    mutate(&mut meta.refs).map_err(anyhow::Error::msg)?;
+    dedup_refs(&mut meta.refs);
+    meta.last_active_at = chrono::Utc::now().naive_utc();
+    jsonl_append_meta_snapshot(root, session, &mut meta)?;
+    Ok(meta.refs)
+}
+
 /// `touch_meta` for the JSONL backend: append one fresh snapshot line with
 /// `last_active_at = now` and `entry_count` = the current transcript line
 /// count, or no-op when no sidecar exists (R3 — a sidecar-less session
-/// must not fabricate its own row). The transcript is re-counted on every
-/// call: the store is stateless, and the count is the exact JSONL analogue
-/// of the DB's `next_seq`. Called synchronously at turn boundaries; the
-/// read is a few hundred KB at worst.
+/// must not fabricate its own row). A damaged sidecar (a torn record) is an
+/// error, never an append: the caller (the runner's fire-and-forget touch)
+/// logs the refusal instead of advancing a metadata tail whose provenance
+/// is unknown. The transcript is re-counted on every call: the store is
+/// stateless, and the count is the exact JSONL analogue of the DB's
+/// `next_seq`. Called synchronously at turn boundaries; the read is a few
+/// hundred KB at worst.
 fn jsonl_touch_meta(root: &Path, session: &str) -> anyhow::Result<()> {
-    let Some(mut meta) = jsonl_read_meta_snapshot(root, session)? else {
+    let path = jsonl_meta_sidecar_path(root, session)?;
+    let _guard = lock_jsonl_meta(&path);
+    let (existing, unknown) = jsonl_read_meta_snapshot_and_unknown(root, session)?;
+    if unknown {
+        return Err(jsonl_refuse_damaged_meta(&path));
+    }
+    let Some(mut meta) = existing else {
         return Ok(()); // R3: never self-create
     };
     meta.last_active_at = chrono::Utc::now().naive_utc();
@@ -4404,6 +5109,10 @@ fn jsonl_list_meta_diagnostic(
 /// transcript, so hiding is scoped to the current server lifetime.
 fn jsonl_delete_meta(root: &Path, session: &str) -> anyhow::Result<()> {
     let path = jsonl_meta_sidecar_path(root, session)?;
+    // Same per-session snapshot lock as the writers: a delete must not be
+    // undone by an in-flight read-modify-append (which would recreate the
+    // sidecar with the snapshot it read before the delete).
+    let _guard = lock_jsonl_meta(&path);
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -4424,7 +5133,9 @@ fn jsonl_delete_meta(root: &Path, session: &str) -> anyhow::Result<()> {
 /// from the transcript file's mtime — the only recoverable activity signal
 /// for a pre-sidecar session. `entry_count` is the transcript line count.
 /// Legacy `.json` transcripts are excluded (they are rewritten to `.jsonl`
-/// on their next resume).
+/// on their next resume). A sidecar that exists but cannot decode is left
+/// untouched, because backfilling it would fabricate the parentlessness
+/// the interrupted write never recorded.
 fn jsonl_backfill_sessions(root: &Path) -> anyhow::Result<()> {
     let directory = root.join(".e-agent/sessions");
     let Ok(entries) = std::fs::read_dir(&directory) else {
@@ -4443,8 +5154,18 @@ fn jsonl_backfill_sessions(root: &Path) -> anyhow::Result<()> {
         .collect();
     sessions.sort();
     for session in sessions {
-        if jsonl_read_meta_snapshot(root, &session)?.is_some() {
+        // Same per-session lock as every other metadata writer: another
+        // handle may create the sidecar between the absence check and this
+        // append, and a second creation line would rewrite created_at and
+        // omit links that handle stored. Re-check under the lock.
+        let path = jsonl_meta_sidecar_path(root, &session)?;
+        let _guard = lock_jsonl_meta(&path);
+        let (existing, unknown) = jsonl_read_meta_snapshot_and_unknown(root, &session)?;
+        if existing.is_some() {
             continue; // already has a snapshot (idempotent)
+        }
+        if unknown {
+            continue; // interrupted first write: never fabricate a first line
         }
         let mtime = std::fs::metadata(directory.join(format!("{session}.jsonl")))
             .and_then(|meta| meta.modified())
@@ -4462,6 +5183,7 @@ fn jsonl_backfill_sessions(root: &Path) -> anyhow::Result<()> {
             title: None,          // pre-sidecar sessions have no user-assigned name
             pinned: None,         // pre-sidecar sessions are unpinned
             archived: None,       // pre-sidecar sessions are unarchived
+            refs: Vec::new(),     // pre-sidecar sessions carry no PR/issue links
             acp_session_id: None, // pre-sidecar sessions have no ACP conversation
             writer: None,         // stamped by jsonl_append_meta_snapshot with the writing process
             label: None, // label lives in running_tasks / background records, resolved at list time
@@ -5179,6 +5901,40 @@ mod shared_helpers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A ref URL must carry an EXPLICIT `scheme://` authority in the original
+    /// string. `Url::parse` REPAIRS a scheme without one (`https:example.org/
+    /// pull/14` becomes the path `example.org/pull/14` on host "https"), so the
+    /// old checks saw a host and passed while the raw string — the one stored
+    /// in `href` and resolved against the UI origin by the browser — had no
+    /// origin at all. Every malformed form is refused; an accepted URL keeps
+    /// its exact string (the URL is the identity).
+    #[test]
+    fn ref_urls_require_an_explicit_authority_and_keep_their_exact_string() {
+        for (bad, why) in [
+            ("https:example.org/pull/14", "scheme without `//`"),
+            ("http:example.org/x", "scheme without `//`"),
+            ("https:/example.org/x", "single slash"),
+            ("https:///example.org/x", "empty authority"),
+            ("https://\\example.org/pull/14", "backslash authority"),
+            ("https://", "no authority"),
+            ("//example.org/x", "no scheme"),
+            ("example.org/pull/14", "relative path"),
+            ("ftp://example.org/x", "wrong scheme"),
+            ("https://user:pw@example.org/x", "credentials"),
+            ("https://example.org /x", "whitespace"),
+            ("", "empty"),
+        ] {
+            let error = SessionRef::new("pr", bad).expect_err(why);
+            assert!(!error.is_empty(), "{why}: {error}");
+        }
+        let accepted = "https://Example.org/PULL/14";
+        assert_eq!(
+            SessionRef::new("pr", accepted).unwrap().url,
+            accepted,
+            "an accepted URL keeps its exact string"
+        );
+    }
 
     /// JSONL `load_older` pages by ABSOLUTE position (there is no seq
     /// column): `before_seq` is the 0-based file position, the returned
@@ -6115,6 +6871,177 @@ mod tests {
             event_time: None,
             seq,
         }
+    }
+
+    /// The LEADING-marker probe (`leading_fork_marker`) stops at its bound
+    /// instead of parsing the whole JSONL transcript.
+    #[test]
+    fn jsonl_load_first_reads_a_bounded_head() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let entries = fork_turns(10);
+        crate::session::Session::append(root, "bounded", &entries).unwrap();
+        let first = crate::session::Session::load_first(root, "bounded", 3).unwrap();
+        assert_eq!(first, entries[..3]);
+    }
+
+    /// The copy-based writer this repo shipped before `1edc53d` appended the
+    /// marker AFTER the whole selected prefix, so four ordinary turns put it
+    /// ninth. Provenance must find it there; a bounded head of eight answered
+    /// "not a fork", and the reopened fork regained `link_ref`.
+    #[tokio::test]
+    async fn jsonl_provenance_finds_a_copy_marker_behind_four_turns() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let prefix = fork_turns(4); // eight entries
+        crate::session::Session::append(root, "nine-parent", &prefix).unwrap();
+        let mut child = prefix.clone();
+        child.push(marker("nine-parent", prefix.len(), Some(7)));
+        crate::session::Session::append(root, "nine-fork", &child).unwrap();
+
+        assert!(
+            SessionStore::Jsonl
+                .has_fork_provenance(root, "nine-fork")
+                .await
+                .unwrap(),
+            "the ninth-entry marker is provenance, not a head-bound miss"
+        );
+    }
+
+    /// An ordinary long session is not a fork and still builds. JSONL has no
+    /// kind index, so the negative answer is one sequential pass; the scan
+    /// stops at the first marker (see the test below) and never parses a
+    /// legacy `.json` document.
+    #[tokio::test]
+    async fn jsonl_provenance_is_false_for_a_plain_long_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        crate::session::Session::append(root, "plain-long", &fork_turns(500)).unwrap();
+        assert!(
+            !SessionStore::Jsonl
+                .has_fork_provenance(root, "plain-long")
+                .await
+                .unwrap()
+        );
+    }
+
+    /// The marker scan stops at the first match: a corrupt line AFTER it is
+    /// never decoded by the probe (the loader reports it on a real load).
+    #[tokio::test]
+    async fn jsonl_provenance_stops_reading_at_the_first_marker() {
+        use std::io::Write as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let prefix = fork_turns(4);
+        crate::session::Session::append(root, "stop-parent", &prefix).unwrap();
+        let mut child = prefix;
+        child.push(marker("stop-parent", 8, Some(7)));
+        crate::session::Session::append(root, "stop-fork", &child).unwrap();
+        let path = root.join(".e-agent/sessions/stop-fork.jsonl");
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(file, "not json").unwrap();
+
+        assert!(
+            SessionStore::Jsonl
+                .has_fork_provenance(root, "stop-fork")
+                .await
+                .unwrap()
+        );
+    }
+
+    /// A persisted parent link answers "is this a fork" without touching the
+    /// transcript: the stored log here is not even valid JSON.
+    #[tokio::test]
+    async fn persisted_parent_link_answers_without_the_transcript() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        SessionStore::Jsonl
+            .create_meta(
+                root,
+                "meta-child",
+                Some("m"),
+                Some("subagent"),
+                Some("meta-parent"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        std::fs::write(
+            root.join(".e-agent/sessions/meta-child.jsonl"),
+            "not json\n",
+        )
+        .unwrap();
+
+        assert!(
+            SessionStore::Jsonl
+                .has_fork_provenance(root, "meta-child")
+                .await
+                .unwrap()
+        );
+    }
+
+    /// An unreadable metadata sidecar is NOT "no persisted parent": an
+    /// unknown provenance must never resolve to "ordinary session" and
+    /// re-enable `link_ref`. Only `NotFound` is absence.
+    #[tokio::test]
+    async fn an_unreadable_metadata_sidecar_is_an_error_not_an_absent_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        crate::session::Session::append(root, "meta-blocked", &fork_turns(1)).unwrap();
+        // A directory at the sidecar path is openable but not readable on
+        // Unix, and refused at open on Windows: both are non-NotFound.
+        std::fs::create_dir(root.join(".e-agent/sessions/meta-blocked.meta.jsonl")).unwrap();
+
+        let error = SessionStore::Jsonl
+            .has_fork_provenance(root, "meta-blocked")
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("meta-blocked.meta.jsonl"),
+            "the sidecar read error is surfaced by name: {error:#}"
+        );
+    }
+
+    /// The transcript probe follows the same rule: a failed open/read is an
+    /// error, never "no marker". A directory at the transcript path fails on
+    /// every platform (open or first read).
+    #[tokio::test]
+    async fn an_unreadable_transcript_is_an_error_not_an_absent_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join(".e-agent/sessions/tr-blocked.jsonl")).unwrap();
+
+        let error = SessionStore::Jsonl
+            .has_fork_provenance(root, "tr-blocked")
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("tr-blocked.jsonl"),
+            "the transcript read error is surfaced by name: {error:#}"
+        );
+    }
+
+    /// A legacy whole-document `.json` session stores `Message`s only, so it
+    /// can never carry a marker — the probe must not read (or fail on) it.
+    #[tokio::test]
+    async fn jsonl_provenance_never_parses_a_legacy_document() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let directory = root.join(".e-agent/sessions");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("legacy-only.json"), "{ this is not json").unwrap();
+
+        assert!(
+            !SessionStore::Jsonl
+                .has_fork_provenance(root, "legacy-only")
+                .await
+                .unwrap()
+        );
     }
 
     /// Only the two LEADING layouts are a zero-copy fork. A marker deeper in

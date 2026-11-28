@@ -147,6 +147,37 @@ impl Drop for LocalSessionPermit {
     }
 }
 
+/// Test-only interleaving point inside ONE build: a hook armed for one
+/// session id runs after that build's persisted-provenance read and before
+/// its optional metadata backfill, so a test can place a concurrent
+/// writer's damage in exactly the window the locked operation must detect.
+/// Scoped to the session id so builds in parallel tests never fire it.
+#[cfg(test)]
+pub(crate) mod build_probe {
+    use std::sync::Mutex;
+
+    type Hook = Box<dyn FnOnce() + Send>;
+    static AFTER_PROVENANCE: Mutex<Option<(String, Hook)>> = Mutex::new(None);
+
+    pub(crate) fn arm_after_provenance(session: &str, hook: impl FnOnce() + Send + 'static) {
+        *AFTER_PROVENANCE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some((session.to_owned(), Box::new(hook)));
+    }
+
+    pub(crate) fn after_provenance_read(session: &str) {
+        let mut slot = AFTER_PROVENANCE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot.as_ref().is_some_and(|(armed, _)| armed == session) {
+            let (_, hook) = slot.take().expect("checked above");
+            drop(slot);
+            hook();
+        }
+    }
+}
+
 /// Everything resolved once at startup and shared by every built session.
 #[derive(Clone)]
 pub struct SessionFactory {
@@ -947,6 +978,9 @@ impl SessionFactory {
             None
         };
         let mut store = SessionStore::connect(&self.backend, &self.root, &session).await?;
+        // Whether this build CONTINUES another session's transcript (CLI/TUI
+        // `--fork`, web fork) — captured before `fork_from` is consumed.
+        let mut forked = fork_from.is_some();
         if let Some((source, at)) = fork_from {
             // Zero-copy fork: the child's store receives ONLY its own frozen
             // goal plus the marker. The source prefix is read back read-only by
@@ -1023,6 +1057,28 @@ impl SessionFactory {
                 );
             }
         }
+        // Persisted provenance, not just this build's request: a fork or a
+        // child reopened by id (web resume, `--session`) passes
+        // `fork_from = None`, but its metadata row still records its parent
+        // and/or its stored transcript still carries the `ForkedFrom` marker
+        // (at whatever depth the layout put it). `link_ref` must stay off for
+        // it exactly as it does for a fresh fork.
+        //
+        // Head-oriented marker-aware load: the model context this session
+        // initializes from — its own head, or a zero-copy child's resolved
+        // inherited context — never the whole transcript. Older rows stay
+        // readable on demand through the history pager. On JSONL this load
+        // necessarily decodes every entry before slicing at the last
+        // compaction, so it ALSO answers the transcript-marker question: a
+        // second provenance scan would be a second full decode of a long
+        // transcript on every reopen. SQL keeps its bounded marker query.
+        let (loaded, persisted_fork) = store
+            .load_fork_head_and_provenance(&self.root, &session)
+            .await
+            .with_context(|| format!("cannot reopen session {session}"))?;
+        if !forked {
+            forked = persisted_fork;
+        }
         // Snapshot the reloadable state once: the config watcher may swap it
         // between awaits, so everything below uses one consistent view. The
         // models are pre-resolved at construction/reload (a bad edit never
@@ -1060,6 +1116,47 @@ impl SessionFactory {
             crate::config::resolve_background_timeout(config.as_ref(), &self.root).unwrap_or(None);
         let bash_timeout =
             crate::config::resolve_bash_timeout(config.as_ref(), &self.root).unwrap_or(None);
+        // Sessions metadata: write the creation snapshot for a brand-new
+        // session (model/role from the factory configuration; parent links
+        // are None for main sessions). A resumed session (`--session`,
+        // server resume, fork-source reconnect) already has its row —
+        // creation is idempotent and appends nothing — and the runner's
+        // turn-boundary touch keeps it fresh.
+        //
+        // On an EXISTING row that call is only the OPTIONAL backfill of a
+        // model/role the row was created without (a bootstrap-backfilled
+        // session has `model: None`), and a damaged sidecar must not take
+        // that append so unknown provenance is never rewritten into a clean
+        // one. Refusing to open would make an interrupted write fatal to a
+        // resume whose transcript is intact, so the optional entry point
+        // skips the damaged write and REPORTS that it observed damage. The
+        // tool set below is finalized only after that answer: a damage that
+        // lands after the provenance read (a concurrent title edit) must
+        // still keep `link_ref` off, because its links belong to the
+        // metadata row the damage prevents us from trusting. There is
+        // deliberately no `meta_is_damaged` pre-check here — it would race a
+        // concurrent writer that damages the sidecar between the check and
+        // this call; the optional entry point makes the decision in the same
+        // locked read that appends. A fresh session has no sidecar, so it is
+        // never damaged and its creation snapshot is still written.
+        let model_name = main_model.profile_key();
+        let main_role = crate::roles::role_prompt(&self.root, crate::roles::MAIN_ROLE)?;
+        let role_name = main_role
+            .as_ref()
+            .map(|_| crate::roles::MAIN_ROLE.to_owned());
+        #[cfg(test)]
+        build_probe::after_provenance_read(&session);
+        let metadata_damaged = store
+            .create_meta_optional(
+                &self.root,
+                &session,
+                Some(&model_name),
+                role_name.as_deref(),
+                None,
+                None,
+                None, // main sessions keep manual naming; title is a subagent-spawn concern
+            )
+            .await?;
         #[rustfmt::skip]
         let tools_workspace = self.skills_workspace.clone().unwrap_or_else(|| self.workspace.clone());
         let (mut tools, background) = builtins_with_bash_timeout(
@@ -1075,6 +1172,24 @@ impl SessionFactory {
         register_run_rust(&mut tools, &tools_workspace, self.code_mode, self.read_only, self.rust_sandbox.clone());
         // Only the root/main session can pause for Web human input.
         add_root_user_input_tool(&mut tools);
+        // `link_ref` records PR/issue URLs on THIS session's metadata row
+        // through the store already open above (no second connection), so it
+        // belongs only to a session the human started from scratch: a
+        // user-created top-level session with no source transcript. A FORK is
+        // a top-level main session too (the user talks to it), but it
+        // continues another session's transcript — its links belong to the
+        // source it continues, so a fork must never rewrite them. Children
+        // (delegate/btw forks) build the common builtins and never see it
+        // either. Metadata damage observed by the optional backfill above
+        // keeps it off too: a torn row is not a trustworthy place to record
+        // links, even when the provenance read happened before the damage.
+        if !forked && !metadata_damaged {
+            tools.push(crate::tools::link_ref_tool(
+                store.clone(),
+                self.root.clone(),
+                session.clone(),
+            ));
+        }
         // Main-agent only: `generate_image` (direct Codex image HTTP).
         // Read-only sessions skip it (it creates files), and so does a
         // workspace rooted at or below the canonical global skills
@@ -1173,16 +1288,12 @@ impl SessionFactory {
         // The main agent's orchestrator template resolves through the same role
         // layers as delegated roles; the highest-priority available template
         // leads and tells the model to decompose work and delegate.
-        let role_name = match crate::roles::role_prompt(&self.root, crate::roles::MAIN_ROLE)? {
-            Some(orchestrator) => {
-                if let Some(reminder) = crate::roles::core_directive(&orchestrator) {
-                    agent.set_compaction_reminder(reminder);
-                }
-                context.push(orchestrator);
-                Some(crate::roles::MAIN_ROLE.to_owned())
+        if let Some(orchestrator) = main_role {
+            if let Some(reminder) = crate::roles::core_directive(&orchestrator) {
+                agent.set_compaction_reminder(reminder);
             }
-            None => None,
-        };
+            context.push(orchestrator);
+        }
         if let Some(instructions) = &self.agents_instructions {
             context.push(format!("## AGENTS.md\n\n{instructions}"));
         }
@@ -1196,11 +1307,6 @@ impl SessionFactory {
         if let Some(rounds) = max_rounds {
             agent = agent.max_tool_rounds(rounds);
         }
-        // Head-oriented marker-aware load: the model context this session
-        // initializes from — its own head, or a zero-copy child's resolved
-        // inherited context — never the whole transcript. Older rows stay
-        // readable on demand through the history pager.
-        let loaded = store.load_fork_head_located(&self.root, &session).await?;
         let legacy = loaded.legacy;
         let inherited = loaded.inherited;
         let older_route = loaded.next_older;
@@ -1257,24 +1363,6 @@ impl SessionFactory {
             agent.set_context_window(window);
         }
 
-        let model_name = main_model.profile_key();
-        // Sessions metadata: write the creation snapshot for a brand-new
-        // session (model/role from the factory configuration; parent links
-        // are None for main sessions). A resumed session (`--session`,
-        // server resume, fork-source reconnect) already has its row —
-        // create_meta is idempotent and appends nothing — and the runner's
-        // turn-boundary touch keeps it fresh.
-        store
-            .create_meta(
-                &self.root,
-                &session,
-                Some(&model_name),
-                role_name.as_deref(),
-                None,
-                None,
-                None, // main sessions keep manual naming; title is a subagent-spawn concern
-            )
-            .await?;
         let (runner, handle) = SessionRunner::new_with_bootstrap(
             agent,
             store.clone(),
@@ -4738,6 +4826,749 @@ mod generate_image_registration_tests {
                 Some(&missing),
             )
             .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod link_ref_registration_tests {
+    use super::*;
+    use crate::agent::SessionEntry;
+    use crate::session::Session;
+
+    fn user(text: &str) -> SessionEntry {
+        crate::agent::Message::User {
+            content: text.to_owned(),
+            images: vec![],
+        }
+        .into()
+    }
+
+    fn assistant(text: &str) -> SessionEntry {
+        crate::agent::Message::Assistant(crate::agent::AssistantMessage {
+            content: Some(text.to_owned()),
+            tool_calls: vec![],
+            reasoning: None,
+        })
+        .into()
+    }
+
+    fn fork_marker(source: &str, at: usize, seq: i64) -> SessionEntry {
+        SessionEntry::ForkedFrom {
+            source: source.to_owned(),
+            at: Some(at),
+            event_time: None,
+            seq: Some(seq),
+        }
+    }
+
+    /// The main role template resolves through the process-global
+    /// `XDG_CONFIG_HOME`/`HOME` layers, and another test parks a regular file
+    /// at `$XDG_CONFIG_HOME/e-agent` to prove a rejected reload. A reopen
+    /// that builds more than once must hold the same env lock the mutators
+    /// use, or that transient state fails an unrelated build.
+    fn lock_global_config_env() -> std::sync::MutexGuard<'static, ()> {
+        crate::roles::XDG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Provenance must cover every fork layout that exists on disk, not just
+    /// the zero-copy leading marker: zero-copy children store the marker
+    /// first (optionally after the frozen goal), while the older copy-based
+    /// layout stores the copied prefix BEFORE the marker. Reopening each by
+    /// id (no `fork_from` in the build request) must still keep `link_ref`
+    /// off; a session the human started from scratch keeps it.
+    #[tokio::test]
+    async fn every_persisted_fork_layout_reopens_without_link_ref() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let source = [user("q0"), assistant("a0"), user("q1"), assistant("a1")];
+        Session::append(&root, "layout-src", &source).unwrap();
+        // Zero-copy: marker alone, and marker after the child's frozen goal.
+        Session::append(
+            &root,
+            "layout-zero",
+            std::slice::from_ref(&fork_marker("layout-src", 4, 3)),
+        )
+        .unwrap();
+        Session::append(
+            &root,
+            "layout-goal",
+            &[
+                SessionEntry::GoalUpdated { goal: None },
+                fork_marker("layout-src", 4, 3),
+            ],
+        )
+        .unwrap();
+        // Older copy-based layout: two and four stored prefix entries before
+        // the marker (the four-entry one is the layout this repo actually
+        // still carries), plus the four-ordinary-turn case the reviewer
+        // constructed — the marker sits NINTH, behind the whole selected
+        // prefix, so a fixed head can never be the rule.
+        Session::append(
+            &root,
+            "layout-copy2",
+            &[
+                source[0].clone(),
+                source[1].clone(),
+                fork_marker("layout-src", 2, 1),
+            ],
+        )
+        .unwrap();
+        Session::append(
+            &root,
+            "layout-copy4",
+            &[
+                source[0].clone(),
+                source[1].clone(),
+                source[2].clone(),
+                source[3].clone(),
+                fork_marker("layout-src", 4, 3),
+            ],
+        )
+        .unwrap();
+        let source4 = [
+            user("q0"),
+            assistant("a0"),
+            user("q1"),
+            assistant("a1"),
+            user("q2"),
+            assistant("a2"),
+            user("q3"),
+            assistant("a3"),
+        ];
+        Session::append(&root, "layout-src4", &source4).unwrap();
+        let mut copy8 = source4.to_vec();
+        copy8.push(fork_marker("layout-src4", source4.len(), 7));
+        Session::append(&root, "layout-copy8", &copy8).unwrap();
+
+        let factory = SessionFactory::test_factory(root.clone());
+        for id in [
+            "layout-zero",
+            "layout-goal",
+            "layout-copy2",
+            "layout-copy4",
+            "layout-copy8",
+        ] {
+            let reopened = factory
+                .build(
+                    id,
+                    None,
+                    None,
+                    IdlePolicy::FinishWhenIdle,
+                    UnfinishedPolicy::Preserve,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{id} reopens: {error:#}"));
+            let names = reopened.runner.tool_names_for_test();
+            assert!(
+                !names.iter().any(|name| name == "link_ref"),
+                "{id} must stay recognizable as a fork: {names:?}"
+            );
+        }
+
+        Session::append(&root, "layout-plain", &[user("q0"), assistant("a0")]).unwrap();
+        let plain = factory
+            .build(
+                "layout-plain",
+                None,
+                None,
+                IdlePolicy::FinishWhenIdle,
+                UnfinishedPolicy::Preserve,
+            )
+            .await
+            .expect("normal session builds");
+        let names = plain.runner.tool_names_for_test();
+        assert!(
+            names.iter().any(|name| name == "link_ref"),
+            "a user-created top-level session still gets link_ref: {names:?}"
+        );
+
+        // A LONG ordinary session is not a fork either: provenance must not
+        // mistake depth for a marker. Its build still registers link_ref.
+        let long: Vec<SessionEntry> = (0..500)
+            .flat_map(|i| [user(&format!("q{i}")), assistant(&format!("a{i}"))])
+            .collect();
+        Session::append(&root, "layout-long", &long).unwrap();
+        let long = factory
+            .build(
+                "layout-long",
+                None,
+                None,
+                IdlePolicy::FinishWhenIdle,
+                UnfinishedPolicy::Preserve,
+            )
+            .await
+            .expect("a long ordinary session builds");
+        let names = long.runner.tool_names_for_test();
+        assert!(
+            names.iter().any(|name| name == "link_ref"),
+            "a long ordinary session still gets link_ref: {names:?}"
+        );
+    }
+
+    /// A resumed CHILD session (delegate/btw) records its parent in the
+    /// metadata row. Provenance takes that answer without reading the
+    /// transcript, so a child keeps building without `link_ref` even though
+    /// its own log carries no `ForkedFrom` marker.
+    #[tokio::test]
+    async fn a_resumed_child_session_takes_its_metadata_parent_as_provenance() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        Session::append(&root, "child-session", &[user("q0"), assistant("a0")]).unwrap();
+        SessionStore::Jsonl
+            .create_meta(
+                &root,
+                "child-session",
+                Some("m"),
+                Some("subagent"),
+                Some("parent-session"),
+                Some(7),
+                None,
+            )
+            .await
+            .unwrap();
+        let factory = SessionFactory::test_factory(root.clone());
+        let reopened = factory
+            .build(
+                "child-session",
+                None,
+                None,
+                IdlePolicy::FinishWhenIdle,
+                UnfinishedPolicy::Preserve,
+            )
+            .await
+            .expect("the child session builds");
+        let names = reopened.runner.tool_names_for_test();
+        assert!(
+            !names.iter().any(|name| name == "link_ref"),
+            "a persisted parent link is provenance: {names:?}"
+        );
+    }
+
+    /// Delete the closing brace of the sidecar's LAST line: a crash artifact
+    /// that still reads, but no longer decodes.
+    fn tear_last_sidecar_line(root: &Path, session: &str) {
+        let path = root
+            .join(".e-agent/sessions")
+            .join(format!("{session}.meta.jsonl"));
+        let sidecar = std::fs::read_to_string(&path).unwrap();
+        let torn = sidecar
+            .strip_suffix("}\n")
+            .unwrap_or_else(|| panic!("{session} sidecar has no complete last line: {sidecar:?}"));
+        std::fs::write(&path, format!("{torn}\n")).unwrap();
+    }
+
+    /// A TORN metadata tail must not stop a session from opening — the last
+    /// good snapshot is enough for display — but it is not evidence of "no
+    /// parent". Provenance is unknown, so a child whose parent-bearing
+    /// snapshot was truncated must not regain `link_ref`, and an older
+    /// parentless line followed by a torn parent update is just as unknown.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_torn_sidecar_tail_never_proves_parentlessness() {
+        let _env = lock_global_config_env();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let history = [user("q0"), assistant("a0")];
+
+        Session::append(&root, "torn-child", &history).unwrap();
+        SessionStore::Jsonl
+            .create_meta(
+                &root,
+                "torn-child",
+                Some("m"),
+                Some("subagent"),
+                Some("parent-session"),
+                Some(7),
+                None,
+            )
+            .await
+            .unwrap();
+        tear_last_sidecar_line(&root, "torn-child");
+
+        Session::append(&root, "torn-update-child", &history).unwrap();
+        SessionStore::Jsonl
+            .create_meta(
+                &root,
+                "torn-update-child",
+                Some("m"),
+                Some("subagent"),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        SessionStore::Jsonl
+            .create_meta(
+                &root,
+                "torn-update-child",
+                Some("m"),
+                Some("subagent"),
+                Some("parent-session"),
+                Some(7),
+                None,
+            )
+            .await
+            .unwrap();
+        tear_last_sidecar_line(&root, "torn-update-child");
+
+        let factory = SessionFactory::test_factory(root.clone());
+        for id in ["torn-child", "torn-update-child"] {
+            let path = root
+                .join(".e-agent/sessions")
+                .join(format!("{id}.meta.jsonl"));
+            let torn_bytes = std::fs::read(&path).unwrap();
+            for build in 1..=2 {
+                let reopened = factory
+                    .build(
+                        id,
+                        None,
+                        None,
+                        IdlePolicy::FinishWhenIdle,
+                        UnfinishedPolicy::Preserve,
+                    )
+                    .await
+                    .unwrap_or_else(|error| panic!("{id} build {build} still opens: {error:#}"));
+                assert_eq!(
+                    Session::load(&root, id).unwrap().entries,
+                    history,
+                    "{id} build {build} reopens with its history intact"
+                );
+                let names = reopened.runner.tool_names_for_test();
+                assert!(
+                    !names.iter().any(|name| name == "link_ref"),
+                    "{id} build {build} has unknown provenance, so link_ref must stay off: {names:?}"
+                );
+                drop(reopened);
+                assert_eq!(
+                    std::fs::read(&path).unwrap(),
+                    torn_bytes,
+                    "{id} build {build} never rewrites the torn sidecar"
+                );
+            }
+        }
+    }
+
+    /// A torn tail is not special-cased into "fork": an ordinary session
+    /// (no parent anywhere) still opens on its last good snapshot and keeps
+    /// `link_ref` off, because surviving the crash does not prove it is
+    /// parentless.
+    #[tokio::test]
+    async fn a_torn_sidecar_tail_on_an_ordinary_session_still_opens() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let history = [user("q0"), assistant("a0")];
+        Session::append(&root, "torn-ordinary", &history).unwrap();
+        SessionStore::Jsonl
+            .create_meta(
+                &root,
+                "torn-ordinary",
+                Some("m"),
+                Some("main"),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        tear_last_sidecar_line(&root, "torn-ordinary");
+
+        let factory = SessionFactory::test_factory(root.clone());
+        let reopened = factory
+            .build(
+                "torn-ordinary",
+                None,
+                None,
+                IdlePolicy::FinishWhenIdle,
+                UnfinishedPolicy::Preserve,
+            )
+            .await
+            .expect("an ordinary session still opens after a torn sidecar tail");
+        assert_eq!(
+            Session::load(&root, "torn-ordinary").unwrap().entries,
+            history,
+            "the torn sidecar never rewrites the transcript"
+        );
+        let names = reopened.runner.tool_names_for_test();
+        assert!(
+            !names.iter().any(|name| name == "link_ref"),
+            "unknown provenance fails closed: {names:?}"
+        );
+    }
+
+    /// The writer creates the sidecar file BEFORE appending its first
+    /// snapshot, so an interruption between those two operations leaves a
+    /// zero-byte sidecar. That is an interrupted first write, not evidence
+    /// of "no parent": the session must still open with its history, and a
+    /// markerless child must stay without `link_ref`. Every reopen must also
+    /// leave the sidecar untouched — a first record written over the crash
+    /// would turn unknown provenance into a parentless one on the next read.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_zero_byte_sidecar_is_unknown_not_parentless() {
+        let _env = lock_global_config_env();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let history = [user("q0"), assistant("a0")];
+        Session::append(&root, "empty-sidecar-child", &history).unwrap();
+        SessionStore::Jsonl
+            .create_meta(
+                &root,
+                "empty-sidecar-child",
+                Some("m"),
+                Some("subagent"),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        // The crash: the file exists (created before the append) but its
+        // first snapshot never landed.
+        let path = root.join(".e-agent/sessions/empty-sidecar-child.meta.jsonl");
+        std::fs::write(&path, "").unwrap();
+
+        let factory = SessionFactory::test_factory(root.clone());
+        for build in 1..=3 {
+            let reopened = factory
+                .build(
+                    "empty-sidecar-child",
+                    None,
+                    None,
+                    IdlePolicy::FinishWhenIdle,
+                    UnfinishedPolicy::Preserve,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("build {build} must open: {error:#}"));
+            assert_eq!(
+                Session::load(&root, "empty-sidecar-child").unwrap().entries,
+                history,
+                "build {build}: the transcript still loads"
+            );
+            let names = reopened.runner.tool_names_for_test();
+            assert!(
+                !names.iter().any(|name| name == "link_ref"),
+                "build {build}: an existing but empty sidecar is unknown provenance: {names:?}"
+            );
+            drop(reopened);
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                b"",
+                "build {build}: the unknown sidecar is never rewritten into a parentless record"
+            );
+        }
+    }
+
+    /// Truncate the sidecar inside a multi-byte character of the title. A
+    /// `lines()` reader would fail the whole reopen with `InvalidData`; the
+    /// crash only damaged the metadata tail, so the session must still open
+    /// with its history, and the undecodable record is unknown provenance
+    /// (no `link_ref` for a markerless child).
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_sidecar_torn_inside_a_multibyte_character_still_opens() {
+        let _env = lock_global_config_env();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let history = [user("q0"), assistant("a0")];
+        Session::append(&root, "torn-multibyte-child", &history).unwrap();
+        SessionStore::Jsonl
+            .create_meta(
+                &root,
+                "torn-multibyte-child",
+                Some("m"),
+                Some("subagent"),
+                None,
+                None,
+                Some("crash 🧵 tail"),
+            )
+            .await
+            .unwrap();
+
+        let path = root.join(".e-agent/sessions/torn-multibyte-child.meta.jsonl");
+        let bytes = std::fs::read(&path).unwrap();
+        let scissor = "🧵".as_bytes();
+        let at = bytes
+            .windows(scissor.len())
+            .position(|window| window == scissor)
+            .expect("the snapshot title carries the multi-byte character");
+        // Keep ONE byte of the four-byte character: the file ends mid-char,
+        // so it is not valid UTF-8 and no JSON value decodes.
+        let torn = &bytes[..at + 1];
+        assert!(
+            std::str::from_utf8(torn).is_err(),
+            "the test must actually tear a multi-byte character"
+        );
+        std::fs::write(&path, torn).unwrap();
+        let torn_bytes = std::fs::read(&path).unwrap();
+
+        let factory = SessionFactory::test_factory(root.clone());
+        for build in 1..=2 {
+            let reopened = factory
+                .build(
+                    "torn-multibyte-child",
+                    None,
+                    None,
+                    IdlePolicy::FinishWhenIdle,
+                    UnfinishedPolicy::Preserve,
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("build {build} of a mid-character tear must open: {error:#}")
+                });
+            assert_eq!(
+                Session::load(&root, "torn-multibyte-child")
+                    .unwrap()
+                    .entries,
+                history,
+                "build {build}: the intact transcript opens despite the torn metadata"
+            );
+            let names = reopened.runner.tool_names_for_test();
+            assert!(
+                !names.iter().any(|name| name == "link_ref"),
+                "build {build}: an undecodable record is unknown provenance: {names:?}"
+            );
+            drop(reopened);
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                torn_bytes,
+                "build {build}: the torn sidecar is never rewritten"
+            );
+        }
+    }
+
+    /// The positive case: a sidecar whose lines ALL decode to "no parent" is
+    /// evidence, so an ordinary session keeps `link_ref`. A transcript
+    /// marker still overrides that answer.
+    #[tokio::test]
+    async fn a_fully_decodable_parentless_session_keeps_link_ref() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        Session::append(&root, "decoded-plain", &[user("q0"), assistant("a0")]).unwrap();
+        SessionStore::Jsonl
+            .create_meta(
+                &root,
+                "decoded-plain",
+                Some("m"),
+                Some("main"),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        // The copy-based fork layout: the marker sits behind stored prefix
+        // entries, and a parentless sidecar row is all the metadata says.
+        Session::append(
+            &root,
+            "decoded-marker",
+            &[
+                user("q0"),
+                assistant("a0"),
+                fork_marker("decoded-source", 2, 1),
+            ],
+        )
+        .unwrap();
+        SessionStore::Jsonl
+            .create_meta(
+                &root,
+                "decoded-marker",
+                Some("m"),
+                Some("main"),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let factory = SessionFactory::test_factory(root.clone());
+        let plain = factory
+            .build(
+                "decoded-plain",
+                None,
+                None,
+                IdlePolicy::FinishWhenIdle,
+                UnfinishedPolicy::Preserve,
+            )
+            .await
+            .expect("the decoded parentless session builds");
+        let names = plain.runner.tool_names_for_test();
+        assert!(
+            names.iter().any(|name| name == "link_ref"),
+            "a fully decoded parentless session keeps link_ref: {names:?}"
+        );
+
+        let fork = factory
+            .build(
+                "decoded-marker",
+                None,
+                None,
+                IdlePolicy::FinishWhenIdle,
+                UnfinishedPolicy::Preserve,
+            )
+            .await
+            .expect("the marker-bearing session builds");
+        let names = fork.runner.tool_names_for_test();
+        assert!(
+            !names.iter().any(|name| name == "link_ref"),
+            "a transcript marker still counts as a fork: {names:?}"
+        );
+    }
+
+    /// `link_ref` writes to THIS session's metadata row, so only a session the
+    /// human started from scratch gets it. A web fork goes through the same
+    /// factory path as a CLI fork (`build_fork` → `build_internal`) and IS a
+    /// new top-level main session, but it continues the SOURCE's transcript:
+    /// its links belong to the source, so it must not be able to relink them.
+    #[tokio::test]
+    async fn forked_sessions_are_built_without_link_ref() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        Session::append(&root, "refs-src", &[user("q0"), assistant("a0")]).unwrap();
+        let factory = SessionFactory::test_factory(root.clone());
+
+        let forked = factory
+            .build_fork(
+                "refs-fork",
+                "refs-src".to_owned(),
+                None,
+                IdlePolicy::FinishWhenIdle,
+                UnfinishedPolicy::Preserve,
+            )
+            .await
+            .expect("the web fork builds");
+        let names = forked.runner.tool_names_for_test();
+        assert!(
+            !names.iter().any(|name| name == "link_ref"),
+            "a fork must not relink the source it continues: {names:?}"
+        );
+        drop(forked);
+
+        // Reopen the SAME fork by id, the way a web resume/attach does: no
+        // `fork_from` is available any more, so only the persisted
+        // `ForkedFrom` marker can keep `link_ref` off.
+        let reopened = factory
+            .build(
+                "refs-fork",
+                None,
+                None,
+                IdlePolicy::FinishWhenIdle,
+                UnfinishedPolicy::Preserve,
+            )
+            .await
+            .expect("the persisted fork resumes");
+        let names = reopened.runner.tool_names_for_test();
+        assert!(
+            !names.iter().any(|name| name == "link_ref"),
+            "a resumed fork must not regain link_ref: {names:?}"
+        );
+        drop(reopened);
+
+        let fresh = factory
+            .build(
+                "refs-main",
+                None,
+                None,
+                IdlePolicy::FinishWhenIdle,
+                UnfinishedPolicy::Preserve,
+            )
+            .await
+            .expect("the plain top-level session builds");
+        let names = fresh.runner.tool_names_for_test();
+        assert!(
+            names.iter().any(|name| name == "link_ref"),
+            "a user-created top-level session keeps link_ref: {names:?}"
+        );
+    }
+
+    /// A reopen must answer fork provenance from the SAME JSONL decode that
+    /// builds the history head. The ninth-entry fix first added a separate
+    /// full scan here, so a long transcript was decoded twice on every
+    /// reopen. The probe counts both entry points for sessions named
+    /// `once-…` (this test only): the head decode runs once and the separate
+    /// marker scan never runs, while the fork/ordinary answer stays right.
+    #[tokio::test]
+    async fn a_reopen_decodes_a_large_transcript_once_for_provenance() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let turns: Vec<SessionEntry> = (0..500)
+            .flat_map(|i| [user(&format!("q{i}")), assistant(&format!("a{i}"))])
+            .collect();
+        Session::append(&root, "once-ordinary", &turns).unwrap();
+        // The legacy copy layout: the marker sits behind the whole copied
+        // prefix, so only a whole-log answer can recognize it.
+        let prefix = turns[..8].to_vec();
+        Session::append(&root, "once-source", &prefix).unwrap();
+        let mut copy = prefix.clone();
+        copy.push(fork_marker("once-source", prefix.len(), 7));
+        Session::append(&root, "once-fork", &copy).unwrap();
+
+        let factory = SessionFactory::test_factory(root.clone());
+        for (id, expected_link_ref) in [("once-ordinary", true), ("once-fork", false)] {
+            crate::session::reopen_decode_probe::reset();
+            let built = factory
+                .build(
+                    id,
+                    None,
+                    None,
+                    IdlePolicy::FinishWhenIdle,
+                    UnfinishedPolicy::Preserve,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{id} reopens: {error:#}"));
+            let (loads, scans) = crate::session::reopen_decode_probe::counts();
+            assert_eq!(
+                loads, 1,
+                "{id} must decode the transcript once for history + provenance"
+            );
+            assert_eq!(
+                scans, 0,
+                "{id} must not run a second provenance scan over the transcript"
+            );
+            let names = built.runner.tool_names_for_test();
+            assert_eq!(
+                names.iter().any(|name| name == "link_ref"),
+                expected_link_ref,
+                "{id}: {names:?}"
+            );
+            drop(built);
+        }
+    }
+
+    /// An unreadable parent sidecar must never be read as "no parent": that
+    /// fall-through is what re-enabled `link_ref` on a child. The reopen
+    /// surfaces the sidecar error instead (so no session/tool is built).
+    #[tokio::test]
+    async fn an_unreadable_sidecar_fails_the_reopen_instead_of_enabling_link_ref() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        Session::append(&root, "unreadable-child", &[user("q0"), assistant("a0")]).unwrap();
+        // A directory at the sidecar path is openable but not readable on
+        // Unix, and refused at open on Windows: both are non-NotFound.
+        std::fs::create_dir(root.join(".e-agent/sessions/unreadable-child.meta.jsonl")).unwrap();
+
+        let factory = SessionFactory::test_factory(root.clone());
+        let error = match factory
+            .build(
+                "unreadable-child",
+                None,
+                None,
+                IdlePolicy::FinishWhenIdle,
+                UnfinishedPolicy::Preserve,
+            )
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("an unreadable sidecar is not an ordinary session"),
+        };
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("unreadable-child.meta.jsonl"),
+            "the sidecar read error is surfaced by name: {text}"
         );
     }
 }

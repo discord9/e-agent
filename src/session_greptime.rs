@@ -7,7 +7,7 @@
 
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use tokio_postgres::NoTls;
 
 use crate::agent::SessionEntry;
@@ -114,6 +114,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     archived BOOLEAN NULL,
     writer STRING NULL,
     acp_session_id STRING NULL,
+    refs STRING NULL,
     entry_count BIGINT NOT NULL DEFAULT 0,
     parent_session_id STRING NULL,
     parent_task_id BIGINT NULL,
@@ -167,6 +168,15 @@ fn advance_cursor(cursor: &AtomicI64, next: i64) {
     cursor.fetch_max(next, Ordering::AcqRel);
 }
 
+/// The fork-provenance query: ONE physical matching row, and no `payload`
+/// column. It answers "is this session a fork?" without a logical head bound,
+/// so a legacy copy writer's marker (appended after the whole copied prefix)
+/// is found at any depth, and a normal long session never materializes a
+/// transcript page (or every physical retry version of one) to answer it.
+const FORK_MARKER_SQL: &str = "SELECT 1 FROM session_entries \
+     WHERE workspace_id = $1 AND session_id = $2 AND entry_kind = 'forked_from' \
+     LIMIT 1";
+
 pub struct GreptimeSession {
     client: tokio_postgres::Client,
     /// Next sequence number for appends within this session.
@@ -185,9 +195,71 @@ pub struct GreptimeSession {
     /// row yet).
     /// Interior mutability because every touch path takes `&self`.
     cached_meta: std::sync::Mutex<Option<SessionMeta>>,
+    /// Whether the `sessions.refs` column exists. `false` = the migration
+    /// ALTER failed on this old database (or a read-only connection probed
+    /// it as missing): every read omits the column (links read as empty) and
+    /// every snapshot write omits it, so a failed migration takes away links
+    /// and NOTHING else — listing, creating and resuming sessions keep
+    /// working, and only an explicit ref edit fails loudly.
+    ///
+    /// Mutable because another handle may repair the schema while this one
+    /// stays open: each metadata operation re-probes the column once (with
+    /// the session's mutation lock held) and uses that single decision for
+    /// its read and its write, so the repaired database's links are carried
+    /// forward instead of being erased by a snapshot that omits them.
+    refs_available: AtomicBool,
+}
+
+/// The `refs` tail of every meta SELECT: the column when the migration
+/// succeeded, nothing at all when it did not. Either way the row decodes (a
+/// degraded old database reads links as empty instead of failing the whole
+/// session) — and the projection is what makes a FAILED migration take away
+/// links and nothing else. Free functions so the degraded shape is
+/// unit-testable without a database.
+fn refs_select(refs_available: bool) -> &'static str {
+    if refs_available { ", refs" } else { "" }
+}
+
+/// The same `refs` tail inside the `list_meta` dedup subquery (it is an
+/// aggregate expression there, not a bare column).
+fn refs_group(refs_available: bool) -> &'static str {
+    if refs_available {
+        ",
+                     last_value(ARRAY[refs] ORDER BY last_active_at)[1] AS refs"
+    } else {
+        ""
+    }
+}
+
+/// Serialize same-session metadata snapshot mutations inside this process.
+/// Greptime has no transactions/UPDATE: every mutator reads the newest
+/// snapshot, mutates it, and inserts a new row, so two concurrent writers
+/// (two ref edits, or an edit racing a turn-boundary touch) would otherwise
+/// both start from the same row and the later insert would silently drop
+/// the earlier change. The key is the backend instance + workspace +
+/// session, so unrelated sessions never contend; cross-process writers stay
+/// last-write-wins (the documented optimistic audit-table semantics).
+fn meta_write_lock(
+    backend_fp: &str,
+    workspace_id: &str,
+    session_id: &str,
+) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    type Locks = std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>;
+    static LOCKS: std::sync::OnceLock<std::sync::Mutex<Locks>> = std::sync::OnceLock::new();
+    let key = format!("{backend_fp}\u{0}{workspace_id}\u{0}{session_id}");
+    let mut locks = LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks.entry(key).or_default().clone()
 }
 
 impl GreptimeSession {
+    /// The per-session snapshot-mutation lock (see [`meta_write_lock`]).
+    fn session_meta_lock(&self, session_id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        meta_write_lock(&self.backend_fp, &self.workspace_id, session_id)
+    }
+
     async fn connect_client(conn: &str) -> Result<tokio_postgres::Client> {
         let (client, connection) = tokio_postgres::connect(conn, NoTls)
             .await
@@ -209,6 +281,20 @@ impl GreptimeSession {
         session_id: &str,
     ) -> Result<Self> {
         let client = Self::connect_client(conn).await?;
+        // Read the schema, never migrate it: a read-only listing must know
+        // whether `sessions.refs` exists so an old database still lists (the
+        // SELECT omits the missing column instead of failing the whole list).
+        // A failed probe is not fatal — the list degrades to no links.
+        let refs_available = match Self::probe_refs_column(&client).await {
+            Ok(available) => available,
+            Err(error) => {
+                tracing::warn!(
+                    "e-agent: cannot inspect the sessions.refs column (session links may be \
+                     unavailable on this read-only listing): {error:#}"
+                );
+                false
+            }
+        };
         let backend_fp = crate::session_store::backend_instance_fingerprint("greptime", conn);
         Ok(Self {
             client,
@@ -217,7 +303,26 @@ impl GreptimeSession {
             session_id: session_id.to_owned(),
             backend_fp,
             cached_meta: std::sync::Mutex::new(None),
+            refs_available: AtomicBool::new(refs_available),
         })
+    }
+
+    /// Whether the ACTIVE schema's `sessions.refs` exists, asked of
+    /// `information_schema` with no DDL: the read-only listing path's
+    /// substitute for the migration probe. Scoped by `table_schema`: another
+    /// visible schema's `sessions.refs` must not satisfy the probe, because
+    /// the local `SELECT refs` would then name a column this schema lacks.
+    async fn probe_refs_column(client: &tokio_postgres::Client) -> Result<bool> {
+        let row = client
+            .query_one(
+                "SELECT COUNT(*) AS n FROM information_schema.columns \
+                 WHERE table_schema = current_schema() \
+                   AND table_name = 'sessions' AND column_name = 'refs'",
+                &[],
+            )
+            .await
+            .context("cannot inspect sessions table schema")?;
+        Ok(row.get::<_, i64>("n") > 0)
     }
 
     /// Connect and ensure the table exists. `conn` is a tokio-postgres
@@ -244,7 +349,7 @@ impl GreptimeSession {
             .context("cannot create usage_entries table")?;
 
         // Idempotent schema migration for the `title`, `pinned`,
-        // `archived` and `writer` columns — a table-structure evolution:
+        // `archived`, `writer` and `refs` columns — a table-structure evolution:
         // `sessions` shipped without them, so pre-existing databases need
         // an ALTER (fresh databases already have them via
         // CREATE_TABLE_SESSIONS above). There are no historical rows to
@@ -260,10 +365,14 @@ impl GreptimeSession {
         let mut archived_available = true;
         let mut writer_available = true;
         let mut acp_available = true;
+        let mut refs_available = true;
         let columns: Vec<String> = client
             .query(
+                // Scoped to the ACTIVE schema: another visible schema's
+                // `sessions.refs` must not skip the local ALTER (the local
+                // SELECT would then name a nonexistent column).
                 "SELECT column_name FROM information_schema.columns \
-                 WHERE table_name = 'sessions'",
+                 WHERE table_schema = current_schema() AND table_name = 'sessions'",
                 &[],
             )
             .await
@@ -344,6 +453,21 @@ impl GreptimeSession {
                     writer_available = false;
                     tracing::warn!(
                         "e-agent: cannot add sessions.writer column (writer audit unavailable): \
+                         {error:#}"
+                    );
+                }
+            }
+        }
+        if !columns.iter().any(|c| c == "refs") {
+            match client
+                .execute("ALTER TABLE sessions ADD COLUMN refs STRING NULL", &[])
+                .await
+            {
+                Ok(_) => {}
+                Err(error) => {
+                    refs_available = false;
+                    tracing::warn!(
+                        "e-agent: cannot add sessions.refs column (session links unavailable): \
                          {error:#}"
                     );
                 }
@@ -457,40 +581,37 @@ impl GreptimeSession {
         // Cache the session's latest metadata snapshot (if any) so later
         // touches rewrite complete rows without re-reading immutable
         // columns. The table is append-only; the newest row per session
-        // wins (ORDER BY last_active_at DESC LIMIT 1).
+        // wins (ORDER BY last_active_at DESC LIMIT 1). Skipped only when a
+        // column OTHER than `refs` is unavailable: those cannot be projected
+        // away, while a missing `refs` is simply omitted — an old database
+        // whose refs ALTER failed still creates, lists and touches sessions.
+        // A missing `acp_session_id` DOES skip it: this cache query names
+        // that column (Greptime's ACP writes are never omitted, so a
+        // database without it has no ACP id to cache either).
         let cached_meta = if title_available
             && pinned_available
             && archived_available
             && writer_available
             && acp_available
         {
+            let refs = if refs_available { ", refs" } else { "" };
             let meta_row = client
-                    .query_opt(
+                .query_opt(
+                    &format!(
                         "SELECT created_at, last_active_at, model, \"role\", entry_count, \
-                            parent_session_id, parent_task_id, title, pinned, archived, writer, acp_session_id \
-                     FROM sessions \
-                     WHERE workspace_id = $1 AND session_id = $2 \
-                     ORDER BY last_active_at DESC LIMIT 1",
-                        &[&workspace_id, &session_id],
-                    )
-                    .await
-                    .context("cannot query session metadata")?;
-            meta_row.map(|row| SessionMeta {
-                session_id: session_id.to_string(),
-                created_at: row.get("created_at"),
-                last_active_at: row.get("last_active_at"),
-                model: row.get("model"),
-                role: row.get("role"),
-                entry_count: row.get("entry_count"),
-                parent_session_id: row.get("parent_session_id"),
-                parent_task_id: row.get("parent_task_id"),
-                title: row.get("title"),
-                pinned: row.get("pinned"),
-                archived: row.get("archived"),
-                acp_session_id: row.get("acp_session_id"),
-                writer: row.get("writer"),
-                label: None, // label lives in running_tasks, resolved at list time
-            })
+                            parent_session_id, parent_task_id, title, pinned, archived, writer, \
+                            acp_session_id{refs} \
+                         FROM sessions \
+                         WHERE workspace_id = $1 AND session_id = $2 \
+                         ORDER BY last_active_at DESC LIMIT 1"
+                    ),
+                    &[&workspace_id, &session_id],
+                )
+                .await
+                .context("cannot query session metadata")?;
+            meta_row
+                .map(|row| Self::meta_from_row(&row, session_id, refs_available))
+                .transpose()?
         } else {
             None
         };
@@ -503,6 +624,7 @@ impl GreptimeSession {
             session_id: session_id.to_string(),
             backend_fp,
             cached_meta: std::sync::Mutex::new(cached_meta),
+            refs_available: AtomicBool::new(refs_available),
         };
 
         // Seed next_seq from the DB's current max seq (see db_max_seq).
@@ -1356,6 +1478,22 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
         Ok(entries.into_iter().map(|(_, entry)| entry).collect())
     }
 
+    /// Does the stored transcript carry a `ForkedFrom` marker ANYWHERE?
+    ///
+    /// ONE matching row and NO payload ([`FORK_MARKER_SQL`]). Greptime keeps
+    /// every physical version of a seq, so a logical-key head (the first `n`
+    /// entries) is not an I/O bound; a constant would also silently miss a
+    /// legacy copy fork whose marker sits behind the whole copied prefix.
+    /// `LIMIT 1` bounds the query by the answer itself.
+    pub async fn has_fork_marker(&self) -> Result<bool> {
+        let row = self
+            .client
+            .query_opt(FORK_MARKER_SQL, &[&self.workspace_id, &self.session_id])
+            .await
+            .context("cannot query the fork marker")?;
+        Ok(row.is_some())
+    }
+
     /// Load the selected bounded segment without physical locations.
     pub async fn load_older(
         &self,
@@ -2204,23 +2342,20 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
     // deduplicates per session taking the latest last_active_at. There is
     // no partial-row rewrite, so a touch can never wipe immutable columns.
 
-    /// Latest metadata snapshot for one session, or `None` when the
-    /// session has no row yet (brand-new session, or a subagent whose
-    /// parent has not written its row yet).
-    async fn load_meta_row(&self, session_id: &str) -> Result<Option<SessionMeta>> {
-        let row = self
-            .client
-            .query_opt(
-                "SELECT created_at, last_active_at, model, \"role\", entry_count, \
-                        parent_session_id, parent_task_id, title, pinned, archived, writer, acp_session_id \
-                 FROM sessions \
-                 WHERE workspace_id = $1 AND session_id = $2 \
-                 ORDER BY last_active_at DESC LIMIT 1",
-                &[&self.workspace_id, &session_id],
-            )
-            .await
-            .context("cannot query session metadata")?;
-        Ok(row.map(|row| SessionMeta {
+    /// Decode one metadata row using the column list every meta SELECT
+    /// shares. `refs` is one JSON column: NULL reads as empty, malformed
+    /// JSON fails loudly instead of silently dropping links. When the column
+    /// is unavailable (`refs_available = false`) the SELECT omits it
+    /// entirely, so the row has no `refs` field and links read as empty.
+    /// `acp_session_id` is decoded from the row when the SELECT projected it;
+    /// the list aggregate does not, and a database whose ACP migration failed
+    /// has no such column — both read back as `None`.
+    fn meta_from_row(
+        row: &tokio_postgres::Row,
+        session_id: &str,
+        refs_available: bool,
+    ) -> Result<SessionMeta> {
+        Ok(SessionMeta {
             session_id: session_id.to_owned(),
             created_at: row.get("created_at"),
             last_active_at: row.get("last_active_at"),
@@ -2232,45 +2367,200 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             title: row.get("title"),
             pinned: row.get("pinned"),
             archived: row.get("archived"),
-            acp_session_id: row.get("acp_session_id"),
+            // The per-session SELECTs project the ACP id, the list aggregate
+            // does not, and a database whose ACP migration failed has no
+            // column at all: decode it only when the row carries it (the list
+            // view therefore reports `None`, exactly as before).
+            acp_session_id: if row
+                .columns()
+                .iter()
+                .any(|column| column.name() == "acp_session_id")
+            {
+                row.get("acp_session_id")
+            } else {
+                None
+            },
+            refs: if refs_available {
+                crate::session_store::refs_from_json(
+                    row.get::<_, Option<String>>("refs").as_deref(),
+                )
+                .map_err(anyhow::Error::msg)?
+            } else {
+                Vec::new() // the column is missing: links unavailable, nothing to read
+            },
             writer: row.get("writer"),
             label: None, // label lives in running_tasks, resolved at list time
-        }))
+        })
     }
 
-    async fn insert_meta(&self, meta: &mut SessionMeta) -> Result<()> {
+    /// The parent link of this session's newest metadata snapshot, or `None`
+    /// when the row records none (including "no row yet"). ONE row, ONE
+    /// column: reopening a child session must not read its transcript to know
+    /// it is one. The connect-time cache answers without a query when the
+    /// table was readable then.
+    pub async fn parent_session_id(&self) -> Result<Option<String>> {
+        if let Some(parent) = self
+            .cached_meta
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|meta| meta.parent_session_id.clone())
+        {
+            return Ok(Some(parent));
+        }
+        let row = self
+            .client
+            .query_opt(
+                "SELECT parent_session_id FROM sessions \
+                 WHERE workspace_id = $1 AND session_id = $2 \
+                 ORDER BY last_active_at DESC LIMIT 1",
+                &[&self.workspace_id, &self.session_id],
+            )
+            .await
+            .context("cannot query the session parent")?;
+        Ok(row.and_then(|row| row.get::<_, Option<String>>("parent_session_id")))
+    }
+
+    /// Latest metadata snapshot for one session, or `None` when the
+    /// session has no row yet (brand-new session, or a subagent whose
+    /// parent has not written its row yet). This is the ACP read path's entry
+    /// point; the metadata writers call [`Self::load_meta_row_with`] with their
+    /// own availability decision.
+    async fn load_meta_row(&self, session_id: &str) -> Result<Option<SessionMeta>> {
+        let refs_available = self.refs_available.load(Ordering::Relaxed);
+        self.load_meta_row_with(session_id, refs_available).await
+    }
+
+    /// [`Self::load_meta_row`] with the caller's ONE availability decision
+    /// for this operation: the same bool selects the projected column and
+    /// the decode, so a concurrent repair can never make the SELECT omit a
+    /// column the decoder then names (or vice versa).
+    async fn load_meta_row_with(
+        &self,
+        session_id: &str,
+        refs_available: bool,
+    ) -> Result<Option<SessionMeta>> {
+        let refs = refs_select(refs_available);
+        let row = self
+            .client
+            .query_opt(
+                &format!(
+                    "SELECT created_at, last_active_at, model, \"role\", entry_count, \
+                            parent_session_id, parent_task_id, title, pinned, archived, writer, \
+                            acp_session_id{refs} \
+                     FROM sessions \
+                     WHERE workspace_id = $1 AND session_id = $2 \
+                     ORDER BY last_active_at DESC LIMIT 1"
+                ),
+                &[&self.workspace_id, &session_id],
+            )
+            .await
+            .context("cannot query session metadata")?;
+        row.map(|row| Self::meta_from_row(&row, session_id, refs_available))
+            .transpose()
+    }
+
+    /// Re-probe a degraded handle ONCE, at the start of one metadata
+    /// operation (with that session's mutation lock held): another handle
+    /// may have added `sessions.refs` since this one connected. The returned
+    /// bool is the operation's one availability decision — the row read and
+    /// the snapshot write both use it. A failed probe keeps the feature
+    /// degraded rather than failing the metadata write.
+    async fn ensure_refs_available(&self) -> bool {
+        if self.refs_available.load(Ordering::Relaxed) {
+            return true;
+        }
+        match Self::probe_refs_column(&self.client).await {
+            Ok(true) => {
+                self.refs_available.store(true, Ordering::Relaxed);
+                true
+            }
+            Ok(false) => false,
+            Err(error) => {
+                tracing::warn!(
+                    "e-agent: cannot inspect the sessions.refs column (session links may be \
+                     unavailable): {error:#}"
+                );
+                false
+            }
+        }
+    }
+
+    /// Append one complete snapshot. `refs_available` is the operation's
+    /// ONE decision (taken before its row read, under the mutation lock):
+    /// writing with a different value than the read used is what erased a
+    /// link a repairing handle had just stored.
+    async fn insert_meta(&self, meta: &mut SessionMeta, refs_available: bool) -> Result<()> {
         // Stamp the writer identity at insert time, not at construction
         // (P3): every snapshot row records the process that actually wrote
         // it, and a cross-process resume never replays a stale identity
         // from a row cached by another process. Callers construct with
         // `writer: None`; the stamped value is what lands in the column.
         meta.writer = Some(process_identity().to_owned());
-        self.client
-            .execute(
-                "INSERT INTO sessions \
-                 (workspace_id, session_id, created_at, last_active_at, model, \"role\", \
-                  entry_count, parent_session_id, parent_task_id, title, pinned, archived, writer, \
-                  acp_session_id) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
-                &[
-                    &self.workspace_id,
-                    &meta.session_id,
-                    &meta.created_at,
-                    &meta.last_active_at,
-                    &meta.model,
-                    &meta.role,
-                    &meta.entry_count,
-                    &meta.parent_session_id,
-                    &meta.parent_task_id,
-                    &meta.title,
-                    &meta.pinned,
-                    &meta.archived,
-                    &meta.writer,
-                    &meta.acp_session_id,
-                ],
-            )
-            .await
-            .context("cannot insert session metadata")?;
+        if refs_available {
+            // One JSON value for the whole list; NULL when empty (the same
+            // value a pre-column row reads back as). Encoding happens before
+            // the statement so the parameter borrows a local that outlives it.
+            let refs_json =
+                crate::session_store::refs_to_json(&meta.refs).map_err(anyhow::Error::msg)?;
+            self.client
+                .execute(
+                    "INSERT INTO sessions \
+                     (workspace_id, session_id, created_at, last_active_at, model, \"role\", \
+                      entry_count, parent_session_id, parent_task_id, title, pinned, archived, writer, \
+                      acp_session_id, refs) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+                    &[
+                        &self.workspace_id,
+                        &meta.session_id,
+                        &meta.created_at,
+                        &meta.last_active_at,
+                        &meta.model,
+                        &meta.role,
+                        &meta.entry_count,
+                        &meta.parent_session_id,
+                        &meta.parent_task_id,
+                        &meta.title,
+                        &meta.pinned,
+                        &meta.archived,
+                        &meta.writer,
+                        &meta.acp_session_id,
+                        &refs_json,
+                    ],
+                )
+                .await
+                .context("cannot insert session metadata")?;
+        } else {
+            // The column is missing (a failed migration): omit it instead of
+            // failing the whole snapshot — a degraded database keeps creating,
+            // touching and listing sessions; only links are unavailable.
+            self.client
+                .execute(
+                    "INSERT INTO sessions \
+                     (workspace_id, session_id, created_at, last_active_at, model, \"role\", \
+                      entry_count, parent_session_id, parent_task_id, title, pinned, archived, writer, \
+                      acp_session_id) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+                    &[
+                        &self.workspace_id,
+                        &meta.session_id,
+                        &meta.created_at,
+                        &meta.last_active_at,
+                        &meta.model,
+                        &meta.role,
+                        &meta.entry_count,
+                        &meta.parent_session_id,
+                        &meta.parent_task_id,
+                        &meta.title,
+                        &meta.pinned,
+                        &meta.archived,
+                        &meta.writer,
+                        &meta.acp_session_id,
+                    ],
+                )
+                .await
+                .context("cannot insert session metadata")?;
+        }
         Ok(())
     }
 
@@ -2281,8 +2571,11 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
     /// optimistic last-write-wins semantics. Delete-vs-touch races remain a
     /// documented limitation until database-level conditional/versioned
     /// writes are available.
-    async fn effective_meta(&self) -> Result<Option<SessionMeta>> {
-        match self.load_meta_row(&self.session_id).await? {
+    async fn effective_meta(&self, refs_available: bool) -> Result<Option<SessionMeta>> {
+        match self
+            .load_meta_row_with(&self.session_id, refs_available)
+            .await?
+        {
             Some(meta) => {
                 *self.cached_meta.lock().unwrap() = Some(meta.clone());
                 Ok(Some(meta))
@@ -2328,8 +2621,9 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             acp_session_id: existing.acp_session_id.clone(),
             pinned: existing.pinned,
             archived: existing.archived,
-            writer: None, // stamped by insert_meta with the writing process
-            label: None,  // label lives in running_tasks, resolved at list time
+            refs: existing.refs.clone(), // links are never rewritten by a resume
+            writer: None,                // stamped by insert_meta with the writing process
+            label: None,                 // label lives in running_tasks, resolved at list time
         }
     }
 
@@ -2365,7 +2659,11 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
         parent_task_id: Option<i64>,
         title: Option<&str>,
     ) -> Result<()> {
-        if let Some(existing) = self.load_meta_row(session_id).await? {
+        let _guard = self.session_meta_lock(session_id).lock_owned().await;
+        // One availability decision for this operation, taken AFTER the
+        // mutation lock: every row read and the snapshot write below use it.
+        let refs_available = self.ensure_refs_available().await;
+        if let Some(existing) = self.load_meta_row_with(session_id, refs_available).await? {
             // Row already exists (resume, or a btw/subagent row whose
             // parent link was unknown at build time): only ever backfill
             // what is MISSING — the parent link and/or a model — never
@@ -2383,7 +2681,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
                     parent_session_id,
                     parent_task_id,
                 );
-                self.insert_meta(&mut meta).await?;
+                self.insert_meta(&mut meta, refs_available).await?;
                 *self.cached_meta.lock().unwrap() = Some(meta);
             }
             return Ok(());
@@ -2402,10 +2700,11 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             acp_session_id: None,            // no ACP conversation until `acp_prompt` runs
             pinned: None,                    // a fresh session is unpinned until the user pins it
             archived: None, // a fresh session is unarchived until the user archives it
+            refs: Vec::new(), // no PR/issue links until the tool or the owner adds them
             writer: None,   // stamped by insert_meta with the writing process
             label: None,    // label lives in running_tasks, resolved at list time
         };
-        self.insert_meta(&mut meta).await?;
+        self.insert_meta(&mut meta, refs_available).await?;
         *self.cached_meta.lock().unwrap() = Some(meta);
         Ok(())
     }
@@ -2421,13 +2720,15 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
     /// own row. Callers run this fire-and-forget at turn boundaries (R4);
     /// losing the final touch at process exit is acceptable.
     pub async fn touch_meta(&self) -> Result<()> {
-        let Some(meta) = self.effective_meta().await? else {
+        let _guard = self.session_meta_lock(&self.session_id).lock_owned().await;
+        let refs_available = self.ensure_refs_available().await;
+        let Some(meta) = self.effective_meta(refs_available).await? else {
             return Ok(());
         };
         let mut meta = meta;
         meta.last_active_at = us_to_datetime(next_event_time_us());
         meta.entry_count = self.next_seq.load(Ordering::Acquire);
-        self.insert_meta(&mut meta).await?;
+        self.insert_meta(&mut meta, refs_available).await?;
         *self.cached_meta.lock().unwrap() = Some(meta);
         Ok(())
     }
@@ -2449,17 +2750,19 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
     /// (and refreshed) so the rename is immediately visible to later
     /// touches.
     pub async fn set_title(&self, session_id: &str, title: Option<&str>) -> Result<()> {
+        let _guard = self.session_meta_lock(session_id).lock_owned().await;
+        let refs_available = self.ensure_refs_available().await;
         let meta = if session_id == self.session_id {
-            self.effective_meta().await?
+            self.effective_meta(refs_available).await?
         } else {
-            self.load_meta_row(session_id).await?
+            self.load_meta_row_with(session_id, refs_available).await?
         };
         let Some(mut meta) = meta else {
             return Ok(());
         };
         meta.title = title.map(str::to_owned);
         meta.last_active_at = us_to_datetime(next_event_time_us());
-        self.insert_meta(&mut meta).await?;
+        self.insert_meta(&mut meta, refs_available).await?;
         if session_id == self.session_id {
             *self.cached_meta.lock().unwrap() = Some(meta);
         }
@@ -2484,17 +2787,22 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
         session_id: &str,
         acp_session_id: Option<&str>,
     ) -> Result<()> {
+        let _guard = self.session_meta_lock(session_id).lock_owned().await;
+        // One availability decision for this operation: the row read carries
+        // the latest `refs` forward and the snapshot write reuses the same
+        // projection decision.
+        let refs_available = self.ensure_refs_available().await;
         let meta = if session_id == self.session_id {
-            self.effective_meta().await?
+            self.effective_meta(refs_available).await?
         } else {
-            self.load_meta_row(session_id).await?
+            self.load_meta_row_with(session_id, refs_available).await?
         };
         let Some(mut meta) = meta else {
             return Ok(());
         };
         meta.acp_session_id = acp_session_id.map(str::to_owned);
         meta.last_active_at = us_to_datetime(next_event_time_us());
-        self.insert_meta(&mut meta).await?;
+        self.insert_meta(&mut meta, refs_available).await?;
         if session_id == self.session_id {
             *self.cached_meta.lock().unwrap() = Some(meta);
         }
@@ -2518,17 +2826,19 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
     /// (and refreshed) so the change is immediately visible to later
     /// touches.
     pub async fn set_pinned(&self, session_id: &str, pinned: bool) -> Result<()> {
+        let _guard = self.session_meta_lock(session_id).lock_owned().await;
+        let refs_available = self.ensure_refs_available().await;
         let meta = if session_id == self.session_id {
-            self.effective_meta().await?
+            self.effective_meta(refs_available).await?
         } else {
-            self.load_meta_row(session_id).await?
+            self.load_meta_row_with(session_id, refs_available).await?
         };
         let Some(mut meta) = meta else {
             return Ok(());
         };
         meta.pinned = Some(pinned);
         meta.last_active_at = us_to_datetime(next_event_time_us());
-        self.insert_meta(&mut meta).await?;
+        self.insert_meta(&mut meta, refs_available).await?;
         if session_id == self.session_id {
             *self.cached_meta.lock().unwrap() = Some(meta);
         }
@@ -2553,21 +2863,71 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
     /// used (and refreshed) so the change is immediately visible to later
     /// touches.
     pub async fn set_archived(&self, session_id: &str, archived: bool) -> Result<()> {
+        let _guard = self.session_meta_lock(session_id).lock_owned().await;
+        let refs_available = self.ensure_refs_available().await;
         let meta = if session_id == self.session_id {
-            self.effective_meta().await?
+            self.effective_meta(refs_available).await?
         } else {
-            self.load_meta_row(session_id).await?
+            self.load_meta_row_with(session_id, refs_available).await?
         };
         let Some(mut meta) = meta else {
             return Ok(());
         };
         meta.archived = Some(archived);
         meta.last_active_at = us_to_datetime(next_event_time_us());
-        self.insert_meta(&mut meta).await?;
+        self.insert_meta(&mut meta, refs_available).await?;
         if session_id == self.session_id {
             *self.cached_meta.lock().unwrap() = Some(meta);
         }
         Ok(())
+    }
+
+    /// Read → mutate → append the session's PR/issue links: one full snapshot
+    /// row carrying the new `refs` JSON and a fresh `last_active_at`, exactly
+    /// like [`Self::set_archived`]. Returns the stored (deduplicated) list.
+    ///
+    /// Never self-creates, and — unlike the flag setters' silent `Ok` — a
+    /// missing row is an error: a link handed to the store must not be
+    /// dropped quietly (the same "fail loudly" rule that applies when this
+    /// backend cannot carry the column at all).
+    pub async fn update_refs(
+        &self,
+        session_id: &str,
+        mutate: impl FnOnce(
+            &mut Vec<crate::session_store::SessionRef>,
+        ) -> std::result::Result<(), String>,
+    ) -> Result<Vec<crate::session_store::SessionRef>> {
+        // Serialized against every other metadata writer for this session
+        // FIRST: the read-mutate-insert below is not atomic on its own, and
+        // a probe/flag flip before taking this lock would let a concurrent
+        // touch read without `refs` and then write without carrying them.
+        let _guard = self.session_meta_lock(session_id).lock_owned().await;
+        // ONE availability decision for this operation (read, mutate, write).
+        // A degraded handle re-probes before refusing: another handle may
+        // have repaired the schema since this one connected.
+        let refs_available = self.ensure_refs_available().await;
+        if !refs_available {
+            anyhow::bail!(
+                "session links are unavailable: the sessions.refs column is missing \
+                 (the schema migration failed on this database)"
+            );
+        }
+        let meta = if session_id == self.session_id {
+            self.effective_meta(refs_available).await?
+        } else {
+            self.load_meta_row_with(session_id, refs_available).await?
+        };
+        let Some(mut meta) = meta else {
+            anyhow::bail!("session {session_id} has no metadata row to store links in");
+        };
+        mutate(&mut meta.refs).map_err(anyhow::Error::msg)?;
+        crate::session_store::dedup_refs(&mut meta.refs);
+        meta.last_active_at = us_to_datetime(next_event_time_us());
+        self.insert_meta(&mut meta, refs_available).await?;
+        if session_id == self.session_id {
+            *self.cached_meta.lock().unwrap() = Some(meta.clone());
+        }
+        Ok(meta.refs)
     }
 
     /// Return sessions whose latest metadata snapshot points at `parent_session_id`.
@@ -2653,9 +3013,16 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
     ) -> Result<(Vec<SessionMeta>, crate::session_store::ListMetaDiagnostics)> {
         let query_started = std::time::Instant::now();
         let (filter_clause, live_ids) = sidebar_filter_clause(sidebar_filter);
+        // One availability decision for this query: projection, aggregate
+        // expression and decode all use the same shape.
+        let refs_available = self.refs_available.load(Ordering::Relaxed);
+        let refs = refs_select(refs_available);
+        // The dedup subquery projects the same tail: a missing column is
+        // simply not selected, so a degraded old database still lists.
+        let refs_groups = refs_group(refs_available);
         let sql = format!(
             "SELECT session_id, created_at, last_active_at, model, \"role\", entry_count, \
-                    parent_session_id, parent_task_id, title, pinned, archived, writer \
+                    parent_session_id, parent_task_id, title, pinned, archived, writer{refs} \
              FROM ( \
                  SELECT \
                      session_id, \
@@ -2669,7 +3036,7 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
                      last_value(ARRAY[title] ORDER BY last_active_at)[1] AS title, \
                      last_value(ARRAY[pinned] ORDER BY last_active_at)[1] AS pinned, \
                      last_value(ARRAY[archived] ORDER BY last_active_at)[1] AS archived, \
-                     last_value(ARRAY[writer] ORDER BY last_active_at)[1] AS writer \
+                     last_value(ARRAY[writer] ORDER BY last_active_at)[1] AS writer{refs_groups} \
                  FROM sessions \
                  WHERE workspace_id = $1 \
                  GROUP BY session_id \
@@ -2689,25 +3056,11 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
         let decode_started = std::time::Instant::now();
         let out = rows
             .iter()
-            .map(|row| SessionMeta {
-                session_id: row.get("session_id"),
-                created_at: row.get("created_at"),
-                last_active_at: row.get("last_active_at"),
-                model: row.get("model"),
-                role: row.get("role"),
-                entry_count: row.get("entry_count"),
-                parent_session_id: row.get("parent_session_id"),
-                parent_task_id: row.get("parent_task_id"),
-                title: row.get("title"),
-                pinned: row.get("pinned"),
-                archived: row.get("archived"),
-                // The list projection aggregates a fixed column set and does
-                // not carry the ACP session id.
-                acp_session_id: None,
-                writer: row.get("writer"),
-                label: None, // label lives in running_tasks, resolved at list time
+            .map(|row| {
+                let session_id: String = row.get("session_id");
+                Self::meta_from_row(row, &session_id, refs_available)
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         let decode_ms = decode_started.elapsed().as_millis();
         Ok((
             out.clone(),
@@ -2725,37 +3078,26 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
     /// activity first. This is the audit view — [`Self::list_meta`] shows
     /// only the latest snapshot per session.
     pub async fn audit_meta(&self, session_id: &str) -> Result<Vec<SessionMeta>> {
+        let refs_available = self.refs_available.load(Ordering::Relaxed);
+        let refs = refs_select(refs_available);
         let rows = self
             .client
             .query(
-                "SELECT created_at, last_active_at, model, \"role\", entry_count, \
-                        parent_session_id, parent_task_id, title, pinned, archived, writer, acp_session_id \
-                 FROM sessions \
-                 WHERE workspace_id = $1 AND session_id = $2 \
-                 ORDER BY last_active_at ASC",
+                &format!(
+                    "SELECT created_at, last_active_at, model, \"role\", entry_count, \
+                            parent_session_id, parent_task_id, title, pinned, archived, writer, \
+                            acp_session_id{refs} \
+                     FROM sessions \
+                     WHERE workspace_id = $1 AND session_id = $2 \
+                     ORDER BY last_active_at ASC"
+                ),
                 &[&self.workspace_id, &session_id],
             )
             .await
             .context("cannot load session metadata audit trail")?;
-        Ok(rows
-            .iter()
-            .map(|row| SessionMeta {
-                session_id: session_id.to_owned(),
-                created_at: row.get("created_at"),
-                last_active_at: row.get("last_active_at"),
-                model: row.get("model"),
-                role: row.get("role"),
-                entry_count: row.get("entry_count"),
-                parent_session_id: row.get("parent_session_id"),
-                parent_task_id: row.get("parent_task_id"),
-                title: row.get("title"),
-                pinned: row.get("pinned"),
-                archived: row.get("archived"),
-                acp_session_id: row.get("acp_session_id"),
-                writer: row.get("writer"),
-                label: None, // label lives in running_tasks, resolved at list time
-            })
-            .collect())
+        rows.iter()
+            .map(|row| Self::meta_from_row(row, session_id, refs_available))
+            .collect()
     }
 
     /// Hide a session from the sessions list: delete ALL of its metadata
@@ -2815,22 +3157,39 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             if existing.iter().any(|id| id == &session_id) {
                 continue;
             }
-            self.insert_meta(&mut SessionMeta {
-                session_id,
-                created_at: row.get("created_at"),
-                last_active_at: row.get("last_active_at"),
-                model: None,
-                role: None,
-                entry_count: row.get("entry_count"),
-                parent_session_id: None,
-                parent_task_id: None,
-                title: None,          // pre-table sessions have no user-assigned name
-                pinned: None,         // pre-table sessions are unpinned
-                archived: None,       // pre-table sessions are unarchived
-                acp_session_id: None, // pre-table sessions have no ACP conversation
-                writer: None,         // stamped by insert_meta with the writing process
-                label: None,          // label lives in running_tasks, resolved at list time
-            })
+            // The scan above is only a prefilter: a concurrent create may
+            // have landed since. Recheck absence under the same per-session
+            // mutation lock every other metadata writer uses, with ONE
+            // availability decision serving that read and the INSERT.
+            let _guard = self.session_meta_lock(&session_id).lock_owned().await;
+            let refs_available = self.ensure_refs_available().await;
+            if self
+                .load_meta_row_with(&session_id, refs_available)
+                .await?
+                .is_some()
+            {
+                continue;
+            }
+            self.insert_meta(
+                &mut SessionMeta {
+                    session_id,
+                    created_at: row.get("created_at"),
+                    last_active_at: row.get("last_active_at"),
+                    model: None,
+                    role: None,
+                    entry_count: row.get("entry_count"),
+                    parent_session_id: None,
+                    parent_task_id: None,
+                    title: None,          // pre-table sessions have no user-assigned name
+                    pinned: None,         // pre-table sessions are unpinned
+                    archived: None,       // pre-table sessions are unarchived
+                    refs: Vec::new(),     // pre-table sessions carry no PR/issue links
+                    acp_session_id: None, // pre-table sessions have no ACP conversation
+                    writer: None,         // stamped by the insert with the writing process
+                    label: None,          // label lives in running_tasks, resolved at list time
+                },
+                refs_available,
+            )
             .await?;
         }
         Ok(())
@@ -3221,6 +3580,70 @@ mod tests {
         assert!(source.contains("pub async fn load_older_located"));
     }
 
+    /// The provenance query is bounded in PAYLOAD ROWS, not logical keys: it
+    /// matches `entry_kind` and takes ONE row without selecting `payload`.
+    /// (Greptime keeps every physical version of a seq, so "the first N
+    /// logical entries" would not bound the I/O.)
+    #[test]
+    fn fork_marker_query_is_one_row_and_selects_no_payload() {
+        assert!(FORK_MARKER_SQL.contains("entry_kind = 'forked_from'"));
+        assert!(FORK_MARKER_SQL.contains("LIMIT 1"));
+        assert!(!FORK_MARKER_SQL.contains("payload"));
+    }
+
+    /// A legacy copy fork's marker sits behind the whole copied prefix; the
+    /// single-row marker query still finds it at an arbitrary seq, and a long
+    /// ordinary session answers `false`. Needs a live GreptimeDB
+    /// (`GREPTIME_PG`), like the other integration tests here; the query
+    /// shape itself is covered ungated above.
+    #[tokio::test]
+    async fn fork_marker_query_finds_a_deep_marker() {
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let sid = format!("test-gt-fork-marker-{}", crate::session::new_id());
+        let session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        let mut entries: Vec<SessionEntry> = (0..200)
+            .flat_map(|i| {
+                [
+                    Message::User {
+                        content: format!("q{i}"),
+                        images: vec![],
+                    }
+                    .into(),
+                    Message::Assistant(AssistantMessage {
+                        content: Some(format!("a{i}")),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    })
+                    .into(),
+                ]
+            })
+            .collect();
+        let at = entries.len();
+        entries.push(SessionEntry::ForkedFrom {
+            source: "live-parent".into(),
+            at: Some(at),
+            event_time: None,
+            seq: None,
+        });
+        session.append(&entries).await.unwrap();
+        assert!(
+            session.has_fork_marker().await.unwrap(),
+            "a marker behind 200 turns is still provenance"
+        );
+
+        let plain_id = format!("test-gt-plain-{}", crate::session::new_id());
+        let plain = GreptimeSession::connect(&conn, &wid, &plain_id)
+            .await
+            .unwrap();
+        plain.append(&entries[..400]).await.unwrap();
+        assert!(!plain.has_fork_marker().await.unwrap());
+    }
+
     #[test]
     fn cursor_advancement_is_monotonic_under_concurrency() {
         use std::sync::Arc;
@@ -3258,6 +3681,236 @@ mod tests {
         );
         assert_eq!(live.len(), 2);
         assert!(live.iter().all(|id| live_set.contains(id)));
+    }
+
+    /// A failed `refs` migration must be confined to links: every read then
+    /// OMITS the column (so the row still decodes with empty links) and every
+    /// write omits it in [`GreptimeSession::insert_meta`]. Unit-level because
+    /// the degraded schema would have to replace a live DB's table.
+    #[test]
+    fn refs_projection_omits_a_missing_column() {
+        assert_eq!(refs_select(true), ", refs");
+        assert_eq!(refs_select(false), "");
+        assert!(refs_group(true).contains("last_value(ARRAY[refs]"));
+        assert_eq!(refs_group(false), "");
+    }
+
+    /// `refs` is ONE nullable JSON column: NULL (a row written before the
+    /// column existed) reads as empty, and the stored value is the same
+    /// `{"kind","url"}` list the other two backends carry. Unit-level because
+    /// the live round-trip below needs a database.
+    #[test]
+    fn refs_column_null_reads_as_empty_and_json_round_trips() {
+        use crate::session_store::{SessionRef, refs_from_json};
+        assert!(refs_from_json(None).unwrap().is_empty());
+        assert!(refs_from_json(Some("")).unwrap().is_empty());
+        let refs = refs_from_json(Some(
+            r#"[{"kind":"pr","url":"https://github.com/acme/widget/pull/14"}]"#,
+        ))
+        .unwrap();
+        assert_eq!(
+            refs,
+            vec![SessionRef::new("pr", "https://github.com/acme/widget/pull/14").unwrap()]
+        );
+        assert!(
+            refs_from_json(Some("not json")).is_err(),
+            "a malformed column fails loudly instead of dropping links"
+        );
+    }
+
+    /// Both kinds round-trip through the single JSON column and deduplicate by
+    /// exact URL within a kind (needs a live GreptimeDB, like the other
+    /// integration tests here).
+    #[tokio::test]
+    async fn refs_round_trip() {
+        use crate::session_store::SessionRef;
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let sid = format!("test-gt-refs-{}", crate::session::new_id());
+        let session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        session
+            .create_meta(&sid, Some("m"), Some("main"), None, None, None)
+            .await
+            .unwrap();
+        assert!(
+            session
+                .load_meta_row(&sid)
+                .await
+                .unwrap()
+                .unwrap()
+                .refs
+                .is_empty(),
+            "a fresh row has a NULL refs column and reads back as empty"
+        );
+        let pr = SessionRef::new("pr", "https://github.com/acme/widget/pull/14").unwrap();
+        let issue = SessionRef::new("issue", "https://github.com/acme/widget/issues/22").unwrap();
+        let stored = session
+            .update_refs(&sid, |refs| {
+                refs.push(pr.clone());
+                refs.push(issue.clone());
+                refs.push(pr.clone()); // duplicate collapses
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(stored, vec![pr, issue]);
+        let listed = session.list_meta().await.unwrap();
+        let mine = listed.iter().find(|m| m.session_id == sid).unwrap();
+        assert_eq!(mine.refs, stored);
+        assert_eq!(
+            session.audit_meta(&sid).await.unwrap().last().unwrap().refs,
+            stored
+        );
+        session.delete_meta(&sid).await.unwrap();
+    }
+
+    /// Two concurrent additions through two handles for the SAME session must
+    /// both survive: Greptime has no transactions, so the read-mutate-insert
+    /// is serialized per session in this process (two unserialized handles
+    /// both read the same row and the later insert drops the earlier URL).
+    #[tokio::test]
+    async fn concurrent_ref_additions_both_survive() {
+        use crate::session_store::SessionRef;
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let sid = format!("test-gt-refs-race-{}", crate::session::new_id());
+        let a = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        let b = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        a.create_meta(&sid, Some("m"), Some("main"), None, None, None)
+            .await
+            .unwrap();
+        let pr = SessionRef::new("pr", "https://github.com/acme/widget/pull/14").unwrap();
+        let issue = SessionRef::new("issue", "https://github.com/acme/widget/issues/22").unwrap();
+        let (first, second) = tokio::join!(
+            a.update_refs(&sid, |refs| {
+                refs.push(pr.clone());
+                Ok(())
+            }),
+            b.update_refs(&sid, |refs| {
+                refs.push(issue.clone());
+                Ok(())
+            }),
+        );
+        first.unwrap();
+        second.unwrap();
+        let stored = a.load_meta_row(&sid).await.unwrap().unwrap().refs;
+        assert_eq!(
+            stored.len(),
+            2,
+            "both concurrent adds survive the read-mutate-insert: {stored:?}"
+        );
+        a.delete_meta(&sid).await.unwrap();
+    }
+
+    /// A handle that opened while `refs` was unavailable must not erase a
+    /// link another handle stored after repairing the schema. Every
+    /// metadata operation decides availability ONCE, after taking the
+    /// per-session mutation lock, and uses that decision for its read and
+    /// its write — a probe that ran before the lock could flip the flag
+    /// under a touch that had already read without `refs`.
+    #[tokio::test]
+    async fn degraded_handle_metadata_writes_keep_repaired_links() {
+        use crate::session_store::SessionRef;
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let sid = format!("test-gt-degraded-refs-{}", crate::session::new_id());
+        // Simulate a handle that connected while the column was missing:
+        // the schema is repaired by the other handle below.
+        let degraded = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        degraded.refs_available.store(false, Ordering::Relaxed);
+        let repairing = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        repairing
+            .create_meta(&sid, Some("m"), Some("main"), None, None, None)
+            .await
+            .unwrap();
+        let pr = SessionRef::new("pr", "https://github.com/acme/widget/pull/14").unwrap();
+        repairing
+            .update_refs(&sid, |refs| {
+                refs.push(pr.clone());
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        // A turn-boundary metadata touch on the degraded handle must carry
+        // the link forward instead of appending a snapshot without it.
+        degraded.touch_meta().await.unwrap();
+        assert_eq!(
+            repairing.load_meta_row(&sid).await.unwrap().unwrap().refs,
+            vec![pr.clone()],
+            "the degraded handle's touch must not erase the repaired link"
+        );
+
+        // The ref edit sibling: it takes the mutation lock BEFORE probing,
+        // so its read and write share one availability decision and the
+        // existing link survives its own addition.
+        let issue = SessionRef::new("issue", "https://github.com/acme/gadget/issues/22").unwrap();
+        degraded
+            .update_refs(&sid, |refs| {
+                refs.push(issue.clone());
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            repairing.load_meta_row(&sid).await.unwrap().unwrap().refs,
+            vec![pr, issue],
+            "the degraded edit keeps every link and adds its own"
+        );
+        degraded.delete_meta(&sid).await.unwrap();
+    }
+
+    /// The ref edit must take the per-session mutation lock BEFORE probing
+    /// `sessions.refs`. A probe that runs first can flip the shared
+    /// availability flag while a concurrent touch is between its row read
+    /// (without `refs`) and its snapshot write, making the touch skip the
+    /// carry-forward and erase the repaired link.
+    #[tokio::test]
+    async fn update_refs_probes_only_after_taking_the_mutation_lock() {
+        use std::sync::Arc;
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let sid = format!("test-gt-refs-lock-order-{}", crate::session::new_id());
+        let session = Arc::new(GreptimeSession::connect(&conn, &wid, &sid).await.unwrap());
+        session
+            .create_meta(&sid, Some("m"), Some("main"), None, None, None)
+            .await
+            .unwrap();
+        // Degraded handle: the schema is actually present, so a probe WOULD
+        // flip the flag to true.
+        session.refs_available.store(false, Ordering::Relaxed);
+        let lock = session.session_meta_lock(&sid);
+        let guard = lock.lock_owned().await;
+        let edit = tokio::spawn({
+            let session = session.clone();
+            let sid = sid.clone();
+            async move { session.update_refs(&sid, |_| Ok(())).await }
+        });
+        // Let the spawned edit reach its first await: the lock.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !session.refs_available.load(Ordering::Relaxed),
+            "update_refs must not probe (and promote the flag) before the              mutation lock is held"
+        );
+        drop(guard);
+        edit.await.unwrap().unwrap();
+        session.delete_meta(&sid).await.unwrap();
     }
 
     fn conn_str() -> String {
@@ -6443,6 +7096,13 @@ mod tests {
             pinned: Some(true),
             archived: Some(true),
             acp_session_id: None,
+            refs: vec![
+                crate::session_store::SessionRef::new(
+                    "pr",
+                    "https://github.com/acme/widget/pull/14",
+                )
+                .unwrap(),
+            ],
             writer: None,
             label: None,
         };
@@ -6481,6 +7141,10 @@ mod tests {
         assert_eq!(backfilled.pinned, Some(true));
         assert_eq!(backfilled.archived, Some(true));
         assert_eq!(
+            backfilled.refs, existing.refs,
+            "a resume carries the session's links"
+        );
+        assert_eq!(
             backfilled.writer, None,
             "writer is stamped by insert_meta, never by the constructor"
         );
@@ -6500,6 +7164,7 @@ mod tests {
             pinned: None,
             archived: None,
             acp_session_id: None,
+            refs: Vec::new(),
             writer: None,
             label: None,
         };

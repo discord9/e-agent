@@ -1643,6 +1643,14 @@ impl SessionRunner {
         (self.agent.goal(), self.agent.goal_cleared())
     }
 
+    /// Test-only view of the tools this session actually registered (the
+    /// factory decides main-vs-child registration; a test builds through the
+    /// factory and asserts the resulting set).
+    #[cfg(test)]
+    pub(crate) fn tool_names_for_test(&self) -> Vec<String> {
+        self.agent.tool_names()
+    }
+
     async fn sync_background_projection(&mut self) -> bool {
         let Some(background) = self.background.clone() else {
             if self.bootstrap_projection_pending {

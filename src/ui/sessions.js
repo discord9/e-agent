@@ -28,6 +28,12 @@ function validateSession(s) {
   if (s.label !== undefined && s.label !== null && typeof s.label !== "string") problems.push("label 非字符串");
   if (s.pinned !== undefined && s.pinned !== null && typeof s.pinned !== "boolean") problems.push("pinned 非布尔");
   if (s.archived !== undefined && s.archived !== null && typeof s.archived !== "boolean") problems.push("archived 非布尔");
+  for (const key of ["prs", "issues"]) {
+    if (s[key] !== undefined && s[key] !== null
+        && (!Array.isArray(s[key]) || s[key].some((u) => typeof u !== "string"))) {
+      problems.push(key + " 非字符串数组");
+    }
+  }
   return problems;
 }
 
@@ -165,6 +171,7 @@ function afterPollRound() {
       updateCurrentSessionBusy();
       syncDocumentTitle();   // 服务端后台生成的标题在轮询后同步到标签页
       const cur = (state.lastList || []).find((s) => s.id === state.sessionId);
+      syncChatRefs(cur);
       // 临时重试已安装（onclick 非空）：无论当前行是否存在/是否有父，都必须
       // 保持可用——否则一次轮询就会把重试控件藏掉。只在恢复父信息或导航时清。
       const retryHandler = els.backParentBtn.onclick;
@@ -985,6 +992,211 @@ function renderChatSessionId(id) {
   if (title) {
     const idline = el("span", "chat-sid-id", id);
     el0.append(idline);
+  }
+  renderChatRefs(s, id);
+}
+
+/* =====================================================================
+ * 会话链接（PR / issue）：标签只由 URL 自身形状决定——路径能解析成
+ * `/owner/repo/pull/14`（或 `/-/merge_requests/14`）、`/owner/repo/issues/22`
+ * 时显示 `PR #14` / `issue #22`，否则回退 `host + path`。点击开新标签页。
+ * 手工编辑在会话头部：按 kind 添加/移除，走 POST /api/sessions/{id}/refs。
+ * 这里不做任何分组/过滤/按编号排序。
+ * ===================================================================*/
+let refEditorOpen = false;      // 头部「＋」展开的添加表单（切会话时收起）
+let refEditorSession = null;    // 表单归属：workspace identity + 会话 id
+let chatRefsSig = "";           // 头部 chips 的签名：轮询只在链接变化时重绘
+
+/* 表单/草稿的归属键。只用会话 id 时，另一个 workspace 里的同 id 会话会
+   继承上一个 workspace 的编辑器状态与草稿；workspace identity 必须一起
+   进键（id 只在单个服务器内唯一）。 */
+function refEditorKey(id) {
+  return workspaceIdentityKey(state.workspace, workspaceToken(state.workspace)) + "\u0000" + id;
+}
+
+/* URL 的展示标签：能解析出编号就用 `PR #n` / `issue #n`，否则 host+path。 */
+function refChipLabel(url) {
+  try {
+    const u = new URL(url);
+    const segs = u.pathname.split("/").filter(Boolean);
+    if (segs.length >= 2) {
+      const number = segs[segs.length - 1];
+      const marker = segs[segs.length - 2].toLowerCase();
+      if (/^\d+$/.test(number)) {
+        if (marker === "pull" || marker === "pulls" || marker === "merge_requests") return "PR #" + number;
+        if (marker === "issue" || marker === "issues") return "issue #" + number;
+      }
+    }
+    return u.host + u.pathname.replace(/\/$/, "");
+  } catch (e) {
+    return String(url || "");
+  }
+}
+
+/* 会话对象上的两个列表 → 有序的 [kind, url] 对（pr 在前，保持后端顺序）。 */
+function sessionRefLinks(s) {
+  const out = [];
+  for (const [kind, urls] of [["pr", s && s.prs], ["issue", s && s.issues]]) {
+    if (!Array.isArray(urls)) continue;
+    for (const url of urls) {
+      if (typeof url === "string" && url) out.push({ kind, url });
+    }
+  }
+  return out;
+}
+
+/* 链接列表的签名（顺序敏感）：用于「只有变化才重绘」，避免轮询打断输入。 */
+function refsSignature(links) {
+  return links.map((link) => link.kind + " " + link.url).join("\n");
+}
+
+/* 轮询后同步头部 chips：agent 在 turn 里新增/移除链接时，下一次轮询就反映
+   出来（侧边栏靠树签名自动重绘）；签名不变绝不重绘，正在输入的表单不受影响。 */
+function syncChatRefs(s) {
+  if (!state.sessionId) return;
+  if (refsSignature(sessionRefLinks(s)) === chatRefsSig) return;
+  renderChatRefs(s, state.sessionId);
+}
+
+/* 会话头部的一个 chip：点击新标签页打开，附带 × 移除。 */
+function refChip(link, onRemove) {
+  const a = el("a", "ref-chip " + link.kind, refChipLabel(link.url));
+  a.href = link.url;
+  a.target = "_blank";
+  a.rel = "noopener noreferrer";
+  a.title = link.url;
+  a.draggable = false;
+  a.addEventListener("click", (ev) => ev.stopPropagation());   // 不触发切换会话
+  const wrap = el("span", "ref-chip-wrap");
+  wrap.append(a);
+  const rm = el("button", "ref-chip-remove", "×");
+  rm.type = "button";
+  rm.title = "移除 " + link.url;
+  rm.setAttribute("aria-label", rm.title);
+  rm.addEventListener("click", (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    editSessionRef(link.kind, link.url, true);
+  });
+  wrap.append(rm);
+  return wrap;
+}
+
+/* 会话头部的 chips + 手工编辑（＋ 展开：kind 选择 + URL 输入 + 添加）。 */
+function renderChatRefs(s, id) {
+  const host = els.chatRefs;
+  if (!host) return;
+  const editorKey = id ? refEditorKey(id) : null;
+  if (refEditorSession !== editorKey) {  // 切会话/工作区：收起表单，避免草稿串到别处
+    refEditorSession = editorKey;
+    refEditorOpen = false;
+  }
+  // 重绘（轮询/改名）不丢正在输入的表单：先记下草稿，重建后填回。
+  const draftUrl = host.querySelector(".ref-url");
+  const draftKind = host.querySelector(".ref-kind");
+  const draft = draftUrl ? draftUrl.value : "";
+  const draftValue = draftKind ? draftKind.value : "pr";
+  host.innerHTML = "";
+  if (!id) return;
+  const links = sessionRefLinks(s);
+  for (const link of links) host.append(refChip(link, true));
+  chatRefsSig = refsSignature(links);
+  const add = el("button", "ref-add-btn", "＋");
+  add.type = "button";
+  add.title = refEditorOpen ? "收起添加链接" : "添加 PR / issue 链接";
+  add.setAttribute("aria-label", add.title);
+  add.setAttribute("aria-expanded", String(refEditorOpen));
+  add.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    refEditorOpen = !refEditorOpen;
+    renderChatRefs(s, id);
+  });
+  host.append(add);
+  if (!refEditorOpen) return;
+  const form = el("span", "ref-editor");
+  const kind = el("select", "ref-kind");
+  kind.title = "链接类型";
+  for (const [value, label] of [["pr", "PR"], ["issue", "issue"]]) {
+    const option = el("option", "", label);
+    option.value = value;
+    kind.append(option);
+  }
+  kind.value = draftValue;
+  const url = el("input", "ref-url");
+  url.value = draft;
+  url.placeholder = "https://github.com/owner/repo/pull/14";
+  url.autocomplete = "off";
+  url.spellcheck = false;
+  url.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") { ev.preventDefault(); submit(); }
+    else if (ev.key === "Escape") { refEditorOpen = false; renderChatRefs(s, id); }
+  });
+  const submit = () => {
+    const value = url.value.trim();
+    if (!value) return;
+    editSessionRef(kind.value, value, false);
+  };
+  const addBtn = el("button", "ref-add-submit", "添加");
+  addBtn.type = "button";
+  addBtn.addEventListener("click", (ev) => { ev.stopPropagation(); submit(); });
+  form.append(kind, url, addBtn);
+  host.append(form);
+  url.focus();
+}
+
+/* POST /api/sessions/{id}/refs {kind, url, remove}；成功后把响应里的两个
+   列表写回会话对象并重绘头部/侧边栏（响应即服务器存储的真值）。 */
+async function editSessionRef(kind, url, remove) {
+  const id = state.sessionId;
+  if (!id) return false;
+  // 发起时的身份快照：POST 期间用户可能切了工作区或会话，响应回来时
+  // state.workspace / state.sessionId / state.lastList 都可能已经指向别处。
+  const wsId = state.workspace.id;
+  const wsKey = workspaceIdentityKey(state.workspace, workspaceToken(state.workspace));
+  // 发起时的身份是否仍是当前可见的工作区（含 token/base 变化）。错误提示
+  // 也必须过这一关：迟到的 401/HTTP 错误/fetch 拒绝不能写到别的工作区的
+  // banner 上；await 错误体之后再校验一次。
+  const originCurrent = () => state.workspace.id === wsId
+    && workspaceIdentityKey(state.workspace, workspaceToken(state.workspace)) === wsKey;
+  // Banner 是全局的：错误只能落在发起这次编辑的 workspace + 会话上，
+  // 不能因为请求期间切走就显示在别人的上下文里。
+  const originVisible = () => originCurrent() && state.sessionId === id;
+  if (!workspaceToken(state.workspace)) { setBanner("⚠ 请先输入 Token。", true); return false; }
+  try {
+    const res = await api("/api/sessions/" + encodeURIComponent(id) + "/refs",
+      { method: "POST", body: JSON.stringify({ kind, url, remove }) });
+    if (res.status === 401 || res.status === 403) {
+      if (originVisible()) setBanner("⚠ 认证失败：请检查 Token。");
+      return false;
+    }
+    if (!res.ok) {
+      if (res.status === 404 || res.status === 405) {
+        if (originVisible()) setBanner("⚠ 服务器不支持会话链接编辑。", true);
+      } else {
+        const detail = (await res.text().catch(() => "")).trim();
+        if (originVisible()) setBanner("⚠ 链接更新失败：" + (detail || ("HTTP " + res.status)), true);
+      }
+      return false;
+    }
+    const body = await res.json().catch(() => ({}));
+    // 工作区已切换：state.lastList 此刻是另一个工作区的列表，同 id 的行
+    // 可能是另一条会话。这份响应只属于发起它的那个工作区，整条丢弃——
+    // 新工作区的列表本来就是最新拉到的，不需要也不允许用旧响应去改。
+    if (!originCurrent()) return true;
+    const s = (state.lastList || []).find((x) => x.id === id);
+    if (s) {
+      s.prs = Array.isArray(body.prs) ? body.prs : [];
+      s.issues = Array.isArray(body.issues) ? body.issues : [];
+    }
+    // 会话已切换：只把响应写回它自己的列表缓存（上一段），绝不用 A 的
+    // 响应重画 B 的头部（下面的 renderChatSessionId/renderChatRefs 读的
+    // 是「当前可见会话」）。切回 A 时头部由缓存/轮询重建。
+    if (state.sessionId !== id) return true;
+    renderChatSessionId(id);
+    return true;
+  } catch (e) {
+    if (originVisible()) setBanner("⚠ 链接更新失败：" + e.message, true);
+    return false;
   }
 }
 
