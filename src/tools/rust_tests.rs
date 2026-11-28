@@ -43,8 +43,20 @@ impl Harness {
 // `Some(marker)`: wait for a scratch containing it; `None`: all scratches gone.
 #[rustfmt::skip]
 async fn wait_scratch(base: &Path, marker: Option<&str>) {
-    for _ in 0..500 { let done = match marker { Some(m) => std::fs::read_dir(base).into_iter().flatten().flatten().any(|e| e.path().join(m).exists()), None => std::fs::read_dir(base).map(|mut it| it.next().is_none()).unwrap_or(true) }; if done { return; } tokio::time::sleep(Duration::from_millis(10)).await; }
-    panic!("scratch wait failed in {}", base.display());
+    // The sandbox teardown this waits on is a bwrap process group; under a
+    // parallel `cargo test` it can take longer than the old fixed 5 s window,
+    // which made this helper the suite's recurring flake. Wait up to 30 s and
+    // say what was still there when it gave up.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let done = match marker { Some(m) => std::fs::read_dir(base).into_iter().flatten().flatten().any(|e| e.path().join(m).exists()), None => std::fs::read_dir(base).map(|mut it| it.next().is_none()).unwrap_or(true) };
+        if done { return; }
+        if std::time::Instant::now() >= deadline {
+            let left: Vec<String> = std::fs::read_dir(base).into_iter().flatten().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+            panic!("scratch wait failed after 30s in {} (left: {left:?})", base.display());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 #[rustfmt::skip]
 #[test]
