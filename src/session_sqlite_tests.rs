@@ -6458,6 +6458,10 @@ async fn session_refs_lifecycle_orders_and_deduplicates() {
         .add_session_ref(&sid, "issue", "https://github.com/acme/widget/issues/22")
         .await
         .unwrap();
+    session
+        .add_session_ref(&sid, "link", "https://example.com/docs/x")
+        .await
+        .unwrap();
     // Adding the same key twice keeps one row and its original position.
     session
         .add_session_ref(&sid, "pr", "https://github.com/acme/widget/pull/25")
@@ -6475,6 +6479,7 @@ async fn session_refs_lifecycle_orders_and_deduplicates() {
                 "issue".to_string(),
                 "https://github.com/acme/widget/issues/22".to_string()
             ),
+            ("link".to_string(), "https://example.com/docs/x".to_string()),
         ]
     );
     // Scoped per session.
@@ -6486,10 +6491,13 @@ async fn session_refs_lifecycle_orders_and_deduplicates() {
         .unwrap();
     assert_eq!(
         session.session_refs(&sid).await.unwrap(),
-        vec![(
-            "issue".to_string(),
-            "https://github.com/acme/widget/issues/22".to_string()
-        )]
+        vec![
+            (
+                "issue".to_string(),
+                "https://github.com/acme/widget/issues/22".to_string()
+            ),
+            ("link".to_string(), "https://example.com/docs/x".to_string()),
+        ]
     );
     // Removing an absent row is a no-op.
     session

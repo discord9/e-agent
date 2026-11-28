@@ -384,6 +384,8 @@ fn web_search_registration_requires_a_nonempty_key() {
         "read_output".to_string(),
         "history".to_string(),
         "link_ref".to_string(),
+        "unlink_ref".to_string(),
+        "list_refs".to_string(),
     ];
     // A blank search credential registers no web tool at all: the local
     // `web_fetch` rides the search opt-in and does not stand alone.
@@ -429,7 +431,9 @@ fn web_search_registration_requires_a_nonempty_key() {
             "get_context_usage",
             "read_output",
             "history",
-            "link_ref"
+            "link_ref",
+            "unlink_ref",
+            "list_refs"
         ]
         .map(String::from)
     );
@@ -3103,7 +3107,9 @@ fn read_only_builtins_exclude_write_edit_and_bash_without_sandbox() {
             "get_context_usage",
             "read_output",
             "history",
-            "link_ref"
+            "link_ref",
+            "unlink_ref",
+            "list_refs"
         ],
         "read-only without a sandbox: no write/edit and fail-closed no bash"
     );
@@ -3152,7 +3158,9 @@ fn read_only_builtins_keep_bash_with_a_narrowed_sandbox() {
             "get_context_usage",
             "read_output",
             "history",
-            "link_ref"
+            "link_ref",
+            "unlink_ref",
+            "list_refs"
         ],
         "read-only with a sandbox keeps the shell and web_search"
     );
@@ -8050,6 +8058,8 @@ fn goal_specs_are_closed_and_generic_specs_stay_open() {
         // accepts exactly ref/offset/limit and nothing else.
         "read_output",
         "history",
+        // list_refs is deliberately CLOSED: it takes no arguments at all.
+        "list_refs",
     ];
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();

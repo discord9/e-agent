@@ -879,13 +879,13 @@ pub(crate) struct ProjectedBackgroundTask {
     pub subagent_session_id: Option<String>,
 }
 
-/// One pull-request / issue link recorded against a session in the
-/// `session_refs` row table. `label` is derived from the URL path for
-/// display (`owner/repo#14`, or `host/owner/repo#14` on other hosts) and is
-/// never stored: the URL remains the identity.
+/// One pull-request / issue / plain link recorded against a session in the
+/// `session_refs` row table. `label` is derived from the kind and URL for
+/// display (`owner/repo#14`, `host/owner/repo#14`, or `host/path` for a
+/// plain link) and is never stored: the URL remains the identity.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct SessionRef {
-    /// `"pr"` or `"issue"`.
+    /// `"pr"`, `"issue"`, or `"link"`.
     pub kind: String,
     pub url: String,
     pub label: String,
@@ -898,9 +898,9 @@ pub(crate) const SESSION_REFS_UNSUPPORTED: &str = "this backend does not support
 /// Validate a link kind. The table stores only these two values.
 pub(crate) fn validate_ref_kind(kind: &str) -> Result<(), String> {
     match kind {
-        "pr" | "issue" => Ok(()),
+        "pr" | "issue" | "link" => Ok(()),
         other => Err(format!(
-            "unknown link kind {other:?}; expected \"pr\" or \"issue\""
+            "unknown link kind {other:?}; expected \"pr\", \"issue\", or \"link\""
         )),
     }
 }
@@ -947,8 +947,36 @@ pub fn session_ref_label(raw: &str) -> String {
     let Ok(parsed) = parse_ref_url(raw) else {
         return raw.to_owned();
     };
-    let host = url_host(&parsed);
-    let segments = url_segments(&parsed);
+    pr_issue_label(&parsed)
+}
+
+/// The display label for one stored link, respecting its kind. A plain
+/// `link` is always `host/path` (no `#N`); PRs and issues keep
+/// `owner/repo#N` / `host/owner/repo#N`.
+pub fn session_ref_label_for_kind(kind: &str, raw: &str) -> String {
+    let Ok(parsed) = parse_ref_url(raw) else {
+        return raw.to_owned();
+    };
+    if kind == "link" {
+        plain_link_label(&parsed)
+    } else {
+        pr_issue_label(&parsed)
+    }
+}
+
+fn plain_link_label(parsed: &url::Url) -> String {
+    let host = url_host(parsed);
+    let path = parsed.path().trim_matches('/');
+    if path.is_empty() {
+        host
+    } else {
+        format!("{host}/{path}")
+    }
+}
+
+fn pr_issue_label(parsed: &url::Url) -> String {
+    let host = url_host(parsed);
+    let segments = url_segments(parsed);
     let marker = segments.iter().position(|segment| {
         matches!(
             *segment,
@@ -977,12 +1005,7 @@ pub fn session_ref_label(raw: &str) -> String {
             }
         }
     }
-    let path = parsed.path().trim_matches('/');
-    if path.is_empty() {
-        host
-    } else {
-        format!("{host}/{path}")
-    }
+    plain_link_label(parsed)
 }
 
 /// Infer the kind for a full-URL escape-hatch link. Issue-shaped paths
@@ -4256,7 +4279,7 @@ impl SessionStore {
         Ok(rows
             .into_iter()
             .map(|(kind, url)| SessionRef {
-                label: session_ref_label(&url),
+                label: session_ref_label_for_kind(&kind, &url),
                 kind,
                 url,
             })
@@ -5422,6 +5445,20 @@ mod tests {
             session_ref_label("https://github.com/discord9/e-agent/compare/main...dev"),
             "github.com/discord9/e-agent/compare/main...dev"
         );
+        // A plain link is always host/path, even when its path contains a
+        // PR-shaped segment.
+        assert_eq!(
+            session_ref_label_for_kind("link", "https://example.com/docs/issues/9"),
+            "example.com/docs/issues/9"
+        );
+        assert_eq!(
+            session_ref_label_for_kind("link", "https://example.com/docs/x"),
+            "example.com/docs/x"
+        );
+        assert_eq!(
+            session_ref_label_for_kind("pr", "https://github.com/discord9/e-agent/pull/25"),
+            "discord9/e-agent#25"
+        );
     }
 
     #[test]
@@ -5438,6 +5475,12 @@ mod tests {
             parse_ref_url("https://user:secret@github.com/a/b/pull/1").unwrap_err(),
             "must not carry credentials"
         );
+    }
+
+    #[test]
+    fn link_is_a_valid_kind() {
+        assert!(validate_ref_kind("link").is_ok());
+        assert!(validate_ref_kind("commit").is_err());
     }
 
     #[test]

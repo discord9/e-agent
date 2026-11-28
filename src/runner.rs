@@ -4227,16 +4227,16 @@ impl SessionRunner {
                         continue;
                     }
                     self.prepare_web_attach();
-                    let waited = if call.name == "history"
-                        || call.name == "read_output"
-                        || call.name == "link_ref"
-                    {
+                    let waited = if matches!(
+                        call.name.as_str(),
+                        "history" | "read_output" | "link_ref" | "unlink_ref" | "list_refs"
+                    ) {
                         #[cfg(test)]
                         if let Some(hook) = self.before_read_only_tool.take() {
                             hook();
                         }
-                        // These runner-bound, read-only tools still use the
-                        // normal operation wait so attach/cancel remain live.
+                        // These runner-bound tools still use the normal
+                        // operation wait so attach/cancel remain live.
                         // Own the binding in the future to avoid borrowing the
                         // runner while its command receiver is mutably borrowed.
                         let store = self.store.clone();
@@ -4254,9 +4254,9 @@ impl SessionRunner {
                                     )
                                     .await?
                                 }
-                                "link_ref" => {
+                                "link_ref" | "unlink_ref" | "list_refs" => {
                                     crate::tools::link_ref::execute(
-                                        &store, &root, &session, &arguments,
+                                        &call.name, &store, &root, &session, &arguments,
                                     )
                                     .await?
                                 }

@@ -2137,7 +2137,8 @@ struct LinkBody {
 }
 
 /// `POST /api/sessions/{id}/refs` — add one link. A bare number is resolved
-/// through the workspace's `origin`; a URL's kind comes from its path.
+/// through the workspace's `origin`; a URL's kind comes from its path (or the
+/// explicit `kind`, which is how the editor records a plain `link`).
 async fn add_session_link(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -2146,12 +2147,19 @@ async fn add_session_link(
     let store = session_links_store(&state, &id).await?;
     let root = state.factory.root();
     let (kind, url) = match (body.kind, body.number, body.url) {
+        (Some(kind), Some(_), None) if kind == "link" => {
+            return Err(error(
+                StatusCode::BAD_REQUEST,
+                "kind \"link\" requires a `url` — a plain link has no number form".to_owned(),
+            ));
+        }
         (Some(kind), Some(number), None) => {
-            let url = crate::tools::link_ref::resolve_number(root, &kind, number)
+            let url = crate::tools::link_ref::resolve_number(root, &kind, number, None)
                 .await
                 .map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
             (kind, url)
         }
+        (Some(kind), None, Some(url)) => (kind, url),
         (None, None, Some(url)) => (
             crate::session_store::ref_kind_from_url(&url).to_owned(),
             url,
@@ -2159,7 +2167,7 @@ async fn add_session_link(
         _ => {
             return Err(error(
                 StatusCode::BAD_REQUEST,
-                "provide `kind` + `number`, or `url`".to_owned(),
+                "provide `kind` + `number`, `kind` + `url`, or `url`".to_owned(),
             ));
         }
     };

@@ -1,57 +1,97 @@
-//! `link_ref`: record, remove, or list the pull-request / issue links of
-//! THIS session. The URL is the identity; a bare number is resolved against
-//! the workspace's `origin` remote, and a full URL stays accepted as an
-//! escape hatch.
+//! Session PR/issue/plain links, split by verb: `link_ref` adds,
+//! `unlink_ref` removes, `list_refs` reads. The URL is the identity; a `kind` + `number`
+//! selector is resolved against the workspace's `origin` remote (or an
+//! explicit `repo`), and a full URL stays accepted as an escape hatch.
 
 use std::path::Path;
 
 use async_trait::async_trait;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::agent::{Tool, ToolOutput, ToolSpec};
-use crate::session_store::{SessionRef, SessionStore, ref_kind_from_url};
-use crate::tools::spec;
+use crate::session_store::{
+    SessionRef, SessionStore, parse_ref_url, ref_kind_from_url, session_ref_label_for_kind,
+};
 
-/// The registered tool. Zero state: the runner intercepts execution by name
-/// and binds the session's store/root/session.
+/// The three registered tools. Zero state: the runner intercepts execution
+/// by name and binds the session's store/root/session.
 pub(crate) struct LinkRef;
+pub(crate) struct UnlinkRef;
+pub(crate) struct ListRefs;
+
+/// The closed schema shared by `link_ref` and `unlink_ref`: exactly one of
+/// `kind` + `number` (with optional `repo`) or `url`.
+fn selector_spec(name: &str, description: &str) -> ToolSpec {
+    ToolSpec {
+        name: name.into(),
+        description: description.into(),
+        parameters: json!({
+            "type": "object",
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "kind": {
+                            "type": "string",
+                            "enum": ["pr", "issue"],
+                            "description": "which list the link belongs to"
+                        },
+                        "number": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "pull-request or issue number"
+                        },
+                        "repo": {
+                            "type": "string",
+                            "description": "optional owner/repo or host/owner/repo; defaults to this workspace's git origin"
+                        }
+                    },
+                    "required": ["kind", "number"],
+                    "additionalProperties": false
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "kind": {
+                            "type": "string",
+                            "enum": ["pr", "issue", "link"],
+                            "description": "explicit kind for a URL; `link` is a plain non-PR/issue link"
+                        },
+                        "url": {
+                            "type": "string",
+                            "description": "absolute http(s) URL; skips repository resolution"
+                        }
+                    },
+                    "required": ["kind", "url"],
+                    "additionalProperties": false
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "url": {
+                            "type": "string",
+                            "description": "absolute http(s) URL; skips repository resolution and infers pr/issue from the path"
+                        }
+                    },
+                    "required": ["url"],
+                    "additionalProperties": false
+                }
+            ]
+        }),
+    }
+}
 
 #[async_trait]
 impl Tool for LinkRef {
     fn spec(&self) -> ToolSpec {
-        spec(
+        selector_spec(
             "link_ref",
-            "Record, remove, or list a pull-request / issue link on THIS session. Use `pr: 25` \
-             or `issue: 22` and the number is resolved against the current workspace's git \
-             `origin` remote (never guessed); pass a full `url` only for another repository or \
-             host. `remove: true` removes the same identifier, `list: true` shows the current \
-             links without changing them. The result is \
-             {\"prs\": [\"owner/repo#25\"], \"issues\": [\"owner/repo#22\"]}.",
-            json!({
-                "pr": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "description": "pull-request number in this workspace's origin repository"
-                },
-                "issue": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "description": "issue number in this workspace's origin repository"
-                },
-                "url": {
-                    "type": "string",
-                    "description": "absolute http(s) URL (escape hatch for another repo or host)"
-                },
-                "remove": {
-                    "type": "boolean",
-                    "description": "remove this exact link instead of adding it (default false)"
-                },
-                "list": {
-                    "type": "boolean",
-                    "description": "return the current links without changing them (default false)"
-                }
-            }),
-            &[],
+            "Link this session to a pull request or issue. `kind` + `number` resolve against \
+             this workspace's git `origin` remote unless `repo` (owner/repo or \
+             host/owner/repo) names another repository; a full `url` replaces `kind` + \
+             `number` and skips repository resolution. `kind: \"link\"` records a plain \
+             non-PR/issue URL and requires `url`. Returns the session's current links: \
+             {\"prs\": [\"owner/repo#25\"], \"issues\": [\"owner/repo#22\"], \"links\": [\"host/path\"]}.",
         )
     }
 
@@ -60,138 +100,215 @@ impl Tool for LinkRef {
     }
 }
 
-/// One parsed `link_ref` call.
-enum Action {
-    List,
-    Add {
-        kind: &'static str,
+#[async_trait]
+impl Tool for UnlinkRef {
+    fn spec(&self) -> ToolSpec {
+        selector_spec(
+            "unlink_ref",
+            "Remove one pull-request or issue link from this session. Takes the same selectors \
+             as `link_ref`: `kind` + `number` (resolved against this workspace's git `origin` \
+             unless `repo` names another repository) or a full `url` (with `kind: \"link\"` \
+             for a plain link). Removing something that is not linked is an error naming it. \
+             Returns the session's current links: \
+             {\"prs\": [\"owner/repo#25\"], \"issues\": [\"owner/repo#22\"], \"links\": [\"host/path\"]}.",
+        )
+    }
+
+    async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
+        Err("unlink_ref is executed by the session runner".into())
+    }
+}
+
+#[async_trait]
+impl Tool for ListRefs {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "list_refs".into(),
+            description: "Return this session's current pull-request, issue, and plain links \
+                          without changing them. Takes no arguments. The result is \
+                          {\"prs\": [\"owner/repo#25\"], \"issues\": [\"owner/repo#22\"], \"links\": [\"host/path\"]}."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
+        Err("list_refs is executed by the session runner".into())
+    }
+}
+
+enum Selector {
+    Url {
         url: String,
+        /// Explicit `kind` when supplied; `None` infers pr/issue from the path.
+        kind: Option<&'static str>,
     },
-    Remove {
+    Number {
         kind: &'static str,
-        url: String,
-        number: Option<u64>,
+        number: u64,
+        repo: Option<String>,
     },
 }
 
-/// Execute one `link_ref` call with the runner-bound session context.
+struct Resolved {
+    kind: &'static str,
+    url: String,
+    /// How an absent link is named in an `unlink_ref` error.
+    display: String,
+}
+
+/// Execute one of the three tools with the runner-bound session context.
 pub(crate) async fn execute(
+    tool: &str,
     store: &SessionStore,
     root: &Path,
     session: &str,
     arguments: &Value,
 ) -> Result<String, String> {
-    // The backend check comes first: on JSONL even `pr: 25` must report the
+    // The backend check comes first: on JSONL every selector must report the
     // explicit unsupported error, never a git-resolution failure.
     if !store.supports_session_refs() {
         return Err(crate::session_store::SESSION_REFS_UNSUPPORTED.into());
     }
-    let action = parse_action(root, arguments).await?;
-    match action {
-        Action::List => Ok(render(
-            store
-                .list_refs(root, session)
-                .await
-                .map_err(|e| format!("{e:#}"))?,
-        )),
-        Action::Add { kind, url } => Ok(render(
-            store
-                .add_ref(root, session, kind, &url)
-                .await
-                .map_err(|e| format!("{e:#}"))?,
-        )),
-        Action::Remove { kind, url, number } => {
-            let refs = store
-                .list_refs(root, session)
-                .await
-                .map_err(|e| format!("{e:#}"))?;
-            if !refs.iter().any(|link| link.kind == kind && link.url == url) {
-                let what = if kind == "pr" { "PR" } else { "Issue" };
-                let identifier = number.map(|n| n.to_string()).unwrap_or(url);
-                return Err(format!("{what} {identifier} is not linked"));
-            }
-            Ok(render(
-                store
-                    .remove_ref(root, session, kind, &url)
-                    .await
-                    .map_err(|e| format!("{e:#}"))?,
-            ))
+    if tool == "list_refs" {
+        let object = arguments
+            .as_object()
+            .ok_or("list_refs arguments must be a JSON object")?;
+        if !object.is_empty() {
+            return Err("list_refs takes no arguments".into());
         }
+        return Ok(render(
+            store
+                .list_refs(root, session)
+                .await
+                .map_err(|e| format!("{e:#}"))?,
+        ));
     }
-}
-
-async fn parse_action(root: &Path, arguments: &Value) -> Result<Action, String> {
+    if tool != "link_ref" && tool != "unlink_ref" {
+        return Err(format!("unknown tool {tool:?}"));
+    }
     let object = arguments
         .as_object()
-        .ok_or("link_ref arguments must be a JSON object")?;
-    let list = optional_bool(object.get("list"), "list")?.unwrap_or(false);
-    let remove = optional_bool(object.get("remove"), "remove")?.unwrap_or(false);
-    let pr = optional_number(object.get("pr"), "pr")?;
-    let issue = optional_number(object.get("issue"), "issue")?;
-    let url = optional_string(object.get("url"), "url")?;
-
-    if list {
-        if remove || pr.is_some() || issue.is_some() || url.is_some() {
-            return Err("link_ref `list: true` cannot be combined with a link identifier".into());
+        .ok_or_else(|| format!("{tool} arguments must be a JSON object"))?;
+    let selector = parse_selector(tool, object)?;
+    let resolved = resolve_selector(root, selector).await?;
+    if tool == "unlink_ref" {
+        let refs = store
+            .list_refs(root, session)
+            .await
+            .map_err(|e| format!("{e:#}"))?;
+        if !refs
+            .iter()
+            .any(|link| link.kind == resolved.kind && link.url == resolved.url)
+        {
+            let what = match resolved.kind {
+                "pr" => "PR",
+                "issue" => "Issue",
+                _ => "Link",
+            };
+            return Err(format!("{what} {} is not linked", resolved.display));
         }
-        return Ok(Action::List);
+        return Ok(render(
+            store
+                .remove_ref(root, session, resolved.kind, &resolved.url)
+                .await
+                .map_err(|e| format!("{e:#}"))?,
+        ));
     }
-
-    let (kind, url, number) = match (pr, issue, url) {
-        (Some(_), Some(_), _) => {
-            return Err("link_ref takes either `pr` or `issue`, not both".into());
-        }
-        (Some(number), None, None) => (
-            "pr",
-            resolve_number(root, "pr", number).await?,
-            Some(number),
-        ),
-        (None, Some(number), None) => (
-            "issue",
-            resolve_number(root, "issue", number).await?,
-            Some(number),
-        ),
-        (None, None, Some(url)) => (ref_kind_from_url(&url), url, None),
-        (Some(_), None, Some(_)) | (None, Some(_), Some(_)) => {
-            return Err("link_ref takes either a number (`pr`/`issue`) or `url`, not both".into());
-        }
-        (None, None, None) => {
-            return Err(
-                "link_ref needs `pr: <number>`, `issue: <number>`, `url: <full URL>`, or `list: true`"
-                    .into(),
-            );
-        }
-    };
-
-    Ok(if remove {
-        Action::Remove { kind, url, number }
-    } else {
-        Action::Add { kind, url }
-    })
+    Ok(render(
+        store
+            .add_ref(root, session, resolved.kind, &resolved.url)
+            .await
+            .map_err(|e| format!("{e:#}"))?,
+    ))
 }
 
-/// Render the tool's public view: displayed labels split by kind.
+fn parse_selector(tool: &str, object: &Map<String, Value>) -> Result<Selector, String> {
+    let url = optional_string(object.get("url"), "url")?;
+    let repo = optional_string(object.get("repo"), "repo")?;
+    let kind = optional_string(object.get("kind"), "kind")?;
+    let number = optional_number(object.get("number"), "number")?;
+    match (url, kind, number) {
+        (Some(url), kind, None) => {
+            if repo.is_some() {
+                return Err(format!(
+                    "{tool} `repo` only applies to `kind` + `number`, not `url`"
+                ));
+            }
+            let kind = kind.as_deref().map(parse_kind).transpose()?;
+            Ok(Selector::Url { url, kind })
+        }
+        (None, Some(kind), Some(number)) => {
+            let kind = parse_kind(&kind)?;
+            if kind == "link" {
+                return Err(format!(
+                    "{tool} `kind`: \"link\" requires a `url` — a plain link has no number form; pass a full URL instead"
+                ));
+            }
+            Ok(Selector::Number { kind, number, repo })
+        }
+        (Some(_), _, Some(_)) => Err(format!(
+            "{tool} takes either `url` or `kind` + `number`, not both"
+        )),
+        _ => Err(format!(
+            "{tool} needs `kind` + `number` (optional `repo`), `kind` + `url`, or `url`"
+        )),
+    }
+}
+
+fn parse_kind(kind: &str) -> Result<&'static str, String> {
+    match kind {
+        "pr" => Ok("pr"),
+        "issue" => Ok("issue"),
+        "link" => Ok("link"),
+        other => Err(format!(
+            "unknown link kind {other:?}; expected \"pr\", \"issue\", or \"link\""
+        )),
+    }
+}
+
+async fn resolve_selector(root: &Path, selector: Selector) -> Result<Resolved, String> {
+    match selector {
+        Selector::Url { url, kind } => {
+            let parsed = parse_ref_url(&url)?;
+            let url = parsed.to_string();
+            let kind = kind.unwrap_or_else(|| ref_kind_from_url(&url));
+            Ok(Resolved {
+                kind,
+                display: session_ref_label_for_kind(kind, &url),
+                url,
+            })
+        }
+        Selector::Number { kind, number, repo } => {
+            let url = resolve_number(root, kind, number, repo.as_deref()).await?;
+            let display = match repo {
+                Some(repo) => format!("{repo}#{number}"),
+                None => number.to_string(),
+            };
+            Ok(Resolved { kind, url, display })
+        }
+    }
+}
+
+/// Render the public view shared by all three tools: displayed labels split
+/// by kind.
 fn render(refs: Vec<SessionRef>) -> String {
     let mut prs = Vec::new();
     let mut issues = Vec::new();
+    let mut links = Vec::new();
     for link in refs {
-        if link.kind == "pr" {
-            prs.push(link.label);
-        } else {
-            issues.push(link.label);
+        match link.kind.as_str() {
+            "pr" => prs.push(link.label),
+            "issue" => issues.push(link.label),
+            _ => links.push(link.label),
         }
     }
-    json!({ "prs": prs, "issues": issues }).to_string()
-}
-
-fn optional_bool(value: Option<&Value>, name: &str) -> Result<Option<bool>, String> {
-    value
-        .map(|value| {
-            value
-                .as_bool()
-                .ok_or_else(|| format!("link_ref `{name}` must be a boolean"))
-        })
-        .transpose()
+    json!({ "prs": prs, "issues": issues, "links": links }).to_string()
 }
 
 fn optional_number(value: Option<&Value>, name: &str) -> Result<Option<u64>, String> {
@@ -199,9 +316,9 @@ fn optional_number(value: Option<&Value>, name: &str) -> Result<Option<u64>, Str
         .map(|value| {
             let number = value
                 .as_u64()
-                .ok_or_else(|| format!("link_ref `{name}` must be a non-negative integer"))?;
+                .ok_or_else(|| format!("`{name}` must be a non-negative integer"))?;
             if number == 0 {
-                return Err(format!("link_ref `{name}` must be at least 1"));
+                return Err(format!("`{name}` must be at least 1"));
             }
             Ok(number)
         })
@@ -214,22 +331,56 @@ fn optional_string(value: Option<&Value>, name: &str) -> Result<Option<String>, 
             value
                 .as_str()
                 .map(str::to_owned)
-                .ok_or_else(|| format!("link_ref `{name}` must be a string"))
+                .ok_or_else(|| format!("`{name}` must be a string"))
         })
         .transpose()
 }
 
-/// Resolve `pr: N` / `issue: N` through the workspace's `origin` remote.
-///
-/// The number form is the primary path; every failure names the full-URL
-/// fallback instead of guessing a repository.
-pub(crate) async fn resolve_number(root: &Path, kind: &str, number: u64) -> Result<String, String> {
-    let remote = origin_remote(root).await?;
-    let (host, path) = parse_origin_remote(&remote).map_err(|_| {
-        format!("cannot read 'origin' ({remote}) as host/owner/repo — pass a full URL instead")
-    })?;
+/// Resolve `kind` + `number` through an explicit `repo` or the workspace's
+/// `origin` remote. Every failure names the full-URL fallback instead of
+/// guessing a repository.
+pub(crate) async fn resolve_number(
+    root: &Path,
+    kind: &str,
+    number: u64,
+    repo: Option<&str>,
+) -> Result<String, String> {
+    if kind != "pr" && kind != "issue" {
+        return Err(format!(
+            "unknown link kind {kind:?}; expected \"pr\" or \"issue\""
+        ));
+    }
+    let (host, path) = match repo {
+        Some(repo) => parse_repo_selector(repo)?,
+        None => {
+            let remote = origin_remote(root).await?;
+            parse_origin_remote(&remote).map_err(|_| {
+                format!(
+                    "cannot read 'origin' ({remote}) as host/owner/repo — pass a full URL instead"
+                )
+            })?
+        }
+    };
     let action = if kind == "pr" { "pull" } else { "issues" };
     Ok(format!("https://{host}/{path}/{action}/{number}"))
+}
+
+/// Parse an explicit `owner/repo` (default host `github.com`) or
+/// `host/owner/repo` selector.
+fn parse_repo_selector(repo: &str) -> Result<(String, String), String> {
+    let repo = repo.trim().trim_end_matches('/');
+    let repo = repo.strip_suffix(".git").unwrap_or(repo);
+    let parts: Vec<&str> = repo.split('/').collect();
+    let usable = |part: &str| !part.is_empty() && !part.chars().any(char::is_whitespace);
+    match parts.as_slice() {
+        [owner, name] if usable(owner) && usable(name) => {
+            Ok(("github.com".to_owned(), format!("{owner}/{name}")))
+        }
+        [host, owner, name] if usable(host) && usable(owner) && usable(name) => {
+            Ok((host.to_string(), format!("{owner}/{name}")))
+        }
+        _ => Err("`repo` must be owner/repo or host/owner/repo — pass a full URL instead".into()),
+    }
 }
 
 async fn origin_remote(root: &Path) -> Result<String, String> {
@@ -303,6 +454,26 @@ fn parse_origin_remote(remote: &str) -> Result<(String, String), ()> {
 }
 
 #[cfg(test)]
+fn git_workspace(origin: Option<&str>) -> tempfile::TempDir {
+    let temp = tempfile::tempdir().unwrap();
+    let status = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(temp.path())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    if let Some(origin) = origin {
+        let status = std::process::Command::new("git")
+            .args(["remote", "add", "origin", origin])
+            .current_dir(temp.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+    temp
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -352,33 +523,53 @@ mod tests {
 
     #[tokio::test]
     async fn number_form_resolves_against_origin() {
-        let temp = tempfile::tempdir().unwrap();
-        let status = std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(temp.path())
-            .status()
-            .unwrap();
-        assert!(status.success());
-        let status = std::process::Command::new("git")
-            .args(["remote", "add", "origin", "git@github.com:acme/widget.git"])
-            .current_dir(temp.path())
-            .status()
-            .unwrap();
-        assert!(status.success());
+        let temp = git_workspace(Some("git@github.com:acme/widget.git"));
         assert_eq!(
-            resolve_number(temp.path(), "pr", 25).await.unwrap(),
+            resolve_number(temp.path(), "pr", 25, None).await.unwrap(),
             "https://github.com/acme/widget/pull/25"
         );
         assert_eq!(
-            resolve_number(temp.path(), "issue", 22).await.unwrap(),
+            resolve_number(temp.path(), "issue", 22, None)
+                .await
+                .unwrap(),
             "https://github.com/acme/widget/issues/22"
         );
     }
 
     #[tokio::test]
+    async fn explicit_repo_skips_origin_resolution() {
+        let temp = tempfile::tempdir().unwrap(); // deliberately NOT a git repo
+        assert_eq!(
+            resolve_number(temp.path(), "pr", 25, Some("discord9/e-agent"))
+                .await
+                .unwrap(),
+            "https://github.com/discord9/e-agent/pull/25"
+        );
+        assert_eq!(
+            resolve_number(
+                temp.path(),
+                "issue",
+                22,
+                Some("gitlab.example.com/group/project")
+            )
+            .await
+            .unwrap(),
+            "https://gitlab.example.com/group/project/issues/22"
+        );
+        assert_eq!(
+            parse_repo_selector("acme/widget").unwrap(),
+            ("github.com".to_owned(), "acme/widget".to_owned())
+        );
+        assert!(parse_repo_selector("owner").is_err());
+        assert!(parse_repo_selector("host/owner/repo/extra").is_err());
+    }
+
+    #[tokio::test]
     async fn number_form_without_git_repo_errors_readably() {
         let temp = tempfile::tempdir().unwrap();
-        let error = resolve_number(temp.path(), "pr", 1).await.unwrap_err();
+        let error = resolve_number(temp.path(), "pr", 1, None)
+            .await
+            .unwrap_err();
         assert_eq!(
             error,
             format!(
@@ -390,14 +581,10 @@ mod tests {
 
     #[tokio::test]
     async fn number_form_without_origin_errors_readably() {
-        let temp = tempfile::tempdir().unwrap();
-        let status = std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(temp.path())
-            .status()
-            .unwrap();
-        assert!(status.success());
-        let error = resolve_number(temp.path(), "issue", 22).await.unwrap_err();
+        let temp = git_workspace(None);
+        let error = resolve_number(temp.path(), "issue", 22, None)
+            .await
+            .unwrap_err();
         assert_eq!(
             error,
             format!(
@@ -409,20 +596,10 @@ mod tests {
 
     #[tokio::test]
     async fn unparsable_origin_names_the_raw_remote() {
-        let temp = tempfile::tempdir().unwrap();
-        let status = std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(temp.path())
-            .status()
-            .unwrap();
-        assert!(status.success());
-        let status = std::process::Command::new("git")
-            .args(["remote", "add", "origin", "/local/path/repo"])
-            .current_dir(temp.path())
-            .status()
-            .unwrap();
-        assert!(status.success());
-        let error = resolve_number(temp.path(), "pr", 25).await.unwrap_err();
+        let temp = git_workspace(Some("/local/path/repo"));
+        let error = resolve_number(temp.path(), "pr", 25, None)
+            .await
+            .unwrap_err();
         assert_eq!(
             error,
             "cannot read 'origin' (/local/path/repo) as host/owner/repo — pass a full URL instead"
@@ -447,61 +624,186 @@ mod tool_tests {
                 url: "https://gitlab.com/acme/widget/-/issues/22".into(),
                 label: "gitlab.com/acme/widget#22".into(),
             },
+            SessionRef {
+                kind: "link".into(),
+                url: "https://example.com/docs/x".into(),
+                label: "example.com/docs/x".into(),
+            },
         ]);
         assert_eq!(
             rendered,
-            r#"{"prs":["acme/widget#25"],"issues":["gitlab.com/acme/widget#22"]}"#
+            r#"{"prs":["acme/widget#25"],"issues":["gitlab.com/acme/widget#22"],"links":["example.com/docs/x"]}"#
         );
     }
 
     #[tokio::test]
     async fn jsonl_reports_unsupported_before_touching_git() {
         let temp = tempfile::tempdir().unwrap();
-        let error = execute(&SessionStore::Jsonl, temp.path(), "s", &json!({"pr": 25}))
-            .await
-            .unwrap_err();
-        assert_eq!(
-            error, "this backend does not support session links",
-            "a JSONL workspace must not be probed for git"
-        );
+        for (tool, arguments) in [
+            ("link_ref", json!({"kind": "pr", "number": 25})),
+            ("unlink_ref", json!({"kind": "pr", "number": 25})),
+            ("list_refs", json!({})),
+        ] {
+            let error = execute(tool, &SessionStore::Jsonl, temp.path(), "s", &arguments)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error, "this backend does not support session links",
+                "{tool} must not probe git on JSONL"
+            );
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    async fn in_memory_store() -> SessionStore {
+        let session = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::session_sqlite::SqliteSession::connect(":memory:", "workspace", "s")
+                .await
+                .expect("in-memory SQLite"),
+        ));
+        SessionStore::Sqlite {
+            session,
+            path: ":memory:".into(),
+        }
     }
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
-    async fn remove_of_an_unlinked_number_names_it() {
-        let temp = tempfile::tempdir().unwrap();
-        let status = std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(temp.path())
-            .status()
-            .unwrap();
-        assert!(status.success());
-        let status = std::process::Command::new("git")
-            .args(["remote", "add", "origin", "git@github.com:acme/widget.git"])
-            .current_dir(temp.path())
-            .status()
-            .unwrap();
-        assert!(status.success());
-        let store = SessionStore::Sqlite {
-            session: std::sync::Arc::new(tokio::sync::Mutex::new(
-                crate::session_sqlite::SqliteSession::connect(":memory:", "workspace", "s")
-                    .await
-                    .unwrap(),
-            )),
-            path: ":memory:".into(),
-        };
-        let error = execute(&store, temp.path(), "s", &json!({"pr": 25, "remove": true}))
+    async fn link_then_list_then_unlink_round_trip() {
+        let store = in_memory_store().await;
+        let temp = git_workspace(Some("git@github.com:discord9/e-agent.git"));
+        let root = temp.path();
+        let linked = execute(
+            "link_ref",
+            &store,
+            root,
+            "s",
+            &json!({"kind": "pr", "number": 25}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            linked,
+            r#"{"prs":["discord9/e-agent#25"],"issues":[],"links":[]}"#
+        );
+        let listed = execute("list_refs", &store, root, "s", &json!({}))
             .await
-            .unwrap_err();
+            .unwrap();
+        assert_eq!(listed, linked);
+        let unlinked = execute(
+            "unlink_ref",
+            &store,
+            root,
+            "s",
+            &json!({"url": "https://github.com/discord9/e-agent/pull/25"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(unlinked, r#"{"prs":[],"issues":[],"links":[]}"#);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn unlink_of_an_unlinked_number_names_it() {
+        let store = in_memory_store().await;
+        let temp = git_workspace(Some("git@github.com:discord9/e-agent.git"));
+        let root = temp.path();
+        let error = execute(
+            "unlink_ref",
+            &store,
+            root,
+            "s",
+            &json!({"kind": "pr", "number": 25}),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(error, "PR 25 is not linked");
         let error = execute(
+            "unlink_ref",
             &store,
-            temp.path(),
+            root,
             "s",
-            &json!({"issue": 22, "remove": true}),
+            &json!({"kind": "issue", "number": 22}),
         )
         .await
         .unwrap_err();
         assert_eq!(error, "Issue 22 is not linked");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn plain_link_round_trip_uses_host_path_label() {
+        let store = in_memory_store().await;
+        let root = std::path::Path::new("/not-a-repo");
+        let linked = execute(
+            "link_ref",
+            &store,
+            root,
+            "s",
+            &json!({"kind": "link", "url": "https://example.com/docs/x"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            linked,
+            r#"{"prs":[],"issues":[],"links":["example.com/docs/x"]}"#
+        );
+        let listed = execute("list_refs", &store, root, "s", &json!({}))
+            .await
+            .unwrap();
+        assert_eq!(listed, linked);
+        let unlinked = execute(
+            "unlink_ref",
+            &store,
+            root,
+            "s",
+            &json!({"kind": "link", "url": "https://example.com/docs/x"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(unlinked, r#"{"prs":[],"issues":[],"links":[]}"#);
+        let error = execute(
+            "unlink_ref",
+            &store,
+            root,
+            "s",
+            &json!({"kind": "link", "url": "https://example.com/docs/x"}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, "Link example.com/docs/x is not linked");
+    }
+
+    #[test]
+    fn selectors_are_exclusive_and_closed() {
+        let parse = |value: Value| {
+            let object = value.as_object().unwrap();
+            parse_selector("link_ref", object)
+        };
+        assert!(matches!(
+            parse(json!({"url": "https://github.com/a/b/pull/1"})).unwrap(),
+            Selector::Url { kind: None, .. }
+        ));
+        assert!(matches!(
+            parse(json!({"kind": "link", "url": "https://example.com/docs/x"})).unwrap(),
+            Selector::Url {
+                kind: Some("link"),
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse(json!({"kind": "pr", "number": 1})).unwrap(),
+            Selector::Number { .. }
+        ));
+        for invalid in [
+            json!({"kind": "pr", "number": 1, "url": "https://github.com/a/b/pull/1"}),
+            json!({"url": "https://github.com/a/b/pull/1", "repo": "a/b"}),
+            json!({"kind": "pr"}),
+            json!({"kind": "link", "number": 1}),
+            json!({"kind": "commit", "number": 1}),
+            json!({}),
+        ] {
+            assert!(parse(invalid.clone()).is_err(), "{invalid}");
+        }
     }
 }

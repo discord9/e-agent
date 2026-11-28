@@ -446,6 +446,7 @@
   }
   .chat-ref-chip.pr { border-color: var(--green); }
   .chat-ref-chip.issue { border-color: var(--blue); }
+  .chat-ref-chip.link { border-color: var(--yellow); }
   .chat-ref-chip a { color: var(--base02); text-decoration: none; }
   .chat-ref-chip a:hover { color: var(--blue); text-decoration: underline; }
   .chat-ref-remove {

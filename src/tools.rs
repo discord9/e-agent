@@ -498,8 +498,10 @@ fn tools_with_background_and_web_search(
     tools.push(Box::new(History));
     // Session links are runner-intercepted for the same reason: the row is
     // keyed by the runner's workspace/session, and number resolution runs
-    // against its root.
+    // against its root. The verb is part of each tool name.
     tools.push(Box::new(link_ref::LinkRef));
+    tools.push(Box::new(link_ref::UnlinkRef));
+    tools.push(Box::new(link_ref::ListRefs));
     tools
 }
 

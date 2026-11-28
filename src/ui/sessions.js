@@ -968,7 +968,7 @@ function syncDocumentTitle() {
 }
 
 /* =====================================================================
- * 会话 PR/issue 链接（顶部 chip + 内联编辑器）
+ * 会话 PR/issue/普通链接（顶部 chip + 内联编辑器）
  * ===================================================================*/
 
 /* 打开会话时拉取；supported=false（JSONL）时整个编辑区隐藏。 */
@@ -1019,7 +1019,8 @@ function renderChatRefs() {
   }
   host.hidden = false;
   for (const ref of st.refs) {
-    const chip = el("span", "chat-ref-chip " + (ref.kind === "issue" ? "issue" : "pr"));
+    const kindClass = ref.kind === "issue" ? "issue" : (ref.kind === "link" ? "link" : "pr");
+    const chip = el("span", "chat-ref-chip " + kindClass);
     const link = el("a", "chat-ref-link", ref.label || ref.url);
     link.href = ref.url;
     link.target = "_blank";
@@ -1039,7 +1040,7 @@ function renderChatRefs() {
   }
   const add = el("button", "chat-ref-add", st.editorOpen ? "关闭" : "+ 链接");
   add.type = "button";
-  add.title = "添加 PR / issue 链接";
+  add.title = "添加 PR / issue / 普通链接";
   add.addEventListener("click", () => {
     st.editorOpen = !st.editorOpen;
     st.error = "";
@@ -1055,18 +1056,27 @@ function buildChatRefEditor(st) {
   const form = el("span", "chat-ref-editor");
   const select = document.createElement("select");
   select.className = "chat-ref-kind";
-  for (const [value, label] of [["pr", "PR"], ["issue", "Issue"]]) {
+  for (const [value, label] of [["pr", "PR"], ["issue", "Issue"], ["link", "链接"]]) {
     const option = document.createElement("option");
     option.value = value;
     option.textContent = label;
     select.append(option);
   }
-  select.value = st.kind === "issue" ? "issue" : "pr";
-  select.addEventListener("change", () => { st.kind = select.value; });
+  select.value = st.kind === "issue" ? "issue" : (st.kind === "link" ? "link" : "pr");
   const input = document.createElement("input");
   input.className = "chat-ref-input";
   input.type = "text";
-  input.placeholder = "25 或 https://github.com/owner/repo/pull/25";
+  const applyPlaceholder = () => {
+    input.placeholder = select.value === "link"
+      ? "https://example.com/docs/x（仅接受 URL）"
+      : "25 或 https://github.com/owner/repo/pull/25";
+  };
+  select.addEventListener("change", () => {
+    st.kind = select.value;
+    st.error = "";
+    applyPlaceholder();
+  });
+  applyPlaceholder();
   input.value = st.draft || "";
   input.addEventListener("input", () => { st.draft = input.value; });
   const submit = el("button", "chat-ref-submit", st.busy ? "添加中…" : "添加");
@@ -1101,15 +1111,24 @@ async function submitChatRef(kind, raw) {
   st.kind = kind;
   st.draft = raw == null ? "" : String(raw);
   if (!text) {
-    st.error = "请输入 PR/issue 编号或完整 URL";
+    st.error = kind === "link" ? "请输入完整链接 URL" : "请输入 PR/issue 编号或完整 URL";
     st.editorOpen = true;
+    renderChatRefs();
+    return;
+  }
+  if (kind === "link" && /^\d+$/.test(text)) {
+    st.error = "纯链接需要完整的 http(s) URL，不能只填编号";
+    st.editorOpen = true;
+    st.busy = false;
     renderChatRefs();
     return;
   }
   st.busy = true;
   st.error = "";
   renderChatRefs();
-  const body = /^\d+$/.test(text) ? { kind, number: Number(text) } : { url: text };
+  const body = /^\d+$/.test(text)
+    ? { kind, number: Number(text) }
+    : (kind === "link" ? { kind: "link", url: text } : { url: text });
   try {
     const res = await api("/api/sessions/" + encodeURIComponent(id) + "/refs", {
       method: "POST",
