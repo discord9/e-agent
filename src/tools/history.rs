@@ -398,7 +398,13 @@ fn scoped_entry(entry: &HistoryEntry) -> Value {
 /// still pairs them without handing a later model one wire's signature or
 /// correlation token. Applies to every entry shape, including a compaction's
 /// retained messages.
-fn public_entry(entry: &SessionEntry) -> Value {
+///
+/// This is THE public projection, shared with the server's history page and
+/// web bootstrap: the stored rows keep the signature (replay needs it) while
+/// everything that crosses to a client goes through here — otherwise a client
+/// would index a bootstrapped call by its wire id while the live result carries
+/// the digest.
+pub(crate) fn public_entry(entry: &SessionEntry) -> Value {
     let mut value = serde_json::to_value(entry).unwrap_or(Value::Null);
     strip_private(&mut value);
     value

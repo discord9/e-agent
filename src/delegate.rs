@@ -245,10 +245,17 @@ impl Tool for SendMessage {
                     .into_iter()
                     .find_map(|(_, entry)| (entry.session_id == target).then_some(entry))
                     .ok_or_else(|| {
+                        // The target may be a background task number rather
+                        // than a session id, so the resume placeholder stays
+                        // literal: echoing the caller's own target back as
+                        // `resume: "<target>"` would just fail again.
                         format!(
-                            "target `{target}` is not a live child session; to continue a finished \
-                             child, use the `delegate` tool with `resume: \"{target}\"`, a fresh \
-                             `task`, and the original `role`/`workspace` if the task used them"
+                            "target `{target}` is not a live child session. Pass the exact \
+                             `sub-...` session id printed after `subagent session:` in the \
+                             delegate result — a background task number such as `#123` is not a \
+                             session id. To continue a finished child, use the `delegate` tool \
+                             with `resume: \"<session id>\"`, a fresh `task`, and the original \
+                             `role`/`workspace` if the task used them."
                         )
                     })?;
                 entry

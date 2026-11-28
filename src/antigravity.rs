@@ -27,12 +27,15 @@
 //! stream does not always send one, and text has no side effect — truncation is
 //! caught by the framing instead.
 //!
-//! A request carries the CLI's own envelope (`requestType`, `requestId`, and a
+//! A request carries the CLI's own envelope (`requestType`, `requestId` — its
+//! conversation segment is the SESSION's, never a clone's — and a
 //! conversation-derived `request.sessionId`) and a DISCOVERED `project`:
-//! `loadCodeAssist` (once per instance, see `project_id`) names the account's
-//! `cloudaicompanionProject` — a real id for GCP/Workspace, the consumer
-//! literal [`PROJECT`] for `agy`'s own — and anything less falls back to that
-//! literal without failing the turn.
+//! `loadCodeAssist` (once per process for one login, see `project_id`) names
+//! the account's `cloudaicompanionProject` — a real id for GCP/Workspace, the
+//! consumer literal [`PROJECT`] for `agy`'s own — and anything less falls back
+//! to that literal without failing the turn. A 401 refreshes the bearer and
+//! rediscovers the project with it, so the retried body cannot post a fallback
+//! project under a fresh token.
 //! The body is repaired rather than refused where the wire tolerates it (empty
 //! parts, missing call/response ids, a drifted response name, a missing tool
 //! schema), and a 404 for a flash model is retried ONCE against that family's
@@ -158,6 +161,96 @@ fn login_fingerprint(refresh_token: &str) -> String {
         .encode(Sha256::digest(refresh_token.as_bytes()))
 }
 
+/// The SELECTED `agy` login and e-agent's bound cache, read as ONE snapshot
+/// (`credentials`), so the bearer and the account it belongs to always agree.
+struct Tokens {
+    cached: Option<StoredToken>,
+    cli: StoredToken,
+}
+
+impl Tokens {
+    /// [`login_fingerprint`] of the account these tokens belong to: the CLI
+    /// refresh credential, or the CLI access token when that file carries no
+    /// refresh credential. Never the credential itself.
+    fn login(&self) -> String {
+        self.cli
+            .refresh_token
+            .as_deref()
+            .map(login_fingerprint)
+            .unwrap_or_else(|| login_fingerprint(&self.cli.access_token))
+    }
+}
+
+/// One credential to spend on one request: the bearer AND the login it belongs
+/// to. [`AntigravityModel::access_token`] / [`AntigravityModel::refresh`] read
+/// both together; project discovery is keyed by `login`, so a re-login between
+/// two separate reads could otherwise cache one account's project under
+/// another, or post the fallback project with a refreshed bearer.
+struct Credential {
+    token: String,
+    login: String,
+}
+
+/// The `cloudaicompanionProject` discovered for one (discovery endpoint,
+/// `agy` login), as an async once cell.
+type ProjectCell = std::sync::Arc<tokio::sync::OnceCell<String>>;
+
+/// Project discovery shared by EVERY [`AntigravityModel`] in this process.
+/// Separately constructed models — the session factory builds one per session
+/// from the same profile — would otherwise each run `loadCodeAssist` for the
+/// same account. Keyed by (endpoint, [`Credential::login`]) rather than by
+/// login alone: a project id belongs to the endpoint that reported it, and a
+/// login switch selects another cell.
+static PROJECTS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<(String, String), ProjectCell>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// The shared cell for one (endpoint, login): created once, cloned out under
+/// the lock, awaited outside it.
+fn project_cell(endpoint: &str, login: &str) -> ProjectCell {
+    let mut projects = PROJECTS.lock().unwrap();
+    projects
+        .entry((endpoint.to_owned(), login.to_owned()))
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::OnceCell::new()))
+        .clone()
+}
+
+/// `<conversation>` of every `requestId`: the SESSION this model belongs to.
+/// The runner binds it through `Model::set_request_session_id` with an id
+/// hashed from (workspace, session), so two sessions — including two agents
+/// built from ONE cloned configured profile, and two sessions of the same `agy`
+/// login — never send the same conversation segment.
+///
+/// An unbound model (a bare unit-test model) falls back to its first turn's
+/// contents, frozen for that instance; a clone starts fresh, so cloning can
+/// never hand one instance's id to another.
+#[derive(Default)]
+struct Conversation {
+    session: Option<String>,
+    frozen: std::sync::OnceLock<String>,
+}
+
+impl Clone for Conversation {
+    fn clone(&self) -> Self {
+        Self {
+            session: self.session.clone(),
+            frozen: Default::default(),
+        }
+    }
+}
+
+impl Conversation {
+    /// The segment for a request whose contents hash to `digest`: the bound
+    /// session's id (UUID-shaped, so `requestId` keeps the CLI's shape), else
+    /// this instance's frozen first-turn digest.
+    fn segment(&self, digest: [u8; 16]) -> String {
+        match &self.session {
+            Some(session) => uuid_like(digest16(session.as_bytes())),
+            None => self.frozen.get_or_init(|| uuid_like(digest)).clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct StoredToken {
     access_token: String,
@@ -199,20 +292,13 @@ pub struct AntigravityModel {
     /// Start time of the last request, shared by clones: the pacer's only
     /// state. Never held across a network call (see [`Self::pace`]).
     last_request: std::sync::Arc<tokio::sync::Mutex<Option<Instant>>>,
-    /// `<conversation>` of every `requestId`: derived from the FIRST turn's
-    /// contents and then frozen, so each turn of the session — and every clone
-    /// of this model — sends the same conversation segment.
-    conversation: std::sync::Arc<std::sync::OnceLock<String>>,
+    /// `<conversation>` of every `requestId`: the SESSION this model belongs
+    /// to, bound by the runner through `Model::set_request_session_id` (see
+    /// [`Conversation`]). Never one id for two sessions: the session factory
+    /// clones one configured profile into several agents.
+    conversation: Conversation,
     /// The generation host's `loadCodeAssist` (see [`LOAD_ASSIST_URL`]).
     load_assist_url: String,
-    /// The project id every body carries: discovered ONCE per selected `agy`
-    /// LOGIN by [`Self::project_id`], [`PROJECT`] on a discovery that produced
-    /// nothing. Switching logins selects a different entry; a clone shares it.
-    project: std::sync::Arc<
-        std::sync::Mutex<
-            std::collections::HashMap<String, std::sync::Arc<tokio::sync::OnceCell<String>>>,
-        >,
-    >,
     /// Whether this profile takes images (profile `vision`, default TRUE).
     /// `supports_vision` reports it and `complete` gates on it.
     vision: bool,
@@ -259,15 +345,13 @@ impl AntigravityModel {
             min_interval: Duration::from_millis(min_interval_ms.unwrap_or(DEFAULT_MIN_INTERVAL_MS)),
             last_request: Default::default(),
             conversation: Default::default(),
-            project: Default::default(),
             vision: true,
             image_store: crate::agent::image_store_dir(),
         })
     }
 
-    /// The two ids a `requestId` carries: the session's CONVERSATION id
-    /// (UUID-shaped, derived from the first turn's contents and then frozen for
-    /// this model instance) and this TURN's trajectory id (derived from this
+    /// The two ids a `requestId` carries: the SESSION's CONVERSATION id (see
+    /// [`Conversation`]) and this TURN's trajectory id (derived from this
     /// turn's contents, so a retry reuses it and the next turn does not).
     fn turn_ids(&self, request: &Value) -> (String, String) {
         let contents = request["request"]["contents"]
@@ -275,48 +359,23 @@ impl AntigravityModel {
             .map(Vec::as_slice)
             .unwrap_or(&[]);
         let digest = conversation_digest(contents);
-        let conversation = self.conversation.get_or_init(|| uuid_like(digest)).clone();
-        (conversation, uuid_like(digest))
+        (self.conversation.segment(digest), uuid_like(digest))
     }
 
-    /// Binding identity of the SELECTED `agy` login: the fingerprint of its
-    /// refresh credential (or of its access token when the file carries no
-    /// refresh credential), never the credential itself. Project discovery is
-    /// cached per key, so switching `agy` accounts cannot keep posting the
-    /// previous account's project.
-    fn selected_login(&self) -> anyhow::Result<String> {
-        let (_, cli) = self.credentials()?;
-        Ok(cli
-            .refresh_token
-            .as_deref()
-            .map(login_fingerprint)
-            .unwrap_or_else(|| login_fingerprint(&cli.access_token)))
-    }
-
-    /// The project id one request body carries, discovered once per selected
-    /// `agy` login by [`Self::discover_project`]. Each login has its own async
-    /// once cell under a shared map, so two concurrent sessions/clones cannot
-    /// both discover, and a switch to another account selects another cell.
-    async fn project_id(&self, token: &str) -> String {
-        let login = match self.selected_login() {
-            Ok(login) => login,
-            // `access_token` already required the CLI file; this is defensive.
-            Err(_) => return PROJECT.to_owned(),
-        };
-        let cell = {
-            let mut projects = self.project.lock().unwrap();
-            projects
-                .entry(login)
-                .or_insert_with(|| std::sync::Arc::new(tokio::sync::OnceCell::new()))
-                .clone()
-        };
+    /// The project id one request body carries, discovered once per
+    /// (endpoint, selected `agy` login) by [`Self::discover_project`]. The
+    /// cells are PROCESS-wide (see [`project_cell`]), so two separately
+    /// constructed models of the same login cannot both discover, and a login
+    /// switch selects another cell.
+    async fn project_id(&self, credential: &Credential) -> String {
+        let cell = project_cell(&self.load_assist_url, &credential.login);
         cell.get_or_try_init(|| async {
             // A discovery that produced nothing is cached as the literal too:
             // the project does not change within one login, and a definitive
             // empty answer must not be retried on every turn. An authentication
-            // or transport failure is NOT cached: a later turn may carry a
+            // or transport failure is NOT cached: a later request may carry a
             // refreshed token and discover the real project.
-            self.discover_project(token)
+            self.discover_project(&credential.token)
                 .await
                 .map(|project| project.unwrap_or_else(|| PROJECT.to_owned()))
         })
@@ -449,7 +508,11 @@ impl AntigravityModel {
     /// account. A corrupt/missing CLI file is an error rather than masked by
     /// the cache — without the CLI credential e-agent cannot tell which
     /// account the cache belongs to, and `agy` is one command away.
-    fn credentials(&self) -> anyhow::Result<(Option<StoredToken>, StoredToken)> {
+    ///
+    /// Both files are read ONCE here: [`Self::Tokens::login`] and the bearer
+    /// every caller uses come from this one snapshot, so a re-login between
+    /// two reads cannot pair one account's project with another's bearer.
+    fn credentials(&self) -> anyhow::Result<Tokens> {
         let cli = read_token(&self.token_file)?.ok_or_else(|| {
             anyhow!(
                 "Antigravity CLI token file {} is missing; run `agy` to log in",
@@ -462,29 +525,40 @@ impl AntigravityModel {
             .flatten()
             .filter(|cache| cache.cli_fingerprint.is_some() && cache.cli_fingerprint == fingerprint)
             .map(|cache| cache.token);
-        Ok((cached, cli.token))
+        Ok(Tokens {
+            cached,
+            cli: cli.token,
+        })
     }
 
-    /// A token to spend now: a stored one while still usable (the bound cache
-    /// first, then the CLI's), else a refresh.
-    async fn access_token(&mut self) -> anyhow::Result<String> {
-        let (cached, cli) = self.credentials()?;
-        match [cached, Some(cli)]
+    /// A credential to spend now: a stored bearer while still usable (the bound
+    /// cache first, then the CLI's), else a refresh. `login` is the fingerprint
+    /// of the account that bearer belongs to, taken from the same read.
+    async fn access_token(&mut self) -> anyhow::Result<Credential> {
+        let tokens = self.credentials()?;
+        let login = tokens.login();
+        match [tokens.cached, Some(tokens.cli)]
             .into_iter()
             .flatten()
             .find(StoredToken::usable)
         {
-            Some(token) => Ok(token.access_token),
+            Some(token) => Ok(Credential {
+                token: token.access_token,
+                login,
+            }),
             None => self.refresh().await,
         }
     }
 
     /// Exchange the refresh credential of the SELECTED login for a fresh
     /// access token and cache it in e-agent's own config dir, bound to that
-    /// login's fingerprint. The CLI's file is never written.
-    async fn refresh(&mut self) -> anyhow::Result<String> {
-        let (cached, cli) = self.credentials()?;
-        let cli_refresh = cli.refresh_token.clone().ok_or_else(|| {
+    /// login's fingerprint. The CLI's file is never written. The returned
+    /// [`Credential`] carries the login fingerprint read in the SAME snapshot,
+    /// so the project discovered for it can never belong to another account.
+    async fn refresh(&mut self) -> anyhow::Result<Credential> {
+        let tokens = self.credentials()?;
+        let login = tokens.login();
+        let cli_refresh = tokens.cli.refresh_token.clone().ok_or_else(|| {
             anyhow!(
                 "Antigravity CLI token file {} has no refresh_token; run `agy` to log in again",
                 self.token_file.display()
@@ -492,7 +566,8 @@ impl AntigravityModel {
         })?;
         // The bound cache may hold a rotated refresh token for the same login;
         // an unbound cache was already dropped by `credentials`.
-        let refresh_token = cached
+        let refresh_token = tokens
+            .cached
             .and_then(|token| token.refresh_token)
             .unwrap_or_else(|| cli_refresh.clone());
         // The consumer client that may spend this credential is the `agy`
@@ -586,7 +661,10 @@ impl AntigravityModel {
             // Not fatal, but the operator should know why every turn refreshes.
             tracing::warn!("cannot cache the Antigravity token: {error:#}");
         }
-        Ok(token.access_token)
+        Ok(Credential {
+            token: token.access_token,
+            login,
+        })
     }
 
     /// The full wire body for one turn. Fails when the tool batch being
@@ -770,6 +848,13 @@ impl AntigravityModel {
 
 #[async_trait::async_trait]
 impl Model for AntigravityModel {
+    /// Bind this model to its SESSION: the conversation segment of every
+    /// `requestId` is derived from it (see [`Conversation`]), so agents that
+    /// share one configured profile never share a conversation id.
+    fn set_request_session_id(&mut self, id: &str) {
+        self.conversation.session = Some(id.to_owned());
+    }
+
     fn name(&self) -> &str {
         self.name()
     }
@@ -797,11 +882,14 @@ impl Model for AntigravityModel {
         let (conversation, trajectory) = self.turn_ids(&request);
         let mut step = 0;
         set_request_id(&mut request, &conversation, &trajectory, step);
-        let mut token = self.access_token().await?;
+        // ONE credential snapshot (bearer + the login it belongs to) for the
+        // whole turn: the project discovered for that login is what this
+        // bearer posts.
+        let mut credential = self.access_token().await?;
         // The builder's `project` is the fallback; the discovered id replaces
         // it here, before the first POST, and rides every retry below too.
-        request["project"] = json!(self.project_id(&token).await);
-        let mut response = self.send(&token, &request).await?;
+        request["project"] = json!(self.project_id(&credential).await);
+        let mut response = self.send(&credential.token, &request).await?;
         // Three one-shot budgets, all kept ACROSS transitions: a 401 first
         // seen on the `-tiered` POST still refreshes, a 404 first seen after
         // a refresh still falls back, and both retries spend the ACTIVE token
@@ -814,10 +902,15 @@ impl Model for AntigravityModel {
             match response.status() {
                 reqwest::StatusCode::UNAUTHORIZED if !refreshed => {
                     refreshed = true;
-                    token = self.refresh().await?;
+                    credential = self.refresh().await?;
+                    // The bearer changed, so the PROJECT is recomputed with it:
+                    // discovery is never cached for a 401, so the refreshed
+                    // token can still discover the real id, and a login switch
+                    // between the two reads selects the new account's cell.
+                    request["project"] = json!(self.project_id(&credential).await);
                     step += 1;
                     set_request_id(&mut request, &conversation, &trajectory, step);
-                    response = self.send(&token, &request).await?;
+                    response = self.send(&credential.token, &request).await?;
                 }
                 reqwest::StatusCode::NOT_FOUND if !tiered => {
                     // One bounded fallback, never a loop: this client version
@@ -833,7 +926,7 @@ impl Model for AntigravityModel {
                     request["model"] = json!(fallback);
                     step += 1;
                     set_request_id(&mut request, &conversation, &trajectory, step);
-                    response = self.send(&token, &request).await?;
+                    response = self.send(&credential.token, &request).await?;
                 }
                 reqwest::StatusCode::TOO_MANY_REQUESTS if !rate_retried => {
                     // The body is classified and then DROPPED (see `Rate429`):
@@ -858,7 +951,7 @@ impl Model for AntigravityModel {
                     rate_retried = true;
                     step += 1;
                     set_request_id(&mut request, &conversation, &trajectory, step);
-                    response = self.send(&token, &request).await?;
+                    response = self.send(&credential.token, &request).await?;
                 }
                 _ => break,
             }
@@ -898,7 +991,8 @@ impl Model for AntigravityModel {
                 turn.absorb(&element, &mut *emit)?;
             }
         }
-        // A clean EOF is not a success on its own: the array must have closed.
+        // A clean EOF is not a success on its own: the last SSE event must
+        // have been dispatched, so a half-read frame at EOF fails the turn.
         scanner.finish()?;
         turn.finish()
     }
@@ -951,9 +1045,9 @@ impl QuotaBucket {
 /// an error and the next turn refreshes it as usual.
 pub(crate) async fn quota_summary() -> anyhow::Result<Vec<QuotaBucket>> {
     let mut model = AntigravityModel::new(String::new(), None, None, None, None)?;
-    let token = model.access_token().await?;
-    let project = model.project_id(&token).await;
-    quota_summary_at(&model.client, QUOTA_URL, &token, &project).await
+    let credential = model.access_token().await?;
+    let project = model.project_id(&credential).await;
+    quota_summary_at(&model.client, QUOTA_URL, &credential.token, &project).await
 }
 
 /// The one POST behind [`quota_summary`], split out so a fake server can drive
@@ -1103,8 +1197,9 @@ impl Turn {
         element: &Value,
         on_delta: &mut (dyn FnMut(ModelDeltaKind, &str) + Send),
     ) -> anyhow::Result<()> {
-        // A mid-stream failure still arrives inside the array shape. Only the
-        // allowlisted code is surfaced (the body can quote credentials).
+        // A mid-stream failure still arrives as one SSE event carrying an
+        // `error` field. Only the allowlisted code is surfaced (the body can
+        // quote credentials).
         if let Some(error) = element.get("error").filter(|error| !error.is_null()) {
             let code = error_code(error)
                 .map(|code| format!(" ({code})"))
@@ -1571,7 +1666,12 @@ fn conversation_digest(contents: &[Value]) -> [u8; 16] {
             hasher.update([0]);
         }
     }
-    let digest = Sha256::digest(hasher.finalize());
+    digest16(&hasher.finalize())
+}
+
+/// SHA-256 of `bytes`, first 16 bytes: the digest a UUID-shaped id renders.
+fn digest16(bytes: &[u8]) -> [u8; 16] {
+    let digest = Sha256::digest(bytes);
     let mut truncated = [0u8; 16];
     truncated.copy_from_slice(&digest[..16]);
     truncated

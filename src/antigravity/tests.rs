@@ -211,6 +211,15 @@ fn write_cache(path: &Path, access: &str, expiry: DateTime<Utc>, refresh: &str, 
     .unwrap();
 }
 
+/// One credential snapshot as the wire sees it: a bearer plus the `agy` login
+/// it belongs to (the fingerprint of that login's CLI refresh credential).
+fn credential(token: &str, refresh: &str) -> super::Credential {
+    super::Credential {
+        token: token.to_owned(),
+        login: login_fingerprint(refresh),
+    }
+}
+
 fn model_for(fake: &Fake, token_file: PathBuf, cache_file: PathBuf) -> AntigravityModel {
     AntigravityModel {
         // The production client shape (redirect policy included), only with
@@ -239,7 +248,6 @@ fn model_for(fake: &Fake, token_file: PathBuf, cache_file: PathBuf) -> Antigravi
         // tests set a real interval on the model.
         min_interval: std::time::Duration::ZERO,
         conversation: Default::default(),
-        project: Default::default(),
         last_request: Default::default(),
         vision: true,
         image_store: None,
@@ -262,7 +270,6 @@ fn test_model(dir: &Path) -> AntigravityModel {
         min_interval: std::time::Duration::ZERO,
         last_request: Default::default(),
         conversation: Default::default(),
-        project: Default::default(),
         vision: true,
         image_store: None,
     }
@@ -1463,7 +1470,6 @@ fn tool_result_body_echoes_signature_and_function_response() {
         min_interval: std::time::Duration::ZERO,
         last_request: Default::default(),
         conversation: Default::default(),
-        project: Default::default(),
         vision: true,
         image_store: None,
     };
@@ -2074,10 +2080,10 @@ async fn failure_finish_after_a_valid_call_prefix_is_not_a_turn() {
     assert!(message.contains("finishReason"), "{message}");
 }
 
-/// B1: an array that closed cleanly after a call-shaped prefix, with no
+/// B1: a stream that ended cleanly after a call-shaped prefix, with no
 /// candidate ever reporting a terminal `finishReason`, is an INCOMPLETE turn.
 /// The old rule (`finishReason` was optional usage metadata) returned those
-/// calls as soon as the array closed.
+/// calls as soon as the framing closed.
 #[tokio::test]
 async fn closed_array_without_a_terminal_candidate_is_not_a_turn() {
     let dir = tempfile::tempdir().unwrap();
@@ -2925,7 +2931,6 @@ fn history_tool_schema_rides_the_wire() {
         min_interval: std::time::Duration::ZERO,
         last_request: Default::default(),
         conversation: Default::default(),
-        project: Default::default(),
         vision: true,
         image_store: None,
     };
@@ -3107,7 +3112,6 @@ fn request_metadata_carries_type_id_and_derived_session() {
         min_interval: std::time::Duration::ZERO,
         last_request: Default::default(),
         conversation: Default::default(),
-        project: Default::default(),
         vision: true,
         image_store: None,
     };
@@ -3378,7 +3382,6 @@ fn request_repair_fills_ids_aligns_names_and_drops_empty_parts() {
         min_interval: std::time::Duration::ZERO,
         last_request: Default::default(),
         conversation: Default::default(),
-        project: Default::default(),
         vision: true,
         image_store: None,
     };
@@ -3754,7 +3757,6 @@ fn catalog_vision_matches_the_wire_capability() {
         min_interval: std::time::Duration::ZERO,
         last_request: Default::default(),
         conversation: Default::default(),
-        project: Default::default(),
         vision: true,
         image_store: None,
     };
@@ -4621,18 +4623,25 @@ async fn project_discovery_is_bound_to_the_selected_login() {
         dir.path().join("cache/token.json"),
     );
     model.load_assist_url = format!("http://{}/v1internal:loadCodeAssist", fake.address);
-    assert_eq!(model.project_id("token-a").await, "project-a");
+    // ONE snapshot per request: the bearer and the login it belongs to.
+    let first = model.access_token().await.unwrap();
+    assert_eq!(first.token, "access-a");
+    assert_eq!(model.project_id(&first).await, "project-a");
     // `agy` logs into the second account: the CLI file now carries a different
-    // refresh credential, so the cached project must not survive.
+    // refresh credential (so a different login), and the cached project must
+    // not survive it.
     write_agy_token(
         dir.path(),
         "access-b",
         Utc::now() + ChronoDuration::hours(1),
         "refresh-b",
     );
-    assert_eq!(model.project_id("token-b").await, "project-b");
-    // Re-reading the same login is the async-once path: no third discovery.
-    assert_eq!(model.project_id("token-b").await, "project-b");
+    let second = model.access_token().await.unwrap();
+    assert_eq!(second.token, "access-b");
+    assert_ne!(second.login, first.login, "a re-login is another account");
+    assert_eq!(model.project_id(&second).await, "project-b");
+    // The same login is the async-once path: no third discovery.
+    assert_eq!(model.project_id(&second).await, "project-b");
     assert_eq!(fake.requests().len(), 2);
 }
 
@@ -4660,9 +4669,168 @@ async fn unauthorized_discovery_is_retried_not_frozen() {
     .await;
     let mut model = model_for(&fake, token_file, dir.path().join("cache/token.json"));
     model.load_assist_url = format!("http://{}/v1internal:loadCodeAssist", fake.address);
-    assert_eq!(model.project_id("expired").await, PROJECT);
-    assert_eq!(model.project_id("refreshed").await, "project-later");
+    let expired = credential("expired", "refresh-a");
+    assert_eq!(model.project_id(&expired).await, PROJECT);
+    let refreshed = credential("refreshed", "refresh-a");
+    assert_eq!(model.project_id(&refreshed).await, "project-later");
     assert_eq!(fake.requests().len(), 2);
+}
+
+/// A discovery 401 costs the FALLBACK project for the first POST only: the 401
+/// refresh replaces the bearer, so the project is rediscovered with it and the
+/// retried body carries the real id — not the fallback the turn started with.
+#[tokio::test]
+async fn a_refreshed_bearer_rediscovers_the_project_before_the_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    // A still-valid CLI token: the turn's FIRST POST starts without a refresh.
+    let token_file = write_agy_token(
+        dir.path(),
+        "stale-token",
+        Utc::now() + ChronoDuration::hours(1),
+        "refresh-a",
+    );
+    let body = sse_body(&[text_element("ok")]);
+    let discovery = Arc::new(Mutex::new(0));
+    let seen = discovery.clone();
+    let fake = spawn_fake(5, move |index, path| match (index, path) {
+        (0, _) => (
+            401,
+            json!({"error": {"code": 401, "status": "UNAUTHENTICATED"}}).to_string(),
+        ),
+        (1, _) => (
+            401,
+            json!({"error": {"code": 401, "status": "UNAUTHENTICATED"}}).to_string(),
+        ),
+        (2, "/token") => (
+            200,
+            json!({"access_token": "fresh-token", "expires_in": 3599}).to_string(),
+        ),
+        (3, _) if path.contains("loadCodeAssist") => {
+            *seen.lock().unwrap() += 1;
+            (
+                200,
+                json!({"cloudaicompanionProject": "project-42"}).to_string(),
+            )
+        }
+        _ => (200, body.clone()),
+    })
+    .await;
+    let mut model = model_for(&fake, token_file, dir.path().join("cache/token.json"));
+    model.load_assist_url = format!("http://{}/v1internal:loadCodeAssist", fake.address);
+    let (assistant, _) = model
+        .complete(
+            &[Message::User {
+                content: "say ok".into(),
+                images: Vec::new(),
+            }],
+            &[],
+            None,
+        )
+        .await
+        .expect("the refreshed retry is a normal turn");
+    assert_eq!(assistant.content.as_deref(), Some("ok"));
+    let requests = fake.requests();
+    assert_eq!(
+        requests.len(),
+        5,
+        "discovery, generation, refresh, discovery, retry"
+    );
+    assert_eq!(
+        requests[1].2["project"], PROJECT,
+        "the unauthorized discovery falls back for the FIRST post only"
+    );
+    let rediscovery = &requests[3];
+    assert_eq!(rediscovery.0, "/v1internal:loadCodeAssist");
+    assert!(
+        rediscovery
+            .1
+            .to_ascii_lowercase()
+            .contains("authorization: bearer fresh-token"),
+        "the rediscovery spends the refreshed bearer: {}",
+        rediscovery.1
+    );
+    assert_eq!(
+        requests[4].2["project"], "project-42",
+        "the retried body carries the project the refreshed bearer discovered"
+    );
+    assert_eq!(*discovery.lock().unwrap(), 1);
+}
+
+/// Two SESSIONS built from ONE configured profile (the factory clones it) sign
+/// with DISTINCT conversation segments while sharing the login's single project
+/// discovery. Same contents on purpose: only the session binding can separate
+/// them.
+#[tokio::test]
+async fn two_sessions_share_one_discovery_but_not_one_conversation() {
+    let dir = tempfile::tempdir().unwrap();
+    let token_file = write_agy_token(
+        dir.path(),
+        "shared-access",
+        Utc::now() + ChronoDuration::hours(1),
+        "shared-login",
+    );
+    let body = sse_body(&[text_element("ok")]);
+    let fake = spawn_fake(4, move |_, path| {
+        if path.contains("loadCodeAssist") {
+            (
+                200,
+                json!({"cloudaicompanionProject": "project-shared"}).to_string(),
+            )
+        } else {
+            (200, body.clone())
+        }
+    })
+    .await;
+    let mut template = model_for(&fake, token_file, dir.path().join("cache/token.json"));
+    template.load_assist_url = format!("http://{}/v1internal:loadCodeAssist", fake.address);
+    // The factory path: ONE configured model, cloned per session, each bound to
+    // its own session identity.
+    let mut first = template.clone();
+    let mut second = template.clone();
+    first.set_request_session_id("session-one");
+    second.set_request_session_id("session-two");
+    let turn = [Message::User {
+        content: "say ok".into(),
+        images: Vec::new(),
+    }];
+    first.complete(&turn, &[], None).await.unwrap();
+    first.complete(&turn, &[], None).await.unwrap();
+    second.complete(&turn, &[], None).await.unwrap();
+
+    let requests = fake.requests();
+    let discoveries = requests
+        .iter()
+        .filter(|(path, _, _)| path.contains("loadCodeAssist"))
+        .count();
+    assert_eq!(discoveries, 1, "one discovery for the login, both sessions");
+    for (path, _, body) in &requests {
+        if path.contains("loadCodeAssist") {
+            continue;
+        }
+        assert_eq!(body["project"], "project-shared", "{path}");
+    }
+    let ids: Vec<String> = requests
+        .iter()
+        .filter(|(path, _, _)| path.contains("streamGenerateContent"))
+        .map(|(_, _, body)| body["requestId"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert!(!ids.is_empty(), "the fake recorded no generation POST");
+    assert_eq!(ids.len(), 3, "two turns of session one, one of session two");
+    let segments: Vec<Vec<String>> = ids
+        .iter()
+        .map(|id| {
+            assert_request_id_shape(id);
+            id.split('/').map(str::to_owned).collect()
+        })
+        .collect();
+    assert_eq!(
+        segments[0][1], segments[1][1],
+        "one conversation for one session across its turns"
+    );
+    assert_ne!(
+        segments[0][1], segments[2][1],
+        "two sessions of one login never share a conversation id"
+    );
 }
 
 /// B4, streaming form: a `MAX_TOKENS` signed call in one SSE element followed

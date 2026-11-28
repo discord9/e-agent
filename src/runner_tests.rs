@@ -588,6 +588,696 @@ async fn request_user_input_waits_answers_and_resumes_same_turn() {
     drop(task);
 }
 
+/// A tool that asks the human ONE option question mid-call, exactly as the
+/// ACP tool does, and records the id it got back.
+struct AskTool {
+    handle: Option<SessionHandle>,
+    answer: Arc<Mutex<Option<Option<String>>>>,
+}
+
+#[async_trait]
+impl Tool for AskTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "ask_tool".into(),
+            description: "test only".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+    async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
+        let handle = self.handle.as_ref().expect("the runner binds a handle");
+        let request = UserInputRequest {
+            call_id: "tool-ask".into(),
+            questions: vec![UserQuestion {
+                id: "permission".into(),
+                prompt: "Allow the tool to run?".into(),
+                options: vec![
+                    UserOption {
+                        id: "allow".into(),
+                        label: "Allow".into(),
+                        description: None,
+                    },
+                    UserOption {
+                        id: "deny".into(),
+                        label: "Deny".into(),
+                        description: Some("reject_once".into()),
+                    },
+                ],
+            }],
+        };
+        // No frontend must mean `Err` (the tool then applies its own policy),
+        // never a parked turn.
+        let answer = match handle.ask_user(request) {
+            Ok(answer) => answer.await.ok().flatten(),
+            Err(_) => None,
+        };
+        *self.answer.lock().unwrap() = Some(answer.clone());
+        Ok(ToolOutput::text(format!("answer: {answer:?}")))
+    }
+    fn set_session_handle(&mut self, _session_id: &str, handle: SessionHandle) {
+        self.handle = Some(handle);
+    }
+}
+
+/// The next `WaitingInput` request, or a failure naming the status actually
+/// observed (a parked turn that never reaches `WaitingInput` fails here).
+async fn wait_for_question(status: &mut watch::Receiver<SessionStatus>) -> UserInputRequest {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let SessionStatus::WaitingInput(request) = &*status.borrow() {
+                return request.clone();
+            }
+            status.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no question surfaced; status={:?}", *status.borrow()))
+}
+
+/// Wait for the committed tool result event of the wire call id `call_id`. The
+/// durable row is already written when it is emitted, so the store can be read
+/// right after. The EVENT carries the call's public projection (the local
+/// digest), while the persisted row keeps the wire id — hence the hash here.
+async fn wait_for_tool_result(events: &mut broadcast::Receiver<AgentEvent>, call_id: &str) {
+    let projected = crate::agent::public_call_id(call_id);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let AgentEvent::ToolResult {
+                call_id: Some(id), ..
+            } = events.recv().await.expect("the session emits events")
+                && id == projected
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the tool result must be emitted")
+}
+
+fn ask_tool_agent(answer: Arc<Mutex<Option<Option<String>>>>) -> Agent {
+    Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: VecDeque::from(vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call-ask".into(),
+                        name: "ask_tool".into(),
+                        arguments: "{}".into(),
+                        provider_meta: None,
+                    }],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("done".into()),
+                    tool_calls: Vec::new(),
+                    reasoning: None,
+                },
+            ]),
+        }),
+        vec![Box::new(AskTool {
+            handle: None,
+            answer,
+        })],
+    )
+}
+
+/// A tool's mid-call question parks the turn through the SAME frontend as
+/// `request_user_input`, and the tool gets the chosen option id back.
+#[tokio::test]
+async fn a_tool_question_parks_the_turn_and_returns_the_chosen_option_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let answer = Arc::new(Mutex::new(None));
+    let (runner, handle) = SessionRunner::new(
+        ask_tool_agent(answer.clone()),
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "tool-ask".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let runner = runner.with_user_input_allowed();
+    let (_, mut events, mut status) = handle.attach();
+    let task = runner.start(Some("start".into()));
+
+    let request = wait_for_question(&mut status).await;
+    assert_eq!(request.call_id, "tool-ask");
+    assert_eq!(request.questions[0].prompt, "Allow the tool to run?");
+    assert_eq!(
+        request.questions[0]
+            .options
+            .iter()
+            .map(|option| option.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["allow", "deny"]
+    );
+    // An id the question does not offer is refused and leaves it answerable.
+    assert!(matches!(
+        handle.submit_prompt_with_call_id(Some("tool-ask".into()), "bogus".into()),
+        PromptSubmission::Invalid(_)
+    ));
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("tool-ask".into()), "deny".into()),
+        PromptSubmission::Answered
+    );
+
+    wait_for_tool_result(&mut events, "call-ask").await;
+    drop(task);
+    assert_eq!(*answer.lock().unwrap(), Some(Some("deny".to_owned())));
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "tool-ask")
+        .await
+        .unwrap()
+        .entries;
+    let result = tool_entries(&entries)
+        .into_iter()
+        .find_map(|message| match message {
+            Message::Tool {
+                call_id, content, ..
+            } if call_id == "call-ask" => Some(content.clone()),
+            _ => None,
+        })
+        .expect("the tool result is committed");
+    assert_eq!(result, r#"answer: Some("deny")"#);
+}
+
+/// Without a frontend a tool's ask is refused outright: no `WaitingInput`, no
+/// parked turn — the tool applies its own policy on the next line.
+#[tokio::test]
+async fn a_tool_question_without_a_frontend_is_refused_instead_of_parking() {
+    let temp = tempfile::tempdir().unwrap();
+    let answer = Arc::new(Mutex::new(None));
+    let (runner, handle) = SessionRunner::new(
+        ask_tool_agent(answer.clone()),
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "tool-ask-child".into(),
+        IdlePolicy::WaitForInput,
+    );
+    // A delegate/btw/fork child: no `with_user_input_allowed`.
+    let (_, mut events, _status) = handle.attach();
+    let task = runner.start(Some("start".into()));
+    wait_for_tool_result(&mut events, "call-ask").await;
+    drop(task);
+    assert_eq!(*answer.lock().unwrap(), Some(None));
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "tool-ask-child")
+        .await
+        .unwrap()
+        .entries;
+    assert!(
+        tool_entries(&entries).iter().any(|message| matches!(
+            message,
+            Message::Tool { call_id, content, .. }
+                if call_id == "call-ask" && content == "answer: None"
+        )),
+        "the tool ran without asking"
+    );
+}
+
+/// A tool that asks THREE questions: two at once (the shape that used to be
+/// told `Ok` twice because `ask_user` only enqueued) and one after the first
+/// was answered (the slot must be free again by then).
+struct DoubleAskTool {
+    handle: Option<SessionHandle>,
+    /// Whether the second, concurrent ask was refused `Busy` (the honest
+    /// answer) and the later one was admitted.
+    second_busy: Arc<Mutex<Option<bool>>>,
+    third_ok: Arc<Mutex<Option<bool>>>,
+}
+
+#[async_trait]
+impl Tool for DoubleAskTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "double_ask".into(),
+            description: "test only".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+    async fn execute(&self, _: Value) -> Result<ToolOutput, String> {
+        let handle = self.handle.as_ref().expect("the runner binds a handle");
+        let request = |call_id: &str| UserInputRequest {
+            call_id: call_id.into(),
+            questions: vec![UserQuestion {
+                id: "permission".into(),
+                prompt: "Allow the tool to run?".into(),
+                options: vec![UserOption {
+                    id: "allow".into(),
+                    label: "Allow".into(),
+                    description: None,
+                }],
+            }],
+        };
+        let first = handle.ask_user(request("tool-ask-1"));
+        let second = handle.ask_user(request("tool-ask-2"));
+        *self.second_busy.lock().unwrap() = Some(matches!(second, Err(AskRefusal::Busy)));
+        let first_answer = match first {
+            Ok(answer) => answer.await.ok().flatten(),
+            Err(_) => None,
+        };
+        // The slot is free again once the first question was answered, so this
+        // ask must be admitted (and its answer delivered).
+        let third = handle.ask_user(request("tool-ask-3"));
+        *self.third_ok.lock().unwrap() = Some(third.is_ok());
+        let third_answer = match third {
+            Ok(answer) => answer.await.ok().flatten(),
+            Err(_) => None,
+        };
+        Ok(ToolOutput::text(format!(
+            "first {first_answer:?} third {third_answer:?}"
+        )))
+    }
+    fn set_session_handle(&mut self, _session_id: &str, handle: SessionHandle) {
+        self.handle = Some(handle);
+    }
+}
+
+/// The session's mid-call ask slot is reserved at `ask_user` time, not when the
+/// runner publishes the question: of two concurrent generic callers exactly one
+/// is admitted, the other is refused `Busy` deterministically — and the slot is
+/// free again once the admitted ask was answered.
+#[tokio::test]
+async fn a_second_mid_call_ask_is_refused_while_the_first_is_still_queued() {
+    let temp = tempfile::tempdir().unwrap();
+    let second_busy = Arc::new(Mutex::new(None));
+    let third_ok = Arc::new(Mutex::new(None));
+    let agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: VecDeque::from(vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call-double".into(),
+                        name: "double_ask".into(),
+                        arguments: "{}".into(),
+                        provider_meta: None,
+                    }],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("done".into()),
+                    tool_calls: Vec::new(),
+                    reasoning: None,
+                },
+            ]),
+        }),
+        vec![Box::new(DoubleAskTool {
+            handle: None,
+            second_busy: second_busy.clone(),
+            third_ok: third_ok.clone(),
+        })],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "double-ask".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let runner = runner.with_user_input_allowed();
+    let (_, mut events, mut status) = handle.attach();
+    let task = runner.start(Some("start".into()));
+
+    let request = wait_for_question(&mut status).await;
+    assert_eq!(
+        request.call_id, "tool-ask-1",
+        "the admitted ask is the one published"
+    );
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some(request.call_id.clone()), "allow".into()),
+        PromptSubmission::Answered
+    );
+
+    // The later ask is surfaced only after the first was answered. Wait for
+    // THAT question (the status may still hold the previous one for a moment).
+    let later = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let SessionStatus::WaitingInput(request) = &*status.borrow()
+                && request.call_id == "tool-ask-3"
+            {
+                return request.clone();
+            }
+            status.changed().await.expect("the runner keeps its status");
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the second ask was not surfaced; status={:?}",
+            *status.borrow()
+        )
+    });
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some(later.call_id.clone()), "allow".into()),
+        PromptSubmission::Answered
+    );
+    wait_for_tool_result(&mut events, "call-double").await;
+
+    assert_eq!(
+        *second_busy.lock().unwrap(),
+        Some(true),
+        "two concurrent callers must never both be told the slot is theirs"
+    );
+    assert_eq!(
+        *third_ok.lock().unwrap(),
+        Some(true),
+        "the slot must be released once the admitted question was answered"
+    );
+    drop(task);
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "double-ask")
+        .await
+        .unwrap()
+        .entries;
+    assert!(
+        entries.iter().any(|entry| matches!(
+            entry,
+            SessionEntry::Message {
+                message: Message::Tool { call_id, content, .. }
+            } if call_id == "call-double"
+                && content == "first Some(\"allow\") third Some(\"allow\")"
+        )),
+        "both admitted asks received their answer"
+    );
+}
+
+/// `NoFrontend` is the ONE refusal that licenses a caller's own policy, so a
+/// dead handle must be `Closed` instead: nothing may apply a fallback on
+/// behalf of a session that is gone.
+#[test]
+fn a_closed_handle_refuses_as_closed_before_it_calls_itself_frontendless() {
+    let (handle, _emitter, commands) = session_test_channel();
+    drop(commands);
+    let refusal = match handle.ask_user(UserInputRequest {
+        call_id: "ask-closed".into(),
+        questions: vec![UserQuestion {
+            id: "permission".into(),
+            prompt: "Allow the tool to run?".into(),
+            options: vec![UserOption {
+                id: "allow".into(),
+                label: "Allow".into(),
+                description: None,
+            }],
+        }],
+    }) {
+        Ok(_) => panic!("a dead handle must refuse the ask"),
+        Err(refusal) => refusal,
+    };
+    assert_eq!(refusal, AskRefusal::Closed);
+}
+
+/// End-to-end blocking path with fixed options: an invalid id is rejected
+/// while the turn stays parked, and the accepted option reaches the model as
+/// `Selected option: {id} ({label})` inside the tool result.
+#[tokio::test]
+async fn blocking_option_question_answer_reaches_the_model_with_id_and_label() {
+    let temp = tempfile::tempdir().unwrap();
+    let agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: VecDeque::from(vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call-opt".into(),
+                        name: "request_user_input".into(),
+                        arguments: r#"{"questions":[{"id":"perm","prompt":"Allow?","options":[{"id":"allow-once","label":"允许一次"},{"id":"deny","label":"拒绝","description":"仅此一次"}]}]}"#.into(),
+                        provider_meta: None,
+                    }],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("decided".into()),
+                    tool_calls: Vec::new(),
+                    reasoning: None,
+                },
+            ]),
+        }),
+        vec![
+            Box::new(crate::tools::user_input::RequestUserInput),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "option-input".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let runner = runner.with_user_input_allowed();
+    let (_, _events, mut status) = handle.attach();
+    let task = runner.start(Some("start".into()));
+    let waiting = wait_for_status(&mut status, |status| {
+        matches!(status, SessionStatus::WaitingInput(_))
+    })
+    .await;
+    match waiting {
+        SessionStatus::WaitingInput(request) => {
+            assert_eq!(request.call_id, "call-opt");
+            assert_eq!(request.questions[0].options.len(), 2);
+        }
+        other => panic!("expected WaitingInput, got {other:?}"),
+    }
+    assert!(matches!(
+        handle.submit_prompt_with_call_id(Some("call-opt".into()), "allow".into()),
+        PromptSubmission::Invalid(error) if error.contains("allow-once") && error.contains("deny")
+    ));
+    assert!(
+        matches!(&*status.borrow(), SessionStatus::WaitingInput(request) if request.call_id == "call-opt"),
+        "a rejected id leaves the turn parked: {:?}",
+        *status.borrow()
+    );
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("call-opt".into()), "deny".into()),
+        PromptSubmission::Answered
+    );
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "decided"),
+    )
+    .await;
+    wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)).await;
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "option-input")
+        .await
+        .unwrap()
+        .entries;
+    match tool_entries(&entries)[0] {
+        Message::Tool {
+            call_id, content, ..
+        } => {
+            assert_eq!(call_id, "call-opt");
+            assert!(
+                content.contains("Selected option: deny (拒绝)"),
+                "model-facing answer: {content}"
+            );
+            assert!(content.contains("\"id\":\"perm\""), "{content}");
+        }
+        other => panic!("expected the tool result, got {other:?}"),
+    }
+    drop(task);
+}
+
+/// A question may carry fixed options. Only an exact option id is accepted,
+/// the rejection names the allowed ids, and the model-facing answer carries
+/// both the id and its label so no mapping has to be remembered.
+#[test]
+fn option_answer_accepts_only_listed_ids_and_keeps_id_and_label() {
+    let (handle, emitter, mut commands) = crate::runner::session_test_channel();
+    emitter.set_status(SessionStatus::WaitingInput(UserInputRequest {
+        call_id: "call-perm".into(),
+        questions: vec![option_question()],
+    }));
+    // A label, a translated name and a padded id are all NOT ids: an option id
+    // is an identity the asking tool sends back verbatim, so `" allow-once "`
+    // is a different id from `"allow-once"` (`" x "` vs `"x"` may both be
+    // offered). Never trim, case-fold, or otherwise guess.
+    for submitted in ["allow", "允许一次", " allow-once ", "ALLOW-ONCE"] {
+        match handle.submit_prompt_with_call_id(Some("call-perm".into()), submitted.into()) {
+            PromptSubmission::Invalid(error) => assert!(
+                error.contains("allow-once") && error.contains("deny"),
+                "{error}"
+            ),
+            other => panic!("accepted {submitted:?}: {other:?}"),
+        }
+    }
+    // A rejected answer never claims the question.
+    assert!(commands.try_recv().is_err());
+    // The exact id is accepted and resolves to
+    // `Selected option: {id} ({label})`.
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("call-perm".into()), "allow-once".into()),
+        PromptSubmission::Answered
+    );
+    match commands.try_recv().unwrap() {
+        SessionCommand::Answer {
+            call_id,
+            answers,
+            option,
+        } => {
+            assert_eq!(call_id, "call-perm");
+            assert_eq!(
+                option.as_deref(),
+                Some("allow-once"),
+                "the accepted id is carried, not re-derived from the text"
+            );
+            assert_eq!(
+                answers,
+                vec![(
+                    "perm".to_owned(),
+                    "Selected option: allow-once (允许一次)".to_owned()
+                )]
+            );
+        }
+        _ => panic!("expected the structured answer command"),
+    }
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("call-perm".into()), "deny".into()),
+        PromptSubmission::Conflict
+    );
+}
+
+/// The async path shares the same acceptance rule: the later user-shaped
+/// message (:Notice) carries the id and the label.
+#[test]
+fn async_option_answer_uses_the_same_resolution() {
+    let (handle, emitter, mut commands) = crate::runner::session_test_channel();
+    emitter.register_pending_question(UserInputRequest {
+        call_id: "call-async-perm".into(),
+        questions: vec![option_question()],
+    });
+    assert!(matches!(
+        handle.submit_prompt_with_call_id(Some("call-async-perm".into()), "allow".into()),
+        PromptSubmission::Invalid(error) if error.contains("allow-once, deny")
+    ));
+    assert_eq!(
+        handle.pending_questions(),
+        vec![UserInputRequest {
+            call_id: "call-async-perm".into(),
+            questions: vec![option_question()],
+        }],
+        "a rejected answer leaves the question answerable"
+    );
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("call-async-perm".into()), "deny".into()),
+        PromptSubmission::Answered
+    );
+    match commands.try_recv().unwrap() {
+        SessionCommand::Answer {
+            call_id,
+            answers,
+            option,
+        } => {
+            assert_eq!(call_id, "call-async-perm");
+            assert_eq!(option.as_deref(), Some("deny"));
+            assert_eq!(
+                answers,
+                vec![("perm".to_owned(), "Selected option: deny (拒绝)".to_owned())]
+            );
+        }
+        _ => panic!("expected the structured answer command"),
+    }
+}
+
+/// A free-text question has no id to protect, so its answer is accepted as its
+/// trimmed text (layout dropped, nothing rewritten).
+#[test]
+fn free_text_answer_still_accepts_any_non_empty_text() {
+    let (handle, emitter, mut commands) = crate::runner::session_test_channel();
+    emitter.set_status(SessionStatus::WaitingInput(UserInputRequest {
+        call_id: "call-text".into(),
+        questions: vec![UserQuestion {
+            id: "answer".into(),
+            prompt: "Your name?".into(),
+            options: Vec::new(),
+        }],
+    }));
+    assert!(matches!(
+        handle.submit_prompt_with_call_id(Some("call-text".into()), "  ".into()),
+        PromptSubmission::Invalid(_)
+    ));
+    assert!(commands.try_recv().is_err());
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("call-text".into()), " Ada 你好 ".into()),
+        PromptSubmission::Answered
+    );
+    match commands.try_recv().unwrap() {
+        SessionCommand::Answer {
+            call_id,
+            answers,
+            option,
+        } => {
+            assert_eq!(call_id, "call-text");
+            assert_eq!(option, None, "a free-text question names no option");
+            assert_eq!(answers, vec![("answer".to_owned(), "Ada 你好".to_owned())]);
+        }
+        _ => panic!("expected the structured answer command"),
+    }
+}
+
+/// A question with options serializes them; one without serializes exactly as
+/// before (no empty `options` key), which is what the frontends and the
+/// status payload rely on.
+#[test]
+fn user_question_serde_omits_empty_options() {
+    let with_options = UserQuestion {
+        id: "perm".into(),
+        prompt: "Allow?".into(),
+        options: vec![
+            UserOption {
+                id: "allow-once".into(),
+                label: "允许一次".into(),
+                description: Some("仅此一次".into()),
+            },
+            UserOption {
+                id: "deny".into(),
+                label: "拒绝".into(),
+                description: None,
+            },
+        ],
+    };
+    assert_eq!(
+        serde_json::to_value(&with_options).unwrap(),
+        serde_json::json!({
+            "id": "perm",
+            "prompt": "Allow?",
+            "options": [
+                {"id": "allow-once", "label": "允许一次", "description": "仅此一次"},
+                {"id": "deny", "label": "拒绝"}
+            ]
+        })
+    );
+    let plain = UserQuestion {
+        id: "name".into(),
+        prompt: "Your name?".into(),
+        options: Vec::new(),
+    };
+    assert_eq!(
+        serde_json::to_value(&plain).unwrap(),
+        serde_json::json!({"id": "name", "prompt": "Your name?"})
+    );
+}
+
+fn option_question() -> UserQuestion {
+    UserQuestion {
+        id: "perm".into(),
+        prompt: "Allow?".into(),
+        options: vec![
+            UserOption {
+                id: "allow-once".into(),
+                label: "允许一次".into(),
+                description: Some("仅此一次".into()),
+            },
+            UserOption {
+                id: "deny".into(),
+                label: "拒绝".into(),
+                description: None,
+            },
+        ],
+    }
+}
+
 /// A delegate/btw/fork session has no frontend that could answer a
 /// `request_user_input` question, so the interception must fail that call
 /// back to the model as an ordinary tool error and keep the SAME turn going
@@ -1153,8 +1843,10 @@ async fn request_user_input_channel_close_exits_without_answer() {
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 /// The pinned receipt text an asynchronous call returns immediately (the
-/// production string is intentionally not shared with this assertion).
+/// production string is intentionally not shared with this assertion). The id
+/// it names is the call's LOCAL digest: these are public, persisted strings.
 fn async_receipt(call_id: &str) -> String {
+    let call_id = crate::agent::public_call_id(call_id);
     format!(
         "question {call_id} asked; you may continue. The answer will arrive later as a user \
          message with the original question."
@@ -1163,6 +1855,7 @@ fn async_receipt(call_id: &str) -> String {
 
 /// The pinned user-shaped Notice one accepted answer commits.
 fn answer_notice(call_id: &str, prompt: &str, answer: &str) -> String {
+    let call_id = crate::agent::public_call_id(call_id);
     format!("[question {call_id}]\nQuestion: {prompt}\n[answer]\n{answer}")
 }
 
@@ -1286,6 +1979,7 @@ async fn async_request_user_input_receipts_and_keeps_the_turn_going() {
             questions: vec![UserQuestion {
                 id: "name".into(),
                 prompt: "Your name?".into(),
+                options: Vec::new(),
             }],
         }]
     );
@@ -1874,11 +2568,14 @@ async fn async_answer_during_requested_compaction_lands_in_the_next_request() {
         let calls = calls.lock().unwrap();
         // [0] initial round, [1] requested compaction, [2] next regular request.
         assert!(calls.len() >= 3, "model calls: {}", calls.len());
+        // The Notice names the call's LOCAL digest, never the wire id it was
+        // answered by.
+        let notice = format!("[question {}]", crate::agent::public_call_id("ask1"));
         assert!(
             calls[2].iter().any(|message| matches!(
                 message,
                 Message::User { content, .. }
-                    if content.contains("[question ask1]") && content.contains("[answer]\nA")
+                    if content.contains(&notice) && content.contains("[answer]\nA")
             )),
             "the answer Notice must precede the next regular request: {:?}",
             calls[2]

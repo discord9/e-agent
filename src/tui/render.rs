@@ -47,6 +47,10 @@ pub(crate) fn draw<'a, B: ratatui::backend::Backend>(
         let inner_input_width = usize::from(frame.area().width.saturating_sub(2)).max(1);
         let input_rows = if let Some(attached) = &state.attached {
             attached.input.visual_rows(inner_input_width)
+        } else if !state.waiting_options.is_empty() {
+            // The selectable list of the pending question needs one row per
+            // option; the free-text box keeps its usual wrapped height.
+            state.waiting_options.len()
         } else {
             state.input.visual_rows(inner_input_width)
         };
@@ -538,11 +542,25 @@ pub(crate) fn draw<'a, B: ratatui::backend::Backend>(
         let (usage, fg) = cwd_usage_text(&state.cwd, state.tokens_context, state.context_window);
         let (cursor_row, cursor_col) = state.input.wrapped_cursor(inner_input_width);
         let inner_input_height = usize::from(input.height.saturating_sub(2));
-        let input_scroll = cursor_row.saturating_sub(inner_input_height.saturating_sub(1));
-        let input_lines: Vec<Line> = hard_wrap(&state.input.text, inner_input_width)
-            .into_iter()
-            .map(|line| Line::styled(line, SOLARIZED_LIGHT.panel_style()))
-            .collect();
+        // A pending question with fixed options shows the selectable list in
+        // the input box instead of the (inert) free-text buffer; the highlight
+        // decides the scroll row so it can never leave the visible box.
+        let show_options = !state.waiting_options.is_empty();
+        let input_scroll = if show_options {
+            state
+                .waiting_selection
+                .saturating_sub(inner_input_height.saturating_sub(1))
+        } else {
+            cursor_row.saturating_sub(inner_input_height.saturating_sub(1))
+        };
+        let input_lines: Vec<Line> = if show_options {
+            waiting_option_lines(&state.waiting_options, state.waiting_selection)
+        } else {
+            hard_wrap(&state.input.text, inner_input_width)
+                .into_iter()
+                .map(|line| Line::styled(line, SOLARIZED_LIGHT.panel_style()))
+                .collect()
+        };
         let inner = input_block.inner(input);
         frame.render_widget(input_block, input);
         {
@@ -589,13 +607,51 @@ pub(crate) fn draw<'a, B: ratatui::backend::Backend>(
                 );
             }
         }
-        frame.set_cursor_position((
-            input.x + 1 + (cursor_col as u16).min(input.width.saturating_sub(2)),
-            input.y + 1 + ((cursor_row - input_scroll) as u16).min(input.height.saturating_sub(2)),
-        ));
+        // The selectable list has no text caret; leaving the terminal cursor
+        // unset keeps it from blinking over a row it does not edit.
+        if !show_options {
+            frame.set_cursor_position((
+                input.x + 1 + (cursor_col as u16).min(input.width.saturating_sub(2)),
+                input.y
+                    + 1
+                    + ((cursor_row - input_scroll) as u16).min(input.height.saturating_sub(2)),
+            ));
+        }
         let area = frame.area();
         force_wide_trailing_cell_updates(frame.buffer_mut(), area);
     })
+}
+
+/// Rows of the pending question's selectable list, drawn inside the existing
+/// input block: `1. label — description`, the highlight on the panel's
+/// selection background (the same vocabulary as the tasks panel rows).
+pub(crate) fn waiting_option_lines(
+    options: &[crate::runner::UserOption],
+    selected: usize,
+) -> Vec<Line<'static>> {
+    options
+        .iter()
+        .enumerate()
+        .map(|(index, option)| {
+            let text = match option.description.as_deref() {
+                Some(description) => {
+                    format!(" {}. {} — {description}", index + 1, option.label)
+                }
+                None => format!(" {}. {}", index + 1, option.label),
+            };
+            let style = if index == selected {
+                Style::default()
+                    .fg(SOLARIZED_LIGHT.text)
+                    .bg(SOLARIZED_LIGHT.selection)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(SOLARIZED_LIGHT.muted)
+                    .bg(SOLARIZED_LIGHT.panel)
+            };
+            Line::styled(text, style)
+        })
+        .collect()
 }
 
 /// Keep wrapping text-only so scroll accounting is unchanged, then add the

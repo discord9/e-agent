@@ -36,6 +36,7 @@ async fn main_waiting_submission_is_call_id_bound_and_preserves_conflicts() {
         questions: vec![crate::runner::UserQuestion {
             id: "q".into(),
             prompt: "?".into(),
+            options: Vec::new(),
         }],
     };
     emitter.set_status(SessionStatus::WaitingInput(request));
@@ -82,6 +83,7 @@ async fn main_waiting_submission_routes_matching_answer_through_key_handler() {
             questions: vec![crate::runner::UserQuestion {
                 id: "q".into(),
                 prompt: "?".into(),
+                options: Vec::new(),
             }],
         },
     ));
@@ -110,6 +112,236 @@ async fn main_waiting_submission_routes_matching_answer_through_key_handler() {
     );
 }
 
+/// A pending question with fixed options turns the input box into a
+/// selectable list: ↑/↓ move the highlight, Enter and 1..9 submit the right
+/// option id through the one `submit_prompt_with_call_id` path.
+#[tokio::test]
+async fn main_option_question_moves_selection_and_submits_the_chosen_id() {
+    let (handle, emitter, mut commands) = crate::runner::session_test_channel();
+    let request = option_request();
+    emitter.set_status(SessionStatus::WaitingInput(request.clone()));
+    let mut state = TuiState::default();
+    project_main_status(&mut state, &SessionStatus::WaitingInput(request.clone()));
+    assert_eq!(state.waiting_options.len(), 2);
+    assert_eq!(state.waiting_selection, 0);
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+    let mut events =
+        futures_util::stream::iter(Vec::<Result<crossterm::event::Event, std::io::Error>>::new())
+            .peekable();
+    let sessions = Sessions::default();
+    let (sender, _receiver) = mpsc::unbounded_channel();
+    // Same call the pre-draw urgent peek and the select branch share.
+    macro_rules! press {
+        ($code:expr) => {
+            handle_pressed_key(
+                &mut state,
+                KeyEvent::new($code, KeyModifiers::empty()),
+                &handle,
+                &handle.status(),
+                &sessions,
+                &sender,
+                &mut terminal,
+                &mut events,
+            )
+            .await
+            .unwrap()
+        };
+    }
+    // ↑/↓ only move the highlight; they never submit and never wrap past the
+    // ends (the list owns the key, so the scrollback does not move).
+    press!(KeyCode::Down);
+    assert_eq!(state.waiting_selection, 1);
+    press!(KeyCode::Down);
+    assert_eq!(state.waiting_selection, 1);
+    assert!(commands.try_recv().is_err());
+    press!(KeyCode::Up);
+    assert_eq!(state.waiting_selection, 0);
+    press!(KeyCode::Down);
+    // Enter submits the HIGHLIGHTED option's id.
+    press!(KeyCode::Enter);
+    match commands.try_recv().unwrap() {
+        crate::runner::SessionCommand::Answer {
+            call_id,
+            answers,
+            option,
+        } => {
+            assert_eq!(call_id, "perm-call");
+            assert_eq!(
+                option.as_deref(),
+                Some("deny"),
+                "the id travels with the answer"
+            );
+            assert_eq!(
+                answers,
+                vec![("perm".to_owned(), "Selected option: deny (拒绝)".to_owned())]
+            );
+        }
+        _ => panic!("expected the structured answer command"),
+    }
+    // Digits are 1-based shortcuts that select and submit in one keystroke.
+    emitter.set_status(SessionStatus::WaitingInput(request.clone()));
+    project_main_status(&mut state, &SessionStatus::WaitingInput(request.clone()));
+    press!(KeyCode::Char('1'));
+    assert_eq!(state.waiting_selection, 0);
+    match commands.try_recv().unwrap() {
+        crate::runner::SessionCommand::Answer { answers, .. } => assert_eq!(
+            answers,
+            vec![(
+                "perm".to_owned(),
+                "Selected option: allow-once (允许一次)".to_owned()
+            )]
+        ),
+        _ => panic!("expected the structured answer command"),
+    }
+    // Printable keys must not accumulate into the invisible free-text buffer.
+    emitter.set_status(SessionStatus::WaitingInput(request.clone()));
+    project_main_status(&mut state, &SessionStatus::WaitingInput(request.clone()));
+    press!(KeyCode::Char('x'));
+    assert!(state.input.text.is_empty());
+    assert!(commands.try_recv().is_err());
+}
+
+/// A key is answered with the call id the rendered list was CAPTURED with,
+/// never the one that happens to be live: another frontend can answer ask A
+/// and ask B can open before the next redraw, and a key meant for A must never
+/// approve B.
+#[tokio::test]
+async fn main_option_submission_uses_the_captured_call_id_not_the_live_one() {
+    let (handle, emitter, mut commands) = crate::runner::session_test_channel();
+    let shown = option_request();
+    emitter.set_status(SessionStatus::WaitingInput(shown.clone()));
+    let mut state = TuiState::default();
+    project_main_status(&mut state, &SessionStatus::WaitingInput(shown.clone()));
+    assert_eq!(state.waiting_call_id.as_deref(), Some("perm-call"));
+    // Ask B opens before the redraw: the screen still shows A's list.
+    let fresh = crate::runner::UserInputRequest {
+        call_id: "perm-call-2".into(),
+        questions: shown.questions.clone(),
+    };
+    emitter.set_status(SessionStatus::WaitingInput(fresh.clone()));
+    assert!(
+        matches!(
+            &*handle.status().borrow(),
+            SessionStatus::WaitingInput(request) if request.call_id == "perm-call-2"
+        ),
+        "the live question is B"
+    );
+
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+    let mut events =
+        futures_util::stream::iter(Vec::<Result<crossterm::event::Event, std::io::Error>>::new())
+            .peekable();
+    let sessions = Sessions::default();
+    let (sender, _receiver) = mpsc::unbounded_channel();
+    handle_pressed_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        &handle,
+        &handle.status(),
+        &sessions,
+        &sender,
+        &mut terminal,
+        &mut events,
+    )
+    .await
+    .unwrap();
+    // The key answers A, the ask the user was looking at. A is no longer open,
+    // so the runner refuses it — and B is never answered with A's option.
+    assert!(
+        commands.try_recv().is_err(),
+        "a key meant for A must never approve the live ask B"
+    );
+    // Proof that B was untouched: it is still answerable with its own id.
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some("perm-call-2".into()), "deny".into()),
+        crate::runner::PromptSubmission::Answered
+    );
+    match commands.try_recv().unwrap() {
+        crate::runner::SessionCommand::Answer { call_id, .. } => {
+            assert_eq!(call_id, "perm-call-2")
+        }
+        _ => panic!("expected the structured answer command"),
+    }
+
+    // Once B is drawn, the capture follows it.
+    project_main_status(&mut state, &SessionStatus::WaitingInput(fresh));
+    assert_eq!(state.waiting_call_id.as_deref(), Some("perm-call-2"));
+}
+
+/// The list replaces the free-text buffer inside the SAME input box; the
+/// highlighted row uses the panel's selection background.
+#[test]
+fn draw_shows_the_pending_option_list_in_the_input_box() {
+    let mut state = TuiState {
+        waiting_question: Some("Allow?".into()),
+        waiting_options: option_request().questions[0].options.clone(),
+        waiting_selection: 1,
+        ..Default::default()
+    };
+    let backend = ratatui::backend::TestBackend::new(60, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    draw(&mut terminal, &mut state).unwrap();
+    let buffer = terminal.backend().buffer();
+    let rows: Vec<String> = (0..12)
+        .map(|y| {
+            (0..60)
+                .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        })
+        .collect();
+    // TestBackend pads every wide (CJK) glyph with a placeholder cell, so the
+    // comparisons run on the space-free row text.
+    let squashed: Vec<String> = rows.iter().map(|row| row.replace(' ', "")).collect();
+    let first = squashed
+        .iter()
+        .position(|row| row.contains("1.允许一次"))
+        .unwrap_or_else(|| panic!("option 1 not drawn: {rows:?}"));
+    let second = squashed
+        .iter()
+        .position(|row| row.contains("2.拒绝"))
+        .unwrap_or_else(|| panic!("option 2 not drawn: {rows:?}"));
+    assert_eq!(second, first + 1, "one row per option: {rows:?}");
+    assert!(
+        rows.iter().any(|row| row.contains("waiting: Allow?")),
+        "the question keeps the input-box title: {rows:?}"
+    );
+    assert!(
+        squashed[second].contains("仅此一次"),
+        "the description rides on the option row: {:?}",
+        rows[second]
+    );
+    // The highlighted row carries the selection background, the other one the
+    // plain panel background.
+    let selected_bg = buffer[(1, second as u16)].bg;
+    let other_bg = buffer[(1, first as u16)].bg;
+    assert_eq!(selected_bg, SOLARIZED_LIGHT.selection);
+    assert_ne!(other_bg, SOLARIZED_LIGHT.selection);
+}
+
+fn option_request() -> crate::runner::UserInputRequest {
+    crate::runner::UserInputRequest {
+        call_id: "perm-call".into(),
+        questions: vec![crate::runner::UserQuestion {
+            id: "perm".into(),
+            prompt: "Allow?".into(),
+            options: vec![
+                crate::runner::UserOption {
+                    id: "allow-once".into(),
+                    label: "允许一次".into(),
+                    description: None,
+                },
+                crate::runner::UserOption {
+                    id: "deny".into(),
+                    label: "拒绝".into(),
+                    description: Some("仅此一次".into()),
+                },
+            ],
+        }],
+    }
+}
+
 #[test]
 fn main_status_projection_clears_waiting_question_for_all_non_waiting_states() {
     let mut state = TuiState {
@@ -123,6 +355,7 @@ fn main_status_projection_clears_waiting_question_for_all_non_waiting_states() {
     ] {
         project_main_status(&mut state, &status);
         assert!(state.waiting_question.is_none());
+        assert!(state.waiting_call_id.is_none(), "no id outlives its list");
     }
     project_main_status(&mut state, &SessionStatus::Busy);
     assert!(state.waiting_question.is_none());
@@ -144,6 +377,7 @@ async fn attached_waiting_submission_routes_and_restores_unicode_cursor_on_confl
             questions: vec![crate::runner::UserQuestion {
                 id: "q".into(),
                 prompt: "?".into(),
+                options: Vec::new(),
             }],
         },
     ));
@@ -4134,6 +4368,26 @@ fn session_entry_to_lines_maps_persisted_entry_kinds() {
     assert_eq!(out.len(), 3);
     assert_eq!(out[0].text, "[background task 7 completed: demo]");
     assert!(out.iter().all(|line| line.kind == LineKind::Dim));
+
+    // A delegate completion names the child's session id (the
+    // `send_message` target) in the header, untruncated; a bash one does not.
+    let child = "sub-0123456789abcdef0123456789abcdef";
+    let out = lines(&SessionEntry::BackgroundCompletion {
+        id: 8,
+        output: format!("subagent session: {child}\nanswer"),
+        label: Some("demo".into()),
+        started_at_ms: None,
+        duration_ms: None,
+        exit_code: None,
+        signal: None,
+        status: None,
+        kind: Some("delegate".into()),
+        cancellation_source: None,
+    });
+    assert_eq!(
+        out[0].text,
+        format!("[background task 8 completed: demo] [session: {child}]")
+    );
 
     // ForkedFrom → dim provenance notice.
     let out = lines(&SessionEntry::ForkedFrom {

@@ -68,7 +68,9 @@ impl Tool for GetBackgroundTasks {
             description: "Return a one-time snapshot of currently running background tasks. \
                 Do not poll or repeatedly call this tool to wait for completion. \
                 Results are delivered automatically as [background task N completed]; \
-                continue independent work or end the turn while waiting."
+                continue independent work or end the turn while waiting. \
+                Delegate tasks carry a [session: …] tag holding the child's session id, \
+                which is what send_message's target expects."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -150,6 +152,11 @@ impl Tool for GetBackgroundTasks {
                     if let Some(ws) = &meta.workspace {
                         use crate::agent::preview;
                         t.push_str(&format!(" [workspace: {}]", preview(ws, 40)));
+                    }
+                    // The delegate child's session id is never truncated: it
+                    // must stay copy-pasteable as `send_message`'s `target`.
+                    if let Some(session_id) = &meta.subagent_session_id {
+                        t.push_str(&format!(" [session: {session_id}]"));
                     }
                     t
                 })

@@ -2117,11 +2117,18 @@ impl Agent {
                 // before, but the header (id + label) is never bounded —
                 // only the output field carries a receipt when oversized.
                 SessionEntry::BackgroundCompletion {
-                    id, output, label, ..
+                    id,
+                    output,
+                    label,
+                    kind,
+                    ..
                 } => {
+                    // Delegate completions also name the child's session id
+                    // (the `send_message` target); bash stays unchanged.
+                    let tag = background_session_tag(kind.as_deref(), output).unwrap_or_default();
                     let header = match label.as_ref().map(|l| l.trim()).filter(|l| !l.is_empty()) {
-                        Some(l) => format!("[background task {id} completed: {l}]"),
-                        None => format!("[background task {id} completed]"),
+                        Some(l) => format!("[background task {id} completed: {l}]{tag}"),
+                        None => format!("[background task {id} completed]{tag}"),
                     };
                     items.push(ContextItem {
                         message: Message::User {
@@ -2975,6 +2982,27 @@ fn started_task_id(output: &str) -> Option<u64> {
         .0
         .parse()
         .ok()
+}
+
+/// The trailing `[session: <id>]` tag a delegate completion notice carries:
+/// the child subagent's own session id, exactly what `send_message`'s
+/// `target` expects. The id is the one the delegate wrapper already writes on
+/// the completion output's first line (`subagent session: …` on a fresh
+/// spawn/continuation, `fork session: …` on a fork), so no extra event field
+/// has to be threaded through the session schema. `kind` gates the tag to
+/// delegate tasks: bash completions have a shell `kind`, so their notice text
+/// stays byte-identical. The id is returned verbatim (never truncated) — it
+/// must stay copy-pasteable.
+pub(crate) fn background_session_tag(kind: Option<&str>, output: &str) -> Option<String> {
+    if kind != Some("delegate") {
+        return None;
+    }
+    let first = output.lines().next()?;
+    let id = first
+        .strip_prefix("subagent session: ")
+        .or_else(|| first.strip_prefix("fork session: "))?
+        .trim();
+    (!id.is_empty()).then(|| format!(" [session: {id}]"))
 }
 
 pub fn preview(text: &str, max_chars: usize) -> String {

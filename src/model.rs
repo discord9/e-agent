@@ -82,8 +82,13 @@ impl ConfiguredModel {
 #[async_trait::async_trait]
 impl Model for ConfiguredModel {
     fn set_request_session_id(&mut self, id: &str) {
-        if let ConfiguredModelKind::Chat(model) = &mut self.kind {
-            model.set_request_session_id(id);
+        match &mut self.kind {
+            ConfiguredModelKind::Chat(model) => model.set_request_session_id(id),
+            // The Antigravity wire derives `requestId`'s conversation segment
+            // from this id: without the binding, agents cloned from one
+            // configured profile would share one conversation id.
+            ConfiguredModelKind::Antigravity(model) => model.set_request_session_id(id),
+            ConfiguredModelKind::Codex(_) => {}
         }
     }
 

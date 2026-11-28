@@ -1715,6 +1715,8 @@ function renderWaitingInput(payload) {
   const questions = Array.isArray(payload.questions) ? payload.questions : [];
   const valid = !!callId && questions.length === 1
     && questions.every((q) => q && typeof q.id === "string" && typeof q.prompt === "string");
+  const options = valid ? questionOptions(questions[0]) : [];
+  const fixed = options.length > 0;
   const changed = previous && previous.callId !== callId;
   if (changed) state.waitingDrafts[waitingDraftKey(previous.callId)] = els.promptInput.value;
   if (state.waitingSubmit && state.waitingSubmit.callId !== callId) state.waitingSubmit = null;
@@ -1727,6 +1729,32 @@ function renderWaitingInput(payload) {
   for (const question of questions) {
     const item = el("div", "waiting-input-question", question && question.prompt ? question.prompt : "");
     els.waitingInputQuestions.appendChild(item);
+  }
+  if (fixed) {
+    // 固定选项：选项按钮就是唯一回答路径。文本框只服务没有选项的自由
+    // 文本问题；选项 id 原样提交（" x " 与 "x" 是两个不同的选项）。
+    const list = el("div", "pending-question-options");
+    list.setAttribute("role", "group");
+    list.setAttribute("aria-label", "选项：" + questions[0].prompt);
+    for (const option of options) {
+      const choice = document.createElement("button");
+      choice.type = "button";
+      choice.className = "pending-question-option primary";
+      choice.textContent = typeof option.label === "string" && option.label
+        ? option.label : option.id;
+      choice.setAttribute("data-option-id", option.id);
+      if (typeof option.description === "string" && option.description) {
+        choice.title = option.description;
+        choice.setAttribute("aria-description", option.description);
+      }
+      choice.disabled = !valid || !!state.waitingSubmit;
+      choice.classList.toggle("chosen", !!state.waitingSubmit
+        && state.waitingSubmit.callId === callId
+        && state.waitingSubmit.optionId === option.id);
+      choice.addEventListener("click", () => submitWaitingAnswer(option.id));
+      list.appendChild(choice);
+    }
+    els.waitingInputQuestions.appendChild(list);
   }
   els.waitingInputPanel.hidden = false;
   els.waitingInputError.hidden = true;
@@ -1742,13 +1770,15 @@ function renderWaitingInput(payload) {
     els.promptInput.value = state.waitingDrafts[waitingDraftKey(callId)] || "";
     autosizeInput();
   }
-  els.promptLabel.textContent = "回答当前问题";
-  els.promptInput.placeholder = "输入回答：Enter 提交，Shift+Enter 换行…";
+  els.promptLabel.textContent = fixed ? "请选择上方选项" : "回答当前问题";
+  els.promptInput.placeholder = fixed
+    ? "请点击上方选项作答（选项 id 原样提交）"
+    : "输入回答：Enter 提交，Shift+Enter 换行…";
   els.sendBtn.textContent = state.waitingSubmit
     ? state.waitingSubmit.accepted ? "已回答" : "提交中…"
-    : "回答";
-  els.sendBtn.disabled = !valid || !!state.waitingSubmit;
-  els.promptInput.disabled = !valid || !!state.waitingSubmit;
+    : fixed ? "请选择选项" : "回答";
+  els.sendBtn.disabled = fixed || !valid || !!state.waitingSubmit;
+  els.promptInput.disabled = fixed || !valid || !!state.waitingSubmit;
 }
 
 function clearWaitingInput(restoreDraft = true) {
@@ -1789,43 +1819,87 @@ function normalizePendingQuestions(payload) {
   return out;
 }
 
+/* 固定选项：老会话/自由文本问题没有 options 键（或为空）→ 保持文本框。 */
+function questionOptions(question) {
+  const options = question && Array.isArray(question.options) ? question.options : [];
+  return options.filter((option) => option && typeof option.id === "string" && option.id);
+}
+
+/* 同一 call_id 的选项集合（id + label）变化时才需要重建卡片控件。 */
+function pendingOptionsKey(item) {
+  return questionOptions(item.questions[0])
+    .map((option) => option.id + "=" + (typeof option.label === "string" ? option.label : ""))
+    .join("\u0000");
+}
+
 function buildPendingQuestionCard(item) {
   const promptText = item.questions.map((q) => q.prompt).join("\n");
+  const options = questionOptions(item.questions[0]);
   const root = el("article", "pending-question-card");
   root.setAttribute("data-call-id", item.callId);
   root.appendChild(el("p", "pending-question-prompt", promptText));
-  const row = el("div", "pending-question-row");
-  const field = el("label", "pending-question-field");
-  field.appendChild(el("span", "sr-only", "回答：" + promptText));
-  const input = document.createElement("input");
-  input.type = "text";
-  input.className = "pending-question-input";
-  input.placeholder = "输入回答…";
-  input.autocomplete = "off";
-  input.spellcheck = "false";
-  input.setAttribute("aria-label", "回答：" + promptText);
-  field.appendChild(input);
-  row.appendChild(field);
-  const button = document.createElement("button");
-  button.type = "button";
-  button.className = "pending-question-submit primary";
-  button.textContent = "回答";
-  row.appendChild(button);
-  root.appendChild(row);
+  const entry = {
+    root, input: null, button: null, optionButtons: [], status: null,
+    pending: false, submitted: false, chosen: "",
+  };
+  if (options.length) {
+    // 固定选项：一个选项一个按钮，点选即提交该选项的 id——与文本框走同一条
+    // submitPendingAnswer → POST /prompt 路径，绝不另开提交通道。
+    const list = el("div", "pending-question-options");
+    list.setAttribute("role", "group");
+    list.setAttribute("aria-label", "选项：" + promptText);
+    for (const option of options) {
+      const choice = document.createElement("button");
+      choice.type = "button";
+      choice.className = "pending-question-option primary";
+      choice.textContent = typeof option.label === "string" && option.label
+        ? option.label : option.id;
+      choice.setAttribute("data-option-id", option.id);
+      if (typeof option.description === "string" && option.description) {
+        choice.title = option.description;
+        choice.setAttribute("aria-description", option.description);
+      }
+      choice.addEventListener("click", () => submitPendingAnswer(item.callId, option.id));
+      list.appendChild(choice);
+      entry.optionButtons.push({ el: choice, id: option.id });
+    }
+    root.appendChild(list);
+  } else {
+    const row = el("div", "pending-question-row");
+    const field = el("label", "pending-question-field");
+    field.appendChild(el("span", "sr-only", "回答：" + promptText));
+    const input = document.createElement("input");
+    input.type = "text";
+    input.className = "pending-question-input";
+    input.placeholder = "输入回答…";
+    input.autocomplete = "off";
+    input.spellcheck = "false";
+    input.setAttribute("aria-label", "回答：" + promptText);
+    field.appendChild(input);
+    row.appendChild(field);
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "pending-question-submit primary";
+    button.textContent = "回答";
+    row.appendChild(button);
+    root.appendChild(row);
+    entry.input = input;
+    entry.button = button;
+    // 键盘可达：Enter 提交本卡片（单行 input，无需 Shift+Enter 换行）。
+    button.addEventListener("click", () => submitPendingAnswer(item.callId));
+    input.addEventListener("keydown", (ev) => {
+      if (ev.key !== "Enter" || ev.isComposing || ev.keyCode === 229) return;
+      ev.preventDefault();
+      submitPendingAnswer(item.callId);
+    });
+    input.addEventListener("input", () => {
+      if (!entry.pending && !entry.submitted) entry.status.textContent = "";
+    });
+  }
   const status = el("p", "pending-question-status");
   status.setAttribute("role", "status");
   root.appendChild(status);
-  const entry = { root, input, button, status, pending: false, submitted: false };
-  // 键盘可达：Enter 提交本卡片（单行 input，无需 Shift+Enter 换行）。
-  button.addEventListener("click", () => submitPendingAnswer(item.callId));
-  input.addEventListener("keydown", (ev) => {
-    if (ev.key !== "Enter" || ev.isComposing || ev.keyCode === 229) return;
-    ev.preventDefault();
-    submitPendingAnswer(item.callId);
-  });
-  input.addEventListener("input", () => {
-    if (!entry.pending && !entry.submitted) status.textContent = "";
-  });
+  entry.status = status;
   return entry;
 }
 
@@ -1835,11 +1909,17 @@ function syncPendingQuestionCards() {
     const busy = !!entry.pending;
     // 已提交的卡片保持只读，直到下一次 status 帧把它移除（避免重复回答）。
     const locked = finished || busy || !!entry.submitted;
-    entry.input.disabled = locked;
-    entry.button.disabled = locked;
+    if (entry.input) entry.input.disabled = locked;
+    if (entry.button) entry.button.disabled = locked;
+    for (const option of entry.optionButtons) {
+      option.el.disabled = locked;
+      option.el.classList.toggle("chosen", !!entry.chosen && option.id === entry.chosen);
+    }
     entry.root.classList.toggle("submitted", !!entry.submitted);
     entry.root.classList.toggle("sending", busy);
-    entry.button.textContent = entry.submitted ? "已提交" : (busy ? "提交中…" : "回答");
+    if (entry.button) {
+      entry.button.textContent = entry.submitted ? "已提交" : (busy ? "提交中…" : "回答");
+    }
   }
 }
 
@@ -1872,11 +1952,27 @@ function renderPendingQuestions(payload) {
   let cursor = els.pendingQuestionsList.firstChild;
   for (const item of items) {
     const promptText = item.questions.map((q) => q.prompt).join("\n");
+    const optionsKey = pendingOptionsKey(item);
     let entry = state.pendingCards.get(item.callId);
     if (!entry) {
       entry = buildPendingQuestionCard(item);
       entry.promptText = promptText;
+      entry.optionsKey = optionsKey;
       state.pendingCards.set(item.callId, entry);
+    } else if (entry.optionsKey !== optionsKey) {
+      // 同一 call_id 的选项集合变了：文本框与选项按钮不能就地互换，重建卡片并
+      // 保留草稿/已提交/选中状态。
+      const rebuilt = buildPendingQuestionCard(item);
+      rebuilt.promptText = promptText;
+      rebuilt.optionsKey = optionsKey;
+      rebuilt.submitted = entry.submitted;
+      rebuilt.chosen = entry.chosen;
+      if (entry.input && rebuilt.input) rebuilt.input.value = entry.input.value;
+      if (entry.root === cursor) cursor = cursor.nextSibling;
+      els.pendingQuestionsList.insertBefore(rebuilt.root, entry.root);
+      entry.root.remove();
+      state.pendingCards.set(item.callId, rebuilt);
+      entry = rebuilt;
     } else if (entry.promptText !== promptText) {
       // Same call id, changed prompt text: update labels in place; keep the
       // input value and submission state.
@@ -1884,7 +1980,7 @@ function renderPendingQuestions(payload) {
       if (prompt) prompt.textContent = promptText;
       const label = entry.root.querySelector(".pending-question-field .sr-only");
       if (label) label.textContent = "回答：" + promptText;
-      entry.input.setAttribute("aria-label", "回答：" + promptText);
+      if (entry.input) entry.input.setAttribute("aria-label", "回答：" + promptText);
       entry.promptText = promptText;
     }
     if (entry.root === cursor) {
@@ -1898,15 +1994,17 @@ function renderPendingQuestions(payload) {
   syncPendingQuestionCards();
 }
 
-/* 回答一张卡片：POST 现有 /prompt，携带该卡片自己的 call_id。失败时保留
-   文本并显示既有 banner；成功后卡片标记「已提交」，等下一次 status 帧移除。 */
-async function submitPendingAnswer(callId) {
+/* 回答一张卡片：POST 现有 /prompt，携带该卡片自己的 call_id。固定选项卡片提交
+   所点选项的 id（与文本框同一条路径），失败时保留状态并显示既有 banner；成功后
+   卡片标记「已提交」，等下一次 status 帧移除。 */
+async function submitPendingAnswer(callId, optionId) {
   const entry = state.pendingCards.get(callId);
   if (!entry || entry.pending || entry.submitted || !state.sessionId) return;
-  const text = entry.input.value.trim();
+  const choice = typeof optionId === "string" ? optionId : "";
+  const text = choice || (entry.input ? entry.input.value.trim() : "");
   if (!text) {
     entry.status.textContent = "请输入回答后再提交。";
-    entry.input.focus();
+    if (entry.input) entry.input.focus();
     return;
   }
   const captured = {
@@ -1918,6 +2016,7 @@ async function submitPendingAnswer(callId) {
     && !!state.workspace && state.workspace.id === captured.wid
     && state.pendingCards.get(callId) === entry;
   entry.pending = true;
+  entry.chosen = choice;
   syncPendingQuestionCards();
   entry.status.textContent = "正在提交…";
   try {
@@ -1935,6 +2034,7 @@ async function submitPendingAnswer(callId) {
     if (!current()) return;
     setBanner("⚠ 回答未发送：" + e.message, true);
     entry.status.textContent = "未发送，请重试";
+    entry.chosen = "";
   } finally {
     if (state.pendingCards.get(callId) === entry) {
       entry.pending = false;

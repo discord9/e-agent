@@ -551,12 +551,31 @@ fn project_main_status(state: &mut TuiState, status: &SessionStatus) {
         SessionStatus::Compacting => Some(BusyState::compacting()),
         SessionStatus::WaitingInput(request) => {
             state.waiting_question = request.questions.first().map(|q| q.prompt.clone());
+            let options = request
+                .questions
+                .first()
+                .map(|q| q.options.clone())
+                .unwrap_or_default();
+            // Keep the highlight on a status frame that re-publishes the SAME
+            // question (e.g. an async question registered meanwhile).
+            if options != state.waiting_options {
+                state.waiting_selection = 0;
+            }
+            state.waiting_options = options;
+            // The rendered list is answered with the id it was CAPTURED with,
+            // captured here, together with the options: a later status frame
+            // (another frontend answered this ask, a different one opened) must
+            // not retarget the keys the user is about to press.
+            state.waiting_call_id = Some(request.call_id.clone());
             None
         }
         SessionStatus::Idle | SessionStatus::Finished(_) => None,
     };
     if !matches!(status, SessionStatus::WaitingInput(_)) {
         state.waiting_question = None;
+        state.waiting_options.clear();
+        state.waiting_call_id = None;
+        state.waiting_selection = 0;
     }
 }
 
@@ -623,6 +642,12 @@ where
     }
     if waiting_call_id.is_some() && is_exit(key) {
         return Ok(KeyHandled::Exit);
+    }
+    // A pending question with fixed options replaces free-text input with a
+    // selectable list, so these keys must be claimed before scroll handling.
+    // The list answers with the call id it was captured with, not the live one.
+    if waiting_call_id.is_some() && state.handle_option_key(key, handle) {
+        return Ok(KeyHandled::Continue);
     }
     if is_scroll_key(key) {
         state.handle_scroll(key);

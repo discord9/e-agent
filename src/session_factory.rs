@@ -23,7 +23,7 @@ use crate::codex::CodexModel;
 use crate::codex_auth::CodexAuth;
 use crate::config::{
     AuthMode, Config, ProjectSourceObservation, ResolvedModel, Sandbox, SandboxPolicy,
-    WebSearchProvider,
+    WebFetchProvider, WebSearchProvider,
 };
 use crate::delegate::{Delegate, Sessions};
 use crate::mcp;
@@ -32,7 +32,8 @@ use crate::runner::{IdlePolicy, SessionBootstrap, SessionHandle, SessionRunner};
 use crate::session_store::SessionStore;
 use crate::tools::{
     AuthResolver, BackgroundTasks, DEEPSEEK_API_KEY_ENV, SEARXNG_BASE_URL_ENV,
-    add_root_user_input_tool, builtins_with_bash_timeout, generate_image_tool,
+    WEB_FETCH_PROVIDER_ENV, WEB_SEARCH_PROVIDER_ENV, add_root_user_input_tool,
+    builtins_with_bash_timeout, generate_image_tool,
 };
 use crate::workspace::Workspace;
 
@@ -353,16 +354,36 @@ impl SessionFactory {
             .as_ref()
             .map(|c| c.session_backend())
             .unwrap_or_default();
-        // Web search reads its backend from the process env (tools.rs and
-        // subagents pick it up there): EXA_API_KEY for the default Exa
+        // Web search/fetch read their backends from the process env (tools.rs
+        // and subagents pick it up there): EXA_API_KEY for the default Exa
         // provider, the internal `E_AGENT_SEARXNG_BASE_URL` for
         // `[web_search] provider = "searxng"`, and the internal
-        // `E_AGENT_DEEPSEEK_API_KEY` for `provider = "deepseek"`. The
-        // section is validated once here, which keeps the single transport
-        // mechanism and avoids threading the setting through every tools
-        // constructor. Startup is single-threaded, so set_var is safe.
+        // `E_AGENT_DEEPSEEK_API_KEY` for `provider = "deepseek"` or
+        // `fetch_provider = "deepseek"`. The provider choices travel beside
+        // the credentials in `E_AGENT_WEB_SEARCH` / `E_AGENT_WEB_FETCH`, so a
+        // SearXNG search can carry a DeepSeek key for the fetch without the
+        // key hijacking the search backend. The section is validated once
+        // here, which keeps the single transport mechanism and avoids
+        // threading the setting through every tools constructor. Startup is
+        // single-threaded, so set_var is safe.
         if let Some(config) = &config {
-            match config.web_search_provider()? {
+            let search = config.web_search_provider()?;
+            let deepseek_fetch = config.web_fetch_provider()? == Some(WebFetchProvider::Deepseek);
+            if let Some(search) = &search {
+                let selector = match search {
+                    WebSearchProvider::Exa => "exa",
+                    WebSearchProvider::Searxng { .. } => "searxng",
+                    WebSearchProvider::Deepseek => "deepseek",
+                };
+                if std::env::var_os(WEB_SEARCH_PROVIDER_ENV).is_none() {
+                    unsafe { std::env::set_var(WEB_SEARCH_PROVIDER_ENV, selector) };
+                }
+            }
+            if deepseek_fetch && std::env::var_os(WEB_FETCH_PROVIDER_ENV).is_none() {
+                unsafe { std::env::set_var(WEB_FETCH_PROVIDER_ENV, "deepseek") };
+            }
+            let search_is_deepseek = matches!(search, Some(WebSearchProvider::Deepseek));
+            match search {
                 Some(WebSearchProvider::Searxng { base_url }) => {
                     if std::env::var_os(SEARXNG_BASE_URL_ENV).is_none() {
                         unsafe { std::env::set_var(SEARXNG_BASE_URL_ENV, base_url) };
@@ -384,6 +405,15 @@ impl SessionFactory {
                         unsafe { std::env::set_var(DEEPSEEK_API_KEY_ENV, key) };
                     }
                 }
+            }
+            // A SearXNG (or Exa) search with a DeepSeek fetch still needs the
+            // credential, because it now belongs to the fetch.
+            if deepseek_fetch
+                && !search_is_deepseek
+                && std::env::var_os(DEEPSEEK_API_KEY_ENV).is_none()
+                && let Some(key) = config.web_search_key()?
+            {
+                unsafe { std::env::set_var(DEEPSEEK_API_KEY_ENV, key) };
             }
         }
         let (runtime, auth) = match &config {
@@ -1050,6 +1080,21 @@ impl SessionFactory {
             self.read_only,
             self.skills_root.as_deref(),
         );
+        // Main-agent only: `acp_prompt` (one external ACP stdio agent per
+        // call). Children/btw forks build the common builtins, so they never
+        // see it — like `generate_image`, a same-workspace fork of a main
+        // session that exposed it has a different tool array.
+        // The store + root + session id are the ACP session-reuse wiring: the
+        // tool reads/writes `sessions.acp_session_id` through the store.
+        register_acp(
+            &mut tools,
+            &tools_workspace,
+            config.as_ref(),
+            self.read_only,
+            &store,
+            &self.root,
+            &session,
+        );
         // Read-only sessions skip MCP entirely: MCP tools carry no read-only
         // marker, so exposing them would defeat the policy. Delegation stays —
         // spawning a subagent does not mutate this session's host state, and
@@ -1414,6 +1459,42 @@ pub(crate) fn register_generate_image(
         tools.push(tool);
     }
 }
+
+/// Register the main-agent-only `acp_prompt` tool. The `[acp]` section is the
+/// opt-in: without it nothing is registered (the same boundary as a
+/// `[web_search]` without a usable credential). Read-only sessions skip it —
+/// the external agent carries no read-only marker and would defeat the policy
+/// — and children/btw forks build the common builtins without it.
+///
+/// This is the wiring point for ACP session reuse: the tool gets the session
+/// store (`sessions.acp_session_id`) plus the store's workspace root and the
+/// session id it belongs to, so it never opens a database itself.
+pub(crate) fn register_acp(
+    tools: &mut Vec<Box<dyn crate::agent::Tool>>,
+    workspace: &Workspace,
+    config: Option<&crate::config::Config>,
+    read_only: bool,
+    store: &crate::session_store::SessionStore,
+    root: &std::path::Path,
+    session: &str,
+) {
+    if read_only {
+        return;
+    }
+    let Some(acp) = config.and_then(crate::config::Config::acp) else {
+        return;
+    };
+    // The session id is bound up front: the ACP id belongs to THIS session's
+    // metadata row from the first call.
+    tools.push(crate::tools::acp_tool(
+        workspace.clone(),
+        acp,
+        store.clone(),
+        root.to_path_buf(),
+        session,
+    ));
+}
+
 fn preflight_sandbox(policy: &Sandbox, announce: bool) -> anyhow::Result<()> {
     #[cfg(windows)]
     {
@@ -1887,9 +1968,18 @@ fn apply_reloaded_config(
         Ok(provider) => provider,
         Err(error) => return ReloadResult::Rejected(format!("{error:#}")),
     };
+    let web_fetch_provider = match config.web_fetch_provider() {
+        Ok(provider) => provider,
+        Err(error) => return ReloadResult::Rejected(format!("{error:#}")),
+    };
+    let deepseek_fetch = web_fetch_provider == Some(WebFetchProvider::Deepseek);
     let key_env = match &web_search_provider {
-        Some(WebSearchProvider::Searxng { .. }) => None,
-        Some(WebSearchProvider::Deepseek) => Some(DEEPSEEK_API_KEY_ENV),
+        // A SearXNG search carries no credential unless the fetch is
+        // DeepSeek's, which then needs one.
+        Some(WebSearchProvider::Searxng { .. }) if !deepseek_fetch => None,
+        Some(WebSearchProvider::Searxng { .. }) | Some(WebSearchProvider::Deepseek) => {
+            Some(DEEPSEEK_API_KEY_ENV)
+        }
         Some(WebSearchProvider::Exa) | None => Some("EXA_API_KEY"),
     };
     if let Some(variable) = key_env
