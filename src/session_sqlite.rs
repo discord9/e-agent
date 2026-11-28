@@ -17,7 +17,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::agent::SessionEntry;
 use crate::output_receipt::{
@@ -127,7 +126,6 @@ CREATE TABLE IF NOT EXISTS sessions (
     archived INTEGER NULL,
     writer TEXT NULL,
     acp_session_id TEXT NULL,
-    refs TEXT NULL,
     PRIMARY KEY (workspace_id, session_id, last_active_at)
 )
 "#;
@@ -178,15 +176,6 @@ CREATE TABLE IF NOT EXISTS usage_entries (
 /// `(session_id, entry_count, created_at_us, last_active_at_us)`.
 type BackfillRow = (String, i64, i64, i64);
 
-/// The fork-provenance query: ONE physical matching row, and no `payload`
-/// column. It answers "is this session a fork?" without a logical head bound,
-/// so a legacy copy writer's marker (appended after the whole copied prefix)
-/// is found at any depth, and a normal long session never materializes a
-/// transcript page to answer it.
-const FORK_MARKER_SQL: &str = "SELECT 1 FROM session_entries \
-     WHERE workspace_id = ?1 AND session_id = ?2 AND entry_kind = 'forked_from' \
-     LIMIT 1";
-
 pub struct SqliteSession {
     /// The shared turso connection, guarded by an async mutex so every
     /// `&self` method can serialize its statements against concurrent
@@ -204,14 +193,12 @@ pub struct SqliteSession {
     /// path — and `read_field` rejects a receipt bound to another database
     /// file before querying.
     backend_fp: String,
-    /// The session's latest metadata snapshot, refreshed after every
-    /// successful create/mutation. `None` = no row yet (brand-new session,
-    /// or a subagent whose parent has not written its row yet).
-    ///
-    /// Metadata WRITES never read this cache: another handle may have
-    /// deleted the row or changed its links since it was populated, so
-    /// every mutator re-reads the latest row inside its write transaction.
-    /// Interior mutability because every path takes `&self`.
+    /// The session's latest metadata snapshot, cached at connect time so
+    /// every touch carries the immutable columns (created_at/model/role/
+    /// parent/title/pinned) without re-reading them. `None` = no row yet
+    /// (brand-new session, or a subagent whose parent has not written its
+    /// row yet).
+    /// Interior mutability because every touch path takes `&self`.
     cached_meta: std::sync::Mutex<Option<SessionMeta>>,
     /// `sessions.acp_session_id` exists (its migration at connect succeeded).
     /// When it does not, metadata reads project `NULL` in its place and writes
@@ -219,24 +206,9 @@ pub struct SqliteSession {
     /// [`Self::set_acp_session_id`] fails instead of reporting a write it
     /// cannot make (the ACP layer treats `Ok` as "the id is durable").
     acp_available: bool,
-    /// Whether the `sessions.refs` column exists. `false` = the migration
-    /// ALTER failed on this old database: every read projects the column as
-    /// NULL (links read as empty) and every snapshot write omits it, so a
-    /// failed migration takes away links and NOTHING else — listing,
-    /// creating and resuming sessions keep working, and only an explicit
-    /// ref edit fails (loudly) instead of corrupting the row.
-    ///
-    /// Mutable because another handle may repair the schema while this one
-    /// stays open: every degraded write re-probes the column inside its
-    /// transaction and flips this flag, so the repaired database's links are
-    /// carried forward instead of being erased by a NULL snapshot.
-    refs_available: AtomicBool,
 }
 
 /// The shared `sessions` metadata projection, in [`row_to_meta`] order.
-/// Every SELECT that decodes with [`row_to_meta`] appends the `refs`
-/// projection ([`SqliteSession::refs_projection`]) as the LAST column, so the
-/// layout is exactly `META_COLUMNS, refs`.
 const META_COLUMNS: &str = "created_at, last_active_at, model, \"role\", entry_count, \
      parent_session_id, parent_task_id, title, pinned, archived, writer, acp_session_id";
 
@@ -244,8 +216,6 @@ const META_COLUMNS: &str = "created_at, last_active_at, model, \"role\", entry_c
 /// migration failed: `NULL` stands in for the missing column, so the column
 /// layout — and therefore [`row_to_meta`], `create_meta`, and every other
 /// metadata read — is unchanged and only the ACP reuse feature degrades.
-/// The `refs` projection is still appended after it, exactly as with
-/// [`META_COLUMNS`].
 const META_COLUMNS_WITHOUT_ACP: &str = "created_at, last_active_at, model, \"role\", \
      entry_count, parent_session_id, parent_task_id, title, pinned, archived, writer, \
      NULL AS acp_session_id";
@@ -291,29 +261,6 @@ impl SqliteSession {
         workspace_id: &str,
         session_id: &str,
     ) -> Result<Self, String> {
-        Self::connect_inner(db_path, workspace_id, session_id, true).await
-    }
-
-    /// Test-only: open the database exactly like [`Self::connect`] but do
-    /// NOT repair a missing `sessions.refs` column, reproducing an old
-    /// database whose `ALTER` failed. The schema genuinely lacks the
-    /// column; the session then takes exactly the production degraded path
-    /// (`refs_available = false`).
-    #[cfg(test)]
-    pub(crate) async fn connect_with_failed_refs_migration(
-        db_path: &str,
-        workspace_id: &str,
-        session_id: &str,
-    ) -> Result<Self, String> {
-        Self::connect_inner(db_path, workspace_id, session_id, false).await
-    }
-
-    async fn connect_inner(
-        db_path: &str,
-        workspace_id: &str,
-        session_id: &str,
-        repair_refs_column: bool,
-    ) -> Result<Self, String> {
         ensure_db_parent_dir(db_path)?;
         let db = turso::Builder::new_local(db_path)
             .build()
@@ -357,7 +304,7 @@ impl SqliteSession {
             .map_err(|e| format!("cannot create usage_entries table: {e}"))?;
 
         // Idempotent schema migration for the `title`, `pinned`,
-        // `archived`, `writer` and `refs` columns — a table-structure evolution:
+        // `archived` and `writer` columns — a table-structure evolution:
         // the `sessions` table shipped without them, so pre-existing
         // databases need an ALTER (fresh databases already have them via
         // CREATE_TABLE_SESSIONS above; `CREATE TABLE IF NOT EXISTS` never
@@ -382,7 +329,6 @@ impl SqliteSession {
         let mut archived_available = true;
         let mut writer_available = true;
         let mut acp_available = true;
-        let mut refs_available = true;
         {
             let mut rows = conn
                 .query("PRAGMA table_info(sessions)", ())
@@ -411,7 +357,7 @@ impl SqliteSession {
             // trailing `NULL` as NOT NULL (CREATE TABLE is unaffected —
             // fresh DBs keep nullable columns), so the ALTER must OMIT the
             // constraint; ADD COLUMN defaults to nullable anyway.
-            let migrations: [(&str, &str, &str, &mut bool); 6] = [
+            let migrations: [(&str, &str, &str, &mut bool); 5] = [
                 ("title", "TEXT", "session titles", &mut title_available),
                 (
                     "pinned",
@@ -432,18 +378,10 @@ impl SqliteSession {
                     "ACP session reuse",
                     &mut acp_available,
                 ),
-                ("refs", "TEXT", "session refs", &mut refs_available),
             ];
             for (name, sql_type, feature, available) in migrations {
                 if columns.iter().any(|c| c == name) {
                     continue; // column already present (fresh DB or migrated)
-                }
-                if name == "refs" && !repair_refs_column {
-                    // Test seam only: an old database whose ALTER failed —
-                    // the column really is absent and the session must run
-                    // degraded instead of failing every metadata write.
-                    *available = false;
-                    continue;
                 }
                 let sql = format!("ALTER TABLE sessions ADD COLUMN {name} {sql_type}");
                 if let Err(error) = conn.execute(&sql, ()).await {
@@ -580,31 +518,22 @@ impl SqliteSession {
         // touches rewrite complete rows without re-reading immutable
         // columns. The table is append-only; the newest row per session
         // wins (ORDER BY last_active_at DESC LIMIT 1). Skipped when a
-        // feature column OTHER than `refs` is unavailable (failed
-        // migration): those columns cannot be projected away. A missing
-        // `refs` column does NOT skip the cache — it is projected as a
-        // literal NULL, so an old database whose refs ALTER failed still
-        // creates, lists and touches sessions. A missing `acp_session_id`
-        // DOES skip it: the cache query names that column and cannot
-        // project it away (only the per-session read swaps in
-        // META_COLUMNS_WITHOUT_ACP).
+        // feature column is unavailable (failed migration): the cache
+        // query references the columns and would error on an unmigrated
+        // table, exactly like Greptime's degraded mode.
         let cached_meta = if title_available
             && pinned_available
             && archived_available
             && writer_available
             && acp_available
         {
-            let refs_col = if refs_available { "refs" } else { "NULL" };
             let mut rows = conn
-                .query(
-                    &format!(
+                    .query(
                         "SELECT created_at, last_active_at, model, \"role\", entry_count, \
-                                parent_session_id, parent_task_id, title, pinned, archived, writer, \
-                                acp_session_id, {refs_col} \
+                                parent_session_id, parent_task_id, title, pinned, archived, writer, acp_session_id \
                          FROM sessions \
                          WHERE workspace_id = ?1 AND session_id = ?2 \
-                         ORDER BY last_active_at DESC LIMIT 1"
-                    ),
+                         ORDER BY last_active_at DESC LIMIT 1",
                         (workspace_id, session_id),
                     )
                     .await
@@ -632,7 +561,6 @@ impl SqliteSession {
             ),
             cached_meta: std::sync::Mutex::new(cached_meta),
             acp_available,
-            refs_available: AtomicBool::new(refs_available),
         };
 
         // Seed next_seq from the DB's current max seq (see db_max_seq).
@@ -1553,28 +1481,6 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
         Ok(entries.into_iter().map(|(_, entry)| entry).collect())
     }
 
-    /// Does the stored transcript carry a `ForkedFrom` marker ANYWHERE?
-    ///
-    /// ONE matching row and NO payload ([`FORK_MARKER_SQL`]). A logical-key
-    /// head (the first `n` rows) is not an I/O bound — retries keep every
-    /// physical version — and a constant would silently miss a legacy copy
-    /// fork whose marker sits behind the whole copied prefix. `LIMIT 1`
-    /// bounds the query by the answer itself.
-    pub async fn has_fork_marker(&self) -> Result<bool, String> {
-        let conn = self.conn.lock().await;
-        let mut rows = conn
-            .query(
-                FORK_MARKER_SQL,
-                (self.workspace_id.as_str(), self.session_id.as_str()),
-            )
-            .await
-            .map_err(|e| format!("cannot query the fork marker: {e}"))?;
-        rows.next()
-            .await
-            .map(|row| row.is_some())
-            .map_err(|e| format!("cannot query the fork marker: {e}"))
-    }
-
     /// Load the selected bounded segment without physical locations.
     pub async fn load_older(
         &self,
@@ -2381,99 +2287,20 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
         Ok(out)
     }
 
-    /// The `refs` projection every meta SELECT uses: the real column when
-    /// the migration succeeded, a literal `NULL` when it did not. It stays
-    /// ONE column wide either way, so the row decoders keep their positional
-    /// indices and a degraded old database reads links as empty instead of
-    /// failing the whole read.
-    ///
-    /// `refs_available` is the ONE decision an operation made when it began
-    /// (`ensure_refs_available_in`): projection, decode and write all use it,
-    /// never a fresh look at the shared flag.
-    fn refs_projection(refs_available: bool, qualified: bool) -> &'static str {
-        match (refs_available, qualified) {
-            (true, true) => "s.refs",
-            (true, false) => "refs",
-            (false, _) => "NULL",
-        }
-    }
-
-    /// The parent link of this session's newest metadata snapshot, or `None`
-    /// when the row records none (including "no row yet"). ONE row, ONE
-    /// column: reopening a child session must not read its transcript to know
-    /// it is one. The connect-time cache answers without a query when the
-    /// table was readable then.
-    pub async fn parent_session_id(&self) -> Result<Option<String>, String> {
-        if let Some(parent) = self
-            .cached_meta
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|meta| meta.parent_session_id.clone())
-        {
-            return Ok(Some(parent));
-        }
-        let conn = self.conn.lock().await;
-        let mut rows = conn
-            .query(
-                "SELECT parent_session_id FROM sessions \
-                 WHERE workspace_id = ?1 AND session_id = ?2 \
-                 ORDER BY last_active_at DESC LIMIT 1",
-                (self.workspace_id.as_str(), self.session_id.as_str()),
-            )
-            .await
-            .map_err(|e| format!("cannot query the session parent: {e}"))?;
-        rows.next()
-            .await
-            .map_err(|e| format!("cannot query the session parent: {e}"))?
-            .map(|row| {
-                row.get_value(0)
-                    .map_err(|e| format!("cannot query the session parent: {e}"))
-                    .map(|value| value.as_text().cloned())
-            })
-            .transpose()
-            .map(Option::flatten)
-    }
-
     /// Latest metadata snapshot for one session, or `None` when the
     /// session has no row yet (brand-new session, or a subagent whose
-    /// parent has not written its row yet). This is the ACP read path's
-    /// entry point; metadata WRITES read through
-    /// [`Self::load_meta_row_locked`] inside their transaction.
+    /// parent has not written its row yet).
     async fn load_meta_row(&self, session_id: &str) -> Result<Option<SessionMeta>, String> {
-        // One decision for this read: the projection and the decode must
-        // agree even if a degraded handle flips its flag concurrently.
-        let refs_available = self.refs_available.load(Ordering::Relaxed);
-        let conn = self.conn.lock().await;
-        self.load_meta_row_locked(&conn, session_id, refs_available)
-            .await
-    }
-
-    /// The row read behind [`Self::load_meta_row`], on a connection the
-    /// caller already holds: a read-modify-write must see and write the
-    /// table under ONE lock, so no other operation on this connection can
-    /// delete the row between the check and the append.
-    async fn load_meta_row_locked(
-        &self,
-        conn: &turso::Connection,
-        session_id: &str,
-        refs_available: bool,
-    ) -> Result<Option<SessionMeta>, String> {
-        // Two independent feature columns with two independent degraded
-        // forms, and neither may shift the decode: a missing `refs` column
-        // is projected as a literal NULL in its own slot, and a missing
-        // `acp_session_id` swaps in META_COLUMNS_WITHOUT_ACP (also one
-        // column wide), so [`row_to_meta`] keeps its positions either way.
         let columns = if self.acp_available {
             META_COLUMNS
         } else {
             META_COLUMNS_WITHOUT_ACP
         };
-        let refs = Self::refs_projection(refs_available, false);
+        let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
                 &format!(
-                    "SELECT {columns}, {refs} \
+                    "SELECT {columns} \
                      FROM sessions \
                      WHERE workspace_id = ?1 AND session_id = ?2 \
                      ORDER BY last_active_at DESC LIMIT 1"
@@ -2492,243 +2319,86 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
         }
     }
 
-    /// Append the bootstrap snapshot for ONE session, atomically.
-    ///
-    /// The absence recheck and the INSERT run inside one `BEGIN IMMEDIATE`
-    /// transaction: the aggregate scan and this write deliberately release
-    /// the connection between them, so a concurrent create (or a ref edit on
-    /// a just-created row) can otherwise land in the window and a second,
-    /// empty-links snapshot would win the latest-row race. One availability
-    /// decision, taken inside that transaction, selects both the projection
-    /// the recheck decodes and the column the INSERT writes.
-    async fn insert_backfill_meta(&self, mut meta: SessionMeta) -> Result<(), String> {
-        let mut conn = self.conn.lock().await;
-        let tx = conn
-            .transaction_with_behavior(turso::transaction::TransactionBehavior::Immediate)
-            .await
-            .map_err(|e| format!("cannot begin metadata backfill transaction: {e}"))?;
-        let outcome: Result<(), String> = async {
-            let refs_available = self.ensure_refs_available_in(&tx).await?;
-            if self
-                .load_meta_row_locked(&tx, &meta.session_id, refs_available)
-                .await?
-                .is_some()
-            {
-                // The row appeared after the aggregate scan: leave it
-                // untouched (its links and fresh timestamp win).
-                return Ok(());
-            }
-            self.insert_meta_locked(&tx, &mut meta, refs_available)
-                .await
-        }
-        .await;
-        match outcome {
-            Ok(()) => tx
-                .commit()
-                .await
-                .map_err(|e| format!("cannot commit metadata backfill transaction: {e}")),
-            Err(error) => {
-                let _ = tx.rollback().await;
-                Err(error)
-            }
-        }
-    }
-
-    /// Does the caller's connection see `sessions.refs`? Used to re-probe
-    /// before a degraded write: a handle that connected while the migration
-    /// was failing keeps running, but another handle may have repaired the
-    /// column since.
-    async fn refs_column_exists_in(conn: &turso::Connection) -> Result<bool, String> {
-        let mut rows = conn
-            .query("PRAGMA table_info(sessions)", ())
-            .await
-            .map_err(|e| format!("cannot inspect sessions table schema: {e}"))?;
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| format!("cannot inspect sessions table schema: {e}"))?
-        {
-            // PRAGMA table_info columns: cid, name, ... — the name is index 1.
-            if row
-                .get_value(1)
-                .map_err(|e| format!("cannot inspect sessions table schema: {e}"))?
-                .as_text()
-                .is_some_and(|name| name == "refs")
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    /// Availability of `sessions.refs` on the caller's connection, updating
-    /// this handle's flag when a degraded handle observes the repaired
-    /// column. Returns the availability the write should use.
-    async fn ensure_refs_available_in(&self, conn: &turso::Connection) -> Result<bool, String> {
-        if self.refs_available.load(Ordering::Relaxed) {
-            return Ok(true);
-        }
-        let available = Self::refs_column_exists_in(conn).await?;
-        if available {
-            self.refs_available.store(true, Ordering::Relaxed);
-        }
-        Ok(available)
-    }
-
-    /// The append behind the metadata mutators, on a connection the caller
-    /// already holds (see [`Self::load_meta_row_locked`]). `refs_available`
-    /// is the operation's ONE decision: it selects the INSERT shape, exactly
-    /// the decision the row read used, so a flag flip cannot make the write
-    /// name a column the read never decoded.
-    async fn insert_meta_locked(
-        &self,
-        conn: &turso::Connection,
-        meta: &mut SessionMeta,
-        refs_available: bool,
-    ) -> Result<(), String> {
+    async fn insert_meta(&self, meta: &mut SessionMeta) -> Result<(), String> {
         // Stamp the writer identity at insert time, not at construction
         // (P3): every snapshot row records the process that actually wrote
         // it, and a cross-process resume never replays a stale identity
         // from a row cached by another process. Callers construct with
         // `writer: None`; the stamped value is what lands in the column.
         meta.writer = Some(process_identity().to_owned());
-        // Two independent feature columns, each named ONLY when its migration
-        // succeeded: a database without `sessions.acp_session_id` (or without
-        // `sessions.refs`) gets the same full snapshot written WITHOUT that
-        // column, so a failed migration costs exactly that one feature — every
-        // session create, touch and list keeps working. Neither missing column
-        // fails the snapshot here; [`Self::set_acp_session_id`] and
-        // [`Self::update_refs`] are the writes that must fail loudly instead.
-        //
-        // The refs JSON is encoded only when its column is written: it is one
-        // JSON value, and its absence (NULL) and an empty list read the same.
-        let text = |value: Option<&str>| match value {
-            Some(value) => turso::Value::Text(value.to_owned()),
-            None => turso::Value::Null,
+        let conn = self.conn.lock().await;
+        // The ACP id column is only named when its migration succeeded: on a
+        // database without it the row is written without that column, so a
+        // failed `sessions.acp_session_id` migration costs the ACP reuse
+        // feature and nothing else (session creation keeps working).
+        let written = if self.acp_available {
+            conn.execute(
+                "INSERT INTO sessions \
+                 (workspace_id, session_id, created_at, last_active_at, model, \"role\", \
+                  entry_count, parent_session_id, parent_task_id, title, pinned, archived, writer, \
+                  acp_session_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                (
+                    self.workspace_id.as_str(),
+                    meta.session_id.as_str(),
+                    datetime_to_us(meta.created_at),
+                    datetime_to_us(meta.last_active_at),
+                    meta.model.as_deref(),
+                    meta.role.as_deref(),
+                    meta.entry_count,
+                    meta.parent_session_id.as_deref(),
+                    meta.parent_task_id,
+                    meta.title.as_deref(),
+                    meta.pinned.map(|p| if p { 1 } else { 0 }),
+                    meta.archived.map(|a| if a { 1 } else { 0 }),
+                    meta.writer.as_deref(),
+                    meta.acp_session_id.as_deref(),
+                ),
+            )
+            .await
+        } else {
+            conn.execute(
+                "INSERT INTO sessions \
+                 (workspace_id, session_id, created_at, last_active_at, model, \"role\", \
+                  entry_count, parent_session_id, parent_task_id, title, pinned, archived, writer) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                (
+                    self.workspace_id.as_str(),
+                    meta.session_id.as_str(),
+                    datetime_to_us(meta.created_at),
+                    datetime_to_us(meta.last_active_at),
+                    meta.model.as_deref(),
+                    meta.role.as_deref(),
+                    meta.entry_count,
+                    meta.parent_session_id.as_deref(),
+                    meta.parent_task_id,
+                    meta.title.as_deref(),
+                    meta.pinned.map(|p| if p { 1 } else { 0 }),
+                    meta.archived.map(|a| if a { 1 } else { 0 }),
+                    meta.writer.as_deref(),
+                ),
+            )
+            .await
         };
-        let flag = |value: Option<bool>| match value {
-            Some(value) => turso::Value::Integer(if value { 1 } else { 0 }),
-            None => turso::Value::Null,
-        };
-        let mut columns = "workspace_id, session_id, created_at, last_active_at, model, \
-                           \"role\", entry_count, parent_session_id, parent_task_id, title, \
-                           pinned, archived, writer"
-            .to_string();
-        let mut params = vec![
-            turso::Value::Text(self.workspace_id.clone()),
-            turso::Value::Text(meta.session_id.clone()),
-            turso::Value::Integer(datetime_to_us(meta.created_at)),
-            turso::Value::Integer(datetime_to_us(meta.last_active_at)),
-            text(meta.model.as_deref()),
-            text(meta.role.as_deref()),
-            turso::Value::Integer(meta.entry_count),
-            text(meta.parent_session_id.as_deref()),
-            meta.parent_task_id
-                .map_or(turso::Value::Null, turso::Value::Integer),
-            text(meta.title.as_deref()),
-            flag(meta.pinned),
-            flag(meta.archived),
-            text(meta.writer.as_deref()),
-        ];
-        if self.acp_available {
-            columns.push_str(", acp_session_id");
-            params.push(text(meta.acp_session_id.as_deref()));
-        }
-        if refs_available {
-            columns.push_str(", refs");
-            params.push(text(
-                crate::session_store::refs_to_json(&meta.refs)?.as_deref(),
-            ));
-        }
-        let placeholders = (1..=params.len())
-            .map(|index| format!("?{index}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        conn.execute(
-            &format!("INSERT INTO sessions ({columns}) VALUES ({placeholders})"),
-            turso::params_from_iter(params),
-        )
-        .await
-        .map_err(|e| format!("cannot insert session metadata: {e}"))?;
+        written.map_err(|e| format!("cannot insert session metadata: {e}"))?;
         Ok(())
     }
 
-    /// One `BEGIN IMMEDIATE` window around read-latest → mutate → append for
-    /// a session's metadata snapshot. Every snapshot mutator goes through
-    /// this helper, so:
-    ///
-    /// - the row is read INSIDE the write transaction, never from
-    ///   `cached_meta`: two handles sharing one database file cannot both
-    ///   start from the same snapshot and let the later write drop the
-    ///   earlier links;
-    /// - a row deleted between the read and the append cannot be
-    ///   resurrected: the check and the INSERT are one atomic write
-    ///   transaction (the transcript append path's discipline);
-    /// - a degraded handle makes ONE availability decision inside the
-    ///   transaction (re-probing `sessions.refs`), and that same decision
-    ///   selects the row read and the snapshot write: a schema another
-    ///   handle repaired is used for both, so the latest row's links are
-    ///   read and carried instead of being written as NULL.
-    ///
-    /// Returns the mutation's value, or `None` when the session has no
-    /// metadata row (R3: touch / flag setters never self-create).
-    /// `require_refs` turns a still-missing `refs` column into a loud error
-    /// (the ref editor must not silently drop links).
-    async fn mutate_meta<T>(
-        &self,
-        session_id: &str,
-        require_refs: bool,
-        mutate: impl FnOnce(&mut SessionMeta) -> Result<T, String>,
-    ) -> Result<Option<T>, String> {
-        let mut conn = self.conn.lock().await;
-        let tx = conn
-            .transaction_with_behavior(turso::transaction::TransactionBehavior::Immediate)
-            .await
-            .map_err(|e| format!("cannot begin metadata transaction: {e}"))?;
-        let outcome: Result<Option<(T, SessionMeta)>, String> = async {
-            let refs_available = self.ensure_refs_available_in(&tx).await?;
-            if require_refs && !refs_available {
-                return Err(
-                    "session links are unavailable: the sessions.refs column is missing \
-                     (the schema migration failed on this database)"
-                        .to_string(),
-                );
-            }
-            let Some(mut meta) = self
-                .load_meta_row_locked(&tx, session_id, refs_available)
-                .await?
-            else {
-                return Ok(None);
-            };
-            let value = mutate(&mut meta)?;
-            meta.last_active_at = us_to_datetime(next_event_time_us());
-            self.insert_meta_locked(&tx, &mut meta, refs_available)
-                .await?;
-            Ok(Some((value, meta)))
+    /// The full snapshot the next touch must carry: the cached row when
+    /// present, otherwise a read-on-miss of the table (a subagent's first
+    /// touch reads back the row its parent wrote at spawn time — R3).
+    /// Absence is never cached: a parent may create the row between
+    /// touches, and the next touch must see it.
+    async fn effective_meta(&self) -> Result<Option<SessionMeta>, String> {
+        if let Some(cached) = self.cached_meta.lock().unwrap().clone() {
+            return Ok(Some(cached));
         }
-        .await;
-
-        match outcome {
-            Ok(Some((value, meta))) => {
-                tx.commit()
-                    .await
-                    .map_err(|e| format!("cannot commit metadata transaction: {e}"))?;
-                if session_id == self.session_id {
-                    *self.cached_meta.lock().unwrap() = Some(meta);
-                }
-                Ok(Some(value))
+        match self.load_meta_row(&self.session_id).await? {
+            Some(meta) => {
+                *self.cached_meta.lock().unwrap() = Some(meta.clone());
+                Ok(Some(meta))
             }
-            Ok(None) => {
-                let _ = tx.rollback().await;
-                if session_id == self.session_id {
-                    *self.cached_meta.lock().unwrap() = None;
-                }
-                Ok(None)
-            }
-            Err(error) => {
-                let _ = tx.rollback().await;
-                Err(error)
-            }
+            None => Ok(None),
         }
     }
 
@@ -2765,7 +2435,6 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
             title: existing.title.clone(),
             pinned: existing.pinned,
             archived: existing.archived,
-            refs: existing.refs.clone(), // links are never rewritten by a resume
             acp_session_id: existing.acp_session_id.clone(),
             writer: None, // stamped by insert_meta with the writing process
             label: None,  // label lives in running_tasks, resolved at list time
@@ -2804,89 +2473,49 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
         parent_task_id: Option<i64>,
         title: Option<&str>,
     ) -> Result<(), String> {
-        // The existence check and the append are ONE write transaction: a
-        // second handle may otherwise insert the creation row (or a
-        // concurrent touch may add links) between the check and this
-        // INSERT, and the later snapshot would drop them.
-        let mut conn = self.conn.lock().await;
-        let tx = conn
-            .transaction_with_behavior(turso::transaction::TransactionBehavior::Immediate)
-            .await
-            .map_err(|e| format!("cannot begin metadata transaction: {e}"))?;
-        let outcome: Result<Option<SessionMeta>, String> = async {
-            // ONE decision for this operation: the same `refs_available`
-            // selects the row projection and the INSERT shape below.
-            let refs_available = self.ensure_refs_available_in(&tx).await?;
-            if let Some(existing) = self
-                .load_meta_row_locked(&tx, session_id, refs_available)
-                .await?
-            {
-                // Row already exists (resume, or a btw/subagent row whose
-                // parent link was unknown at build time): only ever backfill
-                // what is MISSING — the parent link and/or a model — never
-                // UPDATE/DELETE, never overwrite an existing link or model,
-                // and never append without something to record.
-                let backfill_parent =
-                    parent_session_id.is_some() && existing.parent_session_id.is_none();
-                let backfill_model = model.is_some() && existing.model.is_none();
-                if backfill_parent || backfill_model {
-                    let mut meta = Self::backfill_meta_snapshot(
-                        &existing,
-                        us_to_datetime(next_event_time_us()),
-                        model,
-                        role,
-                        parent_session_id,
-                        parent_task_id,
-                    );
-                    self.insert_meta_locked(&tx, &mut meta, refs_available)
-                        .await?;
-                    return Ok(Some(meta));
-                }
-                return Ok(None);
+        if let Some(existing) = self.load_meta_row(session_id).await? {
+            // Row already exists (resume, or a btw/subagent row whose
+            // parent link was unknown at build time): only ever backfill
+            // what is MISSING — the parent link and/or a model — never
+            // UPDATE/DELETE, never overwrite an existing link or model,
+            // and never append without something to record.
+            let backfill_parent =
+                parent_session_id.is_some() && existing.parent_session_id.is_none();
+            let backfill_model = model.is_some() && existing.model.is_none();
+            if backfill_parent || backfill_model {
+                let mut meta = Self::backfill_meta_snapshot(
+                    &existing,
+                    us_to_datetime(next_event_time_us()),
+                    model,
+                    role,
+                    parent_session_id,
+                    parent_task_id,
+                );
+                self.insert_meta(&mut meta).await?;
+                *self.cached_meta.lock().unwrap() = Some(meta);
             }
-            let now = us_to_datetime(next_event_time_us());
-            let mut meta = SessionMeta {
-                session_id: session_id.to_owned(),
-                created_at: now,
-                last_active_at: now,
-                model: model.map(str::to_owned),
-                role: role.map(str::to_owned),
-                entry_count: *self.next_seq.lock().unwrap(),
-                parent_session_id: parent_session_id.map(str::to_owned),
-                parent_task_id,
-                title: title.map(str::to_owned), // a fresh session may be named at creation (subagent label)
-                pinned: None,     // a fresh session is unpinned until the user pins it
-                archived: None,   // a fresh session is unarchived until the user archives it
-                refs: Vec::new(), // no PR/issue links until the tool or the owner adds them
-                acp_session_id: None, // no ACP conversation until `acp_prompt` runs
-                writer: None,     // stamped by the insert with the writing process
-                label: None,      // label lives in running_tasks, resolved at list time
-            };
-            self.insert_meta_locked(&tx, &mut meta, refs_available)
-                .await?;
-            Ok(Some(meta))
+            return Ok(());
         }
-        .await;
-
-        match outcome {
-            Ok(Some(meta)) => {
-                tx.commit()
-                    .await
-                    .map_err(|e| format!("cannot commit metadata transaction: {e}"))?;
-                if session_id == self.session_id {
-                    *self.cached_meta.lock().unwrap() = Some(meta);
-                }
-                Ok(())
-            }
-            Ok(None) => {
-                let _ = tx.rollback().await;
-                Ok(())
-            }
-            Err(error) => {
-                let _ = tx.rollback().await;
-                Err(error)
-            }
-        }
+        let now = us_to_datetime(next_event_time_us());
+        let mut meta = SessionMeta {
+            session_id: session_id.to_owned(),
+            created_at: now,
+            last_active_at: now,
+            model: model.map(str::to_owned),
+            role: role.map(str::to_owned),
+            entry_count: *self.next_seq.lock().unwrap(),
+            parent_session_id: parent_session_id.map(str::to_owned),
+            parent_task_id,
+            title: title.map(str::to_owned), // a fresh session may be named at creation (subagent label)
+            pinned: None,                    // a fresh session is unpinned until the user pins it
+            archived: None, // a fresh session is unarchived until the user archives it
+            acp_session_id: None, // no ACP conversation until `acp_prompt` runs
+            writer: None,   // stamped by insert_meta with the writing process
+            label: None,    // label lives in running_tasks, resolved at list time
+        };
+        self.insert_meta(&mut meta).await?;
+        *self.cached_meta.lock().unwrap() = Some(meta);
+        Ok(())
     }
 
     /// Append one activity snapshot for the bound session: a full row with
@@ -2900,15 +2529,13 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
     /// own row. Callers run this fire-and-forget at turn boundaries (R4);
     /// losing the final touch at process exit is acceptable.
     pub async fn touch_meta(&self) -> Result<(), String> {
-        // Read-latest INSIDE the write transaction: another handle may have
-        // added links since this handle cached its snapshot, and replaying
-        // the cached `refs` would drop them.
-        self.mutate_meta(&self.session_id, false, |meta| {
-            meta.entry_count = *self.next_seq.lock().unwrap();
-            Ok(())
-        })
-        .await
-        .map(|_| ())
+        let Some(meta) = self.effective_meta().await? else {
+            return Ok(());
+        };
+        let mut meta = meta;
+        meta.last_active_at = us_to_datetime(next_event_time_us());
+        meta.entry_count = *self.next_seq.lock().unwrap();
+        self.insert_meta(&mut meta).await
     }
 
     /// Manually name a session: append one full snapshot row carrying the
@@ -2924,15 +2551,25 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
     ///
     /// `session_id` is explicit (like [`Self::delete_meta`]) so a
     /// workspace-scoped meta store can rename historical sessions it is
-    /// not bound to; the write re-reads the latest row (and refreshes the
-    /// local cache) so the rename is immediately visible to later touches.
+    /// not bound to; for the bound session the cached snapshot is used
+    /// (and refreshed) so the rename is immediately visible to later
+    /// touches.
     pub async fn set_title(&self, session_id: &str, title: Option<&str>) -> Result<(), String> {
-        self.mutate_meta(session_id, false, |meta| {
-            meta.title = title.map(str::to_owned);
-            Ok(())
-        })
-        .await
-        .map(|_| ())
+        let meta = if session_id == self.session_id {
+            self.effective_meta().await?
+        } else {
+            self.load_meta_row(session_id).await?
+        };
+        let Some(mut meta) = meta else {
+            return Ok(());
+        };
+        meta.title = title.map(str::to_owned);
+        meta.last_active_at = us_to_datetime(next_event_time_us());
+        self.insert_meta(&mut meta).await?;
+        if session_id == self.session_id {
+            *self.cached_meta.lock().unwrap() = Some(meta);
+        }
+        Ok(())
     }
 
     /// Pin or unpin a session: append one full snapshot row carrying the
@@ -2948,15 +2585,25 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
     ///
     /// `session_id` is explicit (like [`Self::set_title`]) so a
     /// workspace-scoped meta store can pin/unpin historical sessions it is
-    /// not bound to; the write re-reads the latest row (and refreshes the
-    /// local cache) so the change is immediately visible to later touches.
+    /// not bound to; for the bound session the cached snapshot is used
+    /// (and refreshed) so the change is immediately visible to later
+    /// touches.
     pub async fn set_pinned(&self, session_id: &str, pinned: bool) -> Result<(), String> {
-        self.mutate_meta(session_id, false, |meta| {
-            meta.pinned = Some(pinned);
-            Ok(())
-        })
-        .await
-        .map(|_| ())
+        let meta = if session_id == self.session_id {
+            self.effective_meta().await?
+        } else {
+            self.load_meta_row(session_id).await?
+        };
+        let Some(mut meta) = meta else {
+            return Ok(());
+        };
+        meta.pinned = Some(pinned);
+        meta.last_active_at = us_to_datetime(next_event_time_us());
+        self.insert_meta(&mut meta).await?;
+        if session_id == self.session_id {
+            *self.cached_meta.lock().unwrap() = Some(meta);
+        }
+        Ok(())
     }
 
     /// Archive or restore a session: append one full snapshot row carrying
@@ -2973,47 +2620,25 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
     ///
     /// `session_id` is explicit (like [`Self::set_pinned`]) so a
     /// workspace-scoped meta store can archive/restore historical sessions
-    /// it is not bound to; the write re-reads the latest row (and refreshes
-    /// the local cache) so the change is immediately visible to later
+    /// it is not bound to; for the bound session the cached snapshot is
+    /// used (and refreshed) so the change is immediately visible to later
     /// touches.
     pub async fn set_archived(&self, session_id: &str, archived: bool) -> Result<(), String> {
-        self.mutate_meta(session_id, false, |meta| {
-            meta.archived = Some(archived);
-            Ok(())
-        })
-        .await
-        .map(|_| ())
-    }
-
-    /// Read → mutate → append the session's PR/issue links: one full snapshot
-    /// row carrying the new `refs` JSON and a fresh `last_active_at`, exactly
-    /// like [`Self::set_title`]. Returns the stored (deduplicated) list.
-    ///
-    /// Never self-creates, and — unlike the flag setters' silent `Ok` — a
-    /// missing row is an error: a link handed to the store must not be
-    /// dropped quietly.
-    ///
-    /// `session_id` is explicit like the other metadata mutators so a
-    /// workspace-scoped meta store can edit historical sessions it is not
-    /// bound to; the bound session's local cache is refreshed after commit.
-    pub async fn update_refs(
-        &self,
-        session_id: &str,
-        mutate: impl FnOnce(&mut Vec<crate::session_store::SessionRef>) -> Result<(), String>,
-    ) -> Result<Vec<crate::session_store::SessionRef>, String> {
-        // Read the CURRENT row and append inside ONE write transaction:
-        // never the cached snapshot (another handle may have deleted the row
-        // or added links since this store was built, and a cached
-        // read-then-insert would silently RESURRECT the row or drop the
-        // links). `require_refs` keeps a still-degraded schema a loud error.
-        let stored = self
-            .mutate_meta(session_id, true, |meta| {
-                mutate(&mut meta.refs)?;
-                crate::session_store::dedup_refs(&mut meta.refs);
-                Ok(meta.refs.clone())
-            })
-            .await?;
-        stored.ok_or_else(|| format!("session {session_id} has no metadata row to store links in"))
+        let meta = if session_id == self.session_id {
+            self.effective_meta().await?
+        } else {
+            self.load_meta_row(session_id).await?
+        };
+        let Some(mut meta) = meta else {
+            return Ok(());
+        };
+        meta.archived = Some(archived);
+        meta.last_active_at = us_to_datetime(next_event_time_us());
+        self.insert_meta(&mut meta).await?;
+        if session_id == self.session_id {
+            *self.cached_meta.lock().unwrap() = Some(meta);
+        }
+        Ok(())
     }
 
     /// Latest metadata snapshot per session, newest activity first.
@@ -3046,14 +2671,10 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
         let connection_lock_wait_ms = lock_started.elapsed().as_millis();
         let query_started = std::time::Instant::now();
         let (filter_clause, live_ids) = sqlite_sidebar_filter_clause(sidebar_filter);
-        // One decision for this read: the projection and the NULL-or-column
-        // decode below can never disagree.
-        let refs_available = self.refs_available.load(Ordering::Relaxed);
-        let refs = Self::refs_projection(refs_available, true);
         let sql = format!(
             "SELECT s.session_id, s.created_at, s.last_active_at, s.model, s.\"role\", \
                     s.entry_count, s.parent_session_id, s.parent_task_id, s.title, s.pinned, \
-                    s.archived, s.writer, {refs} \
+                    s.archived, s.writer \
              FROM sessions s \
              WHERE s.workspace_id = ?1 \
                AND s.last_active_at = ( \
@@ -3114,13 +2735,11 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
         } else {
             META_COLUMNS_WITHOUT_ACP
         };
-        let refs_available = self.refs_available.load(Ordering::Relaxed);
-        let refs = Self::refs_projection(refs_available, false);
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
                 &format!(
-                    "SELECT {columns}, {refs} \
+                    "SELECT {columns} \
                      FROM sessions \
                      WHERE workspace_id = ?1 AND session_id = ?2 \
                      ORDER BY last_active_at ASC"
@@ -3193,18 +2812,19 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
                  column (its migration failed), so the id for `{session_id}` was NOT written"
             ));
         }
-        // Read the CURRENT row inside one write transaction (the same window
-        // `set_title` uses): the snapshot then carries the latest `refs`
-        // forward instead of replaying a cached list, and a concurrent link
-        // edit is never dropped by this write.
-        let written = self
-            .mutate_meta(session_id, false, |meta| {
-                meta.acp_session_id = acp_session_id.map(str::to_owned);
-                Ok(())
-            })
-            .await?;
-        if written.is_none() {
-            return Ok(()); // R3: never self-create
+        let meta = if session_id == self.session_id {
+            self.effective_meta().await?
+        } else {
+            self.load_meta_row(session_id).await?
+        };
+        let Some(mut meta) = meta else {
+            return Ok(());
+        };
+        meta.acp_session_id = acp_session_id.map(str::to_owned);
+        meta.last_active_at = us_to_datetime(next_event_time_us());
+        self.insert_meta(&mut meta).await?;
+        if session_id == self.session_id {
+            *self.cached_meta.lock().unwrap() = Some(meta);
         }
         Ok(())
     }
@@ -3314,10 +2934,7 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
             if existing.iter().any(|id| id == &session_id) {
                 continue;
             }
-            // The scan above is only a prefilter: the row may have appeared
-            // since. `insert_backfill_meta` rechecks absence inside its own
-            // write transaction and appends nothing when it finds one.
-            self.insert_backfill_meta(SessionMeta {
+            self.insert_meta(&mut SessionMeta {
                 session_id,
                 created_at: us_to_datetime(created_us),
                 last_active_at: us_to_datetime(last_us),
@@ -3329,7 +2946,6 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
                 title: None,          // pre-table sessions have no user-assigned name
                 pinned: None,         // pre-table sessions are unpinned
                 archived: None,       // pre-table sessions are unarchived
-                refs: Vec::new(),     // pre-table sessions carry no PR/issue links
                 acp_session_id: None, // pre-table sessions have no ACP conversation
                 writer: None,         // stamped by insert_meta with the writing process
                 label: None,          // label lives in running_tasks, resolved at list time
@@ -3954,9 +3570,8 @@ async fn overlap_conflict_seq_in(
 
 /// Map a `sessions` table row (all columns except `session_id`, which is
 /// passed in) to a [`SessionMeta`]. Column layout of the shared SELECT:
-/// [`META_COLUMNS`] (… `writer`, `acp_session_id`) followed by the `refs`
-/// projection, so `refs` is always the LAST column and a degraded database
-/// that cannot project either feature column keeps the same positions.
+/// `created_at, last_active_at, model, "role", entry_count,
+/// parent_session_id, parent_task_id, title, pinned, archived, writer`.
 fn row_to_meta(row: &turso::Row, session_id: &str) -> Result<SessionMeta, String> {
     let created_at = us_to_datetime(
         row.get_value(0)
@@ -4044,12 +3659,6 @@ fn row_to_meta(row: &turso::Row, session_id: &str) -> Result<SessionMeta, String
         title,
         pinned,
         archived,
-        refs: crate::session_store::refs_from_json(
-            row.get_value(12)
-                .map_err(|e| format!("cannot query session metadata: {e}"))?
-                .as_text()
-                .map(String::as_str),
-        )?,
         writer: row
             .get_value(10)
             .map_err(|e| format!("cannot query session metadata: {e}"))?
@@ -4067,8 +3676,7 @@ fn row_to_meta(row: &turso::Row, session_id: &str) -> Result<SessionMeta, String
 /// Map a `list_meta` row (session_id already extracted as column 0) to a
 /// [`SessionMeta`]. Column layout of the list SELECT: `session_id,
 /// created_at, last_active_at, model, "role", entry_count,
-/// parent_session_id, parent_task_id, title, pinned, archived, writer,
-/// refs`.
+/// parent_session_id, parent_task_id, title, pinned, archived, writer`.
 fn meta_from_row_values(row: &turso::Row, session_id: &str) -> Result<SessionMeta, String> {
     let created_at = us_to_datetime(
         row.get_value(1)
@@ -4157,12 +3765,6 @@ fn meta_from_row_values(row: &turso::Row, session_id: &str) -> Result<SessionMet
         // The list projection selects a fixed column set and does not carry
         // the ACP session id.
         acp_session_id: None,
-        refs: crate::session_store::refs_from_json(
-            row.get_value(12)
-                .map_err(|e| format!("cannot list session metadata: {e}"))?
-                .as_text()
-                .map(String::as_str),
-        )?,
         writer: row
             .get_value(11)
             .map_err(|e| format!("cannot list session metadata: {e}"))?
