@@ -1286,6 +1286,10 @@ pub struct Agent {
     event_handler: Option<Box<dyn FnMut(AgentEvent) + Send>>,
     max_tool_rounds: Option<usize>,
     background_receiver: mpsc::UnboundedReceiver<AgentEvent>,
+    /// The ingress half of `background_receiver`, kept so a runner-owned
+    /// producer (the PR watcher) can deliver an `AgentEvent::Notice` through
+    /// the existing background path instead of a separate command channel.
+    background_sender: mpsc::UnboundedSender<AgentEvent>,
     pending_background: VecDeque<SessionEntry>,
     subscriber: Option<mpsc::UnboundedSender<AgentEvent>>,
     /// Long-lived session sinks (e.g. a TUI view). Unlike
@@ -1367,6 +1371,7 @@ impl Agent {
             event_handler: None,
             max_tool_rounds: None,
             background_receiver,
+            background_sender,
             pending_background: VecDeque::new(),
             subscriber: None,
             running_background: HashSet::new(),
@@ -1386,6 +1391,14 @@ impl Agent {
             compaction_mode: CompactionMode::Main,
             omitted_images: HashSet::new(),
         }
+    }
+
+    /// A clone of the ingress this agent's tools use for background events.
+    /// A runner-owned producer (the PR watcher) uses it to deliver a durable
+    /// `AgentEvent::Notice` through the existing background path: the agent
+    /// persists one `SessionEntry::Notice` and arms one reaction turn.
+    pub(crate) fn background_sender(&self) -> mpsc::UnboundedSender<AgentEvent> {
+        self.background_sender.clone()
     }
 
     /// Set the compaction mode explicitly (see [`CompactionMode`]). Main by

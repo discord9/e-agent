@@ -55,6 +55,30 @@ fn word(state: &str) -> &'static str {
     }
 }
 
+/// GitHub's effective review decision. This is the ONE normalization shared
+/// by the chip (which reads GitHub's `reviewDecision`) and the watcher (which
+/// derives the same decision from the reviews list): both consume the same
+/// tokens, so they cannot disagree about what "changes requested" or
+/// "approved" means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReviewDecision {
+    Changes,
+    Approved,
+}
+
+impl ReviewDecision {
+    /// Map one GitHub token. Case-insensitive; any other token (including
+    /// `DISMISSED`, which a reviews-list walker must handle itself because it
+    /// clears an earlier decision) is not a decision.
+    pub(crate) fn from_token(raw: &str) -> Option<Self> {
+        match raw.to_ascii_uppercase().as_str() {
+            "CHANGES_REQUESTED" => Some(Self::Changes),
+            "APPROVED" => Some(Self::Approved),
+            _ => None,
+        }
+    }
+}
+
 /// The pieces a watcher needs for a SILENT baseline. This is never part of
 /// the wire shape: it is the same observation the chip cache made, kept so a
 /// link added while a session is live can start watching from that state
@@ -65,8 +89,8 @@ pub(crate) struct WatchBaseline {
     pub terminal: Option<&'static str>,
     /// Names of checks failing in this observation.
     pub failing: Vec<String>,
-    /// `"changes"` or `"approved"`, if a review decision exists.
-    pub review: Option<&'static str>,
+    /// The normalized review decision, if one exists.
+    pub review: Option<ReviewDecision>,
 }
 
 /// One link's status: the state token the chip's dot paints, the single
@@ -134,35 +158,15 @@ impl LinkStatus {
 #[derive(Clone)]
 pub(crate) struct Target {
     /// The link's normalized URL — what `gh` is asked about.
-    url: String,
+    pub(crate) url: String,
     /// `owner/repo`, for the "is this the session's own repository" test.
-    repo: String,
-    number: String,
+    pub(crate) repo: String,
+    pub(crate) number: String,
     /// `true` for a pull request, `false` for an issue.
-    pr: bool,
+    pub(crate) pr: bool,
 }
 
 impl Target {
-    /// `owner/repo` this target lives in.
-    pub(crate) fn repo(&self) -> &str {
-        &self.repo
-    }
-
-    /// The PR/issue number, as GitHub wrote it.
-    pub(crate) fn number(&self) -> &str {
-        &self.number
-    }
-
-    /// `true` for a pull request, `false` for an issue.
-    pub(crate) fn is_pr(&self) -> bool {
-        self.pr
-    }
-
-    /// The normalized link URL (the stored identity).
-    pub(crate) fn url(&self) -> &str {
-        &self.url
-    }
-
     /// The cache key: one entry per (repo, number, kind).
     fn key(&self) -> String {
         let kind = if self.pr { "pr" } else { "issue" };
@@ -331,7 +335,8 @@ fn pr_status(json: &Value) -> LinkStatus {
     let merged = is_merged
         || json.get("merged").and_then(Value::as_bool).unwrap_or(false)
         || text("mergedAt").is_some();
-    let review = text("reviewDecision").map(str::to_ascii_uppercase);
+    let review_token = text("reviewDecision").map(str::to_ascii_uppercase);
+    let review = review_token.as_deref().and_then(ReviewDecision::from_token);
     let merge = text("mergeStateStatus").map(str::to_ascii_uppercase);
     let checks = checks(json.get("statusCheckRollup"));
     let failing = checks.as_ref().is_some_and(|c| c.failed > 0);
@@ -339,7 +344,7 @@ fn pr_status(json: &Value) -> LinkStatus {
         .as_ref()
         .is_none_or(|c| c.failed == 0 && c.pending == 0);
     let conflict = merge.as_deref() == Some("DIRTY");
-    let state = if conflict || failing || review.as_deref() == Some("CHANGES_REQUESTED") {
+    let state = if conflict || failing || review == Some(ReviewDecision::Changes) {
         NEEDS
     } else if draft {
         DRAFT
@@ -349,21 +354,16 @@ fn pr_status(json: &Value) -> LinkStatus {
         CLOSED
     } else if settled && merge.as_deref() == Some("CLEAN") {
         READY
-    } else if review.as_deref() == Some("APPROVED") {
+    } else if review == Some(ReviewDecision::Approved) {
         APPROVED
     } else {
         OPEN
-    };
-    let review_baseline = match review.as_deref() {
-        Some("CHANGES_REQUESTED") => Some("changes"),
-        Some("APPROVED") => Some("approved"),
-        _ => None,
     };
     let mut parts = Vec::new();
     if let Some(merge) = merge {
         parts.push(format!("merge {}", merge.to_ascii_lowercase()));
     }
-    if let Some(review) = review.filter(|review| !review.is_empty()) {
+    if let Some(review) = review_token.filter(|review| !review.is_empty()) {
         parts.push(format!(
             "review {}",
             review.to_ascii_lowercase().replace('_', " ")
@@ -393,7 +393,7 @@ fn pr_status(json: &Value) -> LinkStatus {
             None
         },
         failing: failing_names(json.get("statusCheckRollup")),
-        review: review_baseline,
+        review,
     });
     status
 }
@@ -843,7 +843,7 @@ pub(crate) fn status_for_test(
     status.watch = Some(WatchBaseline {
         terminal,
         failing,
-        review,
+        review: review.and_then(ReviewDecision::from_token),
     });
     status
 }
@@ -1253,7 +1253,7 @@ mod tests {
             WatchBaseline {
                 terminal: Some("merged"),
                 failing: Vec::new(),
-                review: Some("approved"),
+                review: Some(ReviewDecision::Approved),
             }
         );
         // Without `mergedAt` the state alone still says merged.

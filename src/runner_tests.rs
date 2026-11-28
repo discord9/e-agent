@@ -19698,6 +19698,7 @@ async fn an_automatic_notice_is_one_notice_entry_and_one_projected_user_message(
 
     let temp = tempfile::tempdir().unwrap();
     let calls = Arc::new(Mutex::new(Vec::new()));
+    let sender = Arc::new(Mutex::new(None));
     let agent = Agent::new(
         Box::new(ScriptedContextCaptureModel {
             replies: vec![(
@@ -19711,7 +19712,12 @@ async fn an_automatic_notice_is_one_notice_entry_and_one_projected_user_message(
             .into(),
             calls: calls.clone(),
         }),
-        vec![Box::new(KeepAliveTool { sender: None })],
+        vec![
+            Box::new(NoticeEmitter {
+                sender: sender.clone(),
+            }),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
     );
     let (runner, handle) = SessionRunner::new(
         agent,
@@ -19731,9 +19737,12 @@ async fn an_automatic_notice_is_one_notice_entry_and_one_projected_user_message(
          discord9 · \"这版先别合，测试挂了\"\n\
          {DISCLAIMER}"
     );
-    handle
-        .commands
-        .send(SessionCommand::AutomaticNotice { text: text.clone() })
+    sender
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .send(AgentEvent::Notice(text.clone()))
         .unwrap();
 
     let mut user_prompts = Vec::new();
