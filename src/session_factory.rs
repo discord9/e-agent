@@ -1749,13 +1749,16 @@ fn configured_model(
         // provider (`client_id` / `client_secret`), as does the request
         // pacing override (`min_interval_ms`).
         AuthMode::Antigravity => {
-            let mut cm = ConfiguredModel::antigravity(AntigravityModel::new(
-                model.unwrap_or(resolved.model),
-                resolved.reasoning_effort,
-                resolved.client_id,
-                resolved.client_secret,
-                resolved.min_interval_ms,
-            )?);
+            let mut cm = ConfiguredModel::antigravity(
+                AntigravityModel::new(
+                    model.unwrap_or(resolved.model),
+                    resolved.reasoning_effort,
+                    resolved.client_id,
+                    resolved.client_secret,
+                    resolved.min_interval_ms,
+                )?
+                .with_vision(resolved.vision),
+            );
             cm.display = display;
             Ok(cm)
         }

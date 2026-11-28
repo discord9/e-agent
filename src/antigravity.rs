@@ -76,7 +76,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::agent::{AssistantMessage, Message, Model, ModelDeltaKind, ToolCall, ToolSpec, Usage};
+use crate::agent::{
+    AssistantMessage, ImagePart, Message, Model, ModelDeltaKind, ToolCall, ToolSpec, Usage,
+};
 use crate::model::IncompleteToolCall;
 
 /// Streaming generation endpoint on the Cloud Code "daily" host, in its SSE
@@ -181,6 +183,12 @@ pub struct AntigravityModel {
     /// contents and then frozen, so each turn of the session — and every clone
     /// of this model — sends the same conversation segment.
     conversation: std::sync::Arc<std::sync::OnceLock<String>>,
+    /// Whether this profile takes images (profile `vision`, default TRUE).
+    /// `supports_vision` reports it and `complete` gates on it.
+    vision: bool,
+    /// Content-addressed image store: BYTES are read at send time and never
+    /// persisted or logged (see [`Self::inline_parts`]).
+    image_store: Option<PathBuf>,
 }
 
 impl AntigravityModel {
@@ -220,6 +228,8 @@ impl AntigravityModel {
             min_interval: Duration::from_millis(min_interval_ms.unwrap_or(DEFAULT_MIN_INTERVAL_MS)),
             last_request: Default::default(),
             conversation: Default::default(),
+            vision: true,
+            image_store: crate::agent::image_store_dir(),
         })
     }
 
@@ -261,6 +271,41 @@ impl AntigravityModel {
         if !wait.is_zero() {
             tokio::time::sleep(wait).await;
         }
+    }
+
+    /// Whether this profile takes image input (profile `vision`, default
+    /// TRUE; `vision = false` marks a text-only model).
+    pub fn with_vision(mut self, vision: bool) -> Self {
+        self.vision = vision;
+        self
+    }
+
+    /// Point the image reader at an explicit store (tests); the default is the
+    /// global content-addressed one.
+    #[cfg(test)]
+    pub(crate) fn with_image_store(mut self, store: PathBuf) -> Self {
+        self.image_store = Some(store);
+        self
+    }
+
+    /// `inlineData` parts for these images, read from the content-addressed
+    /// store at SEND time (the same `agent::load_image_bytes` helper the chat
+    /// wire uses): the bytes are never persisted, cached, or logged — only the
+    /// hash is. A missing file degrades to a `[image missing: <hash>]` text
+    /// part instead of failing, exactly like the chat wire.
+    fn inline_parts(&self, images: &[ImagePart]) -> Vec<Value> {
+        images
+            .iter()
+            .map(|image| {
+                match crate::agent::load_image_bytes(self.image_store.as_deref(), &image.hash) {
+                    Some(bytes) => json!({"inlineData": {
+                        "mimeType": image.mime,
+                        "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+                    }}),
+                    None => json!({"text": format!("[image missing: {}]", image.hash)}),
+                }
+            })
+            .collect()
     }
 
     /// Model slug (the `fetchAvailableModels` id), used for display.
@@ -457,7 +502,11 @@ impl AntigravityModel {
                 Message::System { .. } => continue,
                 // Text only: `supports_vision` is false, so the agent's vision
                 // gate rejects attached images before this wire is reached.
-                Message::User { content, .. } => ("user", vec![json!({"text": content})]),
+                Message::User { content, images } => {
+                    let mut parts = vec![json!({"text": content})];
+                    parts.extend(self.inline_parts(images));
+                    ("user", parts)
+                }
                 Message::Assistant(message) => {
                     let mut parts: Vec<Value> = Vec::new();
                     if let Some(text) = message.content.as_deref().filter(|text| !text.is_empty()) {
@@ -505,10 +554,10 @@ impl AntigravityModel {
                     name,
                     content,
                     is_error,
+                    images,
                     ..
-                } => (
-                    "user",
-                    vec![json!({"functionResponse": {
+                } => {
+                    let mut response = json!({
                         "name": name,
                         "id": call_id,
                         "response": {"output": if *is_error {
@@ -516,8 +565,15 @@ impl AntigravityModel {
                         } else {
                             content.clone()
                         }},
-                    }})],
-                ),
+                    });
+                    // A result's images belong INSIDE its functionResponse, as
+                    // its own `parts` — a reference client documents that
+                    // placement as load-bearing, so they are never siblings.
+                    if !images.is_empty() {
+                        response["parts"] = json!(self.inline_parts(images));
+                    }
+                    ("user", vec![json!({"functionResponse": response})])
+                }
             };
             // Repeated same-role turns merge into one content: a tool batch is
             // a single user turn on this wire.
@@ -587,7 +643,12 @@ impl Model for AntigravityModel {
         self.name()
     }
 
-    // Text-only: `supports_vision` keeps the trait default (false).
+    /// Profile `vision` (default TRUE): images ride as `inlineData` parts (see
+    /// `request_body`), so this adapter is vision-capable unless a profile says
+    /// `vision = false`.
+    fn supports_vision(&self) -> bool {
+        self.vision
+    }
 
     async fn complete(
         &mut self,
@@ -595,7 +656,7 @@ impl Model for AntigravityModel {
         tools: &[ToolSpec],
         on_delta: Option<&mut (dyn for<'a> FnMut(ModelDeltaKind, &'a str) + Send)>,
     ) -> anyhow::Result<(AssistantMessage, Option<Usage>)> {
-        crate::agent::ensure_vision_supported(&self.model, false, messages)?;
+        crate::agent::ensure_vision_supported(&self.model, self.vision, messages)?;
         let mut request = self.request_body(messages, tools)?;
         // The ids a `requestId` is built from, and the STEP counter: every
         // request of THIS turn advances the step (the 401 retry and the 404
@@ -626,6 +687,31 @@ impl Model for AntigravityModel {
             step += 1;
             set_request_id(&mut retried, &conversation, &trajectory, step);
             response = self.send(&token, &retried).await?;
+            // A 429 on the fallback is the same 429: the retry below re-sends
+            // THIS body (the tiered model), not the configured one.
+            request = retried;
+        }
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            // The body is classified and then DROPPED (see `Rate429`): only an
+            // allowlisted reason and a parsed delay reach the message.
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            let wait = match classify_429(status, body.as_bytes()) {
+                Rate429::RateLimited { delay: Some(wait) } if wait <= RATE_LIMIT_429_CAP => wait,
+                Rate429::Soft => SOFT_429_BACKOFF,
+                Rate429::Unknown => UNKNOWN_429_BACKOFF,
+                rate => return Err(rate_429_error(&self.model, rate)),
+            };
+            // Sleeping here does not bypass pacing: `send` still waits out
+            // `min_interval`, so the retry is spaced like any other request.
+            tokio::time::sleep(wait).await;
+            step += 1;
+            set_request_id(&mut request, &conversation, &trajectory, step);
+            response = self.send(&token, &request).await?;
+            // One retry is the whole budget: a second 429 fails on its status.
+            if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                return Err(rate_429_error(&self.model, Rate429::Unknown));
+            }
         }
         let status = response.status();
         // A redirect is a status-only failure here too: the body names another
@@ -1207,7 +1293,10 @@ fn repair_request(request: &mut Value) {
 /// text, no signature. A signature-only part is kept — it belongs to the call
 /// beside it and dropping it would make the batch unreplayable.
 fn is_empty_part(part: &Value) -> bool {
-    if part.get("functionCall").is_some() || part.get("functionResponse").is_some() {
+    if part.get("functionCall").is_some()
+        || part.get("functionResponse").is_some()
+        || part.get("inlineData").is_some()
+    {
         return false;
     }
     !part["text"].as_str().is_some_and(|text| !text.is_empty())
@@ -1324,6 +1413,143 @@ fn short_digest(value: &str) -> String {
     )
 }
 
+/// What a 429 means on this wire: one status, several meanings that need
+/// different reactions. Only an ALLOWLISTED reason constant and a PARSED delay
+/// reach a message — never the body, which can quote the request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rate429 {
+    /// `QUOTA_EXHAUSTED`: the (weekly) window is spent; retrying cannot help.
+    QuotaExhausted { reset: Option<Duration> },
+    /// `RATE_LIMIT_EXCEEDED`: too fast right now, with an optional hint.
+    RateLimited { delay: Option<Duration> },
+    /// "try again" / "temporarily": one short retry is expected to work.
+    Soft,
+    /// Nothing this adapter knows: one short retry, then the status alone.
+    Unknown,
+}
+
+/// Body markers, lowercase. Quota first: a body naming a spent quota AND "try
+/// again" is the condition a retry cannot fix. The `ErrorInfo.reason` values
+/// (`QUOTA_EXHAUSTED`, `RATE_LIMIT_EXCEEDED`) lowercase into these tables.
+#[rustfmt::skip]
+const QUOTA_MARKERS: &[&str] = &[
+    "quota_exhausted", "quota reached", "enable overages", "individual quota",
+    "insufficient credit", "free tier", "daily limit", "exhausted your capacity",
+];
+#[rustfmt::skip]
+const RATE_MARKERS: &[&str] = &[
+    "rate_limit_exceeded", "per minute", "rpm", "rate limit", "too many requests",
+    "reset in 0s", "reset after 0s",
+];
+const SOFT_MARKERS: &[&str] = &["try again", "temporarily"];
+/// A `rate_limited` hint above this is not slept: the turn fails with it instead.
+const RATE_LIMIT_429_CAP: Duration = Duration::from_secs(60);
+const SOFT_429_BACKOFF: Duration = Duration::from_secs(2);
+const UNKNOWN_429_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Classify a 429 body; a non-429 is not this decision's business.
+fn classify_429(status: reqwest::StatusCode, body: &[u8]) -> Rate429 {
+    if status != reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Rate429::Unknown;
+    }
+    // `ErrorInfo.reason` is text like `QUOTA_EXHAUSTED`, so the marker tables
+    // below cover it (`quota_exhausted`, `rate_limit_exceeded`); the JSON body
+    // is only needed for the delay.
+    let text = String::from_utf8_lossy(body).to_ascii_lowercase();
+    let value: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+    let value = value
+        .as_array()
+        .and_then(|array| array.first())
+        .unwrap_or(&value);
+    let hint = delay_hint(&text, value);
+    let marker = |set: &[&str]| set.iter().any(|marker| text.contains(marker));
+    if marker(QUOTA_MARKERS) {
+        Rate429::QuotaExhausted { reset: hint }
+    } else if marker(RATE_MARKERS) {
+        Rate429::RateLimited { delay: hint }
+    } else if marker(SOFT_MARKERS) {
+        Rate429::Soft
+    } else {
+        Rate429::Unknown
+    }
+}
+
+/// The delay a 429 body carries: `RetryInfo.retryDelay` (protobuf JSON
+/// duration) anywhere in the document, else a `reset in Ns|Nm|Nh` phrase.
+fn delay_hint(text: &str, value: &Value) -> Option<Duration> {
+    fn walk(value: &Value) -> Option<&str> {
+        match value {
+            Value::Array(items) => items.iter().find_map(walk),
+            Value::Object(map) => map
+                .get("retryDelay")
+                .and_then(Value::as_str)
+                .or_else(|| map.values().find_map(walk)),
+            _ => None,
+        }
+    }
+    if let Some(seconds) = walk(value).and_then(parse_seconds) {
+        return Some(Duration::from_secs_f64(seconds));
+    }
+    let tail = ["reset in ", "reset after "]
+        .iter()
+        .find_map(|prefix| text.split(prefix).nth(1))?
+        .trim_start();
+    let number = tail
+        .split(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .next()?;
+    let unit = tail[number.len()..]
+        .trim_start()
+        .chars()
+        .next()
+        .unwrap_or('s');
+    parse_seconds(&format!("{number}{unit}")).map(Duration::from_secs_f64)
+}
+
+/// `"12s"` / `"1.500s"` / `"5m"` / `"2h"` / `"12"` -> seconds, by hand: the
+/// forms are fixed and a crate would be more machinery than this.
+fn parse_seconds(raw: &str) -> Option<f64> {
+    let raw = raw.trim();
+    let (number, factor) = match raw.chars().last()? {
+        's' => (&raw[..raw.len() - 1], 1.0),
+        'm' => (&raw[..raw.len() - 1], 60.0),
+        'h' => (&raw[..raw.len() - 1], 3600.0),
+        _ => (raw, 1.0),
+    };
+    let seconds: f64 = number.trim().parse().ok()?;
+    (seconds.is_finite() && seconds >= 0.0).then_some(seconds * factor)
+}
+
+/// The one-line, actionable message for a 429 the adapter will not retry: only
+/// allowlisted reason constants and parsed delays are interpolated.
+fn rate_429_error(model: &str, rate: Rate429) -> anyhow::Error {
+    let until = |wait: Duration| {
+        let reset =
+            Utc::now() + ChronoDuration::from_std(wait).unwrap_or_else(|_| ChronoDuration::zero());
+        reset.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+    };
+    match rate {
+        Rate429::QuotaExhausted { reset } => anyhow!(
+            "Antigravity quota exhausted (HTTP 429 QUOTA_EXHAUSTED, model={model}){}; retrying cannot help",
+            reset
+                .map(|wait| format!(", resets in {}s (until {})", wait.as_secs(), until(wait)))
+                .unwrap_or_else(|| " with no reset time given".to_owned())
+        ),
+        Rate429::RateLimited { delay } => anyhow!(
+            "Antigravity rate limited (HTTP 429 RATE_LIMIT_EXCEEDED, model={model}){}; try again later",
+            delay
+                .map(|wait| format!(
+                    ", retry in {}s (the cap is {}s)",
+                    wait.as_secs(),
+                    RATE_LIMIT_429_CAP.as_secs()
+                ))
+                .unwrap_or_else(|| " with no retry delay given".to_owned())
+        ),
+        Rate429::Soft | Rate429::Unknown => {
+            anyhow!("Antigravity returned HTTP 429 (model={model})")
+        }
+    }
+}
+
 /// The only provider codes e-agent will ever repeat: the gRPC canonical status
 /// names, the numeric statuses this endpoint mirrors into `code`, and the few
 /// reason codes it is known to answer with. A value is matched against these
@@ -1359,9 +1585,11 @@ const ERROR_CODES: &[&str] = &[
     "502",
     "503",
     "504",
-    // Reasons this wire is known to name.
+    // Reasons this wire is known to name (the 429 split lives in `Rate429`).
     "API_KEY_INVALID",
     "API_KEY_EXPIRED",
+    "QUOTA_EXHAUSTED",
+    "RATE_LIMIT_EXCEEDED",
     "invalid_grant",
 ];
 
@@ -1382,7 +1610,13 @@ fn error_code(error: &Value) -> Option<&'static str> {
     ["status", "code", "type"]
         .into_iter()
         .filter_map(|field| error[field].as_str())
-        .chain(error["details"][0]["reason"].as_str())
+        .chain(
+            error["details"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|detail| detail["reason"].as_str()),
+        )
         .filter_map(allowlisted)
         .next()
 }

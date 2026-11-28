@@ -47,7 +47,7 @@ impl Fake {
 
 /// The interval the pacing tests configure: far below the 1000 ms default, so
 /// the tests stay fast, and far above any unpaced gap (~0.2 ms).
-const PACING_TEST_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+const PACING_TEST_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
 
 /// Assert one measured arrival gap is paced. An arrival stamp carries the
 /// client's per-request DISPATCH latency (wake-up after the sleep, request
@@ -235,6 +235,28 @@ fn model_for(fake: &Fake, token_file: PathBuf, cache_file: PathBuf) -> Antigravi
         min_interval: std::time::Duration::ZERO,
         conversation: Default::default(),
         last_request: Default::default(),
+        vision: true,
+        image_store: None,
+    }
+}
+
+/// A model with no server behind it: for `request_body` unit tests.
+fn test_model(dir: &Path) -> AntigravityModel {
+    AntigravityModel {
+        client: reqwest::Client::new(),
+        model: "gemini-3.8-flash-tiered".into(),
+        reasoning_effort: None,
+        stream_url: "http://127.0.0.1:1/stream".into(),
+        token_endpoint: "http://127.0.0.1:1/token".into(),
+        token_file: dir.join("agy.json"),
+        cache_file: dir.join("cache.json"),
+        client_id: None,
+        client_secret: None,
+        min_interval: std::time::Duration::ZERO,
+        last_request: Default::default(),
+        conversation: Default::default(),
+        vision: true,
+        image_store: None,
     }
 }
 
@@ -1269,6 +1291,8 @@ fn tool_result_body_echoes_signature_and_function_response() {
         min_interval: std::time::Duration::ZERO,
         last_request: Default::default(),
         conversation: Default::default(),
+        vision: true,
+        image_store: None,
     };
     let messages = vec![
         Message::User {
@@ -2209,12 +2233,13 @@ async fn provider_error_bodies_are_never_surfaced() {
     assert!(message.contains("INVALID_ARGUMENT"), "{message}");
 
     // No allowlisted value anywhere: the HTTP status alone, and in particular
-    // nothing sentinel-shaped.
+    // nothing sentinel-shaped. A bare 429 gets its one bounded retry (see
+    // `Rate429::Unknown`), so the fake answers twice.
     let bare_body = json!([{
         "error": {"code": SENTINEL, "type": SENTINEL, "details": [{"reason": SENTINEL}]}
     }])
     .to_string();
-    let bare = spawn_fake(1, move |_, _| (429, bare_body.clone())).await;
+    let bare = spawn_fake(2, move |_, _| (429, bare_body.clone())).await;
     let mut model = model_for(&bare, token_file.clone(), dir.path().join("c/t.json"));
     let error = model
         .complete(
@@ -2726,6 +2751,8 @@ fn history_tool_schema_rides_the_wire() {
         min_interval: std::time::Duration::ZERO,
         last_request: Default::default(),
         conversation: Default::default(),
+        vision: true,
+        image_store: None,
     };
     let specs = builtin_specs(dir.path());
     assert!(specs.iter().any(|spec| spec.name == "history"));
@@ -2904,6 +2931,8 @@ fn request_metadata_carries_type_id_and_derived_session() {
         min_interval: std::time::Duration::ZERO,
         last_request: Default::default(),
         conversation: Default::default(),
+        vision: true,
+        image_store: None,
     };
     let user = Message::User {
         content: "hi".into(),
@@ -3171,6 +3200,8 @@ fn request_repair_fills_ids_aligns_names_and_drops_empty_parts() {
         min_interval: std::time::Duration::ZERO,
         last_request: Default::default(),
         conversation: Default::default(),
+        vision: true,
+        image_store: None,
     };
     let messages = vec![
         // An empty prompt part would be an empty `text` part on the wire.
@@ -3232,5 +3263,599 @@ fn request_repair_fills_ids_aligns_names_and_drops_empty_parts() {
         body["request"]["tools"][0]["functionDeclarations"][0]["parametersJsonSchema"],
         json!({"type": "object"}),
         "a missing schema is defaulted, not sent as null"
+    );
+}
+
+/// A Google error document for a 429: `ErrorInfo.reason` plus an optional
+/// `RetryInfo.retryDelay` (protobuf JSON duration).
+fn error_429(reason: &str, message: &str, retry_delay: Option<&str>) -> String {
+    let mut details = vec![json!({
+        "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+        "reason": reason,
+        "domain": "cloudcode-pa.googleapis.com",
+    })];
+    if let Some(delay) = retry_delay {
+        details.push(json!({
+            "@type": "type.googleapis.com/google.rpc.RetryInfo",
+            "retryDelay": delay,
+        }));
+    }
+    json!([{"error": {
+        "code": 429,
+        "status": "RESOURCE_EXHAUSTED",
+        "message": message,
+        "details": details,
+    }}])
+    .to_string()
+}
+
+/// The `<step>` of every generation request the fake recorded.
+fn steps(fake: &Fake) -> Vec<String> {
+    fake.requests()
+        .into_iter()
+        .filter(|(path, _, _)| path.contains("streamGenerateContent"))
+        .map(|(_, _, body)| {
+            body["requestId"]
+                .as_str()
+                .unwrap_or_default()
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect()
+}
+
+/// The decision table, category by category: the allowlisted `ErrorInfo.reason`
+/// first, then the body markers (quota outranking both others), then the parsed
+/// delay from `RetryInfo.retryDelay` or a "reset in Ns|Nm" phrase.
+#[test]
+fn classify_429_decision_table() {
+    let too_many = reqwest::StatusCode::TOO_MANY_REQUESTS;
+    let classify = |body: &str| classify_429(too_many, body.as_bytes());
+    // Explicit reasons win over any text.
+    assert_eq!(
+        classify(&error_429("QUOTA_EXHAUSTED", "", Some("3600s"))),
+        Rate429::QuotaExhausted {
+            reset: Some(std::time::Duration::from_secs(3600))
+        }
+    );
+    assert_eq!(
+        classify(&error_429("RATE_LIMIT_EXCEEDED", "", Some("1.500s"))),
+        Rate429::RateLimited {
+            delay: Some(std::time::Duration::from_millis(1500))
+        }
+    );
+    // The text markers, per category.
+    for body in [
+        "quota_exhausted",
+        "your quota reached",
+        "please enable overages",
+        "individual quota exceeded",
+        "insufficient credit",
+        "free tier limit",
+        "daily limit hit",
+        "you have exhausted your capacity",
+    ] {
+        assert_eq!(
+            classify(body),
+            Rate429::QuotaExhausted { reset: None },
+            "{body}"
+        );
+    }
+    for body in [
+        "requests per minute",
+        "rpm exceeded",
+        "rate limit",
+        "too many requests",
+    ] {
+        assert_eq!(
+            classify(body),
+            Rate429::RateLimited { delay: None },
+            "{body}"
+        );
+    }
+    // `reset in|after 0s` is a rate-limit marker AND a zero delay hint.
+    for body in ["quota will reset in 0s", "quota reset after 0s"] {
+        assert_eq!(
+            classify(body),
+            Rate429::RateLimited {
+                delay: Some(std::time::Duration::ZERO)
+            },
+            "{body}"
+        );
+    }
+    for body in ["try again later", "temporarily unavailable"] {
+        assert_eq!(classify(body), Rate429::Soft, "{body}");
+    }
+    assert_eq!(classify("nope"), Rate429::Unknown);
+    // A body naming a spent quota AND "try again" is the condition no retry
+    // fixes: quota wins.
+    assert_eq!(
+        classify("quota_exhausted, try again later"),
+        Rate429::QuotaExhausted { reset: None }
+    );
+    // The delay forms: protobuf JSON durations and reset phrases.
+    assert_eq!(
+        classify(&error_429("RATE_LIMIT_EXCEEDED", "", Some("12s"))),
+        Rate429::RateLimited {
+            delay: Some(std::time::Duration::from_secs(12))
+        }
+    );
+    // A reset phrase is a delay HINT for a category the markers already chose
+    // (on its own it classifies nothing: see the `Unknown` case below).
+    assert_eq!(
+        classify("rate limit, reset in 90s"),
+        Rate429::RateLimited {
+            delay: Some(std::time::Duration::from_secs(90))
+        }
+    );
+    assert_eq!(
+        classify("too many requests, reset after 5m"),
+        Rate429::RateLimited {
+            delay: Some(std::time::Duration::from_secs(300))
+        }
+    );
+    assert_eq!(
+        classify("slow down, reset in 2h"),
+        Rate429::Unknown,
+        "a reset phrase is a hint, not a category (only `reset in 0s` marks a rate limit)"
+    );
+    // Only a 429 is this decision's business.
+    assert_eq!(
+        classify_429(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            b"quota_exhausted"
+        ),
+        Rate429::Unknown
+    );
+}
+
+/// `quota_exhausted` is not retried: the window resets later, and the message
+/// says when (the parsed `RetryInfo.retryDelay`), with the reason allowlisted
+/// and the raw body dropped.
+#[tokio::test]
+async fn quota_429_is_not_retried_and_names_the_reset() {
+    const SENTINEL: &str = "SENTINEL-BODY-TEXT-3f21";
+    let dir = tempfile::tempdir().unwrap();
+    let token_file = write_agy_token(
+        dir.path(),
+        "test-token",
+        Utc::now() + ChronoDuration::hours(1),
+        "refresh-token",
+    );
+    let body = error_429("QUOTA_EXHAUSTED", SENTINEL, Some("3600s"));
+    let fake = spawn_fake(1, move |_, _| (429, body.clone())).await;
+    let mut model = model_for(&fake, token_file, dir.path().join("cache/token.json"));
+    let error = model
+        .complete(
+            &[Message::User {
+                content: "hi".into(),
+                images: Vec::new(),
+            }],
+            &[],
+            None,
+        )
+        .await
+        .expect_err("a spent quota is not retried");
+    let message = format!("{error:#}");
+    assert!(message.contains("quota exhausted"), "{message}");
+    assert!(message.contains("QUOTA_EXHAUSTED"), "{message}");
+    assert!(message.contains("resets in 3600s"), "{message}");
+    assert!(message.contains("until "), "the reset time is surfaced");
+    assert!(!message.contains(SENTINEL), "the body is never echoed");
+    assert_eq!(fake.requests().len(), 1, "no retry for a spent quota");
+}
+
+/// `rate_limited` honours the hint (here 200 ms) and retries exactly once,
+/// counting the retry as the next `<step>` of the same turn.
+#[tokio::test]
+async fn rate_limited_429_honours_the_hint_and_retries_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let token_file = write_agy_token(
+        dir.path(),
+        "test-token",
+        Utc::now() + ChronoDuration::hours(1),
+        "refresh-token",
+    );
+    let limited = error_429("RATE_LIMIT_EXCEEDED", "slow down", Some("0.2s"));
+    let ok = sse_body(&[text_element("ok")]);
+    let fake = spawn_fake(2, move |index, _| match index {
+        0 => (429, limited.clone()),
+        _ => (200, ok.clone()),
+    })
+    .await;
+    let mut model = model_for(&fake, token_file, dir.path().join("cache/token.json"));
+    let started = Instant::now();
+    let (assistant, _) = model
+        .complete(
+            &[Message::User {
+                content: "hi".into(),
+                images: Vec::new(),
+            }],
+            &[],
+            None,
+        )
+        .await
+        .expect("the retry answers");
+    // The hint is a client-side sleep: no arrival-stamp jitter can shrink it.
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(200),
+        "the 200 ms hint is waited out: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(assistant.content.as_deref(), Some("ok"));
+    assert_eq!(fake.requests().len(), 2, "one 429, one retry");
+    assert_eq!(steps(&fake), ["0", "1"], "the retry is the next step");
+    let gap = fake.gaps()[0];
+    assert_paced(
+        gap,
+        std::time::Duration::from_millis(200),
+        "the hinted retry",
+    );
+    assert!(
+        gap < std::time::Duration::from_secs(2),
+        "and it is not padded beyond it: {gap:?}"
+    );
+}
+
+/// `soft_rate_limit` ("try again") retries once after the short backoff.
+#[tokio::test]
+async fn soft_rate_limit_retries_once_after_the_backoff() {
+    let dir = tempfile::tempdir().unwrap();
+    let token_file = write_agy_token(
+        dir.path(),
+        "test-token",
+        Utc::now() + ChronoDuration::hours(1),
+        "refresh-token",
+    );
+    let softening = json!([{"error": {
+        "code": 429,
+        "status": "RESOURCE_EXHAUSTED",
+        "message": "please try again later",
+    }}])
+    .to_string();
+    let ok = sse_body(&[text_element("ok")]);
+    let fake = spawn_fake(2, move |index, _| match index {
+        0 => (429, softening.clone()),
+        _ => (200, ok.clone()),
+    })
+    .await;
+    let mut model = model_for(&fake, token_file, dir.path().join("cache/token.json"));
+    let started = Instant::now();
+    model
+        .complete(
+            &[Message::User {
+                content: "hi".into(),
+                images: Vec::new(),
+            }],
+            &[],
+            None,
+        )
+        .await
+        .expect("the short retry answers");
+    assert!(
+        started.elapsed() >= SOFT_429_BACKOFF,
+        "the soft backoff is waited out: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(fake.requests().len(), 2);
+    assert_eq!(steps(&fake), ["0", "1"]);
+    let gap = fake.gaps()[0];
+    assert_paced(gap, SOFT_429_BACKOFF, "the soft retry");
+    assert!(
+        gap < UNKNOWN_429_BACKOFF,
+        "a SOFT 429 is not treated as an unknown one (5 s): {gap:?}"
+    );
+}
+
+/// An UNKNOWN 429 gets one retry after the short backoff; if it is a 429 again
+/// the turn fails on the STATUS alone, with no body text.
+#[tokio::test]
+async fn unknown_429_retries_once_then_fails_with_the_status_only() {
+    const SENTINEL: &str = "SENTINEL-BODY-TEXT-9a74";
+    let dir = tempfile::tempdir().unwrap();
+    let token_file = write_agy_token(
+        dir.path(),
+        "test-token",
+        Utc::now() + ChronoDuration::hours(1),
+        "refresh-token",
+    );
+    let body = json!([{"error": {"code": 429, "message": SENTINEL}}]).to_string();
+    let fake = spawn_fake(2, move |_, _| (429, body.clone())).await;
+    let mut model = model_for(&fake, token_file, dir.path().join("cache/token.json"));
+    let started = Instant::now();
+    let error = model
+        .complete(
+            &[Message::User {
+                content: "hi".into(),
+                images: Vec::new(),
+            }],
+            &[],
+            None,
+        )
+        .await
+        .expect_err("a second 429 fails");
+    assert!(
+        started.elapsed() >= UNKNOWN_429_BACKOFF,
+        "the unknown backoff is waited out: {:?}",
+        started.elapsed()
+    );
+    let message = format!("{error:#}");
+    assert_eq!(
+        message.trim(),
+        "Antigravity returned HTTP 429 (model=gemini-3.8-flash-tiered)"
+    );
+    assert!(!message.contains(SENTINEL), "{message}");
+    assert_eq!(fake.requests().len(), 2, "one retry, never a loop");
+    assert_eq!(steps(&fake), ["0", "1"]);
+    assert_paced(fake.gaps()[0], UNKNOWN_429_BACKOFF, "the unknown retry");
+}
+
+/// A `rate_limited` hint above the cap is not slept: the turn fails with the
+/// hint in the message, after ONE request.
+#[tokio::test]
+async fn rate_limited_hint_above_the_cap_is_not_retried() {
+    let dir = tempfile::tempdir().unwrap();
+    let token_file = write_agy_token(
+        dir.path(),
+        "test-token",
+        Utc::now() + ChronoDuration::hours(1),
+        "refresh-token",
+    );
+    let body = error_429("RATE_LIMIT_EXCEEDED", "slow down", Some("120s"));
+    let fake = spawn_fake(1, move |_, _| (429, body.clone())).await;
+    let mut model = model_for(&fake, token_file, dir.path().join("cache/token.json"));
+    let error = model
+        .complete(
+            &[Message::User {
+                content: "hi".into(),
+                images: Vec::new(),
+            }],
+            &[],
+            None,
+        )
+        .await
+        .expect_err("a 120 s hint is not slept");
+    let message = format!("{error:#}");
+    assert!(message.contains("rate limited"), "{message}");
+    assert!(message.contains("RATE_LIMIT_EXCEEDED"), "{message}");
+    assert!(message.contains("retry in 120s"), "{message}");
+    assert!(message.contains("cap is 60s"), "{message}");
+    assert_eq!(fake.requests().len(), 1);
+}
+
+/// A 429 retry still goes through the pacer: a configured `min_interval`
+/// outlasts a shorter hint, so the retry is spaced like any other request.
+#[tokio::test]
+async fn pacing_survives_a_429_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let token_file = write_agy_token(
+        dir.path(),
+        "test-token",
+        Utc::now() + ChronoDuration::hours(1),
+        "refresh-token",
+    );
+    let limited = error_429("RATE_LIMIT_EXCEEDED", "slow down", Some("0.01s"));
+    let ok = sse_body(&[text_element("ok")]);
+    let fake = spawn_fake(2, move |index, _| match index {
+        0 => (429, limited.clone()),
+        _ => (200, ok.clone()),
+    })
+    .await;
+    let mut model = model_for(&fake, token_file, dir.path().join("cache/token.json"));
+    model.min_interval = PACING_TEST_INTERVAL;
+    model
+        .complete(
+            &[Message::User {
+                content: "hi".into(),
+                images: Vec::new(),
+            }],
+            &[],
+            None,
+        )
+        .await
+        .expect("the paced retry answers");
+    assert_eq!(fake.requests().len(), 2);
+    let gap = fake.gaps()[0];
+    assert_paced(gap, PACING_TEST_INTERVAL, "the paced 429 retry");
+    assert!(
+        gap < UNKNOWN_429_BACKOFF,
+        "the retry used the hint (not the unknown backoff) plus pacing: {gap:?}"
+    );
+}
+
+/// V2: a user turn's images ride as `inlineData` parts AFTER its text part,
+/// read from the content-addressed store at send time (the reference's Gemini
+/// shape), with the mime type the reference carries.
+#[test]
+fn user_images_ride_as_inline_data_parts() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("images");
+    std::fs::create_dir_all(&store).unwrap();
+    let bytes = b"\x89PNG\r\n\x1a\n-not-really-a-png";
+    let hash = crate::agent::store_image_bytes(&store, bytes).unwrap();
+    let model = test_model(dir.path()).with_image_store(store);
+    let body = model
+        .request_body(
+            &[Message::User {
+                content: "what is this".into(),
+                images: vec![ImagePart {
+                    hash: hash.clone(),
+                    mime: "image/png".into(),
+                }],
+            }],
+            &[],
+        )
+        .unwrap();
+    let parts = body["request"]["contents"][0]["parts"].as_array().unwrap();
+    assert_eq!(parts.len(), 2, "text plus one image: {parts:?}");
+    assert_eq!(parts[0]["text"], "what is this");
+    assert_eq!(parts[1]["inlineData"]["mimeType"], "image/png");
+    let data = parts[1]["inlineData"]["data"]
+        .as_str()
+        .expect("base64 data");
+    assert!(!data.is_empty());
+    use base64::Engine;
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .unwrap(),
+        bytes,
+        "the bytes come from the store at send time"
+    );
+    // A missing file degrades, exactly like the chat wire.
+    let missing = model
+        .request_body(
+            &[Message::User {
+                content: "gone".into(),
+                images: vec![ImagePart {
+                    hash: "0".repeat(64),
+                    mime: "image/png".into(),
+                }],
+            }],
+            &[],
+        )
+        .unwrap();
+    let parts = missing["request"]["contents"][0]["parts"]
+        .as_array()
+        .unwrap();
+    assert_eq!(
+        parts[1]["text"],
+        format!("[image missing: {}]", "0".repeat(64))
+    );
+}
+
+/// V2: a tool result's image goes INSIDE its `functionResponse`, as that
+/// response's own `parts` (a reference client documents the placement as
+/// load-bearing), never as a sibling part of the user content.
+#[test]
+fn tool_result_images_ride_inside_the_function_response() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("images");
+    std::fs::create_dir_all(&store).unwrap();
+    let hash = crate::agent::store_image_bytes(&store, b"jpeg-bytes").unwrap();
+    let model = test_model(dir.path()).with_image_store(store);
+    let body = model
+        .request_body(
+            &[
+                Message::Assistant(AssistantMessage {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_1".into(),
+                        name: "read_image".into(),
+                        arguments: r#"{"path":"a.png"}"#.into(),
+                        provider_meta: Some("sig-call".into()),
+                    }],
+                    reasoning: None,
+                }),
+                Message::Tool {
+                    call_id: "call_1".into(),
+                    name: "read_image".into(),
+                    content: "a picture".into(),
+                    images: vec![ImagePart {
+                        hash,
+                        mime: "image/jpeg".into(),
+                    }],
+                    is_error: false,
+                    synthetic: false,
+                },
+            ],
+            &[],
+        )
+        .unwrap();
+    let contents = body["request"]["contents"].as_array().unwrap();
+    let parts = contents[1]["parts"].as_array().unwrap();
+    assert_eq!(parts.len(), 1, "one part, the response itself: {parts:?}");
+    let response = &parts[0]["functionResponse"];
+    assert_eq!(response["name"], "read_image");
+    assert_eq!(response["response"]["output"], "a picture");
+    let inline = response["parts"]
+        .as_array()
+        .expect("parts inside the response");
+    assert_eq!(inline.len(), 1);
+    assert_eq!(inline[0]["inlineData"]["mimeType"], "image/jpeg");
+    assert!(
+        inline[0]["inlineData"]["data"]
+            .as_str()
+            .is_some_and(|data| !data.is_empty()),
+        "the image bytes ride inside the functionResponse"
+    );
+    assert!(
+        parts.iter().all(|part| part.get("inlineData").is_none()),
+        "no sibling inlineData part: {parts:?}"
+    );
+}
+
+/// V1/V2: a profile that says `vision = false` still fails the gate with the
+/// existing error, before any request is made.
+#[tokio::test]
+async fn vision_false_still_rejects_images() {
+    let dir = tempfile::tempdir().unwrap();
+    let token_file = write_agy_token(
+        dir.path(),
+        "test-token",
+        Utc::now() + ChronoDuration::hours(1),
+        "refresh-token",
+    );
+    let fake = spawn_fake(1, |_, _| (200, sse_body(&[text_element("unused")]))).await;
+    // The adapter is vision-capable by DEFAULT (V1/V2); the profile turns it off.
+    assert!(
+        model_for(
+            &fake,
+            token_file.clone(),
+            dir.path().join("cache/token.json")
+        )
+        .supports_vision(),
+        "an Antigravity profile that omits `vision` takes images"
+    );
+    let mut model =
+        model_for(&fake, token_file, dir.path().join("cache/token.json")).with_vision(false);
+    assert!(!model.supports_vision());
+    let error = model
+        .complete(
+            &[Message::User {
+                content: "look".into(),
+                images: vec![ImagePart {
+                    hash: "0".repeat(64),
+                    mime: "image/png".into(),
+                }],
+            }],
+            &[],
+            None,
+        )
+        .await
+        .expect_err("a text-only profile rejects images");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("does not support image input"),
+        "{message}"
+    );
+    assert!(message.contains(&model.name().to_owned()), "{message}");
+    assert_eq!(fake.requests().len(), 0, "nothing was sent");
+}
+
+/// V2: the PERSISTED entry carries the image reference only — never bytes, and
+/// never anything base64-shaped.
+#[test]
+fn persisted_image_references_carry_no_bytes() {
+    let hash = "a".repeat(64);
+    let user = Message::User {
+        content: "look".into(),
+        images: vec![ImagePart {
+            hash: hash.clone(),
+            mime: "image/png".into(),
+        }],
+    };
+    let stored = serde_json::to_string(&user).unwrap();
+    assert!(
+        stored.contains(&hash),
+        "the reference is persisted: {stored}"
+    );
+    assert!(!stored.contains("inlineData"), "{stored}");
+    assert!(!stored.contains("base64"), "{stored}");
+    assert!(
+        !stored.contains(&"a".repeat(96)),
+        "nothing base64-shaped lands in the entry: {stored}"
     );
 }

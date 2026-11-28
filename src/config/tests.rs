@@ -116,7 +116,7 @@ context_window = 131072
 }
 
 #[test]
-fn vision_defaults_to_false_and_reads_from_model_profile() {
+fn vision_defaults_to_true_and_reads_from_model_profile() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("key"), "key").unwrap();
     let path = write_config(
@@ -134,7 +134,8 @@ vision = true
     let resolved = Config::from_path(&path).unwrap().resolve(None).unwrap();
     assert!(resolved.vision);
 
-    // Absent `vision` means false (deepseek-style default).
+    // Absent `vision` means TRUE: a profile that omits the key is treated as
+    // vision-capable, and a text-only model must say so explicitly.
     let path = write_config(
         temp.path(),
         r#"
@@ -144,6 +145,22 @@ base_url = "https://api.deepseek.com/v1"
 api_key_file = "key"
 [models."deepseek/v3"]
 model = "deepseek-chat"
+"#,
+    );
+    let resolved = Config::from_path(&path).unwrap().resolve(None).unwrap();
+    assert!(resolved.vision, "an omitted `vision` key defaults to true");
+
+    // `vision = false` is how a text-only profile declares itself.
+    let path = write_config(
+        temp.path(),
+        r#"
+default = "deepseek/v3"
+[providers.deepseek]
+base_url = "https://api.deepseek.com/v1"
+api_key_file = "key"
+[models."deepseek/v3"]
+model = "deepseek-chat"
+vision = false
 "#,
     );
     let resolved = Config::from_path(&path).unwrap().resolve(None).unwrap();

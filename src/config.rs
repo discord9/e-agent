@@ -388,10 +388,10 @@ struct ModelProfile {
     /// auto-compacts when usage exceeds 80% of this value, and the TUI
     /// shows a percentage alongside the token count.
     context_window: Option<u64>,
-    /// Whether the model accepts image input. Defaults to false: user
-    /// messages with attached images fail the vision gate with a clear
-    /// error on non-vision models. kimi/k3 profiles should set
-    /// `vision = true`; deepseek defaults to false.
+    /// Whether the model accepts image input. Defaults to TRUE: a profile
+    /// that omits the key is treated as vision-capable, and a text-only
+    /// profile must say `vision = false` — a user message with images then
+    /// fails the vision gate with an error naming the model.
     #[serde(default)]
     vision: Option<bool>,
     /// DeepSeek Chat wire compatibility (default false). Solely for
@@ -422,6 +422,8 @@ pub struct ResolvedModel {
     pub auth: AuthMode,
     pub display: String,
     pub context_window: Option<u64>,
+    /// Profile `vision` (default TRUE: a profile that omits it is
+    /// vision-capable; `vision = false` marks a text-only model).
     pub vision: bool,
     /// `auth = "antigravity"`: the `agy` install's OAuth consumer client
     /// (`client_id` / `client_secret`), needed only to refresh. `None` for
@@ -966,7 +968,7 @@ impl Config {
                 auth: mode,
                 display: profile.to_owned(),
                 context_window: model_profile.context_window,
-                vision: model_profile.vision.unwrap_or(false),
+                vision: model_profile.vision.unwrap_or(true),
                 client_id: provider.client_id.clone(),
                 client_secret: provider.client_secret.clone(),
                 min_interval_ms: provider.min_interval_ms,
@@ -1017,7 +1019,7 @@ impl Config {
             auth: AuthMode::ApiKey,
             display: profile.to_owned(),
             context_window: model_profile.context_window,
-            vision: model_profile.vision.unwrap_or(false),
+            vision: model_profile.vision.unwrap_or(true),
             client_id: None,
             client_secret: None,
             min_interval_ms: None,
