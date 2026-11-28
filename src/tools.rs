@@ -11,6 +11,7 @@ mod bash;
 mod file;
 pub(crate) mod history;
 mod image_generation;
+pub(crate) mod link_ref;
 mod notes;
 pub mod output;
 #[cfg(target_os = "linux")]
@@ -502,6 +503,25 @@ fn tools_with_background_and_web_search(
 /// subagents and btw forks intentionally use the common builtins above.
 pub fn add_root_user_input_tool(tools: &mut Vec<Box<dyn Tool>>) {
     tools.push(Box::new(RequestUserInput));
+}
+
+/// Root-session-only session links: `link_ref`, `unlink_ref`, `list_refs`.
+///
+/// They are deliberately NOT in the common builtins. A link is what feeds the
+/// PR/issue watcher, and the watcher turns an observed change into a model
+/// turn: a writable subagent that could link a PR would be able to schedule
+/// automatic turns for a session whose job is one delegated task. Both halves
+/// are installed together, by the root session construction (this and
+/// `SessionRunner::with_ref_watch`), so the child path has nothing to disable.
+/// Inside a read-only role only the read verb exists — the same rule notes
+/// writes follow (nothing mutating is registered at all, rather than
+/// registered-then-refused).
+pub fn add_root_ref_tools(tools: &mut Vec<Box<dyn Tool>>, read_only: bool) {
+    if !read_only {
+        tools.push(Box::new(link_ref::LinkRef));
+        tools.push(Box::new(link_ref::UnlinkRef));
+    }
+    tools.push(Box::new(link_ref::ListRefs));
 }
 
 fn spec(name: &str, description: &str, properties: Value, required: &[&str]) -> ToolSpec {

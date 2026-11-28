@@ -31,7 +31,7 @@ use crate::runner::{IdlePolicy, SessionBootstrap, SessionHandle, SessionRunner};
 use crate::session_store::SessionStore;
 use crate::tools::{
     AuthResolver, BackgroundTasks, DEEPSEEK_API_KEY_ENV, SEARXNG_BASE_URL_ENV,
-    WEB_FETCH_PROVIDER_ENV, WEB_SEARCH_PROVIDER_ENV, add_root_user_input_tool,
+    WEB_FETCH_PROVIDER_ENV, WEB_SEARCH_PROVIDER_ENV, add_root_ref_tools, add_root_user_input_tool,
     builtins_with_bash_timeout, generate_image_tool,
 };
 use crate::workspace::Workspace;
@@ -1075,6 +1075,12 @@ impl SessionFactory {
         register_run_rust(&mut tools, &tools_workspace, self.code_mode, self.read_only, self.rust_sandbox.clone());
         // Only the root/main session can pause for Web human input.
         add_root_user_input_tool(&mut tools);
+        // Main-agent only: the session-link verbs. A link is what the
+        // PR/issue watcher turns into a model turn, so a subagent — which is
+        // built from the common builtins — gets neither the verbs nor the
+        // watcher (see `with_ref_watch` below). Read-only main sessions keep
+        // only the read verb.
+        add_root_ref_tools(&mut tools, self.read_only);
         // Main-agent only: `generate_image` (direct Codex image HTTP).
         // Read-only sessions skip it (it creates files), and so does a
         // workspace rooted at or below the canonical global skills
@@ -1286,9 +1292,14 @@ impl SessionFactory {
         .await?;
         // The root/main session is the only one with a user-facing
         // `WaitingInput` frontend (Web/TUI), so it is the only session
-        // allowed to suspend on `request_user_input` for an answer.
+        // allowed to suspend on `request_user_input` for an answer. It is also
+        // the only session that watches its linked PRs: the watcher can start
+        // an automatic turn, and a subagent has exactly one task to finish.
+        // Both opt-ins are installed HERE, so `delegate`/`btw`/`fork` build
+        // their runners without them and have nothing to switch off.
         let runner = runner
             .with_background_tasks(background.clone())
+            .with_ref_watch()
             .with_user_input_allowed();
         Ok(SessionBuild {
             runner,

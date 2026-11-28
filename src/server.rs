@@ -26,6 +26,10 @@
 //! | GET    | `/api/sessions/{id}/goal`         | current goal snapshot (or null)     |
 //! | POST   | `/api/sessions/{id}/goal`         | create / pause / resume / clear / continue the goal |
 //! | PUT    | `/api/sessions/{id}/title`        | rename a session                  |
+//! | GET    | `/api/sessions/{id}/refs`         | PR/issue links (`supported: false` on JSONL) |
+//! | POST   | `/api/sessions/{id}/refs`         | add one PR/issue link             |
+//! | DELETE | `/api/sessions/{id}/refs`         | remove one PR/issue link          |
+//! | GET    | `/api/sessions/{id}/refs/status`  | chip states + detail lines, `gh`-backed, 60 s cache |
 //! | DELETE | `/api/sessions/{id}`              | cancel + remove from the registry  |
 //! | GET    | `/api/tasks`                        | running background tasks, all sessions |
 //! | DELETE | `/api/sessions/{id}/tasks/{task_id}` | cancel one background task          |
@@ -284,6 +288,13 @@ fn router(state: Arc<AppState>) -> Router {
             get(session_goal_get).post(session_goal_post),
         )
         .route("/api/sessions/{id}/title", put(session_title))
+        .route(
+            "/api/sessions/{id}/refs",
+            get(session_links)
+                .post(add_session_link)
+                .delete(remove_session_link),
+        )
+        .route("/api/sessions/{id}/refs/status", get(session_link_statuses))
         .route("/api/sessions/{id}/pin", put(session_pin))
         .route("/api/sessions/{id}/archive", put(session_archive))
         .route("/api/sessions/{id}", delete(delete_session))
@@ -2065,6 +2076,316 @@ async fn session_goal_post(
         ));
     }
     Ok(StatusCode::ACCEPTED)
+}
+
+// ----------------------------------------------------------------------
+// Session PR/issue links
+// ----------------------------------------------------------------------
+
+/// One chip. `label` is the full identity — the tooltip, `unlink_ref`, and the
+/// model-facing tool all use it; `short` is what the chip prints when the link
+/// lives in the session's OWN repository (`#27`, `#22`), because that
+/// session's `origin` already says which repository it is.
+#[derive(Serialize)]
+struct RefChip {
+    kind: String,
+    url: String,
+    label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    short: Option<String>,
+}
+
+/// One session's link list. `supported: false` is the JSONL answer — never
+/// an empty list pretending the backend worked.
+#[derive(Serialize)]
+struct SessionLinksView {
+    supported: bool,
+    refs: Vec<RefChip>,
+}
+
+/// Chips for one session's rows: shorten exactly the links that point at the
+/// session's own repository. An unresolvable origin shortens nothing — "same
+/// repository" is a claim that needs evidence.
+async fn ref_chips(
+    workspace: Option<&std::path::Path>,
+    refs: Vec<crate::session_store::SessionRef>,
+) -> Vec<RefChip> {
+    let own = crate::tools::link_ref::origin_repo(workspace).await;
+    refs.into_iter()
+        .map(|link| RefChip {
+            short: crate::link_status::same_repo_short(&link.kind, &link.url, own.as_deref()),
+            kind: link.kind,
+            url: link.url,
+            label: link.label,
+        })
+        .collect()
+}
+
+/// The store that owns one session's rows: its live store when the session
+/// is running, otherwise the workspace-scoped meta store (the `session_refs`
+/// methods take the session id explicitly).
+async fn session_links_store(
+    state: &AppState,
+    id: &str,
+) -> Result<SessionStore, (StatusCode, String)> {
+    match live(state, id) {
+        Ok(SessionRef::Live(session)) => Ok(session.store.clone()),
+        Ok(SessionRef::Subagent { entry, .. }) => Ok(entry.store.clone()),
+        Err(_) => meta_store(state)
+            .await
+            .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))),
+    }
+}
+
+/// `GET /api/sessions/{id}/refs` — the session's chips in the backend's
+/// stable link order (see `SessionStore::list_refs`).
+async fn session_links(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<SessionLinksView>, (StatusCode, String)> {
+    let store = session_links_store(&state, &id).await?;
+    if !store.supports_session_refs() {
+        return Ok(Json(SessionLinksView {
+            supported: false,
+            refs: Vec::new(),
+        }));
+    }
+    let refs = store
+        .list_refs(state.factory.root(), &id)
+        .await
+        .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let workspace = session_git_workspace(&state, live(&state, &id).ok().as_ref());
+    Ok(Json(SessionLinksView {
+        supported: true,
+        refs: ref_chips(workspace.as_deref(), refs).await,
+    }))
+}
+
+/// One session's link statuses, keyed by the stored URL (the identity the
+/// frontend already holds). `supported: false` is the JSONL answer.
+#[derive(Serialize)]
+struct SessionLinkStatusView {
+    supported: bool,
+    statuses: std::collections::BTreeMap<String, crate::link_status::LinkStatus>,
+}
+
+/// `GET /api/sessions/{id}/refs/status` — the chip's state dot and the one
+/// line behind it, for every PR/issue link, from the 60-second in-memory
+/// cache. Nothing is persisted and nothing polls: the frontend asks when it
+/// opens a session and when it refreshes the link list.
+///
+/// A link GitHub cannot be asked about (another forge, a plain link, a fetch
+/// that failed) stays listed: a PR/issue reports `unknown`, and a plain link
+/// has no status entry at all.
+#[derive(Deserialize, Default)]
+struct LinkStatusQuery {
+    /// `refresh=1` bypasses the 60-second chip cache; it is only used by the
+    /// explicit per-link retry and the header's refresh-all action.
+    #[serde(default)]
+    refresh: Option<String>,
+    /// Limit a refresh to one stored URL (the popover retry).
+    #[serde(default)]
+    url: Option<String>,
+}
+
+async fn session_link_statuses(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(query): Query<LinkStatusQuery>,
+) -> Result<Json<SessionLinkStatusView>, (StatusCode, String)> {
+    let store = session_links_store(&state, &id).await?;
+    let mut statuses = std::collections::BTreeMap::new();
+    if !store.supports_session_refs() {
+        return Ok(Json(SessionLinkStatusView {
+            supported: false,
+            statuses,
+        }));
+    }
+    let refs = store
+        .list_refs(state.factory.root(), &id)
+        .await
+        .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let refresh = query
+        .refresh
+        .as_deref()
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+    let now = std::time::Instant::now();
+    // One fetch per distinct stored URL, even if a backend ever returns the
+    // same identity twice. A per-link retry only looks at that URL.
+    let mut seen = std::collections::HashSet::new();
+    for link in &refs {
+        if query.url.as_deref().is_some_and(|url| url != link.url) {
+            continue;
+        }
+        if !seen.insert(link.url.clone()) {
+            continue;
+        }
+        match crate::link_status::target(&link.kind, &link.url) {
+            Some(target) => {
+                // Both answers are DISPLAY observations: they update the chip
+                // and the 60-second window. Neither replaces the watcher's
+                // add-time baseline, so a refresh can never erase the change
+                // the watcher has yet to report.
+                let status = if refresh {
+                    crate::link_status::refresh(crate::link_status::cache(), &target, now).await
+                } else {
+                    crate::link_status::status(crate::link_status::cache(), &target, now).await
+                };
+                statuses.insert(link.url.clone(), status);
+            }
+            // A plain link has no state; a PR/issue we cannot ask GitHub
+            // about is `unknown`, never a guess.
+            None if link.kind != "link" => {
+                statuses.insert(link.url.clone(), crate::link_status::LinkStatus::unknown());
+            }
+            None => {}
+        }
+    }
+    Ok(Json(SessionLinkStatusView {
+        supported: true,
+        statuses,
+    }))
+}
+
+#[derive(Deserialize)]
+struct LinkBody {
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    number: Option<u64>,
+    #[serde(default)]
+    url: Option<String>,
+}
+
+/// The directory Git is read from for one session's links: a live main
+/// session works in the workspace root, a live subagent in its own `cwd`.
+/// A historical session has no known workspace, so `None` makes the number
+/// form require a full URL instead of resolving someone else's `origin`.
+fn session_git_workspace(state: &AppState, live: Option<&SessionRef>) -> Option<PathBuf> {
+    match live {
+        Some(SessionRef::Live(_)) => Some(state.factory.root().to_path_buf()),
+        Some(SessionRef::Subagent { entry, .. }) => Some(PathBuf::from(entry.cwd.as_str())),
+        None => None,
+    }
+}
+
+/// `POST /api/sessions/{id}/refs` — add one link. A bare number is resolved
+/// through the session's own workspace `origin`; a URL's kind is the explicit
+/// `kind` when given (that is how the editor records the kind the user
+/// picked, including a plain `link`) and only falls back to the URL's path
+/// when no kind was sent.
+async fn add_session_link(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<LinkBody>,
+) -> Result<Json<SessionLinksView>, (StatusCode, String)> {
+    let store = session_links_store(&state, &id).await?;
+    // Backend support comes first: on JSONL a number form must report the
+    // unsupported backend, never a git-resolution failure.
+    if !store.supports_session_refs() {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            crate::session_store::SESSION_REFS_UNSUPPORTED.to_owned(),
+        ));
+    }
+    let root = state.factory.root();
+    let session = live(&state, &id).ok();
+    // No "does this session exist?" precondition: a link is a row keyed by
+    // (workspace, session, url), and the storage primitive needs no metadata
+    // row to hold one. Requiring `sessions` metadata here refused exactly the
+    // sessions that never write it (a session id created by another client, a
+    // session store copied to a new root) while buying nothing — the row can
+    // only be read back by naming the same id. What a session cannot do is
+    // resolve a bare NUMBER without a live handle: there is no known
+    // workspace, so `session_git_workspace` stays `None` and the number form
+    // asks for a full URL instead of guessing a repository.
+    let workspace = session_git_workspace(&state, session.as_ref());
+    let (kind, url) = match (body.kind, body.number, body.url) {
+        (Some(kind), Some(_), None) if kind == "link" => {
+            return Err(error(
+                StatusCode::BAD_REQUEST,
+                "kind \"link\" requires a `url` — a plain link has no number form".to_owned(),
+            ));
+        }
+        (Some(kind), Some(number), None) if kind == "pr" || kind == "issue" => {
+            let url =
+                crate::tools::link_ref::resolve_number(workspace.as_deref(), &kind, number, None)
+                    .await
+                    .map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
+            (kind, url)
+        }
+        (Some(kind), Some(_), None) => {
+            return Err(error(
+                StatusCode::BAD_REQUEST,
+                if kind.is_empty() {
+                    "a bare number needs a `kind`: pick \"pr\" or \"issue\", or paste a full URL"
+                        .to_owned()
+                } else {
+                    format!("`kind` must be \"pr\" or \"issue\" for a number, not {kind:?}")
+                },
+            ));
+        }
+        // An explicit kind is honoured verbatim (the editor always sends the
+        // kind the user selected). Without one, only a recognised PR/issue
+        // path may be inferred; anything else is refused with a reason
+        // instead of being filed as a PR by default.
+        (Some(kind), None, Some(url)) => (kind, url),
+        (None, None, Some(url)) => {
+            let kind = crate::session_store::ref_kind_from_url(&url).ok_or_else(|| {
+                error(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "{url} is not a pull-request or issue URL — send `kind`: \
+                         \"pr\", \"issue\", or \"link\""
+                    ),
+                )
+            })?;
+            (kind.to_owned(), url)
+        }
+        _ => {
+            return Err(error(
+                StatusCode::BAD_REQUEST,
+                "provide `kind` + `number`, `kind` + `url`, or `url`".to_owned(),
+            ));
+        }
+    };
+    let refs = store
+        .add_ref(root, &id, &kind, &url)
+        .await
+        .map_err(|e| error(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    // The editor's add path gets the same one immediate, non-blocking
+    // observation as the tool: the chip reflects it, and it is THIS session's
+    // add-time baseline for the watcher — a later refresh never replaces it.
+    crate::link_status::prewarm(&id, &kind, &url);
+    Ok(Json(SessionLinksView {
+        supported: true,
+        refs: ref_chips(workspace.as_deref(), refs).await,
+    }))
+}
+
+#[derive(Deserialize)]
+struct LinkQuery {
+    kind: String,
+    url: String,
+}
+
+/// `DELETE /api/sessions/{id}/refs?kind=pr&url=…` — remove one exact link.
+async fn remove_session_link(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(query): Query<LinkQuery>,
+) -> Result<Json<SessionLinksView>, (StatusCode, String)> {
+    let store = session_links_store(&state, &id).await?;
+    let refs = store
+        .remove_ref(state.factory.root(), &id, &query.url)
+        .await
+        .map_err(|e| error(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    crate::link_status::forget(&id, &query.kind, &query.url);
+    let workspace = session_git_workspace(&state, live(&state, &id).ok().as_ref());
+    Ok(Json(SessionLinksView {
+        supported: true,
+        refs: ref_chips(workspace.as_deref(), refs).await,
+    }))
 }
 
 /// Cap for user-assigned session titles: longer titles are truncated
@@ -6824,6 +7145,442 @@ model = "deepseek-chat"
                 "placeholder {placeholder} leaked into GET / body"
             );
         }
+    }
+
+    /// An `AppState` whose sessions live in a SQLite database under `root`,
+    /// with the matching meta store: the refs handlers need a backend that
+    /// supports links and a session row to attach one to.
+    #[cfg(feature = "sqlite")]
+    async fn sqlite_app_state(token: &str, root: &std::path::Path) -> Arc<AppState> {
+        let factory = crate::session_factory::SessionFactory::test_factory_with_backend(
+            root.to_path_buf(),
+            crate::config::SessionBackend::Sqlite {
+                path: Some(root.join("sessions.db").display().to_string()),
+            },
+        );
+        let meta_store = SessionStore::connect_meta(factory.backend(), factory.root())
+            .await
+            .unwrap();
+        Arc::new(AppState {
+            factory,
+            registry: Arc::new(SessionRegistry::default()),
+            token: token.to_owned(),
+            meta_store,
+            summaries: Arc::new(Mutex::new(HashMap::new())),
+            summary_pending: Arc::new(SummaryPending(Mutex::new(HashSet::new()))),
+            shutdown: watch::channel(()).0,
+        })
+    }
+
+    /// Item 6: on JSONL a number POST must report the unsupported backend,
+    /// never a git-resolution failure — the backend check comes first.
+    #[tokio::test]
+    async fn refs_post_on_jsonl_reports_unsupported_before_touching_git() {
+        use tower::util::ServiceExt;
+        let temp = tempfile::tempdir().unwrap(); // deliberately NOT a git repository
+        let factory =
+            crate::session_factory::SessionFactory::test_factory(temp.path().to_path_buf());
+        let state = Arc::new(AppState {
+            factory,
+            registry: Arc::new(SessionRegistry::default()),
+            token: "sekrit".to_owned(),
+            meta_store: SessionStore::Jsonl,
+            summaries: Arc::new(Mutex::new(HashMap::new())),
+            summary_pending: Arc::new(SummaryPending(Mutex::new(HashSet::new()))),
+            shutdown: watch::channel(()).0,
+        });
+        let (id, session) = live_session("jsonl-refs");
+        state.registry.insert(id, session);
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions/jsonl-refs/refs")
+                    .method("POST")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"kind":"pr","number":25}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "this backend does not support session links",
+            "a JSONL number POST must not probe git first"
+        );
+    }
+
+    /// A link is a row keyed by (workspace, session, url), and the storage
+    /// primitive needs no `sessions` metadata row to hold one. The add
+    /// endpoint must therefore accept an id that has no live handle and no
+    /// metadata row (another client's session, a store copied to a new root):
+    /// refusing it made a link impossible to create for exactly the sessions
+    /// that never write that row, and bought nothing — the row is only ever
+    /// read back by naming the same id.
+    ///
+    /// What such a session really cannot do is resolve a bare NUMBER: with no
+    /// live handle there is no known workspace, so no `origin` may be read —
+    /// and guessing one would file the link against someone else's repo.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn refs_post_accepts_a_session_id_without_a_metadata_row() {
+        use tower::util::ServiceExt;
+        let temp = tempfile::tempdir().unwrap();
+        let state = sqlite_app_state("sekrit", temp.path()).await;
+        let store = SessionStore::connect_meta(state.factory.backend(), state.factory.root())
+            .await
+            .unwrap();
+        let app = router(state.clone());
+        let post = |id: &'static str, body: &'static str| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .uri(format!("/api/sessions/{id}/refs"))
+                        .method("POST")
+                        .header(header::AUTHORIZATION, "Bearer sekrit")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        // No live handle, no metadata row: the URL form must still store it.
+        assert!(
+            !store
+                .session_exists(state.factory.root(), "never-existed")
+                .await
+                .unwrap(),
+            "the point of this test is an id with no metadata row"
+        );
+        let response = post(
+            "never-existed",
+            r#"{"kind":"pr","url":"https://github.com/acme/widget/pull/25"}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let view: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            view["refs"][0]["url"],
+            "https://github.com/acme/widget/pull/25"
+        );
+        assert_eq!(
+            store
+                .list_refs(state.factory.root(), "never-existed")
+                .await
+                .unwrap()
+                .iter()
+                .map(|link| link.url.clone())
+                .collect::<Vec<_>>(),
+            vec!["https://github.com/acme/widget/pull/25".to_owned()],
+            "the row is readable by the same session id, with or without metadata"
+        );
+
+        // The number form is the part that needs a workspace: refused with
+        // the reason, never resolved against some other session's `origin`.
+        let response = post("never-existed", r#"{"kind":"pr","number":25}"#).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "this session's workspace is unknown — pass a full URL instead"
+        );
+        assert_eq!(
+            store
+                .list_refs(state.factory.root(), "never-existed")
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the refused number POST adds nothing"
+        );
+    }
+
+    /// Item 8 (and the inference rule): an explicit kind is honoured — Issue
+    /// + a non-issue URL stores an ISSUE — while a kind-less URL that is
+    /// neither a PR nor an issue is refused with a reason instead of being
+    /// filed as a PR.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn refs_post_honours_the_selected_kind_and_refuses_unknown_urls() {
+        use tower::util::ServiceExt;
+        let temp = tempfile::tempdir().unwrap();
+        let state = sqlite_app_state("sekrit", temp.path()).await;
+        let store = SessionStore::connect_meta(state.factory.backend(), state.factory.root())
+            .await
+            .unwrap();
+        store
+            .create_meta(
+                state.factory.root(),
+                "editor",
+                Some("m"),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let app = router(state);
+        let post = |body: &'static str| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .uri("/api/sessions/editor/refs")
+                        .method("POST")
+                        .header(header::AUTHORIZATION, "Bearer sekrit")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let response = post(r#"{"kind":"issue","url":"https://example.org/tracker/7"}"#).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let view: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            view["refs"][0]["kind"], "issue",
+            "the selected kind wins over the URL's shape"
+        );
+
+        let response = post(r#"{"url":"https://example.org/docs/x"}"#).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "https://example.org/docs/x is not a pull-request or issue URL — send `kind`: \
+             \"pr\", \"issue\", or \"link\""
+        );
+
+        // A recognised shape still infers without `kind`.
+        let response = post(r#"{"url":"https://example.org/own/repo/pull/9"}"#).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // A bare number needs a real kind.
+        let response = post(r#"{"kind":"","number":25}"#).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "a bare number needs a `kind`: pick \"pr\" or \"issue\", or paste a full URL"
+        );
+    }
+
+    /// Link status is display-only and must never take the links down with it:
+    /// a PR/issue GitHub cannot be asked about (another forge here, so the test
+    /// makes no network call) is `unknown`, a plain link has no status at all,
+    /// and both keep their rows and labels.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn refs_status_is_unknown_for_a_link_github_cannot_be_asked_about() {
+        use tower::util::ServiceExt;
+        let temp = tempfile::tempdir().unwrap();
+        let state = sqlite_app_state("sekrit", temp.path()).await;
+        let store = SessionStore::connect_meta(state.factory.backend(), state.factory.root())
+            .await
+            .unwrap();
+        store
+            .create_meta(
+                state.factory.root(),
+                "status",
+                Some("m"),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let app = router(state);
+        let call = |method: &'static str, path: &'static str, body: Option<&'static str>| {
+            let app = app.clone();
+            async move {
+                let request = Request::builder()
+                    .uri(path)
+                    .method(method)
+                    .header(header::AUTHORIZATION, "Bearer sekrit");
+                let request = match body {
+                    Some(body) => request
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body)),
+                    None => request.body(Body::empty()),
+                }
+                .unwrap();
+                app.oneshot(request).await.unwrap()
+            }
+        };
+        for body in [
+            r#"{"kind":"pr","url":"https://gitlab.com/acme/widget/pull/3"}"#,
+            r#"{"kind":"link","url":"https://example.org/docs/x"}"#,
+        ] {
+            let response = call("POST", "/api/sessions/status/refs", Some(body)).await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let response = call("GET", "/api/sessions/status/refs/status", None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let view: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(view["supported"], true);
+        assert_eq!(
+            view["statuses"]["https://gitlab.com/acme/widget/pull/3"]["state"],
+            "unknown"
+        );
+        assert_eq!(
+            view["statuses"]["https://gitlab.com/acme/widget/pull/3"]["detail"],
+            "UNKNOWN"
+        );
+        assert!(
+            view["statuses"]["https://example.org/docs/x"].is_null(),
+            "a plain link carries no status at all"
+        );
+        // A status that cannot be fetched never removes or relabels a link.
+        let response = call("GET", "/api/sessions/status/refs", None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let view: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let labels: Vec<&str> = view["refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["label"].as_str())
+            .collect();
+        assert!(labels.contains(&"gitlab.com/acme/widget#3"), "{labels:?}");
+        assert!(labels.contains(&"example.org/docs/x"), "{labels:?}");
+    }
+
+    /// The chip label: the session's OWN repository drops the `owner/repo`
+    /// prefix (`#27`), because the session's `origin` already names it.
+    /// Another repo, another host, a plain link, and an unknown origin all keep
+    /// the qualified label — "same repository" needs evidence.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn ref_chips_shorten_only_the_sessions_own_repository() {
+        let temp = tempfile::tempdir().unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["remote", "add", "origin", "git@github.com:acme/widget.git"],
+        ] {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(temp.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        let link = |kind: &str, url: &str, label: &str| crate::session_store::SessionRef {
+            kind: kind.into(),
+            url: url.into(),
+            label: label.into(),
+        };
+        let refs = vec![
+            link(
+                "pr",
+                "https://github.com/acme/widget/pull/27",
+                "acme/widget#27",
+            ),
+            link(
+                "issue",
+                "https://github.com/acme/widget/issues/22",
+                "acme/widget#22",
+            ),
+            link(
+                "pr",
+                "https://github.com/acme/other/pull/27",
+                "acme/other#27",
+            ),
+            link(
+                "pr",
+                "https://gitlab.com/acme/widget/pull/27",
+                "gitlab.com/acme/widget#27",
+            ),
+            link("link", "https://example.org/docs/x", "example.org/docs/x"),
+        ];
+        let chips = ref_chips(Some(temp.path()), refs.clone()).await;
+        assert_eq!(chips[0].short.as_deref(), Some("#27"));
+        assert_eq!(chips[1].short.as_deref(), Some("#22"));
+        assert_eq!(chips[2].short, None, "another repository keeps the prefix");
+        assert_eq!(chips[3].short, None, "another host keeps the prefix");
+        assert_eq!(chips[4].short, None, "a plain link is never shortened");
+        assert_eq!(chips[0].label, "acme/widget#27", "the full identity stays");
+        // No evidence, no shortening: an unknown workspace, or one whose
+        // `origin` is not a GitHub remote.
+        assert!(
+            ref_chips(None, refs.clone())
+                .await
+                .iter()
+                .all(|chip| chip.short.is_none())
+        );
+        let bare = tempfile::tempdir().unwrap();
+        assert!(
+            ref_chips(Some(bare.path()), refs)
+                .await
+                .iter()
+                .all(|chip| chip.short.is_none())
+        );
+    }
+
+    /// JSONL keeps no links at all, so there is nothing to ask GitHub about:
+    /// the status endpoint reports the unsupported backend instead of
+    /// pretending every link is `unknown`.
+    #[tokio::test]
+    async fn refs_status_on_jsonl_reports_unsupported() {
+        use tower::util::ServiceExt;
+        let temp = tempfile::tempdir().unwrap();
+        let factory =
+            crate::session_factory::SessionFactory::test_factory(temp.path().to_path_buf());
+        let state = Arc::new(AppState {
+            factory,
+            registry: Arc::new(SessionRegistry::default()),
+            token: "sekrit".to_owned(),
+            meta_store: SessionStore::Jsonl,
+            summaries: Arc::new(Mutex::new(HashMap::new())),
+            summary_pending: Arc::new(SummaryPending(Mutex::new(HashSet::new()))),
+            shutdown: watch::channel(()).0,
+        });
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions/jsonl-refs/refs/status")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let view: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(view["supported"], false);
+        assert_eq!(view["statuses"], serde_json::json!({}));
     }
 
     fn live_session(id: &str) -> (String, Arc<LiveSession>) {

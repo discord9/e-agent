@@ -879,6 +879,166 @@ pub(crate) struct ProjectedBackgroundTask {
     pub subagent_session_id: Option<String>,
 }
 
+/// One pull-request / issue / plain link recorded against a session in the
+/// `session_refs` row table. `label` is derived from the kind and URL for
+/// display (`owner/repo#14`, `host/owner/repo#14`, or `host/path` for a
+/// plain link) and is never stored: the URL remains the identity.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct SessionRef {
+    /// `"pr"`, `"issue"`, or `"link"`.
+    pub kind: String,
+    pub url: String,
+    pub label: String,
+}
+
+/// The one error every JSONL session-link operation returns. Kept in one
+/// place so the tool and the HTTP API phrase "unsupported" identically.
+pub(crate) const SESSION_REFS_UNSUPPORTED: &str = "this backend does not support session links";
+
+/// Validate a link kind. The table stores only these two values.
+pub(crate) fn validate_ref_kind(kind: &str) -> Result<(), String> {
+    match kind {
+        "pr" | "issue" | "link" => Ok(()),
+        other => Err(format!(
+            "unknown link kind {other:?}; expected \"pr\", \"issue\", or \"link\""
+        )),
+    }
+}
+
+/// Parse and validate a PR/issue URL. Credentials and non-http(s) URLs are
+/// refused before any row is written.
+pub(crate) fn parse_ref_url(raw: &str) -> Result<url::Url, String> {
+    let parsed =
+        url::Url::parse(raw.trim()).map_err(|_| "must be an absolute http(s) URL".to_owned())?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err("must be an absolute http(s) URL".into());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("must not carry credentials".into());
+    }
+    Ok(parsed)
+}
+
+/// Path segments of a URL, empty segments dropped.
+fn url_segments(parsed: &url::Url) -> Vec<&str> {
+    parsed
+        .path_segments()
+        .map(|segments| segments.filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default()
+}
+
+/// Host plus a non-default port (`example.com:8443`).
+fn url_host(parsed: &url::Url) -> String {
+    let host = parsed.host_str().unwrap_or_default();
+    match parsed.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_owned(),
+    }
+}
+
+/// The display label for a stored link.
+///
+/// `https://github.com/acme/widget/pull/14` → `acme/widget#14`;
+/// `https://gitlab.example.com/acme/widget/-/merge_requests/14` →
+/// `gitlab.example.com/acme/widget#14` (non-GitHub hosts keep the host so
+/// the label stays unambiguous). An unparseable shape falls back to
+/// `host/path` — never to a bare number.
+pub fn session_ref_label(raw: &str) -> String {
+    let Ok(parsed) = parse_ref_url(raw) else {
+        return raw.to_owned();
+    };
+    pr_issue_label(&parsed)
+}
+
+/// The display label for one stored link, respecting its kind. A plain
+/// `link` is always `host/path` (no `#N`); PRs and issues keep
+/// `owner/repo#N` / `host/owner/repo#N`.
+pub fn session_ref_label_for_kind(kind: &str, raw: &str) -> String {
+    let Ok(parsed) = parse_ref_url(raw) else {
+        return raw.to_owned();
+    };
+    if kind == "link" {
+        plain_link_label(&parsed)
+    } else {
+        pr_issue_label(&parsed)
+    }
+}
+
+fn plain_link_label(parsed: &url::Url) -> String {
+    let host = url_host(parsed);
+    let path = parsed.path().trim_matches('/');
+    if path.is_empty() {
+        host
+    } else {
+        format!("{host}/{path}")
+    }
+}
+
+fn pr_issue_label(parsed: &url::Url) -> String {
+    let host = url_host(parsed);
+    let segments = url_segments(parsed);
+    let marker = segments.iter().position(|segment| {
+        matches!(
+            *segment,
+            "pull" | "pulls" | "issues" | "issue" | "merge_requests" | "pull-requests"
+        )
+    });
+    if let Some(index) = marker {
+        let number = segments
+            .get(index + 1)
+            .filter(|number| !number.is_empty() && number.chars().all(|c| c.is_ascii_digit()));
+        if let Some(number) = number {
+            let mut before = &segments[..index];
+            // GitLab inserts a literal `-` before the action segment.
+            if before.last() == Some(&"-") {
+                before = &before[..before.len() - 1];
+            }
+            if before.len() >= 2 {
+                let owner = before[before.len() - 2];
+                let repo = before[before.len() - 1];
+                let base = format!("{owner}/{repo}#{number}");
+                return if host == "github.com" || host == "www.github.com" {
+                    base
+                } else {
+                    format!("{host}/{base}")
+                };
+            }
+        }
+    }
+    plain_link_label(parsed)
+}
+
+/// Infer the kind of a full-URL link from its path — but only for a
+/// COMPLETE recognised shape: `owner/repo/pull/N`, `…/pulls/N`,
+/// `…/pull-requests/N`, `…/merge_requests/N`, `…/issues/N`, `…/issue/N`
+/// (GitLab puts a `-` before the action, which does not change the marker).
+/// The number must be the URL's LAST segment and an owner/repo must precede
+/// the action, so `example.org/pull/7/manual` is a page ABOUT pull 7, not
+/// pull 7.
+///
+/// `None` means the URL is neither a pull request nor an issue: a plain docs
+/// URL is NOT a pull request, so the caller requires an explicit `kind`
+/// (`link` for plain) instead of filing it as a PR by default.
+pub(crate) fn ref_kind_from_url(raw: &str) -> Option<&'static str> {
+    let parsed = parse_ref_url(raw).ok()?;
+    let segments = url_segments(&parsed);
+    let (number, before_number) = segments.split_last()?;
+    if number.is_empty() || !number.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let (action, owner_repo) = before_number.split_last()?;
+    // GitLab inserts a literal `-` before the action segment.
+    let owner_repo = owner_repo.strip_suffix(&["-"]).unwrap_or(owner_repo);
+    if owner_repo.len() < 2 {
+        return None;
+    }
+    Some(match *action {
+        "issues" | "issue" => "issue",
+        "pull" | "pulls" | "pull-requests" | "merge_requests" => "pr",
+        _ => return None,
+    })
+}
+
 #[derive(Clone)]
 pub enum SessionStore {
     /// Default file-based JSONL backend. Stateless — delegates to
@@ -3390,6 +3550,29 @@ impl SessionStore {
         }
     }
 
+    /// Whether one session has a metadata row. This is a query, not an
+    /// authorization gate: session links are keyed rows and never needed one
+    /// (`add_ref` works for a session id with no metadata at all).
+    pub async fn session_exists(&self, root: &Path, session: &str) -> Result<bool> {
+        Ok(match self {
+            SessionStore::Jsonl => jsonl_list_meta(root)?
+                .iter()
+                .any(|meta| meta.session_id == session),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session: db, .. } => {
+                db.load_meta_row(session).await?.is_some()
+            }
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite { session: db, .. } => db
+                .lock()
+                .await
+                .load_meta_row(session)
+                .await
+                .map_err(anyhow::Error::msg)?
+                .is_some(),
+        })
+    }
+
     /// Find child sessions using each session's latest metadata snapshot.
     /// Greptime uses a targeted workspace-scoped query; other backends keep
     /// their existing list-and-filter behavior.
@@ -4104,6 +4287,110 @@ impl SessionStore {
                 .map_err(anyhow::Error::msg)
                 .map(Some),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Session links (`session_refs` row table)
+    // ------------------------------------------------------------------
+    //
+    // PR/issue links are ordinary rows keyed by (workspace, session, kind,
+    // url) — NOT session metadata: adding or removing one never touches the
+    // `sessions` snapshot log. JSONL has no table, so it reports the
+    // unsupported error instead of pretending the list is empty.
+
+    /// Whether this backend can store session links at all.
+    pub fn supports_session_refs(&self) -> bool {
+        !matches!(self, SessionStore::Jsonl)
+    }
+
+    /// Every link for one session, in the backend's stable link order
+    /// (SQLite: insertion order; Greptime: key order, because its time index
+    /// is derived from the key so an exact re-add stays one row).
+    pub async fn list_refs(&self, _root: &Path, session: &str) -> Result<Vec<SessionRef>> {
+        let rows = match self {
+            SessionStore::Jsonl => anyhow::bail!(SESSION_REFS_UNSUPPORTED),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session: db, .. } => db.session_refs(session).await?,
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite { session: db, .. } => db
+                .lock()
+                .await
+                .session_refs(session)
+                .await
+                .map_err(anyhow::Error::msg)?,
+        };
+        Ok(rows
+            .into_iter()
+            .map(|(kind, url)| SessionRef {
+                label: session_ref_label_for_kind(&kind, &url),
+                kind,
+                url,
+            })
+            .collect())
+    }
+
+    /// Insert one link and return the session's list in stored order. Adding
+    /// an exact duplicate is a no-op on every backend that claims support
+    /// (SQLite `INSERT OR IGNORE` on the row key; Greptime's time index is
+    /// derived from the key, so the same insert lands on the same row).
+    pub async fn add_ref(
+        &self,
+        root: &Path,
+        session: &str,
+        kind: &str,
+        url: &str,
+    ) -> Result<Vec<SessionRef>> {
+        if !self.supports_session_refs() {
+            anyhow::bail!(SESSION_REFS_UNSUPPORTED);
+        }
+        validate_ref_kind(kind).map_err(anyhow::Error::msg)?;
+        let url = parse_ref_url(url).map_err(anyhow::Error::msg)?.to_string();
+        match self {
+            SessionStore::Jsonl => unreachable!("checked above"),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session: db, .. } => {
+                db.add_session_ref(session, kind, &url).await?
+            }
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite { session: db, .. } => db
+                .lock()
+                .await
+                .add_session_ref(session, kind, &url)
+                .await
+                .map_err(anyhow::Error::msg)?,
+        }
+        self.list_refs(root, session).await
+    }
+
+    /// Remove one link by its URL and return the remaining list. The URL
+    /// alone is the identity — `kind` is an attribute, never part of the key —
+    /// so an unlink never has to infer (or be told) which list a URL is in.
+    /// Removing an absent link is a no-op.
+    pub async fn remove_ref(
+        &self,
+        root: &Path,
+        session: &str,
+        url: &str,
+    ) -> Result<Vec<SessionRef>> {
+        if !self.supports_session_refs() {
+            anyhow::bail!(SESSION_REFS_UNSUPPORTED);
+        }
+        let url = parse_ref_url(url).map_err(anyhow::Error::msg)?.to_string();
+        match self {
+            SessionStore::Jsonl => unreachable!("checked above"),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session: db, .. } => {
+                db.remove_session_ref(session, &url).await?
+            }
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite { session: db, .. } => db
+                .lock()
+                .await
+                .remove_session_ref(session, &url)
+                .await
+                .map_err(anyhow::Error::msg)?,
+        }
+        self.list_refs(root, session).await
     }
 }
 
@@ -5179,6 +5466,113 @@ mod shared_helpers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_ref_labels_identify_the_repository() {
+        assert_eq!(
+            session_ref_label("https://github.com/discord9/e-agent/pull/25"),
+            "discord9/e-agent#25"
+        );
+        assert_eq!(
+            session_ref_label("https://github.com/discord9/e-agent/issues/22"),
+            "discord9/e-agent#22"
+        );
+        assert_eq!(
+            session_ref_label("https://gitlab.com/group/project/-/merge_requests/7"),
+            "gitlab.com/group/project#7"
+        );
+        assert_eq!(
+            session_ref_label("https://git.example.com/group/project/pull/3"),
+            "git.example.com/group/project#3"
+        );
+        // Unparseable shapes fall back to host/path, never a bare number.
+        assert_eq!(
+            session_ref_label("https://github.com/discord9/e-agent/compare/main...dev"),
+            "github.com/discord9/e-agent/compare/main...dev"
+        );
+        // A plain link is always host/path, even when its path contains a
+        // PR-shaped segment.
+        assert_eq!(
+            session_ref_label_for_kind("link", "https://example.com/docs/issues/9"),
+            "example.com/docs/issues/9"
+        );
+        assert_eq!(
+            session_ref_label_for_kind("link", "https://example.com/docs/x"),
+            "example.com/docs/x"
+        );
+        assert_eq!(
+            session_ref_label_for_kind("pr", "https://github.com/discord9/e-agent/pull/25"),
+            "discord9/e-agent#25"
+        );
+    }
+
+    #[test]
+    fn ref_urls_refuse_unsafe_shapes() {
+        assert_eq!(
+            parse_ref_url("ftp://github.com/a/b/pull/1").unwrap_err(),
+            "must be an absolute http(s) URL"
+        );
+        assert_eq!(
+            parse_ref_url("not a url").unwrap_err(),
+            "must be an absolute http(s) URL"
+        );
+        assert_eq!(
+            parse_ref_url("https://user:secret@github.com/a/b/pull/1").unwrap_err(),
+            "must not carry credentials"
+        );
+    }
+
+    #[test]
+    fn link_is_a_valid_kind() {
+        assert!(validate_ref_kind("link").is_ok());
+        assert!(validate_ref_kind("commit").is_err());
+    }
+
+    #[test]
+    fn ref_kind_comes_from_a_recognised_url_path() {
+        assert_eq!(
+            ref_kind_from_url("https://github.com/a/b/pull/1"),
+            Some("pr")
+        );
+        assert_eq!(
+            ref_kind_from_url("https://github.com/a/b/issues/2"),
+            Some("issue")
+        );
+        assert_eq!(
+            ref_kind_from_url("https://gitlab.com/a/b/-/issues/2"),
+            Some("issue")
+        );
+        assert_eq!(
+            ref_kind_from_url("https://gitlab.com/a/b/-/merge_requests/2"),
+            Some("pr")
+        );
+        // Not a PR/issue shape: no kind is invented, the caller must ask for
+        // one (a docs URL is not a pull request).
+        for unknown in [
+            "https://example.com/docs/x",
+            "https://github.com/a/b/compare/main...dev",
+            "https://example.com/docs/issues",
+            "https://example.com/docs/pull/not-a-number",
+            // The number must be the URL's LAST segment, under an
+            // owner/repo path: this page is ABOUT pull 7, it is not pull 7.
+            "https://example.org/pull/7/manual",
+            "https://example.org/pull/7",
+            "https://github.com/pull/7",
+            "https://example.org/a/b/pull/7/files",
+            "not a url",
+        ] {
+            assert_eq!(ref_kind_from_url(unknown), None, "{unknown}");
+        }
+        // A trailing slash or a query is not a different shape.
+        assert_eq!(
+            ref_kind_from_url("https://github.com/a/b/pull/7/"),
+            Some("pr")
+        );
+        assert_eq!(
+            ref_kind_from_url("https://github.com/a/b/pull/7#discussion_r1"),
+            Some("pr")
+        );
+    }
 
     /// JSONL `load_older` pages by ABSOLUTE position (there is no seq
     /// column): `before_seq` is the 0-based file position, the returned

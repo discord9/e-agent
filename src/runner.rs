@@ -2,9 +2,9 @@
 
 use crate::{
     agent::{
-        Agent, AgentEvent, BACKGROUND_REMINDER, CompactionOutput, GoalStatus, ImagePart, Message,
-        Model, POLL_GUARD_TERMINATION_NOTICE, RoundOutput, SessionEntry, ToolCall, ToolOutput,
-        ToolSpec, is_poll_guard_terminate, tool_error_content,
+        Agent, AgentEvent, BACKGROUND_REMINDER, CancellationSource, CompactionOutput, GoalStatus,
+        ImagePart, Message, Model, POLL_GUARD_TERMINATION_NOTICE, RoundOutput, SessionEntry,
+        ToolCall, ToolOutput, ToolSpec, is_poll_guard_terminate, tool_error_content,
     },
     model::{ImageRejection, image_rejection},
     session_store::{LocatedKey, SessionStore},
@@ -1494,8 +1494,21 @@ pub struct SessionRunner {
     agent: Agent,
     store: SessionStore,
     root: PathBuf,
+    /// The directory Git is read from for session links. It defaults to
+    /// `root` (a main session stores and works in the same workspace), but a
+    /// delegate's transcript/rows live under the parent's persistence root
+    /// while it works in its own workspace — and only THAT workspace's
+    /// `origin` may be resolved for a bare PR/issue number.
+    link_workspace: PathBuf,
     session: String,
     shared: Arc<Mutex<Shared>>,
+    /// The PR watcher's background-registry id. It is aborted when this
+    /// runner goes away, so the watcher never outlives its session.
+    ref_watch: Option<u64>,
+    #[cfg(test)]
+    ref_watch_interval: Option<std::time::Duration>,
+    #[cfg(test)]
+    ref_watch_program: Option<String>,
     background: Option<crate::tools::BackgroundTasks>,
     projected_background: Option<Vec<crate::session_store::ProjectedBackgroundTask>>,
     bootstrap_projection_pending: bool,
@@ -1539,6 +1552,12 @@ pub struct SessionRunner {
 impl Drop for SessionRunner {
     fn drop(&mut self) {
         self.shared.lock().unwrap().commands_open = false;
+        // The PR watcher is a registry task, and the registry outlives one
+        // session (it is shared by the whole process). Its lifecycle is tied
+        // here: whatever ends the runner also ends the watcher.
+        if let (Some(background), Some(id)) = (self.background.as_ref(), self.ref_watch.take()) {
+            background.cancel_with_source(id, CancellationSource::System);
+        }
     }
 }
 
@@ -1608,6 +1627,14 @@ fn respond_web_attach_locked(shared: &Shared, reply: oneshot::Sender<WebAttach>)
 }
 
 impl SessionRunner {
+    /// Bind the workspace Git is read from for session links (see
+    /// [`Self::link_workspace`]). Only a delegate — whose persistence root is
+    /// not where it works — needs to call this.
+    pub(crate) fn with_link_workspace(mut self, workspace: PathBuf) -> Self {
+        self.link_workspace = workspace;
+        self
+    }
+
     pub(crate) fn with_background_tasks(
         mut self,
         background: crate::tools::BackgroundTasks,
@@ -1625,6 +1652,35 @@ impl SessionRunner {
     /// waiting for an answer nobody can give.
     pub(crate) fn with_user_input_allowed(self) -> Self {
         self.shared.lock().unwrap().user_input_allowed = true;
+        self
+    }
+
+    /// Test-only cadence/executable seams for the PR watcher: production
+    /// uses five minutes and `gh`.
+    #[cfg(test)]
+    pub(crate) fn with_ref_watch_interval(mut self, interval: std::time::Duration) -> Self {
+        self.ref_watch_interval = Some(interval);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_ref_watch_program(mut self, program: String) -> Self {
+        self.ref_watch_program = Some(program);
+        self
+    }
+
+    /// Start the PR/issue watcher for this session. Only the root/main
+    /// session construction calls it, next to the link tools it pairs with:
+    /// a watcher turns an observed change on a linked PR into an automatic
+    /// model turn, which is the main session's job. Delegate, btw and fork
+    /// runners are built by `delegate` and never call this, so a child is
+    /// structurally incapable of subscribing — there is no role check to
+    /// repeat, and no default to turn off.
+    ///
+    /// It starts HERE rather than in [`Self::start`] so the opt-in lives in
+    /// one place: `start` knows nothing about links.
+    pub(crate) fn with_ref_watch(mut self) -> Self {
+        self.start_ref_watch();
         self
     }
 
@@ -1784,9 +1840,15 @@ impl SessionRunner {
             Self {
                 agent,
                 store,
+                link_workspace: root.clone(),
                 root,
                 session,
                 shared,
+                ref_watch: None,
+                #[cfg(test)]
+                ref_watch_interval: None,
+                #[cfg(test)]
+                ref_watch_program: None,
                 background: None,
                 projected_background: None,
                 bootstrap_projection_pending: true,
@@ -1875,6 +1937,46 @@ impl SessionRunner {
             }
         }
         Ok(())
+    }
+
+    /// Tie one PR/issue watcher to this live runner. It is a normal
+    /// background-registry task with no completion event of its own: every
+    /// change it observes becomes one `AgentEvent::Notice` on this session's
+    /// existing background channel. Called from [`Self::with_ref_watch`] only
+    /// — never from a constructor, and never from `start`.
+    fn start_ref_watch(&mut self) {
+        let Some(background) = self.background.clone() else {
+            return;
+        };
+        if !self.store.supports_session_refs() {
+            return;
+        }
+        #[cfg(test)]
+        let interval = self
+            .ref_watch_interval
+            .unwrap_or(crate::ref_watch::POLL_INTERVAL);
+        #[cfg(not(test))]
+        let interval = crate::ref_watch::POLL_INTERVAL;
+        #[cfg(test)]
+        let program = self
+            .ref_watch_program
+            .clone()
+            .unwrap_or_else(|| "gh".to_owned());
+        #[cfg(not(test))]
+        let program = "gh".to_owned();
+        let sender = self.agent.background_sender();
+        match crate::ref_watch::spawn(
+            &background,
+            self.store.clone(),
+            self.root.clone(),
+            self.session.clone(),
+            interval,
+            program,
+            move |text| sender.send(AgentEvent::Notice(text)).is_ok(),
+        ) {
+            Ok(id) => self.ref_watch = Some(id),
+            Err(error) => tracing::warn!("cannot start PR watcher: {error}"),
+        }
     }
 
     pub fn start(mut self, initial_prompt: Option<String>) -> SessionTask {
@@ -4227,33 +4329,63 @@ impl SessionRunner {
                         continue;
                     }
                     self.prepare_web_attach();
-                    let waited = if call.name == "history" || call.name == "read_output" {
+                    let waited = if matches!(
+                        call.name.as_str(),
+                        "history" | "read_output" | "link_ref" | "unlink_ref" | "list_refs"
+                    ) {
                         #[cfg(test)]
                         if let Some(hook) = self.before_read_only_tool.take() {
                             hook();
                         }
-                        // These runner-bound, read-only tools still use the
-                        // normal operation wait so attach/cancel remain live.
+                        // These runner-bound tools still use the normal
+                        // operation wait so attach/cancel remain live.
                         // Own the binding in the future to avoid borrowing the
                         // runner while its command receiver is mutably borrowed.
                         let store = self.store.clone();
                         let root = self.root.clone();
+                        let link_workspace = self.link_workspace.clone();
                         let session = self.session.clone();
+                        // These tools are intercepted BY NAME, so the name
+                        // alone would let a provider dispatch one this session
+                        // never registered — a read-only session has no
+                        // `link_ref` schema, but a call naming it must not
+                        // mutate anything either. The registry is the same
+                        // authority `execute_on` uses for every other tool.
+                        let registered = self.agent.tool_names();
                         let call = &call;
                         let mut operation = Box::pin(async move {
+                            if !registered.iter().any(|name| name == &call.name) {
+                                return Err(format!("unknown tool: {}", call.name));
+                            }
                             let arguments: serde_json::Value =
                                 serde_json::from_str(&call.arguments)
                                     .map_err(|error| format!("invalid JSON arguments: {error}"))?;
-                            let text = if call.name == "history" {
-                                crate::tools::history::execute(&store, &root, &session, &arguments)
+                            let text = match call.name.as_str() {
+                                "history" => {
+                                    crate::tools::history::execute(
+                                        &store, &root, &session, &arguments,
+                                    )
                                     .await?
-                            } else {
-                                let (reference, offset, limit) =
-                                    crate::tools::output::parse_arguments(&arguments)?;
-                                crate::tools::output::execute(
-                                    &store, &root, &session, &reference, offset, limit,
-                                )
-                                .await?
+                                }
+                                "link_ref" | "unlink_ref" | "list_refs" => {
+                                    crate::tools::link_ref::execute(
+                                        &call.name,
+                                        &store,
+                                        &root,
+                                        Some(&link_workspace),
+                                        &session,
+                                        &arguments,
+                                    )
+                                    .await?
+                                }
+                                _ => {
+                                    let (reference, offset, limit) =
+                                        crate::tools::output::parse_arguments(&arguments)?;
+                                    crate::tools::output::execute(
+                                        &store, &root, &session, &reference, offset, limit,
+                                    )
+                                    .await?
+                                }
                             };
                             Ok::<ToolOutput, String>(ToolOutput::text(text))
                         });

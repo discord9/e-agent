@@ -576,6 +576,56 @@ async fn capturing_model() -> (String, Arc<Mutex<Vec<u8>>>) {
     (format!("http://{address}"), captured)
 }
 
+/// Like [`capturing_model`], and it also snapshots how many tasks the shared
+/// background registry held at the instant the request arrived: the child
+/// session is alive then, so its own watcher (if it had one) is registered.
+async fn capturing_model_with_registry(
+    background: crate::tools::BackgroundTasks,
+) -> (String, Arc<Mutex<Vec<u8>>>, Arc<Mutex<usize>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let running = Arc::new(Mutex::new(0));
+    let captured_clone = captured.clone();
+    let running_clone = running.clone();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let header_end = loop {
+            let mut chunk = [0; 1024];
+            let count = stream.read(&mut chunk).await.unwrap();
+            request.extend_from_slice(&chunk[..count]);
+            if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                break end + 4;
+            }
+        };
+        let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap();
+        let received_body = request.len() - header_end;
+        let mut rest = vec![0; content_length - received_body];
+        stream.read_exact(&mut rest).await.unwrap();
+        request.extend_from_slice(&rest);
+        *running_clone.lock().unwrap() = background.all_running_ids().len();
+        *captured_clone.lock().unwrap() = request;
+
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+            .to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+    });
+    (format!("http://{address}"), captured, running)
+}
+
 /// A provider that accepts connections but never answers: the subagent's
 /// first model call blocks forever, so an abort deterministically lands on
 /// a live child runner.
@@ -1509,6 +1559,79 @@ async fn canonical_role_wins_for_delegate_prompt_and_attributes() {
     assert!(request.contains("This role is read-only"), "{request}");
 
     unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+}
+
+/// Session links are MAIN-AGENT ONLY. A writable subagent used to be built
+/// from the common builtins, which registered `link_ref`/`unlink_ref`/
+/// `list_refs`, and `SessionRunner::start` started a PR watcher for it:
+/// linking a pull request in a child then produced automatic turns in a
+/// session that exists for one delegated task.
+///
+/// This drives the real spawn path, on a store backend that CAN hold links,
+/// and records two facts at the child's own first request: the tools it was
+/// offered, and how many background tasks the shared registry held while it
+/// was alive (one: the delegate wrapper — never a watcher).
+#[tokio::test]
+async fn a_subagent_gets_neither_the_link_verbs_nor_a_watcher() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(temp.path()).unwrap();
+    // ONE registry: the parent's, handed to the child runner exactly like
+    // `Delegate::execute` does — so the probe sees what the child really
+    // registered there.
+    let (_, background) = builtins(workspace.clone(), SandboxPolicy::fixed(None), false, None);
+    let (url, captured, running) = capturing_model_with_registry(background.clone()).await;
+    let model = ConfiguredModel::chat(
+        crate::model::OpenAiModel::new(url, "test-key".into(), "test-model".into(), None)
+            .expect("a test model"),
+    );
+    let mut tool = Delegate::new(model, workspace, background.clone())
+        // SQLite: this backend CAN store links, so their absence below is the
+        // construction path talking, not a missing capability.
+        .persist_sessions(temp.path().to_path_buf())
+        .with_persist_store(crate::config::SessionBackend::Sqlite { path: None });
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    tool.set_event_sender(sender);
+    tool.execute(json!({
+        "task": "audit",
+        "workspace": temp.path().to_str().unwrap()
+    }))
+    .await
+    .expect("the delegate spawns a background task");
+    assert!(await_completion(&mut receiver).await.contains("done"));
+
+    let request = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+    let body = request
+        .split_once("\r\n\r\n")
+        .expect("a complete HTTP request")
+        .1;
+    let body: serde_json::Value = serde_json::from_str(body).expect("a JSON chat request");
+    // OpenAI's wire shape wraps each schema: {"type":"function","function":{…}}.
+    let names: Vec<&str> = body["tools"]
+        .as_array()
+        .expect("the request carries a tools array")
+        .iter()
+        .filter_map(|tool| {
+            tool["function"]["name"]
+                .as_str()
+                .or_else(|| tool["name"].as_str())
+        })
+        .collect();
+    assert!(
+        names.contains(&"bash"),
+        "the child really was a writable subagent: {names:?}"
+    );
+    for link in ["link_ref", "unlink_ref", "list_refs"] {
+        assert!(
+            !names.contains(&link),
+            "a subagent must never be offered `{link}`: {names:?}"
+        );
+    }
+    assert_eq!(
+        *running.lock().unwrap(),
+        1,
+        "while the child lived the registry held only the delegate wrapper — \
+         a `PR watch` task there means the child could start its own turns"
+    );
 }
 
 #[tokio::test]

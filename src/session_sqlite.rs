@@ -83,6 +83,57 @@ CREATE TABLE IF NOT EXISTS running_tasks (
 )
 "#;
 
+/// DDL for the session PR/issue link table. Idempotent. One row per
+/// (workspace, session, normalised url): the URL ALONE is the identity, and
+/// `kind` is an attribute of that URL — linking the same URL once as a plain
+/// `link` and once as a `pr` is one link, and an unlink by URL needs no kind.
+/// `created_at_us` orders the chips oldest-first; a re-add keeps its original
+/// position. This is a separate row table on purpose: links are not
+/// session metadata, so writes never touch the `sessions` snapshot log.
+const CREATE_TABLE_SESSION_REFS: &str = r#"
+CREATE TABLE IF NOT EXISTS session_refs (
+    workspace_id TEXT NOT NULL,
+    session_id   TEXT NOT NULL,
+    url          TEXT NOT NULL,
+    kind         TEXT NOT NULL,
+    created_at_us INTEGER NOT NULL,
+    PRIMARY KEY (workspace_id, session_id, url)
+)
+"#;
+
+/// The session_refs URL-identity rebuild, in order, as ONE unit: each
+/// statement is only correct together with the others. An interrupted run
+/// that kept the rename would leave every link in
+/// `session_refs_legacy_kind`, and the next `connect` — which creates the
+/// new-key table before it probes it — would find the right schema, skip the
+/// migration, and strand those links forever. See
+/// [`rebuild_session_refs_url_identity`].
+const MIGRATE_SESSION_REFS_URL_IDENTITY: [&str; 4] = [
+    "ALTER TABLE session_refs RENAME TO session_refs_legacy_kind",
+    CREATE_TABLE_SESSION_REFS,
+    "INSERT OR REPLACE INTO session_refs \
+     (workspace_id, session_id, url, kind, created_at_us) \
+     SELECT workspace_id, session_id, url, kind, created_at_us \
+     FROM session_refs_legacy_kind ORDER BY created_at_us ASC",
+    "DROP TABLE session_refs_legacy_kind",
+];
+
+// Test seam: the statement index after which
+// `rebuild_session_refs_url_identity` behaves as if the process died there, so
+// a test can prove an interrupted migration strands nothing. Thread-local so
+// parallel tests on other connections are unaffected.
+#[cfg(test)]
+thread_local! {
+    static MIGRATION_INTERRUPT_AFTER: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Set (or clear) the interruption point for THIS thread's next connect.
+#[cfg(test)]
+pub(crate) fn interrupt_refs_migration_after(statement: Option<usize>) {
+    MIGRATION_INTERRUPT_AFTER.with(|after| after.set(statement));
+}
+
 /// DDL for the sessions metadata table. Idempotent.
 ///
 /// Semantics: an append-only lifecycle AUDIT log, not a one-row-per-session
@@ -244,6 +295,58 @@ fn ensure_db_parent_dir(db_path: &str) -> Result<(), String> {
     }
 }
 
+/// Rebuild `session_refs` under the URL identity in ONE transaction.
+///
+/// The statements rename the legacy (kind-keyed) table away, create the
+/// URL-keyed one, copy every row across and drop the old table. Run
+/// separately, a crash between two of them is indistinguishable from success
+/// on the next start: the schema probe sees a URL-keyed `session_refs` and
+/// never looks for the leftover legacy table, so a rename-without-copy
+/// silently loses every link in the database. In one transaction those
+/// intermediate states are unobservable — a failure rolls the rebuild back,
+/// leaving the legacy table intact, and a process death leaves the write
+/// lock's transaction to SQLite's own recovery, which discards it the same
+/// way. The next `connect` then retries the whole rebuild from the top.
+async fn rebuild_session_refs_url_identity(conn: &mut turso::Connection) -> Result<(), String> {
+    // BEGIN IMMEDIATE, like `append_located`: reserve the write lock before
+    // the probe-and-copy window instead of upgrading a read snapshot in the
+    // middle of it.
+    let tx = conn
+        .transaction_with_behavior(turso::transaction::TransactionBehavior::Immediate)
+        .await
+        .map_err(|e| format!("cannot begin session_refs migration: {e}"))?;
+    let outcome: Result<(), String> = async {
+        for (index, sql) in MIGRATE_SESSION_REFS_URL_IDENTITY.iter().enumerate() {
+            tx.execute(sql, ())
+                .await
+                .map_err(|e| format!("cannot migrate session_refs to URL identity: {e}"))?;
+            #[cfg(not(test))]
+            let _ = index;
+            #[cfg(test)]
+            if MIGRATION_INTERRUPT_AFTER.with(std::cell::Cell::get) == Some(index) {
+                // Stand-in for the process dying here: the loop stops, no
+                // COMMIT is issued, and unwinding drops the connection.
+                panic!("simulated process death after session_refs migration statement {index}");
+            }
+        }
+        Ok(())
+    }
+    .await;
+    match outcome {
+        Ok(()) => tx
+            .commit()
+            .await
+            .map_err(|e| format!("cannot commit session_refs migration: {e}")),
+        Err(error) => {
+            // Explicit rollback: turso's Transaction drop defers the ROLLBACK
+            // to the connection's next operation, which would leave the write
+            // lock held across the error return.
+            let _ = tx.rollback().await;
+            Err(error)
+        }
+    }
+}
+
 impl SqliteSession {
     /// Connect to the SQLite/turso database file and ensure the tables
     /// exist. `db_path` is a path to a SQLite-compatible database file
@@ -266,7 +369,7 @@ impl SqliteSession {
             .build()
             .await
             .map_err(|e| format!("cannot open SQLite database '{db_path}': {e}"))?;
-        let conn = db
+        let mut conn = db
             .connect()
             .map_err(|e| format!("cannot connect to SQLite database '{db_path}': {e}"))?;
 
@@ -296,12 +399,53 @@ impl SqliteSession {
         conn.execute(CREATE_TABLE_RUNNING_TASKS, ())
             .await
             .map_err(|e| format!("cannot create running_tasks table: {e}"))?;
+        conn.execute(CREATE_TABLE_SESSION_REFS, ())
+            .await
+            .map_err(|e| format!("cannot create session_refs table: {e}"))?;
         conn.execute(CREATE_TABLE_SESSIONS, ())
             .await
             .map_err(|e| format!("cannot create sessions table: {e}"))?;
         conn.execute(CREATE_TABLE_USAGE, ())
             .await
             .map_err(|e| format!("cannot create usage_entries table: {e}"))?;
+
+        // The URL is the link identity now. Databases created before that
+        // change still key session_refs by (workspace, session, kind, url);
+        // `CREATE TABLE IF NOT EXISTS` cannot change a primary key, so probe
+        // and rebuild once. The rebuild is ONE transaction, so an
+        // interruption cannot leave the links in the legacy table where
+        // nothing would ever read them again.
+        {
+            let mut rows = conn
+                .query("PRAGMA table_info(session_refs)", ())
+                .await
+                .map_err(|e| format!("cannot inspect session_refs table schema: {e}"))?;
+            let mut kind_is_key = false;
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| format!("cannot inspect session_refs table schema: {e}"))?
+            {
+                let name = row
+                    .get_value(1)
+                    .map_err(|e| format!("cannot inspect session_refs table schema: {e}"))?
+                    .as_text()
+                    .cloned()
+                    .unwrap_or_default();
+                let pk = row
+                    .get_value(5)
+                    .map_err(|e| format!("cannot inspect session_refs table schema: {e}"))?
+                    .as_integer()
+                    .copied()
+                    .unwrap_or(0);
+                if name == "kind" && pk > 0 {
+                    kind_is_key = true;
+                }
+            }
+            if kind_is_key {
+                rebuild_session_refs_url_identity(&mut conn).await?;
+            }
+        }
 
         // Idempotent schema migration for the `title`, `pinned`,
         // `archived` and `writer` columns — a table-structure evolution:
@@ -2289,8 +2433,12 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
 
     /// Latest metadata snapshot for one session, or `None` when the
     /// session has no row yet (brand-new session, or a subagent whose
-    /// parent has not written its row yet).
-    async fn load_meta_row(&self, session_id: &str) -> Result<Option<SessionMeta>, String> {
+    /// parent has not written its row yet). Also the existence check the
+    /// session-link write path uses.
+    pub(crate) async fn load_meta_row(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionMeta>, String> {
         let columns = if self.acp_available {
             META_COLUMNS
         } else {
@@ -3022,6 +3170,90 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
         )
         .await
         .map_err(|e| format!("cannot clear background task: {e}"))?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Session links (`session_refs` row table)
+    // ------------------------------------------------------------------
+    //
+    // Links are keyed by the session id passed explicitly (a workspace-
+    // scoped `meta_store` can serve historical sessions the same way).
+
+    /// Every (kind, url) link for one session, oldest first.
+    pub async fn session_refs(&self, session_id: &str) -> Result<Vec<(String, String)>, String> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT kind, url FROM session_refs \
+                 WHERE workspace_id = ?1 AND session_id = ?2 \
+                 ORDER BY created_at_us, url",
+                (self.workspace_id.as_str(), session_id),
+            )
+            .await
+            .map_err(|e| format!("cannot load session links: {e}"))?;
+        let mut links = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| format!("cannot load session links: {e}"))?
+        {
+            let kind = row
+                .get_value(0)
+                .map_err(|e| format!("cannot load session links: {e}"))?
+                .as_text()
+                .cloned()
+                .unwrap_or_default();
+            let url = row
+                .get_value(1)
+                .map_err(|e| format!("cannot load session links: {e}"))?
+                .as_text()
+                .cloned()
+                .unwrap_or_default();
+            links.push((kind, url));
+        }
+        Ok(links)
+    }
+
+    /// Insert one link. The URL is the identity: re-adding it keeps the same
+    /// row and its original `created_at_us` (hence its position) and only
+    /// re-states its `kind` attribute.
+    pub async fn add_session_ref(
+        &self,
+        session_id: &str,
+        kind: &str,
+        url: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO session_refs \
+             (workspace_id, session_id, url, kind, created_at_us) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT (workspace_id, session_id, url) DO UPDATE SET kind = excluded.kind",
+            (
+                self.workspace_id.as_str(),
+                session_id,
+                url,
+                kind,
+                next_event_time_us(),
+            ),
+        )
+        .await
+        .map_err(|e| format!("cannot record session link: {e}"))?;
+        Ok(())
+    }
+
+    /// Delete one link by URL. `kind` is an attribute, so it is not part of
+    /// the identity an unlink has to know. Absent rows are a no-op.
+    pub async fn remove_session_ref(&self, session_id: &str, url: &str) -> Result<(), String> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "DELETE FROM session_refs \
+             WHERE workspace_id = ?1 AND session_id = ?2 AND url = ?3",
+            (self.workspace_id.as_str(), session_id, url),
+        )
+        .await
+        .map_err(|e| format!("cannot remove session link: {e}"))?;
         Ok(())
     }
 

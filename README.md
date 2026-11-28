@@ -371,6 +371,98 @@ The `/api` surface (JSON except for the SSE endpoint):
 | GET | `/api/tasks` | running background tasks, all sessions |
 | DELETE | `/api/sessions/{id}/tasks/{task_id}` | cancel one background task |
 | GET | `/api/sessions/{id}/tasks/{task_id}/output` | full output of a running bash task |
+| GET | `/api/sessions/{id}/refs/status` | per-link chip state + one-line detail, `gh`-backed, 60-second memory cache |
+
+### Session links
+
+A session can hold pull-request, issue, and plain links (`link_ref`,
+`list_refs`, `unlink_ref`; SQLite/Greptime backends only, and MAIN SESSION ONLY
+— a subagent is offered none of the three and never watches anything, because
+it exists to finish one delegated task and must not start turns of its own). In
+the web UI each link is a chip: the label stays the full identity
+(`owner/repo#27`), shortened to `#27` when the link lives in the session's own
+repository — that session's
+`origin` already names it — and the chip carries at most one small state dot:
+
+| Dot | Meaning |
+|-----|---------|
+| green | ready: open, merge clean, every check settled and green (or no checks), no changes requested |
+| blue | approved but not green yet, or simply open and in flight |
+| orange | needs you: a merge conflict, a failing check, or a review requesting changes |
+| grey | draft |
+| purple | merged |
+| dark red | closed without merging |
+| muted ring | the lookup was attempted and failed (`unknown`) |
+| *(none)* | never observed, or a plain link; nothing was looked up |
+
+Blockers win: conflict or failing check, then changes requested, then draft,
+then merged/closed, then approved, then ready. Hovering or focusing a chip
+opens a real popover (a native `title` tooltip cannot hold links): the PR/issue
+title, the state line `state · merge · review · checks · head`, and clickable
+new-tab links to the PR/issue, the checks/actions page, the head commit, and
+the review/files page. A plain link's popover contains just the link. Escape
+closes it; moving away closes after a short grace so the pointer can travel
+into it; focusing the chip and tabbing enters its links. The expanded editor
+row is the same clickable link. A plain link has no dot and no status.
+
+Statuses are read from the `gh` CLI, cached in memory for 60 seconds per
+(repo, number), and never written to the session store. They are read when a
+frontend opens a session's links, when a link is added (one immediate,
+non-blocking fetch), and when the user explicitly retries one link or refreshes
+all links in the header. A failed observation is `unknown` (muted ring); a link
+this process never observed has no dot at all. The dot is not a button — the
+chip's click still opens the link. A failed link's popover offers `重试`, a
+never-observed one offers `查询状态`, and the header's `↻` refreshes every link
+of the session, all without starting a model turn. A plain link has no status.
+
+The tools (`list_refs`, `link_ref`, `unlink_ref`) report a `status` token only
+when the in-memory cache already holds an observation: a cache miss omits the
+field (no placeholder, no `gh` call from the tool), a failed observation is
+`"unknown"`, and a successful one is the chip token. A plain link never has a
+status field.
+
+#### PR/issue watcher
+
+While a session is live, its linked open PRs and issues are also watched
+independently of the web UI: one hidden task in the session's existing
+background registry polls every five minutes. Each independently mutable
+resource revalidates with its own `If-None-Match` (the PR document, check runs,
+commit statuses, reviews), while comment lists are bounded by
+`issues/{n}/comments?since=` / review-comment watermarks. An unchanged poll
+therefore sends only conditional reads for those REST resources — plus ONE
+unconditional request per pull request, the GraphQL read of GitHub's aggregate
+`reviewDecision`, which is not exposed by any REST resource and carries no
+validator to revalidate with. It produces nothing to report: a `304` on a
+resource and an unchanged answer to that one request are both "no change", and
+a change reads the nested resources it needs. A `403`/`429` pauses the whole
+watcher until `X-RateLimit-Reset`.
+
+Only transitions become a turn: checks going from all-passing (or pending) to
+failing, a review decision becoming changes-requested or approved, a merge, a
+close, and new comments/reviews. Several changes found in one poll coalesce
+into one message. Merged and closed links are dropped and never polled again.
+The first observation of a link (including every restart) is a silent
+baseline: the watcher records current state and the comment watermark, so it
+never reports the past. Adding a link while the session is live uses the same
+add-time status observation as that baseline: the immediate add fetch is
+silent, the add itself never produces a turn, and the first transition after
+the add does.
+
+The message is delivered through the existing durable `Notice` projection, so
+the transcript renders a dim notice rather than a user bubble, while the model
+sees the same text as a user-shaped message:
+
+```text
+[自动检测 · 非用户消息] PR owner/repo#27 检查失败：build, test（2 项）
+discord9 · "这版先别合，测试挂了"
+——本消息由 PR 监视自动生成，不是用户发言；请据此判断并采取必要行动。
+```
+
+There is no gate or confirmation: the notice is committed durably, arms one
+ordinary model turn, and the model acts under its normal rules. The watcher
+holds no persisted state, shares the session's lifetime (runner drop, session
+teardown/delete, and process exit all abort it), and never impersonates the
+human in the notice, a bubble, or `send_message`.
 
 ## MCP (local servers)
 
@@ -518,5 +610,11 @@ starts.
   background waits.
 - MCP is local stdio servers only; no remote HTTP/SSE, OAuth, resources,
   prompts, or server restart.
+- Session links have no webhooks, no dedicated scheduler or process, and no
+  persisted watcher state. The watcher is one task in the session's existing
+  background registry, polls only open PR/issue links every five minutes with
+  ETag/rate-limit handling, and drops merged/closed links. A chip's state stays
+  a 60-second in-memory `gh` read (`unknown` whenever that read fails), with no
+  status for plain links.
 - The web server has no multi-user model: one token, one workspace per process.
 - Windows support is narrower than Linux (see the sandbox notes above).
