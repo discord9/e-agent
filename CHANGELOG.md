@@ -8,6 +8,34 @@ does not yet follow semantic versioning strictly.
 
 ### Added
 
+- **Native Antigravity provider (`auth = "antigravity"`)** — a new
+  `ConfiguredModelKind::Antigravity` speaks
+  `v1internal:streamGenerateContent` directly, with no CLI subprocess: the
+  profile's `model` is a pinned catalog id (34 chat models from the 37-entry
+  model-list capture; the two tab previews and the image-generation model are
+  excluded, and every row carries the wire's context window and max output).
+  An omitted `model` defaults to `gemini-4-neon-high`, and an unknown id fails
+  at config resolution with its closest family. Credentials come read-only
+  from
+  `~/.gemini/antigravity-cli/antigravity-oauth-token`, and an expired token
+  (or a 401) is refreshed once and cached in
+  `$XDG_CONFIG_HOME/e-agent/antigravity-token.json` (0600). That refresh is
+  authenticated with the provider's `client_id` / `client_secret` (the `agy`
+  install's own OAuth consumer client — nothing is compiled into e-agent); a
+  still-valid access token needs neither, and a refresh without them fails
+  with an actionable error instead of a request. Text streams out
+  as deltas; usage maps `promptTokenCount` / `candidatesTokenCount +
+  thoughtsTokenCount`. Tool calls are native `functionCall` parts and the
+  `thoughtSignature` they carry is echoed back through the new opaque
+  `ToolCall::provider_meta` (other provider wires never see it, and old
+  sessions still load). `base_url`/`api_key_*` are rejected for these
+  profiles; `vision` follows the catalog row's `supportsImages` (images ride as
+  `inlineData` parts, and `gpt-oss-120b-medium` stays text-only), narrowed by
+  `vision = false`; `reasoning_effort`/`thinking` stay inert (the
+  `generationConfig` mapping could not be verified against the live service).
+  The provider's quota card reads `retrieveUserQuotaSummary` for the selected
+  login and shows one remaining-quota row per bucket.
+
 - **配置热重载 (config hot reload)** — the headless server and the TUI now
   poll the config files (`config.toml` + project `.e-agent/config.toml`)
   and, on a valid change, atomically swap the effective config: edited

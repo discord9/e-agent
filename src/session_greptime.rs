@@ -4743,6 +4743,7 @@ mod tests {
                     id: "call_1".into(),
                     name: "write_file".into(),
                     arguments: r#"{"path":"/tmp/x","content":"toolneedle"}"#.into(),
+                    provider_meta: None,
                 }],
                 reasoning: Some(r#"reasononly "quoted reasoning""#.into()),
             }),
@@ -4853,6 +4854,7 @@ mod tests {
                     id: "idonlymarker".into(),
                     name: "bash".into(),
                     arguments: r#"{"command":"echo hi"}"#.into(),
+                    provider_meta: None,
                 }],
                 reasoning: None,
             }),
@@ -4941,6 +4943,7 @@ mod tests {
                     name: "write_file".into(),
                     arguments: r#"{"path":"C:\\Users\\me\\new.txt","content":"line1\nline2"}"#
                         .into(),
+                    provider_meta: None,
                 }],
                 reasoning: None,
             }),
@@ -5147,6 +5150,7 @@ mod tests {
                 } else {
                     format!(r#"{{"command":"echo {index}"}}"#)
                 },
+                provider_meta: None,
             })
             .collect::<Vec<_>>();
         let entries = vec![
@@ -5174,6 +5178,7 @@ mod tests {
                         id: format!("call-{marker}"),
                         name: "bash".into(),
                         arguments: r#"{"command":"echo hi"}"#.into(),
+                        provider_meta: None,
                     }],
                     reasoning: Some(format!("{marker} {name_marker}")),
                 }),
@@ -5220,6 +5225,7 @@ mod tests {
                         id: "call-cross".into(),
                         name: format!("beta-{cross}"),
                         arguments: "{}".into(),
+                        provider_meta: None,
                     }],
                     reasoning: None,
                 }),

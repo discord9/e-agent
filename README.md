@@ -52,7 +52,7 @@ api_key_file = "kimi-key"          # or api_key_env = "KIMI_API_KEY"
 [models."kimi/k3"]
 model = "k3"
 reasoning_effort = "high"          # provider-specific pass-through
-vision = true                      # set only for image-capable models
+vision = true                      # the default; a text-only model sets false
 ```
 
 A provider needs exactly one of `api_key_file` or `api_key_env`; with neither it
@@ -73,7 +73,7 @@ The keys most configurations touch:
 | `reasoning_effort` | optional pass-through (`low`/`high`/`max` are common) |
 | `thinking` | enable provider thinking mode where supported |
 | `context_window` | token budget used for compaction |
-| `vision` | allow image input for this profile |
+| `vision` | image input; defaults to true, a text-only model sets false |
 | `deepseek_compat` | DeepSeek Chat reasoning-replay contract |
 | `[sandbox].enabled` | run bash inside bubblewrap |
 | `[sandbox].network` / `workspace_writable` | defaults for that sandbox |
@@ -85,6 +85,106 @@ The keys most configurations touch:
 A workspace-level `.e-agent/config.toml` may add or override models, roles, MCP
 servers, `[bash]`, and `[background]`; it cannot define providers or the session
 backend. `--model`, `--base-url`, and `--profile` override the file for one run.
+
+### Antigravity profiles
+
+Antigravity profiles speak the Cloud Code streaming endpoint natively with the
+Antigravity CLI's own OAuth login — no CLI subprocess, no API key, no base URL:
+
+```toml
+[providers.antigravity]
+auth = "antigravity"
+# The `agy` install's own OAuth consumer client, copied from that install.
+# Needed only to refresh an expired login (see below); no default ships in
+# e-agent.
+client_id = "<client id from the agy install>"
+client_secret = "<client secret from the agy install>"
+
+[models."antigravity/gemini"]
+model = "gemini-4-neon-high"   # a pinned id from the fixed catalog
+```
+
+e-agent pins the 34 chat models from the provider's 37-entry model list
+(captured from `v1internal:fetchAvailableModels`; the table is
+`src/antigravity/catalog.rs`) and validates `model` against that table while
+resolving the profile: a typo fails at startup with the model and the closest
+family's ids, not as a 404 on the first turn. The two `tab_*_preview` entries
+are CLI UI previews with a 16,384-token context and are excluded; the
+`gemini-3.1-flash-image` image-generation model is excluded because this
+adapter cannot use image output. Everything else is included. Each row
+carries the wire's `maxTokens` and `maxOutputTokens`; no number is guessed, and
+`supports_vision` follows the row's `supportsImages` because the adapter sends
+attached images as `inlineData` parts: every row is vision-capable except
+`gpt-oss-120b-medium`. A profile's `vision = false` can narrow that, never
+widen it. Omit `model` to use the catalog default, `gemini-4-neon-high` —
+a wire-recommended model (all 34 are flagged recommended), Gemini 4 Neon at
+its top reasoning tier, and it does not depend on the flash-only `-tiered`
+404 fallback. A bare `gemini-…-flash` alias is not a catalog entry and is
+rejected at resolution; the shared `gemini-3.8-flash-tiered` id is in the
+catalog, and a 404 for any catalog flash tier still retries once against it,
+unchanged.
+
+Credentials come from
+`~/.gemini/antigravity-cli/antigravity-oauth-token`, which stays READ-ONLY: an
+expired access token (or a request rejected with 401 — one refresh, then one
+retry, never a loop) is exchanged — with the provider's `client_id` /
+`client_secret`, the CLI install's own OAuth consumer client; a still-valid
+access token needs neither, and a refresh without them fails with a message
+naming both keys — and the result cached in
+`$XDG_CONFIG_HOME/e-agent/antigravity-token.json`, never written back to the
+CLI's file. That cache is owner-only (0600, a Unix promise; on Windows the file
+inherits the directory ACL), is replaced atomically (private temp file in the
+destination directory, fsync, rename — so an interrupted write cannot truncate
+it and a symlink at that path is replaced, never written through), and is BOUND
+to the CLI login: it records a hash of the CLI refresh credential it was
+written for and is ignored once `agy` logs into another account, so a re-login
+can never keep spending the old one. A malformed CLI file is reported (path,
+line, column) rather than masked by the cache: without it e-agent cannot tell
+which account the cache belongs to. A refresh rejected with `invalid_grant` is
+definitive: the cached entry is removed — only when it still holds the very
+credential that was rejected, compared and unlinked under the same process-wide
+lock that replacement takes, so a newer entry another refresh installed is
+never thrown away (cross-process races are out of scope: replacement is an
+atomic rename, so a second e-agent process can at worst lose its cache entry,
+never a login) — and the next request starts over from `agy`'s own
+credential, with the error saying to run `agy` (the failed turn itself is not
+retried again). Replacement is atomic, but the rename is not followed by
+a directory fsync — durability across a power loss is the filesystem's job, a
+documented limit rather than a promise. A relative or empty `XDG_CONFIG_HOME`
+is ignored (the XDG spec requires an absolute path) and `~/.config/e-agent` is
+used instead.
+
+Tool declarations ride `parametersJsonSchema`: the Schema-proto `parameters`
+field rejects `const`, which the builtin `history` tool's schema uses (verified
+live — `parameters` answers 400 INVALID_ARGUMENT, `parametersJsonSchema`
+accepts the whole builtin toolset and the model invokes `history` with the
+arguments the schema declares). Tool calls are native `functionCall` parts whose
+`thoughtSignature` must ride back on the next request; e-agent keeps it in an
+opaque per-call `provider_meta` blob that only this wire reads and isolates it
+at its own part position. A parallel batch is signed by the provider on its
+first call only, and that is exactly what is replayed (a sibling that arrived
+unsigned stays unsigned — verified live: as-received replay 200, duplicated
+signature 200, signature-less replay 400). Only the tool batch being continued
+now — the trailing run of tool results and the assistant turn that asked for
+them — must carry its signature: it is refused locally, naming the call, when
+that batch has none, instead of borrowing one. History a later assistant
+answer already closed replays exactly as recorded, so resuming or forking a
+conversation is never refused for what it merely carries.
+`--base-url` is rejected on every path, including a runtime `/model` switch,
+and a `--model` override must still be a pinned catalog id;
+`reasoning_effort`/`thinking` are accepted but inert (the `generationConfig`
+mapping could not be verified against the live service). A truncated or badly
+framed stream is an error, never a shorter successful turn, and provider error
+bodies are never surfaced: the message carries the HTTP status plus, only when
+the body's value is exactly one of a fixed set of known codes
+(`INVALID_ARGUMENT`, `UNAUTHENTICATED`, `invalid_grant`, …), that constant —
+never the body's own text, whatever shape it takes, because these messages are
+persisted in the session log. Any part with nonempty text is text: it emits
+its delta (provider thinking as a reasoning delta, never as assistant content
+and never replayed) even when a `thoughtSignature` is stamped on it, so that
+signature can never sign the call before it. A signature-only part — no text at
+all — signs the call it directly follows, and any intervening part breaks that
+adjacency, an empty text part included.
 
 ## Safety boundaries
 
@@ -488,9 +588,13 @@ DeepSeek fetch. `provider` still rejects a `base_url` for `"deepseek"`, and
 `read_image` (tool) and the REPL `/image <path>` command attach png/jpeg/webp/gif
 images up to 10 MiB; bytes are stored once in a content-addressed cache under
 `$XDG_STATE_HOME/e-agent/images/`. Sessions persist only the reference, never
-base64, and the wire re-reads the file when sending. The profile needs
-`vision = true`, otherwise the turn fails with a model-does-not-support-images
-error. `generate_image` (main session only, ChatGPT login) writes a PNG.
+base64, and the wire re-reads the file when sending. A profile receives images
+unless it says `vision = false` (the key defaults to true; see [Run](#run)): on
+a text-only model the request copy strips image parts from user and tool
+messages with a text-degradation note while the persisted history keeps them, so
+switching back to a vision model restores them, and an explicit `/image` prompt
+fails with a `model X does not support image input` error before any request is
+sent. `generate_image` (main session only, ChatGPT login) writes a PNG.
 
 ## SQLite session backend
 
@@ -510,6 +614,15 @@ starts.
   scheduler, priority system, or concurrency pool.
 - No provider/model catalog fetching, config generation, metadata caching, or
   context-window inference; TOML profiles are static local settings.
+- No Antigravity catalog fetch: the native provider calls no model-list endpoint
+  (`fetchAvailableModels`) — its 34 chat-model ids are a fixed table
+  (`src/antigravity/catalog.rs`) captured from that endpoint's 37 entries — and
+  it never shells out to the `agy` CLI, rewrites `agy`'s token file, projects
+  the builtin tool schemas to a smaller dialect (the declarations use the
+  endpoint's JSON-Schema field), or maps `generationConfig` reasoning
+  (`reasoning_effort`/`thinking` are inert on that wire). The model slug is a
+  catalog id (or the catalog's default when the profile omits it), and image
+  input rides as `inlineData` only on the rows whose wire capability allows it.
 - `AGENTS.md` loading is workspace-root only: no parent or nested discovery.
 - Subagents are runtime tasks, not processes: no agent-to-agent messaging
   beyond live parent/child `send_message`, no delegation past one level.

@@ -23,6 +23,7 @@ fn responses_wire_flattens_system_tools_and_tool_results() {
                     id: "call-1".into(),
                     name: "bash".into(),
                     arguments: "{}".into(),
+                    provider_meta: None,
                 }],
                 reasoning: Some("never replayed".into()),
             }),
@@ -142,6 +143,7 @@ fn responses_wire_encodes_image_bearing_tool_output_as_output_array() {
                     id: "call-1".into(),
                     name: "read_image".into(),
                     arguments: r#"{"path":"a.png"}"#.into(),
+                    provider_meta: None,
                 }],
                 reasoning: None,
             }),
@@ -195,6 +197,7 @@ fn responses_wire_degrades_missing_tool_image_to_text_part() {
                     id: "call-1".into(),
                     name: "read_image".into(),
                     arguments: r#"{"path":"a.png"}"#.into(),
+                    provider_meta: None,
                 }],
                 reasoning: None,
             }),
@@ -853,4 +856,42 @@ async fn responses_request_hot_reloads_disk_login_headers() {
     .unwrap();
     model.complete(&messages, &[], None).await.unwrap();
     server.await.unwrap();
+}
+
+/// Same contract on the Codex Responses wire: another provider's per-call blob
+/// never reaches the request body.
+#[test]
+fn responses_wire_never_serializes_another_providers_call_blob() {
+    const SENTINEL: &str = "SENTINEL-ANTIGRAVITY-SIGNATURE";
+    let request = ResponsesRequest::from_internal(
+        "codex",
+        None,
+        &[
+            Message::Assistant(AssistantMessage {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "call-1".into(),
+                    name: "bash".into(),
+                    arguments: r#"{"command":"ls"}"#.into(),
+                    provider_meta: Some(SENTINEL.into()),
+                }],
+                reasoning: None,
+            }),
+            Message::Tool {
+                call_id: "call-1".into(),
+                name: "bash".into(),
+                content: "a.txt".into(),
+                is_error: false,
+                synthetic: false,
+                images: vec![],
+            },
+        ],
+        &[],
+        None,
+    );
+    let wire = serde_json::to_string(&serde_json::to_value(request).unwrap()).unwrap();
+    assert!(!wire.contains(SENTINEL), "{wire}");
+    assert!(!wire.contains("provider_meta"), "{wire}");
+    assert!(!wire.contains("thoughtSignature"), "{wire}");
+    assert!(wire.contains("call-1"), "{wire}");
 }

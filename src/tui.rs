@@ -945,6 +945,8 @@ fn handle_model(command: ModelCommand, state: &mut TuiState, handle: &RunnerHand
             let profile_effort = state.model.as_ref().and_then(|model| match &model.kind {
                 crate::model::ConfiguredModelKind::Chat(m) => m.reasoning_effort.as_deref(),
                 crate::model::ConfiguredModelKind::Codex(m) => m.reasoning_effort.as_deref(),
+                // Configured but inert on this wire (see antigravity.rs).
+                crate::model::ConfiguredModelKind::Antigravity(m) => m.reasoning_effort.as_deref(),
             });
             let effort = match state.effort_override.as_ref() {
                 Some(crate::session_factory::EffortOverride::Omit) => {

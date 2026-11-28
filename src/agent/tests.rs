@@ -488,7 +488,27 @@ fn call(id: &str, name: &str, arguments: &str) -> ToolCall {
         id: id.into(),
         name: name.into(),
         arguments: arguments.into(),
+        provider_meta: None,
     }
+}
+
+/// `provider_meta` is an optional, provider-owned round-trip blob: sessions
+/// written before it existed still load, and a call without it stays clean.
+#[test]
+fn tool_call_provider_meta_is_optional_on_the_wire_and_in_sessions() {
+    let stored: ToolCall =
+        serde_json::from_str(r#"{"id":"call_1","name":"bash","arguments":"{\"command\":\"ls\"}"}"#)
+            .unwrap();
+    assert_eq!(stored.provider_meta, None);
+    assert_eq!(call("call_1", "bash", "{}").provider_meta, None);
+    let signed = ToolCall {
+        provider_meta: Some("sig".into()),
+        ..stored
+    };
+    assert_eq!(
+        serde_json::to_value(&signed).unwrap()["provider_meta"],
+        "sig"
+    );
 }
 
 #[tokio::test]
@@ -1521,13 +1541,13 @@ async fn emits_assistant_tool_and_result_events_in_order() {
             AgentEvent::ToolCall {
                 name: "echo".into(),
                 arguments: r#"{"value":"ok"}"#.into(),
-                call_id: Some("call-1".into()),
+                call_id: Some(public_call_id("call-1")),
             },
             AgentEvent::ToolResult {
                 is_error: false,
                 content: "\"ok\"".into(),
                 images: vec![],
-                call_id: Some("call-1".into()),
+                call_id: Some(public_call_id("call-1")),
             },
         ]
     );
@@ -1548,13 +1568,13 @@ async fn emits_deltas_without_duplicate_assistant_text() {
             AgentEvent::ToolCall {
                 name: "echo".into(),
                 arguments: r#"{"value":"ok"}"#.into(),
-                call_id: Some("call-1".into()),
+                call_id: Some(public_call_id("call-1")),
             },
             AgentEvent::ToolResult {
                 is_error: false,
                 content: "\"ok\"".into(),
                 images: vec![],
-                call_id: Some("call-1".into()),
+                call_id: Some(public_call_id("call-1")),
             },
         ]
     );
@@ -3653,6 +3673,7 @@ fn fork_prefix_rejects_mid_turn_at() {
                 id: "call-1".into(),
                 name: "bash".into(),
                 arguments: "{}".into(),
+                provider_meta: None,
             }],
             reasoning: None,
         })
@@ -3767,6 +3788,7 @@ fn fork_prefix_complete_rejects_a_mid_turn_compaction_with_an_unanswered_tool_ca
         id: "call-mid-turn".into(),
         name: "bash".into(),
         arguments: "{}".into(),
+        provider_meta: None,
     };
     let pending = Message::Assistant(AssistantMessage {
         content: None,
@@ -3831,6 +3853,7 @@ fn fork_prefix_complete_accepts_a_superseded_synthetic_placeholder() {
         id: "call-raced".into(),
         name: "bash".into(),
         arguments: "{}".into(),
+        provider_meta: None,
     };
     let entries = vec![
         Message::User {
@@ -3894,6 +3917,7 @@ fn fork_prefix_complete_rejects_a_dangling_call_before_a_later_answer() {
                 id: "call-dangling".into(),
                 name: "bash".into(),
                 arguments: "{}".into(),
+                provider_meta: None,
             }],
             reasoning: None,
         })
@@ -3923,6 +3947,7 @@ fn fork_prefix_complete_rejects_an_unpaired_trailing_tool_call() {
                 id: "call-open".into(),
                 name: "bash".into(),
                 arguments: "{}".into(),
+                provider_meta: None,
             }],
             reasoning: None,
         })
@@ -6558,6 +6583,7 @@ async fn image_rejection_omissions_are_request_only_and_cleared_by_set_model() {
                 id: "call-1".into(),
                 name: "read_image".into(),
                 arguments: "{}".into(),
+                provider_meta: None,
             }],
             reasoning: None,
         })
@@ -7719,6 +7745,7 @@ fn latest_read_output_result_stays_full_in_request_context() {
                         id: "id".into(),
                         name: "read_output".into(),
                         arguments: "{}".into(),
+                        provider_meta: None,
                     }],
                     reasoning: None,
                 }),
@@ -7824,4 +7851,24 @@ fn runtime_model_switch_replaces_window_and_invalidates_context_baseline() {
         true,
     );
     assert!(!agent.take_auto_compact_request());
+}
+
+/// The public projection of a wire call id is a local digest wide enough that
+/// distinct provider ids cannot share one answer key. These two strings
+/// collided under the old 32-bit prefix (`call-bb74105d`); at 128 bits they
+/// project to different ids, and neither leaks its wire id.
+#[test]
+fn public_call_id_is_a_128_bit_local_digest() {
+    let ids = ["call_52986", "call_92571"].map(public_call_id);
+    assert_ne!(ids[0], ids[1], "the old 32-bit prefix collided: {ids:?}");
+    for (id, wire) in ids.iter().zip(["call_52986", "call_92571"]) {
+        assert_eq!(id.len(), "call-".len() + 32, "{id}");
+        assert!(id.starts_with("call-"), "{id}");
+        assert!(
+            id["call-".len()..].chars().all(|c| c.is_ascii_hexdigit()),
+            "{id}"
+        );
+        assert!(!id.contains(wire), "the digest is not the wire id: {id}");
+    }
+    assert_eq!(ids[0], public_call_id("call_52986"), "stable per wire id");
 }

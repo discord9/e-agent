@@ -1061,6 +1061,7 @@ impl Model for AcpCallModel {
                     id: "call-acp".into(),
                     name: "acp_prompt".into(),
                     arguments: json!({"prompt": "review the notes"}).to_string(),
+                    provider_meta: None,
                 }],
                 reasoning: None,
             }
@@ -1510,6 +1511,7 @@ impl Model for TwoRunModel {
                     id: id.into(),
                     name: "acp_prompt".into(),
                     arguments: json!({"prompt": prompt}).to_string(),
+                    provider_meta: None,
                 }],
                 reasoning: None,
             },

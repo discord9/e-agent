@@ -4286,6 +4286,7 @@ fn session_entry_to_lines_maps_persisted_entry_kinds() {
                 id: "c1".into(),
                 name: "bash".into(),
                 arguments: r#"{"command":"ls"}"#.into(),
+                provider_meta: None,
             }],
             reasoning: None,
         }),
@@ -4799,6 +4800,7 @@ fn fork_session_entries() -> Vec<SessionEntry> {
                 id: "call-1".into(),
                 name: "bash".into(),
                 arguments: "{}".into(),
+                provider_meta: None,
             }],
             reasoning: None,
         })

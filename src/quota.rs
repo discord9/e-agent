@@ -5,6 +5,9 @@
 //! table (below) decides which upstream usage API answers for it. Every field
 //! is always serialized, and `kind` is one of `balance` / `quota` / `error`.
 //!
+//! The native Antigravity provider has no config endpoint and no key: its card
+//! is the adapter's own read-only quota POST, one card row per bucket.
+//!
 //! Failure policy: a provider never aborts the response. Non-2xx responses,
 //! timeouts, connection failures, and unparsable bodies all become that
 //! provider's `kind: "error"` card with one of the fixed, short messages
@@ -18,6 +21,7 @@ use serde::Serialize;
 use serde_json::Value;
 use url::Url;
 
+use crate::antigravity::{QuotaBucket, quota_summary};
 use crate::codex_auth::CodexAuth;
 use crate::config::ProviderAccount;
 
@@ -41,6 +45,9 @@ const ERR_TIMEOUT: &str = "请求超时";
 const ERR_QUERY_TIMEOUT: &str = "查询超时";
 const ERR_CONNECT: &str = "连接失败";
 const ERR_PARSE: &str = "响应格式无法解析";
+/// The one fixed message an unavailable Antigravity card shows; the adapter's
+/// own error text never reaches a card.
+const ERR_QUOTA_UNAVAILABLE: &str = "quota unavailable";
 
 const CHATGPT_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 
@@ -77,8 +84,8 @@ pub struct QuotaWindow {
     pub reset_at: Option<String>,
 }
 
-/// Which upstream usage API answers for a provider. `ChatGpt` is selected by
-/// `auth = "chatgpt"` instead of by host.
+/// Which upstream usage API answers for a provider. `ChatGpt` and
+/// `Antigravity` are selected by `auth = "..."` instead of by host.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Source {
     DeepSeek,
@@ -87,6 +94,8 @@ enum Source {
     Kimi,
     OpenCode,
     ChatGpt,
+    /// The native Antigravity wire: no config endpoint, no key.
+    Antigravity,
 }
 
 impl Source {
@@ -99,6 +108,7 @@ impl Source {
             Self::Kimi => "Kimi Code",
             Self::OpenCode => "OpenCode Go",
             Self::ChatGpt => "ChatGPT",
+            Self::Antigravity => "Antigravity",
         }
     }
 }
@@ -145,11 +155,20 @@ struct Target {
 /// provider (`opencode.ai` / `api.opencode.ai`) with the same key produce a
 /// single card, while the same host with different keys stays two accounts.
 /// Accounts arrive sorted by provider name, so the surviving `id` is stable.
+/// The native Antigravity provider carries neither a base URL nor a key; its
+/// target's URL is the adapter's quota endpoint, so aliases of one `agy` login
+/// still collapse to a single card.
 fn targets(accounts: &[ProviderAccount]) -> Vec<Target> {
     let mut targets: Vec<Target> = Vec::new();
     for account in accounts {
         let resolved = if account.auth.as_deref() == Some("chatgpt") {
             Some((CHATGPT_USAGE_URL, Source::ChatGpt, String::new()))
+        } else if account.auth.as_deref() == Some("antigravity") {
+            Some((
+                crate::antigravity::QUOTA_URL,
+                Source::Antigravity,
+                String::new(),
+            ))
         } else {
             account
                 .base_url
@@ -250,6 +269,37 @@ impl ProviderQuota {
     }
 }
 
+/// The Antigravity card from the adapter's answer: one window row per bucket,
+/// and every failure (no login, a 5xx, an unparsable body) becomes the same
+/// fixed message, so this card never fails the response. `used_percent` is
+/// this card's field for "how much is gone", so it holds the complement of the
+/// upstream `remainingFraction`; an unreadable one stays NaN, which serializes
+/// as `null` (the UI's unknown state) instead of a false 100% remaining.
+fn antigravity_card(
+    id: &str,
+    label: &str,
+    summary: anyhow::Result<Vec<QuotaBucket>>,
+) -> ProviderQuota {
+    match summary {
+        Ok(buckets) => ProviderQuota::quota(
+            id,
+            label,
+            None,
+            buckets
+                .iter()
+                .map(|bucket| QuotaWindow {
+                    label: bucket.label(),
+                    used_percent: bucket
+                        .remaining
+                        .map_or(f64::NAN, |remaining| (1.0 - remaining) * 100.0),
+                    reset_at: bucket.resets_at.clone(),
+                })
+                .collect(),
+        ),
+        Err(_) => ProviderQuota::error(id, label, ERR_QUOTA_UNAVAILABLE.to_owned()),
+    }
+}
+
 async fn query(
     client: &reqwest::Client,
     target: &Target,
@@ -264,6 +314,10 @@ async fn query(
             // the actual remedy instead of reporting a generic HTTP 401.
             None => Err(ERR_NOT_LOGGED_IN.to_owned()),
         },
+        // A native wire: the adapter owns the login, the POST and the body,
+        // so this arm is the only Antigravity path and it cannot fail (a
+        // failure is the fixed "unavailable" card).
+        Source::Antigravity => Ok(antigravity_card(&target.id, label, quota_summary().await)),
         // A configured provider whose credential could not be resolved keeps
         // its card; sending an empty `Bearer` would report a misleading 401.
         _ if target.api_key.is_empty() => Err(ERR_NO_KEY.to_owned()),
@@ -299,6 +353,9 @@ fn parse(
         Source::Kimi => parse_kimi(value, id, label),
         Source::OpenCode => parse_opencode(value, now, id, label),
         Source::ChatGpt => parse_chatgpt(value, now, id, label),
+        // No GET body reaches here: the Antigravity card is built by
+        // `antigravity_card` from the adapter's own POST.
+        Source::Antigravity => Err(parse_error()),
     }
 }
 
@@ -1115,6 +1172,33 @@ mod tests {
         assert!(targets[0].api_key.is_empty());
     }
 
+    /// The native Antigravity provider has no config endpoint and no key, but
+    /// it still gets a card: its target's URL is the adapter's quota endpoint,
+    /// so `agy` aliases collapse to one account like every other duplicate.
+    #[test]
+    fn antigravity_account_without_base_url_becomes_a_target() {
+        let accounts = [
+            ProviderAccount {
+                name: "antigravity".to_owned(),
+                base_url: None,
+                auth: Some("antigravity".to_owned()),
+                api_key: String::new(),
+            },
+            ProviderAccount {
+                name: "antigravity-alias".to_owned(),
+                base_url: None,
+                auth: Some("antigravity".to_owned()),
+                api_key: String::new(),
+            },
+        ];
+        let targets = targets(&accounts);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].id, "antigravity");
+        assert_eq!(targets[0].source, Source::Antigravity);
+        assert_eq!(targets[0].url, crate::antigravity::QUOTA_URL);
+        assert_eq!(targets[0].source.label(), "Antigravity");
+    }
+
     /// Every field is serialized, including the `null` ones; `kind` is one of
     /// `balance` / `quota` / `error`.
     #[test]
@@ -1162,5 +1246,134 @@ mod tests {
                  "error":"API 密钥已过期，请重新生成"}
             ]})
         );
+    }
+
+    /// One-shot fake upstream for the Antigravity quota POST: answer once with
+    /// `status` and `body`, then close. Returns the endpoint URL.
+    async fn fake_quota(status: u16, body: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = body.to_owned();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut head = [0_u8; 4096];
+            let _ = stream.read(&mut head).await;
+            let reason = if status == 200 { "OK" } else { "Error" };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+        format!("http://{address}/v1internal:retrieveUserQuotaSummary")
+    }
+
+    /// The card a fake upstream produces, through the same parse and mapping
+    /// the production arm uses (only the token and the URL are substituted).
+    async fn antigravity_card_from(status: u16, body: &str) -> ProviderQuota {
+        let url = fake_quota(status, body).await;
+        let client = reqwest::Client::new();
+        let summary =
+            crate::antigravity::quota_summary_at(&client, &url, "test-token", "test-project").await;
+        antigravity_card("antigravity", Source::Antigravity.label(), summary)
+    }
+
+    /// A normal summary renders one row per bucket with the right percentage
+    /// and reset time: `used_percent` is the complement of the upstream
+    /// `remainingFraction` (the UI shows `100 - used` as the remaining share).
+    #[tokio::test]
+    async fn antigravity_summary_renders_one_row_per_bucket() {
+        let body = json!({"groups":[{"buckets":[
+            {"bucketId":"gemini-5h","window":"5h","remainingFraction":0.42,
+             "resetTime":"2026-11-27T00:00:00Z","disabled":false},
+            {"bucketId":"3p-weekly","window":"weekly","remainingFraction":0.8,
+             "resetTime":"2026-12-01T00:00:00Z","disabled":false}
+        ]}]});
+        let card = antigravity_card_from(200, &body.to_string()).await;
+        assert_eq!(card.kind, QuotaKind::Quota);
+        assert_eq!(card.label, "Antigravity");
+        assert!(card.error.is_none());
+        assert_eq!(card.windows.len(), 2);
+        assert_eq!(card.windows[0].label, "gemini 5h");
+        assert!(
+            (card.windows[0].used_percent - 58.0).abs() < 1e-9,
+            "{card:?}"
+        );
+        assert_eq!(
+            card.windows[0].reset_at.as_deref(),
+            Some("2026-11-27T00:00:00Z")
+        );
+        assert_eq!(card.windows[1].label, "3p weekly");
+        assert!(
+            (card.windows[1].used_percent - 20.0).abs() < 1e-9,
+            "{card:?}"
+        );
+        assert_eq!(
+            card.windows[1].reset_at.as_deref(),
+            Some("2026-12-01T00:00:00Z")
+        );
+    }
+
+    /// A bucket id this client does not know is rendered with its RAW id, not
+    /// dropped and not split into a family it never had.
+    #[tokio::test]
+    async fn antigravity_unknown_bucket_renders_its_raw_id() {
+        let body = json!({"groups":[{"buckets":[
+            {"bucketId":"quartz-daily","remainingFraction":0.5,
+             "resetTime":"2026-11-28T00:00:00Z"}
+        ]}]});
+        let card = antigravity_card_from(200, &body.to_string()).await;
+        assert_eq!(card.kind, QuotaKind::Quota);
+        assert_eq!(card.windows.len(), 1);
+        assert_eq!(card.windows[0].label, "quartz-daily");
+        assert!(
+            (card.windows[0].used_percent - 50.0).abs() < 1e-9,
+            "{card:?}"
+        );
+    }
+
+    /// A 500 is that provider's fixed "unavailable" card: the quota surface
+    /// still answers with a card, so nothing propagates to the caller and no
+    /// upstream text (which could name credentials) reaches the response.
+    #[tokio::test]
+    async fn antigravity_failure_renders_unavailable() {
+        let url = fake_quota(500, r#"{"error":{"message":"boom"}}"#).await;
+        let client = reqwest::Client::new();
+        let summary =
+            crate::antigravity::quota_summary_at(&client, &url, "test-token", "test-project").await;
+        assert!(summary.is_err(), "a 500 is an error at the wire");
+        let card = antigravity_card("antigravity", Source::Antigravity.label(), summary);
+        assert_eq!(card.kind, QuotaKind::Error);
+        assert_eq!(card.error.as_deref(), Some("quota unavailable"));
+        assert!(card.windows.is_empty());
+        assert!(card.amount.is_none() && card.currency.is_none() && card.plan.is_none());
+    }
+    /// A 403 is the documented `SUBSCRIPTION_REQUIRED` refusal: the card must
+    /// still exist and SAY the number is unknown, never disappear.
+    #[tokio::test]
+    async fn antigravity_403_renders_an_unknown_card() {
+        let body = json!({"error":{"code":403,"status":"SUBSCRIPTION_REQUIRED"}});
+        let card = antigravity_card_from(403, &body.to_string()).await;
+        assert_eq!(card.kind, QuotaKind::Quota, "{card:?}");
+        assert_eq!(card.windows.len(), 1, "{card:?}");
+        assert_eq!(card.windows[0].label, "quota");
+        assert!(!card.windows[0].used_percent.is_finite());
+        assert!(card.windows[0].reset_at.is_none());
+    }
+
+    /// Schema drift (a body this client cannot read) is the same answer: one
+    /// known-unknown row, not a missing card and not an upstream error string.
+    #[tokio::test]
+    async fn antigravity_schema_drift_renders_an_unknown_card() {
+        let body = json!({"buckets": [], "unexpected": true});
+        let card = antigravity_card_from(200, &body.to_string()).await;
+        assert_eq!(card.kind, QuotaKind::Quota, "{card:?}");
+        assert_eq!(card.windows.len(), 1, "{card:?}");
+        assert_eq!(card.windows[0].label, "quota");
+        assert!(!card.windows[0].used_percent.is_finite());
     }
 }

@@ -116,7 +116,7 @@ context_window = 131072
 }
 
 #[test]
-fn vision_defaults_to_false_and_reads_from_model_profile() {
+fn vision_defaults_to_true_and_reads_from_model_profile() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("key"), "key").unwrap();
     let path = write_config(
@@ -134,7 +134,8 @@ vision = true
     let resolved = Config::from_path(&path).unwrap().resolve(None).unwrap();
     assert!(resolved.vision);
 
-    // Absent `vision` means false (deepseek-style default).
+    // Absent `vision` means TRUE: a profile that omits the key is treated as
+    // vision-capable, and a text-only model must say so explicitly.
     let path = write_config(
         temp.path(),
         r#"
@@ -144,6 +145,22 @@ base_url = "https://api.deepseek.com/v1"
 api_key_file = "key"
 [models."deepseek/v3"]
 model = "deepseek-chat"
+"#,
+    );
+    let resolved = Config::from_path(&path).unwrap().resolve(None).unwrap();
+    assert!(resolved.vision, "an omitted `vision` key defaults to true");
+
+    // `vision = false` is how a text-only profile declares itself.
+    let path = write_config(
+        temp.path(),
+        r#"
+default = "deepseek/v3"
+[providers.deepseek]
+base_url = "https://api.deepseek.com/v1"
+api_key_file = "key"
+[models."deepseek/v3"]
+model = "deepseek-chat"
+vision = false
 "#,
     );
     let resolved = Config::from_path(&path).unwrap().resolve(None).unwrap();
@@ -1558,6 +1575,8 @@ fn project_sandbox_rejects_unknown_fields() {
         .unwrap();
         let error = config.sandbox(&workspace).unwrap_err().to_string();
         assert!(error.contains("cannot parse project config"), "{error}");
+        // B4: no decoder excerpt / quoted value in the message.
+        assert!(!error.contains("future_policy"), "{error}");
     }
 }
 
@@ -1865,6 +1884,294 @@ model = "codex"
 }
 
 #[test]
+fn resolves_antigravity_and_rejects_mixed_credentials() {
+    let temp = tempfile::tempdir().unwrap();
+    let good = write_config(
+        temp.path(),
+        r#"
+[providers.antigravity]
+auth = "antigravity"
+
+[models."antigravity/gemini"]
+model = "gemini-3.8-flash-high"
+context_window = 65536
+"#,
+    );
+    let resolved = Config::from_path(&good)
+        .unwrap()
+        .resolve(Some("antigravity/gemini"))
+        .unwrap();
+    assert_eq!(resolved.auth, AuthMode::Antigravity);
+    assert_eq!(resolved.model, "gemini-3.8-flash-high");
+    assert_eq!(resolved.context_window, Some(65536));
+    // Fixed endpoint and no API key: neither comes from the config.
+    assert!(resolved.base_url.is_empty());
+    assert!(resolved.api_key.is_empty());
+    // The refresh-only consumer client is absent here (no default in code)...
+    assert!(resolved.client_id.is_none() && resolved.client_secret.is_none());
+    // ...and resolves verbatim onto the provider when it is configured.
+    let keyed = write_config(
+        temp.path(),
+        r#"
+[providers.antigravity]
+auth = "antigravity"
+client_id = "test-client.apps.googleusercontent.com"
+client_secret = "GOCSPX-test"
+
+[models."antigravity/gemini"]
+model = "gemini-3.8-flash-high"
+"#,
+    );
+    let resolved = Config::from_path(&keyed)
+        .unwrap()
+        .resolve(Some("antigravity/gemini"))
+        .unwrap();
+    assert_eq!(
+        (
+            resolved.client_id.as_deref(),
+            resolved.client_secret.as_deref()
+        ),
+        (
+            Some("test-client.apps.googleusercontent.com"),
+            Some("GOCSPX-test")
+        )
+    );
+    for field in [
+        "base_url = \"https://example.test\"",
+        "api_key_file = \"key\"",
+        "api_key_env = \"KEY\"",
+    ] {
+        let path = write_config(
+            temp.path(),
+            &format!(
+                r#"
+[providers.antigravity]
+auth = "antigravity"
+{field}
+
+[models."antigravity/gemini"]
+model = "gemini-3.8-flash-high"
+"#
+            ),
+        );
+        let error = Config::from_path(&path)
+            .unwrap()
+            .resolve(Some("antigravity/gemini"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("auth = `antigravity` cannot set"), "{error}");
+    }
+}
+
+/// Antigravity models are validated against the pinned catalog at CONFIG
+/// resolution: a typo must not survive until the first request. A profile
+/// that omits `model` gets the catalog default instead of the generic
+/// "requires `model`" error.
+#[test]
+fn antigravity_model_is_catalog_validated_and_has_a_default() {
+    use crate::antigravity::catalog;
+
+    let temp = tempfile::tempdir().unwrap();
+    let omitted = write_config(
+        temp.path(),
+        r#"
+[providers.antigravity]
+auth = "antigravity"
+
+[models."antigravity/default"]
+"#,
+    );
+    let resolved = Config::from_path(&omitted)
+        .unwrap()
+        .resolve(Some("antigravity/default"))
+        .unwrap();
+    assert_eq!(resolved.model, catalog::DEFAULT_MODEL);
+    assert_eq!(resolved.auth, AuthMode::Antigravity);
+
+    let typo = write_config(
+        temp.path(),
+        r#"
+[providers.antigravity]
+auth = "antigravity"
+
+[models."antigravity/gemini"]
+model = "gemini-4-neno-high"
+"#,
+    );
+    let error = Config::from_path(&typo)
+        .unwrap()
+        .resolve(Some("antigravity/gemini"))
+        .unwrap_err();
+    let message = format!("{error:#}");
+    assert!(message.contains("gemini-4-neno-high"), "{message}");
+    assert!(message.contains("closest family"), "{message}");
+    assert!(message.contains("gemini-4-neon-high"), "{message}");
+    assert!(message.contains("gemini-4-neon-low"), "{message}");
+    // The top-level Display carries the same detail (the catalog message is
+    // flattened, not merely chained as a cause).
+    let top = error.to_string();
+    assert!(top.contains("gemini-4-neno-high"), "{top}");
+    assert!(top.contains("gemini-4-neon-low"), "{top}");
+
+    // Every pinned id resolves through the real config path, not only
+    // through `catalog::validate`.
+    let mut source = String::from("[providers.antigravity]\nauth = \"antigravity\"\n");
+    for model in catalog::MODELS {
+        source.push_str(&format!(
+            "\n[models.\"antigravity/{}\"]\nmodel = \"{}\"\n",
+            model.id, model.id
+        ));
+    }
+    let all = write_config(temp.path(), &source);
+    let config = Config::from_path(&all).unwrap();
+    for model in catalog::MODELS {
+        let profile = format!("antigravity/{}", model.id);
+        let resolved = config.resolve(Some(&profile)).unwrap();
+        assert_eq!(resolved.model, model.id);
+        assert_eq!(resolved.auth, AuthMode::Antigravity);
+    }
+
+    // Excluded wire entries fail with the policy reason, not a generic typo
+    // suggestion; the shared tiered id is a normal catalog entry.
+    for (model, reason) in [
+        ("tab_flash_lite_preview", "UI preview"),
+        ("gemini-3.1-flash-image", "image-generation"),
+    ] {
+        let path = write_config(
+            temp.path(),
+            &format!(
+                r#"
+[providers.antigravity]
+auth = "antigravity"
+
+[models."antigravity/excluded"]
+model = "{model}"
+"#
+            ),
+        );
+        let error = Config::from_path(&path)
+            .unwrap()
+            .resolve(Some("antigravity/excluded"))
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains(model), "{message}");
+        assert!(message.contains("excluded"), "{message}");
+        assert!(message.contains(reason), "{message}");
+    }
+    let tiered = write_config(
+        temp.path(),
+        r#"
+[providers.antigravity]
+auth = "antigravity"
+
+[models."antigravity/tiered"]
+model = "gemini-3.8-flash-tiered"
+"#,
+    );
+    assert_eq!(
+        Config::from_path(&tiered)
+            .unwrap()
+            .resolve(Some("antigravity/tiered"))
+            .unwrap()
+            .model,
+        "gemini-3.8-flash-tiered"
+    );
+
+    // Every OTHER provider still requires an explicit `model`.
+    let other = write_config(
+        temp.path(),
+        r#"
+[providers.local]
+base_url = "http://127.0.0.1:8000"
+
+[models."local/m"]
+"#,
+    );
+    let error = Config::from_path(&other)
+        .unwrap()
+        .resolve(Some("local/m"))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("requires `model`"), "{error}");
+}
+
+/// Request pacing is a provider key on the Antigravity provider: it
+/// round-trips onto the resolved model (`0` included — it disables pacing
+/// explicitly), is absent when unset (the adapter's 1000 ms default applies),
+/// and is rejected on every other auth mode, exactly like the consumer client.
+#[test]
+fn min_interval_ms_round_trips_and_is_antigravity_only() {
+    let temp = tempfile::tempdir().unwrap();
+    let resolved_with = |extra: &str| {
+        let path = write_config(
+            temp.path(),
+            &format!(
+                r#"
+[providers.antigravity]
+auth = "antigravity"
+{extra}
+
+[models."antigravity/gemini"]
+model = "gemini-3.8-flash-high"
+"#
+            ),
+        );
+        Config::from_path(&path)
+            .unwrap()
+            .resolve(Some("antigravity/gemini"))
+            .unwrap()
+    };
+    assert_eq!(
+        resolved_with("min_interval_ms = 250").min_interval_ms,
+        Some(250)
+    );
+    assert_eq!(
+        resolved_with("min_interval_ms = 0").min_interval_ms,
+        Some(0),
+        "0 is a real value: pacing explicitly off, not the default"
+    );
+    assert_eq!(resolved_with("").min_interval_ms, None);
+
+    // Rejected on a non-antigravity auth mode, like `client_id`/`client_secret`.
+    for (source, profile, expected) in [
+        (
+            r#"
+[providers.cg]
+auth = "chatgpt"
+min_interval_ms = 100
+
+[models."cg/gpt"]
+model = "gpt"
+"#,
+            "cg/gpt",
+            "cannot set",
+        ),
+        (
+            r#"
+[providers.p1]
+base_url = "http://one"
+api_key_env = "PATH"
+min_interval_ms = 100
+
+[models."p1/m1"]
+model = "m1"
+"#,
+            "p1/m1",
+            "only auth = \"antigravity\" accepts",
+        ),
+    ] {
+        let path = write_config(temp.path(), source);
+        let error = Config::from_path(&path)
+            .unwrap()
+            .resolve(Some(profile))
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("min_interval_ms"), "{message}");
+        assert!(message.contains(expected), "{message}");
+    }
+}
+
+#[test]
 fn global_config_rejects_unknown_top_level_fields_and_sections() {
     let temp = tempfile::tempdir().unwrap();
     for source in [
@@ -1873,7 +2180,12 @@ fn global_config_rejects_unknown_top_level_fields_and_sections() {
     ] {
         let error = Config::from_path(&write_config(temp.path(), source)).unwrap_err();
         let error = format!("{error:#}");
-        assert!(error.contains("unknown field"), "{error}");
+        // B4: the path and the POSITION, never the decoder's excerpt (a config
+        // line can hold a credential) and never its quoted value.
+        assert!(error.contains("cannot parse config file"), "{error}");
+        assert!(error.contains("line "), "{error}");
+        assert!(!error.contains("spritesheet"), "{error}");
+        assert!(!error.contains("unexpected"), "{error}");
     }
 }
 
@@ -2004,10 +2316,10 @@ loop_ms = 1200
         "[pet]\nspritesheet = \"/tmp/maid.webp\"\ncolumns = 8\n",
     ))
     .unwrap_err();
-    assert!(
-        format!("{error:#}").contains("unknown field `columns`"),
-        "{error:#}"
-    );
+    let message = format!("{error:#}");
+    assert!(message.contains("cannot parse config file"), "{message}");
+    assert!(message.contains("line "), "{message}");
+    assert!(!message.contains("columns"), "{message}");
 }
 
 #[test]
@@ -2051,7 +2363,10 @@ fn merged_with_project_pet_replaces_global_wholesale() {
 
     std::fs::write(ws.join(".e-agent/config.toml"), "[pet]\nunknown = 1\n").unwrap();
     let error = global.merged_with_project(&ws).unwrap_err();
-    assert!(format!("{error:#}").contains("unknown field"), "{error:#}");
+    let message = format!("{error:#}");
+    assert!(message.contains("cannot parse project config"), "{message}");
+    assert!(message.contains("line "), "{message}");
+    assert!(!message.contains("unknown = 1"), "{message}");
 }
 
 #[test]
@@ -2223,7 +2538,10 @@ finalize_wait_secs = 1
 "#,
     );
     let error = Config::from_path(&path).unwrap_err();
-    assert!(format!("{error:#}").contains("unknown field"), "{error:#}");
+    let message = format!("{error:#}");
+    assert!(message.contains("cannot parse config file"), "{message}");
+    assert!(message.contains("line "), "{message}");
+    assert!(!message.contains("finalize_wait_secs"), "{message}");
 }
 
 #[test]
@@ -2918,7 +3236,10 @@ model = "k3"
             .unwrap_err();
         let error = format!("{error:#}");
         assert!(error.contains("cannot parse project config"), "{error}");
-        assert!(error.contains("unknown field"), "{error}");
+        // B4: the position, never the decoder's excerpt or its quoted value.
+        assert!(error.contains("line "), "{error}");
+        assert!(!error.contains("commad"), "{error}");
+        assert!(!error.contains("futur ="), "{error}");
     }
 }
 
@@ -3253,7 +3574,8 @@ fn sandbox_gpu_is_global_only() {
         .unwrap_err();
     let chain = format!("{error:#}");
     assert!(chain.contains("cannot parse project config"), "{chain}");
-    assert!(chain.contains("gpu"), "{chain}");
+    assert!(chain.contains("line "), "{chain}");
+    assert!(!chain.contains("gpu"), "{chain}");
 }
 
 #[test]
@@ -3714,6 +4036,38 @@ writable_paths = ["./p"]
         .0,
         "unknown"
     );
+}
+
+/// A relative or empty `XDG_CONFIG_HOME` is ignored (the XDG spec requires an
+/// absolute path), so a bogus value can never place e-agent's credential cache
+/// relative to the current directory.
+///
+/// The test never points `XDG_CONFIG_HOME` at a temp directory: the fallback it
+/// asserts is `$HOME/.config/e-agent`, so a concurrent non-locking reader (role
+/// discovery) keeps seeing the same config tree it sees with the variable
+/// unset. The absolute-value case is covered end-to-end by the roles and
+/// session-factory tests.
+#[test]
+fn config_dir_ignores_a_non_absolute_xdg_config_home() {
+    let _guard = crate::roles::XDG_TEST_LOCK.lock().unwrap();
+    let Some(home) = crate::home_dir() else {
+        return;
+    };
+    let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
+    for bogus in ["", "relative/dir", "./e-agent", "../e-agent"] {
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", bogus) };
+        assert_eq!(
+            crate::config::config_dir(),
+            Some(home.join(".config/e-agent")),
+            "XDG_CONFIG_HOME={bogus:?} must fall back to $HOME"
+        );
+    }
+    unsafe {
+        match old_xdg {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+    }
 }
 
 #[test]

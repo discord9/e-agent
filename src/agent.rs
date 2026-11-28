@@ -467,9 +467,45 @@ pub struct AssistantMessage {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
+    /// The provider's wire id. Private replay data: it is what the provider's
+    /// result must carry back, and it never leaves this process in a history
+    /// or event projection (see [`public_call_id`]).
     pub id: String,
     pub name: String,
     pub arguments: String,
+    /// Opaque, provider-owned round-trip blob for ONE call. Only the wire
+    /// that produced it may read it back; every other provider wire ignores
+    /// it (their request builders never serialize this field).
+    /// The Antigravity wire stores the `thoughtSignature` that accompanied
+    /// the `functionCall` part here, because echoing it back with that call
+    /// on the next request is mandatory (the API 400s with INVALID_ARGUMENT
+    /// otherwise). Persisted with the session like any other call field;
+    /// absent everywhere else. It is PRIVATE replay data: history/tool
+    /// projections strip it before a provider switch can show one wire's
+    /// signature to another model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_meta: Option<String>,
+}
+
+/// A stable, LOCAL correlation id for a tool call's public projection: the
+/// first 128 bits of SHA-256 over the provider wire id, as 32 hex characters.
+/// The wire id itself is provider-controlled text, and a provider switch must
+/// not carry it into another model's tool output; the digest still pairs a
+/// `ToolCall` event with its `ToolResult` across live, late-attach, and history
+/// projections.
+///
+/// The width is deliberate: this id is also a live answer key for an
+/// asynchronous question, and a 32-bit prefix could project two distinct wire
+/// ids onto one key. 128 bits makes such a collision unreachable in practice;
+/// the runner's pending-question registry still refuses to reuse the id as a
+/// second defense.
+pub(crate) fn public_call_id(wire_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(wire_id.as_bytes());
+    let prefix: [u8; 16] = digest[..16]
+        .try_into()
+        .expect("SHA-256 digest is longer than 16 bytes");
+    format!("call-{:032x}", u128::from_be_bytes(prefix))
 }
 
 /// Lifecycle status of the session's current goal. Serialized as the
@@ -2707,7 +2743,9 @@ impl Agent {
                 self.emit(AgentEvent::ToolCall {
                     name: call.name.clone(),
                     arguments: call.arguments.clone(),
-                    call_id: Some(call.id.clone()),
+                    // Public projection: the local correlation id, never the
+                    // provider-controlled wire id.
+                    call_id: Some(public_call_id(&call.id)),
                 });
                 let result = Self::execute_on(&self.tools, call).await;
                 if call.name == "get_background_tasks" && is_poll_guard_terminate(&result) {
@@ -2734,7 +2772,7 @@ impl Agent {
                     is_error,
                     content: content.clone(),
                     images: images.clone(),
-                    call_id: Some(call.id.clone()),
+                    call_id: Some(public_call_id(&call.id)),
                 });
                 self.push_message(Message::Tool {
                     call_id: call.id.clone(),

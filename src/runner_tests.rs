@@ -37,7 +37,7 @@ fn entry_event_projects_tool_images_for_durable_replay() {
     assert!(matches!(
         entry_event(&entry),
         Some(AgentEvent::ToolResult { is_error: false, content, images: projected, call_id: Some(call_id) })
-            if content == "persisted image result" && call_id == "call-image-replay" && projected == images
+            if content == "persisted image result" && call_id == crate::agent::public_call_id("call-image-replay") && projected == images
     ));
 }
 
@@ -275,6 +275,7 @@ impl Model for GoalInputModel {
                         id: "goal-input".into(),
                         name: "request_user_input".into(),
                         arguments: r#"{"questions":[{"id":"answer","prompt":"answer?"}]}"#.into(),
+                        provider_meta: None,
                     }],
                     reasoning: None,
                 },
@@ -310,6 +311,7 @@ impl Model for InputRecordingModel {
                     id: "call-input".into(),
                     name: "request_user_input".into(),
                     arguments: r#"{"questions":[{"id":"name","prompt":"Your name?"}]}"#.into(),
+                    provider_meta: None,
                 }],
                 reasoning: None,
             }
@@ -380,6 +382,7 @@ impl Model for TwoWaitModel {
             arguments: format!(
                 r#"{{"questions":[{{"id":"{question_id}","prompt":"question {question_id}"}}]}}"#
             ),
+            provider_meta: None,
         };
         let reply = match turn {
             0 => AssistantMessage {
@@ -539,7 +542,7 @@ async fn request_user_input_waits_answers_and_resumes_same_turn() {
         }
     }
     assert!(matches!(
-        handle.submit_prompt_with_call_id(Some("call-input".into()), "Ada".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("call-input")), "Ada".into()),
         PromptSubmission::Answered
     ));
     assert_eq!(
@@ -651,15 +654,18 @@ async fn wait_for_question(status: &mut watch::Receiver<SessionStatus>) -> UserI
     .unwrap_or_else(|_| panic!("no question surfaced; status={:?}", *status.borrow()))
 }
 
-/// Wait for the committed tool result event of `call_id`. The durable row is
-/// already written when it is emitted, so the store can be read right after.
+/// Wait for the committed tool result event of the wire call id `call_id`. The
+/// durable row is already written when it is emitted, so the store can be read
+/// right after. The EVENT carries the call's public projection (the local
+/// digest), while the persisted row keeps the wire id — hence the hash here.
 async fn wait_for_tool_result(events: &mut broadcast::Receiver<AgentEvent>, call_id: &str) {
+    let projected = crate::agent::public_call_id(call_id);
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             if let AgentEvent::ToolResult {
                 call_id: Some(id), ..
             } = events.recv().await.expect("the session emits events")
-                && id == call_id
+                && id == projected
             {
                 return;
             }
@@ -679,6 +685,7 @@ fn ask_tool_agent(answer: Arc<Mutex<Option<Option<String>>>>) -> Agent {
                         id: "call-ask".into(),
                         name: "ask_tool".into(),
                         arguments: "{}".into(),
+                        provider_meta: None,
                     }],
                     reasoning: None,
                 },
@@ -694,6 +701,112 @@ fn ask_tool_agent(answer: Arc<Mutex<Option<Option<String>>>>) -> Agent {
             answer,
         })],
     )
+}
+
+/// The question status and the call's events name ONE public id.
+///
+/// A provider wire id (Antigravity's `call_AG_wire_1`, the same shape an ACP
+/// transcript carries) is private replay data: the `WaitingInput` /
+/// `pending_questions` frame advertises the SAME digest the call's `ToolCall` /
+/// `ToolResult` events carry, that digest is what routes an answer, and the
+/// persisted transcript keeps the wire id.
+#[tokio::test]
+async fn question_status_and_events_share_one_public_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let wire = "call_AG_wire_1";
+    let agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: VecDeque::from(vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: wire.into(),
+                        name: "request_user_input".into(),
+                        arguments: r#"{"questions":[{"id":"name","prompt":"Your name?"}]}"#.into(),
+                        provider_meta: Some("sig".into()),
+                    }],
+                    reasoning: None,
+                },
+                assistant_reply("hello Ada"),
+            ]),
+        }),
+        vec![
+            Box::new(crate::tools::user_input::RequestUserInput),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "public-question-id".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let runner = runner.with_user_input_allowed();
+    let (_, mut events, mut status) = handle.attach();
+    let task = runner.start(Some("start".into()));
+
+    let request = wait_for_question(&mut status).await;
+    let public = question_id(wire);
+    assert_eq!(
+        request.call_id, public,
+        "the frame names the call's public projection"
+    );
+    // Both status shapes serialize exactly this field (`WaitingInput.call_id`
+    // as itself, `pending_questions[].call_id` through the struct), so the
+    // wire payload cannot disagree with the event below.
+    assert_eq!(
+        serde_json::to_value(&request).unwrap()["call_id"],
+        serde_json::json!(public)
+    );
+    assert!(
+        !serde_json::to_string(&request).unwrap().contains(wire),
+        "the provider wire id never reaches a status frame: {:?}",
+        serde_json::to_string(&request).unwrap()
+    );
+    assert!(
+        handle.snapshot().iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolCall { name, call_id: Some(call_id), .. }
+                if name == "request_user_input" && call_id == &public
+        )),
+        "the tool event carries the same digest: {:?}",
+        handle.snapshot()
+    );
+
+    // The wire id is not an answer key; the public digest is.
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some(wire.into()), "Ada".into()),
+        PromptSubmission::Conflict,
+        "answering by the provider wire id must not claim the question"
+    );
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some(public.clone()), "Ada".into()),
+        PromptSubmission::Answered
+    );
+    wait_for_tool_result(&mut events, wire).await;
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "hello Ada"),
+    )
+    .await;
+    drop(task);
+
+    // The transcript is the one place the wire id survives.
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "public-question-id")
+        .await
+        .unwrap()
+        .entries;
+    match tool_entries(&entries)[0] {
+        Message::Tool {
+            call_id, content, ..
+        } => {
+            assert_eq!(call_id, wire, "the persisted row keeps the wire id");
+            assert!(content.contains("Ada"), "{content}");
+        }
+        other => panic!("expected the tool result, got {other:?}"),
+    }
 }
 
 /// A tool's mid-call question parks the turn through the SAME frontend as
@@ -864,6 +977,7 @@ async fn a_second_mid_call_ask_is_refused_while_the_first_is_still_queued() {
                         id: "call-double".into(),
                         name: "double_ask".into(),
                         arguments: "{}".into(),
+                        provider_meta: None,
                     }],
                     reasoning: None,
                 },
@@ -994,6 +1108,7 @@ async fn blocking_option_question_answer_reaches_the_model_with_id_and_label() {
                         id: "call-opt".into(),
                         name: "request_user_input".into(),
                         arguments: r#"{"questions":[{"id":"perm","prompt":"Allow?","options":[{"id":"allow-once","label":"允许一次"},{"id":"deny","label":"拒绝","description":"仅此一次"}]}]}"#.into(),
+                        provider_meta: None,
                     }],
                     reasoning: None,
                 },
@@ -1025,22 +1140,22 @@ async fn blocking_option_question_answer_reaches_the_model_with_id_and_label() {
     .await;
     match waiting {
         SessionStatus::WaitingInput(request) => {
-            assert_eq!(request.call_id, "call-opt");
+            assert_eq!(request.call_id, question_id("call-opt"));
             assert_eq!(request.questions[0].options.len(), 2);
         }
         other => panic!("expected WaitingInput, got {other:?}"),
     }
     assert!(matches!(
-        handle.submit_prompt_with_call_id(Some("call-opt".into()), "allow".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("call-opt")), "allow".into()),
         PromptSubmission::Invalid(error) if error.contains("allow-once") && error.contains("deny")
     ));
     assert!(
-        matches!(&*status.borrow(), SessionStatus::WaitingInput(request) if request.call_id == "call-opt"),
+        matches!(&*status.borrow(), SessionStatus::WaitingInput(request) if request.call_id == question_id("call-opt")),
         "a rejected id leaves the turn parked: {:?}",
         *status.borrow()
     );
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("call-opt".into()), "deny".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("call-opt")), "deny".into()),
         PromptSubmission::Answered
     );
     wait_for_log_event(
@@ -1207,6 +1322,120 @@ fn free_text_answer_still_accepts_any_non_empty_text() {
     }
 }
 
+/// Two asynchronous questions are two live answer keys: registering the
+/// second must never evict the first, each answers under the public id its
+/// client was shown (in either order), and the provider wire id stays private
+/// replay data — never an answer key.
+#[test]
+fn two_pending_async_questions_stay_answerable_under_their_public_ids() {
+    let (handle, emitter, mut commands) = crate::runner::session_test_channel();
+    let first = UserInputRequest {
+        call_id: question_id("wire-first"),
+        questions: vec![UserQuestion {
+            id: "first".into(),
+            prompt: "First?".into(),
+            options: Vec::new(),
+        }],
+    };
+    let second = UserInputRequest {
+        call_id: question_id("wire-second"),
+        questions: vec![UserQuestion {
+            id: "second".into(),
+            prompt: "Second?".into(),
+            options: Vec::new(),
+        }],
+    };
+    assert!(emitter.register_pending_question(first.clone()));
+    assert!(emitter.register_pending_question(second.clone()));
+    let pending = handle.pending_questions();
+    assert_eq!(pending.len(), 2, "{pending:?}");
+    assert!(pending.contains(&first) && pending.contains(&second));
+    // Answering with the wire id is refused in both shapes.
+    for wire in ["wire-first", "wire-second"] {
+        assert_eq!(
+            handle.submit_prompt_with_call_id(Some(wire.into()), "Ada".into()),
+            PromptSubmission::Conflict,
+            "{wire} must not be an answer key"
+        );
+    }
+    assert!(commands.try_recv().is_err());
+    // The FIRST question is still answerable after the second registered.
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some(first.call_id.clone()), "Ada".into()),
+        PromptSubmission::Answered
+    );
+    match commands.try_recv().unwrap() {
+        SessionCommand::Answer {
+            call_id,
+            answers,
+            option,
+        } => {
+            assert_eq!(call_id, first.call_id);
+            assert_eq!(option, None);
+            assert_eq!(answers, vec![("first".to_owned(), "Ada".to_owned())]);
+        }
+        _ => panic!("expected the first question's answer command"),
+    }
+    // The second keeps its own id and is answerable too.
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some(second.call_id.clone()), "Grace".into()),
+        PromptSubmission::Answered
+    );
+    match commands.try_recv().unwrap() {
+        SessionCommand::Answer {
+            call_id, answers, ..
+        } => {
+            assert_eq!(call_id, second.call_id);
+            assert_eq!(answers, vec![("second".to_owned(), "Grace".to_owned())]);
+        }
+        _ => panic!("expected the second question's answer command"),
+    }
+}
+
+/// A live answer key is never reassigned: registering another question under a
+/// public id that is already pending is refused, the map is untouched, and the
+/// id still answers the FIRST question a client is showing.
+#[test]
+fn registering_a_live_public_id_is_refused_and_keeps_the_first_question() {
+    let (handle, emitter, mut commands) = crate::runner::session_test_channel();
+    let public_id = question_id("wire-shared");
+    let first = UserInputRequest {
+        call_id: public_id.clone(),
+        questions: vec![UserQuestion {
+            id: "first".into(),
+            prompt: "First?".into(),
+            options: Vec::new(),
+        }],
+    };
+    let second = UserInputRequest {
+        call_id: public_id.clone(),
+        questions: vec![UserQuestion {
+            id: "second".into(),
+            prompt: "Second?".into(),
+            options: Vec::new(),
+        }],
+    };
+    assert!(emitter.register_pending_question(first.clone()));
+    assert!(
+        !emitter.register_pending_question(second),
+        "a pending public id must refuse a second question"
+    );
+    assert_eq!(handle.pending_questions(), vec![first.clone()]);
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some(public_id.clone()), "Ada".into()),
+        PromptSubmission::Answered
+    );
+    match commands.try_recv().unwrap() {
+        SessionCommand::Answer {
+            call_id, answers, ..
+        } => {
+            assert_eq!(call_id, public_id, "the id answers the first question");
+            assert_eq!(answers, vec![("first".to_owned(), "Ada".to_owned())]);
+        }
+        _ => panic!("expected the first question's answer command"),
+    }
+}
+
 /// A question with options serializes them; one without serializes exactly as
 /// before (no empty `options` key), which is what the frontends and the
 /// status payload rely on.
@@ -1285,6 +1514,7 @@ async fn request_user_input_without_a_frontend_errors_and_never_waits() {
                         id: "call-input".into(),
                         name: "request_user_input".into(),
                         arguments: r#"{"questions":[{"id":"name","prompt":"Your name?"}]}"#.into(),
+                        provider_meta: None,
                     }],
                     reasoning: None,
                 },
@@ -1322,7 +1552,7 @@ async fn request_user_input_without_a_frontend_errors_and_never_waits() {
         handle.snapshot().iter().any(|event| matches!(
             event,
             AgentEvent::ToolResult { is_error: true, content, call_id: Some(call_id), .. }
-                if call_id == "call-input" && content == USER_INPUT_UNAVAILABLE
+                if call_id == &crate::agent::public_call_id("call-input") && content == USER_INPUT_UNAVAILABLE
         )),
         "the question must come back as a plain tool error: {:?}",
         handle.snapshot()
@@ -1336,7 +1566,7 @@ async fn request_user_input_without_a_frontend_errors_and_never_waits() {
     // No WaitingInput claim was ever registered for that call id, so an
     // "answer" is rejected instead of being consumed by a parked turn.
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("call-input".into()), "Ada".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("call-input")), "Ada".into()),
         PromptSubmission::Conflict
     );
     let entries = SessionStore::Jsonl
@@ -1500,7 +1730,7 @@ async fn web_attach_while_waiting_input_returns_before_answer() {
     assert!(matches!(attach.status, SessionStatus::WaitingInput(_)));
     assert!(attach.entries.iter().any(|entry| matches!(entry, SessionEntry::Message { message: Message::User { content, .. } } if content == "start")));
     assert!(matches!(
-        handle.submit_prompt_with_call_id(Some("call-input".into()), "Ada".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("call-input")), "Ada".into()),
         PromptSubmission::Answered
     ));
     drop(task);
@@ -1529,7 +1759,7 @@ async fn request_user_input_twice_rejects_stale_first_call_id() {
     let mut status = handle.status();
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
-            if matches!(&*status.borrow(), SessionStatus::WaitingInput(request) if request.call_id == "call-a") {
+            if matches!(&*status.borrow(), SessionStatus::WaitingInput(request) if request.call_id == question_id("call-a")) {
                 break;
             }
             status.changed().await.unwrap();
@@ -1538,12 +1768,12 @@ async fn request_user_input_twice_rejects_stale_first_call_id() {
     .await
     .unwrap();
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("call-a".into()), "answer-a".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("call-a")), "answer-a".into()),
         PromptSubmission::Answered
     );
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
-            if matches!(&*status.borrow(), SessionStatus::WaitingInput(request) if request.call_id == "call-b") {
+            if matches!(&*status.borrow(), SessionStatus::WaitingInput(request) if request.call_id == question_id("call-b")) {
                 break;
             }
             status.changed().await.unwrap();
@@ -1552,15 +1782,15 @@ async fn request_user_input_twice_rejects_stale_first_call_id() {
     .await
     .unwrap();
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("call-a".into()), "stale-answer".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("call-a")), "stale-answer".into()),
         PromptSubmission::Conflict
     );
     assert!(matches!(
         &*status.borrow(),
-        SessionStatus::WaitingInput(request) if request.call_id == "call-b"
+        SessionStatus::WaitingInput(request) if request.call_id == question_id("call-b")
     ));
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("call-b".into()), "answer-b".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("call-b")), "answer-b".into()),
         PromptSubmission::Answered
     );
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -1652,7 +1882,7 @@ async fn request_user_input_answer_claim_wins_then_cancel_commits_once() {
         status.changed().await.unwrap();
     }
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("call-input".into()), "Ada".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("call-input")), "Ada".into()),
         PromptSubmission::Answered
     );
     handle.cancel();
@@ -1702,7 +1932,7 @@ async fn request_user_input_cancel_claim_wins_then_answer_conflicts() {
     }
     handle.cancel();
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("call-input".into()), "late".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("call-input")), "late".into()),
         PromptSubmission::Conflict
     );
     loop {
@@ -1763,7 +1993,7 @@ async fn request_user_input_cancel_discards_goal_continue_until_fresh_continue()
     handle.continue_goal(None);
     handle.cancel();
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("goal-input".into()), "late".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("goal-input")), "late".into()),
         PromptSubmission::Conflict
     );
     wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)).await;
@@ -1833,8 +2063,10 @@ async fn request_user_input_channel_close_exits_without_answer() {
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 /// The pinned receipt text an asynchronous call returns immediately (the
-/// production string is intentionally not shared with this assertion).
+/// production string is intentionally not shared with this assertion). The id
+/// it names is the call's LOCAL digest: these are public, persisted strings.
 fn async_receipt(call_id: &str) -> String {
+    let call_id = crate::agent::public_call_id(call_id);
     format!(
         "question {call_id} asked; you may continue. The answer will arrive later as a user \
          message with the original question."
@@ -1843,7 +2075,16 @@ fn async_receipt(call_id: &str) -> String {
 
 /// The pinned user-shaped Notice one accepted answer commits.
 fn answer_notice(call_id: &str, prompt: &str, answer: &str) -> String {
+    let call_id = crate::agent::public_call_id(call_id);
     format!("[question {call_id}]\nQuestion: {prompt}\n[answer]\n{answer}")
+}
+
+/// The PUBLIC id a `request_user_input` question is published and answered
+/// under: the wire call's projected digest, NOT the provider's wire id (that
+/// one stays in the persisted transcript). Written as a call, never as a
+/// literal, so a test cannot quietly keep answering by the wire id.
+fn question_id(wire_id: &str) -> String {
+    crate::agent::public_call_id(wire_id)
 }
 
 fn async_question_call(call_id: &str, question_id: &str, prompt: &str) -> AssistantMessage {
@@ -1855,6 +2096,7 @@ fn async_question_call(call_id: &str, question_id: &str, prompt: &str) -> Assist
             arguments: format!(
                 r#"{{"async":true,"questions":[{{"id":"{question_id}","prompt":"{prompt}"}}]}}"#
             ),
+            provider_meta: None,
         }],
         reasoning: None,
     }
@@ -1867,6 +2109,7 @@ fn blocking_tool_call(call_id: &str, name: &str) -> AssistantMessage {
             id: call_id.into(),
             name: name.into(),
             arguments: "{}".into(),
+            provider_meta: None,
         }],
         reasoning: None,
     }
@@ -1947,7 +2190,7 @@ async fn async_request_user_input_receipts_and_keeps_the_turn_going() {
         handle.snapshot().iter().any(|event| matches!(
             event,
             AgentEvent::ToolResult { is_error: false, content, call_id: Some(call_id), .. }
-                if call_id == "call-async" && content == &async_receipt("call-async")
+                if call_id == &crate::agent::public_call_id("call-async") && content == &async_receipt("call-async")
         )),
         "the async call must return its receipt: {:?}",
         handle.snapshot()
@@ -1960,7 +2203,7 @@ async fn async_request_user_input_receipts_and_keeps_the_turn_going() {
     assert_eq!(
         handle.pending_questions(),
         vec![UserInputRequest {
-            call_id: "call-async".into(),
+            call_id: question_id("call-async"),
             questions: vec![UserQuestion {
                 id: "name".into(),
                 prompt: "Your name?".into(),
@@ -2029,11 +2272,11 @@ async fn async_answer_while_the_turn_runs_lands_in_the_next_request() {
     // The turn is in flight (its tool batch is executing) when the answer
     // arrives, so this is the running-session path, not an idle new turn.
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("call-async".into()), "Ada".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("call-async")), "Ada".into()),
         PromptSubmission::Answered
     );
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("call-async".into()), "Ada".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("call-async")), "Ada".into()),
         PromptSubmission::Conflict
     );
     release.notify_one();
@@ -2121,7 +2364,7 @@ async fn async_answer_while_idle_opens_a_turn_with_the_notice() {
     wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)).await;
     assert_eq!(handle.pending_questions().len(), 1);
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("call-async".into()), "Ada".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("call-async")), "Ada".into()),
         PromptSubmission::Answered
     );
     // The start turn already used two provider calls (question + final
@@ -2139,7 +2382,7 @@ async fn async_answer_while_idle_opens_a_turn_with_the_notice() {
     );
     // The claim is one-shot: answering twice cannot commit a second Notice.
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("call-async".into()), "Ada".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("call-async")), "Ada".into()),
         PromptSubmission::Conflict
     );
     wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)).await;
@@ -2189,20 +2432,24 @@ async fn async_answers_arrive_out_of_order_without_cross_talk() {
     )
     .await;
     wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)).await;
+    // The frame is ordered by the published id, which is now a digest: the
+    // pair is what matters, not the wire ids' own ordering.
+    let mut expected = vec![question_id("call-a"), question_id("call-b")];
+    expected.sort();
     assert_eq!(
         handle
             .pending_questions()
             .iter()
-            .map(|request| request.call_id.as_str())
+            .map(|request| request.call_id.clone())
             .collect::<Vec<_>>(),
-        vec!["call-a", "call-b"]
+        expected
     );
     // Out of order: the second question is answered first. Each answer
     // commits its own Notice (the durable event is the sync point).
     let notice_b = answer_notice("call-b", "question b", "answer-b");
     let notice_a = answer_notice("call-a", "question a", "answer-a");
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("call-b".into()), "answer-b".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("call-b")), "answer-b".into()),
         PromptSubmission::Answered
     );
     wait_for_log_event(
@@ -2211,7 +2458,7 @@ async fn async_answers_arrive_out_of_order_without_cross_talk() {
     )
     .await;
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("call-a".into()), "answer-a".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("call-a")), "answer-a".into()),
         PromptSubmission::Answered
     );
     wait_for_log_event(
@@ -2278,7 +2525,7 @@ async fn async_answer_requires_the_open_call_id_and_commits_once() {
         PromptSubmission::Conflict
     );
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("call-async".into()), "  ".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("call-async")), "  ".into()),
         PromptSubmission::Conflict,
         "an empty answer leaves the question answerable"
     );
@@ -2289,11 +2536,11 @@ async fn async_answer_requires_the_open_call_id_and_commits_once() {
         "an absent call id is never an asynchronous answer"
     );
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("call-async".into()), "Ada".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("call-async")), "Ada".into()),
         PromptSubmission::Answered
     );
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("call-async".into()), "Ada".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("call-async")), "Ada".into()),
         PromptSubmission::Conflict
     );
     wait_for_log_event(&handle, |event| {
@@ -2354,7 +2601,7 @@ async fn async_request_user_input_without_a_frontend_registers_nothing() {
         handle.snapshot().iter().any(|event| matches!(
             event,
             AgentEvent::ToolResult { is_error: true, content, call_id: Some(call_id), .. }
-                if call_id == "call-async" && content == USER_INPUT_UNAVAILABLE
+                if call_id == &crate::agent::public_call_id("call-async") && content == USER_INPUT_UNAVAILABLE
         )),
         "the async call must fail back as the existing tool error: {:?}",
         handle.snapshot()
@@ -2364,7 +2611,7 @@ async fn async_request_user_input_without_a_frontend_registers_nothing() {
         "no frontend may register a question nobody can answer"
     );
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("call-async".into()), "Ada".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("call-async")), "Ada".into()),
         PromptSubmission::Conflict
     );
     wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)).await;
@@ -2445,7 +2692,7 @@ async fn async_questions_are_memory_only_across_restart() {
     );
     assert!(resumed.pending_questions().is_empty());
     assert_eq!(
-        resumed.submit_prompt_with_call_id(Some("call-async".into()), "Ada".into()),
+        resumed.submit_prompt_with_call_id(Some(question_id("call-async")), "Ada".into()),
         PromptSubmission::Conflict
     );
 }
@@ -2505,11 +2752,13 @@ async fn async_answer_during_requested_compaction_lands_in_the_next_request() {
                             name: "request_user_input".into(),
                             arguments: r#"{"async":true,"questions":[{"id":"q","prompt":"Q?"}]}"#
                                 .into(),
+                            provider_meta: None,
                         },
                         ToolCall {
                             id: "compact".into(),
                             name: "request_compaction".into(),
                             arguments: "{}".into(),
+                            provider_meta: None,
                         },
                     ],
                     reasoning: None,
@@ -2538,7 +2787,7 @@ async fn async_answer_during_requested_compaction_lands_in_the_next_request() {
     let task = runner.start(Some("start".into()));
     entered.notified().await;
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("ask1".into()), "A".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("ask1")), "A".into()),
         PromptSubmission::Answered
     );
     release.notify_one();
@@ -2551,11 +2800,14 @@ async fn async_answer_during_requested_compaction_lands_in_the_next_request() {
         let calls = calls.lock().unwrap();
         // [0] initial round, [1] requested compaction, [2] next regular request.
         assert!(calls.len() >= 3, "model calls: {}", calls.len());
+        // The Notice names the call's LOCAL digest, never the wire id it was
+        // answered by.
+        let notice = format!("[question {}]", crate::agent::public_call_id("ask1"));
         assert!(
             calls[2].iter().any(|message| matches!(
                 message,
                 Message::User { content, .. }
-                    if content.contains("[question ask1]") && content.contains("[answer]\nA")
+                    if content.contains(&notice) && content.contains("[answer]\nA")
             )),
             "the answer Notice must precede the next regular request: {:?}",
             calls[2]
@@ -2571,6 +2823,7 @@ fn persisted_request_user_input_call_is_repaired_on_resume_not_waiting() {
         id: "resume-call".into(),
         name: "request_user_input".into(),
         arguments: r#"{"questions":[{"id":"x","prompt":"x"}]}"#.into(),
+        provider_meta: None,
     };
     let mut agent = Agent::new(
         Box::new(NamedRecordingModel {
@@ -3963,6 +4216,7 @@ async fn image_rejection_omissions_stay_cached_for_the_tool_loop_and_later_turns
                         id: "call-keep".into(),
                         name: "keep_alive".into(),
                         arguments: "{}".into(),
+                        provider_meta: None,
                     }],
                     reasoning: None,
                 },
@@ -5544,6 +5798,7 @@ async fn get_context_usage_saturates_extreme_utilization() {
                             id: "usage".into(),
                             name: "get_context_usage".into(),
                             arguments: "{}".into(),
+                            provider_meta: None,
                         }],
                         reasoning: None,
                     },
@@ -5607,11 +5862,13 @@ async fn get_context_usage_reports_previous_regular_usage_in_a_mixed_batch() {
                                 id: "usage".into(),
                                 name: "get_context_usage".into(),
                                 arguments: "{}".into(),
+                                provider_meta: None,
                             },
                             ToolCall {
                                 id: "request".into(),
                                 name: "request_compaction".into(),
                                 arguments: "{}".into(),
+                                provider_meta: None,
                             },
                         ],
                         reasoning: None,
@@ -5704,6 +5961,7 @@ async fn auto_compaction_satisfies_request_compaction_without_a_second_summary()
                             id: "request".into(),
                             name: "request_compaction".into(),
                             arguments: "{}".into(),
+                            provider_meta: None,
                         }],
                         reasoning: None,
                     },
@@ -5780,26 +6038,31 @@ async fn request_compaction_pairs_every_call_then_compacts_once_after_the_batch(
                             id: "first".into(),
                             name: "keep_alive".into(),
                             arguments: "{}".into(),
+                            provider_meta: None,
                         },
                         ToolCall {
                             id: "request-1".into(),
                             name: "request_compaction".into(),
                             arguments: "{}".into(),
+                            provider_meta: None,
                         },
                         ToolCall {
                             id: "middle".into(),
                             name: "keep_alive".into(),
                             arguments: "{}".into(),
+                            provider_meta: None,
                         },
                         ToolCall {
                             id: "request-2".into(),
                             name: "request_compaction".into(),
                             arguments: "{}".into(),
+                            provider_meta: None,
                         },
                         ToolCall {
                             id: "last".into(),
                             name: "keep_alive".into(),
                             arguments: "{}".into(),
+                            provider_meta: None,
                         },
                     ],
                     reasoning: None,
@@ -5895,11 +6158,13 @@ async fn request_compaction_is_superseded_by_queued_human_prompt_after_siblings(
                                 id: "request".into(),
                                 name: "request_compaction".into(),
                                 arguments: "{}".into(),
+                                provider_meta: None,
                             },
                             ToolCall {
                                 id: "sibling".into(),
                                 name: "read_image".into(),
                                 arguments: "{}".into(),
+                                provider_meta: None,
                             },
                         ],
                         reasoning: None,
@@ -5986,11 +6251,13 @@ async fn request_compaction_is_superseded_by_queued_goal_after_siblings() {
                         id: "request".into(),
                         name: "request_compaction".into(),
                         arguments: "{}".into(),
+                        provider_meta: None,
                     },
                     ToolCall {
                         id: "sibling".into(),
                         name: "read_image".into(),
                         arguments: "{}".into(),
+                        provider_meta: None,
                     },
                 ],
                 reasoning: None,
@@ -6068,6 +6335,7 @@ async fn requested_compaction_singletask_resume_keeps_pair_and_summary_constrain
                         id: "request".into(),
                         name: "request_compaction".into(),
                         arguments: "{}".into(),
+                        provider_meta: None,
                     }],
                     reasoning: None,
                 },
@@ -6102,6 +6370,7 @@ async fn requested_compaction_singletask_resume_keeps_pair_and_summary_constrain
                     id: format!("tool-{index}"),
                     name: "keep_alive".into(),
                     arguments: "{}".into(),
+                    provider_meta: None,
                 }],
                 reasoning: None,
             })
@@ -6178,6 +6447,7 @@ async fn cancel_during_requested_compaction_keeps_request_result_and_queued_prom
                         id: "request".into(),
                         name: "request_compaction".into(),
                         arguments: "{}".into(),
+                        provider_meta: None,
                     }],
                     reasoning: None,
                 },
@@ -6250,6 +6520,7 @@ async fn invalid_request_compaction_arguments_pair_an_error_without_compacting()
                         id: "bad-request".into(),
                         name: "request_compaction".into(),
                         arguments: r#"{"tokens": 12}"#.into(),
+                        provider_meta: None,
                     }],
                     reasoning: None,
                 },
@@ -6334,6 +6605,7 @@ async fn completed_tool_result_is_committed_before_stale_cancel() {
                     id: "call-1".into(),
                     name: "cancel_tool".into(),
                     arguments: "{}".into(),
+                    provider_meta: None,
                 }],
                 reasoning: None,
             }]
@@ -6412,7 +6684,8 @@ async fn mid_turn_auto_compact_before_tool_result_pairs_real_result() {
                             id: "call-1".into(),
                             name: "keep_alive".into(),
                             arguments: "{}".into(),
-                        }],
+                                                    provider_meta: None,
+}],
                         reasoning: None,
                     },
                     // 80% of the 1000-token window: triggers the in-turn
@@ -6522,7 +6795,7 @@ async fn mid_turn_auto_compact_before_tool_result_pairs_real_result() {
     let tool_call_at = log
         .iter()
         .position(|event| {
-            matches!(event, AgentEvent::ToolCall { call_id: Some(id), .. } if id == "call-1")
+            matches!(event, AgentEvent::ToolCall { call_id: Some(id), .. } if id == &crate::agent::public_call_id("call-1"))
         })
         .expect("the committed assistant's tool call is published");
     let compacted_at = log
@@ -6538,7 +6811,7 @@ async fn mid_turn_auto_compact_before_tool_result_pairs_real_result() {
     assert_eq!(
         log.iter()
             .filter(|event| {
-                matches!(event, AgentEvent::ToolCall { call_id: Some(id), .. } if id == "call-1")
+                matches!(event, AgentEvent::ToolCall { call_id: Some(id), .. } if id == &crate::agent::public_call_id("call-1"))
             })
             .count(),
         1,
@@ -6662,7 +6935,8 @@ async fn successful_auto_compact_resets_latch_and_fires_again_on_next_big_round(
                             id: "call-1".into(),
                             name: "keep_alive".into(),
                             arguments: "{}".into(),
-                        }],
+                                                    provider_meta: None,
+}],
                         reasoning: None,
                     },
                     Some(Usage {
@@ -6694,7 +6968,8 @@ async fn successful_auto_compact_resets_latch_and_fires_again_on_next_big_round(
                                 id: format!("call-2-{index}"),
                                 name: "keep_alive".into(),
                                 arguments: "{}".into(),
-                            })
+                                                            provider_meta: None,
+})
                             .collect(),
                         reasoning: None,
                     },
@@ -7108,6 +7383,7 @@ async fn runner_commits_image_bearing_tool_and_strips_requests_without_vision() 
                             id: "call-img".into(),
                             name: "read_image".into(),
                             arguments: r#"{"path":"pic.png"}"#.into(),
+                            provider_meta: None,
                         }],
                         reasoning: None,
                     },
@@ -7248,6 +7524,7 @@ async fn runner_durable_before_ref_for_oversized_tool_content() {
                             id: "call-huge".into(),
                             name: "huge".into(),
                             arguments: r#"{}"#.into(),
+                            provider_meta: None,
                         }],
                         reasoning: None,
                     },
@@ -7354,6 +7631,7 @@ async fn runner_commits_image_bearing_tool_with_vision_model() {
                                 id: "call-img".into(),
                                 name: "read_image".into(),
                                 arguments: r#"{"path":"pic.png"}"#.into(),
+                                provider_meta: None,
                             }],
                             reasoning: None,
                         },
@@ -7450,6 +7728,7 @@ async fn switch_to_non_vision_during_read_image_strips_request() {
                     id: "call-img".into(),
                     name: "read_image".into(),
                     arguments: r#"{"path":"pic.png"}"#.into(),
+                    provider_meta: None,
                 }],
                 reasoning: None,
             },
@@ -7563,6 +7842,7 @@ async fn switch_to_vision_during_read_image_keeps_history_image_and_serves_it() 
                     id: "call-img".into(),
                     name: "read_image".into(),
                     arguments: r#"{"path":"pic.png"}"#.into(),
+                    provider_meta: None,
                 }],
                 reasoning: None,
             },
@@ -8086,6 +8366,7 @@ fn background_bash_call(command: &str, detached: bool) -> ToolCall {
         id: "call-1".into(),
         name: "bash".into(),
         arguments: arguments.to_string(),
+        provider_meta: None,
     }
 }
 
@@ -8348,6 +8629,7 @@ fn reminder_bash_call(id: &str) -> ToolCall {
         id: id.into(),
         name: "bash".into(),
         arguments: "{}".into(),
+        provider_meta: None,
     }
 }
 
@@ -8356,6 +8638,7 @@ fn reminder_echo_call(id: &str) -> ToolCall {
         id: id.into(),
         name: "echo".into(),
         arguments: "{}".into(),
+        provider_meta: None,
     }
 }
 
@@ -8583,6 +8866,7 @@ async fn background_reminder_reaches_the_next_request_once_without_waking_the_tu
                             arguments:
                                 serde_json::json!({"command": gated_bash_command(temp.path())})
                                     .to_string(),
+                            provider_meta: None,
                         }],
                         reasoning: None,
                     },
@@ -8597,6 +8881,7 @@ async fn background_reminder_reaches_the_next_request_once_without_waking_the_tu
                             name: "bash".into(),
                             arguments: serde_json::json!({"command": "printf independent"})
                                 .to_string(),
+                            provider_meta: None,
                         }],
                         reasoning: None,
                     },
@@ -9707,6 +9992,7 @@ async fn steer_release_during_tool_keeps_next_provider_context_legal() {
                             id: "call-1".into(),
                             name: "blocker".into(),
                             arguments: "{}".into(),
+                            provider_meta: None,
                         }],
                         reasoning: None,
                     },
@@ -9966,6 +10252,7 @@ async fn steer_release_during_tool_without_queued_prompt_finish_when_idle_finali
                     id: "call-1".into(),
                     name: "blocker".into(),
                     arguments: "{}".into(),
+                    provider_meta: None,
                 }],
                 reasoning: None,
             }]
@@ -10831,6 +11118,7 @@ async fn history_runner_binds_only_its_current_session() {
                             "limit": 100,
                         })
                         .to_string(),
+                        provider_meta: None,
                     }],
                     reasoning: None,
                 },
@@ -10952,6 +11240,7 @@ async fn assert_read_only_runner_cancel_while_sqlite_read_pending(read_output: b
                         id: "pending-read".into(),
                         name: name.into(),
                         arguments: arguments.clone(),
+                        provider_meta: None,
                     }],
                     reasoning: None,
                 },
@@ -10961,6 +11250,7 @@ async fn assert_read_only_runner_cancel_while_sqlite_read_pending(read_output: b
                         id: "keep-alive".into(),
                         name: "keep_alive".into(),
                         arguments: "{}".into(),
+                        provider_meta: None,
                     }],
                     reasoning: None,
                 },
@@ -11037,7 +11327,7 @@ async fn assert_read_only_runner_cancel_while_sqlite_read_pending(read_output: b
         handle.snapshot()
     );
     assert!(!handle.snapshot().iter().any(|event| matches!(
-        event, AgentEvent::ToolResult { call_id: Some(id), .. } if id == "pending-read"
+        event, AgentEvent::ToolResult { call_id: Some(id), .. } if id == &crate::agent::public_call_id("pending-read")
     )));
     drop(held.lock().unwrap().take());
     handle.prompt("resume after cancel");
@@ -11142,6 +11432,7 @@ async fn history_runner_search_session_scope_finds_marker_older_than_100_entries
                             "limit": 20,
                         })
                         .to_string(),
+                        provider_meta: None,
                     }],
                     reasoning: None,
                 },
@@ -11222,6 +11513,7 @@ async fn update_goal_tool_cas_updates_and_completes_with_evidence() {
                         "id": id, "revision": rev1, "action": "progress", "progress": "core done"
                     })
                     .to_string(),
+                    provider_meta: None,
                 }],
                 reasoning: None,
             },
@@ -11235,6 +11527,7 @@ async fn update_goal_tool_cas_updates_and_completes_with_evidence() {
                         "evidence": ["unverified: analysis passed"]
                     })
                     .to_string(),
+                    provider_meta: None,
                 }],
                 reasoning: None,
             },
@@ -11247,6 +11540,7 @@ async fn update_goal_tool_cas_updates_and_completes_with_evidence() {
                         "id": id, "revision": rev1, "action": "pause"
                     })
                     .to_string(),
+                    provider_meta: None,
                 }],
                 reasoning: None,
             },
@@ -11316,6 +11610,7 @@ async fn goal_tools_are_isolated_per_session_fresh_session_has_no_goal() {
                     id: "c1".into(),
                     name: "update_goal".into(),
                     arguments: r#"{"id":"goal-x","revision":1,"action":"pause"}"#.into(),
+                    provider_meta: None,
                 }],
                 reasoning: None,
             },
@@ -11390,6 +11685,7 @@ impl Model for GoalRoundTripModel {
                         id: "c1".into(),
                         name: "get_goal".into(),
                         arguments: "{}".into(),
+                        provider_meta: None,
                     }],
                     reasoning: None,
                 },
@@ -11456,6 +11752,7 @@ impl Model for GoalRoundTripModel {
                             "progress": "round trip"
                         })
                         .to_string(),
+                        provider_meta: None,
                     }],
                     reasoning: None,
                 },
@@ -11558,6 +11855,7 @@ async fn update_goal_rejects_wrong_typed_criteria_and_evidence() {
                         "success_criteria": ["ok", 42]
                     })
                     .to_string(),
+                    provider_meta: None,
                 }],
                 reasoning: None,
             },
@@ -11571,6 +11869,7 @@ async fn update_goal_rejects_wrong_typed_criteria_and_evidence() {
                         "evidence": "not-an-array"
                     })
                     .to_string(),
+                    provider_meta: None,
                 }],
                 reasoning: None,
             },
@@ -11659,6 +11958,7 @@ async fn update_goal_rejects_unknown_fields_without_commit() {
                         "sucess_criteria": ["typo"]
                     })
                     .to_string(),
+                    provider_meta: None,
                 }],
                 reasoning: None,
             },
@@ -11672,6 +11972,7 @@ async fn update_goal_rejects_unknown_fields_without_commit() {
                         "bogus": {"nested": true}, "extra": 1
                     })
                     .to_string(),
+                    provider_meta: None,
                 }],
                 reasoning: None,
             },
@@ -11770,6 +12071,7 @@ async fn get_goal_rejects_unknown_arguments_and_non_object() {
                     id: "c1".into(),
                     name: "get_goal".into(),
                     arguments: r#"{"extra": 1}"#.into(),
+                    provider_meta: None,
                 }],
                 reasoning: None,
             },
@@ -11779,6 +12081,7 @@ async fn get_goal_rejects_unknown_arguments_and_non_object() {
                     id: "c2".into(),
                     name: "get_goal".into(),
                     arguments: r#""not-an-object""#.into(),
+                    provider_meta: None,
                 }],
                 reasoning: None,
             },
@@ -11886,6 +12189,7 @@ fn poll_call(id: &str) -> ToolCall {
         id: id.into(),
         name: "get_background_tasks".into(),
         arguments: "{}".into(),
+        provider_meta: None,
     }
 }
 
@@ -11930,6 +12234,7 @@ async fn poll_guard_finish_when_idle_waits_for_owned_completion_and_resets() {
                             name: "bash".into(),
                             arguments: r#"{"command":"sleep 1; echo done","background":true}"#
                                 .into(),
+                            provider_meta: None,
                         },
                         poll_call("c1"),
                         poll_call("c2"),
@@ -12119,6 +12424,7 @@ async fn poll_guard_runner_durable_batch_safe_point_and_next_turn_reset() {
                             name: "bash".into(),
                             arguments: r#"{"command":"sleep 2; echo done","background":true}"#
                                 .into(),
+                            provider_meta: None,
                         },
                         poll_call("c1"),
                         poll_call("c2"),
@@ -12127,6 +12433,7 @@ async fn poll_guard_runner_durable_batch_safe_point_and_next_turn_reset() {
                             id: "c4".into(),
                             name: "slow_test".into(),
                             arguments: "{}".into(),
+                            provider_meta: None,
                         },
                     ],
                     reasoning: None,
@@ -13359,6 +13666,7 @@ async fn goal_continue_inflight_cancel_discards_transferred_continue_and_fresh_c
                         id: "first-tool".into(),
                         name: "read_image".into(),
                         arguments: "{}".into(),
+                        provider_meta: None,
                     }],
                     reasoning: None,
                 },
@@ -13447,6 +13755,7 @@ async fn goal_continue_capped_missing_usage_commits_tools_without_another_provid
                         id: "real-tool".into(),
                         name: "keep_alive".into(),
                         arguments: "{}".into(),
+                        provider_meta: None,
                     }],
                     reasoning: None,
                 },
@@ -13508,11 +13817,13 @@ async fn goal_request_compaction_suppresses_after_exhausted_or_missing_usage() {
                                 id: "request".into(),
                                 name: "request_compaction".into(),
                                 arguments: "{}".into(),
+                                provider_meta: None,
                             },
                             ToolCall {
                                 id: "sibling".into(),
                                 name: "keep_alive".into(),
                                 arguments: "{}".into(),
+                                provider_meta: None,
                             },
                         ],
                         reasoning: None,
@@ -13659,6 +13970,7 @@ async fn goal_continue_tools_queued_compaction_keeps_goal_driver_alive() {
                         id: "tool".into(),
                         name: "read_image".into(),
                         arguments: "{}".into(),
+                        provider_meta: None,
                     }],
                     reasoning: None,
                 },
@@ -13744,6 +14056,7 @@ async fn ordinary_tools_queued_compaction_keeps_required_resume_turn() {
                             id: "tool".into(),
                             name: "read_image".into(),
                             arguments: "{}".into(),
+                            provider_meta: None,
                         }],
                         reasoning: None,
                     },
@@ -13815,6 +14128,7 @@ async fn sibling_safe_point_preserves_fifo_prompt_pause_and_clear_after_durable_
                             id: "tool".into(),
                             name: "read_image".into(),
                             arguments: "{}".into(),
+                            provider_meta: None,
                         }],
                         reasoning: None,
                     },
@@ -13989,6 +14303,7 @@ async fn goal_continue_poll_guard_safe_point_remounts_after_committed_completion
                             name: "bash".into(),
                             arguments: r#"{"command":"sleep 2; echo done","background":true}"#
                                 .into(),
+                            provider_meta: None,
                         },
                         poll_call("poll-1"),
                         poll_call("poll-2"),
@@ -13997,6 +14312,7 @@ async fn goal_continue_poll_guard_safe_point_remounts_after_committed_completion
                             id: "slow".into(),
                             name: "slow_test".into(),
                             arguments: "{}".into(),
+                            provider_meta: None,
                         },
                     ],
                     reasoning: None,
@@ -14159,6 +14475,7 @@ async fn oracle393_goal_tool_compact_prompt_keeps_charge_but_runs_user_turn() {
                             id: "tool".into(),
                             name: "read_image".into(),
                             arguments: "{}".into(),
+                            provider_meta: None,
                         }],
                         reasoning: None,
                     },
@@ -14293,6 +14610,7 @@ async fn oracle393_goal_manual_compact_resumes_turn_and_charges_budget() {
                             id: "tool".into(),
                             name: "read_image".into(),
                             arguments: "{}".into(),
+                            provider_meta: None,
                         }],
                         reasoning: None,
                     },
@@ -14442,6 +14760,7 @@ async fn oracle393_missing_usage_tool_compact_never_resumes_as_ordinary() {
                             id: "tool".into(),
                             name: "read_image".into(),
                             arguments: "{}".into(),
+                            provider_meta: None,
                         }],
                         reasoning: None,
                     },
@@ -14540,6 +14859,7 @@ async fn oracle393_ordinary_resume_does_not_restart_turn_state() {
                         id: "tool".into(),
                         name: "read_image".into(),
                         arguments: "{}".into(),
+                        provider_meta: None,
                     }],
                     reasoning: None,
                 },
@@ -14608,6 +14928,7 @@ async fn oracle_followup_goal_command_maintenance_error_keeps_driver_live() {
                             id: "tool".into(),
                             name: "read_image".into(),
                             arguments: "{}".into(),
+                            provider_meta: None,
                         }],
                         reasoning: None,
                     },
@@ -14696,6 +15017,7 @@ async fn oracle_followup_goal_maintenance_keeps_goal_turn_state_and_human_resets
                             id: "tool".into(),
                             name: "read_image".into(),
                             arguments: "{}".into(),
+                            provider_meta: None,
                         }],
                         reasoning: None,
                     },
@@ -14802,6 +15124,7 @@ async fn oracle_followup_transferred_continue_precedes_blocked_tool_cancel_and_r
                         id: "tool".into(),
                         name: "read_image".into(),
                         arguments: "{}".into(),
+                        provider_meta: None,
                     }],
                     reasoning: None,
                 },
@@ -14968,11 +15291,13 @@ async fn exhausted_goal_input_answer_continues(usage: Option<Usage>, session: &s
                                 name: "request_user_input".into(),
                                 arguments: r#"{"questions":[{"id":"answer","prompt":"answer?"}]}"#
                                     .into(),
+                                provider_meta: None,
                             },
                             ToolCall {
                                 id: "sibling".into(),
                                 name: "read_image".into(),
                                 arguments: "{}".into(),
+                                provider_meta: None,
                             },
                         ],
                         reasoning: None,
@@ -15021,7 +15346,7 @@ async fn exhausted_goal_input_answer_continues(usage: Option<Usage>, session: &s
     })
     .await;
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("input".into()), "yes".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("input")), "yes".into()),
         PromptSubmission::Answered
     );
     wait_for_log_event(
@@ -15119,6 +15444,7 @@ async fn exhausted_maintenance_fresh_continue_starts_turn(usage: Option<Usage>, 
                             id: "tool".into(),
                             name: "read_image".into(),
                             arguments: "{}".into(),
+                            provider_meta: None,
                         }],
                         reasoning: None,
                     },
@@ -15235,6 +15561,7 @@ async fn oracle677_answer_requested_compaction_is_budget_exempt() {
                             name: "request_user_input".into(),
                             arguments: r#"{"questions":[{"id":"answer","prompt":"answer?"}]}"#
                                 .into(),
+                            provider_meta: None,
                         }],
                         reasoning: None,
                     },
@@ -15250,6 +15577,7 @@ async fn oracle677_answer_requested_compaction_is_budget_exempt() {
                             id: "compact".into(),
                             name: "request_compaction".into(),
                             arguments: "{}".into(),
+                            provider_meta: None,
                         }],
                         reasoning: None,
                     },
@@ -15305,7 +15633,7 @@ async fn oracle677_answer_requested_compaction_is_budget_exempt() {
     })
     .await;
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("input".into()), "yes".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("input")), "yes".into()),
         PromptSubmission::Answered
     );
     wait_for_log_event(
@@ -15348,11 +15676,13 @@ async fn oracle677_answer_manual_compact_preserves_resume_after_cap() {
                                 name: "request_user_input".into(),
                                 arguments: r#"{"questions":[{"id":"answer","prompt":"answer?"}]}"#
                                     .into(),
+                                provider_meta: None,
                             },
                             ToolCall {
                                 id: "sibling".into(),
                                 name: "read_image".into(),
                                 arguments: "{}".into(),
+                                provider_meta: None,
                             },
                         ],
                         reasoning: None,
@@ -15426,7 +15756,7 @@ async fn oracle677_answer_manual_compact_preserves_resume_after_cap() {
     .await;
     handle.compact();
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("input".into()), "yes".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("input")), "yes".into()),
         PromptSubmission::Answered
     );
     wait_for_log_event(&handle, |event| matches!(event, AgentEvent::AssistantText(text) if text == "answer processed after manual")).await;
@@ -15462,6 +15792,7 @@ async fn oracle677_answer_manual_compact_missing_usage_preserves_resume() {
                             name: "request_user_input".into(),
                             arguments: r#"{"questions":[{"id":"answer","prompt":"answer?"}]}"#
                                 .into(),
+                            provider_meta: None,
                         }],
                         reasoning: None,
                     },
@@ -15522,7 +15853,7 @@ async fn oracle677_answer_manual_compact_missing_usage_preserves_resume() {
     .unwrap();
     handle.compact();
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("input".into()), "yes".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("input")), "yes".into()),
         PromptSubmission::Answered
     );
     tokio::time::timeout(std::time::Duration::from_secs(2), wait_for_log_event(&handle, |event| matches!(event, AgentEvent::AssistantText(text) if text == "answer after missing manual"))).await.unwrap_or_else(|_| panic!("status={:?} events={:?}", *status.borrow(), handle.snapshot()));
@@ -15554,6 +15885,7 @@ async fn oracle677_answer_auto_compaction_is_budget_exempt() {
                             name: "request_user_input".into(),
                             arguments: r#"{"questions":[{"id":"answer","prompt":"answer?"}]}"#
                                 .into(),
+                            provider_meta: None,
                         }],
                         reasoning: None,
                     },
@@ -15615,7 +15947,7 @@ async fn oracle677_answer_auto_compaction_is_budget_exempt() {
     })
     .await;
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("input".into()), "yes".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("input")), "yes".into()),
         PromptSubmission::Answered
     );
     wait_for_log_event(&handle, |event| matches!(event, AgentEvent::Display(text) if text == "compacted: auto answer summary")).await;
@@ -15650,11 +15982,13 @@ async fn oracle677_answer_queued_goal_mutation_keeps_resume(
                                 name: "request_user_input".into(),
                                 arguments: r#"{"questions":[{"id":"answer","prompt":"answer?"}]}"#
                                     .into(),
+                                provider_meta: None,
                             },
                             ToolCall {
                                 id: "sibling".into(),
                                 name: "read_image".into(),
                                 arguments: "{}".into(),
+                                provider_meta: None,
                             },
                         ],
                         reasoning: None,
@@ -15708,7 +16042,7 @@ async fn oracle677_answer_queued_goal_mutation_keeps_resume(
     .unwrap();
     assert!(handle.goal_command(GoalCommand::Action(action)));
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("input".into()), "yes".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("input")), "yes".into()),
         PromptSubmission::Answered
     );
     tokio::time::timeout(std::time::Duration::from_secs(2), wait_for_log_event(&handle, |event| matches!(event, AgentEvent::AssistantText(text) if text == "answer after mutation"))).await.unwrap();
@@ -15770,8 +16104,12 @@ async fn oracle677_answer_update_goal_sibling_keeps_resume() {
         Box::new(ScriptedContextCaptureModel {
             replies: vec![
                 (AssistantMessage { content: None, tool_calls: vec![
-                    ToolCall { id: "input".into(), name: "request_user_input".into(), arguments: r#"{"questions":[{"id":"answer","prompt":"answer?"}]}"#.into() },
-                    ToolCall { id: "pause".into(), name: "update_goal".into(), arguments: serde_json::json!({"id":"goal-test","revision":1,"action":"pause"}).to_string() },
+                    ToolCall { id: "input".into(), name: "request_user_input".into(), arguments: r#"{"questions":[{"id":"answer","prompt":"answer?"}]}"#.into(),
+                                            provider_meta: None,
+},
+                    ToolCall { id: "pause".into(), name: "update_goal".into(), arguments: serde_json::json!({"id":"goal-test","revision":1,"action":"pause"}).to_string(),
+                                            provider_meta: None,
+},
                 ], reasoning: None }, Some(Usage::default())),
                 (AssistantMessage { content: Some("answer after tool pause".into()), tool_calls: vec![], reasoning: None }, Some(Usage::default())),
             ].into(),
@@ -15806,7 +16144,7 @@ async fn oracle677_answer_update_goal_sibling_keeps_resume() {
     .await
     .unwrap();
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("input".into()), "yes".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("input")), "yes".into()),
         PromptSubmission::Answered
     );
     tokio::time::timeout(std::time::Duration::from_secs(2), wait_for_log_event(&handle, |event| matches!(event, AgentEvent::AssistantText(text) if text == "answer after tool pause"))).await.unwrap();
@@ -15844,6 +16182,7 @@ async fn oracle677_ordinary_goal_queued_mutation_stops(
                             id: "sibling".into(),
                             name: "read_image".into(),
                             arguments: "{}".into(),
+                            provider_meta: None,
                         }],
                         reasoning: None,
                     },
@@ -15941,8 +16280,12 @@ async fn oracle677_ordinary_goal_update_pause_sibling_stops() {
         Box::new(ScriptedContextCaptureModel {
             replies: vec![
                 (AssistantMessage { content: None, tool_calls: vec![
-                    ToolCall { id: "pause".into(), name: "update_goal".into(), arguments: serde_json::json!({"id":"goal-test","revision":1,"action":"pause"}).to_string() },
-                    ToolCall { id: "sibling".into(), name: "read_image".into(), arguments: "{}".into() },
+                    ToolCall { id: "pause".into(), name: "update_goal".into(), arguments: serde_json::json!({"id":"goal-test","revision":1,"action":"pause"}).to_string(),
+                                            provider_meta: None,
+},
+                    ToolCall { id: "sibling".into(), name: "read_image".into(), arguments: "{}".into(),
+                                            provider_meta: None,
+},
                 ], reasoning: None }, Some(Usage::default())),
                 (AssistantMessage { content: Some("post-pause request".into()), tool_calls: vec![], reasoning: None }, Some(Usage::default())),
             ].into(), calls: calls.clone(),
@@ -16013,6 +16356,7 @@ async fn oracle677_positive_answer_compaction_keeps_goal_budget(
             id: "compact".into(),
             name: "request_compaction".into(),
             arguments: "{}".into(),
+            provider_meta: None,
         }]
     } else {
         vec![]
@@ -16041,6 +16385,7 @@ async fn oracle677_positive_answer_compaction_keeps_goal_budget(
                             name: "request_user_input".into(),
                             arguments: r#"{"questions":[{"id":"answer","prompt":"answer?"}]}"#
                                 .into(),
+                            provider_meta: None,
                         }],
                         reasoning: None,
                     },
@@ -16125,7 +16470,7 @@ async fn oracle677_positive_answer_compaction_keeps_goal_budget(
     .await
     .unwrap();
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("input".into()), "yes".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("input")), "yes".into()),
         PromptSubmission::Answered
     );
     tokio::time::timeout(std::time::Duration::from_secs(2), normal_entered.notified())
@@ -16184,12 +16529,14 @@ async fn oracle718_answer_pause_compact_resume_does_not_rearm_driver() {
                                 id: "input".into(),
                                 name: "request_user_input".into(),
                                 arguments: r#"{"questions":[{"id":"answer","prompt":"answer?"}]}"#.into(),
-                            },
+                                                            provider_meta: None,
+},
                             ToolCall {
                                 id: "pause".into(),
                                 name: "update_goal".into(),
                                 arguments: serde_json::json!({"id":"goal-test","revision":1,"action":"pause"}).to_string(),
-                            },
+                                                            provider_meta: None,
+},
                         ],
                         reasoning: None,
                     },
@@ -16243,7 +16590,7 @@ async fn oracle718_answer_pause_compact_resume_does_not_rearm_driver() {
     handle.compact();
     assert!(handle.goal_command(GoalCommand::Action(crate::agent::GoalAction::Resume)));
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("input".into()), "yes".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("input")), "yes".into()),
         PromptSubmission::Answered
     );
     tokio::time::timeout(std::time::Duration::from_secs(2), wait_for_log_event(&handle, |event| matches!(event, AgentEvent::AssistantText(text) if text == "answer after pause"))).await.unwrap();
@@ -16279,8 +16626,12 @@ async fn oracle718_ordinary_pause_compact_resume_does_not_rearm_driver() {
                 (AssistantMessage {
                     content: None,
                     tool_calls: vec![
-                        ToolCall { id: "pause".into(), name: "update_goal".into(), arguments: serde_json::json!({"id":"goal-test","revision":1,"action":"pause"}).to_string() },
-                        ToolCall { id: "sibling".into(), name: "read_image".into(), arguments: "{}".into() },
+                        ToolCall { id: "pause".into(), name: "update_goal".into(), arguments: serde_json::json!({"id":"goal-test","revision":1,"action":"pause"}).to_string(),
+                                                    provider_meta: None,
+},
+                        ToolCall { id: "sibling".into(), name: "read_image".into(), arguments: "{}".into(),
+                                                    provider_meta: None,
+},
                     ],
                     reasoning: None,
                 }, Some(Usage::default())),
@@ -16369,6 +16720,7 @@ async fn oracle718_background_during_answer_compact_keeps_resume(
                             name: "request_user_input".into(),
                             arguments: r#"{"questions":[{"id":"answer","prompt":"answer?"}]}"#
                                 .into(),
+                            provider_meta: None,
                         }],
                         reasoning: None,
                     },
@@ -16439,7 +16791,7 @@ async fn oracle718_background_during_answer_compact_keeps_resume(
     handle.compact();
     assert!(handle.goal_command(GoalCommand::Action(action)));
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("input".into()), "yes".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("input")), "yes".into()),
         PromptSubmission::Answered
     );
     tokio::time::timeout(
@@ -16512,6 +16864,7 @@ async fn oracle739_notice_during_answer_compact_active_continue_zero_keeps_resum
                             name: "request_user_input".into(),
                             arguments: r#"{"questions":[{"id":"answer","prompt":"answer?"}]}"#
                                 .into(),
+                            provider_meta: None,
                         }],
                         reasoning: None,
                     },
@@ -16580,7 +16933,7 @@ async fn oracle739_notice_during_answer_compact_active_continue_zero_keeps_resum
     handle.compact();
     assert_eq!(
         handle.submit_prompt_with_call_id(
-            Some("oracle739-answer".into()),
+            Some(question_id("oracle739-answer")),
             "oracle739 precise answer".into(),
         ),
         PromptSubmission::Answered
@@ -16670,11 +17023,17 @@ async fn oracle731_resumed_answer_pause_queued_resume_disarms_driver() {
     let mut agent = Agent::new(
         Box::new(GatedContextCaptureModel {
             replies: vec![
-                (AssistantMessage { content: None, tool_calls: vec![ToolCall { id: "input".into(), name: "request_user_input".into(), arguments: r#"{"questions":[{"id":"answer","prompt":"answer?"}]}"#.into() }], reasoning: None }, Some(Usage { input_tokens: 1, ..Usage::default() })),
+                (AssistantMessage { content: None, tool_calls: vec![ToolCall { id: "input".into(), name: "request_user_input".into(), arguments: r#"{"questions":[{"id":"answer","prompt":"answer?"}]}"#.into(),
+                                    provider_meta: None,
+}], reasoning: None }, Some(Usage { input_tokens: 1, ..Usage::default() })),
                 (AssistantMessage { content: Some("first summary".into()), tool_calls: vec![], reasoning: None }, Some(Usage::default())),
                 (AssistantMessage { content: None, tool_calls: vec![
-                    ToolCall { id: "pause".into(), name: "update_goal".into(), arguments: serde_json::json!({"id":"goal-test","revision":1,"action":"pause"}).to_string() },
-                    ToolCall { id: "sibling".into(), name: "read_image".into(), arguments: "{}".into() },
+                    ToolCall { id: "pause".into(), name: "update_goal".into(), arguments: serde_json::json!({"id":"goal-test","revision":1,"action":"pause"}).to_string(),
+                                            provider_meta: None,
+},
+                    ToolCall { id: "sibling".into(), name: "read_image".into(), arguments: "{}".into(),
+                                            provider_meta: None,
+},
                 ], reasoning: None }, Some(Usage::default())),
                 (AssistantMessage { content: Some("final answer".into()), tool_calls: vec![], reasoning: None }, Some(Usage::default())),
                 (AssistantMessage { content: Some("unexpected auto goal".into()), tool_calls: vec![], reasoning: None }, Some(Usage::default())),
@@ -16721,7 +17080,7 @@ async fn oracle731_resumed_answer_pause_queued_resume_disarms_driver() {
     .unwrap();
     handle.compact();
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("input".into()), "yes".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("input")), "yes".into()),
         PromptSubmission::Answered
     );
     tokio::time::timeout(std::time::Duration::from_secs(2), gated.notified())
@@ -16808,8 +17167,12 @@ async fn oracle120_continue_preserves_accepted_input_resume() {
         Box::new(ScriptedContextCaptureModel {
             replies: vec![
                 (AssistantMessage { content: None, tool_calls: vec![
-                    ToolCall { id: "oracle120-input".into(), name: "request_user_input".into(), arguments: r#"{"questions":[{"id":"requested-answer","prompt":"answer?"}]}"#.into() },
-                    ToolCall { id: "oracle120-sibling".into(), name: "read_image".into(), arguments: "{}".into() },
+                    ToolCall { id: "oracle120-input".into(), name: "request_user_input".into(), arguments: r#"{"questions":[{"id":"requested-answer","prompt":"answer?"}]}"#.into(),
+                                            provider_meta: None,
+},
+                    ToolCall { id: "oracle120-sibling".into(), name: "read_image".into(), arguments: "{}".into(),
+                                            provider_meta: None,
+},
                 ], reasoning: None }, Some(Usage { input_tokens: 10, ..Usage::default() })),
                 (AssistantMessage { content: Some("maintenance summary".into()), tool_calls: vec![], reasoning: None }, Some(Usage::default())),
                 (AssistantMessage { content: Some("accepted answer processed".into()), tool_calls: vec![], reasoning: None }, Some(Usage::default())),
@@ -16853,7 +17216,7 @@ async fn oracle120_continue_preserves_accepted_input_resume() {
     assert!(handle.continue_goal(Some(10)));
     assert_eq!(
         handle.submit_prompt_with_call_id(
-            Some("oracle120-input".into()),
+            Some(question_id("oracle120-input")),
             "precise accepted answer".into()
         ),
         PromptSubmission::Answered
@@ -16901,9 +17264,15 @@ async fn oracle120_inactive_goal_tool_commit_disarms_before_later_resume_sibling
         Box::new(ScriptedContextCaptureModel {
             replies: vec![
                 (AssistantMessage { content: None, tool_calls: vec![
-                    ToolCall { id: "pause".into(), name: "update_goal".into(), arguments: serde_json::json!({"id":"goal-test","revision":1,"action":"pause"}).to_string() },
-                    ToolCall { id: "resume".into(), name: "update_goal".into(), arguments: serde_json::json!({"id":"goal-test","revision":2,"action":"resume"}).to_string() },
-                    ToolCall { id: "sibling".into(), name: "read_image".into(), arguments: "{}".into() },
+                    ToolCall { id: "pause".into(), name: "update_goal".into(), arguments: serde_json::json!({"id":"goal-test","revision":1,"action":"pause"}).to_string(),
+                                            provider_meta: None,
+},
+                    ToolCall { id: "resume".into(), name: "update_goal".into(), arguments: serde_json::json!({"id":"goal-test","revision":2,"action":"resume"}).to_string(),
+                                            provider_meta: None,
+},
+                    ToolCall { id: "sibling".into(), name: "read_image".into(), arguments: "{}".into(),
+                                            provider_meta: None,
+},
                 ], reasoning: None }, Some(Usage::default())),
                 (AssistantMessage { content: Some("siblings completed".into()), tool_calls: vec![], reasoning: None }, Some(Usage::default())),
                 (AssistantMessage { content: Some("unexpected automatic goal".into()), tool_calls: vec![], reasoning: None }, Some(Usage::default())),
@@ -16968,6 +17337,7 @@ async fn oracle120_goal_compaction_error_disarms_automatic_follow_up() {
                         id: "compact".into(),
                         name: "request_compaction".into(),
                         arguments: "{}".into(),
+                        provider_meta: None,
                     }],
                     reasoning: None,
                 },
@@ -17072,11 +17442,13 @@ async fn oracle481_auto_compaction_failure_commits_siblings_without_follow_up() 
                             id: "requested".into(),
                             name: "request_compaction".into(),
                             arguments: "{}".into(),
+                            provider_meta: None,
                         },
                         ToolCall {
                             id: "sibling".into(),
                             name: "read_image".into(),
                             arguments: "{}".into(),
+                            provider_meta: None,
                         },
                     ],
                     reasoning: None,
@@ -17171,6 +17543,7 @@ async fn oracle481_auto_nothing_to_compact_preserves_queued_manual_and_human_wor
                             id: "sibling".into(),
                             name: "read_image".into(),
                             arguments: "{}".into(),
+                            provider_meta: None,
                         }],
                         reasoning: None,
                     },
@@ -17331,6 +17704,7 @@ async fn agent_message_and_compaction_while_waiting_input_preserve_answer_turn()
                             name: "request_user_input".into(),
                             arguments: r#"{"questions":[{"id":"answer","prompt":"answer?"}]}"#
                                 .into(),
+                            provider_meta: None,
                         }],
                         reasoning: None,
                     },
@@ -17382,7 +17756,7 @@ async fn agent_message_and_compaction_while_waiting_input_preserve_answer_turn()
         .unwrap();
     handle.compact();
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("input".into()), "yes".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("input")), "yes".into()),
         PromptSubmission::Answered
     );
     wait_for_log_event(
@@ -17457,6 +17831,7 @@ async fn agent_message_during_active_tool_resumes_without_new_turn() {
                             id: "block".into(),
                             name: "read_image".into(),
                             arguments: "{}".into(),
+                            provider_meta: None,
                         }],
                         reasoning: None,
                     },
@@ -17605,11 +17980,13 @@ async fn agent_message_handoff_preserves_accepted_compaction_after_siblings() {
                                 id: "request".into(),
                                 name: "request_compaction".into(),
                                 arguments: "{}".into(),
+                                provider_meta: None,
                             },
                             ToolCall {
                                 id: "sibling".into(),
                                 name: "read_image".into(),
                                 arguments: "{}".into(),
+                                provider_meta: None,
                             },
                         ],
                         reasoning: None,
@@ -17701,11 +18078,13 @@ async fn agent_message_continue_handoff_preserves_compaction(message_first: bool
                                 id: "request".into(),
                                 name: "request_compaction".into(),
                                 arguments: "{}".into(),
+                                provider_meta: None,
                             },
                             ToolCall {
                                 id: "sibling".into(),
                                 name: "read_image".into(),
                                 arguments: "{}".into(),
+                                provider_meta: None,
                             },
                         ],
                         reasoning: None,
@@ -18368,6 +18747,7 @@ fn delegate_call(workspace: &std::path::Path, task: &str) -> ToolCall {
         name: "delegate".into(),
         arguments: serde_json::json!({"task": task, "workspace": workspace.to_str().unwrap()})
             .to_string(),
+        provider_meta: None,
     }
 }
 

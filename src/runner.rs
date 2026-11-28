@@ -45,6 +45,15 @@ pub struct UserQuestion {
     pub options: Vec<UserOption>,
 }
 
+/// One question waiting for a human.
+///
+/// `call_id` is a PUBLIC id and the ONLY id an answer routes by, in both
+/// shapes this struct is published in (`WaitingInput` and `pending_questions`).
+/// For the `request_user_input` interception it is the call's public
+/// projection ([`crate::agent::public_call_id`]) — exactly what that call's
+/// `ToolCall` / `ToolResult` events carry — and never the provider's wire id,
+/// which stays in the persisted transcript. A tool-initiated ask (`ask_user`,
+/// the ACP permission bridge) supplies its own local id.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct UserInputRequest {
     pub call_id: String,
@@ -62,7 +71,7 @@ struct PendingQuestion {
 }
 
 /// The process-local asynchronous questions this session still awaits, in
-/// call-id order (deterministic for status payloads).
+/// public call-id order (deterministic for status payloads).
 fn pending_questions(shared: &Shared) -> Vec<UserInputRequest> {
     let mut requests: Vec<UserInputRequest> = shared
         .pending_questions
@@ -763,7 +772,15 @@ impl Shared {
 
     /// Register one asynchronous question (`async: true`). Pure memory: the
     /// model already got its receipt, nothing here is persisted.
-    fn register_pending_question(&mut self, request: UserInputRequest) {
+    ///
+    /// `false` means the public id is already a live answer key: nothing is
+    /// inserted and the EXISTING question stays answerable under that id. A
+    /// second question never silently evicts the one a client is already
+    /// showing; the caller must treat that as a refused registration.
+    fn register_pending_question(&mut self, request: UserInputRequest) -> bool {
+        if self.pending_questions.contains_key(&request.call_id) {
+            return false;
+        }
         self.pending_questions.insert(
             request.call_id.clone(),
             PendingQuestion {
@@ -772,6 +789,7 @@ impl Shared {
             },
         );
         self.republish_status();
+        true
     }
 
     /// The user-shaped Notice an accepted answer commits. `None` means the id
@@ -787,6 +805,10 @@ impl Shared {
         if id != &question.id || value.trim().is_empty() {
             return None;
         }
+        // The notice is PUBLIC text (persisted, model-facing, shown in the
+        // UI): `request.call_id` is already the call's public projection, the
+        // same digest its events and the question frame carry — hashing it
+        // again here would name a third, unrelated id.
         Some(format!(
             "[question {}]\nQuestion: {}\n[answer]\n{}",
             pending.request.call_id, question.prompt, value
@@ -1310,12 +1332,12 @@ impl TestSessionEmitter {
     }
     /// Test-only: register one process-local asynchronous question exactly as
     /// the runner does, so status/answer tests can exercise the map without
-    /// driving a full turn.
-    pub(crate) fn register_pending_question(&self, request: UserInputRequest) {
+    /// driving a full turn. `false` means the id was already live.
+    pub(crate) fn register_pending_question(&self, request: UserInputRequest) -> bool {
         self.shared
             .lock()
             .unwrap()
-            .register_pending_question(request);
+            .register_pending_question(request)
     }
     /// Test-only: mirror the runner's post-commit removal of an answered
     /// asynchronous question (the runner only removes it after the Notice is
@@ -2441,7 +2463,7 @@ impl SessionRunner {
                 is_error,
                 content: tool_text,
                 images: event_images,
-                call_id: Some(call.id.clone()),
+                call_id: Some(crate::agent::public_call_id(&call.id)),
             });
         let steering = self.intake_after_operation(Vec::new());
         if steering != Steering::None {
@@ -2479,14 +2501,16 @@ impl SessionRunner {
         self.status(status);
     }
 
-    /// Register an asynchronous question (`request_user_input` with
+    /// Register one asynchronous question (`request_user_input` with
     /// `async: true`) and keep the turn going. Pure memory: a restart drops
     /// every unanswered question, while the model's receipt stays in history.
-    fn register_pending_question(&mut self, request: UserInputRequest) {
+    /// `false` means a live answer key already owns that public id; the
+    /// caller must refuse the NEW question, never replace the pending one.
+    fn register_pending_question(&mut self, request: UserInputRequest) -> bool {
         self.shared
             .lock()
             .unwrap()
-            .register_pending_question(request);
+            .register_pending_question(request)
     }
 
     /// Commit every queued asynchronous answer as exactly one durable,
@@ -2498,6 +2522,10 @@ impl SessionRunner {
     /// [answer]
     /// {answer}
     /// ```
+    ///
+    /// `{call_id}` is the call's LOCAL digest
+    /// ([`crate::agent::public_call_id`]), the same id its event projections
+    /// carry — never the provider's wire id.
     ///
     /// The command is only consumed when `Shared` still holds the claimed
     /// question, so an unknown, stale, or repeated answer never writes a
@@ -2549,7 +2577,7 @@ impl SessionRunner {
             match self.commands.recv().await {
                 Some(SessionCommand::Answer {
                     call_id, answers, ..
-                }) if call_id == call.id => {
+                }) if call_id == crate::agent::public_call_id(&call.id) => {
                     return WaitResult {
                         outcome: WaitOutcome::Completed(Ok(answers)),
                         pending,
@@ -3863,7 +3891,10 @@ impl SessionRunner {
                         shared.emit_durable(AgentEvent::ToolCall {
                             name: call.name.clone(),
                             arguments: call.arguments.clone(),
-                            call_id: Some(call.id.clone()),
+                            // Public projection: a local correlation id, so
+                            // the provider's wire id never reaches the event
+                            // stream (and a later provider never sees it).
+                            call_id: Some(crate::agent::public_call_id(&call.id)),
                         });
                     }
                 }
@@ -4025,14 +4056,21 @@ impl SessionRunner {
                                         is_error: true,
                                         content: error,
                                         images: Vec::new(),
-                                        call_id: Some(call.id.clone()),
+                                        call_id: Some(crate::agent::public_call_id(&call.id)),
                                     });
                                 continue;
                             }
                         };
                         let questions = vec![parsed.question];
                         let request = UserInputRequest {
-                            call_id: call.id.clone(),
+                            // The question's id is the call's PUBLIC projection
+                            // ([`crate::agent::public_call_id`]), the same value
+                            // its `ToolCall` / `ToolResult` events carry: one id
+                            // pairs the frame with the call for a client, and
+                            // answers route by it. The provider's wire id stays
+                            // private replay data (the persisted `Message::Tool`
+                            // row below keeps it).
+                            call_id: crate::agent::public_call_id(&call.id),
                             questions: questions.clone(),
                         };
                         if parsed.is_async {
@@ -4040,11 +4078,44 @@ impl SessionRunner {
                             // finish the call with a receipt. No WaitingInput,
                             // no suspension — the answer arrives later as a
                             // user-shaped Notice, and this turn keeps going.
-                            self.register_pending_question(request);
+                            //
+                            // A live answer key is never reassigned: if this
+                            // public id is already pending, refuse THIS
+                            // question instead of evicting the one a client
+                            // may already be showing. The first question keeps
+                            // its id and stays answerable.
+                            if !self.register_pending_question(request) {
+                                let error = format!(
+                                    "question {} is already pending; a live answer id is \
+                                     never reassigned. Ask again with a different call id.",
+                                    crate::agent::public_call_id(&call.id)
+                                );
+                                match self.finish_intercepted_tool(&call, Err(error)).await {
+                                    Ok(Steering::None) => {}
+                                    Ok(steering) => {
+                                        if self.release_after_preempt(steering) {
+                                            return;
+                                        }
+                                        break 'turn;
+                                    }
+                                    Err(error) => {
+                                        self.terminate(
+                                            SessionResult::Failed(format!("{error:#}")),
+                                            Vec::new(),
+                                        )
+                                        .await;
+                                        return;
+                                    }
+                                }
+                                continue;
+                            }
+                            // Public text: the receipt names the LOCAL digest
+                            // that this call's projections carry, so the model
+                            // (and the UI) never thread a provider wire id.
                             let receipt = format!(
                                 "question {} asked; you may continue. The answer will arrive \
                                  later as a user message with the original question.",
-                                call.id
+                                crate::agent::public_call_id(&call.id)
                             );
                             match self
                                 .finish_intercepted_tool(&call, Ok(ToolOutput::text(receipt)))
@@ -4111,7 +4182,7 @@ impl SessionRunner {
                                         is_error: false,
                                         content,
                                         images: Vec::new(),
-                                        call_id: Some(call.id.clone()),
+                                        call_id: Some(crate::agent::public_call_id(&call.id)),
                                     });
                                 let steering = self.intake_after_operation(waited.pending);
                                 if steering != Steering::None {
@@ -4341,7 +4412,7 @@ impl SessionRunner {
                             is_error,
                             content: tool_text,
                             images,
-                            call_id: Some(call.id.clone()),
+                            call_id: Some(crate::agent::public_call_id(&call.id)),
                         });
                     // A release that raced the tool's own completion: the
                     // tool result was committed above (contract: completed
@@ -4635,7 +4706,7 @@ fn entry_event(entry: &SessionEntry) -> Option<AgentEvent> {
             is_error: *is_error,
             content: content.clone(),
             images: images.clone(),
-            call_id: Some(call_id.clone()),
+            call_id: Some(crate::agent::public_call_id(call_id)),
         }),
         SessionEntry::Compaction { summary, .. } => {
             Some(AgentEvent::Display(format!("compacted: {summary}")))

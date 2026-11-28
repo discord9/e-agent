@@ -18,6 +18,7 @@ use std::time::SystemTime;
 use anyhow::{Context, anyhow};
 
 use crate::agent::{Agent, GoalSnapshot, SessionEntry};
+use crate::antigravity::AntigravityModel;
 use crate::codex::CodexModel;
 use crate::codex_auth::CodexAuth;
 use crate::config::{
@@ -422,9 +423,10 @@ impl SessionFactory {
                 // profile; checked before auth load so this message wins
                 // over an auth error. Also enforced by reload validation
                 // (`apply_reloaded_config`).
-                if matches!(resolved.main.auth, AuthMode::ChatGpt) && base_url.is_some() {
+                if resolved.main.auth != AuthMode::ApiKey && base_url.is_some() {
                     return Err(anyhow!(
-                        "--base-url cannot be used with a provider using auth = `chatgpt`"
+                        "--base-url cannot be used with a provider using auth = `{}`",
+                        auth_label(resolved.main.auth)
                     ));
                 }
                 let needs_chatgpt = resolved.main.auth == AuthMode::ChatGpt
@@ -824,7 +826,7 @@ impl SessionFactory {
                 if !watch_paths_changed(&mut mtimes) {
                     continue;
                 }
-                match reload_config_at(
+                let result = reload_config_at(
                     &reloadable,
                     &root,
                     &sandbox,
@@ -832,25 +834,8 @@ impl SessionFactory {
                     &base_url,
                     &model,
                     announce,
-                ) {
-                    ReloadResult::Reloaded => {
-                        if announce {
-                            tracing::info!(
-                                "e-agent: config reloaded: new sessions, `/model` switches and the next bash/background dispatch use the updated config; \
-                                 the [session] backend and web-search key changes still need a restart"
-                            );
-                        }
-                    }
-                    ReloadResult::ReloadedNoSource => {}
-                    ReloadResult::Rejected(reason) => {
-                        if announce {
-                            tracing::warn!(
-                                "e-agent: config reload rejected (keeping the previous config): {reason}"
-                            );
-                        }
-                    }
-                    ReloadResult::NoChange => {}
-                }
+                );
+                announce_reload_result(&result, announce);
             }
         });
     }
@@ -1795,6 +1780,15 @@ fn configured_model(
     base_url: Option<String>,
     model: Option<String>,
 ) -> anyhow::Result<ConfiguredModel> {
+    // Every path that builds a wire model passes through here, including the
+    // runtime `/model` switch, so a fixed-endpoint provider rejects
+    // `--base-url` even when startup used an api_key profile.
+    if base_url.is_some() && resolved.auth != AuthMode::ApiKey {
+        return Err(anyhow!(
+            "--base-url cannot be used with a provider using auth = `{}`",
+            auth_label(resolved.auth)
+        ));
+    }
     let display = Some(resolved.display);
     match resolved.auth {
         AuthMode::ApiKey => {
@@ -1830,6 +1824,50 @@ fn configured_model(
             cm.display = display;
             Ok(cm)
         }
+        // Antigravity authenticates from the CLI's own token file, read
+        // lazily on first use, so no auth handle is threaded here; the OAuth
+        // consumer client needed to refresh comes from the profile's
+        // provider (`client_id` / `client_secret`), as does the request
+        // pacing override (`min_interval_ms`).
+        AuthMode::Antigravity => {
+            // The profile's own model was validated at config resolution; a
+            // `--model` override has not been, and a raw wire id that is not
+            // in the fixed catalog would only become a 404 on the first turn.
+            let model = match model {
+                Some(model) => {
+                    crate::antigravity::catalog::validate(&model)
+                        .context("--model is not a pinned Antigravity catalog id")?;
+                    model
+                }
+                None => resolved.model,
+            };
+            // The catalog row is the wire truth: `supportsImages` is what the
+            // MODEL accepts, and the profile may narrow it with `vision = false`
+            // but never claim a model that cannot take images.
+            let catalog_vision =
+                crate::antigravity::catalog::find(&model).is_some_and(|row| row.supports_images);
+            let mut cm = ConfiguredModel::antigravity(
+                AntigravityModel::new(
+                    model,
+                    resolved.reasoning_effort,
+                    resolved.client_id,
+                    resolved.client_secret,
+                    resolved.min_interval_ms,
+                )?
+                .with_vision(resolved.vision && catalog_vision),
+            );
+            cm.display = display;
+            Ok(cm)
+        }
+    }
+}
+
+/// Config name of an alternate auth mode, for the `--base-url` rejection.
+fn auth_label(auth: AuthMode) -> &'static str {
+    match auth {
+        AuthMode::ApiKey => "api_key",
+        AuthMode::ChatGpt => "chatgpt",
+        AuthMode::Antigravity => "antigravity",
     }
 }
 
@@ -1864,9 +1902,10 @@ fn build_runtime_models(
     base_url: &Option<String>,
     model: &Option<String>,
 ) -> anyhow::Result<RuntimeModels> {
-    if matches!(resolved.main.auth, AuthMode::ChatGpt) && base_url.is_some() {
+    if resolved.main.auth != AuthMode::ApiKey && base_url.is_some() {
         return Err(anyhow!(
-            "--base-url cannot be used with a provider using auth = `chatgpt`"
+            "--base-url cannot be used with a provider using auth = `{}`",
+            auth_label(resolved.main.auth)
         ));
     }
     // A `--model` override replaces the wire model, so the profile's
@@ -2036,6 +2075,30 @@ fn sandbox_inputs(
     (sandbox_table(global), sandbox_table(project))
 }
 
+/// Render one reload outcome as the user-facing announcement the config
+/// watcher writes (`announce` gates it there). Extracted so the RENDERED text
+/// is testable without the poll loop — in particular that a rejected reload
+/// never quotes the config line the decoder pointed at.
+fn announce_reload_result(result: &ReloadResult, announce: bool) {
+    if !announce {
+        return;
+    }
+    match result {
+        ReloadResult::Reloaded => {
+            tracing::info!(
+                "e-agent: config reloaded: new sessions, `/model` switches and the next bash/background dispatch use the updated config; \
+                 the [session] backend and web-search key changes still need a restart"
+            );
+        }
+        ReloadResult::Rejected(reason) => {
+            tracing::warn!(
+                "e-agent: config reload rejected (keeping the previous config): {reason}"
+            );
+        }
+        ReloadResult::ReloadedNoSource | ReloadResult::NoChange => {}
+    }
+}
+
 /// Load the effective config for `root` and apply it through
 /// [`apply_reloaded_config`], then swap the `[sandbox]` policy when (and only
 /// when) its parsed inputs changed. The shared core of
@@ -2189,6 +2252,9 @@ model = "m1"
         match &model.kind {
             crate::model::ConfiguredModelKind::Chat(model) => model.reasoning_effort.as_deref(),
             crate::model::ConfiguredModelKind::Codex(model) => model.reasoning_effort.as_deref(),
+            crate::model::ConfiguredModelKind::Antigravity(model) => {
+                model.reasoning_effort.as_deref()
+            }
         }
     }
 
@@ -2238,6 +2304,77 @@ deepseek_compat = true
                 _ => panic!("expected Chat profile"),
             }
         }
+    }
+
+    /// M2: `--base-url` is rejected on EVERY path that builds a wire model.
+    /// Startup and reload check an api_key main profile, but a runtime
+    /// `/model` switch to a fixed-endpoint provider must not sneak the
+    /// override in — the guard lives in the shared construction path.
+    #[test]
+    fn runtime_switch_to_a_fixed_endpoint_profile_rejects_base_url() {
+        let temp = tempfile::tempdir().unwrap();
+        let config: Config = toml::from_str(
+            r#"default = "p1/m1"
+[providers.p1]
+base_url = "http://one"
+api_key_env = "PATH"
+[models."p1/m1"]
+model = "m1"
+
+[providers.ag]
+auth = "antigravity"
+[models."ag/gemini"]
+model = "gemini-3.8-flash-high"
+"#,
+        )
+        .expect("test config parses");
+        let mut factory =
+            SessionFactory::test_factory_with_config(temp.path().to_path_buf(), Some(config));
+        // The profile that started the process carries an override.
+        factory.base_url = Some("http://proxy".into());
+        let Err(error) = factory.resolve_profile("ag/gemini", None) else {
+            panic!("a fixed-endpoint provider cannot take --base-url");
+        };
+        let message = format!("{error:#}");
+        assert!(message.contains("--base-url"), "{message}");
+        assert!(message.contains("antigravity"), "{message}");
+        // The api_key profile keeps accepting the override.
+        assert!(factory.resolve_profile("p1/m1", None).is_ok());
+    }
+
+    /// A `--model` override bypasses the profile's `model`, so it is validated
+    /// against the Antigravity catalog at the shared construction path too: a
+    /// raw id outside the table must fail before the first turn's 404.
+    #[test]
+    fn model_override_outside_the_antigravity_catalog_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let config: Config = toml::from_str(
+            r#"default = "p1/m1"
+[providers.p1]
+base_url = "http://one"
+api_key_env = "PATH"
+[models."p1/m1"]
+model = "m1"
+
+[providers.ag]
+auth = "antigravity"
+[models."ag/gemini"]
+model = "gemini-4-neon-high"
+"#,
+        )
+        .expect("test config parses");
+        let mut factory =
+            SessionFactory::test_factory_with_config(temp.path().to_path_buf(), Some(config));
+        factory.model = Some("gemini-4-neno-high".into());
+        let Err(error) = factory.resolve_profile("ag/gemini", None) else {
+            panic!("a model outside the catalog cannot be a wire override");
+        };
+        let message = format!("{error:#}");
+        assert!(message.contains("gemini-4-neno-high"), "{message}");
+        assert!(message.contains("closest family"), "{message}");
+        assert!(message.contains("gemini-4-neon-high"), "{message}");
+        // The api_key profile still accepts the same raw override.
+        assert!(factory.resolve_profile("p1/m1", None).is_ok());
     }
 
     #[derive(Clone, Default)]
@@ -2912,6 +3049,57 @@ model = "m2"
         assert_eq!(factory.model_profiles(), vec!["p1/m1", "p2/m2"]);
 
         unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+    }
+
+    /// B4: a config file whose PARSE ERROR lands on a credential line must not
+    /// put that line — or any part of it — into the reload warning the server
+    /// renders. The warning reports the path and the position only: the TOML
+    /// decoder's own excerpt quotes the line, and a line can be
+    /// `client_secret = "..."`.
+    #[test]
+    fn reload_parse_error_warning_never_quotes_a_credential_line() {
+        const SENTINEL: &str = "GOCSPX-SENTINEL-CLIENT-SECRET-5b7e";
+        let _guard = crate::roles::XDG_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let env = XdgEnv::new(temp.path());
+        std::fs::create_dir_all(env.xdg.join("e-agent")).unwrap();
+        std::fs::write(
+            env.xdg.join("e-agent/config.toml"),
+            format!(
+                r#"default = "p1/m1"
+[providers.p1]
+auth = "antigravity"
+client_id = "id"
+client_secret = "{SENTINEL}" trailing-garbage
+"#
+            ),
+        )
+        .unwrap();
+        let mut factory = SessionFactory::test_factory(temp.path().to_path_buf());
+        factory.announce = true;
+        let result = factory.reload_config();
+        let ReloadResult::Rejected(reason) = &result else {
+            panic!("expected rejection, got {result:?}");
+        };
+        // The reason names the file and the POSITION, and quotes neither the
+        // offending line nor anything on it.
+        assert!(reason.contains("config.toml"), "{reason}");
+        assert!(reason.contains("line 5"), "{reason}");
+        assert!(!reason.contains("client_secret"), "{reason}");
+        assert!(!reason.contains(SENTINEL), "{reason}");
+        assert!(!reason.contains("trailing-garbage"), "{reason}");
+        // ...and the rendered warning (the exact line the watcher writes) is
+        // that same text.
+        let capture = ReloadCapture::default();
+        capture_reload(&capture, || {
+            announce_reload_result(&result, factory.announce)
+        });
+        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("config reload rejected"), "{output}");
+        assert!(output.contains("line 5"), "{output}");
+        assert!(!output.contains("client_secret"), "{output}");
+        assert!(!output.contains(SENTINEL), "{output}");
+        assert!(!output.contains("trailing-garbage"), "{output}");
     }
 
     #[test]

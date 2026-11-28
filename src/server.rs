@@ -622,6 +622,11 @@ fn status_string(status: &SessionStatus) -> &'static str {
 /// a client can answer them through `POST /api/sessions/{id}/prompt` with the
 /// corresponding `call_id`. The `WaitingInput` fields keep their existing
 /// shape (that is the blocking request, not an asynchronous one).
+///
+/// Both shapes carry the question's PUBLIC `call_id` verbatim, and that is the
+/// ONLY id an answer may name: for a `request_user_input` call it is the same
+/// digest its `ToolCall` / `ToolResult` events carry, so a frame and a call
+/// pair up. A provider wire id is never published here.
 fn status_json(
     status: &SessionStatus,
     pending_questions: &[UserInputRequest],
@@ -2606,13 +2611,18 @@ pub struct HistoryParams {
 }
 
 /// One history page: a compaction segment (or an intra-segment slice of
-/// it) of [`SessionEntry`] values plus the cursor for the next older page.
+/// it) of [`SessionEntry`] values, in their public projection, plus the cursor
+/// for the next older page.
 /// `next_before_seq` is `Some` when older entries exist (feed it back as
 /// `before_seq`), `None` when this was the oldest segment, the oldest page
 /// was reached, or the session has no compaction at all.
 #[derive(Serialize)]
 pub struct HistoryResponse {
-    pub entries: Vec<SessionEntry>,
+    /// Public projections (see [`crate::tools::history::public_entry`]): the
+    /// stored rows keep `provider_meta` and the wire call ids for replay, and
+    /// only what crosses to a client is projected, so a bootstrapped call and
+    /// its live result share one id.
+    pub entries: Vec<serde_json::Value>,
     pub locations: Vec<Option<crate::session_store::WebEntryLocation>>,
     pub next_before_seq: Option<i64>,
     /// Session that owns `next_before_seq` when the next older page lives in
@@ -2629,11 +2639,12 @@ struct EventsParams {
 }
 
 /// One atomic runner-owned web bootstrap, delivered as the first event on
-/// `/events?view=web`. `entries` are durable SessionEntry history; replay is
-/// only the presentation bridge after the frozen head.
+/// `/events?view=web`. `entries` are durable SessionEntry history in the same
+/// public projection the history page uses; replay is only the presentation
+/// bridge after the frozen head.
 #[derive(Serialize)]
 struct WebBootstrap {
-    entries: Vec<SessionEntry>,
+    entries: Vec<serde_json::Value>,
     locations: Vec<Option<crate::session_store::WebEntryLocation>>,
     next_before_seq: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2731,7 +2742,11 @@ async fn session_history(
         }
     };
     Ok(Json(HistoryResponse {
-        entries: page.entries,
+        entries: page
+            .entries
+            .iter()
+            .map(crate::tools::history::public_entry)
+            .collect(),
         locations: page
             .locations
             .iter()
@@ -3687,7 +3702,11 @@ async fn session_events(
             .map_err(|_| error(StatusCode::CONFLICT, "session attach unavailable"))?;
         (
             Event::default().event("bootstrap").json_data(WebBootstrap {
-                entries: attach.entries,
+                entries: attach
+                    .entries
+                    .iter()
+                    .map(crate::tools::history::public_entry)
+                    .collect(),
                 locations: attach.locations,
                 next_before_seq: attach.next_before_seq,
                 next_older_session: attach.next_older_session,
@@ -9169,8 +9188,8 @@ model = "deepseek-chat"
     /// frontend's defensive parsing (bare array or `{entries:[...]}`).
     #[test]
     fn history_response_wire_shape() {
-        use crate::agent::{Message, SessionEntry};
-        let entries = vec![
+        use crate::agent::{AssistantMessage, Message, SessionEntry, ToolCall};
+        let entries = [
             SessionEntry::Message {
                 message: Message::User {
                     content: "hello".into(),
@@ -9183,10 +9202,28 @@ model = "deepseek-chat"
                 current_prompt_at: None,
                 no_current_prompt: false,
             },
+            // A signed call: the stored row keeps both the signature and the
+            // wire id, and the page carries neither.
+            SessionEntry::Message {
+                message: Message::Assistant(AssistantMessage {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "wire-call".into(),
+                        name: "read_file".into(),
+                        arguments: "{}".into(),
+                        provider_meta: Some("signature".into()),
+                    }],
+                    reasoning: None,
+                }),
+            },
         ];
+        let digest = crate::agent::public_call_id("wire-call");
         assert_eq!(
             serde_json::to_value(HistoryResponse {
-                entries,
+                entries: entries
+                    .iter()
+                    .map(crate::tools::history::public_entry)
+                    .collect(),
                 locations: vec![],
                 next_before_seq: Some(42),
                 next_older_session: None,
@@ -9196,6 +9233,14 @@ model = "deepseek-chat"
                 "entries": [
                     {"type": "message", "message": {"User": {"content": "hello"}}},
                     {"type": "compaction", "summary": "rolled up", "retained": []},
+                    {"type": "message", "message": {"Assistant": {
+                        "content": null,
+                        "tool_calls": [{
+                            "id": digest,
+                            "name": "read_file",
+                            "arguments": "{}",
+                        }],
+                    }}},
                 ],
                 "locations": [],
                 "next_before_seq": 42,
@@ -9416,6 +9461,7 @@ model = "deepseek-chat"
                     id: "call_1".into(),
                     name: "bash".into(),
                     arguments: "ls".into(),
+                    provider_meta: None,
                 }],
                 reasoning: None,
             }),

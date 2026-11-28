@@ -1276,6 +1276,7 @@ mod tests {
                     id: id.into(),
                     name: "generate_image".into(),
                     arguments: json!({"prompt": LOOP_PROMPT, "path": path}).to_string(),
+                    provider_meta: None,
                 };
                 let tool_calls = vec![
                     call("call-image", "art/pixel.png"),
@@ -1433,10 +1434,12 @@ mod tests {
         // the assistant answer.
         let events = handle.snapshot();
         assert!(events.iter().any(|event| matches!(event,
-            AgentEvent::ToolCall { call_id: Some(id), .. } if id == "call-image")));
+            AgentEvent::ToolCall { call_id: Some(id), .. }
+                if id == &crate::agent::public_call_id("call-image"))));
         assert!(events.iter().any(|event| matches!(event,
             AgentEvent::ToolResult { is_error: false, call_id: Some(id), content, .. }
-                if id == "call-image" && content.contains("art/pixel.png"))));
+                if id == &crate::agent::public_call_id("call-image")
+                    && content.contains("art/pixel.png"))));
         assert!(events.iter().any(|event| matches!(event,
             AgentEvent::AssistantText(text) if text == "loop complete")));
 

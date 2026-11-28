@@ -357,6 +357,7 @@ async fn consume_stream(
                         id: id.into(),
                         name: name.into(),
                         arguments: arguments.into(),
+                        provider_meta: None,
                     });
                 }
             }

@@ -414,10 +414,24 @@ pub enum WebFetchProvider {
 
 #[derive(Clone, Debug, Deserialize)]
 struct Provider {
+    /// How this provider authenticates: absent = OpenAI-compatible
+    /// (`base_url` plus an optional key), `"chatgpt"` = the ChatGPT login
+    /// (codex Responses wire), `"antigravity"` = the Antigravity CLI's own
+    /// OAuth token file (`~/.gemini/antigravity-cli/antigravity-oauth-token`,
+    /// read-only; e-agent caches refreshes in its own config dir).
     auth: Option<String>,
     base_url: Option<String>,
     api_key_file: Option<PathBuf>,
     api_key_env: Option<String>,
+    /// `auth = "antigravity"` only: the OAuth consumer client of the `agy`
+    /// install, needed to refresh an expired login. No default exists, and a
+    /// still-valid access token works without either key.
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    /// `auth = "antigravity"` only: minimum spacing between request starts in
+    /// milliseconds (absent = 1000, `0` = no pacing). A terms-risk mitigation
+    /// for this OAuth session, not a quota guarantee.
+    min_interval_ms: Option<u64>,
 }
 
 /// One configured provider with its resolved credential, as returned by
@@ -434,6 +448,9 @@ pub struct ProviderAccount {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ModelProfile {
+    /// Wire model id. Antigravity profiles must use a pinned
+    /// `antigravity::catalog` id and may omit this (the catalog default
+    /// applies); every other provider requires it.
     model: Option<String>,
     reasoning_effort: Option<String>,
     /// Force the OpenAI-compatible `thinking` switch (`thinking:
@@ -447,10 +464,10 @@ struct ModelProfile {
     /// auto-compacts when usage exceeds 80% of this value, and the TUI
     /// shows a percentage alongside the token count.
     context_window: Option<u64>,
-    /// Whether the model accepts image input. Defaults to false: user
-    /// messages with attached images fail the vision gate with a clear
-    /// error on non-vision models. kimi/k3 profiles should set
-    /// `vision = true`; deepseek defaults to false.
+    /// Whether the model accepts image input. Defaults to TRUE: a profile
+    /// that omits the key is treated as vision-capable, and a text-only
+    /// profile must say `vision = false` — a user message with images then
+    /// fails the vision gate with an error naming the model.
     #[serde(default)]
     vision: Option<bool>,
     /// DeepSeek Chat wire compatibility (default false). Solely for
@@ -481,13 +498,26 @@ pub struct ResolvedModel {
     pub auth: AuthMode,
     pub display: String,
     pub context_window: Option<u64>,
+    /// Profile `vision` (default TRUE: a profile that omits it is
+    /// vision-capable; `vision = false` marks a text-only model).
     pub vision: bool,
+    /// `auth = "antigravity"`: the `agy` install's OAuth consumer client
+    /// (`client_id` / `client_secret`), needed only to refresh. `None` for
+    /// every other auth mode.
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+    /// `auth = "antigravity"`: request pacing override (`min_interval_ms`);
+    /// `None` means the adapter's default. `None` for every other auth mode.
+    pub min_interval_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthMode {
     ApiKey,
     ChatGpt,
+    /// Antigravity CLI OAuth token file, native
+    /// `v1internal:streamGenerateContent` wire.
+    Antigravity,
 }
 
 #[derive(Debug)]
@@ -495,6 +525,47 @@ pub(crate) enum ProjectSourceObservation {
     Observed(toml::Value),
     Absent,
     Unavailable,
+}
+
+/// Decode one config source, reporting the file path and the POSITION of the
+/// error only. The TOML decoder's own message quotes the offending line, and a
+/// config line can hold `client_secret` / an api key (or a token in a value the
+/// decoder echoes back), so neither the excerpt nor the message is repeated
+/// here: the message is persisted (a rejected reload is logged and an error
+/// event is written to the session) and `path (line L, column C)` is what tells
+/// the user where to look. `what` names the source being decoded.
+fn parse_config<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    source: &str,
+    what: &str,
+) -> anyhow::Result<T> {
+    toml::from_str(source).map_err(|error| match error.span() {
+        Some(span) => {
+            let (line, column) = source_position(source, span.start);
+            anyhow!(
+                "cannot parse {what} {} (line {line}, column {column})",
+                path.display()
+            )
+        }
+        None => anyhow!(
+            "cannot parse {what} {} (no position reported)",
+            path.display()
+        ),
+    })
+}
+
+/// 1-based line and column of a byte offset, i.e. the position the TOML
+/// decoder would have pointed at.
+fn source_position(source: &str, offset: usize) -> (usize, usize) {
+    // `offset` is a decoder-reported byte offset; a mid-character one falls
+    // back to the whole source rather than panicking.
+    let upto = source.get(..offset.min(source.len())).unwrap_or(source);
+    let line = upto.matches('\n').count() + 1;
+    let column = upto
+        .rsplit('\n')
+        .next()
+        .map_or(1, |tail| tail.chars().count() + 1);
+    (line, column)
 }
 
 fn observe_project_source_best_effort(workspace: &Path) -> ProjectSourceObservation {
@@ -695,10 +766,8 @@ impl Config {
     fn from_path(path: &Path) -> anyhow::Result<Self> {
         let source = std::fs::read_to_string(path)
             .with_context(|| format!("cannot read config file {}", path.display()))?;
-        let mut config: Self = toml::from_str(&source)
-            .with_context(|| format!("cannot parse config file {}", path.display()))?;
-        let diagnostic: toml::Value = toml::from_str(&source)
-            .with_context(|| format!("cannot parse config diagnostics {}", path.display()))?;
+        let mut config: Self = parse_config(path, &source, "config file")?;
+        let diagnostic: toml::Value = parse_config(path, &source, "config diagnostics")?;
         config.path = path.to_path_buf();
         config.diagnostic_global = Some(sanitize_diagnostic_source(diagnostic));
         Ok(config)
@@ -1016,28 +1085,56 @@ impl Config {
             .models
             .get(profile)
             .ok_or_else(|| anyhow!("model profile `{profile}` is not defined"))?;
-        let model = model_profile
+        let configured_model = model_profile
             .model
             .as_deref()
-            .filter(|model| !model.is_empty())
-            .ok_or_else(|| anyhow!("model profile `{profile}` requires `model`"))?
-            .to_owned();
+            .filter(|model| !model.is_empty());
         let reasoning_effort = model_profile.reasoning_effort.clone();
         let thinking = model_profile.thinking.unwrap_or(false);
         let provider = self.providers.get(provider_name).ok_or_else(|| {
             anyhow!("provider `{provider_name}` for profile `{profile}` is not defined")
         })?;
         if let Some(auth) = provider.auth.as_deref() {
-            if auth != "chatgpt" {
-                bail!("provider `{provider_name}` has unsupported auth `{auth}`");
-            }
+            // Neither alternate-auth provider takes a URL or a key from the
+            // config: their endpoint and credentials are fixed.
+            let mode = match auth {
+                "chatgpt" => AuthMode::ChatGpt,
+                "antigravity" => AuthMode::Antigravity,
+                _ => bail!("provider `{provider_name}` has unsupported auth `{auth}`"),
+            };
             if provider.base_url.is_some()
                 || provider.api_key_file.is_some()
                 || provider.api_key_env.is_some()
             {
                 bail!(
-                    "provider `{provider_name}` with auth = `chatgpt` cannot set `base_url`, `api_key_file`, or `api_key_env`"
+                    "provider `{provider_name}` with auth = `{auth}` cannot set `base_url`, `api_key_file`, or `api_key_env`"
                 );
+            }
+            if mode != AuthMode::Antigravity
+                && (provider.client_id.is_some()
+                    || provider.client_secret.is_some()
+                    || provider.min_interval_ms.is_some())
+            {
+                bail!(
+                    "provider `{provider_name}` with auth = `{auth}` cannot set `client_id`, `client_secret`, or `min_interval_ms`"
+                );
+            }
+            let model = match configured_model {
+                Some(model) => model.to_owned(),
+                // The pinned catalog supplies Antigravity's default; every
+                // other provider still requires an explicit model.
+                None if mode == AuthMode::Antigravity => {
+                    crate::antigravity::catalog::DEFAULT_MODEL.to_owned()
+                }
+                None => bail!("model profile `{profile}` requires `model`"),
+            };
+            if mode == AuthMode::Antigravity
+                && let Err(error) = crate::antigravity::catalog::validate(&model)
+            {
+                // Flatten the catalog's message into this error: the model
+                // and its closest family stay visible even to a caller that
+                // only prints the top-level Display.
+                bail!("model profile `{profile}`: {error:#}");
             }
             return Ok(ResolvedModel {
                 base_url: String::new(),
@@ -1046,11 +1143,25 @@ impl Config {
                 reasoning_effort,
                 thinking,
                 deepseek_compat: model_profile.deepseek_compat.unwrap_or(false),
-                auth: AuthMode::ChatGpt,
+                auth: mode,
                 display: profile.to_owned(),
                 context_window: model_profile.context_window,
-                vision: model_profile.vision.unwrap_or(false),
+                vision: model_profile.vision.unwrap_or(true),
+                client_id: provider.client_id.clone(),
+                client_secret: provider.client_secret.clone(),
+                min_interval_ms: provider.min_interval_ms,
             });
+        }
+        let model = configured_model
+            .ok_or_else(|| anyhow!("model profile `{profile}` requires `model`"))?
+            .to_owned();
+        if provider.client_id.is_some()
+            || provider.client_secret.is_some()
+            || provider.min_interval_ms.is_some()
+        {
+            bail!(
+                "provider `{provider_name}` sets `client_id`/`client_secret`/`min_interval_ms`, which only auth = \"antigravity\" accepts"
+            );
         }
         let base_url = provider
             .base_url
@@ -1089,7 +1200,10 @@ impl Config {
             auth: AuthMode::ApiKey,
             display: profile.to_owned(),
             context_window: model_profile.context_window,
-            vision: model_profile.vision.unwrap_or(false),
+            vision: model_profile.vision.unwrap_or(true),
+            client_id: None,
+            client_secret: None,
+            min_interval_ms: None,
         })
     }
 
@@ -1115,9 +1229,17 @@ impl Config {
 /// The user-level config directory (`$XDG_CONFIG_HOME/e-agent` or
 /// `~/.config/e-agent`), without requiring a `config.toml` to exist. Used by
 /// roles.rs to locate the global agents directory.
+///
+/// `XDG_CONFIG_HOME` is honored only when it is a NON-EMPTY ABSOLUTE path (the
+/// XDG Base Directory spec). An empty or relative value is ignored and the
+/// `$HOME` fallback applies, so a bogus value can never place e-agent's
+/// credential cache relative to the current directory.
 pub fn config_dir() -> Option<PathBuf> {
-    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
-        return Some(PathBuf::from(xdg).join("e-agent"));
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    {
+        return Some(xdg.join("e-agent"));
     }
     crate::home_dir().map(|home| home.join(".config/e-agent"))
 }
@@ -1464,10 +1586,8 @@ fn project_config(workspace: &Path) -> anyhow::Result<Option<ProjectConfig>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).with_context(|| format!("cannot read {}", path.display())),
     };
-    let mut parsed: ProjectConfig = toml::from_str(&source)
-        .with_context(|| format!("cannot parse project config {}", path.display()))?;
-    let diagnostic: toml::Value = toml::from_str(&source)
-        .with_context(|| format!("cannot parse project diagnostics {}", path.display()))?;
+    let mut parsed: ProjectConfig = parse_config(&path, &source, "project config")?;
+    let diagnostic: toml::Value = parse_config(&path, &source, "project diagnostics")?;
     parsed.diagnostic_source = Some(sanitize_diagnostic_source(diagnostic));
     Ok(Some(parsed))
 }
@@ -1481,8 +1601,7 @@ fn project_background(workspace: &Path) -> anyhow::Result<Option<BackgroundConfi
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).with_context(|| format!("cannot read {}", path.display())),
     };
-    let parsed: ProjectConfig = toml::from_str(&source)
-        .with_context(|| format!("cannot parse project config {}", path.display()))?;
+    let parsed: ProjectConfig = parse_config(&path, &source, "project config")?;
     Ok(parsed.background)
 }
 
@@ -1515,8 +1634,7 @@ fn project_bash(workspace: &Path) -> anyhow::Result<Option<BashConfig>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).with_context(|| format!("cannot read {}", path.display())),
     };
-    let parsed: ProjectConfig = toml::from_str(&source)
-        .with_context(|| format!("cannot parse project config {}", path.display()))?;
+    let parsed: ProjectConfig = parse_config(&path, &source, "project config")?;
     Ok(parsed.bash)
 }
 
@@ -1553,8 +1671,7 @@ fn project_sandbox(workspace: &Path) -> anyhow::Result<Option<ProjectSandbox>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).with_context(|| format!("cannot read {}", path.display())),
     };
-    let parsed: ProjectConfig = toml::from_str(&source)
-        .with_context(|| format!("cannot parse project config {}", path.display()))?;
+    let parsed: ProjectConfig = parse_config(&path, &source, "project config")?;
     Ok(parsed.sandbox)
 }
 
