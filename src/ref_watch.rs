@@ -27,7 +27,9 @@
 //! - A link is dropped as soon as it is MERGED or CLOSED, and a terminal link
 //!   is never polled — or resurrected — again.
 //! - A list read that cannot be proven complete is not an observation at all:
-//!   the whole burst is skipped and the next poll retries.
+//!   the whole burst is skipped and the next poll retries. GitHub's list
+//!   endpoints are ascending and ignore `sort`/`direction`, so a list is only
+//!   ever read to its end (bounded), never assumed newest-first.
 //!
 //! Everything here is process-local. There is no webhook, no persisted
 //! watcher row, and no second scheduler: the loop is one ordinary detached
@@ -54,17 +56,20 @@ const GH_TIMEOUT: Duration = Duration::from_secs(15);
 /// A 403/429 without `X-RateLimit-Reset` still must not become a retry storm.
 const DEFAULT_BACKOFF: Duration = Duration::from_secs(60);
 
-/// How many pages one NEWEST-FIRST list read may follow before it gives up.
-/// The walk stops at the caller's watermark long before this on a real PR, so
-/// a busy PR costs one page and not its whole history. A read that still
-/// needs more pages is INCOMPLETE: a truncated list is never reported as the
-/// whole one, so nothing is committed and the next poll tries again.
-const MAX_PAGES: usize = 5;
-
-/// How many pages one `check-runs` / `status` read may follow. They are small
-/// (their `next` is followed to the end in practice) and this only bounds one
-/// pathological commit.
-const MAX_CHECK_PAGES: usize = 10;
+/// How many pages one list read may follow, and how many items it may gather,
+/// before the read is declared INCOMPLETE.
+///
+/// GitHub's list endpoints are ASCENDING and ignore `sort`/`direction` (for
+/// reviews and issue comments the parameters are simply not honoured), so the
+/// only way to know a list is whole is to walk it to its end. These caps bound
+/// one pathological PR: a read that hits either cap answers `None`, which is
+/// never reported as the whole list and never committed, and the next poll
+/// tries again. A list that can *never* be walked within these caps (more than
+/// 5000 reviews, or 5000 comments inside one `since` window) leaves that link
+/// silent rather than reporting partial history — a deliberate trade, because a
+/// partial list cannot tell new activity from old.
+const MAX_PAGES: usize = 50;
+const MAX_ITEMS: usize = 5000;
 
 /// The exact prefix every automatic message carries. The transcript entry is
 /// a `Notice`; this line makes the same fact explicit to the model.
@@ -220,29 +225,22 @@ impl<'a> Reads<'a> {
         }
     }
 
-    /// One paginated list, followed until it can be PROVEN complete.
+    /// One paginated list, followed to its END. GitHub's lists are ascending
+    /// and cannot be reversed or cut at a watermark from the request side, so
+    /// "the newest item is on page six" is the normal case for a busy PR and
+    /// stopping early would simply lose it.
     ///
-    /// `items` says where one page's items live. A newest-first list (every
-    /// list this watcher reads) ends early at `older`: the first item OLDER
-    /// than the caller's watermark means every later page is older still.
-    ///
-    /// `max` bounds the walk: a read that needs more pages answers `None`,
-    /// which every caller treats as an incomplete observation — no commit, no
-    /// transition, retry on the next poll. Returning a truncated list as if
-    /// it were whole is the one thing this must never do: an item past the
-    /// truncation point would be invisible forever.
-    async fn walk(
-        &mut self,
-        path: String,
-        max: usize,
-        items: Items,
-        older: impl Fn(&Value) -> bool,
-    ) -> Result<Option<Vec<Value>>, Step> {
+    /// `items` says where one page's items live. `None` means the walk hit
+    /// [`MAX_PAGES`] or [`MAX_ITEMS`] first: the read is INCOMPLETE, and every
+    /// caller treats it as a failed observation — no commit, no cursor, no
+    /// transition, retry on the next poll. Returning a truncated list as if it
+    /// were whole is the one thing this must never do.
+    async fn walk(&mut self, path: String, items: Items) -> Result<Option<Vec<Value>>, Step> {
         let mut collected = Vec::new();
         let mut next = Some(path);
         let mut pages = 0;
         while let Some(path) = next {
-            if pages == max {
+            if pages == MAX_PAGES {
                 return Ok(None);
             }
             pages += 1;
@@ -254,13 +252,10 @@ impl<'a> Reads<'a> {
             let Some(array) = array else {
                 return Err(Step::Failed);
             };
-            // The watermark item is included: it is history, and dropping it
-            // would lose the boundary the next poll compares against.
-            if let Some(index) = array.iter().position(&older) {
-                collected.extend(array[..=index].iter().cloned());
-                return Ok(Some(collected));
-            }
             collected.extend(array);
+            if collected.len() > MAX_ITEMS {
+                return Ok(None);
+            }
             next = page.next;
         }
         Ok(Some(collected))
@@ -413,9 +408,7 @@ impl LinkWatch {
                         "repos/{}/commits/{sha}/check-runs?per_page=100",
                         self.link.repo
                     ),
-                    MAX_CHECK_PAGES,
                     Items::Under("check_runs"),
-                    |_| false,
                 )
                 .await
             {
@@ -426,9 +419,7 @@ impl LinkWatch {
             let statuses = match reads
                 .walk(
                     format!("repos/{}/commits/{sha}/status?per_page=100", self.link.repo),
-                    MAX_CHECK_PAGES,
                     Items::Under("statuses"),
-                    |_| false,
                 )
                 .await
             {
@@ -437,20 +428,17 @@ impl LinkWatch {
                 Err(step) => return step,
             };
             observed.failing = failing_checks(&check_runs, &statuses);
-            // Newest first, stopping at the watch-start boundary: a review
-            // older than the add can never be news, so a busy PR costs one
-            // page instead of its whole history — and a review that lands
-            // while the watcher runs is always on the first page we read.
-            let boundary = self.review_since;
+            // The reviews endpoint has no `since=` cursor and ignores
+            // `sort`/`direction`, so the list is read to its end and history
+            // is filtered here (see `stage_notes`): a review that arrives
+            // while the watcher runs is appended to the LAST page.
             let reviews = match reads
                 .walk(
                     format!(
-                        "repos/{}/pulls/{}/reviews?per_page=100&sort=created&direction=desc",
+                        "repos/{}/pulls/{}/reviews?per_page=100",
                         self.link.repo, self.link.number
                     ),
-                    MAX_PAGES,
                     Items::Whole,
-                    |item| before(item, boundary),
                 )
                 .await
             {
@@ -476,20 +464,19 @@ impl LinkWatch {
         let mut lines = transitions(&self.link, &previous, &observed);
         let mut comments = Vec::new();
 
-        // New issue/conversation comments, from the persisted watermark.
-        // Newest first and stopping at the watermark: the `since=` cursor and
-        // the walk's stop condition are the same instant.
+        // New issue/conversation comments. The endpoint's own `since=` filter
+        // is the watermark (it is honoured, unlike `sort`/`direction`), so the
+        // answer is ascending and only holds comments newer than the cursor;
+        // the walk still runs to its end so a burst cannot be cut off, and ids
+        // keep an inclusive `since=` window idempotent.
         if let Some(last) = self.last_comment_at {
             let path = format!(
-                "repos/{}/issues/{}/comments?since={}&per_page=100&sort=created&direction=desc",
+                "repos/{}/issues/{}/comments?since={}&per_page=100",
                 self.link.repo,
                 self.link.number,
                 since(last)
             );
-            let items = match reads
-                .walk(path, MAX_PAGES, Items::Whole, |item| before(item, last))
-                .await
-            {
+            let items = match reads.walk(path, Items::Whole).await {
                 Ok(Some(items)) => items,
                 Ok(None) => return Step::Failed,
                 Err(step) => return step,
@@ -503,15 +490,12 @@ impl LinkWatch {
             && let Some(last) = self.last_review_comment_at
         {
             let path = format!(
-                "repos/{}/pulls/{}/comments?since={}&per_page=100&sort=created&direction=desc",
+                "repos/{}/pulls/{}/comments?since={}&per_page=100",
                 self.link.repo,
                 self.link.number,
                 since(last)
             );
-            let items = match reads
-                .walk(path, MAX_PAGES, Items::Whole, |item| before(item, last))
-                .await
-            {
+            let items = match reads.walk(path, Items::Whole).await {
                 Ok(Some(items)) => items,
                 Ok(None) => return Step::Failed,
                 Err(step) => return step,
@@ -949,25 +933,6 @@ fn since(at: DateTime<Utc>) -> String {
     at.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
-/// True when this item is STRICTLY older than `watermark`, i.e. older than
-/// the instant the caller started watching (reviews) or the `since=` cursor
-/// (comments). Every list this watcher reads is newest-first, so the first
-/// such item means every later page is older still: the walk can stop instead
-/// of reading a busy PR's whole history.
-///
-/// Ties at the watermark itself never stop the walk, because an item stamped
-/// exactly there can still be news and might sit after its twin in the page.
-/// An item with no parseable time never stops it either: an age we cannot
-/// establish must not hide a later item.
-fn before(item: &Value, watermark: DateTime<Utc>) -> bool {
-    item.get("created_at")
-        .or_else(|| item.get("submitted_at"))
-        .and_then(Value::as_str)
-        .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
-        .map(|at| at.with_timezone(&Utc))
-        .is_some_and(|at| at < watermark)
-}
-
 /// The failing check names from `check-runs` and legacy commit statuses, in
 /// API order and de-duplicated. Anything not completed counts as pending,
 /// not failing — the same conservative split as `link_status`.
@@ -1219,12 +1184,12 @@ mod tests {
         })
     }
 
-    /// The reviews endpoint is queried NEWEST first (`sort=created&
-    /// direction=desc`), so the fixture answers in that order: a fixture
-    /// listing reviews oldest first models a response GitHub never sends.
+    /// The reviews endpoint answers ASCENDING by `submitted_at` and ignores
+    /// `sort`/`direction`, so the fixture always answers in that order: a
+    /// fixture that reversed it would model a response GitHub never sends.
     fn reviews(items: &[(i64, &str, &str, &str, &str)]) -> Value {
         let mut rows = items.to_vec();
-        rows.sort_by(|a, b| b.3.cmp(a.3).then(b.0.cmp(&a.0)));
+        rows.sort_by(|a, b| a.3.cmp(b.3).then(a.0.cmp(&b.0)));
         json!(
             rows.iter()
                 .map(|(id, author, state, at, body)| json!({
@@ -2050,7 +2015,7 @@ mod tests {
             comments(&[(1, "alice", "2023-11-14T22:13:21Z", "失败一次也不能丢")]),
         );
         *fake.broken.lock().unwrap() = Some(format!(
-            "repos/acme/widget/issues/27/comments?since={}&per_page=100&sort=created&direction=desc",
+            "repos/acme/widget/issues/27/comments?since={}&per_page=100",
             since(at(0))
         ));
         let before = fake.not_modified();
@@ -2432,8 +2397,7 @@ mod tests {
             )]),
         );
         *fake.limited.lock().unwrap() = Some(
-            "repos/acme/widget/issues/27/comments?since=2023-11-14T22:13:20Z&per_page=100&sort=created&direction=desc"
-                .into(),
+            "repos/acme/widget/issues/27/comments?since=2023-11-14T22:13:20Z&per_page=100".into(),
         );
         assert_eq!(
             watcher
@@ -2496,19 +2460,19 @@ mod tests {
         // A pathological commit: more pages of checks than one poll may read,
         // with the failing run past the cap.
         let list = "repos/acme/widget/commits/abc123/check-runs?per_page=100";
-        for page in 1..=MAX_CHECK_PAGES + 1 {
+        for page in 1..=MAX_PAGES + 1 {
             let path = if page == 1 {
                 list.to_owned()
             } else {
                 format!("{list}&page={page}")
             };
-            let body = if page == MAX_CHECK_PAGES + 1 {
+            let body = if page == MAX_PAGES + 1 {
                 checks(&[("build", "FAILURE")])
             } else {
                 checks(&[("build", "SUCCESS")])
             };
             fake.set(&path, &format!("checks-{page}"), body);
-            if page <= MAX_CHECK_PAGES {
+            if page <= MAX_PAGES {
                 fake.link(&path, &format!("{list}&page={}", page + 1));
             }
         }
@@ -2546,7 +2510,7 @@ mod tests {
         );
     }
 
-    /// Serve a newest-first paginated review list at `base`, a hundred items
+    /// Serve an ascending paginated review list at `base`, a hundred items
     /// per page, chaining `rel="next"` the way GitHub does.
     fn paginate_reviews(
         fake: &FakeGh,
@@ -2554,7 +2518,7 @@ mod tests {
         version: &str,
         items: &[(i64, &str, &str, &str, &str)],
     ) {
-        let query = "per_page=100&sort=created&direction=desc";
+        let query = "per_page=100";
         let pages = items.len().div_ceil(100).max(1);
         for page in 1..=pages {
             let start = (page - 1) * 100;
@@ -2575,11 +2539,11 @@ mod tests {
         }
     }
 
-    /// A busy PR's newest activity can still need more than one page: when
-    /// every item on page one is newer than the watermark the walk follows
-    /// `rel="next"` and stops at the first older item it meets.
+    /// The comment endpoints cannot be reversed either: `sort`/`direction`
+    /// are ignored, so a burst that spills onto page two is only complete if
+    /// the walk follows `rel="next"` to the end.
     #[tokio::test]
-    async fn a_review_beyond_the_first_page_is_still_reported() {
+    async fn a_comment_on_the_second_page_is_still_reported() {
         let fake = FakeGh::default();
         seed_green(&fake, "abc123");
         let fetch = fake.fetch();
@@ -2592,35 +2556,48 @@ mod tests {
             None
         );
 
-        // A hundred reviews land in the same second: the watermark item is
-        // pushed to page two.
-        let base = "repos/acme/widget/pulls/27/reviews";
-        let mut items: Vec<(i64, &str, &str, &str, &str)> = (2..=101)
-            .rev()
-            .map(|id| (id, "bot", "COMMENTED", "2023-11-14T22:13:21Z", ""))
+        // A hundred and fifty comments land at once: the newest is on page
+        // two, exactly where an ascending list puts it.
+        let base = "repos/acme/widget/issues/27/comments";
+        let query = format!("?since={}&per_page=100", since(at(0)));
+        let page = |page: usize| {
+            if page == 1 {
+                format!("{base}{query}")
+            } else {
+                format!("{base}{query}&page={page}")
+            }
+        };
+        let first: Vec<(i64, &str, &str, &str)> = (1..=100)
+            .map(|id| (id, "bot", "2023-11-14T22:13:21Z", ""))
             .collect();
-        items[0].1 = "bob";
-        items[0].2 = "CHANGES_REQUESTED";
-        items[0].4 = "第一页里的评审";
-        items.push((1, "alice", "COMMENTED", "2023-11-14T22:13:19Z", ""));
-        paginate_reviews(&fake, base, "v2", &items);
+        let mut second: Vec<(i64, &str, &str, &str)> = (101..=150)
+            .map(|id| (id, "bot", "2023-11-14T22:13:22Z", ""))
+            .collect();
+        second.last_mut().unwrap().1 = "alice";
+        second.last_mut().unwrap().3 = "第二页才有的评论";
+        fake.set(&page(1), "comments-p1", comments(&first));
+        fake.set(&page(2), "comments-p2", comments(&second));
+        fake.link(&page(1), &page(2));
 
         let message = watcher
             .poll(std::slice::from_ref(&link), &*fetch, Instant::now(), at(1))
             .await
-            .expect("a review on a later page is still news");
-        assert!(message.contains("bob · \"第一页里的评审\""), "{message}");
+            .expect("a comment on a later page is still news");
+        assert!(
+            message.contains("alice · \"第二页才有的评论\""),
+            "{message}"
+        );
         assert!(
             fake.requests()
                 .iter()
-                .any(|request| request.path.ends_with("page=2")),
+                .any(|request| request.path == page(2)),
             "the second page was followed"
         );
     }
 
-    /// Review 501 on a six-page PR. Oldest-first it hides behind five pages
-    /// that a page cap can never reach; newest-first the walk stops at the
-    /// watch-start boundary on page ONE, so the review is seen — exactly once.
+    /// Review 501 on a six-page PR. The reviews endpoint is ascending and has
+    /// no `since=` cursor, so the new review is appended to the LAST page and
+    /// only a walk to the end can see it — exactly once.
     #[tokio::test]
     async fn review_501_on_a_six_page_pr_is_seen_exactly_once() {
         let fake = FakeGh::default();
@@ -2628,7 +2605,6 @@ mod tests {
         let base = "repos/acme/widget/pulls/27/reviews";
         // Five hundred reviews of history, all older than the add.
         let old: Vec<(i64, &str, &str, &str, &str)> = (1..=500)
-            .rev()
             .map(|id| (id, "alice", "COMMENTED", "2023-11-14T22:13:19Z", "早期评审"))
             .collect();
         paginate_reviews(&fake, base, "v1", &old);
@@ -2643,16 +2619,16 @@ mod tests {
             None
         );
 
-        // Review 501 lands: the list is six pages long, and the review is the
-        // newest item in it.
-        let mut fresh = vec![(
+        // Review 501 lands at the END: the list is six pages long and the
+        // review is on the last one.
+        let mut fresh = old.clone();
+        fresh.push((
             501,
             "bob",
             "CHANGES_REQUESTED",
             "2023-11-14T22:13:21Z",
             "第六页的评审",
-        )];
-        fresh.extend(old.iter().cloned());
+        ));
         paginate_reviews(&fake, base, "v2", &fresh);
 
         let message = watcher
@@ -2675,8 +2651,8 @@ mod tests {
         assert!(
             fake.requests()
                 .iter()
-                .all(|request| !request.path.contains("page=2")),
-            "newest-first paging stops at the watermark on page one"
+                .any(|request| request.path.contains("page=6")),
+            "the walk followed the list to the page review 501 lives on"
         );
     }
 
