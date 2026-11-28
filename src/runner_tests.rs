@@ -4751,7 +4751,7 @@ async fn web_attach_normalizes_a_self_owned_older_cursor_and_keeps_an_ancestor()
     );
     // A head-only history: its own compaction opens it, so the route points at
     // the SAME session.
-    runner.agent.restore_located(
+    runner.agent().restore_located(
         vec![
             SessionEntry::Compaction {
                 summary: "head summary".into(),
@@ -4767,7 +4767,9 @@ async fn web_attach_normalizes_a_self_owned_older_cursor_and_keeps_an_ancestor()
         ],
         vec![None, None],
     );
-    runner.agent.set_older_route(Some(("self-owner".into(), 0)));
+    runner
+        .agent()
+        .set_older_route(Some(("self-owner".into(), 0)));
     runner.prepare_web_attach();
     let (reply, rx) = tokio::sync::oneshot::channel();
     respond_web_attach_shared(&runner.shared, reply);
@@ -4784,7 +4786,7 @@ async fn web_attach_normalizes_a_self_owned_older_cursor_and_keeps_an_ancestor()
 
     // A genuine ancestor owner survives normalization.
     runner
-        .agent
+        .agent()
         .set_older_route(Some(("ancestor-session".into(), 7)));
     runner.prepare_web_attach();
     let (reply, rx) = tokio::sync::oneshot::channel();
@@ -4852,7 +4854,7 @@ async fn web_attach_bootstrap_widens_the_head_to_the_previous_compaction() {
         user("q2"),
     ];
     for (seq, entry) in history.iter().cloned().enumerate() {
-        runner.agent.apply_entry_located(
+        runner.agent().apply_entry_located(
             entry,
             Some(crate::session_store::EntryLocation {
                 backend: "sqlite",
@@ -4925,7 +4927,7 @@ async fn web_attach_replays_a_trailing_display_after_the_selected_rows() {
         } else {
             (index as i64 - 200, 5_000 + index as i64)
         };
-        runner.agent.apply_entry_located(
+        runner.agent().apply_entry_located(
             SessionEntry::from(Message::User {
                 content: format!("row{index}"),
                 images: vec![],
@@ -4940,7 +4942,7 @@ async fn web_attach_replays_a_trailing_display_after_the_selected_rows() {
             }),
         );
     }
-    assert_eq!(runner.agent.history().len(), total);
+    assert_eq!(runner.agent().history().len(), total);
     {
         let mut shared = runner.shared.lock().unwrap();
         shared.set_history_boundary(total - 1);
@@ -4983,25 +4985,22 @@ async fn web_attach_replays_only_transients_in_the_head_history_range() {
     );
     // An early presentation event is outside a later 200-entry head. Two
     // later events retain their physical/logical order inside that head.
-    runner.agent.apply_entry(
+    runner.agent().apply_entry(
         Message::User {
             content: "old".into(),
             images: vec![],
         }
         .into(),
     );
-    runner
-        .shared
-        .lock()
-        .unwrap()
-        .set_history_boundary(runner.agent.history().len());
+    let boundary = runner.agent().history().len();
+    runner.shared.lock().unwrap().set_history_boundary(boundary);
     runner
         .shared
         .lock()
         .unwrap()
         .emit_presentation(AgentEvent::Notice("old-notice".into()));
     for i in 0..205 {
-        runner.agent.apply_entry(
+        runner.agent().apply_entry(
             Message::User {
                 content: format!("u{i}"),
                 images: vec![],
@@ -5009,8 +5008,9 @@ async fn web_attach_replays_only_transients_in_the_head_history_range() {
             .into(),
         );
         if i == 10 || i == 100 {
+            let boundary = runner.agent().history().len();
             let mut shared = runner.shared.lock().unwrap();
-            shared.set_history_boundary(runner.agent.history().len());
+            shared.set_history_boundary(boundary);
             shared.emit_presentation(AgentEvent::Notice(format!("head-notice-{i}")));
         }
     }
@@ -5573,7 +5573,7 @@ async fn get_context_usage_saturates_extreme_utilization() {
         "usage-extreme".into(),
         IdlePolicy::FinishWhenIdle,
     );
-    runner.agent.set_context_window(1);
+    runner.agent().set_context_window(1);
     runner.start(Some("start".into())).join().await.unwrap();
     let entries = SessionStore::Jsonl
         .load(temp.path(), "usage-extreme")
@@ -5657,7 +5657,7 @@ async fn get_context_usage_reports_previous_regular_usage_in_a_mixed_batch() {
         "context-usage".into(),
         IdlePolicy::FinishWhenIdle,
     );
-    runner.agent.set_context_window(100);
+    runner.agent().set_context_window(100);
     runner.start(Some("start".into())).join().await.unwrap();
     let entries = SessionStore::Jsonl
         .load(temp.path(), "context-usage")
@@ -19226,7 +19226,7 @@ async fn bootstrap_consume_mismatch_does_not_fail_and_projection_clears_rows() {
     )
     .await
     .expect("bootstrap continues after stale consume tokens");
-    let history = runner.agent.history();
+    let history = runner.agent_ro().history();
     assert_eq!(history.iter().filter(|entry| matches!(entry, SessionEntry::Notice { text } if text.contains("2 background task(s)"))).count(), 1);
     assert!(
         store
@@ -19365,7 +19365,7 @@ async fn bootstrap_normal_leftover_gets_one_notice_and_is_consumed() {
     )
     .await
     .unwrap();
-    assert_eq!(runner.agent.history().iter().filter(|entry| matches!(entry, SessionEntry::Notice { text } if text.contains("1 background task(s)"))).count(), 1);
+    assert_eq!(runner.agent_ro().history().iter().filter(|entry| matches!(entry, SessionEntry::Notice { text } if text.contains("1 background task(s)"))).count(), 1);
     let remaining = store
         .peek_unfinished_background(temp.path(), "bootstrap-normal")
         .await
@@ -19394,7 +19394,7 @@ async fn bootstrap_normal_leftover_gets_one_notice_and_is_consumed() {
     .unwrap();
     assert_eq!(
         second_runner
-            .agent
+            .agent_ro()
             .history()
             .iter()
             .filter(|entry| matches!(entry, SessionEntry::Notice { text } if text.contains("background task(s)")))

@@ -3718,7 +3718,8 @@ writable_paths = ["./p"]
 
 #[test]
 fn parses_acp_section_with_defaults_and_overrides() {
-    // Absent section: no `acp_prompt` tool at all (opt-in).
+    // Absent section: no configured agent (a bare `delegate { agent: "name" }`
+    // still launches that name with the default stdio arguments).
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("key"), "key").unwrap();
     let base = r#"
@@ -3745,21 +3746,13 @@ model = "k3"
                 .map(|arg| (*arg).to_owned())
                 .collect(),
             model: None,
-            allow_kinds: DEFAULT_ACP_ALLOW_KINDS
-                .iter()
-                .map(|kind| (*kind).to_owned())
-                .collect(),
-            danger: false,
         })
     );
 
-    // Explicit values win; a blank model means "leave the agent's model",
-    // and kinds are normalized because they are matched verbatim.
+    // Explicit values win; a blank model means "leave the agent's model".
     let path = write_config(
         temp.path(),
-        &format!(
-            "{base}[acp]\nbinary = \"/opt/other-acp\"\nargs = [\"serve\"]\nmodel = \"  \"\nallow_kinds = [\"Read\", \" \"]\ndanger = true\n"
-        ),
+        &format!("{base}[acp]\nbinary = \"/opt/other-acp\"\nargs = [\"serve\"]\nmodel = \"  \"\n"),
     );
     let config = Config::from_path(&path).unwrap();
     assert_eq!(
@@ -3768,15 +3761,21 @@ model = "k3"
             binary: "/opt/other-acp".into(),
             args: vec!["serve".into()],
             model: None,
-            allow_kinds: vec!["read".into()],
-            danger: true,
         })
     );
 
-    // `allow_kinds = []` is an explicit "deny every kind".
-    let path = write_config(temp.path(), &format!("{base}[acp]\nallow_kinds = []\n"));
+    // A concrete model id is carried through.
+    let path = write_config(temp.path(), &format!("{base}[acp]\nmodel = \"fast\"\n"));
     let config = Config::from_path(&path).unwrap();
-    assert_eq!(config.acp().unwrap().allow_kinds, Vec::<String>::new());
+    assert_eq!(config.acp().unwrap().model.as_deref(), Some("fast"));
+
+    // The permission-policy knobs are GONE with the tool: every request is
+    // answered by a human (or refused), so such a key is a parse error now
+    // instead of a silently ignored approval switch.
+    let path = write_config(temp.path(), &format!("{base}[acp]\nallow_kinds = []\n"));
+    assert!(Config::from_path(&path).is_err());
+    let path = write_config(temp.path(), &format!("{base}[acp]\ndanger = true\n"));
+    assert!(Config::from_path(&path).is_err());
 
     // A misspelled key is refused instead of silently ignored.
     let path = write_config(temp.path(), &format!("{base}[acp]\ndangerous = true\n"));

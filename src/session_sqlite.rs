@@ -2509,7 +2509,7 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
             title: title.map(str::to_owned), // a fresh session may be named at creation (subagent label)
             pinned: None,                    // a fresh session is unpinned until the user pins it
             archived: None, // a fresh session is unarchived until the user archives it
-            acp_session_id: None, // no ACP conversation until `acp_prompt` runs
+            acp_session_id: None, // no ACP conversation until a driver opens one
             writer: None,   // stamped by insert_meta with the writing process
             label: None,    // label lives in running_tasks, resolved at list time
         };
@@ -2780,7 +2780,7 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
     }
 
     /// The ACP session id this session last used, or `None` when it never
-    /// ran `acp_prompt` (also `None` for a session with no metadata row).
+    /// ran an ACP session (also `None` for a session with no metadata row).
     /// Reads the newest snapshot row, so a value written by another process
     /// on the same database file is visible.
     pub async fn acp_session_id(&self, session_id: &str) -> Result<Option<String>, String> {

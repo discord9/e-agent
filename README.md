@@ -291,6 +291,39 @@ subagent keeps running after detach. While attached, prompts can be queued and
 an in-flight turn can be cancelled; bash tasks have no event stream and cannot
 be attached.
 
+### ACP children: `delegate { agent: "agy" }`
+
+`agent` (mutually exclusive with `role`, `resume` and `fork`) turns the child
+into a session whose turns are an external [ACP](https://agentclientprotocol.com)
+agent's conversation instead of a second model loop: e-agent spawns
+`agy acp --stdio` once (`[acp] binary`/`args` override the program, `[acp]
+model` selects a model id), runs `initialize` + `session/new`, and keeps that
+process for the child's whole lifetime (one process per child, SIGKILLed and
+reaped when the child ends or the parent tears down). The task is one
+`session/prompt`; `agent_message_chunk` text streams into the child's view and
+is committed as its assistant text, and the turn ends on the prompt response's
+`stopReason`. The agent's own history is authoritative for execution; the
+child's transcript is authoritative for display and is never sent back.
+
+The child is not a one-shot tool: after a turn it goes **idle** with its process
+alive and its task still registered, so it can be clicked open in the web task
+panel (or attached in the TUI) and conversed with like any session. An explicit
+stop (task-panel cancel / the child's own cancel while idle) ends it and
+reports once to the parent through the ordinary delegate completion path.
+
+A `session/request_permission` from the agent becomes **that child's own
+blocking question** in its own view: the options are the agent's options, the
+answer is the chosen `optionId` verbatim, and nothing else can grant a request
+(an unanswered, stale, foreign or overlapping request is answered `cancelled`).
+A process that dies mid-turn fails the turn visibly with one terminal report —
+never a hang and never a silent success.
+
+Not in this milestone: tool-call cards for the agent's own calls, usage/context
+accounting, `/model`, compaction, cross-process `session/load`, MCP passthrough,
+TUI parity, more than one queued prompt, and ACP session discovery. Main
+sessions cannot be ACP-driven yet — the driver is a session-layer capability
+(`SessionRunner::new_acp`), and `delegate` is its first caller.
+
 ## Compaction
 
 Use `/compact` in the TUI or `--repl` to manually summarize earlier history.
@@ -513,6 +546,12 @@ starts.
 - `AGENTS.md` loading is workspace-root only: no parent or nested discovery.
 - Subagents are runtime tasks, not processes: no agent-to-agent messaging
   beyond live parent/child `send_message`, no delegation past one level.
+- ACP children (`delegate { agent: "agy" }`) run an external ACP agent as a
+  child SESSION: no tool-call cards for the agent's own calls, no usage/context
+  accounting, no `/model`, no compaction, no cross-process `session/load`, no
+  MCP passthrough, no TUI parity, no second queued prompt, and no ACP session
+  discovery. Their permission requests are answered by the child's own
+  question (or refused) — never auto-approved.
 - Cancellation is a release, not a termination.
 - No idle-runner GC, no shell-command classifier, and no forced turn ending for
   background waits.

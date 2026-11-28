@@ -1095,21 +1095,6 @@ impl SessionFactory {
             self.read_only,
             self.skills_root.as_deref(),
         );
-        // Main-agent only: `acp_prompt` (one external ACP stdio agent per
-        // call). Children/btw forks build the common builtins, so they never
-        // see it — like `generate_image`, a same-workspace fork of a main
-        // session that exposed it has a different tool array.
-        // The store + root + session id are the ACP session-reuse wiring: the
-        // tool reads/writes `sessions.acp_session_id` through the store.
-        register_acp(
-            &mut tools,
-            &tools_workspace,
-            config.as_ref(),
-            self.read_only,
-            &store,
-            &self.root,
-            &session,
-        );
         // Read-only sessions skip MCP entirely: MCP tools carry no read-only
         // marker, so exposing them would defeat the policy. Delegation stays —
         // spawning a subagent does not mutate this session's host state, and
@@ -1137,6 +1122,9 @@ impl SessionFactory {
         .with_sandbox(self.sandbox.clone())
         .with_local_sessions(self.local_sessions.clone())
         .record_background_tasks_in(self.root.clone(), &session, store.clone())
+        // `delegate { agent: "…" }` is the one ACP entry point: the child's
+        // driver (not a tool) launches the configured `[acp]` agent.
+        .with_acp_agents(config.as_ref().and_then(crate::config::Config::acp))
         .with_persist_store(self.backend.clone());
         if let Some(subagent_model) = &subagent_model {
             let name = subagent_model.profile_key();
@@ -1473,41 +1461,6 @@ pub(crate) fn register_generate_image(
     if !read_only && let Ok(tool) = generate_image_tool(workspace.clone(), auth) {
         tools.push(tool);
     }
-}
-
-/// Register the main-agent-only `acp_prompt` tool. The `[acp]` section is the
-/// opt-in: without it nothing is registered (the same boundary as a
-/// `[web_search]` without a usable credential). Read-only sessions skip it —
-/// the external agent carries no read-only marker and would defeat the policy
-/// — and children/btw forks build the common builtins without it.
-///
-/// This is the wiring point for ACP session reuse: the tool gets the session
-/// store (`sessions.acp_session_id`) plus the store's workspace root and the
-/// session id it belongs to, so it never opens a database itself.
-pub(crate) fn register_acp(
-    tools: &mut Vec<Box<dyn crate::agent::Tool>>,
-    workspace: &Workspace,
-    config: Option<&crate::config::Config>,
-    read_only: bool,
-    store: &crate::session_store::SessionStore,
-    root: &std::path::Path,
-    session: &str,
-) {
-    if read_only {
-        return;
-    }
-    let Some(acp) = config.and_then(crate::config::Config::acp) else {
-        return;
-    };
-    // The session id is bound up front: the ACP id belongs to THIS session's
-    // metadata row from the first call.
-    tools.push(crate::tools::acp_tool(
-        workspace.clone(),
-        acp,
-        store.clone(),
-        root.to_path_buf(),
-        session,
-    ));
 }
 
 fn preflight_sandbox(policy: &Sandbox, announce: bool) -> anyhow::Result<()> {
