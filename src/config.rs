@@ -375,6 +375,9 @@ pub struct ProviderAccount {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ModelProfile {
+    /// Wire model id. Antigravity profiles must use a pinned
+    /// `antigravity::catalog` id and may omit this (the catalog default
+    /// applies); every other provider requires it.
     model: Option<String>,
     reasoning_effort: Option<String>,
     /// Force the OpenAI-compatible `thinking` switch (`thinking:
@@ -922,12 +925,10 @@ impl Config {
             .models
             .get(profile)
             .ok_or_else(|| anyhow!("model profile `{profile}` is not defined"))?;
-        let model = model_profile
+        let configured_model = model_profile
             .model
             .as_deref()
-            .filter(|model| !model.is_empty())
-            .ok_or_else(|| anyhow!("model profile `{profile}` requires `model`"))?
-            .to_owned();
+            .filter(|model| !model.is_empty());
         let reasoning_effort = model_profile.reasoning_effort.clone();
         let thinking = model_profile.thinking.unwrap_or(false);
         let provider = self.providers.get(provider_name).ok_or_else(|| {
@@ -958,6 +959,23 @@ impl Config {
                     "provider `{provider_name}` with auth = `{auth}` cannot set `client_id`, `client_secret`, or `min_interval_ms`"
                 );
             }
+            let model = match configured_model {
+                Some(model) => model.to_owned(),
+                // The pinned catalog supplies Antigravity's default; every
+                // other provider still requires an explicit model.
+                None if mode == AuthMode::Antigravity => {
+                    crate::antigravity::catalog::DEFAULT_MODEL.to_owned()
+                }
+                None => bail!("model profile `{profile}` requires `model`"),
+            };
+            if mode == AuthMode::Antigravity
+                && let Err(error) = crate::antigravity::catalog::validate(&model)
+            {
+                // Flatten the catalog's message into this error: the model
+                // and its closest family stay visible even to a caller that
+                // only prints the top-level Display.
+                bail!("model profile `{profile}`: {error:#}");
+            }
             return Ok(ResolvedModel {
                 base_url: String::new(),
                 api_key: String::new(),
@@ -974,6 +992,9 @@ impl Config {
                 min_interval_ms: provider.min_interval_ms,
             });
         }
+        let model = configured_model
+            .ok_or_else(|| anyhow!("model profile `{profile}` requires `model`"))?
+            .to_owned();
         if provider.client_id.is_some()
             || provider.client_secret.is_some()
             || provider.min_interval_ms.is_some()

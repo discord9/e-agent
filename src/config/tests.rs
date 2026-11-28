@@ -1763,7 +1763,7 @@ fn resolves_antigravity_and_rejects_mixed_credentials() {
 auth = "antigravity"
 
 [models."antigravity/gemini"]
-model = "gemini-3.8-flash-tiered"
+model = "gemini-3.8-flash-high"
 context_window = 65536
 "#,
     );
@@ -1772,7 +1772,7 @@ context_window = 65536
         .resolve(Some("antigravity/gemini"))
         .unwrap();
     assert_eq!(resolved.auth, AuthMode::Antigravity);
-    assert_eq!(resolved.model, "gemini-3.8-flash-tiered");
+    assert_eq!(resolved.model, "gemini-3.8-flash-high");
     assert_eq!(resolved.context_window, Some(65536));
     // Fixed endpoint and no API key: neither comes from the config.
     assert!(resolved.base_url.is_empty());
@@ -1789,7 +1789,7 @@ client_id = "test-client.apps.googleusercontent.com"
 client_secret = "GOCSPX-test"
 
 [models."antigravity/gemini"]
-model = "gemini-3.8-flash-tiered"
+model = "gemini-3.8-flash-high"
 "#,
     );
     let resolved = Config::from_path(&keyed)
@@ -1820,7 +1820,7 @@ auth = "antigravity"
 {field}
 
 [models."antigravity/gemini"]
-model = "gemini-3.8-flash-tiered"
+model = "gemini-3.8-flash-high"
 "#
             ),
         );
@@ -1831,6 +1831,138 @@ model = "gemini-3.8-flash-tiered"
             .to_string();
         assert!(error.contains("auth = `antigravity` cannot set"), "{error}");
     }
+}
+
+/// Antigravity models are validated against the pinned catalog at CONFIG
+/// resolution: a typo must not survive until the first request. A profile
+/// that omits `model` gets the catalog default instead of the generic
+/// "requires `model`" error.
+#[test]
+fn antigravity_model_is_catalog_validated_and_has_a_default() {
+    use crate::antigravity::catalog;
+
+    let temp = tempfile::tempdir().unwrap();
+    let omitted = write_config(
+        temp.path(),
+        r#"
+[providers.antigravity]
+auth = "antigravity"
+
+[models."antigravity/default"]
+"#,
+    );
+    let resolved = Config::from_path(&omitted)
+        .unwrap()
+        .resolve(Some("antigravity/default"))
+        .unwrap();
+    assert_eq!(resolved.model, catalog::DEFAULT_MODEL);
+    assert_eq!(resolved.auth, AuthMode::Antigravity);
+
+    let typo = write_config(
+        temp.path(),
+        r#"
+[providers.antigravity]
+auth = "antigravity"
+
+[models."antigravity/gemini"]
+model = "gemini-4-neno-high"
+"#,
+    );
+    let error = Config::from_path(&typo)
+        .unwrap()
+        .resolve(Some("antigravity/gemini"))
+        .unwrap_err();
+    let message = format!("{error:#}");
+    assert!(message.contains("gemini-4-neno-high"), "{message}");
+    assert!(message.contains("closest family"), "{message}");
+    assert!(message.contains("gemini-4-neon-high"), "{message}");
+    assert!(message.contains("gemini-4-neon-low"), "{message}");
+    // The top-level Display carries the same detail (the catalog message is
+    // flattened, not merely chained as a cause).
+    let top = error.to_string();
+    assert!(top.contains("gemini-4-neno-high"), "{top}");
+    assert!(top.contains("gemini-4-neon-low"), "{top}");
+
+    // Every pinned id resolves through the real config path, not only
+    // through `catalog::validate`.
+    let mut source = String::from("[providers.antigravity]\nauth = \"antigravity\"\n");
+    for model in catalog::MODELS {
+        source.push_str(&format!(
+            "\n[models.\"antigravity/{}\"]\nmodel = \"{}\"\n",
+            model.id, model.id
+        ));
+    }
+    let all = write_config(temp.path(), &source);
+    let config = Config::from_path(&all).unwrap();
+    for model in catalog::MODELS {
+        let profile = format!("antigravity/{}", model.id);
+        let resolved = config.resolve(Some(&profile)).unwrap();
+        assert_eq!(resolved.model, model.id);
+        assert_eq!(resolved.auth, AuthMode::Antigravity);
+    }
+
+    // Excluded wire entries fail with the policy reason, not a generic typo
+    // suggestion; the shared tiered id is a normal catalog entry.
+    for (model, reason) in [
+        ("tab_flash_lite_preview", "UI preview"),
+        ("gemini-3.1-flash-image", "image-generation"),
+    ] {
+        let path = write_config(
+            temp.path(),
+            &format!(
+                r#"
+[providers.antigravity]
+auth = "antigravity"
+
+[models."antigravity/excluded"]
+model = "{model}"
+"#
+            ),
+        );
+        let error = Config::from_path(&path)
+            .unwrap()
+            .resolve(Some("antigravity/excluded"))
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains(model), "{message}");
+        assert!(message.contains("excluded"), "{message}");
+        assert!(message.contains(reason), "{message}");
+    }
+    let tiered = write_config(
+        temp.path(),
+        r#"
+[providers.antigravity]
+auth = "antigravity"
+
+[models."antigravity/tiered"]
+model = "gemini-3.8-flash-tiered"
+"#,
+    );
+    assert_eq!(
+        Config::from_path(&tiered)
+            .unwrap()
+            .resolve(Some("antigravity/tiered"))
+            .unwrap()
+            .model,
+        "gemini-3.8-flash-tiered"
+    );
+
+    // Every OTHER provider still requires an explicit `model`.
+    let other = write_config(
+        temp.path(),
+        r#"
+[providers.local]
+base_url = "http://127.0.0.1:8000"
+
+[models."local/m"]
+"#,
+    );
+    let error = Config::from_path(&other)
+        .unwrap()
+        .resolve(Some("local/m"))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("requires `model`"), "{error}");
 }
 
 /// Request pacing is a provider key on the Antigravity provider: it
@@ -1850,7 +1982,7 @@ auth = "antigravity"
 {extra}
 
 [models."antigravity/gemini"]
-model = "gemini-3.8-flash-tiered"
+model = "gemini-3.8-flash-high"
 "#
             ),
         );

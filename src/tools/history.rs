@@ -195,7 +195,7 @@ async fn execute_scoped(
             let Some(entry) = entries.into_iter().next() else {
                 return Err("history entry not found".into());
             };
-            return Ok(json!({"workspace_id":entry.workspace_id,"session_id":entry.session_id,"seq":entry.seq,"entry":entry.entry}).to_string());
+            return Ok(json!({"workspace_id":entry.workspace_id,"session_id":entry.session_id,"seq":entry.seq,"entry":public_entry(&entry.entry)}).to_string());
         }
         let entries = store
             .load_history_session(
@@ -210,7 +210,7 @@ async fn execute_scoped(
             return Err("history entry not found".into());
         };
         return Ok(
-            json!({"workspace_id":workspace_id,"session_id":session_id,"seq":seq,"entry":entry})
+            json!({"workspace_id":workspace_id,"session_id":session_id,"seq":seq,"entry":public_entry(&entry)})
                 .to_string(),
         );
     }
@@ -388,7 +388,49 @@ async fn execute_scoped(
 }
 
 fn scoped_entry(entry: &HistoryEntry) -> Value {
-    json!({"workspace_id":entry.workspace_id,"session_id":entry.session_id,"seq":entry.seq,"entry":entry.entry})
+    json!({"workspace_id":entry.workspace_id,"session_id":entry.session_id,"seq":entry.seq,"entry":public_entry(&entry.entry)})
+}
+
+/// A session entry as history may SHOW it: `provider_meta` (an Antigravity
+/// `thoughtSignature`, replayed only by the wire that produced it) and the
+/// provider's wire call ids never leave private replay. Every call/result id
+/// becomes the same local [`crate::agent::public_call_id`], so the projection
+/// still pairs them without handing a later model one wire's signature or
+/// correlation token. Applies to every entry shape, including a compaction's
+/// retained messages.
+fn public_entry(entry: &SessionEntry) -> Value {
+    let mut value = serde_json::to_value(entry).unwrap_or(Value::Null);
+    strip_private(&mut value);
+    value
+}
+
+fn strip_private(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.remove("provider_meta");
+            if let Some(Value::Array(calls)) = map.get_mut("tool_calls") {
+                for call in calls {
+                    if let Some(id) = call.get("id").and_then(Value::as_str) {
+                        let local = crate::agent::public_call_id(id);
+                        call["id"] = json!(local);
+                    }
+                }
+            }
+            if let Some(id) = map.get("call_id").and_then(Value::as_str) {
+                let local = crate::agent::public_call_id(id);
+                map.insert("call_id".to_owned(), json!(local));
+            }
+            for nested in map.values_mut() {
+                strip_private(nested);
+            }
+        }
+        Value::Array(items) => {
+            for nested in items {
+                strip_private(nested);
+            }
+        }
+        _ => {}
+    }
 }
 fn history_load_error(error: anyhow::Error) -> String {
     tracing::error!("history: cannot load entries: {error:#}");
@@ -1722,5 +1764,54 @@ mod tests {
         }
         assert!(pages > 1, "more than one result page was required");
         assert_eq!(seen, vec![10, 8, 6, 4, 2, 0]);
+    }
+    /// B3: history is a PUBLIC projection. A provider signature and the wire
+    /// call id stay in private replay; the projection carries one local
+    /// correlation id for both the call and its result. Compaction's retained
+    /// tail is projected the same way.
+    #[test]
+    fn projection_strips_provider_meta_and_wire_call_ids() {
+        let assistant = SessionEntry::Message {
+            message: Message::Assistant(AssistantMessage {
+                content: Some("go".into()),
+                tool_calls: vec![ToolCall {
+                    id: "wire-call".into(),
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                    provider_meta: Some("SIG-MUST-NOT-LEAK".into()),
+                }],
+                reasoning: None,
+            }),
+        };
+        let tool = SessionEntry::Message {
+            message: Message::Tool {
+                call_id: "wire-call".into(),
+                name: "bash".into(),
+                content: "ok".into(),
+                images: vec![],
+                is_error: false,
+                synthetic: false,
+            },
+        };
+        let compacted = SessionEntry::Compaction {
+            summary: "s".into(),
+            retained: vec![match assistant.clone() {
+                SessionEntry::Message { message } => message,
+                _ => unreachable!(),
+            }],
+            current_prompt_at: None,
+            no_current_prompt: true,
+        };
+        let local = crate::agent::public_call_id("wire-call");
+        for entry in [assistant, tool, compacted] {
+            let value = public_entry(&entry);
+            let text = value.to_string();
+            assert!(!text.contains("SIG-MUST-NOT-LEAK"), "{text}");
+            assert!(!text.contains("wire-call"), "{text}");
+            assert!(
+                text.contains(&local),
+                "the local correlation id pairs them: {text}"
+            );
+        }
     }
 }

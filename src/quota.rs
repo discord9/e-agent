@@ -1277,7 +1277,8 @@ mod tests {
     async fn antigravity_card_from(status: u16, body: &str) -> ProviderQuota {
         let url = fake_quota(status, body).await;
         let client = reqwest::Client::new();
-        let summary = crate::antigravity::quota_summary_at(&client, &url, "test-token").await;
+        let summary =
+            crate::antigravity::quota_summary_at(&client, &url, "test-token", "test-project").await;
         antigravity_card("antigravity", Source::Antigravity.label(), summary)
     }
 
@@ -1342,12 +1343,37 @@ mod tests {
     async fn antigravity_failure_renders_unavailable() {
         let url = fake_quota(500, r#"{"error":{"message":"boom"}}"#).await;
         let client = reqwest::Client::new();
-        let summary = crate::antigravity::quota_summary_at(&client, &url, "test-token").await;
+        let summary =
+            crate::antigravity::quota_summary_at(&client, &url, "test-token", "test-project").await;
         assert!(summary.is_err(), "a 500 is an error at the wire");
         let card = antigravity_card("antigravity", Source::Antigravity.label(), summary);
         assert_eq!(card.kind, QuotaKind::Error);
         assert_eq!(card.error.as_deref(), Some("quota unavailable"));
         assert!(card.windows.is_empty());
         assert!(card.amount.is_none() && card.currency.is_none() && card.plan.is_none());
+    }
+    /// A 403 is the documented `SUBSCRIPTION_REQUIRED` refusal: the card must
+    /// still exist and SAY the number is unknown, never disappear.
+    #[tokio::test]
+    async fn antigravity_403_renders_an_unknown_card() {
+        let body = json!({"error":{"code":403,"status":"SUBSCRIPTION_REQUIRED"}});
+        let card = antigravity_card_from(403, &body.to_string()).await;
+        assert_eq!(card.kind, QuotaKind::Quota, "{card:?}");
+        assert_eq!(card.windows.len(), 1, "{card:?}");
+        assert_eq!(card.windows[0].label, "quota");
+        assert!(!card.windows[0].used_percent.is_finite());
+        assert!(card.windows[0].reset_at.is_none());
+    }
+
+    /// Schema drift (a body this client cannot read) is the same answer: one
+    /// known-unknown row, not a missing card and not an upstream error string.
+    #[tokio::test]
+    async fn antigravity_schema_drift_renders_an_unknown_card() {
+        let body = json!({"buckets": [], "unexpected": true});
+        let card = antigravity_card_from(200, &body.to_string()).await;
+        assert_eq!(card.kind, QuotaKind::Quota, "{card:?}");
+        assert_eq!(card.windows.len(), 1, "{card:?}");
+        assert_eq!(card.windows[0].label, "quota");
+        assert!(!card.windows[0].used_percent.is_finite());
     }
 }

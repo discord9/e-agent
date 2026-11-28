@@ -2059,7 +2059,7 @@ impl SessionRunner {
                 is_error,
                 content: tool_text,
                 images: event_images,
-                call_id: Some(call.id.clone()),
+                call_id: Some(crate::agent::public_call_id(&call.id)),
             });
         let steering = self.intake_after_operation(Vec::new());
         if steering != Steering::None {
@@ -3468,7 +3468,10 @@ impl SessionRunner {
                         shared.emit_durable(AgentEvent::ToolCall {
                             name: call.name.clone(),
                             arguments: call.arguments.clone(),
-                            call_id: Some(call.id.clone()),
+                            // Public projection: a local correlation id, so
+                            // the provider's wire id never reaches the event
+                            // stream (and a later provider never sees it).
+                            call_id: Some(crate::agent::public_call_id(&call.id)),
                         });
                     }
                 }
@@ -3630,7 +3633,7 @@ impl SessionRunner {
                                         is_error: true,
                                         content: error,
                                         images: Vec::new(),
-                                        call_id: Some(call.id.clone()),
+                                        call_id: Some(crate::agent::public_call_id(&call.id)),
                                     });
                                 continue;
                             }
@@ -3716,7 +3719,7 @@ impl SessionRunner {
                                         is_error: false,
                                         content,
                                         images: Vec::new(),
-                                        call_id: Some(call.id.clone()),
+                                        call_id: Some(crate::agent::public_call_id(&call.id)),
                                     });
                                 let steering = self.intake_after_operation(waited.pending);
                                 if steering != Steering::None {
@@ -3946,7 +3949,7 @@ impl SessionRunner {
                             is_error,
                             content: tool_text,
                             images,
-                            call_id: Some(call.id.clone()),
+                            call_id: Some(crate::agent::public_call_id(&call.id)),
                         });
                     // A release that raced the tool's own completion: the
                     // tool result was committed above (contract: completed
@@ -4240,7 +4243,7 @@ fn entry_event(entry: &SessionEntry) -> Option<AgentEvent> {
             is_error: *is_error,
             content: content.clone(),
             images: images.clone(),
-            call_id: Some(call_id.clone()),
+            call_id: Some(crate::agent::public_call_id(call_id)),
         }),
         SessionEntry::Compaction { summary, .. } => {
             Some(AgentEvent::Display(format!("compacted: {summary}")))

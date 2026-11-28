@@ -1,8 +1,10 @@
 //! Native Google Antigravity provider (`v1internal:streamGenerateContent`):
 //! no CLI subprocess, one HTTP request per turn over the OAuth login the
-//! Antigravity CLI (`agy`) already stored. The response is a JSON ARRAY
-//! stream, decoded incrementally here so text parts reach the caller as
-//! `ModelDeltaKind::Content` deltas. Refreshing an expired login also needs
+//! Antigravity CLI (`agy`) already stored. The response is Server-Sent
+//! Events (`?alt=sse`): `data:` lines joined into one JSON object per event,
+//! decoded incrementally here so text parts reach the caller as
+//! `ModelDeltaKind::Content` deltas. The request asks for `?alt=sse`; there is
+//! no JSON-array framing in this adapter. Refreshing an expired login also needs
 //! the CLI's own OAuth consumer client (`client_id` / `client_secret` from
 //! the provider's config): no credential ships inside e-agent.
 //!
@@ -26,11 +28,18 @@
 //! caught by the framing instead.
 //!
 //! A request carries the CLI's own envelope (`requestType`, `requestId`, and a
-//! conversation-derived `request.sessionId`), is repaired rather than refused
-//! where the wire tolerates it (empty parts, missing call/response ids, a
-//! drifted response name, a missing tool schema), and a 404 for a bare flash
-//! model is retried ONCE against that family's shared `-tiered` endpoint: a
-//! pinned client version is only allowed to reach that one.
+//! conversation-derived `request.sessionId`) and a DISCOVERED `project`:
+//! `loadCodeAssist` (once per instance, see `project_id`) names the account's
+//! `cloudaicompanionProject` — a real id for GCP/Workspace, the consumer
+//! literal [`PROJECT`] for `agy`'s own — and anything less falls back to that
+//! literal without failing the turn.
+//! The body is repaired rather than refused where the wire tolerates it (empty
+//! parts, missing call/response ids, a drifted response name, a missing tool
+//! schema), and a 404 for a flash model is retried ONCE against that family's
+//! shared `-tiered` endpoint: a pinned client version is only allowed to reach
+//! that one. The catalog exposes the flash tiers `-high|-medium|-low` plus the
+//! shared `gemini-3.8-flash-tiered` id itself; a bare `gemini-…-flash` alias is
+//! not a catalog entry and configuration rejects it.
 //! Error messages carry the HTTP status, an allowlisted provider error code,
 //! and allowlisted `finishReason` constants only: a provider body can quote the
 //! submitted credentials and those messages are persisted in the session log.
@@ -57,9 +66,11 @@
 //! The account quota card is the ONE extra call ([`quota_summary`]):
 //! read-only, only when the quota surface asks, never during a turn.
 //!
-//! Non-goals: model listing (`fetchAvailableModels`), image input
-//! (`supports_vision` is false), a retry framework (one 401 -> refresh ->
-//! retry, and one 404 -> `-tiered` fallback, never a loop), and any
+//! Non-goals: model listing at runtime (`fetchAvailableModels`; the ids are
+//! the fixed [`catalog`] table captured from it, never fetched live), account
+//! provisioning (`onboardUser`, the fallback reference clients use when
+//! discovery is empty), a retry framework (one 401 -> refresh -> retry, one
+//! 404 -> `-tiered` fallback, and one 429 -> retry, never a loop), and any
 //! `generationConfig` reasoning mapping (a `thinkingConfig` is
 //! accepted with HTTP 200 but changed nothing observable, so
 //! `reasoning_effort`/`thinking` are inert on this wire).
@@ -81,6 +92,8 @@ use crate::agent::{
 };
 use crate::model::IncompleteToolCall;
 
+pub(crate) mod catalog;
+
 /// Streaming generation endpoint on the Cloud Code "daily" host, in its SSE
 /// form (`alt=sse`): one `data: {json}` event per chunk instead of the
 /// default JSON-array framing, which needs no state machine of ours. Same
@@ -89,12 +102,19 @@ pub(crate) const STREAM_URL: &str =
     "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse";
 /// Google OAuth refresh endpoint.
 pub(crate) const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
-/// Account quota summary: a `POST` with `{"project": PROJECT}` answers
+/// Project discovery on the generation host: its `cloudaicompanionProject` is
+/// the id a generation body carries. It is per ACCOUNT, so no config key.
+pub(crate) const LOAD_ASSIST_URL: &str =
+    "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
+/// Account quota summary: a `POST` with the selected login's project answers
 /// `groups[].buckets[]` of `{bucketId, window, remainingFraction, resetTime,
 /// disabled}` for the logged-in account. Read-only.
 pub(crate) const QUOTA_URL: &str =
     "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
-/// The only project id this endpoint accepts.
+/// The fallback project id: the literal `loadCodeAssist` itself returns for a
+/// CONSUMER account (`agy`'s own login). A GCP/Workspace account gets a real id
+/// from discovery instead; this stands in when discovery reports nothing, fails,
+/// or has not run yet.
 pub(crate) const PROJECT: &str = "aicode-consumers";
 /// `requestType` every CLI generation request carries.
 pub(crate) const REQUEST_TYPE: &str = "agent";
@@ -183,6 +203,16 @@ pub struct AntigravityModel {
     /// contents and then frozen, so each turn of the session — and every clone
     /// of this model — sends the same conversation segment.
     conversation: std::sync::Arc<std::sync::OnceLock<String>>,
+    /// The generation host's `loadCodeAssist` (see [`LOAD_ASSIST_URL`]).
+    load_assist_url: String,
+    /// The project id every body carries: discovered ONCE per selected `agy`
+    /// LOGIN by [`Self::project_id`], [`PROJECT`] on a discovery that produced
+    /// nothing. Switching logins selects a different entry; a clone shares it.
+    project: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, std::sync::Arc<tokio::sync::OnceCell<String>>>,
+        >,
+    >,
     /// Whether this profile takes images (profile `vision`, default TRUE).
     /// `supports_vision` reports it and `complete` gates on it.
     vision: bool,
@@ -221,6 +251,7 @@ impl AntigravityModel {
             reasoning_effort,
             stream_url: STREAM_URL.into(),
             token_endpoint: TOKEN_URL.into(),
+            load_assist_url: LOAD_ASSIST_URL.into(),
             token_file: home.join(".gemini/antigravity-cli/antigravity-oauth-token"),
             cache_file: config_dir.join("antigravity-token.json"),
             client_id,
@@ -228,6 +259,7 @@ impl AntigravityModel {
             min_interval: Duration::from_millis(min_interval_ms.unwrap_or(DEFAULT_MIN_INTERVAL_MS)),
             last_request: Default::default(),
             conversation: Default::default(),
+            project: Default::default(),
             vision: true,
             image_store: crate::agent::image_store_dir(),
         })
@@ -247,12 +279,109 @@ impl AntigravityModel {
         (conversation, uuid_like(digest))
     }
 
+    /// Binding identity of the SELECTED `agy` login: the fingerprint of its
+    /// refresh credential (or of its access token when the file carries no
+    /// refresh credential), never the credential itself. Project discovery is
+    /// cached per key, so switching `agy` accounts cannot keep posting the
+    /// previous account's project.
+    fn selected_login(&self) -> anyhow::Result<String> {
+        let (_, cli) = self.credentials()?;
+        Ok(cli
+            .refresh_token
+            .as_deref()
+            .map(login_fingerprint)
+            .unwrap_or_else(|| login_fingerprint(&cli.access_token)))
+    }
+
+    /// The project id one request body carries, discovered once per selected
+    /// `agy` login by [`Self::discover_project`]. Each login has its own async
+    /// once cell under a shared map, so two concurrent sessions/clones cannot
+    /// both discover, and a switch to another account selects another cell.
+    async fn project_id(&self, token: &str) -> String {
+        let login = match self.selected_login() {
+            Ok(login) => login,
+            // `access_token` already required the CLI file; this is defensive.
+            Err(_) => return PROJECT.to_owned(),
+        };
+        let cell = {
+            let mut projects = self.project.lock().unwrap();
+            projects
+                .entry(login)
+                .or_insert_with(|| std::sync::Arc::new(tokio::sync::OnceCell::new()))
+                .clone()
+        };
+        cell.get_or_try_init(|| async {
+            // A discovery that produced nothing is cached as the literal too:
+            // the project does not change within one login, and a definitive
+            // empty answer must not be retried on every turn. An authentication
+            // or transport failure is NOT cached: a later turn may carry a
+            // refreshed token and discover the real project.
+            self.discover_project(token)
+                .await
+                .map(|project| project.unwrap_or_else(|| PROJECT.to_owned()))
+        })
+        .await
+        .cloned()
+        .unwrap_or_else(|_| PROJECT.to_owned())
+    }
+
+    /// Ask `loadCodeAssist` for `cloudaicompanionProject` (the TOP-LEVEL field
+    /// of its body — no `response` envelope here, unlike the generation
+    /// stream). NEVER a turn failure: `Ok(None)` caches [`PROJECT`] (a
+    /// definitive empty answer), while `Err` means the lookup was not
+    /// authoritative (401/transport) — this request uses [`PROJECT`] but the
+    /// next turn retries discovery. Only a generation error fails a turn. A
+    /// failed body is never read or logged.
+    async fn discover_project(&self, token: &str) -> anyhow::Result<Option<String>> {
+        self.pace().await;
+        let response = self
+            .client
+            .post(&self.load_assist_url)
+            // The same headers as generation: bearer token, the CLI user
+            // agent, and JSON content (`json()` sets the content type).
+            .header(reqwest::header::USER_AGENT, USER_AGENT)
+            .bearer_auth(token)
+            .json(&json!({"metadata": {"ideType": "ANTIGRAVITY"}}))
+            .send()
+            .await
+            .map_err(|error| {
+                tracing::debug!("Antigravity project discovery failed ({error}); using {PROJECT}");
+                anyhow!("Antigravity project discovery request failed")
+            })?;
+        let status = response.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            // The token may simply have expired between `access_token` and
+            // here; do not freeze the fallback for this login.
+            tracing::debug!(
+                "Antigravity project discovery: HTTP 401; using {PROJECT} for this request only"
+            );
+            return Err(anyhow!("Antigravity project discovery was unauthorized"));
+        }
+        if !status.is_success() {
+            tracing::debug!("Antigravity project discovery: HTTP {status}; using {PROJECT}");
+            return Ok(None);
+        }
+        match response.json::<Value>().await {
+            Ok(body) => Ok(body["cloudaicompanionProject"]
+                .as_str()
+                .filter(|project| !project.trim().is_empty())
+                .map(|project| project.trim().to_owned())),
+            Err(error) => {
+                tracing::debug!(
+                    "Antigravity project discovery unreadable: {error}; using {PROJECT}"
+                );
+                Ok(None)
+            }
+        }
+    }
+
     /// Reserve the next request slot: read the previous start under the lock,
     /// store this one, and RELEASE the lock before sleeping, so the network
     /// call never holds it. Taking the decision under the lock is what makes
     /// concurrent callers serialize — two parallel rounds cannot both pass at
     /// once, and each one waits its own remainder. Every request (the
-    /// generation POST, a refresh, the post-401 retry) goes through here.
+    /// generation POST, a refresh, the post-401 retry, the project discovery)
+    /// goes through here.
     async fn pace(&self) {
         if self.min_interval.is_zero() {
             return;
@@ -308,7 +437,7 @@ impl AntigravityModel {
             .collect()
     }
 
-    /// Model slug (the `fetchAvailableModels` id), used for display.
+    /// Model slug (a pinned [`catalog`] id), used for display.
     pub fn name(&self) -> &str {
         &self.model
     }
@@ -616,6 +745,8 @@ impl AntigravityModel {
         // PER REQUEST by `complete`, not here: its step counts the requests of
         // one turn, and the retries are made there.
         Ok(json!({
+            // The fallback: `complete` replaces it with the discovered id
+            // before the first POST (see `project_id`).
             "project": PROJECT,
             "model": self.model,
             "requestType": REQUEST_TYPE,
@@ -666,51 +797,70 @@ impl Model for AntigravityModel {
         let (conversation, trajectory) = self.turn_ids(&request);
         let mut step = 0;
         set_request_id(&mut request, &conversation, &trajectory, step);
-        let token = self.access_token().await?;
+        let mut token = self.access_token().await?;
+        // The builder's `project` is the fallback; the discovered id replaces
+        // it here, before the first POST, and rides every retry below too.
+        request["project"] = json!(self.project_id(&token).await);
         let mut response = self.send(&token, &request).await?;
-        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-            // One bounded recovery: refresh once, then retry the same body.
-            let token = self.refresh().await?;
-            step += 1;
-            set_request_id(&mut request, &conversation, &trajectory, step);
-            response = self.send(&token, &request).await?;
-        }
-        if response.status() == reqwest::StatusCode::NOT_FOUND
-            && let Some(tiered) = tiered_fallback(&self.model)
-        {
-            // One bounded fallback, never a loop: this client version is only
-            // allowed to reach the shared `-tiered` endpoint for the family,
-            // so the same turn is re-sent once with that model. The NEXT turn
-            // starts from the configured id again (a 404 costs one request).
-            let mut retried = request.clone();
-            retried["model"] = json!(tiered);
-            step += 1;
-            set_request_id(&mut retried, &conversation, &trajectory, step);
-            response = self.send(&token, &retried).await?;
-            // A 429 on the fallback is the same 429: the retry below re-sends
-            // THIS body (the tiered model), not the configured one.
-            request = retried;
-        }
-        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            // The body is classified and then DROPPED (see `Rate429`): only an
-            // allowlisted reason and a parsed delay reach the message.
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            let wait = match classify_429(status, body.as_bytes()) {
-                Rate429::RateLimited { delay: Some(wait) } if wait <= RATE_LIMIT_429_CAP => wait,
-                Rate429::Soft => SOFT_429_BACKOFF,
-                Rate429::Unknown => UNKNOWN_429_BACKOFF,
-                rate => return Err(rate_429_error(&self.model, rate)),
-            };
-            // Sleeping here does not bypass pacing: `send` still waits out
-            // `min_interval`, so the retry is spaced like any other request.
-            tokio::time::sleep(wait).await;
-            step += 1;
-            set_request_id(&mut request, &conversation, &trajectory, step);
-            response = self.send(&token, &request).await?;
-            // One retry is the whole budget: a second 429 fails on its status.
-            if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                return Err(rate_429_error(&self.model, Rate429::Unknown));
+        // Three one-shot budgets, all kept ACROSS transitions: a 401 first
+        // seen on the `-tiered` POST still refreshes, a 404 first seen after
+        // a refresh still falls back, and both retries spend the ACTIVE token
+        // (the refreshed one, not the one that started the turn). Each
+        // transition happens at most once; anything beyond it fails below.
+        let mut refreshed = false;
+        let mut tiered = false;
+        let mut rate_retried = false;
+        loop {
+            match response.status() {
+                reqwest::StatusCode::UNAUTHORIZED if !refreshed => {
+                    refreshed = true;
+                    token = self.refresh().await?;
+                    step += 1;
+                    set_request_id(&mut request, &conversation, &trajectory, step);
+                    response = self.send(&token, &request).await?;
+                }
+                reqwest::StatusCode::NOT_FOUND if !tiered => {
+                    // One bounded fallback, never a loop: this client version
+                    // is only allowed to reach the shared `-tiered` endpoint
+                    // for the family, so the same turn is re-sent once with
+                    // that model. The NEXT turn starts from the configured id
+                    // again (a 404 costs one request).
+                    let current = request["model"].as_str().unwrap_or(&self.model);
+                    let Some(fallback) = tiered_fallback(current) else {
+                        break;
+                    };
+                    tiered = true;
+                    request["model"] = json!(fallback);
+                    step += 1;
+                    set_request_id(&mut request, &conversation, &trajectory, step);
+                    response = self.send(&token, &request).await?;
+                }
+                reqwest::StatusCode::TOO_MANY_REQUESTS if !rate_retried => {
+                    // The body is classified and then DROPPED (see `Rate429`):
+                    // only an allowlisted reason and a parsed delay reach the
+                    // message.
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    let wait = match classify_429(status, body.as_bytes()) {
+                        Rate429::RateLimited { delay: Some(wait) }
+                            if wait <= RATE_LIMIT_429_CAP =>
+                        {
+                            wait
+                        }
+                        Rate429::Soft => SOFT_429_BACKOFF,
+                        Rate429::Unknown => UNKNOWN_429_BACKOFF,
+                        rate => return Err(rate_429_error(&self.model, rate)),
+                    };
+                    // Sleeping here does not bypass pacing: `send` still waits
+                    // out `min_interval`, so the retry is spaced like any other
+                    // request.
+                    tokio::time::sleep(wait).await;
+                    rate_retried = true;
+                    step += 1;
+                    set_request_id(&mut request, &conversation, &trajectory, step);
+                    response = self.send(&token, &request).await?;
+                }
+                _ => break,
             }
         }
         let status = response.status();
@@ -780,6 +930,19 @@ impl QuotaBucket {
             format!("{} {}", self.family, self.window)
         }
     }
+
+    /// The row a card shows when the upstream refuses to state a number
+    /// (403 `SUBSCRIPTION_REQUIRED`, or a body this client cannot read): the
+    /// UI renders a `used_percent: null` window as "unknown", so the card
+    /// still exists instead of disappearing.
+    pub(crate) fn unknown() -> Self {
+        Self {
+            family: "quota".to_owned(),
+            window: String::new(),
+            remaining: None,
+            resets_at: None,
+        }
+    }
 }
 
 /// The account's remaining quota, one row per bucket: one fresh read per call,
@@ -789,31 +952,42 @@ impl QuotaBucket {
 pub(crate) async fn quota_summary() -> anyhow::Result<Vec<QuotaBucket>> {
     let mut model = AntigravityModel::new(String::new(), None, None, None, None)?;
     let token = model.access_token().await?;
-    quota_summary_at(&model.client, QUOTA_URL, &token).await
+    let project = model.project_id(&token).await;
+    quota_summary_at(&model.client, QUOTA_URL, &token, &project).await
 }
 
 /// The one POST behind [`quota_summary`], split out so a fake server can drive
-/// it with a fixed URL and token. Status only on failure: no upstream body
-/// reaches an error.
+/// it with a fixed URL, token, and project. Status only on failure: no upstream
+/// body reaches an error.
 pub(crate) async fn quota_summary_at(
     client: &reqwest::Client,
     url: &str,
     token: &str,
+    project: &str,
 ) -> anyhow::Result<Vec<QuotaBucket>> {
     let response = client
         .post(url)
         .header(reqwest::header::USER_AGENT, USER_AGENT)
         .bearer_auth(token)
-        .json(&json!({"project": PROJECT}))
+        .json(&json!({"project": project}))
         .send()
         .await
-        .and_then(reqwest::Response::error_for_status)
         .context("Antigravity quota request failed")?;
+    // A 403 is the documented `SUBSCRIPTION_REQUIRED` answer (and also what an
+    // unauthorized caller sees): it is not a transport failure, and the card
+    // must SAY the number is unknown rather than vanish.
+    if response.status() == reqwest::StatusCode::FORBIDDEN {
+        return Ok(vec![QuotaBucket::unknown()]);
+    }
     let value = response
+        .error_for_status()
+        .context("Antigravity quota request failed")?
         .json()
         .await
         .context("cannot decode the Antigravity quota response")?;
-    parse_quota_summary(&value)
+    // Schema drift is handled the same way: a card with one unknown row beats
+    // a card that disappears because a field moved.
+    Ok(parse_quota_summary(&value).unwrap_or_else(|_| vec![QuotaBucket::unknown()]))
 }
 
 /// `{"groups":[{"buckets":[{"bucketId":"gemini-5h","remainingFraction":0.42,
@@ -916,6 +1090,11 @@ struct Turn {
     /// part clears it; it SURVIVES into the following element, because the wire
     /// splits a call and its signature part across elements.
     pending_call: Option<usize>,
+    /// The one candidate this stream may carry. A second candidate in the same
+    /// element, or a different `index` later, is rejected before any call is
+    /// returned: accumulating candidates let a `MAX_TOKENS` call and a `STOP`
+    /// text answer share one turn, and the last `finishReason` decided both.
+    candidate_index: Option<u64>,
 }
 
 impl Turn {
@@ -939,8 +1118,48 @@ impl Turn {
         {
             self.usage = Some(metadata);
         }
-        for candidate in response["candidates"].as_array().into_iter().flatten() {
+        let candidates = response["candidates"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if candidates.len() > 1 {
+            // Two candidates are two independent generations (the review's
+            // case: a `MAX_TOKENS` signed call plus a `STOP` text answer).
+            // There is no rule that says which one the caller asked for, so
+            // none of them runs; the count is ours, not provider text.
+            bail!(
+                "Antigravity returned {} candidates in one response; exactly one is supported",
+                candidates.len()
+            );
+        }
+        for candidate in candidates {
+            // If the wire numbers its candidate, the same number must own the
+            // whole stream; a different one would splice two generations.
+            if let Some(index) = candidate["index"].as_u64() {
+                match self.candidate_index {
+                    Some(expected) if expected != index => bail!(
+                        "Antigravity stream switched candidates ({} after {}); exactly one is supported",
+                        index,
+                        expected
+                    ),
+                    None => self.candidate_index = Some(index),
+                    _ => {}
+                }
+            }
             if let Some(reason) = candidate["finishReason"].as_str() {
+                // A single candidate has one terminal reason. A different one
+                // later is a SECOND generation spliced into the stream (the
+                // `MAX_TOKENS` signed call followed by a `STOP` text answer);
+                // the values are provider text and are never echoed.
+                if self
+                    .finish_reason
+                    .as_deref()
+                    .is_some_and(|previous| previous != reason)
+                {
+                    bail!(
+                        "Antigravity stream changed its finishReason mid-turn; exactly one candidate is supported"
+                    );
+                }
                 self.finish_reason = Some(reason.to_owned());
             }
             let parts = candidate["content"]["parts"]
@@ -1226,14 +1445,19 @@ fn repair_request(request: &mut Value) {
     let Some(contents) = request["contents"].as_array_mut() else {
         return;
     };
-    // Calls first: the id filled here is the one the matching result must use.
-    let mut call_names: std::collections::HashMap<String, String> = Default::default();
-    let mut unanswered: Vec<String> = Vec::new();
+    // The calls of the most recent assistant batch, still unanswered. A result
+    // is matched HERE, never against every id in the transcript: two turns may
+    // reuse a wire id for different tools, and a later call must not rewrite an
+    // earlier result's name.
+    let mut batch: Vec<(String, String)> = Vec::new();
     for content in contents.iter_mut() {
         let Some(parts) = content["parts"].as_array_mut() else {
             continue;
         };
         parts.retain(|part| !is_empty_part(part));
+        // Calls first: the id filled here is the one the matching result must
+        // use, and this content becomes the batch those results belong to.
+        let mut calls: Vec<(String, String)> = Vec::new();
         for part in parts.iter_mut() {
             let Some(call) = part.get_mut("functionCall") else {
                 continue;
@@ -1242,31 +1466,31 @@ fn repair_request(request: &mut Value) {
                 call["id"] = json!(local_call_id());
             }
             let id = call["id"].as_str().unwrap_or_default().to_owned();
-            if let Some(name) = call["name"].as_str() {
-                call_names.insert(id.clone(), name.to_owned());
-            }
-            unanswered.push(id);
+            let name = call["name"].as_str().unwrap_or_default().to_owned();
+            calls.push((id, name));
         }
-    }
-    for content in contents.iter_mut() {
-        let Some(parts) = content["parts"].as_array_mut() else {
-            continue;
-        };
+        if !calls.is_empty() {
+            batch = calls;
+        }
         for part in parts.iter_mut() {
             let Some(response) = part.get_mut("functionResponse") else {
                 continue;
             };
             let mut id = response["id"].as_str().unwrap_or_default().to_owned();
             if id.is_empty() {
-                // The next call still waiting for its result.
-                id = unanswered.first().cloned().unwrap_or_else(local_call_id);
-                response["id"] = json!(id);
+                // The first call of THIS batch still waiting for its result.
+                let local = batch
+                    .first()
+                    .map(|(open, _)| open.clone())
+                    .unwrap_or_else(local_call_id);
+                response["id"] = json!(local);
+                id = local;
             }
-            if let Some(position) = unanswered.iter().position(|open| *open == id) {
-                unanswered.remove(position);
-            }
-            if let Some(name) = call_names.get(&id) {
-                response["name"] = json!(name);
+            if let Some(position) = batch.iter().position(|(open, _)| *open == id) {
+                let (_, name) = batch.remove(position);
+                if !name.is_empty() {
+                    response["name"] = json!(name);
+                }
             }
         }
     }
@@ -1387,6 +1611,15 @@ fn uuid_like(mut digest: [u8; 16]) -> String {
 /// refused for the bare and per-tier flash ids with 404 while the SHARED tier
 /// endpoint answers 200. Only Gemini **flash** families take part, an id that
 /// already ends in `-tiered` has no second chance, and the caller retries ONCE.
+///
+/// The catalog exposes flash as `-high|-medium|-low` plus the shared
+/// `gemini-3.8-flash-tiered` id, so the fallback still applies to every
+/// configurable flash TIER: the tier is stripped and the shared `-tiered` id
+/// (itself a pinned catalog entry) is the one retry target. A bare
+/// `gemini-…-flash` alias is not in the catalog and configuration rejects it;
+/// an explicit `-tiered` id is in the catalog and this function still returns
+/// None for it (no second chance), while a direct call with the legacy bare
+/// alias behaves exactly as it did.
 fn tiered_fallback(model: &str) -> Option<String> {
     if model.ends_with(TIERED_SUFFIX) {
         return None;

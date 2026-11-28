@@ -37,7 +37,7 @@ fn entry_event_projects_tool_images_for_durable_replay() {
     assert!(matches!(
         entry_event(&entry),
         Some(AgentEvent::ToolResult { is_error: false, content, images: projected, call_id: Some(call_id) })
-            if content == "persisted image result" && call_id == "call-image-replay" && projected == images
+            if content == "persisted image result" && call_id == crate::agent::public_call_id("call-image-replay") && projected == images
     ));
 }
 
@@ -642,7 +642,7 @@ async fn request_user_input_without_a_frontend_errors_and_never_waits() {
         handle.snapshot().iter().any(|event| matches!(
             event,
             AgentEvent::ToolResult { is_error: true, content, call_id: Some(call_id), .. }
-                if call_id == "call-input" && content == USER_INPUT_UNAVAILABLE
+                if call_id == &crate::agent::public_call_id("call-input") && content == USER_INPUT_UNAVAILABLE
         )),
         "the question must come back as a plain tool error: {:?}",
         handle.snapshot()
@@ -1269,7 +1269,7 @@ async fn async_request_user_input_receipts_and_keeps_the_turn_going() {
         handle.snapshot().iter().any(|event| matches!(
             event,
             AgentEvent::ToolResult { is_error: false, content, call_id: Some(call_id), .. }
-                if call_id == "call-async" && content == &async_receipt("call-async")
+                if call_id == &crate::agent::public_call_id("call-async") && content == &async_receipt("call-async")
         )),
         "the async call must return its receipt: {:?}",
         handle.snapshot()
@@ -1675,7 +1675,7 @@ async fn async_request_user_input_without_a_frontend_registers_nothing() {
         handle.snapshot().iter().any(|event| matches!(
             event,
             AgentEvent::ToolResult { is_error: true, content, call_id: Some(call_id), .. }
-                if call_id == "call-async" && content == USER_INPUT_UNAVAILABLE
+                if call_id == &crate::agent::public_call_id("call-async") && content == USER_INPUT_UNAVAILABLE
         )),
         "the async call must fail back as the existing tool error: {:?}",
         handle.snapshot()
@@ -5866,7 +5866,7 @@ async fn mid_turn_auto_compact_before_tool_result_pairs_real_result() {
     let tool_call_at = log
         .iter()
         .position(|event| {
-            matches!(event, AgentEvent::ToolCall { call_id: Some(id), .. } if id == "call-1")
+            matches!(event, AgentEvent::ToolCall { call_id: Some(id), .. } if id == &crate::agent::public_call_id("call-1"))
         })
         .expect("the committed assistant's tool call is published");
     let compacted_at = log
@@ -5882,7 +5882,7 @@ async fn mid_turn_auto_compact_before_tool_result_pairs_real_result() {
     assert_eq!(
         log.iter()
             .filter(|event| {
-                matches!(event, AgentEvent::ToolCall { call_id: Some(id), .. } if id == "call-1")
+                matches!(event, AgentEvent::ToolCall { call_id: Some(id), .. } if id == &crate::agent::public_call_id("call-1"))
             })
             .count(),
         1,
@@ -10398,7 +10398,7 @@ async fn assert_read_only_runner_cancel_while_sqlite_read_pending(read_output: b
         handle.snapshot()
     );
     assert!(!handle.snapshot().iter().any(|event| matches!(
-        event, AgentEvent::ToolResult { call_id: Some(id), .. } if id == "pending-read"
+        event, AgentEvent::ToolResult { call_id: Some(id), .. } if id == &crate::agent::public_call_id("pending-read")
     )));
     drop(held.lock().unwrap().take());
     handle.prompt("resume after cancel");

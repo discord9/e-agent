@@ -300,10 +300,29 @@ auth = "antigravity"
 client_id = "<client id from the agy install>"
 client_secret = "<client secret from the agy install>"
 
-[models."antigravity/gemini-flash"]
-model = "gemini-3.8-flash-tiered"   # a slug from the CLI's model list
-context_window = 65536
+[models."antigravity/gemini"]
+model = "gemini-4-neon-high"   # a pinned id from the fixed catalog
 ```
+
+e-agent pins the 34 chat models from the provider's 37-entry model list
+(captured from `v1internal:fetchAvailableModels`; the table is
+`src/antigravity/catalog.rs`) and validates `model` against that table while
+resolving the profile: a typo fails at startup with the model and the closest
+family's ids, not as a 404 on the first turn. The two `tab_*_preview` entries
+are CLI UI previews with a 16,384-token context and are excluded; the
+`gemini-3.1-flash-image` image-generation model is excluded because this
+adapter cannot use image output. Everything else is included. Each row
+carries the wire's `maxTokens` and `maxOutputTokens`; no number is guessed, and
+`supports_vision` follows the row's `supportsImages` because the adapter sends
+attached images as `inlineData` parts: every row is vision-capable except
+`gpt-oss-120b-medium`. A profile's `vision = false` can narrow that, never
+widen it. Omit `model` to use the catalog default, `gemini-4-neon-high` —
+a wire-recommended model (all 34 are flagged recommended), Gemini 4 Neon at
+its top reasoning tier, and it does not depend on the flash-only `-tiered`
+404 fallback. A bare `gemini-…-flash` alias is not a catalog entry and is
+rejected at resolution; the shared `gemini-3.8-flash-tiered` id is in the
+catalog, and a 404 for any catalog flash tier still retries once against it,
+unchanged.
 
 Credentials come from
 `~/.gemini/antigravity-cli/antigravity-oauth-token`, which stays READ-ONLY: an
@@ -737,7 +756,8 @@ by default; the flag sets an explicit cap). `--read-only` applies the read-only
 role policy to the main session (see "Read-only roles").
 `--profile` selects a TOML profile and requires a TOML config. When config is
 used, `--base-url` and `--model` are raw API wire-value overrides and take
-precedence over the selected profile values.
+precedence over the selected profile values (`--model` on an Antigravity
+profile must still be a pinned catalog id; `--base-url` is rejected there).
 
 ### Forking a session
 
@@ -1862,9 +1882,13 @@ parallel tool executor, task scheduler, priority system, or concurrency pool.
 It deliberately does not fetch provider/model catalogs (including
 models.dev), generate configuration, cache provider metadata, or infer
 context windows; TOML profiles are local static settings only. The native
-Antigravity provider does not list models (`fetchAvailableModels`) and never
-shells out to the `agy` CLI: the model slug is a static profile field, the wire
-is text-only, and no reasoning control is mapped. It also does not project or
+Antigravity provider does not call the model-list endpoint at runtime
+(`fetchAvailableModels`): its 34 chat-model ids are a fixed catalog
+(`src/antigravity/catalog.rs`) captured from that endpoint's 37 entries, not a
+live fetch, and it never shells out to the `agy` CLI. The model slug is a
+catalog id (or the catalog's default when the profile omits it), image input
+rides as `inlineData` on the rows whose wire capability allows it, and no
+reasoning control is mapped. It also does not project or
 downgrade the builtin tool schemas to a smaller dialect — the declarations use
 the endpoint's JSON-Schema field instead — and it never rewrites `agy`'s own
 token file. `AGENTS.md`

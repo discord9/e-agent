@@ -8,6 +8,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use super::*;
 use crate::agent::{Message, Model, ToolSpec};
+use crate::antigravity::catalog::{DEFAULT_MODEL, MODELS, Tier};
 
 /// One recorded request: path, raw headers (lowercased compare on demand) and
 /// the decoded JSON body.
@@ -219,13 +220,17 @@ fn model_for(fake: &Fake, token_file: PathBuf, cache_file: PathBuf) -> Antigravi
             .timeout(std::time::Duration::from_secs(10))
             .build()
             .unwrap(),
-        model: "gemini-3.8-flash-tiered".into(),
+        model: "gemini-3.8-flash-high".into(),
         reasoning_effort: None,
         stream_url: format!(
             "http://{}/v1internal:streamGenerateContent?alt=sse",
             fake.address
         ),
         token_endpoint: format!("http://{}/token", fake.address),
+        // Discovery is pointed away from the fake by default: these tests
+        // count their own requests, and a refused connection is an instant
+        // fallback to `PROJECT` (the discovery tests set this at the fake).
+        load_assist_url: "http://127.0.0.1:1/v1internal:loadCodeAssist".into(),
         token_file,
         cache_file,
         client_id: Some(TEST_CLIENT_ID.into()),
@@ -234,6 +239,7 @@ fn model_for(fake: &Fake, token_file: PathBuf, cache_file: PathBuf) -> Antigravi
         // tests set a real interval on the model.
         min_interval: std::time::Duration::ZERO,
         conversation: Default::default(),
+        project: Default::default(),
         last_request: Default::default(),
         vision: true,
         image_store: None,
@@ -248,6 +254,7 @@ fn test_model(dir: &Path) -> AntigravityModel {
         reasoning_effort: None,
         stream_url: "http://127.0.0.1:1/stream".into(),
         token_endpoint: "http://127.0.0.1:1/token".into(),
+        load_assist_url: "http://127.0.0.1:1/v1internal:loadCodeAssist".into(),
         token_file: dir.join("agy.json"),
         cache_file: dir.join("cache.json"),
         client_id: None,
@@ -255,6 +262,7 @@ fn test_model(dir: &Path) -> AntigravityModel {
         min_interval: std::time::Duration::ZERO,
         last_request: Default::default(),
         conversation: Default::default(),
+        project: Default::default(),
         vision: true,
         image_store: None,
     }
@@ -364,7 +372,7 @@ async fn streams_text_deltas_and_maps_usage() {
     );
     assert!(!lower.contains("x-goog-api-client"));
     assert_eq!(body["project"], "aicode-consumers");
-    assert_eq!(body["model"], "gemini-3.8-flash-tiered");
+    assert_eq!(body["model"], "gemini-3.8-flash-high");
     assert_eq!(
         body["request"]["systemInstruction"]["parts"][0]["text"],
         "be brief"
@@ -375,6 +383,169 @@ async fn streams_text_deltas_and_maps_usage() {
         "bash"
     );
     assert!(!dir.path().join("cache/antigravity-token.json").exists());
+}
+
+/// A model whose discovery POST and generation POSTs all reach ONE fake: the
+/// `loadCodeAssist` request is answered with `discovery`, every other one with
+/// one text turn. The fake is returned so a caller can count and inspect.
+async fn discovery_model(
+    dir: &Path,
+    discovery: (u16, String),
+    turns: usize,
+) -> (AntigravityModel, Fake) {
+    let token_file = write_agy_token(
+        dir,
+        "test-token",
+        Utc::now() + ChronoDuration::hours(1),
+        "refresh-token",
+    );
+    let body = sse_body(&[text_element("ok")]);
+    let fake = spawn_fake(turns + 1, move |_, path| {
+        if path.contains("loadCodeAssist") {
+            discovery.clone()
+        } else {
+            (200, body.clone())
+        }
+    })
+    .await;
+    let mut model = model_for(&fake, token_file, dir.join("cache/token.json"));
+    model.load_assist_url = format!("http://{}/v1internal:loadCodeAssist", fake.address);
+    (model, fake)
+}
+
+/// The project id a discovery POST reports is the one the generation body
+/// carries, and the discovery POST itself sends the generation headers.
+#[tokio::test]
+async fn discovered_project_rides_the_generation_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut model, fake) = discovery_model(
+        dir.path(),
+        (
+            200,
+            json!({"cloudaicompanionProject": "gcp-project-42"}).to_string(),
+        ),
+        1,
+    )
+    .await;
+    let (assistant, _) = model
+        .complete(
+            &[Message::User {
+                content: "say ok".into(),
+                images: Vec::new(),
+            }],
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(assistant.content.as_deref(), Some("ok"));
+    let requests = fake.requests();
+    assert_eq!(requests.len(), 2, "one discovery, one generation");
+    let (path, headers, body) = &requests[0];
+    assert_eq!(path, "/v1internal:loadCodeAssist");
+    assert_eq!(body["metadata"]["ideType"], "ANTIGRAVITY");
+    let lower = headers.to_ascii_lowercase();
+    assert!(
+        lower.contains("authorization: bearer test-token"),
+        "{lower}"
+    );
+    assert!(
+        headers.contains(&format!("user-agent: {USER_AGENT}")),
+        "{headers}"
+    );
+    assert!(lower.contains("content-type: application/json"), "{lower}");
+    assert_eq!(requests[1].2["project"], "gcp-project-42");
+}
+
+/// Discovery that names nothing — an empty field, or no field at all — keeps
+/// the consumer literal: that IS what a consumer account is told anyway.
+#[tokio::test]
+async fn empty_discovered_project_keeps_the_consumer_literal() {
+    for discovery in [json!({"cloudaicompanionProject": ""}), json!({})] {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut model, fake) = discovery_model(dir.path(), (200, discovery.to_string()), 1).await;
+        model
+            .complete(
+                &[Message::User {
+                    content: "say ok".into(),
+                    images: Vec::new(),
+                }],
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+        let requests = fake.requests();
+        assert_eq!(requests.len(), 2, "{discovery}");
+        assert_eq!(requests[1].2["project"], PROJECT, "{discovery}");
+    }
+}
+
+/// A FAILED discovery is not a failed turn: a 500 falls back to the literal and
+/// the generation goes ahead. Only a generation error fails a turn.
+#[tokio::test]
+async fn discovery_failure_keeps_the_consumer_literal_and_the_turn_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut model, fake) = discovery_model(
+        dir.path(),
+        (500, json!({"error": {"code": 500}}).to_string()),
+        1,
+    )
+    .await;
+    let (assistant, _) = model
+        .complete(
+            &[Message::User {
+                content: "say ok".into(),
+                images: Vec::new(),
+            }],
+            &[],
+            None,
+        )
+        .await
+        .expect("a failed discovery does not fail the turn");
+    assert_eq!(assistant.content.as_deref(), Some("ok"));
+    let requests = fake.requests();
+    assert_eq!(requests.len(), 2, "discovery, then the generation");
+    assert_eq!(requests[1].2["project"], PROJECT);
+}
+
+/// The project is looked up ONCE per model instance: two turns make one
+/// discovery POST, and both bodies carry the discovered id.
+#[tokio::test]
+async fn discovery_runs_once_per_model_across_two_turns() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut model, fake) = discovery_model(
+        dir.path(),
+        (
+            200,
+            json!({"cloudaicompanionProject": "gcp-project-42"}).to_string(),
+        ),
+        2,
+    )
+    .await;
+    for _ in 0..2 {
+        model
+            .complete(
+                &[Message::User {
+                    content: "say ok".into(),
+                    images: Vec::new(),
+                }],
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    let requests = fake.requests();
+    assert_eq!(requests.len(), 3, "one discovery, two generations");
+    let discoveries = requests
+        .iter()
+        .filter(|(path, _, _)| path.contains("loadCodeAssist"))
+        .count();
+    assert_eq!(discoveries, 1, "fetched once per model instance");
+    for request in &requests[1..] {
+        assert_eq!(request.2["project"], "gcp-project-42");
+    }
 }
 
 #[tokio::test]
@@ -1280,10 +1451,11 @@ fn tool_result_body_echoes_signature_and_function_response() {
     let dir = tempfile::tempdir().unwrap();
     let model = AntigravityModel {
         client: reqwest::Client::new(),
-        model: "gemini-3.8-flash-tiered".into(),
+        model: "gemini-3.8-flash-high".into(),
         reasoning_effort: None,
         stream_url: "http://127.0.0.1:1/stream".into(),
         token_endpoint: "http://127.0.0.1:1/token".into(),
+        load_assist_url: "http://127.0.0.1:1/v1internal:loadCodeAssist".into(),
         token_file: dir.path().join("agy.json"),
         cache_file: dir.path().join("cache.json"),
         client_id: None,
@@ -1291,6 +1463,7 @@ fn tool_result_body_echoes_signature_and_function_response() {
         min_interval: std::time::Duration::ZERO,
         last_request: Default::default(),
         conversation: Default::default(),
+        project: Default::default(),
         vision: true,
         image_store: None,
     };
@@ -2633,7 +2806,7 @@ async fn request_pacing_spaces_consecutive_turns() {
 
     // The default is the documented 1000 ms (60 RPM).
     let default =
-        AntigravityModel::new("gemini-3.8-flash-tiered".into(), None, None, None, None).unwrap();
+        AntigravityModel::new("gemini-3.8-flash-high".into(), None, None, None, None).unwrap();
     assert_eq!(
         default.min_interval,
         std::time::Duration::from_millis(DEFAULT_MIN_INTERVAL_MS)
@@ -2740,10 +2913,11 @@ fn history_tool_schema_rides_the_wire() {
     let dir = tempfile::tempdir().unwrap();
     let model = AntigravityModel {
         client: reqwest::Client::new(),
-        model: "gemini-3.8-flash-tiered".into(),
+        model: "gemini-3.8-flash-high".into(),
         reasoning_effort: None,
         stream_url: "http://127.0.0.1:1/stream".into(),
         token_endpoint: "http://127.0.0.1:1/token".into(),
+        load_assist_url: "http://127.0.0.1:1/v1internal:loadCodeAssist".into(),
         token_file: dir.path().join("agy.json"),
         cache_file: dir.path().join("cache.json"),
         client_id: None,
@@ -2751,6 +2925,7 @@ fn history_tool_schema_rides_the_wire() {
         min_interval: std::time::Duration::ZERO,
         last_request: Default::default(),
         conversation: Default::default(),
+        project: Default::default(),
         vision: true,
         image_store: None,
     };
@@ -2823,7 +2998,7 @@ async fn live_builtin_toolset_and_parallel_round_trip() {
     let dir = tempfile::tempdir().unwrap();
     let specs = builtin_specs(dir.path());
     let mut model = AntigravityModel::new(
-        "gemini-3.8-flash-tiered".into(),
+        "gemini-3.8-flash-high".into(),
         None,
         std::env::var("E_AGENT_ANTIGRAVITY_CLIENT_ID").ok(),
         std::env::var("E_AGENT_ANTIGRAVITY_CLIENT_SECRET").ok(),
@@ -2920,10 +3095,11 @@ fn request_metadata_carries_type_id_and_derived_session() {
     let dir = tempfile::tempdir().unwrap();
     let model = AntigravityModel {
         client: reqwest::Client::new(),
-        model: "gemini-3.8-flash-tiered".into(),
+        model: "gemini-3.8-flash-high".into(),
         reasoning_effort: None,
         stream_url: "http://127.0.0.1:1/stream".into(),
         token_endpoint: "http://127.0.0.1:1/token".into(),
+        load_assist_url: "http://127.0.0.1:1/v1internal:loadCodeAssist".into(),
         token_file: dir.path().join("agy.json"),
         cache_file: dir.path().join("cache.json"),
         client_id: None,
@@ -2931,6 +3107,7 @@ fn request_metadata_carries_type_id_and_derived_session() {
         min_interval: std::time::Duration::ZERO,
         last_request: Default::default(),
         conversation: Default::default(),
+        project: Default::default(),
         vision: true,
         image_store: None,
     };
@@ -3146,7 +3323,7 @@ async fn not_found_retries_once_with_the_tiered_model() {
 /// failure — one request, never a loop.
 #[tokio::test]
 async fn not_found_without_a_tiered_variant_is_not_retried() {
-    for model_name in ["gemini-3.8-flash-tiered", "claude-sonnet-4-5"] {
+    for model_name in ["gemini-3.8-flash-tiered", "claude-opus-5-5-high"] {
         let dir = tempfile::tempdir().unwrap();
         let token_file = write_agy_token(
             dir.path(),
@@ -3189,10 +3366,11 @@ fn request_repair_fills_ids_aligns_names_and_drops_empty_parts() {
     let dir = tempfile::tempdir().unwrap();
     let model = AntigravityModel {
         client: reqwest::Client::new(),
-        model: "gemini-3.8-flash-tiered".into(),
+        model: "gemini-3.8-flash-high".into(),
         reasoning_effort: None,
         stream_url: "http://127.0.0.1:1/stream".into(),
         token_endpoint: "http://127.0.0.1:1/token".into(),
+        load_assist_url: "http://127.0.0.1:1/v1internal:loadCodeAssist".into(),
         token_file: dir.path().join("agy.json"),
         cache_file: dir.path().join("cache.json"),
         client_id: None,
@@ -3200,6 +3378,7 @@ fn request_repair_fills_ids_aligns_names_and_drops_empty_parts() {
         min_interval: std::time::Duration::ZERO,
         last_request: Default::default(),
         conversation: Default::default(),
+        project: Default::default(),
         vision: true,
         image_store: None,
     };
@@ -3264,6 +3443,358 @@ fn request_repair_fills_ids_aligns_names_and_drops_empty_parts() {
         json!({"type": "object"}),
         "a missing schema is defaulted, not sent as null"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Catalog: fixed table generated from the wire's 37-entry model list.
+// ---------------------------------------------------------------------------
+
+/// The tier an id's suffix names, the same way the table records it.
+fn tier_in(id: &str) -> Option<Tier> {
+    [Tier::Low, Tier::Medium, Tier::High, Tier::XHigh]
+        .into_iter()
+        .find(|tier| id.strip_suffix(tier.suffix()).is_some())
+}
+
+/// Every included id resolves, and its recorded family/tier agree with the id
+/// itself. The counts are pinned so a silently dropped row cannot pass.
+#[test]
+fn catalog_pins_every_included_id_with_its_family_and_tier() {
+    assert_eq!(MODELS.len(), 34, "the 34 included chat models");
+    assert_eq!(
+        catalog::EXCLUDED.len(),
+        3,
+        "the three excluded wire entries"
+    );
+    assert_eq!(
+        MODELS.len() + catalog::EXCLUDED.len(),
+        37,
+        "the wire capture's entry count"
+    );
+    let mut ids = std::collections::BTreeSet::new();
+    for row in MODELS {
+        assert!(ids.insert(row.id), "duplicate catalog id {}", row.id);
+        assert!(!row.display_name.is_empty(), "{} has no label", row.id);
+        assert_eq!(catalog::find(row.id), Some(row));
+        catalog::validate(row.id).expect("every included id resolves");
+        assert_eq!(tier_in(row.id), row.tier, "tier of {}", row.id);
+        // The id is the family itself or a variant/tier under it.
+        assert!(
+            row.id == row.family || row.id.starts_with(&format!("{}-", row.family)),
+            "{} is not in family {}",
+            row.id,
+            row.family
+        );
+        if let Some(tier) = row.tier {
+            assert!(
+                row.id.ends_with(tier.suffix()),
+                "{}'s tier is not its suffix",
+                row.id
+            );
+        }
+    }
+}
+
+/// The tier set per family is exactly what the wire capture lists: no family
+/// is missing a tier it serves and no extra tier is invented. Named variants
+/// (`-sonar`, `-tiered`, `-thinking`, `-lite`) are recorded as no tier.
+#[test]
+fn catalog_family_tier_sets_match_the_captured_list() {
+    let expected: &[(&str, &[Option<Tier>])] = &[
+        (
+            "gemini-4-neon",
+            &[
+                Some(Tier::Low),
+                Some(Tier::Medium),
+                Some(Tier::High),
+                Some(Tier::XHigh),
+            ],
+        ),
+        (
+            "gemini-4-carbon",
+            &[Some(Tier::Low), Some(Tier::Medium), Some(Tier::High)],
+        ),
+        (
+            "gemini-4-argon",
+            &[Some(Tier::Low), Some(Tier::Medium), Some(Tier::High)],
+        ),
+        (
+            "gemini-4-hydrogen",
+            &[
+                Some(Tier::Low),
+                Some(Tier::Medium),
+                Some(Tier::High),
+                Some(Tier::XHigh),
+                None,
+            ],
+        ),
+        (
+            "gemini-3.8-flash",
+            &[Some(Tier::Low), Some(Tier::Medium), Some(Tier::High), None],
+        ),
+        ("gemini-3.5-flash-lite", &[None]),
+        ("gemini-3.1-flash-lite", &[None]),
+        ("gemini-3-flash", &[None]),
+        ("gemini-2.5-flash", &[None]),
+        (
+            "claude-opus-5-5",
+            &[Some(Tier::Low), Some(Tier::Medium), Some(Tier::High)],
+        ),
+        (
+            "claude-sonnet-5-5",
+            &[Some(Tier::Low), Some(Tier::Medium), Some(Tier::High)],
+        ),
+        ("gpt-oss-120b", &[Some(Tier::Medium)]),
+    ];
+    for (family, tiers) in expected {
+        let actual: std::collections::BTreeSet<Option<&str>> = MODELS
+            .iter()
+            .filter(|model| model.family == *family)
+            .map(|model| model.tier.map(Tier::suffix))
+            .collect();
+        let wanted: std::collections::BTreeSet<Option<&str>> =
+            tiers.iter().map(|tier| (*tier).map(Tier::suffix)).collect();
+        assert_eq!(actual, wanted, "tiers for {family}");
+    }
+    let actual: std::collections::BTreeSet<&str> =
+        MODELS.iter().map(|model| model.family).collect();
+    let wanted: std::collections::BTreeSet<&str> =
+        expected.iter().map(|(family, _)| *family).collect();
+    assert_eq!(actual, wanted, "the catalog has exactly these families");
+}
+
+/// A near miss is rejected with the model and the closest family's ids, not a
+/// bare "unknown model"; an unrelated id falls back to the family list.
+#[test]
+fn catalog_rejects_an_unknown_id_with_the_closest_family_ids() {
+    let error = catalog::validate("gemini-4-neno-high")
+        .unwrap_err()
+        .to_string();
+    for needle in [
+        "gemini-4-neno-high",
+        "closest family",
+        "gemini-4-neon",
+        "gemini-4-neon-high",
+        "gemini-4-neon-xhigh",
+        "gemini-4-neon-medium",
+        "gemini-4-neon-low",
+    ] {
+        assert!(error.contains(needle), "missing {needle}: {error}");
+    }
+    assert!(
+        !error.contains("gemini-4-carbon"),
+        "only the closest family is listed: {error}"
+    );
+
+    let unrelated = catalog::validate("totally-unknown")
+        .unwrap_err()
+        .to_string();
+    assert!(unrelated.contains("totally-unknown"), "{unrelated}");
+    assert!(unrelated.contains("families are"), "{unrelated}");
+}
+
+/// The bare family alias is not a wire id, so it is rejected; the shared
+/// `gemini-3.8-flash-tiered` id IS in the capture and is a normal config id.
+#[test]
+fn catalog_rejects_the_bare_flash_alias_but_pins_the_tiered_id() {
+    let error = catalog::validate("gemini-3.8-flash")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("gemini-3.8-flash"), "{error}");
+    assert!(error.contains("closest family"), "{error}");
+    assert!(error.contains("gemini-3.8-flash-high"), "{error}");
+    assert!(error.contains("gemini-3.8-flash-tiered"), "{error}");
+
+    assert!(catalog::find("gemini-3.8-flash-tiered").is_some());
+    assert!(catalog::validate("gemini-3.8-flash-tiered").is_ok());
+}
+
+/// The inclusion policy has to be visible in the rejection, not just an
+/// "unknown model" answer.
+#[test]
+fn catalog_excludes_ui_previews_and_the_image_model_with_reasons() {
+    assert_eq!(catalog::EXCLUDED.len(), 3);
+    for (id, reason) in catalog::EXCLUDED {
+        let error = catalog::validate(id).unwrap_err().to_string();
+        assert!(error.contains(*id), "{error}");
+        assert!(error.contains("excluded"), "{error}");
+        assert!(error.contains(*reason), "{error}");
+    }
+    let preview = catalog::validate("tab_flash_lite_preview")
+        .unwrap_err()
+        .to_string();
+    assert!(preview.contains("UI preview"), "{preview}");
+    assert!(preview.contains("16,384"), "{preview}");
+    let image = catalog::validate("gemini-3.1-flash-image")
+        .unwrap_err()
+        .to_string();
+    assert!(image.contains("image-generation"), "{image}");
+}
+
+/// Every included id carries the `maxTokens` / `maxOutputTokens` from the
+/// capture, and no included id is missing from this expectation table.
+#[test]
+fn catalog_every_included_id_carries_its_wire_numbers() {
+    let expected: &[(&str, u64, u64)] = &[
+        ("gemini-4-neon-high", 1048576, 262144),
+        ("gemini-4-neon-xhigh", 1048576, 262144),
+        ("gemini-4-neon-medium", 1048576, 262144),
+        ("gemini-4-neon-low", 1048576, 262144),
+        ("gemini-4-carbon-high", 1048576, 262144),
+        ("gemini-4-carbon-medium", 1048576, 262144),
+        ("gemini-4-carbon-low", 1048576, 262144),
+        ("gemini-4-argon-high", 1048576, 65536),
+        ("gemini-4-argon-medium", 1048576, 65536),
+        ("gemini-4-argon-low", 1048576, 65536),
+        ("gemini-4-hydrogen-high", 1048576, 262144),
+        ("gemini-4-hydrogen-xhigh", 1048576, 262144),
+        ("gemini-4-hydrogen-medium", 1048576, 262144),
+        ("gemini-4-hydrogen-low", 1048576, 262144),
+        ("gemini-4-hydrogen-sonar", 1048576, 65536),
+        ("gemini-4-hydrogen-tiered-high", 1048576, 262144),
+        ("gemini-4-hydrogen-tiered-xhigh", 1048576, 262144),
+        ("gemini-3.8-flash-high", 1048576, 65536),
+        ("gemini-3.8-flash-medium", 1048576, 65536),
+        ("gemini-3.8-flash-low", 1048576, 65536),
+        ("gemini-3.8-flash-tiered", 1048576, 65536),
+        ("gemini-3.5-flash-lite", 1048576, 65535),
+        ("gemini-3.1-flash-lite", 1048576, 65535),
+        ("gemini-3-flash", 1048576, 65536),
+        ("gemini-2.5-flash", 1048576, 65535),
+        ("gemini-2.5-flash-lite", 1048576, 65535),
+        ("gemini-2.5-flash-thinking", 1048576, 65535),
+        ("claude-opus-5-5-high", 1000000, 128000),
+        ("claude-opus-5-5-medium", 1000000, 128000),
+        ("claude-opus-5-5-low", 1000000, 128000),
+        ("claude-sonnet-5-5-high", 1000000, 128000),
+        ("claude-sonnet-5-5-medium", 1000000, 128000),
+        ("claude-sonnet-5-5-low", 1000000, 128000),
+        ("gpt-oss-120b-medium", 131072, 32768),
+    ];
+    assert_eq!(
+        expected.len(),
+        MODELS.len(),
+        "every included id is covered exactly once"
+    );
+    let mut seen = std::collections::BTreeSet::new();
+    for (id, context_window, max_output_tokens) in expected {
+        let model = catalog::find(id).unwrap_or_else(|| panic!("{id} is missing"));
+        assert!(seen.insert(*id), "duplicate expectation for {id}");
+        assert_eq!(
+            model.context_window, *context_window,
+            "context window of {id}"
+        );
+        assert_eq!(
+            model.max_output_tokens, *max_output_tokens,
+            "max output of {id}"
+        );
+        assert!(catalog::validate(id).is_ok(), "{id} resolves");
+    }
+    for model in MODELS {
+        assert!(
+            seen.contains(model.id),
+            "{} has no expected numbers",
+            model.id
+        );
+    }
+}
+
+/// The default is a real, wire-recommended row: the top tier of the primary
+/// Gemini 4 Neon family.
+#[test]
+fn catalog_default_is_a_recommended_primary_model() {
+    let default = catalog::find(DEFAULT_MODEL).expect("the default is in the catalog");
+    assert!(
+        default.recommended,
+        "the default is a wire-recommended model"
+    );
+    assert_eq!(default.family, "gemini-4-neon");
+    assert_eq!(default.tier, Some(Tier::High));
+    assert_eq!(default.context_window, 1_048_576);
+    assert_eq!(default.max_output_tokens, 262_144);
+    assert!(catalog::validate(DEFAULT_MODEL).is_ok());
+    // Every included model is recommended on this wire, so the flag alone
+    // cannot choose; the default is still one of them.
+    assert!(MODELS.iter().all(|model| model.recommended));
+}
+
+/// `supports_vision` is now the MODEL's wire capability: the adapter sends
+/// images as `inlineData`, so every catalog row must agree with the wire's
+/// `supportsImages`, including `gpt-oss-120b-medium` staying text-only.
+#[test]
+fn catalog_vision_matches_the_wire_capability() {
+    assert_eq!(
+        MODELS.iter().filter(|model| model.supports_images).count(),
+        33,
+        "every included model but gpt-oss-120b-medium accepts images on the wire"
+    );
+    let gpt_oss = catalog::find("gpt-oss-120b-medium").expect("gpt-oss is included");
+    assert!(!gpt_oss.supports_images);
+    assert!(!gpt_oss.supports_vision);
+    for row in MODELS {
+        assert_eq!(
+            row.supports_vision, row.supports_images,
+            "{}: the adapter sends images, so vision must follow supportsImages",
+            row.id
+        );
+    }
+    // A bare instance, so the assertion does not depend on HOME / the config
+    // dir like `AntigravityModel::new` does.
+    let model = AntigravityModel {
+        client: reqwest::Client::new(),
+        model: DEFAULT_MODEL.into(),
+        reasoning_effort: None,
+        stream_url: String::new(),
+        token_endpoint: String::new(),
+        load_assist_url: String::new(),
+        token_file: PathBuf::new(),
+        cache_file: PathBuf::new(),
+        client_id: None,
+        client_secret: None,
+        min_interval: std::time::Duration::ZERO,
+        last_request: Default::default(),
+        conversation: Default::default(),
+        project: Default::default(),
+        vision: true,
+        image_store: None,
+    };
+    assert!(model.supports_vision());
+    assert!(!model.with_vision(false).supports_vision());
+}
+
+/// `tiered_fallback` is unchanged for every id it handled before: all
+/// tier-carrying flash ids map to the shared endpoint, the bare alias still
+/// maps, the explicit tiered id and every non-flash family do not.
+#[test]
+fn tiered_fallback_keeps_its_targets_after_the_catalog() {
+    for row in MODELS
+        .iter()
+        .filter(|model| model.family == "gemini-3.8-flash" && model.tier.is_some())
+    {
+        assert_eq!(
+            tiered_fallback(row.id).as_deref(),
+            Some("gemini-3.8-flash-tiered"),
+            "{}",
+            row.id
+        );
+    }
+    assert_eq!(
+        tiered_fallback("gemini-3.8-flash").as_deref(),
+        Some("gemini-3.8-flash-tiered"),
+        "legacy bare flash id keeps its target"
+    );
+    assert_eq!(tiered_fallback("gemini-3.8-flash-tiered"), None);
+    // The retry target is itself a pinned catalog id now.
+    assert!(catalog::find("gemini-3.8-flash-tiered").is_some());
+    for id in [
+        "gemini-4-neon-high",
+        "gemini-4-hydrogen-tiered-high",
+        "gemini-4-hydrogen-sonar",
+        "claude-opus-5-5-high",
+        "gpt-oss-120b-medium",
+    ] {
+        assert_eq!(tiered_fallback(id), None, "no fallback for {id}");
+    }
 }
 
 /// A Google error document for a 429: `ErrorInfo.reason` plus an optional
@@ -3584,7 +4115,7 @@ async fn unknown_429_retries_once_then_fails_with_the_status_only() {
     let message = format!("{error:#}");
     assert_eq!(
         message.trim(),
-        "Antigravity returned HTTP 429 (model=gemini-3.8-flash-tiered)"
+        "Antigravity returned HTTP 429 Too Many Requests (model=gemini-3.8-flash-high)"
     );
     assert!(!message.contains(SENTINEL), "{message}");
     assert_eq!(fake.requests().len(), 2, "one retry, never a loop");
@@ -3858,4 +4389,320 @@ fn persisted_image_references_carry_no_bytes() {
         !stored.contains(&"a".repeat(96)),
         "nothing base64-shaped lands in the entry: {stored}"
     );
+}
+
+/// B2: a 401 -> refresh -> 404 -> `-tiered` sequence must spend the REFRESHED
+/// token on the tiered POST, not the token that started the turn.
+#[tokio::test]
+async fn refreshed_token_is_used_by_the_tiered_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let token_file = write_agy_token(
+        dir.path(),
+        "stale-token",
+        Utc::now() + ChronoDuration::hours(1),
+        "refresh-token",
+    );
+    let body = sse_body(&[text_element("ok")]);
+    let fake = spawn_fake(4, move |index, path| match (index, path) {
+        (0, _) => (
+            401,
+            json!([{"error": {"code": 401, "status": "UNAUTHENTICATED"}}]).to_string(),
+        ),
+        (1, "/token") => (
+            200,
+            json!({"access_token": "fresh-token", "expires_in": 3599}).to_string(),
+        ),
+        (2, _) => (
+            404,
+            json!([{"error": {"code": 404, "status": "NOT_FOUND"}}]).to_string(),
+        ),
+        _ => (200, body.clone()),
+    })
+    .await;
+    let mut model = model_for(
+        &fake,
+        token_file,
+        dir.path().join("cache/antigravity-token.json"),
+    );
+    let (assistant, _) = model
+        .complete(
+            &[Message::User {
+                content: "say ok".into(),
+                images: Vec::new(),
+            }],
+            &[],
+            None,
+        )
+        .await
+        .expect("the tiered retry answers with the refreshed token");
+    assert_eq!(assistant.content.as_deref(), Some("ok"));
+    let requests = fake.requests();
+    assert_eq!(requests.len(), 4);
+    assert!(requests[1].0.ends_with("/token"));
+    assert_eq!(requests[2].2["model"], "gemini-3.8-flash-high");
+    assert_eq!(
+        requests[3].2["model"], "gemini-3.8-flash-tiered",
+        "the fallback body carries the tiered model"
+    );
+    for retried in [&requests[2], &requests[3]] {
+        assert!(
+            retried
+                .1
+                .to_ascii_lowercase()
+                .contains("authorization: bearer fresh-token"),
+            "the retry must spend the refreshed token: {}",
+            retried.1
+        );
+    }
+}
+
+/// B2: a 401 first seen ON the tiered POST still refreshes and retries that
+/// same tiered body; the refresh budget is not consumed by the 404 transition.
+#[tokio::test]
+async fn unauthorized_tiered_retry_still_refreshes_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let token_file = write_agy_token(
+        dir.path(),
+        "stale-token",
+        Utc::now() + ChronoDuration::hours(1),
+        "refresh-token",
+    );
+    let body = sse_body(&[text_element("ok")]);
+    let fake = spawn_fake(4, move |index, path| match (index, path) {
+        (0, _) => (
+            404,
+            json!([{"error": {"code": 404, "status": "NOT_FOUND"}}]).to_string(),
+        ),
+        (1, _) => (
+            401,
+            json!([{"error": {"code": 401, "status": "UNAUTHENTICATED"}}]).to_string(),
+        ),
+        (2, "/token") => (
+            200,
+            json!({"access_token": "fresh-token", "expires_in": 3599}).to_string(),
+        ),
+        _ => (200, body.clone()),
+    })
+    .await;
+    let mut model = model_for(
+        &fake,
+        token_file,
+        dir.path().join("cache/antigravity-token.json"),
+    );
+    let (assistant, _) = model
+        .complete(
+            &[Message::User {
+                content: "say ok".into(),
+                images: Vec::new(),
+            }],
+            &[],
+            None,
+        )
+        .await
+        .expect("a 401 on the tiered POST is still inside the one refresh budget");
+    assert_eq!(assistant.content.as_deref(), Some("ok"));
+    let requests = fake.requests();
+    assert_eq!(requests.len(), 4);
+    assert_eq!(requests[1].2["model"], "gemini-3.8-flash-tiered");
+    assert_eq!(requests[3].2["model"], "gemini-3.8-flash-tiered");
+    assert!(
+        requests[3]
+            .1
+            .to_ascii_lowercase()
+            .contains("authorization: bearer fresh-token"),
+        "{}",
+        requests[3].1
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|(path, _, _)| path.ends_with("/token"))
+            .count(),
+        1,
+        "one refresh, never a loop"
+    );
+}
+
+/// B4: two candidates in one response are two generations. Reject the whole
+/// element before any signed call from the `MAX_TOKENS` candidate can run.
+#[tokio::test]
+async fn multiple_candidates_are_rejected_before_any_call_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let token_file = write_agy_token(
+        dir.path(),
+        "valid-token",
+        Utc::now() + ChronoDuration::hours(1),
+        "refresh-token",
+    );
+    let body = sse_body(&[json!({"response": {"candidates": [
+        {
+            "content": {"role": "model", "parts": [{
+                "functionCall": {"name": "bash", "args": {"command": "echo hi"}, "id": "call_1"},
+                "thoughtSignature": "sig-call",
+            }]},
+            "finishReason": "MAX_TOKENS",
+        },
+        {
+            "content": {"role": "model", "parts": [{"text": "done"}]},
+            "finishReason": "STOP",
+        },
+    ]}})]);
+    let fake = spawn_fake(1, move |_, _| (200, body.clone())).await;
+    let mut model = model_for(&fake, token_file, dir.path().join("cache/token.json"));
+    let error = model
+        .complete(
+            &[Message::User {
+                content: "go".into(),
+                images: Vec::new(),
+            }],
+            &[],
+            None,
+        )
+        .await
+        .expect_err("a two-candidate response is not a turn");
+    let message = format!("{error:#}");
+    assert!(message.contains("2 candidates"), "{message}");
+    assert_eq!(fake.requests().len(), 1, "no retry, no call execution");
+}
+
+/// B5: two turns may reuse wire id `1` for different tools; repairing the
+/// second turn's drifted result name must not rewrite the first turn's result.
+#[test]
+fn repair_matches_results_to_their_own_call_batch() {
+    let mut request = json!({"contents": [
+        {"role": "model", "parts": [
+            {"functionCall": {"name": "bash", "args": {}, "id": "1"}},
+        ]},
+        {"role": "user", "parts": [
+            {"functionResponse": {"name": "bash", "id": "1", "response": {"output": "a"}}},
+        ]},
+        {"role": "model", "parts": [
+            {"functionCall": {"name": "read_file", "args": {}, "id": "1"}},
+        ]},
+        {"role": "user", "parts": [
+            {"functionResponse": {"name": "bash", "id": "1", "response": {"output": "b"}}},
+        ]},
+    ]});
+    repair_request(&mut request);
+    let contents = request["contents"].as_array().unwrap();
+    assert_eq!(contents[1]["parts"][0]["functionResponse"]["name"], "bash");
+    assert_eq!(
+        contents[3]["parts"][0]["functionResponse"]["name"], "read_file",
+        "the later call owns the later result, not the earlier one"
+    );
+}
+
+/// B6: discovery is bound to the selected `agy` login. Switching the CLI token
+/// file to another account discovers that account's project instead of
+/// replaying the previous account's cached id.
+#[tokio::test]
+async fn project_discovery_is_bound_to_the_selected_login() {
+    let dir = tempfile::tempdir().unwrap();
+    let token_file = write_agy_token(
+        dir.path(),
+        "access-a",
+        Utc::now() + ChronoDuration::hours(1),
+        "refresh-a",
+    );
+    let fake = spawn_fake(2, |index, _| match index {
+        0 => (
+            200,
+            json!({"cloudaicompanionProject": "project-a"}).to_string(),
+        ),
+        _ => (
+            200,
+            json!({"cloudaicompanionProject": "project-b"}).to_string(),
+        ),
+    })
+    .await;
+    let mut model = model_for(
+        &fake,
+        token_file.clone(),
+        dir.path().join("cache/token.json"),
+    );
+    model.load_assist_url = format!("http://{}/v1internal:loadCodeAssist", fake.address);
+    assert_eq!(model.project_id("token-a").await, "project-a");
+    // `agy` logs into the second account: the CLI file now carries a different
+    // refresh credential, so the cached project must not survive.
+    write_agy_token(
+        dir.path(),
+        "access-b",
+        Utc::now() + ChronoDuration::hours(1),
+        "refresh-b",
+    );
+    assert_eq!(model.project_id("token-b").await, "project-b");
+    // Re-reading the same login is the async-once path: no third discovery.
+    assert_eq!(model.project_id("token-b").await, "project-b");
+    assert_eq!(fake.requests().len(), 2);
+}
+
+/// B6: a discovery 401 is not a definitive answer; it must not freeze the
+/// fallback for that login. The next turn (with a refreshed token) retries.
+#[tokio::test]
+async fn unauthorized_discovery_is_retried_not_frozen() {
+    let dir = tempfile::tempdir().unwrap();
+    let token_file = write_agy_token(
+        dir.path(),
+        "access-a",
+        Utc::now() + ChronoDuration::hours(1),
+        "refresh-a",
+    );
+    let fake = spawn_fake(2, |index, _| match index {
+        0 => (
+            401,
+            json!([{"error": {"code": 401, "status": "UNAUTHENTICATED"}}]).to_string(),
+        ),
+        _ => (
+            200,
+            json!({"cloudaicompanionProject": "project-later"}).to_string(),
+        ),
+    })
+    .await;
+    let mut model = model_for(&fake, token_file, dir.path().join("cache/token.json"));
+    model.load_assist_url = format!("http://{}/v1internal:loadCodeAssist", fake.address);
+    assert_eq!(model.project_id("expired").await, PROJECT);
+    assert_eq!(model.project_id("refreshed").await, "project-later");
+    assert_eq!(fake.requests().len(), 2);
+}
+
+/// B4, streaming form: a `MAX_TOKENS` signed call in one SSE element followed
+/// by a `STOP` text candidate in the next must not let the later reason bless
+/// the earlier call. The stream never gets to return a call.
+#[tokio::test]
+async fn a_second_candidate_cannot_arrive_in_a_later_element() {
+    let dir = tempfile::tempdir().unwrap();
+    let token_file = write_agy_token(
+        dir.path(),
+        "valid-token",
+        Utc::now() + ChronoDuration::hours(1),
+        "refresh-token",
+    );
+    let body = sse_body(&[
+        json!({"response": {"candidates": [{
+            "content": {"role": "model", "parts": [{
+                "functionCall": {"name": "bash", "args": {"command": "echo hi"}, "id": "call_1"},
+                "thoughtSignature": "sig-call",
+            }]},
+            "finishReason": "MAX_TOKENS",
+        }]}}),
+        json!({"response": {"candidates": [{
+            "content": {"role": "model", "parts": [{"text": "done"}]},
+            "finishReason": "STOP",
+        }]}}),
+    ]);
+    let fake = spawn_fake(1, move |_, _| (200, body.clone())).await;
+    let mut model = model_for(&fake, token_file, dir.path().join("cache/token.json"));
+    let error = model
+        .complete(
+            &[Message::User {
+                content: "go".into(),
+                images: Vec::new(),
+            }],
+            &[],
+            None,
+        )
+        .await
+        .expect_err("a spliced second candidate is not a turn");
+    let message = format!("{error:#}");
+    assert!(message.contains("changed its finishReason"), "{message}");
 }

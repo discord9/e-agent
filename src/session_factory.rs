@@ -1749,15 +1749,31 @@ fn configured_model(
         // provider (`client_id` / `client_secret`), as does the request
         // pacing override (`min_interval_ms`).
         AuthMode::Antigravity => {
+            // The profile's own model was validated at config resolution; a
+            // `--model` override has not been, and a raw wire id that is not
+            // in the fixed catalog would only become a 404 on the first turn.
+            let model = match model {
+                Some(model) => {
+                    crate::antigravity::catalog::validate(&model)
+                        .context("--model is not a pinned Antigravity catalog id")?;
+                    model
+                }
+                None => resolved.model,
+            };
+            // The catalog row is the wire truth: `supportsImages` is what the
+            // MODEL accepts, and the profile may narrow it with `vision = false`
+            // but never claim a model that cannot take images.
+            let catalog_vision =
+                crate::antigravity::catalog::find(&model).is_some_and(|row| row.supports_images);
             let mut cm = ConfiguredModel::antigravity(
                 AntigravityModel::new(
-                    model.unwrap_or(resolved.model),
+                    model,
                     resolved.reasoning_effort,
                     resolved.client_id,
                     resolved.client_secret,
                     resolved.min_interval_ms,
                 )?
-                .with_vision(resolved.vision),
+                .with_vision(resolved.vision && catalog_vision),
             );
             cm.display = display;
             Ok(cm)
@@ -2218,7 +2234,7 @@ model = "m1"
 [providers.ag]
 auth = "antigravity"
 [models."ag/gemini"]
-model = "gemini-3.8-flash-tiered"
+model = "gemini-3.8-flash-high"
 "#,
         )
         .expect("test config parses");
@@ -2233,6 +2249,41 @@ model = "gemini-3.8-flash-tiered"
         assert!(message.contains("--base-url"), "{message}");
         assert!(message.contains("antigravity"), "{message}");
         // The api_key profile keeps accepting the override.
+        assert!(factory.resolve_profile("p1/m1", None).is_ok());
+    }
+
+    /// A `--model` override bypasses the profile's `model`, so it is validated
+    /// against the Antigravity catalog at the shared construction path too: a
+    /// raw id outside the table must fail before the first turn's 404.
+    #[test]
+    fn model_override_outside_the_antigravity_catalog_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let config: Config = toml::from_str(
+            r#"default = "p1/m1"
+[providers.p1]
+base_url = "http://one"
+api_key_env = "PATH"
+[models."p1/m1"]
+model = "m1"
+
+[providers.ag]
+auth = "antigravity"
+[models."ag/gemini"]
+model = "gemini-4-neon-high"
+"#,
+        )
+        .expect("test config parses");
+        let mut factory =
+            SessionFactory::test_factory_with_config(temp.path().to_path_buf(), Some(config));
+        factory.model = Some("gemini-4-neno-high".into());
+        let Err(error) = factory.resolve_profile("ag/gemini", None) else {
+            panic!("a model outside the catalog cannot be a wire override");
+        };
+        let message = format!("{error:#}");
+        assert!(message.contains("gemini-4-neno-high"), "{message}");
+        assert!(message.contains("closest family"), "{message}");
+        assert!(message.contains("gemini-4-neon-high"), "{message}");
+        // The api_key profile still accepts the same raw override.
         assert!(factory.resolve_profile("p1/m1", None).is_ok());
     }
 
