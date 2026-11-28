@@ -248,9 +248,10 @@ pub(crate) async fn execute(
         .add_ref(root, session, resolved.kind, &resolved.url)
         .await
         .map_err(|e| format!("{e:#}"))?;
-    // One observation right away, off the tool's critical path. A warm cache
-    // is a no-op; the result also becomes the watcher's silent baseline.
-    crate::link_status::prewarm(resolved.kind, &resolved.url);
+    // One observation right away, off the tool's critical path. It becomes
+    // this session's add-time baseline for the watcher, which no later
+    // display refresh can replace.
+    crate::link_status::prewarm(session, resolved.kind, &resolved.url);
     Ok(render(refs))
 }
 

@@ -14,9 +14,20 @@
 //!   conditional request and produces no turn.
 //! - Nested reads (checks, reviews, comments) happen only after a `200`.
 //! - A `403`/`429` pauses the whole watcher until `X-RateLimit-Reset`.
-//! - The first observation of a link is a baseline: it records current state
-//!   and the comment watermark, and emits nothing for the past.
-//! - A link is dropped as soon as it is MERGED or CLOSED.
+//! - The first observation of a link is a SILENT baseline: it records the
+//!   current state and the comment watermark and emits nothing for the past.
+//!   A restart and a fresh add follow the same rule, so a restart never
+//!   replays what changed while the process was down.
+//! - An added link's baseline is the ADD-TIME observation of that link in
+//!   that session, captured once; a display refresh updates the chip only and
+//!   can never replace it.
+//! - Notifications are new activity only: a transition or a new comment or
+//!   review after the baseline. Nothing re-announces a state that was already
+//!   true when the baseline was taken.
+//! - A link is dropped as soon as it is MERGED or CLOSED, and a terminal link
+//!   is never polled — or resurrected — again.
+//! - A list read that cannot be proven complete is not an observation at all:
+//!   the whole burst is skipped and the next poll retries.
 //!
 //! Everything here is process-local. There is no webhook, no persisted
 //! watcher row, and no second scheduler: the loop is one ordinary detached
@@ -43,10 +54,17 @@ const GH_TIMEOUT: Duration = Duration::from_secs(15);
 /// A 403/429 without `X-RateLimit-Reset` still must not become a retry storm.
 const DEFAULT_BACKOFF: Duration = Duration::from_secs(60);
 
-/// How many pages one list read will follow. A PR with more than this many
-/// pages of reviews is far past "the first page", and one pathological list
-/// must not pin the watcher in a loop.
+/// How many pages one NEWEST-FIRST list read may follow before it gives up.
+/// The walk stops at the caller's watermark long before this on a real PR, so
+/// a busy PR costs one page and not its whole history. A read that still
+/// needs more pages is INCOMPLETE: a truncated list is never reported as the
+/// whole one, so nothing is committed and the next poll tries again.
 const MAX_PAGES: usize = 5;
+
+/// How many pages one `check-runs` / `status` read may follow. They are small
+/// (their `next` is followed to the end in practice) and this only bounds one
+/// pathological commit.
+const MAX_CHECK_PAGES: usize = 10;
 
 /// The exact prefix every automatic message carries. The transcript entry is
 /// a `Notice`; this line makes the same fact explicit to the model.
@@ -202,23 +220,59 @@ impl<'a> Reads<'a> {
         }
     }
 
-    /// One paginated list, followed to the end: a busy PR's first page must
-    /// not hide new activity behind its own 100-item window, and the
-    /// watermark can only be committed once every newer item was read.
-    async fn list(&mut self, path: String) -> Result<Vec<Value>, Step> {
-        let mut items = Vec::new();
+    /// One paginated list, followed until it can be PROVEN complete.
+    ///
+    /// `items` says where one page's items live. A newest-first list (every
+    /// list this watcher reads) ends early at `older`: the first item OLDER
+    /// than the caller's watermark means every later page is older still.
+    ///
+    /// `max` bounds the walk: a read that needs more pages answers `None`,
+    /// which every caller treats as an incomplete observation — no commit, no
+    /// transition, retry on the next poll. Returning a truncated list as if
+    /// it were whole is the one thing this must never do: an item past the
+    /// truncation point would be invisible forever.
+    async fn walk(
+        &mut self,
+        path: String,
+        max: usize,
+        items: Items,
+        older: impl Fn(&Value) -> bool,
+    ) -> Result<Option<Vec<Value>>, Step> {
+        let mut collected = Vec::new();
         let mut next = Some(path);
         let mut pages = 0;
         while let Some(path) = next {
+            if pages == max {
+                return Ok(None);
+            }
             pages += 1;
             let page = self.read(path).await?;
-            if let Some(array) = page.doc.as_array() {
-                items.extend(array.iter().cloned());
+            let array = match items {
+                Items::Whole => page.doc.as_array().cloned(),
+                Items::Under(key) => page.doc.get(key).and_then(Value::as_array).cloned(),
+            };
+            let Some(array) = array else {
+                return Err(Step::Failed);
+            };
+            // The watermark item is included: it is history, and dropping it
+            // would lose the boundary the next poll compares against.
+            if let Some(index) = array.iter().position(&older) {
+                collected.extend(array[..=index].iter().cloned());
+                return Ok(Some(collected));
             }
-            next = (pages < MAX_PAGES).then_some(page.next).flatten();
+            collected.extend(array);
+            next = page.next;
         }
-        Ok(items)
+        Ok(Some(collected))
     }
+}
+
+/// Where one page's items live: the page document itself is the array (every
+/// `list` endpoint), or they sit under a key (`check-runs`, `status`).
+#[derive(Clone, Copy)]
+enum Items {
+    Whole,
+    Under(&'static str),
 }
 
 /// The notes one poll wants to report, plus the dedup ids and the cursor it
@@ -263,9 +317,11 @@ impl LinkWatch {
         }
     }
 
-    /// Seed the silent baseline from the add-time status observation. The
-    /// first real poll still compares against it, so a change between the
-    /// add and that poll is news; the add itself is not.
+    /// Seed the silent baseline from the ADD-TIME observation of this link in
+    /// this session — never from a later display refresh, which would move
+    /// the baseline past the very change the watcher exists to report. The
+    /// first real poll still compares against it, so a change between the add
+    /// and that poll is news; the add itself is not.
     fn seed(&mut self, wall: DateTime<Utc>, baseline: &link_status::WatchBaseline) {
         self.prev = Some(Observed {
             terminal: match baseline.terminal {
@@ -347,33 +403,62 @@ impl LinkWatch {
                 return Step::Failed;
             };
             let sha = sha.to_owned();
+            // Checks and statuses are small and both are paginated, so they
+            // are followed to the end: a check that fails on page two is on
+            // the SAME commit, so the PR document cannot vouch for it. A read
+            // that cannot be completed is not an observation at all.
             let check_runs = match reads
-                .read(format!("repos/{}/commits/{sha}/check-runs", self.link.repo))
+                .walk(
+                    format!(
+                        "repos/{}/commits/{sha}/check-runs?per_page=100",
+                        self.link.repo
+                    ),
+                    MAX_CHECK_PAGES,
+                    Items::Under("check_runs"),
+                    |_| false,
+                )
                 .await
             {
-                Ok(page) => page.doc,
+                Ok(Some(items)) => items,
+                Ok(None) => return Step::Failed,
                 Err(step) => return step,
             };
             let statuses = match reads
-                .read(format!("repos/{}/commits/{sha}/status", self.link.repo))
+                .walk(
+                    format!("repos/{}/commits/{sha}/status?per_page=100", self.link.repo),
+                    MAX_CHECK_PAGES,
+                    Items::Under("statuses"),
+                    |_| false,
+                )
                 .await
             {
-                Ok(page) => page.doc,
+                Ok(Some(items)) => items,
+                Ok(None) => return Step::Failed,
                 Err(step) => return step,
             };
             observed.failing = failing_checks(&check_runs, &statuses);
+            // Newest first, stopping at the watch-start boundary: a review
+            // older than the add can never be news, so a busy PR costs one
+            // page instead of its whole history — and a review that lands
+            // while the watcher runs is always on the first page we read.
+            let boundary = self.review_since;
             let reviews = match reads
-                .list(format!(
-                    "repos/{}/pulls/{}/reviews?per_page=100",
-                    self.link.repo, self.link.number
-                ))
+                .walk(
+                    format!(
+                        "repos/{}/pulls/{}/reviews?per_page=100&sort=created&direction=desc",
+                        self.link.repo, self.link.number
+                    ),
+                    MAX_PAGES,
+                    Items::Whole,
+                    |item| before(item, boundary),
+                )
                 .await
             {
-                Ok(items) => items,
+                Ok(Some(items)) => items,
+                Ok(None) => return Step::Failed,
                 Err(step) => return step,
             };
-            let review_notes = parse_notes(&Value::Array(reviews.clone()));
-            observed.review = review_decision(&Value::Array(reviews));
+            let review_notes = parse_notes(&Value::Array(reviews));
             let notes = self.stage_notes(review_notes, NoteKind::Review);
             reviewed = notes.lines.clone();
             staged.push((NoteKind::Review, notes));
@@ -392,15 +477,21 @@ impl LinkWatch {
         let mut comments = Vec::new();
 
         // New issue/conversation comments, from the persisted watermark.
+        // Newest first and stopping at the watermark: the `since=` cursor and
+        // the walk's stop condition are the same instant.
         if let Some(last) = self.last_comment_at {
             let path = format!(
-                "repos/{}/issues/{}/comments?since={}&per_page=100",
+                "repos/{}/issues/{}/comments?since={}&per_page=100&sort=created&direction=desc",
                 self.link.repo,
                 self.link.number,
                 since(last)
             );
-            let items = match reads.list(path).await {
-                Ok(items) => items,
+            let items = match reads
+                .walk(path, MAX_PAGES, Items::Whole, |item| before(item, last))
+                .await
+            {
+                Ok(Some(items)) => items,
+                Ok(None) => return Step::Failed,
                 Err(step) => return step,
             };
             let notes = self.stage_notes(parse_notes(&Value::Array(items)), NoteKind::Comment);
@@ -412,13 +503,17 @@ impl LinkWatch {
             && let Some(last) = self.last_review_comment_at
         {
             let path = format!(
-                "repos/{}/pulls/{}/comments?since={}&per_page=100",
+                "repos/{}/pulls/{}/comments?since={}&per_page=100&sort=created&direction=desc",
                 self.link.repo,
                 self.link.number,
                 since(last)
             );
-            let items = match reads.list(path).await {
-                Ok(items) => items,
+            let items = match reads
+                .walk(path, MAX_PAGES, Items::Whole, |item| before(item, last))
+                .await
+            {
+                Ok(Some(items)) => items,
+                Ok(None) => return Step::Failed,
                 Err(step) => return step,
             };
             let notes =
@@ -559,6 +654,9 @@ struct Note {
 /// The process-local watcher state. One instance per live session.
 #[derive(Default)]
 pub(crate) struct Watcher {
+    /// The session whose links are watched: an add-time baseline belongs to
+    /// one session's add, never to the process.
+    session: String,
     links: Vec<LinkWatch>,
     paused_until: Option<Instant>,
     /// Terminal links are remembered so a later poll of the same stored URL
@@ -566,11 +664,19 @@ pub(crate) struct Watcher {
     done: HashSet<String>,
     /// The first sync baselines everything already present (a restart must
     /// not report the past). Links that appear LATER are adds, and may seed
-    /// from the process's add-time status observation instead.
+    /// from THAT session's add-time observation instead.
     started: bool,
 }
 
 impl Watcher {
+    /// One watcher for one session.
+    pub(crate) fn for_session(session: &str) -> Self {
+        Self {
+            session: session.to_owned(),
+            ..Self::default()
+        }
+    }
+
     /// Poll every currently linked open PR/issue once. Returns exactly one
     /// message for the whole burst, or `None` when nothing changed.
     pub(crate) async fn poll(
@@ -580,6 +686,11 @@ impl Watcher {
         now: Instant,
         wall: DateTime<Utc>,
     ) -> Option<String> {
+        // The first poll after start is a RESTART: nothing is replayed from
+        // before it. Every link's own first observation becomes its baseline,
+        // however it changed while the process was down. A link added later
+        // is the only kind that arrives with an observation of its own (the
+        // add-time one), and that is a silent baseline too.
         let initial = !self.started;
         self.sync(links, initial, wall);
         self.started = true;
@@ -622,7 +733,13 @@ impl Watcher {
     }
 
     /// Keep state for exactly the currently linked refs, in store order.
-    /// A newly added link starts unbaselined, so its own past is silent.
+    ///
+    /// One rule covers restart and add: the first observation of a link is a
+    /// SILENT baseline, never news. A restart has no observation to inherit,
+    /// so the link is baselined by its own first poll; a link that appears
+    /// while the watcher runs is an ADD and may seed from that session's
+    /// add-time observation instead. A terminal add is dropped here, and only
+    /// an add — never a later poll — can resurrect it (see `done`).
     fn sync(&mut self, links: &[Target], initial: bool, wall: DateTime<Utc>) {
         // `done` exists to keep a STILL-LINKED merged ref from restarting a
         // watch, not to remember every ref this process ever finished: an
@@ -644,7 +761,8 @@ impl Watcher {
                 None => {
                     let mut watch = LinkWatch::new(link.clone(), wall);
                     if !initial
-                        && let Some((wall, status)) = link_status::last_observation(
+                        && let Some((wall, status)) = link_status::add_baseline(
+                            &self.session,
                             if link.pr { "pr" } else { "issue" },
                             &link.url,
                         )
@@ -678,7 +796,7 @@ where
     S: FnMut(String) -> bool,
 {
     let fetch: Box<Fetch> = Box::new(gh_fetch(program));
-    let mut watcher = Watcher::default();
+    let mut watcher = Watcher::for_session(&session);
     loop {
         let wall = Utc::now();
         let now = Instant::now();
@@ -736,8 +854,21 @@ fn observe_pr(doc: &Value) -> Option<Observed> {
     Some(Observed {
         terminal,
         failing: Vec::new(),
-        review: None,
+        // The AGGREGATE decision GitHub publishes for the PR — the same field
+        // the chip reads — so the watcher can never claim "approved" where
+        // GitHub's own review requirement still holds the PR at
+        // `REVIEW_REQUIRED`. Individual votes are never summed here.
+        review: aggregate_review(doc),
     })
+}
+
+/// GitHub's aggregate review decision on a pull-request document. An absent
+/// or unrecognised value (`REVIEW_REQUIRED`, an empty string) is no decision:
+/// silence, never a guess.
+fn aggregate_review(doc: &Value) -> Option<ReviewDecision> {
+    doc.get("reviewDecision")
+        .and_then(Value::as_str)
+        .and_then(ReviewDecision::from_token)
 }
 
 fn observe_issue(doc: &Value) -> Option<Observed> {
@@ -818,64 +949,74 @@ fn since(at: DateTime<Utc>) -> String {
     at.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
+/// True when this item is STRICTLY older than `watermark`, i.e. older than
+/// the instant the caller started watching (reviews) or the `since=` cursor
+/// (comments). Every list this watcher reads is newest-first, so the first
+/// such item means every later page is older still: the walk can stop instead
+/// of reading a busy PR's whole history.
+///
+/// Ties at the watermark itself never stop the walk, because an item stamped
+/// exactly there can still be news and might sit after its twin in the page.
+/// An item with no parseable time never stops it either: an age we cannot
+/// establish must not hide a later item.
+fn before(item: &Value, watermark: DateTime<Utc>) -> bool {
+    item.get("created_at")
+        .or_else(|| item.get("submitted_at"))
+        .and_then(Value::as_str)
+        .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+        .map(|at| at.with_timezone(&Utc))
+        .is_some_and(|at| at < watermark)
+}
+
 /// The failing check names from `check-runs` and legacy commit statuses, in
 /// API order and de-duplicated. Anything not completed counts as pending,
 /// not failing — the same conservative split as `link_status`.
-fn failing_checks(check_runs: &Value, statuses: &Value) -> Vec<String> {
+fn failing_checks(check_runs: &[Value], statuses: &[Value]) -> Vec<String> {
     let mut names = Vec::new();
     let mut push = |name: String| {
         if !name.is_empty() && !names.contains(&name) {
             names.push(name);
         }
     };
-    if let Some(runs) = check_runs.get("check_runs").and_then(Value::as_array) {
-        for run in runs {
-            let text = |name: &str| {
-                run.get(name)
+    for run in check_runs {
+        let text = |name: &str| {
+            run.get(name)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_ascii_uppercase()
+        };
+        if text("status") != "COMPLETED" {
+            continue;
+        }
+        if matches!(
+            text("conclusion").as_str(),
+            "FAILURE" | "TIMED_OUT" | "CANCELLED" | "ACTION_REQUIRED" | "STARTUP_FAILURE" | "STALE"
+        ) {
+            push(
+                run.get("name")
                     .and_then(Value::as_str)
                     .unwrap_or_default()
-                    .to_ascii_uppercase()
-            };
-            if text("status") != "COMPLETED" {
-                continue;
-            }
-            if matches!(
-                text("conclusion").as_str(),
-                "FAILURE"
-                    | "TIMED_OUT"
-                    | "CANCELLED"
-                    | "ACTION_REQUIRED"
-                    | "STARTUP_FAILURE"
-                    | "STALE"
-            ) {
-                push(
-                    run.get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned(),
-                );
-            }
+                    .to_owned(),
+            );
         }
     }
-    if let Some(contexts) = statuses.get("statuses").and_then(Value::as_array) {
-        for context in contexts {
-            if matches!(
+    for context in statuses {
+        if matches!(
+            context
+                .get("state")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_ascii_uppercase()
+                .as_str(),
+            "ERROR" | "FAILURE"
+        ) {
+            push(
                 context
-                    .get("state")
+                    .get("context")
                     .and_then(Value::as_str)
                     .unwrap_or_default()
-                    .to_ascii_uppercase()
-                    .as_str(),
-                "ERROR" | "FAILURE"
-            ) {
-                push(
-                    context
-                        .get("context")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned(),
-                );
-            }
+                    .to_owned(),
+            );
         }
     }
     names
@@ -911,65 +1052,6 @@ fn parse_notes(value: &Value) -> Vec<Note> {
         .collect::<Vec<_>>();
     notes.sort_by_key(|note| (note.at, note.id));
     notes
-}
-
-/// GitHub's effective decision: each author's latest decisive review wins.
-/// A `DISMISSED` review CLEARS that author's earlier decision — otherwise a
-/// dismissed "changes requested" would outlive its dismissal — while
-/// COMMENTED/PENDING never change it.
-fn review_decision(value: &Value) -> Option<ReviewDecision> {
-    let mut latest: HashMap<&str, (DateTime<Utc>, Option<ReviewDecision>)> = HashMap::new();
-    for review in value.as_array().into_iter().flatten() {
-        let author = review
-            .pointer("/user/login")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if author.is_empty() {
-            continue;
-        }
-        let state = review
-            .get("state")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_ascii_uppercase();
-        let decision = if state == "DISMISSED" {
-            // Some(None): a decisive clearing event for this author.
-            Some(None)
-        } else {
-            ReviewDecision::from_token(&state).map(Some)
-        };
-        let Some(decision) = decision else {
-            continue;
-        };
-        let at = review
-            .get("submitted_at")
-            .and_then(Value::as_str)
-            .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
-            .map(|at| at.with_timezone(&Utc))
-            .unwrap_or_default();
-        if latest
-            .get(author)
-            .is_none_or(|(previous, _)| at >= *previous)
-        {
-            latest.insert(author, (at, decision));
-        }
-    }
-    let mut changes = false;
-    let mut approved = false;
-    for (_, decision) in latest.values() {
-        match decision {
-            Some(ReviewDecision::Changes) => changes = true,
-            Some(ReviewDecision::Approved) => approved = true,
-            None => {}
-        }
-    }
-    if changes {
-        Some(ReviewDecision::Changes)
-    } else if approved {
-        Some(ReviewDecision::Approved)
-    } else {
-        None
-    }
 }
 
 fn backoff(reset_at: Option<i64>, wall: DateTime<Utc>) -> Duration {
@@ -1095,7 +1177,20 @@ mod tests {
     }
 
     fn pr_body(state: &str, merged: bool, sha: &str) -> Value {
-        json!({"state": state, "merged": merged, "draft": false, "head": {"sha": sha}})
+        pr_body_review(state, merged, sha, None)
+    }
+
+    /// A pull-request document with GitHub's AGGREGATE review decision, the
+    /// field the chip reads. `None` is "no decision" (`REVIEW_REQUIRED`,
+    /// which the watcher must never read as approval).
+    fn pr_body_review(state: &str, merged: bool, sha: &str, review: Option<&str>) -> Value {
+        json!({
+            "state": state,
+            "merged": merged,
+            "draft": false,
+            "head": {"sha": sha},
+            "reviewDecision": review,
+        })
     }
 
     fn checks(items: &[(&str, &str)]) -> Value {
@@ -1124,10 +1219,14 @@ mod tests {
         })
     }
 
+    /// The reviews endpoint is queried NEWEST first (`sort=created&
+    /// direction=desc`), so the fixture answers in that order: a fixture
+    /// listing reviews oldest first models a response GitHub never sends.
     fn reviews(items: &[(i64, &str, &str, &str, &str)]) -> Value {
+        let mut rows = items.to_vec();
+        rows.sort_by(|a, b| b.3.cmp(a.3).then(b.0.cmp(&a.0)));
         json!(
-            items
-                .iter()
+            rows.iter()
                 .map(|(id, author, state, at, body)| json!({
                     "id": id,
                     "user": {"login": author},
@@ -1517,8 +1616,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_added_link_baselines_from_its_cached_observation_silently() {
-        use crate::link_status::{NEEDS, OPEN, READY, seed_for_test, status_for_test};
+    async fn an_added_link_baselines_from_its_add_time_observation_silently() {
+        use crate::link_status::{NEEDS, OPEN, READY, seed_baseline_for_test, status_for_test};
 
         let added = crate::link_status::target("pr", "https://github.com/acme/widget/pull/77")
             .expect("a GitHub PR target");
@@ -1536,7 +1635,8 @@ mod tests {
         // Add #77 while the watcher is live: the status prewarm observed it
         // as OPEN with no failures. The watcher's built-in poll (now) sees
         // that as its baseline, so the add itself emits nothing.
-        seed_for_test(
+        seed_baseline_for_test(
+            "",
             "pr",
             &added.url,
             status_for_test(OPEN, None, Vec::new(), None),
@@ -1633,7 +1733,8 @@ mod tests {
             "review-comments-v1",
             comments(&[]),
         );
-        seed_for_test(
+        seed_baseline_for_test(
+            "",
             "pr",
             &stable.url,
             status_for_test(NEEDS, None, vec!["build".into()], None),
@@ -1727,12 +1828,20 @@ mod tests {
         );
     }
 
+    /// The review transition comes from the AGGREGATE decision the PR
+    /// document carries — the same field the chip reads — never from summing
+    /// individual votes.
     #[tokio::test]
     async fn review_decisions_and_legacy_status_contexts_are_transitions() {
         let fake = FakeGh::default();
         seed_green(&fake, "abc123");
-        // The baseline already carries one approval: only a NEW changes
-        // requested decision is a transition.
+        // The add already saw an approval, so the baseline carries APPROVED:
+        // only a NEW changes-requested decision is a transition.
+        fake.set(
+            "repos/acme/widget/pulls/27",
+            "pr-v1",
+            pr_body_review("OPEN", false, "abc123", Some("APPROVED")),
+        );
         fake.set(
             "repos/acme/widget/pulls/27/reviews",
             "reviews-v1",
@@ -1752,7 +1861,7 @@ mod tests {
         fake.set(
             "repos/acme/widget/pulls/27",
             "pr-v2",
-            pr_body("OPEN", false, "abc123"),
+            pr_body_review("OPEN", false, "abc123", Some("CHANGES_REQUESTED")),
         );
         fake.set(
             "repos/acme/widget/pulls/27/reviews",
@@ -1941,7 +2050,7 @@ mod tests {
             comments(&[(1, "alice", "2023-11-14T22:13:21Z", "失败一次也不能丢")]),
         );
         *fake.broken.lock().unwrap() = Some(format!(
-            "repos/acme/widget/issues/27/comments?since={}&per_page=100",
+            "repos/acme/widget/issues/27/comments?since={}&per_page=100&sort=created&direction=desc",
             since(at(0))
         ));
         let before = fake.not_modified();
@@ -1977,12 +2086,18 @@ mod tests {
         );
     }
 
-    /// A dismissal clears the author's earlier decision. Alice's stale
-    /// changes-requested review must not hide Bob's approval.
+    /// The AGGREGATE decision drives the transition. A dismissal moves
+    /// GitHub back to APPROVED, and only that move is the news — a
+    /// changes-requested review that GitHub cleared is not.
     #[tokio::test]
-    async fn a_dismissed_changes_request_then_an_approval_is_a_transition() {
+    async fn a_cleared_changes_request_then_an_aggregate_approval_is_a_transition() {
         let fake = FakeGh::default();
         seed_green(&fake, "abc123");
+        fake.set(
+            "repos/acme/widget/pulls/27",
+            "pr-v1",
+            pr_body_review("OPEN", false, "abc123", Some("CHANGES_REQUESTED")),
+        );
         fake.set(
             "repos/acme/widget/pulls/27/reviews",
             "reviews-v1",
@@ -2004,10 +2119,13 @@ mod tests {
             None
         );
 
-        // Alice's original changes-requested review is followed by its
-        // DISMISSED event, then Bob approves. GitHub's effective decision is
-        // APPROVED; the watcher must clear Alice's decision on the dismissal
-        // instead of keeping the stale changes-requested verdict.
+        // Alice's review is DISMISSED and Bob approves, so GitHub's aggregate
+        // decision is APPROVED.
+        fake.set(
+            "repos/acme/widget/pulls/27",
+            "pr-v2",
+            pr_body_review("OPEN", false, "abc123", Some("APPROVED")),
+        );
         fake.set(
             "repos/acme/widget/pulls/27/reviews",
             "reviews-v2",
@@ -2026,7 +2144,7 @@ mod tests {
         let message = watcher
             .poll(std::slice::from_ref(&link), &*fetch, Instant::now(), at(1))
             .await
-            .expect("dismissal + approval is one transition");
+            .expect("a cleared changes-requested + approval is one transition");
         assert!(message.contains("PR acme/widget#27 已批准"), "{message}");
         assert!(!message.contains("要求修改"), "{message}");
         assert_eq!(
@@ -2035,6 +2153,244 @@ mod tests {
                 .await,
             None,
             "the approval is not repeated"
+        );
+    }
+
+    /// One approval on a branch that needs two leaves GitHub at
+    /// `REVIEW_REQUIRED`. The watcher reports the APPROVAL as news only when
+    /// GitHub's aggregate says so — never by summing votes.
+    #[tokio::test]
+    async fn one_approval_on_a_two_approval_branch_is_not_approved() {
+        let fake = FakeGh::default();
+        seed_green(&fake, "abc123");
+        fake.set(
+            "repos/acme/widget/pulls/27",
+            "pr-v1",
+            pr_body_review("OPEN", false, "abc123", Some("REVIEW_REQUIRED")),
+        );
+        fake.set(
+            "repos/acme/widget/pulls/27/reviews",
+            "reviews-v1",
+            reviews(&[(1, "alice", "APPROVED", "2023-11-14T22:13:19Z", "")]),
+        );
+        let fetch = fake.fetch();
+        let mut watcher = Watcher::default();
+        let link = link(true, 27);
+        assert_eq!(
+            watcher
+                .poll(std::slice::from_ref(&link), &*fetch, Instant::now(), at(0))
+                .await,
+            None
+        );
+
+        // Bob approves too — still one short of two approvers, so GitHub keeps
+        // the PR at REVIEW_REQUIRED and the watcher must say nothing.
+        fake.set(
+            "repos/acme/widget/pulls/27",
+            "pr-v2",
+            pr_body_review("OPEN", false, "abc123", Some("REVIEW_REQUIRED")),
+        );
+        fake.set(
+            "repos/acme/widget/pulls/27/reviews",
+            "reviews-v2",
+            reviews(&[
+                (1, "alice", "APPROVED", "2023-11-14T22:13:19Z", ""),
+                (2, "bob", "APPROVED", "2023-11-14T22:13:21Z", ""),
+            ]),
+        );
+        assert_eq!(
+            watcher
+                .poll(std::slice::from_ref(&link), &*fetch, Instant::now(), at(1))
+                .await,
+            None,
+            "a single approval is not the PR being approved"
+        );
+
+        // The second approval flips the aggregate: exactly one transition.
+        fake.set(
+            "repos/acme/widget/pulls/27",
+            "pr-v3",
+            pr_body_review("OPEN", false, "abc123", Some("APPROVED")),
+        );
+        let message = watcher
+            .poll(std::slice::from_ref(&link), &*fetch, Instant::now(), at(2))
+            .await
+            .expect("the aggregate approval is one transition");
+        assert!(message.contains("PR acme/widget#27 已批准"), "{message}");
+        assert_eq!(
+            watcher
+                .poll(std::slice::from_ref(&link), &*fetch, Instant::now(), at(3))
+                .await,
+            None,
+            "the approval is not repeated"
+        );
+    }
+
+    /// The add-time baseline is captured once. A manual refresh (a DISPLAY
+    /// observation) that lands between the add and the first poll must not
+    /// become the baseline, or the change it shows would never be delivered.
+    #[tokio::test]
+    async fn a_manual_refresh_before_the_first_poll_keeps_the_add_time_baseline() {
+        use crate::link_status::{
+            NEEDS, READY, seed_baseline_for_test, seed_for_test, status_for_test,
+        };
+
+        let fake = FakeGh::default();
+        seed_green(&fake, "abc123");
+        let fetch = fake.fetch();
+        let mut watcher = Watcher::default();
+        assert_eq!(
+            watcher.poll(&[], &*fetch, Instant::now(), at(0)).await,
+            None
+        );
+        let link = link(true, 27);
+
+        // The add saw a green PR…
+        seed_baseline_for_test(
+            "",
+            "pr",
+            &link.url,
+            status_for_test(READY, None, Vec::new(), None),
+        );
+        // …then a check failed, and the human refreshed the chip before the
+        // watcher's first poll: the RED value is a display value only.
+        seed_for_test(
+            "pr",
+            &link.url,
+            status_for_test(NEEDS, None, vec!["build".into()], None),
+        );
+        fake.set(
+            "repos/acme/widget/pulls/27",
+            "pr-v2",
+            pr_body("OPEN", false, "abc123"),
+        );
+        fake.set(
+            "repos/acme/widget/commits/abc123/check-runs",
+            "checks-v2",
+            checks(&[("build", "FAILURE"), ("test", "SUCCESS")]),
+        );
+        let message = watcher
+            .poll(std::slice::from_ref(&link), &*fetch, Instant::now(), at(1))
+            .await
+            .expect("the green→red change survives the refresh");
+        assert!(
+            message.contains("PR acme/widget#27 检查失败：build（1 项）"),
+            "{message}"
+        );
+    }
+
+    /// A merge between the add and the first poll is news, not something the
+    /// watcher swallows by treating the refreshed MERGED value as its
+    /// baseline.
+    #[tokio::test]
+    async fn a_merge_before_the_first_poll_is_delivered() {
+        use crate::link_status::{
+            MERGED, READY, seed_baseline_for_test, seed_for_test, status_for_test,
+        };
+
+        let fake = FakeGh::default();
+        seed_green(&fake, "abc123");
+        let fetch = fake.fetch();
+        let mut watcher = Watcher::default();
+        assert_eq!(
+            watcher.poll(&[], &*fetch, Instant::now(), at(0)).await,
+            None
+        );
+        let link = link(true, 27);
+
+        seed_baseline_for_test(
+            "",
+            "pr",
+            &link.url,
+            status_for_test(READY, None, Vec::new(), None),
+        );
+        // The chip was refreshed after the merge; that is display-only.
+        seed_for_test(
+            "pr",
+            &link.url,
+            status_for_test(MERGED, Some("merged"), Vec::new(), None),
+        );
+        fake.set(
+            "repos/acme/widget/pulls/27",
+            "pr-v2",
+            pr_body("CLOSED", true, "abc123"),
+        );
+        let message = watcher
+            .poll(std::slice::from_ref(&link), &*fetch, Instant::now(), at(1))
+            .await
+            .expect("a merge before the first poll is one notice");
+        assert!(message.contains("PR acme/widget#27 已合并"), "{message}");
+        assert_eq!(
+            watcher
+                .poll(std::slice::from_ref(&link), &*fetch, Instant::now(), at(2))
+                .await,
+            None,
+            "a merged link is never polled again"
+        );
+    }
+
+    /// A restart must not produce notifications. Watcher state is in memory,
+    /// so after a restart every link is "new": its first observation is a
+    /// silent baseline, whatever a previous process (or an earlier add) once
+    /// recorded. Nothing that changed while the process was down is replayed,
+    /// and only a change AFTER that baseline notifies.
+    #[tokio::test]
+    async fn a_restart_baselines_silently_and_never_replays_the_past() {
+        use crate::link_status::{READY, seed_baseline_for_test, status_for_test};
+
+        let fake = FakeGh::default();
+        seed_green(&fake, "abc123");
+        // The PR is already red and the issue is already closed at start-up.
+        fake.set(
+            "repos/acme/widget/commits/abc123/check-runs",
+            "checks-v1",
+            checks(&[("build", "FAILURE"), ("test", "SUCCESS")]),
+        );
+        fake.set(
+            "repos/acme/widget/issues/9",
+            "issue-v1",
+            json!({"state": "CLOSED"}),
+        );
+        let fetch = fake.fetch();
+        let mut watcher = Watcher::default();
+        let pr = link(true, 27);
+        let issue = link(false, 9);
+        // What the previous process knew: #27 was green. After a restart that
+        // memory is not a baseline — the first observation is.
+        seed_baseline_for_test(
+            "",
+            "pr",
+            &pr.url,
+            status_for_test(READY, None, Vec::new(), None),
+        );
+        assert_eq!(
+            watcher
+                .poll(&[pr.clone(), issue.clone()], &*fetch, Instant::now(), at(0))
+                .await,
+            None,
+            "a restart replays nothing: no failure storm, no 已关闭 notice"
+        );
+
+        // One genuine change after the baseline is exactly one notice.
+        fake.set(
+            "repos/acme/widget/commits/abc123/check-runs",
+            "checks-v2",
+            checks(&[("build", "FAILURE"), ("test", "FAILURE")]),
+        );
+        let message = watcher
+            .poll(&[pr.clone(), issue], &*fetch, Instant::now(), at(1))
+            .await
+            .expect("a change after the baseline is one notice");
+        assert!(
+            message.contains("PR acme/widget#27 检查失败：test（1 项）"),
+            "{message}"
+        );
+        assert_eq!(
+            watcher
+                .poll(std::slice::from_ref(&pr), &*fetch, Instant::now(), at(2))
+                .await,
+            None,
+            "the same state is never re-announced"
         );
     }
 
@@ -2076,7 +2432,8 @@ mod tests {
             )]),
         );
         *fake.limited.lock().unwrap() = Some(
-            "repos/acme/widget/issues/27/comments?since=2023-11-14T22:13:20Z&per_page=100".into(),
+            "repos/acme/widget/issues/27/comments?since=2023-11-14T22:13:20Z&per_page=100&sort=created&direction=desc"
+                .into(),
         );
         assert_eq!(
             watcher
@@ -2119,33 +2476,13 @@ mod tests {
         );
     }
 
-    /// Blocker 3: a busy PR's list is paginated, and the new item can live
-    /// past page one. The poll follows `rel="next"` before committing, so
-    /// first-page-only reads lose nothing.
+    /// A read that cannot be proven complete is not an observation: the burst
+    /// is skipped, nothing is committed, and the next poll retries. A
+    /// truncated list reported as whole would hide the failing run forever.
     #[tokio::test]
-    async fn a_review_beyond_the_first_page_is_still_reported() {
+    async fn an_incomplete_check_list_is_skipped_and_retried() {
         let fake = FakeGh::default();
         seed_green(&fake, "abc123");
-        // Page one already holds a hundred old reviews and page two is where
-        // a busy PR's newest activity lands.
-        let mut older = Vec::new();
-        for id in 1..=100 {
-            older.push((id, "alice", "COMMENTED", "2023-11-14T22:13:19Z", "早期评审"));
-        }
-        fake.set(
-            "repos/acme/widget/pulls/27/reviews?per_page=100",
-            "reviews-p1",
-            reviews(&older),
-        );
-        fake.set(
-            "repos/acme/widget/pulls/27/reviews?page=2",
-            "reviews-p2",
-            reviews(&[]),
-        );
-        fake.link(
-            "repos/acme/widget/pulls/27/reviews?per_page=100",
-            "repos/acme/widget/pulls/27/reviews?page=2",
-        );
         let fetch = fake.fetch();
         let mut watcher = Watcher::default();
         let link = link(true, 27);
@@ -2156,34 +2493,249 @@ mod tests {
             None
         );
 
-        // Only page TWO changes: page one keeps its ETag and answers 304, so
-        // a watcher that stops at the first page loses the new review.
+        // A pathological commit: more pages of checks than one poll may read,
+        // with the failing run past the cap.
+        let list = "repos/acme/widget/commits/abc123/check-runs?per_page=100";
+        for page in 1..=MAX_CHECK_PAGES + 1 {
+            let path = if page == 1 {
+                list.to_owned()
+            } else {
+                format!("{list}&page={page}")
+            };
+            let body = if page == MAX_CHECK_PAGES + 1 {
+                checks(&[("build", "FAILURE")])
+            } else {
+                checks(&[("build", "SUCCESS")])
+            };
+            fake.set(&path, &format!("checks-{page}"), body);
+            if page <= MAX_CHECK_PAGES {
+                fake.link(&path, &format!("{list}&page={}", page + 1));
+            }
+        }
+        assert_eq!(
+            watcher
+                .poll(std::slice::from_ref(&link), &*fetch, Instant::now(), at(1))
+                .await,
+            None,
+            "a truncated list is never reported as the whole one"
+        );
+
+        // The list fits again: the failure is news now, and only once.
+        fake.links.lock().unwrap().clear();
+        fake.set(list, "checks-ok", checks(&[("build", "SUCCESS")]));
         fake.set(
-            "repos/acme/widget/pulls/27/reviews?page=2",
-            "reviews-p2b",
-            reviews(&[(
-                101,
-                "bob",
-                "CHANGES_REQUESTED",
-                "2023-11-14T22:13:21Z",
-                "第二页才有的评审",
-            )]),
+            &format!("{list}&page=2"),
+            "checks-ok-p2",
+            checks(&[("build", "FAILURE")]),
+        );
+        fake.link(list, &format!("{list}&page=2"));
+        let message = watcher
+            .poll(std::slice::from_ref(&link), &*fetch, Instant::now(), at(2))
+            .await
+            .expect("the retry after an incomplete read still reports the failure");
+        assert!(
+            message.contains("PR acme/widget#27 检查失败：build（1 项）"),
+            "{message}"
+        );
+        assert_eq!(
+            watcher
+                .poll(std::slice::from_ref(&link), &*fetch, Instant::now(), at(3))
+                .await,
+            None,
+            "the failure is not reported twice"
+        );
+    }
+
+    /// Serve a newest-first paginated review list at `base`, a hundred items
+    /// per page, chaining `rel="next"` the way GitHub does.
+    fn paginate_reviews(
+        fake: &FakeGh,
+        base: &str,
+        version: &str,
+        items: &[(i64, &str, &str, &str, &str)],
+    ) {
+        let query = "per_page=100&sort=created&direction=desc";
+        let pages = items.len().div_ceil(100).max(1);
+        for page in 1..=pages {
+            let start = (page - 1) * 100;
+            let end = (start + 100).min(items.len());
+            let path = if page == 1 {
+                format!("{base}?{query}")
+            } else {
+                format!("{base}?{query}&page={page}")
+            };
+            fake.set(
+                &path,
+                &format!("{base}-{version}-p{page}"),
+                reviews(&items[start..end]),
+            );
+            if page < pages {
+                fake.link(&path, &format!("{base}?{query}&page={}", page + 1));
+            }
+        }
+    }
+
+    /// A busy PR's newest activity can still need more than one page: when
+    /// every item on page one is newer than the watermark the walk follows
+    /// `rel="next"` and stops at the first older item it meets.
+    #[tokio::test]
+    async fn a_review_beyond_the_first_page_is_still_reported() {
+        let fake = FakeGh::default();
+        seed_green(&fake, "abc123");
+        let fetch = fake.fetch();
+        let mut watcher = Watcher::default();
+        let link = link(true, 27);
+        assert_eq!(
+            watcher
+                .poll(std::slice::from_ref(&link), &*fetch, Instant::now(), at(0))
+                .await,
+            None
+        );
+
+        // A hundred reviews land in the same second: the watermark item is
+        // pushed to page two.
+        let base = "repos/acme/widget/pulls/27/reviews";
+        let mut items: Vec<(i64, &str, &str, &str, &str)> = (2..=101)
+            .rev()
+            .map(|id| (id, "bot", "COMMENTED", "2023-11-14T22:13:21Z", ""))
+            .collect();
+        items[0].1 = "bob";
+        items[0].2 = "CHANGES_REQUESTED";
+        items[0].4 = "第一页里的评审";
+        items.push((1, "alice", "COMMENTED", "2023-11-14T22:13:19Z", ""));
+        paginate_reviews(&fake, base, "v2", &items);
+
+        let message = watcher
+            .poll(std::slice::from_ref(&link), &*fetch, Instant::now(), at(1))
+            .await
+            .expect("a review on a later page is still news");
+        assert!(message.contains("bob · \"第一页里的评审\""), "{message}");
+        assert!(
+            fake.requests()
+                .iter()
+                .any(|request| request.path.ends_with("page=2")),
+            "the second page was followed"
+        );
+    }
+
+    /// Review 501 on a six-page PR. Oldest-first it hides behind five pages
+    /// that a page cap can never reach; newest-first the walk stops at the
+    /// watch-start boundary on page ONE, so the review is seen — exactly once.
+    #[tokio::test]
+    async fn review_501_on_a_six_page_pr_is_seen_exactly_once() {
+        let fake = FakeGh::default();
+        seed_green(&fake, "abc123");
+        let base = "repos/acme/widget/pulls/27/reviews";
+        // Five hundred reviews of history, all older than the add.
+        let old: Vec<(i64, &str, &str, &str, &str)> = (1..=500)
+            .rev()
+            .map(|id| (id, "alice", "COMMENTED", "2023-11-14T22:13:19Z", "早期评审"))
+            .collect();
+        paginate_reviews(&fake, base, "v1", &old);
+
+        let fetch = fake.fetch();
+        let mut watcher = Watcher::default();
+        let link = link(true, 27);
+        assert_eq!(
+            watcher
+                .poll(std::slice::from_ref(&link), &*fetch, Instant::now(), at(0))
+                .await,
+            None
+        );
+
+        // Review 501 lands: the list is six pages long, and the review is the
+        // newest item in it.
+        let mut fresh = vec![(
+            501,
+            "bob",
+            "CHANGES_REQUESTED",
+            "2023-11-14T22:13:21Z",
+            "第六页的评审",
+        )];
+        fresh.extend(old.iter().cloned());
+        paginate_reviews(&fake, base, "v2", &fresh);
+
+        let message = watcher
+            .poll(std::slice::from_ref(&link), &*fetch, Instant::now(), at(1))
+            .await
+            .expect("the newest review of a six-page PR is still news");
+        assert!(message.contains("bob · \"第六页的评审\""), "{message}");
+        assert_eq!(
+            message.matches("第六页的评审").count(),
+            1,
+            "review 501 is reported exactly once: {message}"
+        );
+        assert_eq!(
+            watcher
+                .poll(std::slice::from_ref(&link), &*fetch, Instant::now(), at(2))
+                .await,
+            None,
+            "the same review is never reported twice"
+        );
+        assert!(
+            fake.requests()
+                .iter()
+                .all(|request| !request.path.contains("page=2")),
+            "newest-first paging stops at the watermark on page one"
+        );
+    }
+
+    /// A check run that fails on the SECOND page of the same commit is still
+    /// delivered: the checks list is followed to the end.
+    #[tokio::test]
+    async fn a_check_failing_on_the_second_page_of_check_runs_is_delivered() {
+        let fake = FakeGh::default();
+        seed_green(&fake, "abc123");
+        let list = "repos/acme/widget/commits/abc123/check-runs?per_page=100";
+        let names: Vec<String> = (0..100).map(|i| format!("green-{i}")).collect();
+        let first: Vec<(&str, &str)> = names
+            .iter()
+            .map(|name| (name.as_str(), "SUCCESS"))
+            .collect();
+        fake.set(list, "checks-p1", checks(&first));
+        fake.set(
+            "repos/acme/widget/commits/abc123/check-runs?per_page=100&page=2",
+            "checks-p2",
+            checks(&[]),
+        );
+        fake.link(
+            list,
+            "repos/acme/widget/commits/abc123/check-runs?per_page=100&page=2",
+        );
+
+        let fetch = fake.fetch();
+        let mut watcher = Watcher::default();
+        let link = link(true, 27);
+        assert_eq!(
+            watcher
+                .poll(std::slice::from_ref(&link), &*fetch, Instant::now(), at(0))
+                .await,
+            None
+        );
+
+        // Only page TWO changes; page one keeps its ETag and answers 304.
+        fake.set(
+            "repos/acme/widget/commits/abc123/check-runs?per_page=100&page=2",
+            "checks-p2b",
+            checks(&[("build", "FAILURE")]),
         );
         let before = fake.not_modified();
         let message = watcher
             .poll(std::slice::from_ref(&link), &*fetch, Instant::now(), at(1))
             .await
-            .expect("a review on page two is still news");
+            .expect("a check on page two of the same commit is still news");
+        assert!(
+            message.contains("PR acme/widget#27 检查失败：build（1 项）"),
+            "{message}"
+        );
         assert!(
             fake.not_modified() > before,
             "page one was revalidated, not re-read"
         );
-        assert!(message.contains("PR acme/widget#27 要求修改"), "{message}");
-        assert!(message.contains("bob · \"第二页才有的评审\""), "{message}");
         assert!(
             fake.requests()
                 .iter()
-                .any(|request| request.path == "repos/acme/widget/pulls/27/reviews?page=2"),
+                .any(|request| request.path.ends_with("check-runs?per_page=100&page=2")),
             "the second page was followed"
         );
     }

@@ -2222,6 +2222,10 @@ async fn session_link_statuses(
         }
         match crate::link_status::target(&link.kind, &link.url) {
             Some(target) => {
+                // Both answers are DISPLAY observations: they update the chip
+                // and the 60-second window. Neither replaces the watcher's
+                // add-time baseline, so a refresh can never erase the change
+                // the watcher has yet to report.
                 let status = if refresh {
                     crate::link_status::refresh(crate::link_status::cache(), &target, now).await
                 } else {
@@ -2355,9 +2359,9 @@ async fn add_session_link(
         .await
         .map_err(|e| error(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     // The editor's add path gets the same one immediate, non-blocking
-    // observation as the tool: the chip reflects it, the watcher baselines
-    // from it, and a warm cache is not fetched again.
-    crate::link_status::prewarm(&kind, &url);
+    // observation as the tool: the chip reflects it, and it is THIS session's
+    // add-time baseline for the watcher — a later refresh never replaces it.
+    crate::link_status::prewarm(&id, &kind, &url);
     Ok(Json(SessionLinksView {
         supported: true,
         refs: ref_chips(workspace.as_deref(), refs).await,

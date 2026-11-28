@@ -553,21 +553,19 @@ impl StatusCache {
         (now.saturating_duration_since(*fetched_at) < CACHE_TTL).then(|| status.clone())
     }
 
+    /// Store one DISPLAY observation. This is what the chip paints and what a
+    /// refresh rewrites; it is deliberately not an add-time baseline, so no
+    /// refresh can move the state the watcher compares against.
     fn store(&self, key: &str, now: Instant, status: LinkStatus) {
-        {
-            let mut entries = self
-                .entries
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner());
-            // An expired window can never be served again, so it is dropped
-            // here instead of being kept for the life of the process: the
-            // cache stays bounded by the links read within one TTL.
-            entries.retain(|_, (fetched_at, _)| {
-                now.saturating_duration_since(*fetched_at) < CACHE_TTL
-            });
-            entries.insert(key.to_owned(), (now, status.clone()));
-        }
-        last().put(key, status);
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        // An expired window can never be served again, so it is dropped here
+        // instead of being kept for the life of the process: the cache stays
+        // bounded by the links read within one TTL.
+        entries.retain(|_, (fetched_at, _)| now.saturating_duration_since(*fetched_at) < CACHE_TTL);
+        entries.insert(key.to_owned(), (now, status));
     }
 
     fn forget(&self, key: &str) {
@@ -589,54 +587,64 @@ impl StatusCache {
     }
 }
 
-/// The last observation per link, independent of the 60-second chip window.
-/// A link added while a session is live is baselined from this observation
-/// even when the watcher only notices the new row minutes later, so a change
-/// between the add and the watcher's first poll is still news — while the add
-/// itself never is. Process-local and cleared when the link is removed.
+/// The ADD-TIME observation of one link in one session: the only source of a
+/// watcher's silent baseline. It is captured once, when that session adds the
+/// link, and never replaced by a later display refresh — a refresh moves the
+/// chip, and if it could move this too, a failure that landed between the add
+/// and the watcher's first poll would silently become the baseline and never
+/// be reported. Process-local; bounded by a TTL on every put.
 #[derive(Default)]
-struct LastObservations {
-    entries: Mutex<HashMap<String, (DateTime<Utc>, LinkStatus)>>,
+struct AddBaselines {
+    entries: Mutex<HashMap<Added, (DateTime<Utc>, LinkStatus)>>,
 }
 
-/// How long the last observation of one link survives without a refresh. The
-/// watcher only needs it from the add until its first poll (one cadence), so
-/// an hour is generous; keeping every observation forever would grow with
-/// every link this process ever saw.
-const OBSERVATION_TTL: chrono::TimeDelta = chrono::TimeDelta::minutes(60);
+/// One link ADDED in one session. Two sessions adding the same link keep
+/// their own baselines: each was observed at its own add instant.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct Added {
+    session: String,
+    link: String,
+}
 
-impl LastObservations {
-    fn put(&self, key: &str, status: LinkStatus) {
+impl Added {
+    fn new(session: &str, link: &str) -> Self {
+        Self {
+            session: session.to_owned(),
+            link: link.to_owned(),
+        }
+    }
+}
+
+/// How long one add-time baseline survives. The watcher needs it from the add
+/// until its first poll (one cadence), so an hour is generous; keeping every
+/// baseline forever would grow with every link this process ever saw.
+const BASELINE_TTL: chrono::TimeDelta = chrono::TimeDelta::minutes(60);
+
+impl AddBaselines {
+    fn put(&self, session: &str, key: &str, status: LinkStatus) {
         let now = Utc::now();
         let mut entries = self
             .entries
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        // A link that is no longer read (unlinked, its session gone, or a
-        // terminal ref nobody polls again) leaves an entry nobody can use.
-        entries.retain(|_, (at, _)| now.signed_duration_since(*at) < OBSERVATION_TTL);
-        entries.insert(key.to_owned(), (now, status));
+        // A link whose session ended or whose add is long past leaves an
+        // entry nobody can use.
+        entries.retain(|_, (at, _)| now.signed_duration_since(*at) < BASELINE_TTL);
+        entries.insert(Added::new(session, key), (now, status));
     }
 
-    fn get(&self, key: &str) -> Option<(DateTime<Utc>, LinkStatus)> {
+    fn get(&self, session: &str, key: &str) -> Option<(DateTime<Utc>, LinkStatus)> {
         self.entries
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
-            .get(key)
+            .get(&Added::new(session, key))
             .cloned()
-    }
-
-    fn remove(&self, key: &str) {
-        self.entries
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .remove(key);
     }
 }
 
-fn last() -> &'static LastObservations {
-    static LAST: OnceLock<LastObservations> = OnceLock::new();
-    LAST.get_or_init(LastObservations::default)
+fn baselines() -> &'static AddBaselines {
+    static BASELINES: OnceLock<AddBaselines> = OnceLock::new();
+    BASELINES.get_or_init(AddBaselines::default)
 }
 
 /// The process-wide cache: one window per link, shared by every session and
@@ -659,21 +667,28 @@ pub(crate) fn cached_state(kind: &str, url: &str) -> Option<&'static str> {
     cached(&target).map(|status| status.state)
 }
 
-/// The last observation for one stored link, with its wall-clock time. Used
-/// by the PR watcher only; the chip cache TTL does not apply.
-pub(crate) fn last_observation(kind: &str, url: &str) -> Option<(DateTime<Utc>, LinkStatus)> {
+/// The add-time baseline for one link in one session, with its wall-clock
+/// time. `None` means this session never observed the link when it was added,
+/// so the watcher starts from its own first poll instead. Used by the PR
+/// watcher only; the chip cache TTL does not apply. A DISPLAY refresh writes
+/// the chip cache, never this.
+pub(crate) fn add_baseline(
+    session: &str,
+    kind: &str,
+    url: &str,
+) -> Option<(DateTime<Utc>, LinkStatus)> {
     let target = target(kind, url)?;
-    last().get(&target.key())
+    baselines().get(session, &target.key())
 }
 
-/// Drop every cached observation for one link (removal).
+/// Drop every cached observation for one link (removal). An add-time baseline
+/// is left to its TTL: it belongs to one session's add, and a re-add in that
+/// session overwrites it.
 pub(crate) fn forget(kind: &str, url: &str) {
     let Some(target) = target(kind, url) else {
         return;
     };
-    let key = target.key();
-    cache().forget(&key);
-    last().remove(&key);
+    cache().forget(&target.key());
 }
 
 /// Status for one link at `now`: a fresh entry is reused, otherwise exactly
@@ -693,44 +708,68 @@ pub(crate) async fn refresh(cache: &StatusCache, target: &Target, now: Instant) 
     status_force(cache, target, now, || gh_status(target)).await
 }
 
-/// Fetch one link's status in the background. This is the link-add path: it
-/// returns immediately (a `gh` timeout must never stall a tool result), and
-/// a warm cache skips the fetch entirely. The result lands in both the 60 s
-/// chip window and the last-observation map the watcher baselines from.
-pub(crate) fn prewarm(kind: &str, url: &str) {
+/// Capture one link's ADD-TIME observation in the background. This is the
+/// link-add path: it returns immediately (a `gh` timeout must never stall a
+/// tool result) and the result lands in the 60 s chip window AND as that
+/// session's baseline for the watcher. A display refresh never overwrites the
+/// baseline, and a cache hit older than the add is fetched again instead of
+/// reused: the baseline has to describe the link as it was ADDED.
+pub(crate) fn prewarm(session: &str, kind: &str, url: &str) {
     #[cfg(test)]
     {
         // Unit tests must not launch real `gh` processes or pollute the
-        // process-wide cache; the fetch/one-call behavior is covered by
+        // process-wide cache; the fetch/baseline behavior is covered by
         // `prewarm_for_test`. Record the call so the add path can prove it
         // asks for exactly one observation.
         PREWARM_URLS.with(|urls| urls.borrow_mut().push(format!("{kind} {url}")));
-        let _ = (kind, url);
+        let _ = session;
     }
     #[cfg(not(test))]
-    prewarm_live(kind, url);
+    prewarm_live(session, kind, url);
 }
 
 /// The production prewarm (split out so test builds contain no unreachable
 /// fetch path).
 #[cfg(not(test))]
-fn prewarm_live(kind: &str, url: &str) {
+fn prewarm_live(session: &str, kind: &str, url: &str) {
     let Some(target) = target(kind, url) else {
         return;
     };
-    if cache().fresh(&target.key(), Instant::now()).is_some() {
-        return;
-    }
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
         return;
     };
-    let fetched = target.clone();
+    // The add instant: a hit stamped before it predates the add.
+    let added = Instant::now();
+    let session = session.to_owned();
     runtime.spawn(async move {
-        status_with(cache(), &target, Instant::now(), || async move {
+        let fetched = target.clone();
+        prewarm_with(&session, &target, added, || async move {
             gh_status(&fetched).await
         })
         .await;
     });
+}
+
+/// Capture one add-time baseline: reuse an observation that landed AT OR
+/// AFTER the add (a concurrent refresh's answer), otherwise fetch — a hit
+/// from before the add may describe a state the user never added.
+async fn prewarm_with<F, Fut>(
+    session: &str,
+    target: &Target,
+    added: Instant,
+    fetch: F,
+) -> LinkStatus
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = LinkStatus>,
+{
+    let key = target.key();
+    let status = match cache().stamped(&key) {
+        Some((stored_at, status)) if stored_at >= added => status,
+        _ => status_force(cache(), target, Instant::now(), fetch).await,
+    };
+    baselines().put(session, &key, status.clone());
+    status
 }
 
 /// `fetch` and `now` are the test seams: a counter-backed fixture instead of
@@ -804,6 +843,8 @@ where
     status
 }
 
+/// A DISPLAY observation only — exactly what a chip read or a manual refresh
+/// stores. It is never an add-time baseline.
 #[cfg(test)]
 pub(crate) fn seed_for_test(kind: &str, url: &str, status: LinkStatus) {
     let Some(target) = target(kind, url) else {
@@ -812,8 +853,21 @@ pub(crate) fn seed_for_test(kind: &str, url: &str, status: LinkStatus) {
     cache().store(&target.key(), Instant::now(), status);
 }
 
+/// Record an add-time baseline without a fetch, the way `prewarm` does for a
+/// session that added the link.
+#[cfg(test)]
+pub(crate) fn seed_baseline_for_test(session: &str, kind: &str, url: &str, status: LinkStatus) {
+    let Some(target) = target(kind, url) else {
+        return;
+    };
+    baselines().put(session, &target.key(), status);
+}
+
+/// The test seam for one add: `fetch` plays `gh`, and the result is this
+/// session's baseline.
 #[cfg(test)]
 pub(crate) fn prewarm_for_test<F, Fut>(
+    session: &str,
     kind: &str,
     url: &str,
     fetch: F,
@@ -823,12 +877,11 @@ where
     Fut: Future<Output = LinkStatus> + Send + 'static,
 {
     let target = target(kind, url)?;
-    if cache().fresh(&target.key(), Instant::now()).is_some() {
-        return None;
-    }
+    let added = Instant::now();
+    let session = session.to_owned();
     let runtime = tokio::runtime::Handle::try_current().ok()?;
     Some(runtime.spawn(async move {
-        status_with(cache(), &target, Instant::now(), fetch).await;
+        prewarm_with(&session, &target, added, fetch).await;
     }))
 }
 
@@ -1170,31 +1223,85 @@ mod tests {
         );
         forget("pr", url);
         assert_eq!(cached_state("pr", url), None, "removal drops the entry");
-        assert!(last_observation("pr", url).is_none());
+        assert!(
+            add_baseline("cache-probe", "pr", url).is_none(),
+            "a display observation is never an add-time baseline"
+        );
         // A plain link can never have a status.
         assert_eq!(cached_state("link", "https://example.org/x"), None);
     }
 
+    /// The add-time baseline is captured ONCE: a later display refresh (the
+    /// chip, a manual refresh) rewrites the 60-second window and leaves the
+    /// baseline alone, so a change between the add and the watcher's first
+    /// poll stays reportable. A hit older than the add is fetched again.
     #[tokio::test]
-    async fn prewarm_fetches_once_and_a_warm_cache_skips_the_fetch() {
+    async fn an_add_captures_its_own_baseline_and_a_refresh_never_replaces_it() {
         let url = "https://github.com/prewarm-probe/widget/pull/42";
+        let target = target_of("pr", url);
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = calls.clone();
-        let handle = prewarm_for_test("pr", url, move || {
+        let green = status_for_test(READY, None, Vec::new(), None);
+        let handle = prewarm_for_test("s1", "pr", url, move || {
             counter.fetch_add(1, Ordering::SeqCst);
-            async { status_for_test(READY, None, Vec::new(), None) }
+            let green = green.clone();
+            async move { green }
         })
-        .expect("a cold link is prewarmed");
+        .expect("a link is prewarmed");
         handle.await.unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        // The warm cache makes the second add a no-op, not a second fetch.
-        let second = prewarm_for_test("pr", url, || async {
-            panic!("a warm cache must not fetch");
-        });
-        assert!(second.is_none());
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one add, one fetch");
         assert_eq!(cached_state("pr", url), Some(READY));
-        assert!(last_observation("pr", url).is_some());
+        assert_eq!(
+            add_baseline("s1", "pr", url).map(|(_, status)| status.state),
+            Some(READY)
+        );
+
+        // A manual refresh (or an add from another session) stores the CHIP
+        // value only: this session's baseline still says green.
+        status_force(cache(), &target, Instant::now(), || async {
+            status_for_test(NEEDS, None, vec!["build".into()], None)
+        })
+        .await;
+        assert_eq!(cached_state("pr", url), Some(NEEDS));
+        assert_eq!(
+            add_baseline("s1", "pr", url).map(|(_, status)| status.state),
+            Some(READY),
+            "a refresh never replaces the add-time baseline"
+        );
+
+        // A hit that landed AFTER the add is a real add-time observation and
+        // is reused, so an immediate re-add does not spend a second `gh` call.
+        let added = Instant::now();
+        let refreshed = status_force(cache(), &target, Instant::now(), || async {
+            status_for_test(APPROVED, None, Vec::new(), None)
+        })
+        .await;
+        assert_eq!(refreshed.state, APPROVED);
+        let reused = prewarm_with("s2", &target, added, || async {
+            panic!("a hit stamped after the add is reused");
+        })
+        .await;
+        assert_eq!(reused.state, APPROVED);
+        assert_eq!(
+            add_baseline("s2", "pr", url).map(|(_, status)| status.state),
+            Some(APPROVED)
+        );
+
+        // A cache hit from BEFORE a new add cannot seed it: the add fetches.
+        let later = Instant::now();
+        let handle = prewarm_for_test("s3", "pr", url, || async {
+            status_for_test(OPEN, None, Vec::new(), None)
+        })
+        .expect("an add always captures a baseline");
+        handle.await.unwrap();
+        assert!(
+            cache().stamped(&target.key()).unwrap().0 >= later,
+            "the pre-add hit was replaced by a fresh observation"
+        );
+        assert_eq!(
+            add_baseline("s3", "pr", url).map(|(_, status)| status.state),
+            Some(OPEN)
+        );
         forget("pr", url);
     }
 
@@ -1262,10 +1369,10 @@ mod tests {
     }
 
     /// Blocker 5: a long-lived process must not accumulate one entry per link
-    /// it ever read. An expired window is evicted on the next store, and a
-    /// last observation nobody can use is dropped on the next put.
+    /// it ever read. An expired window is evicted on the next store, and an
+    /// add-time baseline nobody can use is dropped on the next put.
     #[tokio::test]
-    async fn churned_cache_and_last_observations_stay_bounded() {
+    async fn churned_cache_and_baselines_stay_bounded() {
         let cache = StatusCache::default();
         let now = Instant::now();
         for number in 1..=200 {
@@ -1287,16 +1394,16 @@ mod tests {
             "expired cache windows are evicted"
         );
 
-        let last = LastObservations::default();
-        last.entries.lock().unwrap().insert(
-            "acme/widget#1 (pr)".into(),
+        let baselines = AddBaselines::default();
+        baselines.entries.lock().unwrap().insert(
+            Added::new("s1", "acme/widget#1 (pr)"),
             (
                 Utc::now() - chrono::TimeDelta::hours(2),
                 LinkStatus::unknown(),
             ),
         );
-        last.put("acme/widget#2 (pr)", LinkStatus::unknown());
-        assert!(last.get("acme/widget#1 (pr)").is_none());
-        assert!(last.get("acme/widget#2 (pr)").is_some());
+        baselines.put("s1", "acme/widget#2 (pr)", LinkStatus::unknown());
+        assert!(baselines.get("s1", "acme/widget#1 (pr)").is_none());
+        assert!(baselines.get("s1", "acme/widget#2 (pr)").is_some());
     }
 }

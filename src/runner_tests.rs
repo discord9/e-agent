@@ -20123,13 +20123,13 @@ case "$path" in
     case "$mode" in red) current=pr-red ;; *) current=pr-green ;; esac
     body='{{"state":"OPEN","merged":false,"head":{{"sha":"abc123"}}}}'
     ;;
-  repos/acme/widget/commits/abc123/check-runs)
+  repos/acme/widget/commits/abc123/check-runs*)
     case "$mode" in
       red) current=checks-red; body='{{"check_runs":[{{"name":"build","status":"COMPLETED","conclusion":"FAILURE"}},{{"name":"test","status":"COMPLETED","conclusion":"FAILURE"}}]}}' ;;
       *) current=checks-green; body='{{"check_runs":[{{"name":"build","status":"COMPLETED","conclusion":"SUCCESS"}},{{"name":"test","status":"COMPLETED","conclusion":"SUCCESS"}}]}}' ;;
     esac
     ;;
-  repos/acme/widget/commits/abc123/status)
+  repos/acme/widget/commits/abc123/status*)
     current=status
     body='{{"statuses":[]}}'
     ;;
