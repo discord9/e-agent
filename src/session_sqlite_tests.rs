@@ -6486,7 +6486,7 @@ async fn session_refs_lifecycle_orders_and_deduplicates() {
     assert!(session.session_refs(&other).await.unwrap().is_empty());
 
     session
-        .remove_session_ref(&sid, "pr", "https://github.com/acme/widget/pull/25")
+        .remove_session_ref(&sid, "https://github.com/acme/widget/pull/25")
         .await
         .unwrap();
     assert_eq!(
@@ -6501,9 +6501,40 @@ async fn session_refs_lifecycle_orders_and_deduplicates() {
     );
     // Removing an absent row is a no-op.
     session
-        .remove_session_ref(&sid, "pr", "https://github.com/acme/widget/pull/25")
+        .remove_session_ref(&sid, "https://github.com/acme/widget/pull/25")
         .await
         .unwrap();
+}
+
+/// Blocker 6: the URL alone is the stored and unlink identity. Linking one
+/// URL once as a plain `link` and once as a `pr` is ONE link (`kind` is an
+/// attribute), and unlinking by that URL removes it without knowing which
+/// list it is in.
+#[tokio::test]
+async fn session_refs_key_on_the_url_so_one_url_is_one_link() {
+    let (_dir, session, sid) = fresh_session().await;
+    let url = "https://github.com/acme/widget/pull/25";
+
+    session.add_session_ref(&sid, "link", url).await.unwrap();
+    session.add_session_ref(&sid, "pr", url).await.unwrap();
+    assert_eq!(
+        session.session_refs(&sid).await.unwrap(),
+        vec![("pr".to_string(), url.to_string())],
+        "one URL is one row; the last stated kind is its attribute"
+    );
+    // Re-stating the first kind again is still one row.
+    session.add_session_ref(&sid, "link", url).await.unwrap();
+    assert_eq!(
+        session.session_refs(&sid).await.unwrap(),
+        vec![("link".to_string(), url.to_string())]
+    );
+
+    // Unlink by URL: no kind is inferred and none is needed.
+    session.remove_session_ref(&sid, url).await.unwrap();
+    assert!(session.session_refs(&sid).await.unwrap().is_empty());
+    // Removing the same URL again is a no-op.
+    session.remove_session_ref(&sid, url).await.unwrap();
+    assert!(session.session_refs(&sid).await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -6519,11 +6550,65 @@ async fn jsonl_session_refs_report_unsupported() {
             .unwrap_err()
             .to_string(),
         store
-            .remove_ref(root, "s", "pr", "https://github.com/a/b/pull/1")
+            .remove_ref(root, "s", "https://github.com/a/b/pull/1")
             .await
             .unwrap_err()
             .to_string(),
     ] {
         assert_eq!(error, crate::session_store::SESSION_REFS_UNSUPPORTED);
     }
+}
+
+/// A database created before URLs became the link identity keys
+/// `session_refs` by (workspace, session, kind, url). Reconnecting must
+/// rebuild that table once: the URL is one link, adding a different kind
+/// updates the one row instead of creating a second, and removing by URL
+/// drops it.
+#[tokio::test]
+async fn old_kind_keyed_session_refs_migrate_to_url_identity() {
+    let (dir, path) = temp_db();
+    let p = path.to_str().unwrap();
+    {
+        let db = turso::Builder::new_local(p).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "CREATE TABLE session_refs (\
+             workspace_id TEXT NOT NULL, session_id TEXT NOT NULL, kind TEXT NOT NULL, \
+             url TEXT NOT NULL, created_at_us INTEGER NOT NULL, \
+             PRIMARY KEY (workspace_id, session_id, kind, url))",
+            (),
+        )
+        .await
+        .unwrap();
+        for (kind, created) in [("pr", 1_i64), ("issue", 2_i64)] {
+            conn.execute(
+                "INSERT INTO session_refs (workspace_id, session_id, kind, url, created_at_us) \
+                 VALUES ('w', 's', ?1, 'https://github.com/a/b/pull/1', ?2)",
+                (kind, created),
+            )
+            .await
+            .unwrap();
+        }
+    }
+    let session = SqliteSession::connect(p, "w", "s").await.expect("connect");
+    let rows = session.session_refs("s").await.unwrap();
+    assert_eq!(rows.len(), 1, "URL is the identity: {rows:?}");
+    assert_eq!(rows[0].0, "issue", "the newest historical row wins");
+    // Re-adding the same URL under another kind updates the one row.
+    session
+        .add_session_ref("s", "pr", "https://github.com/a/b/pull/1")
+        .await
+        .unwrap();
+    let rows = session.session_refs("s").await.unwrap();
+    assert_eq!(
+        rows,
+        vec![("pr".into(), "https://github.com/a/b/pull/1".into())]
+    );
+    session
+        .remove_session_ref("s", "https://github.com/a/b/pull/1")
+        .await
+        .unwrap();
+    assert!(session.session_refs("s").await.unwrap().is_empty());
+    drop(session);
+    drop(dir);
 }

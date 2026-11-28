@@ -19795,6 +19795,212 @@ async fn an_automatic_notice_is_one_notice_entry_and_one_projected_user_message(
     drop(task);
 }
 
+/// Blocker 9: the read-only restriction is not a schema footnote. A provider
+/// that returns a `link_ref` call in a read-only session never registered the
+/// tool, so the name alone must not reach the mutation: the intercepted path
+/// checks the session's own registry first and answers `unknown tool`.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn a_read_only_session_refuses_an_injected_link_ref_call() {
+    let temp = tempfile::tempdir().unwrap();
+    let session_id = format!("read-only-link-ref-{}", crate::session::new_id());
+    let store = SessionStore::connect(
+        &crate::config::SessionBackend::Sqlite { path: None },
+        temp.path(),
+        &session_id,
+    )
+    .await
+    .unwrap();
+    let (tools, background) = crate::tools::builtins(
+        crate::workspace::Workspace::new(temp.path()).unwrap(),
+        SandboxPolicy::fixed(None),
+        true,
+        None,
+    );
+    let names = tools
+        .iter()
+        .map(|tool| tool.spec().name)
+        .collect::<Vec<_>>();
+    assert!(
+        !names.iter().any(|name| name == "link_ref"),
+        "a read-only session never registers link_ref: {names:?}"
+    );
+    let agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: VecDeque::from(vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "injected-link".into(),
+                        name: "link_ref".into(),
+                        arguments: serde_json::json!({
+                            "kind": "pr",
+                            "repo": "acme/widget",
+                            "number": 27
+                        })
+                        .to_string(),
+                    }],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("done".into()),
+                    tool_calls: Vec::new(),
+                    reasoning: None,
+                },
+            ]),
+        }),
+        tools,
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        store.clone(),
+        temp.path().into(),
+        session_id.clone(),
+        IdlePolicy::WaitForInput,
+    );
+    // The runner's idle loop observes the background channel; a session built
+    // without it sees the sender side gone and closes. Wire the tasks the
+    // builtins handed back, like every other runner test.
+    let runner = runner.with_background_tasks(background.clone());
+    let (_, mut events, _status) = handle.attach();
+    let mut task = runner.start(Some("try to link".into()));
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match events.recv().await.unwrap() {
+                AgentEvent::ToolResult {
+                    is_error, content, ..
+                } => {
+                    assert!(is_error, "the injected mutation must be refused");
+                    assert!(content.contains("unknown tool: link_ref"), "{content}");
+                }
+                AgentEvent::AssistantText(text) if text == "done" => break,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the read-only session must finish its turn");
+    assert_eq!(
+        store.list_refs(temp.path(), &session_id).await.unwrap(),
+        Vec::new(),
+        "nothing was linked"
+    );
+    // This test is about the read-only tool registry, not liveness: a
+    // WaitForInput session with no agent-owned background sender may close
+    // itself after the turn, and that does not weaken the refusal assertion.
+    task.abort();
+}
+
+/// Blocker 4: cancelling the watcher must cancel its SUBPROCESS, not just the
+/// registry id. Teardown happens while a `gh` call is in flight; without
+/// `kill_on_drop` that child would keep running after its session is gone.
+#[cfg(all(unix, feature = "sqlite"))]
+#[tokio::test]
+async fn aborting_the_session_kills_an_in_flight_gh_child() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    // A `gh` that records its own pid and then runs forever: the watcher's
+    // poll is in flight for as long as this child lives.
+    let script = root.join("gh-slow");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s' \"$$\" > '{}/child.pid'\nexec sleep 300\n",
+            root.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let session_id = format!("watch-kill-{}", crate::session::new_id());
+    let store = SessionStore::connect(
+        &crate::config::SessionBackend::Sqlite { path: None },
+        root,
+        &session_id,
+    )
+    .await
+    .unwrap();
+    store
+        .add_ref(
+            root,
+            &session_id,
+            "pr",
+            "https://github.com/acme/widget/pull/27",
+        )
+        .await
+        .unwrap();
+    let (_, background) = crate::tools::builtins(
+        crate::workspace::Workspace::new(root).unwrap(),
+        SandboxPolicy::fixed(None),
+        false,
+        None,
+    );
+    let agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: VecDeque::new(),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    let (runner, _handle) = SessionRunner::new(
+        agent,
+        store.clone(),
+        root.into(),
+        session_id.clone(),
+        IdlePolicy::WaitForInput,
+    );
+    let runner = runner
+        .with_background_tasks(background.clone())
+        .with_ref_watch_interval(std::time::Duration::from_millis(20))
+        .with_ref_watch_program(script.display().to_string());
+    let mut task = runner.start(None);
+
+    // Wait until the `gh` child is really alive.
+    let pid_path = root.join("child.pid");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let pid = loop {
+        if let Ok(pid) = std::fs::read_to_string(&pid_path)
+            && let Ok(pid) = pid.trim().parse::<i32>()
+        {
+            break pid;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the watcher never started its gh child"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    };
+    assert!(child_alive(pid), "the gh child must be running");
+
+    task.abort();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !background.all_running_ids().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "aborting the runner must abort the PR watcher"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    // The child must be gone with it: a live pid here means the watcher's
+    // `gh` outlived the session that asked for it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while child_alive(pid) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the in-flight gh child (pid {pid}) outlived its watcher"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// Whether `pid` is still a live process (Linux `/proc`).
+#[cfg(all(unix, feature = "sqlite"))]
+fn child_alive(pid: i32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
 /// The watcher is an ordinary background-registry task: aborting the runner
 /// (the DELETE-session/cancel path) aborts it too, so it never outlives the
 /// runner.
@@ -19909,10 +20115,9 @@ case "$path" in
     body='{{"state":"OPEN","merged":false,"head":{{"sha":"abc123"}}}}'
     ;;
   repos/acme/widget/commits/abc123/check-runs)
-    current=checks
     case "$mode" in
-      red) body='{{"check_runs":[{{"name":"build","status":"COMPLETED","conclusion":"FAILURE"}},{{"name":"test","status":"COMPLETED","conclusion":"FAILURE"}}]}}' ;;
-      *) body='{{"check_runs":[{{"name":"build","status":"COMPLETED","conclusion":"SUCCESS"}},{{"name":"test","status":"COMPLETED","conclusion":"SUCCESS"}}]}}' ;;
+      red) current=checks-red; body='{{"check_runs":[{{"name":"build","status":"COMPLETED","conclusion":"FAILURE"}},{{"name":"test","status":"COMPLETED","conclusion":"FAILURE"}}]}}' ;;
+      *) current=checks-green; body='{{"check_runs":[{{"name":"build","status":"COMPLETED","conclusion":"SUCCESS"}},{{"name":"test","status":"COMPLETED","conclusion":"SUCCESS"}}]}}' ;;
     esac
     ;;
   repos/acme/widget/commits/abc123/status)
@@ -20044,7 +20249,7 @@ printf 'HTTP/2.0 200 OK\r\nEtag: %s\r\n\r\n%s' "$current" "$body"
         })
         .expect("the model sees the automatic projection");
     assert!(
-        projected.contains("PR #27 检查失败：build, test（2 项）"),
+        projected.contains("PR acme/widget#27 检查失败：build, test（2 项）"),
         "{projected}"
     );
     assert!(projected.contains(DISCLAIMER), "{projected}");

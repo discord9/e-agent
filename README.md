@@ -389,46 +389,64 @@ to `#27` when the link lives in the session's own repository — that session's
 | grey | draft |
 | purple | merged |
 | dark red | closed without merging |
-| *(none)* | status unknown — a failed read never paints a dot or a word |
+| muted ring | the lookup was attempted and failed (`unknown`) |
+| *(none)* | never observed, or a plain link; nothing was looked up |
 
 Blockers win: conflict or failing check, then changes requested, then draft,
-then merged/closed, then approved, then ready. The chip is otherwise left
-alone; the tooltip carries `state · merge · review · checks · head · title`, and
-the editor shows the same one line per link. A plain link has no dot and no
-status.
+then merged/closed, then approved, then ready. Hovering or focusing a chip
+opens a real popover (a native `title` tooltip cannot hold links): the PR/issue
+title, the state line `state · merge · review · checks · head`, and clickable
+new-tab links to the PR/issue, the checks/actions page, the head commit, and
+the review/files page. A plain link's popover contains just the link. Escape
+closes it; moving away closes after a short grace so the pointer can travel
+into it; focusing the chip and tabbing enters its links. The expanded editor
+row is the same clickable link. A plain link has no dot and no status.
 
 Statuses are read from the `gh` CLI, cached in memory for 60 seconds per
 (repo, number), and never written to the session store. They are read when a
-frontend opens a session's links and when it explicitly refreshes them (adding
-or removing a link, or an agent-side `link_ref`). Any failure — no `gh`, no
-network, a rate limit, a non-GitHub URL — renders no dot and never removes the
-link.
+frontend opens a session's links, when a link is added (one immediate,
+non-blocking fetch), and when the user explicitly retries one link or refreshes
+all links in the header. A failed observation is `unknown` (muted ring); a link
+this process never observed has no dot at all. The dot is not a button — the
+chip's click still opens the link. A failed link's popover offers `重试`, a
+never-observed one offers `查询状态`, and the header's `↻` refreshes every link
+of the session, all without starting a model turn. A plain link has no status.
+
+The tools (`list_refs`, `link_ref`, `unlink_ref`) report a `status` token only
+when the in-memory cache already holds an observation: a cache miss omits the
+field (no placeholder, no `gh` call from the tool), a failed observation is
+`"unknown"`, and a successful one is the chip token. A plain link never has a
+status field.
 
 #### PR/issue watcher
 
 While a session is live, its linked open PRs and issues are also watched
 independently of the web UI: one hidden task in the session's existing
-background registry polls every five minutes. The main document is requested
-with `If-None-Match`; a `304` ends that link's poll, so an unchanged link costs
-exactly one conditional request and produces nothing. A `200` opens the
-nested reads: check runs plus legacy commit statuses, reviews, and
-`issues/{n}/comments?since=` / review comments. A `403`/`429` pauses the whole
-watcher until `X-RateLimit-Reset`.
+background registry polls every five minutes. Each independently mutable
+resource revalidates with its own `If-None-Match` (the PR document, check runs,
+commit statuses, reviews), while comment lists are bounded by
+`issues/{n}/comments?since=` / review-comment watermarks. An unchanged poll
+therefore sends only conditional reads and produces nothing; a change reads
+the nested resources it needs. A `403`/`429` pauses the whole watcher until
+`X-RateLimit-Reset`.
 
 Only transitions become a turn: checks going from all-passing (or pending) to
 failing, a review decision becoming changes-requested or approved, a merge, a
 close, and new comments/reviews. Several changes found in one poll coalesce
 into one message. Merged and closed links are dropped and never polled again.
-The first observation of a link (including every restart, and a link added
-later) is a silent baseline: the watcher records current state and the
-comment watermark, so it never reports the past.
+The first observation of a link (including every restart) is a silent
+baseline: the watcher records current state and the comment watermark, so it
+never reports the past. Adding a link while the session is live uses the same
+add-time status observation as that baseline: the immediate add fetch is
+silent, the add itself never produces a turn, and the first transition after
+the add does.
 
 The message is delivered through the existing durable `Notice` projection, so
 the transcript renders a dim notice rather than a user bubble, while the model
 sees the same text as a user-shaped message:
 
 ```text
-[自动检测 · 非用户消息] PR #27 检查失败：build, test（2 项）
+[自动检测 · 非用户消息] PR owner/repo#27 检查失败：build, test（2 项）
 discord9 · "这版先别合，测试挂了"
 ——本消息由 PR 监视自动生成，不是用户发言；请据此判断并采取必要行动。
 ```

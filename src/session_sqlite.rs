@@ -84,17 +84,20 @@ CREATE TABLE IF NOT EXISTS running_tasks (
 "#;
 
 /// DDL for the session PR/issue link table. Idempotent. One row per
-/// (workspace, session, kind, url); `created_at_us` orders the chips
-/// oldest-first. This is a separate row table on purpose: links are not
+/// (workspace, session, normalised url): the URL ALONE is the identity, and
+/// `kind` is an attribute of that URL — linking the same URL once as a plain
+/// `link` and once as a `pr` is one link, and an unlink by URL needs no kind.
+/// `created_at_us` orders the chips oldest-first; a re-add keeps its original
+/// position. This is a separate row table on purpose: links are not
 /// session metadata, so writes never touch the `sessions` snapshot log.
 const CREATE_TABLE_SESSION_REFS: &str = r#"
 CREATE TABLE IF NOT EXISTS session_refs (
     workspace_id TEXT NOT NULL,
     session_id   TEXT NOT NULL,
-    kind         TEXT NOT NULL,
     url          TEXT NOT NULL,
+    kind         TEXT NOT NULL,
     created_at_us INTEGER NOT NULL,
-    PRIMARY KEY (workspace_id, session_id, kind, url)
+    PRIMARY KEY (workspace_id, session_id, url)
 )
 "#;
 
@@ -320,6 +323,55 @@ impl SqliteSession {
         conn.execute(CREATE_TABLE_USAGE, ())
             .await
             .map_err(|e| format!("cannot create usage_entries table: {e}"))?;
+
+        // The URL is the link identity now. Databases created before that
+        // change still key session_refs by (workspace, session, kind, url);
+        // `CREATE TABLE IF NOT EXISTS` cannot change a primary key, so probe
+        // and rebuild once. `INSERT OR REPLACE` in ascending time order keeps
+        // the newest kind for a URL that used to appear twice.
+        {
+            let mut rows = conn
+                .query("PRAGMA table_info(session_refs)", ())
+                .await
+                .map_err(|e| format!("cannot inspect session_refs table schema: {e}"))?;
+            let mut kind_is_key = false;
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| format!("cannot inspect session_refs table schema: {e}"))?
+            {
+                let name = row
+                    .get_value(1)
+                    .map_err(|e| format!("cannot inspect session_refs table schema: {e}"))?
+                    .as_text()
+                    .cloned()
+                    .unwrap_or_default();
+                let pk = row
+                    .get_value(5)
+                    .map_err(|e| format!("cannot inspect session_refs table schema: {e}"))?
+                    .as_integer()
+                    .copied()
+                    .unwrap_or(0);
+                if name == "kind" && pk > 0 {
+                    kind_is_key = true;
+                }
+            }
+            if kind_is_key {
+                for sql in [
+                    "ALTER TABLE session_refs RENAME TO session_refs_legacy_kind",
+                    CREATE_TABLE_SESSION_REFS,
+                    "INSERT OR REPLACE INTO session_refs \
+                     (workspace_id, session_id, url, kind, created_at_us) \
+                     SELECT workspace_id, session_id, url, kind, created_at_us \
+                     FROM session_refs_legacy_kind ORDER BY created_at_us ASC",
+                    "DROP TABLE session_refs_legacy_kind",
+                ] {
+                    conn.execute(sql, ())
+                        .await
+                        .map_err(|e| format!("cannot migrate session_refs to URL identity: {e}"))?;
+                }
+            }
+        }
 
         // Idempotent schema migration for the `title`, `pinned`,
         // `archived` and `writer` columns — a table-structure evolution:
@@ -3061,7 +3113,7 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
             .query(
                 "SELECT kind, url FROM session_refs \
                  WHERE workspace_id = ?1 AND session_id = ?2 \
-                 ORDER BY created_at_us, kind, url",
+                 ORDER BY created_at_us, url",
                 (self.workspace_id.as_str(), session_id),
             )
             .await
@@ -3089,8 +3141,9 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
         Ok(links)
     }
 
-    /// Insert one link. An exact duplicate stays a single row (its original
-    /// `created_at_us`, hence its position, is kept).
+    /// Insert one link. The URL is the identity: re-adding it keeps the same
+    /// row and its original `created_at_us` (hence its position) and only
+    /// re-states its `kind` attribute.
     pub async fn add_session_ref(
         &self,
         session_id: &str,
@@ -3099,14 +3152,15 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
     ) -> Result<(), String> {
         let conn = self.conn.lock().await;
         conn.execute(
-            "INSERT OR IGNORE INTO session_refs \
-             (workspace_id, session_id, kind, url, created_at_us) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO session_refs \
+             (workspace_id, session_id, url, kind, created_at_us) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT (workspace_id, session_id, url) DO UPDATE SET kind = excluded.kind",
             (
                 self.workspace_id.as_str(),
                 session_id,
-                kind,
                 url,
+                kind,
                 next_event_time_us(),
             ),
         )
@@ -3115,18 +3169,14 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
         Ok(())
     }
 
-    /// Delete one exact (kind, url) link. Absent rows are a no-op.
-    pub async fn remove_session_ref(
-        &self,
-        session_id: &str,
-        kind: &str,
-        url: &str,
-    ) -> Result<(), String> {
+    /// Delete one link by URL. `kind` is an attribute, so it is not part of
+    /// the identity an unlink has to know. Absent rows are a no-op.
+    pub async fn remove_session_ref(&self, session_id: &str, url: &str) -> Result<(), String> {
         let conn = self.conn.lock().await;
         conn.execute(
             "DELETE FROM session_refs \
-             WHERE workspace_id = ?1 AND session_id = ?2 AND kind = ?3 AND url = ?4",
-            (self.workspace_id.as_str(), session_id, kind, url),
+             WHERE workspace_id = ?1 AND session_id = ?2 AND url = ?3",
+            (self.workspace_id.as_str(), session_id, url),
         )
         .await
         .map_err(|e| format!("cannot remove session link: {e}"))?;

@@ -271,7 +271,7 @@ class El {
 }
 const elsById={};
 for(const id of ["topActions","backParentBtn","connState","banner","bannerText","bannerClose","tokenInput","tokenToggle","chatView","chatEmpty",
-  "chatBusy","chatSessionId","chatStatus",
+  "chatBusy","chatSessionId","chatRefs","chatStatus",
   "usageInfo","messages","promptInput","sendBtn","cancelBtn","compactBtn",
   "queueBar","goalBar","waitingInputPanel","waitingInputQuestions","waitingInputStatus","waitingInputError",
   "pendingQuestionsPanel","pendingQuestionsList","promptLabel","slashMenu","jumpBottomBtn","composerMeta","sidebarBtn","sidebarOverlay","sidebar",
@@ -902,6 +902,167 @@ async function main(){
     state.globalToken="test-token";   // 全局回退 token（workspaceToken 的兜底）
     state.token="test-token";         // 激活 workspace 派生 token（兼容既有引用）
     await pollSessions();
+    if (MODE === 'refs') {
+      let focusedFail=0;
+      const focusedChk=(name, ok, extra)=>{
+        if(!ok) focusedFail++;
+        console.log((ok?"PASS":"FAIL")+" "+name+(extra?"  "+extra:""));
+      };
+      const prUrl="https://github.com/acme/widget/pull/27";
+      const unknownUrl="https://github.com/acme/widget/pull/28";
+      const neverUrl="https://github.com/acme/widget/pull/29";
+      const plainUrl="https://example.org/docs/x";
+      state.workspace={id:"refs-ws", name:"Refs", url:"", token:""};
+      state.token="";
+      state.sessionId="refs-test";
+      const ready={state:"ready", detail:"READY · merge clean · review approved · checks 2✓ · head 255e5c0 · One identity for a link", state_line:"READY · merge clean · review approved · checks 2✓ · head 255e5c0", title:"One identity for a link", head:"255e5c0deadbeefcafe"};
+      const unknown={state:"unknown", detail:"UNKNOWN", state_line:"UNKNOWN"};
+      state.sessionRefs={
+        id:"refs-test", supported:true,
+        refs:[
+          {kind:"pr", url:prUrl, label:"acme/widget#27", short:"#27"},
+          {kind:"pr", url:unknownUrl, label:"acme/widget#28", short:"#28"},
+          {kind:"pr", url:neverUrl, label:"acme/widget#29", short:"#29"},
+          {kind:"link", url:plainUrl, label:"example.org/docs/x"},
+        ],
+        statuses:{[prUrl]:ready, [unknownUrl]:unknown},
+        editorOpen:false, kind:"", draft:"", error:"", busy:false, retrying:"", refreshing:false,
+      };
+      renderChatRefs();
+      const host=elsById["chatRefs"];
+      const chips=[...host.querySelectorAll(".chat-ref-chip")];
+      const chipFor=(url)=>[...host.querySelectorAll(".chat-ref-chip")]
+        .find(c=>c.getAttribute("data-ref-url")===url);
+      focusedChk("one chip per link", chips.length===4, "got "+chips.length);
+      const prChip=chipFor(prUrl);
+      const prLink=prChip.querySelector(".chat-ref-link");
+      const pop=prChip.querySelector(".chat-ref-popover");
+      focusedChk("native title tooltip removed", !prLink.getAttribute("title"));
+      focusedChk("popover hidden before focus/hover", pop.hidden===true);
+      for (const fn of prChip._listeners["focusin"]||[]) fn({type:"focusin"});
+      focusedChk("focus opens popover", pop.hidden===false);
+      const anchors=[...pop.querySelectorAll("a")];
+      const anchorFor=(href)=>anchors.find(a=>a.getAttribute("href")===href);
+      const prAnchor=anchorFor(prUrl);
+      focusedChk("popover contains PR anchor", !!prAnchor);
+      focusedChk("PR anchor opens a new tab",
+        prAnchor && prAnchor.getAttribute("target")==="_blank"
+        && String(prAnchor.getAttribute("rel")||"").includes("noopener"));
+      focusedChk("checks/actions anchor",
+        !!anchorFor("https://github.com/acme/widget/actions"));
+      focusedChk("head commit anchor",
+        !!anchorFor("https://github.com/acme/widget/commit/255e5c0deadbeefcafe"));
+      focusedChk("review anchor",
+        !!anchorFor(prUrl+"/files"));
+      focusedChk("title + state line are plain text",
+        pop.textContent.includes("One identity for a link")
+        && pop.textContent.includes("READY · merge clean · review approved · checks 2✓ · head 255e5c0"));
+      for (const fn of prChip._listeners["keydown"]||[]) fn({key:"Escape", preventDefault(){}, stopPropagation(){}});
+      focusedChk("Escape closes popover", pop.hidden===true);
+
+      const unknownChip=chipFor(unknownUrl);
+      const unknownPop=unknownChip.querySelector(".chat-ref-popover");
+      focusedChk("unknown observation paints the muted dot",
+        (unknownChip.querySelector(".chat-ref-dot")||{}).className === "chat-ref-dot unknown");
+      for (const fn of unknownChip._listeners["focusin"]||[]) fn({type:"focusin"});
+      focusedChk("unknown opens popover", unknownPop.hidden===false);
+      focusedChk("unknown shows just the link",
+        unknownPop.querySelectorAll("a").length===1
+        && unknownPop.querySelectorAll("a")[0].getAttribute("href")===unknownUrl);
+      let retry=unknownPop.querySelector(".chat-ref-popover-action");
+      focusedChk("unknown offers 重试", !!retry && retry.textContent==="重试");
+
+      const neverChip=chipFor(neverUrl);
+      const neverPop=neverChip.querySelector(".chat-ref-popover");
+      focusedChk("never observed paints no dot", !neverChip.querySelector(".chat-ref-dot"));
+      for (const fn of neverChip._listeners["focusin"]||[]) fn({type:"focusin"});
+      focusedChk("never observed offers 查询状态",
+        (neverPop.querySelector(".chat-ref-popover-action")||{}).textContent==="查询状态");
+
+      const plainChip=chipFor(plainUrl);
+      const plainPop=plainChip.querySelector(".chat-ref-popover");
+      for (const fn of plainChip._listeners["focusin"]||[]) fn({type:"focusin"});
+      focusedChk("plain link popover is just the link",
+        plainPop.querySelectorAll("a").length===1
+        && plainPop.querySelectorAll("a")[0].getAttribute("href")===plainUrl
+        && !plainPop.querySelector(".chat-ref-popover-action"));
+
+      // A retry is ONE uncached status fetch, in place, with no prompt/turn.
+      // Re-open the unknown popover (the later focus tests closed it).
+      for (const fn of unknownChip._listeners["focusin"]||[]) fn({type:"focusin"});
+      const beforeRetryFetches=FETCHES.length;
+      const beforeNotices=elsById["messages"].children.length;
+      let retryCalls=[];
+      const originalFetch=globalThis.fetch;
+      globalThis.fetch=(url, opts={})=>{
+        const text=String(url);
+        if (text.includes("/refs/status") && text.includes("refresh=1") && text.includes("url=")) {
+          retryCalls.push(text);
+          const updated={state:"ready", detail:"READY · merge clean · review approved · checks 1✓ · head abc1234 · Fixed now", state_line:"READY · merge clean · review approved · checks 1✓ · head abc1234", title:"Fixed now", head:"abc1234deadbeefcafe"};
+          return resp(200, JSON.stringify({supported:true, statuses:{[unknownUrl]:updated}}), opts.signal);
+        }
+        return originalFetch(url, opts);
+      };
+      retry._listeners["click"][0]({preventDefault(){}, stopPropagation(){}});
+      focusedChk("retry shows a busy label", (unknownPop.querySelector(".chat-ref-popover-action")||{}).textContent==="查询中…");
+      // A second click while the first is in flight is a no-op.
+      if (retry._listeners["click"][0]) retry._listeners["click"][0]({preventDefault(){}, stopPropagation(){}});
+      return flush().then(()=>{
+        focusedChk("retry made exactly one uncached fetch",
+          retryCalls.length===1, "calls="+retryCalls.length);
+        focusedChk("successful retry replaces the dot in place",
+          chipFor(unknownUrl).querySelector(".chat-ref-dot").className === "chat-ref-dot ready");
+        focusedChk("successful retry keeps the popover open and updates it",
+          unknownPop.hidden===false
+          && unknownPop.textContent.includes("Fixed now")
+          && !!unknownPop.querySelectorAll("a").length
+          && !unknownPop.querySelector(".chat-ref-popover-action"));
+        focusedChk("retry never starts a turn or notice",
+          elsById["messages"].children.length === beforeNotices
+          && !FETCHES.slice(beforeRetryFetches).some(u=>String(u).includes("/prompt"))
+          && !FETCHES.slice(beforeRetryFetches).some(u=>String(u).includes("/events")));
+        globalThis.fetch=originalFetch;
+
+        // Header refresh: one request for all links (the server dedupes).
+        let refreshCalls=[];
+        globalThis.fetch=(url, opts={})=>{
+          const text=String(url);
+          if (text.includes("/refs/status") && text.includes("refresh=1") && !text.includes("url=")) {
+            refreshCalls.push(text);
+            return resp(200, JSON.stringify({supported:true, statuses:{[prUrl]:ready, [unknownUrl]:ready, [neverUrl]:unknown}}), opts.signal);
+          }
+          return originalFetch(url, opts);
+        };
+        const refreshBtn=host.querySelector(".chat-ref-refresh");
+        focusedChk("header exposes a refresh action", !!refreshBtn);
+        refreshBtn._listeners["click"][0]({preventDefault(){}, stopPropagation(){}});
+        focusedChk("header refresh shows busy state",
+          (host.querySelector(".chat-ref-refresh")||{}).textContent==="刷新中…");
+        return flush().then(()=>{
+          focusedChk("header refresh is one request (duplicates coalesce)", refreshCalls.length===1);
+          focusedChk("header refresh settles to idle",
+            (host.querySelector(".chat-ref-refresh")||{}).textContent==="↻");
+          focusedChk("header refresh updates every chip",
+            chipFor(neverUrl).querySelector(".chat-ref-dot").className==="chat-ref-dot unknown");
+          globalThis.fetch=originalFetch;
+          try {
+            // The expanded detail rows are real links too, not title tooltips.
+            state.sessionRefs.editorOpen=true;
+            renderChatRefs();
+            const detail=host.querySelector(".chat-ref-detail");
+            focusedChk("detail row is a clickable link",
+              !!detail && detail.getAttribute("href")===prUrl
+              && detail.getAttribute("target")==="_blank"
+              && String(detail.getAttribute("rel")||"").includes("noopener")
+              && !detail.getAttribute("title"));
+          } catch (e) {
+            focusedChk("detail row is a clickable link", false, String(e && e.stack || e));
+          }
+          console.log(focusedFail===0 ? "ALL PASS" : focusedFail+" FAILURES");
+          imports.system.exit(0);
+        });
+      });
+    }
     if (MODE === 'usage-dashboard') {
       let focusedFail=0;
       const focusedChk=(name, ok, extra)=>{
@@ -9689,7 +9850,8 @@ main();
    .replace("MODE === 'waiting-input'", 'true' if MODE == 'waiting-input' else 'false') \
    .replace("MODE === 'refresh-deep-link'", 'true' if MODE == 'refresh-deep-link' else 'false') \
    .replace("MODE === 'fragment'", 'true' if MODE == 'fragment' else 'false') \
-   .replace("MODE === 'read-image'", 'true' if MODE == 'read-image' else 'false')
+   .replace("MODE === 'read-image'", 'true' if MODE == 'read-image' else 'false') \
+   .replace("MODE === 'refs'", 'true' if MODE == 'refs' else 'false')
 
 # DEEP_LINK env → location.search 注入（init() 启动时 URL 解析入口）
 HARNESS = HARNESS.replace('globalThis.location={ pathname:', 'globalThis.__fragmentHarness=' + ('true' if MODE == 'fragment' else 'false') + '; globalThis.location={ pathname:')

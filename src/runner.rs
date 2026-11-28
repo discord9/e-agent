@@ -2851,6 +2851,23 @@ impl SessionRunner {
                     Some(PendingCommand::Compact) => {
                         self.pending.pop_front();
                     }
+                    // An accepted automatic notice is durable ingress: it
+                    // already exists as a transcript fact, so termination
+                    // still persists it (no turn will read it, but dropping
+                    // it would lose an observation the watcher delivered).
+                    Some(PendingCommand::AutomaticNotice { .. }) => {
+                        let Some(PendingCommand::AutomaticNotice { text }) =
+                            self.pending.pop_front()
+                        else {
+                            unreachable!()
+                        };
+                        if let Err(error) = self.commit(SessionEntry::Notice { text }).await {
+                            self.commit_error(format!(
+                                "persisting accepted notice while terminating: {error:#}"
+                            ))
+                            .await;
+                        }
+                    }
                     // Goal mutations and continuation resets are dropped
                     // while terminating: the session is ending, nothing will
                     // apply them. An asynchronous answer is dropped for the
@@ -2858,7 +2875,6 @@ impl SessionRunner {
                     // will never come, and nothing was promised durably.
                     Some(PendingCommand::Goal(_))
                     | Some(PendingCommand::Continue(_))
-                    | Some(PendingCommand::AutomaticNotice { .. })
                     | Some(PendingCommand::Answer { .. }) => {
                         self.pending.pop_front();
                     }
@@ -4406,8 +4422,18 @@ impl SessionRunner {
                         let root = self.root.clone();
                         let link_workspace = self.link_workspace.clone();
                         let session = self.session.clone();
+                        // These tools are intercepted BY NAME, so the name
+                        // alone would let a provider dispatch one this session
+                        // never registered — a read-only session has no
+                        // `link_ref` schema, but a call naming it must not
+                        // mutate anything either. The registry is the same
+                        // authority `execute_on` uses for every other tool.
+                        let registered = self.agent.tool_names();
                         let call = &call;
                         let mut operation = Box::pin(async move {
+                            if !registered.iter().any(|name| name == &call.name) {
+                                return Err(format!("unknown tool: {}", call.name));
+                            }
                             let arguments: serde_json::Value =
                                 serde_json::from_str(&call.arguments)
                                     .map_err(|error| format!("invalid JSON arguments: {error}"))?;

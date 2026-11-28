@@ -2177,9 +2177,21 @@ struct SessionLinkStatusView {
 /// A link GitHub cannot be asked about (another forge, a plain link, a fetch
 /// that failed) stays listed: a PR/issue reports `unknown`, and a plain link
 /// has no status entry at all.
+#[derive(Deserialize, Default)]
+struct LinkStatusQuery {
+    /// `refresh=1` bypasses the 60-second chip cache; it is only used by the
+    /// explicit per-link retry and the header's refresh-all action.
+    #[serde(default)]
+    refresh: Option<String>,
+    /// Limit a refresh to one stored URL (the popover retry).
+    #[serde(default)]
+    url: Option<String>,
+}
+
 async fn session_link_statuses(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    Query(query): Query<LinkStatusQuery>,
 ) -> Result<Json<SessionLinkStatusView>, (StatusCode, String)> {
     let store = session_links_store(&state, &id).await?;
     let mut statuses = std::collections::BTreeMap::new();
@@ -2193,12 +2205,28 @@ async fn session_link_statuses(
         .list_refs(state.factory.root(), &id)
         .await
         .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let refresh = query
+        .refresh
+        .as_deref()
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
     let now = std::time::Instant::now();
+    // One fetch per distinct stored URL, even if a backend ever returns the
+    // same identity twice. A per-link retry only looks at that URL.
+    let mut seen = std::collections::HashSet::new();
     for link in &refs {
+        if query.url.as_deref().is_some_and(|url| url != link.url) {
+            continue;
+        }
+        if !seen.insert(link.url.clone()) {
+            continue;
+        }
         match crate::link_status::target(&link.kind, &link.url) {
             Some(target) => {
-                let status =
-                    crate::link_status::status(crate::link_status::cache(), &target, now).await;
+                let status = if refresh {
+                    crate::link_status::refresh(crate::link_status::cache(), &target, now).await
+                } else {
+                    crate::link_status::status(crate::link_status::cache(), &target, now).await
+                };
                 statuses.insert(link.url.clone(), status);
             }
             // A plain link has no state; a PR/issue we cannot ask GitHub
@@ -2326,6 +2354,10 @@ async fn add_session_link(
         .add_ref(root, &id, &kind, &url)
         .await
         .map_err(|e| error(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    // The editor's add path gets the same one immediate, non-blocking
+    // observation as the tool: the chip reflects it, the watcher baselines
+    // from it, and a warm cache is not fetched again.
+    crate::link_status::prewarm(&kind, &url);
     Ok(Json(SessionLinksView {
         supported: true,
         refs: ref_chips(workspace.as_deref(), refs).await,
@@ -2346,9 +2378,10 @@ async fn remove_session_link(
 ) -> Result<Json<SessionLinksView>, (StatusCode, String)> {
     let store = session_links_store(&state, &id).await?;
     let refs = store
-        .remove_ref(state.factory.root(), &id, &query.kind, &query.url)
+        .remove_ref(state.factory.root(), &id, &query.url)
         .await
         .map_err(|e| error(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    crate::link_status::forget(&query.kind, &query.url);
     let workspace = session_git_workspace(&state, live(&state, &id).ok().as_ref());
     Ok(Json(SessionLinksView {
         supported: true,

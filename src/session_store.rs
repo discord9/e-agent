@@ -1009,9 +1009,12 @@ fn pr_issue_label(parsed: &url::Url) -> String {
 }
 
 /// Infer the kind of a full-URL link from its path — but only for a
-/// RECOGNISED PR/issue shape: `…/pull/N`, `…/pulls/N`,
+/// COMPLETE recognised shape: `owner/repo/pull/N`, `…/pulls/N`,
 /// `…/pull-requests/N`, `…/merge_requests/N`, `…/issues/N`, `…/issue/N`
 /// (GitLab puts a `-` before the action, which does not change the marker).
+/// The number must be the URL's LAST segment and an owner/repo must precede
+/// the action, so `example.org/pull/7/manual` is a page ABOUT pull 7, not
+/// pull 7.
 ///
 /// `None` means the URL is neither a pull request nor an issue: a plain docs
 /// URL is NOT a pull request, so the caller requires an explicit `kind`
@@ -1019,20 +1022,20 @@ fn pr_issue_label(parsed: &url::Url) -> String {
 pub(crate) fn ref_kind_from_url(raw: &str) -> Option<&'static str> {
     let parsed = parse_ref_url(raw).ok()?;
     let segments = url_segments(&parsed);
-    let marker = segments.iter().position(|segment| {
-        matches!(
-            *segment,
-            "pull" | "pulls" | "pull-requests" | "merge_requests" | "issues" | "issue"
-        )
-    })?;
-    let number = segments.get(marker + 1)?;
+    let (number, before_number) = segments.split_last()?;
     if number.is_empty() || !number.chars().all(|c| c.is_ascii_digit()) {
         return None;
     }
-    Some(if matches!(segments[marker], "issues" | "issue") {
-        "issue"
-    } else {
-        "pr"
+    let (action, owner_repo) = before_number.split_last()?;
+    // GitLab inserts a literal `-` before the action segment.
+    let owner_repo = owner_repo.strip_suffix(&["-"]).unwrap_or(owner_repo);
+    if owner_repo.len() < 2 {
+        return None;
+    }
+    Some(match *action {
+        "issues" | "issue" => "issue",
+        "pull" | "pulls" | "pull-requests" | "merge_requests" => "pr",
+        _ => return None,
     })
 }
 
@@ -4359,31 +4362,31 @@ impl SessionStore {
         self.list_refs(root, session).await
     }
 
-    /// Remove one exact (kind, url) link and return the remaining list.
+    /// Remove one link by its URL and return the remaining list. The URL
+    /// alone is the identity — `kind` is an attribute, never part of the key —
+    /// so an unlink never has to infer (or be told) which list a URL is in.
     /// Removing an absent link is a no-op.
     pub async fn remove_ref(
         &self,
         root: &Path,
         session: &str,
-        kind: &str,
         url: &str,
     ) -> Result<Vec<SessionRef>> {
         if !self.supports_session_refs() {
             anyhow::bail!(SESSION_REFS_UNSUPPORTED);
         }
-        validate_ref_kind(kind).map_err(anyhow::Error::msg)?;
         let url = parse_ref_url(url).map_err(anyhow::Error::msg)?.to_string();
         match self {
             SessionStore::Jsonl => unreachable!("checked above"),
             #[cfg(feature = "greptime")]
             SessionStore::Greptime { session: db, .. } => {
-                db.remove_session_ref(session, kind, &url).await?
+                db.remove_session_ref(session, &url).await?
             }
             #[cfg(feature = "sqlite")]
             SessionStore::Sqlite { session: db, .. } => db
                 .lock()
                 .await
-                .remove_session_ref(session, kind, &url)
+                .remove_session_ref(session, &url)
                 .await
                 .map_err(anyhow::Error::msg)?,
         }
@@ -5550,10 +5553,25 @@ mod tests {
             "https://github.com/a/b/compare/main...dev",
             "https://example.com/docs/issues",
             "https://example.com/docs/pull/not-a-number",
+            // The number must be the URL's LAST segment, under an
+            // owner/repo path: this page is ABOUT pull 7, it is not pull 7.
+            "https://example.org/pull/7/manual",
+            "https://example.org/pull/7",
+            "https://github.com/pull/7",
+            "https://example.org/a/b/pull/7/files",
             "not a url",
         ] {
             assert_eq!(ref_kind_from_url(unknown), None, "{unknown}");
         }
+        // A trailing slash or a query is not a different shape.
+        assert_eq!(
+            ref_kind_from_url("https://github.com/a/b/pull/7/"),
+            Some("pr")
+        );
+        assert_eq!(
+            ref_kind_from_url("https://github.com/a/b/pull/7#discussion_r1"),
+            Some("pr")
+        );
     }
 
     /// JSONL `load_older` pages by ABSOLUTE position (there is no seq

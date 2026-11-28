@@ -977,7 +977,7 @@ async function fetchChatRefs(id) {
   const epoch = sessionOpenEpoch;
   state.sessionRefs = {
     id, supported: null, refs: [], statuses: {}, editorOpen: false, kind: "",
-    draft: "", error: "", busy: false,
+    draft: "", error: "", busy: false, retrying: "", refreshing: false,
   };
   renderChatRefs();
   try {
@@ -992,13 +992,14 @@ async function fetchChatRefs(id) {
       refs: Array.isArray(data.refs) ? data.refs : [],
       statuses: {},
       editorOpen: false, kind: "", draft: "", error: "", busy: false,
+      retrying: "", refreshing: false,
     };
   } catch (_e) {
     if (state.sessionId !== id || state.workspace.id !== wsId || epoch !== sessionOpenEpoch) return;
     // 读取失败不冒充「无链接」：隐藏编辑区，会话其余功能不受影响。
     state.sessionRefs = {
       id, supported: null, refs: [], statuses: {}, editorOpen: false, kind: "",
-      draft: "", error: "", busy: false,
+      draft: "", error: "", busy: false, retrying: "", refreshing: false,
     };
   }
   renderChatRefs();
@@ -1008,21 +1009,101 @@ async function fetchChatRefs(id) {
 /* 链接状态的唯一来源：打开会话或显式刷新链接时问一次 /refs/status。
    服务端按链接缓存 60 秒，前端不轮询 GitHub。请求本身失败时保留已有状态：
    只有「服务端问了 GitHub 但没拿到」才显示 unknown，问不到不冒充。 */
-async function fetchChatRefStatuses(id) {
+/** Query for the status endpoint: an explicit refresh bypasses the 60 s
+    cache; a URL limits the refresh to one link (the popover retry). */
+function chatRefStatusQuery(opts) {
+  const params = [];
+  if (opts && opts.refresh) params.push("refresh=1");
+  if (opts && opts.url) params.push("url=" + encodeURIComponent(opts.url));
+  return params.length ? "?" + params.join("&") : "";
+}
+
+async function fetchChatRefStatuses(id, opts) {
   const st = state.sessionRefs;
   if (!st || st.id !== id || st.supported !== true) return;
   const wsId = state.workspace.id;
   try {
-    const res = await api("/api/sessions/" + encodeURIComponent(id) + "/refs/status");
+    const res = await api(
+      "/api/sessions/" + encodeURIComponent(id) + "/refs/status" + chatRefStatusQuery(opts),
+    );
     const text = await res.text();
     if (!res.ok) return;
     const data = text ? JSON.parse(text) : {};
     if (state.sessionRefs !== st || state.sessionId !== id || state.workspace.id !== wsId) return;
     if (data.supported === false) return;
-    st.statuses = data.statuses && typeof data.statuses === "object" ? data.statuses : {};
+    const next = data.statuses && typeof data.statuses === "object" ? data.statuses : {};
+    if (opts && opts.url) {
+      // A one-link retry updates the dot and the OPEN popover in place: no
+      // full chip rebuild (focus stays inside the popover) and no notice.
+      if (Object.prototype.hasOwnProperty.call(next, opts.url)) {
+        st.statuses[opts.url] = next[opts.url];
+        applyChatRefStatus(st, opts.url);
+      }
+      return;
+    }
+    st.statuses = next;
     renderChatRefs();
   } catch (_e) {
     // 状态是附加信息：读不到就没有小圆点，链接本身照常可用。
+  }
+}
+
+/* Rebuild one chip's dot and popover content from the current status map.
+   Used by the per-link retry so the open popover survives the update. */
+function applyChatRefStatus(st, url) {
+  const host = els.chatRefs;
+  if (!host) return;
+  const chip = [...host.querySelectorAll(".chat-ref-chip")]
+    .find((candidate) => candidate.getAttribute("data-ref-url") === url);
+  if (!chip) return;
+  const ref = (st.refs || []).find((candidate) => candidate.url === url);
+  if (!ref) return;
+  const status = st.statuses && st.statuses[url];
+  let dot = chip.querySelector(".chat-ref-dot");
+  if (status && status.state) {
+    if (!dot) {
+      dot = el("span", "chat-ref-dot");
+      dot.setAttribute("aria-hidden", "true");
+      chip.insertBefore(dot, chip.firstChild);
+    }
+    dot.className = "chat-ref-dot " + status.state;
+  } else if (dot) {
+    dot.remove();
+  }
+  const popover = chip.querySelector(".chat-ref-popover");
+  if (popover) appendChatRefPopoverContent(popover, ref, status, st);
+}
+
+/* Per-link retry: one uncached status observation, in place. */
+async function refreshChatRefStatus(ref) {
+  const st = state.sessionRefs;
+  if (!st || st.supported !== true || st.retrying) return;
+  st.retrying = ref.url;
+  applyChatRefStatus(st, ref.url);
+  try {
+    await fetchChatRefStatuses(st.id, { refresh: true, url: ref.url });
+  } finally {
+    if (state.sessionRefs === st) {
+      st.retrying = "";
+      applyChatRefStatus(st, ref.url);
+    }
+  }
+}
+
+/* Header refresh: all links, bypassing the cache, while the conversation
+   keeps working (the button just shows a busy label). */
+async function refreshAllChatRefStatuses() {
+  const st = state.sessionRefs;
+  if (!st || st.supported !== true || st.refreshing) return;
+  st.refreshing = true;
+  renderChatRefs();
+  try {
+    await fetchChatRefStatuses(st.id, { refresh: true });
+  } finally {
+    if (state.sessionRefs === st) {
+      st.refreshing = false;
+      renderChatRefs();
+    }
   }
 }
 
@@ -1053,9 +1134,195 @@ function clearChatRefs() {
   renderChatRefs();
 }
 
+/* One open popover at a time: opening another closes the previous one, and a
+   full chip re-render closes it before the DOM is replaced. */
+let activeChatRefPopover = null;
+
+function closeChatRefPopover() {
+  const active = activeChatRefPopover;
+  if (!active) return;
+  activeChatRefPopover = null;
+  if (active.timer) clearTimeout(active.timer);
+  active.root.hidden = true;
+}
+
+/* Only GitHub PR/issue URLs may derive extra pages. Anything else is
+   returned as null, and the popover stays "just the link". */
+function chatRefGithub(url) {
+  // A regexp (not `new URL`) keeps this usable in the gjs harness too; the
+  // stored identity is already a normalised absolute GitHub URL.
+  const match = /^https?:\/\/(?:www\.)?github\.com\/([^/?#]+)\/([^/?#]+)\/(pulls?|issues?)\/(\d+)(?:[/?#].*)?$/i
+    .exec(String(url || ""));
+  if (!match) return null;
+  const owner = match[1];
+  const repo = match[2];
+  const action = match[3].toLowerCase();
+  const number = match[4];
+  const pr = action === "pull" || action === "pulls";
+  return { owner, repo, number, pr, base: "https://github.com/" + owner + "/" + repo };
+}
+
+function chatRefShortSha(sha) {
+  const text = String(sha || "").trim();
+  return text ? text.slice(0, 7) : "";
+}
+
+/* The clickable destinations.
+   - known PR: PR, checks/actions, head commit (when the SHA is known),
+     review (files changed);
+   - known issue: just the issue;
+   - unknown / never observed: just the link;
+   - plain link: just the link. */
+function chatRefPopoverAnchors(ref, status) {
+  const anchors = [];
+  const push = (href, text) => {
+    const a = el("a", "chat-ref-popover-link", text);
+    a.setAttribute("href", href);
+    a.setAttribute("target", "_blank");
+    a.setAttribute("rel", "noopener noreferrer");
+    anchors.push(a);
+  };
+  const known = !!(status && status.state && status.state !== "unknown");
+  if (known) {
+    push(ref.url, ref.kind === "issue" ? "打开 Issue" : (ref.kind === "pr" ? "打开 PR" : "打开链接"));
+    if (ref.kind === "pr") {
+      const gh = chatRefGithub(ref.url);
+      if (gh) {
+        push(gh.base + "/actions", "Checks");
+        if (status.head) {
+          push(gh.base + "/commit/" + encodeURIComponent(status.head), "Head " + chatRefShortSha(status.head));
+        }
+        push(String(ref.url).replace(/\/+$/, "") + "/files", "Review");
+      }
+    }
+  } else {
+    push(ref.url, ref.label || ref.url);
+  }
+  return anchors;
+}
+
+function appendChatRefPopoverContent(popover, ref, status, st) {
+  popover.textContent = "";
+  const known = !!(status && status.state && status.state !== "unknown");
+  if (known) {
+    popover.append(el("span", "chat-ref-popover-label", ref.label || ref.url));
+    if (status.title) popover.append(el("span", "chat-ref-popover-title", status.title));
+    const line = status.state_line || status.detail || "";
+    if (line) popover.append(el("span", "chat-ref-popover-state", line));
+  }
+  const links = el("span", "chat-ref-popover-links");
+  links.append(...chatRefPopoverAnchors(ref, status));
+  // Manual observation is offered only for a PR/issue link: a plain link has
+  // no status to query. "重试" means a failed lookup; "查询状态" means this
+  // process never looked at it.
+  if (ref.kind === "pr" || ref.kind === "issue") {
+    const label = known ? "" : (status && status.state === "unknown" ? "重试" : "查询状态");
+    if (label) {
+      const retrying = !!(st && st.retrying === ref.url);
+      const action = el("button", "chat-ref-popover-action", retrying ? "查询中…" : label);
+      action.type = "button";
+      action.disabled = retrying;
+      action.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        refreshChatRefStatus(ref);
+      });
+      links.append(action);
+    }
+  }
+  popover.append(links);
+}
+
+function makeChatRefPopover(chip, ref) {
+  const popover = el("span", "chat-ref-popover");
+  popover.hidden = true;
+  popover.setAttribute("role", "dialog");
+  popover.setAttribute("aria-label", "链接详情 " + (ref.label || ref.url));
+  let timer = null;
+  const hide = () => {
+    if (timer) { clearTimeout(timer); timer = null; }
+    popover.hidden = true;
+    if (activeChatRefPopover && activeChatRefPopover.root === popover) activeChatRefPopover = null;
+  };
+  const show = () => {
+    if (activeChatRefPopover && activeChatRefPopover.root !== popover) closeChatRefPopover();
+    if (timer) { clearTimeout(timer); timer = null; }
+    popover.hidden = false;
+    activeChatRefPopover = { root: popover, timer: null };
+  };
+  const defer = () => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => {
+      timer = null;
+      if (activeChatRefPopover && activeChatRefPopover.root === popover) activeChatRefPopover.timer = null;
+      popover.hidden = true;
+      if (activeChatRefPopover && activeChatRefPopover.root === popover) activeChatRefPopover = null;
+    }, 200);
+    if (activeChatRefPopover && activeChatRefPopover.root === popover) {
+      activeChatRefPopover.timer = timer;
+    }
+  };
+  chip.addEventListener("mouseenter", show);
+  chip.addEventListener("mouseleave", defer);
+  // The popover is a descendant, so the chip's own mouseleave does not fire
+  // when the pointer travels into it; this cancels the grace if it does.
+  popover.addEventListener("mouseenter", show);
+  chip.addEventListener("focusin", show);
+  chip.addEventListener("focusout", (ev) => {
+    if (ev && ev.relatedTarget && chip.contains(ev.relatedTarget)) return;
+    hide();
+  });
+  chip.addEventListener("keydown", (ev) => {
+    if (!ev || ev.key !== "Escape") return;
+    if (ev.preventDefault) ev.preventDefault();
+    if (ev.stopPropagation) ev.stopPropagation();
+    hide();
+    const link = chip.querySelector(".chat-ref-link");
+    if (link && link.focus) link.focus();
+  });
+  return popover;
+}
+
+function buildChatRefChip(ref, st) {
+  const status = st.statuses && st.statuses[ref.url];
+  const kindClass = ref.kind === "issue" ? "issue" : (ref.kind === "link" ? "link" : "pr");
+  const chip = el("span", "chat-ref-chip " + kindClass);
+  chip.setAttribute("data-ref-url", ref.url);
+  // A dot is painted for every OBSERVED state, including `unknown` (muted):
+  // "looked and failed" is different from "never looked", which paints no
+  // dot at all. Plain links have no observation.
+  if (status && status.state) {
+    const dot = el("span", "chat-ref-dot " + status.state);
+    dot.setAttribute("aria-hidden", "true");
+    chip.append(dot);
+  }
+  // 本仓库的链接只印 `#27`（会话的 origin 已经说明是哪个仓库）；
+  // 别的仓库/主机仍用合格标签。完整身份在 popover 里，信息不丢。
+  const link = el("a", "chat-ref-link", ref.short || ref.label || ref.url);
+  link.setAttribute("href", ref.url);
+  link.setAttribute("target", "_blank");
+  link.setAttribute("rel", "noopener noreferrer");
+  link.setAttribute("aria-label", "打开 " + (ref.label || ref.url));
+  chip.append(link);
+  const popover = makeChatRefPopover(chip, ref);
+  appendChatRefPopoverContent(popover, ref, status, st);
+  chip.append(popover);
+  const remove = el("button", "chat-ref-remove", "×");
+  remove.type = "button";
+  remove.title = "移除链接 " + (ref.label || ref.url);
+  remove.addEventListener("click", (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    removeChatRef(ref);
+  });
+  chip.append(remove);
+  return chip;
+}
+
 function renderChatRefs() {
   const host = els.chatRefs;
   if (!host) return;
+  closeChatRefPopover();
   const st = state.sessionRefs;
   host.innerHTML = "";
   if (!st || !state.sessionId || st.id !== state.sessionId || st.supported !== true) {
@@ -1063,38 +1330,7 @@ function renderChatRefs() {
     return;
   }
   host.hidden = false;
-  for (const ref of st.refs) {
-    const kindClass = ref.kind === "issue" ? "issue" : (ref.kind === "link" ? "link" : "pr");
-    const chip = el("span", "chat-ref-chip " + kindClass);
-    const status = st.statuses && st.statuses[ref.url];
-    // 简单视图只多一个小圆点：颜色即状态。unknown 和「没有状态」（普通链接、
-    // JSONL）都不画点 —— chip 上永远不出现占位词。
-    if (status && status.state && status.state !== "unknown") {
-      const dot = el("span", "chat-ref-dot " + status.state);
-      dot.setAttribute("aria-hidden", "true");
-      chip.append(dot);
-    }
-    // 本仓库的链接只印 `#27`（会话的 origin 已经说明是哪个仓库）；
-    // 别的仓库/主机仍用合格标签。tooltip 永远带完整身份，信息不丢。
-    const link = el("a", "chat-ref-link", ref.short || ref.label || ref.url);
-    link.href = ref.url;
-    link.target = "_blank";
-    link.rel = "noreferrer";
-    link.title = ref.label && status && status.detail
-      ? ref.label + " · " + status.detail
-      : (ref.label || ref.url);
-    chip.append(link);
-    const remove = el("button", "chat-ref-remove", "×");
-    remove.type = "button";
-    remove.title = "移除链接 " + (ref.label || ref.url);
-    remove.addEventListener("click", (ev) => {
-      ev.preventDefault();
-      ev.stopPropagation();
-      removeChatRef(ref);
-    });
-    chip.append(remove);
-    host.append(chip);
-  }
+  for (const ref of st.refs) host.append(buildChatRefChip(ref, st));
   const add = el("button", "chat-ref-add", st.editorOpen ? "关闭" : "+ 链接");
   add.type = "button";
   add.title = "添加 PR / issue / 普通链接";
@@ -1106,6 +1342,13 @@ function renderChatRefs() {
     if (input) input.focus();
   });
   host.append(add);
+  const refresh = el("button", "chat-ref-refresh", st.refreshing ? "刷新中…" : "↻");
+  refresh.type = "button";
+  refresh.title = "刷新全部链接状态";
+  refresh.setAttribute("aria-label", "刷新全部链接状态");
+  refresh.disabled = !!st.refreshing;
+  refresh.addEventListener("click", () => refreshAllChatRefStatuses());
+  host.append(refresh);
   if (st.editorOpen) {
     host.append(buildChatRefEditor(st));
     const details = buildChatRefDetails(st);
@@ -1120,8 +1363,12 @@ function buildChatRefDetails(st) {
   for (const ref of st.refs) {
     const status = st.statuses && st.statuses[ref.url];
     if (!status || !status.detail) continue;
-    const line = el("span", "chat-ref-detail", (ref.label || ref.url) + " · " + status.detail);
-    line.title = ref.url;
+    // The expanded detail row is a real link, not a title tooltip: the
+    // owner asked for the detail view's links to be clickable.
+    const line = el("a", "chat-ref-detail", (ref.label || ref.url) + " · " + status.detail);
+    line.setAttribute("href", ref.url);
+    line.setAttribute("target", "_blank");
+    line.setAttribute("rel", "noopener noreferrer");
     lines.push(line);
   }
   if (!lines.length) return null;

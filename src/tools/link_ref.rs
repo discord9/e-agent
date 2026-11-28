@@ -93,7 +93,10 @@ impl Tool for LinkRef {
              host must pass a full `url`, which replaces `kind` + `number` and skips repository \
              resolution. `kind: \"link\"` records a plain non-PR/issue URL and requires `url`. \
              Returns the session's current links: {\"prs\": [{\"label\": \"owner/repo#25\", \
-             \"url\": \"https://github.com/owner/repo/pull/25\"}], \"issues\": [...], \"links\": [...]}.",
+             \"url\": \"https://github.com/owner/repo/pull/25\", \"status\": \"ready\"}], \
+             \"issues\": [...], \"links\": [...]}. `status` appears only when this process already \
+             has a cached observation; a cache miss omits it (no fetch is made), and a failed \
+             observation is \"unknown\".",
         )
     }
 
@@ -109,11 +112,15 @@ impl Tool for UnlinkRef {
             "unlink_ref",
             "Remove one pull-request or issue link from this session. Takes the same selectors \
              as `link_ref`: `kind` + `number` (resolved against this workspace's git `origin` \
-             when it is a github.com remote, or against `repo`) or a full `url` — pass the URL \
-             `list_refs` returned, which is the exact stored identity (with `kind: \"link\"` \
-             for a plain link). Removing something that is not linked is an error naming it. \
+             when it is a github.com remote, or against `repo`) or a full `url`. The URL ALONE \
+             is the stored identity, so pass the `url` `list_refs` returned and no `kind` is \
+             needed — one URL is one link whatever kind it was added as. Removing something \
+             that is not linked is an error naming it. \
              Returns the session's current links: {\"prs\": [{\"label\": \"owner/repo#25\", \
-             \"url\": \"https://github.com/owner/repo/pull/25\"}], \"issues\": [...], \"links\": [...]}.",
+             \"url\": \"https://github.com/owner/repo/pull/25\", \"status\": \"ready\"}], \
+             \"issues\": [...], \"links\": [...]}. `status` appears only when this process already \
+             has a cached observation; a cache miss omits it (no fetch is made), and a failed \
+             observation is \"unknown\".",
         )
     }
 
@@ -132,8 +139,10 @@ impl Tool for ListRefs {
                           the display `label` AND the `url` — take the `url` from here and pass \
                           it to `unlink_ref` verbatim, because two links can share a label \
                           (`example.org/search?q=a` vs `?q=b`). The result is {\"prs\": \
-                          [{\"label\": \"owner/repo#25\", \"url\": \"https://github.com/owner/repo/pull/25\"}], \
-                          \"issues\": [...], \"links\": [...]}."
+                          [{\"label\": \"owner/repo#25\", \"url\": \"https://github.com/owner/repo/pull/25\", \
+                          \"status\": \"ready\"}], \"issues\": [...], \"links\": [...]}. \
+                          `status` appears only when this process already has a cached observation; \
+                          a cache miss omits it (no fetch is made), and a failed observation is \"unknown\"."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -166,8 +175,6 @@ enum Selector {
 struct Resolved {
     kind: &'static str,
     url: String,
-    /// How an absent link is named in an `unlink_ref` error.
-    display: String,
 }
 
 /// Execute one of the three tools with the runner-bound session context.
@@ -212,36 +219,39 @@ pub(crate) async fn execute(
         .as_object()
         .ok_or_else(|| format!("{tool} arguments must be a JSON object"))?;
     let selector = parse_selector(tool, object)?;
-    let resolved = resolve_selector(workspace, selector).await?;
     if tool == "unlink_ref" {
+        // The URL ALONE is the stored identity, so an unlink neither infers
+        // nor needs the kind: the stored row carries it, and that stored kind
+        // — not a guess from the path — is what the cache is cleared by.
+        let removal = resolve_removal(workspace, selector).await?;
         let refs = store
             .list_refs(root, session)
             .await
             .map_err(|e| format!("{e:#}"))?;
-        if !refs
-            .iter()
-            .any(|link| link.kind == resolved.kind && link.url == resolved.url)
-        {
-            let what = match resolved.kind {
-                "pr" => "PR",
-                "issue" => "Issue",
-                _ => "Link",
-            };
-            return Err(format!("{what} {} is not linked", resolved.display));
-        }
-        return Ok(render(
-            store
-                .remove_ref(root, session, resolved.kind, &resolved.url)
-                .await
-                .map_err(|e| format!("{e:#}"))?,
-        ));
-    }
-    Ok(render(
-        store
-            .add_ref(root, session, resolved.kind, &resolved.url)
+        let Some(stored) = refs.iter().find(|link| link.url == removal.url) else {
+            return Err(format!(
+                "{} {} is not linked",
+                kind_word(removal.kind),
+                removal.display
+            ));
+        };
+        let kind = stored.kind.clone();
+        let refs = store
+            .remove_ref(root, session, &removal.url)
             .await
-            .map_err(|e| format!("{e:#}"))?,
-    ))
+            .map_err(|e| format!("{e:#}"))?;
+        crate::link_status::forget(&kind, &removal.url);
+        return Ok(render(refs));
+    }
+    let resolved = resolve_selector(workspace, selector).await?;
+    let refs = store
+        .add_ref(root, session, resolved.kind, &resolved.url)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    // One observation right away, off the tool's critical path. A warm cache
+    // is a no-op; the result also becomes the watcher's silent baseline.
+    crate::link_status::prewarm(resolved.kind, &resolved.url);
+    Ok(render(refs))
 }
 
 fn parse_selector(tool: &str, object: &Map<String, Value>) -> Result<Selector, String> {
@@ -311,9 +321,36 @@ async fn resolve_selector(
                     )
                 })?,
             };
-            Ok(Resolved {
+            Ok(Resolved { kind, url })
+        }
+        Selector::Number { kind, number, repo } => {
+            let url = resolve_number(workspace, kind, number, repo.as_deref()).await?;
+            Ok(Resolved { kind, url })
+        }
+    }
+}
+
+/// One `unlink_ref` target: the URL is the whole identity, so the kind here
+/// is only what the selector claimed — used for the "not linked" wording, and
+/// never for the delete or the cache key.
+struct Removal {
+    url: String,
+    kind: Option<&'static str>,
+    /// How an absent link is named in an `unlink_ref` error.
+    display: String,
+}
+
+/// Resolve a removal selector. Unlike an add, a URL with no `kind` is not
+/// refused when its path is not a recognised PR/issue shape: the stored row
+/// already says what it is, and the URL alone is what an unlink names.
+async fn resolve_removal(workspace: Option<&Path>, selector: Selector) -> Result<Removal, String> {
+    match selector {
+        Selector::Url { url, kind } => {
+            let url = parse_ref_url(&url)?.to_string();
+            let kind = kind.or_else(|| ref_kind_from_url(&url));
+            Ok(Removal {
+                display: session_ref_label_for_kind(kind.unwrap_or("link"), &url),
                 kind,
-                display: session_ref_label_for_kind(kind, &url),
                 url,
             })
         }
@@ -323,8 +360,21 @@ async fn resolve_selector(
                 Some(repo) => format!("{repo}#{number}"),
                 None => number.to_string(),
             };
-            Ok(Resolved { kind, url, display })
+            Ok(Removal {
+                url,
+                kind: Some(kind),
+                display,
+            })
         }
+    }
+}
+
+/// The word an `unlink_ref` error uses for a link kind.
+fn kind_word(kind: Option<&str>) -> &'static str {
+    match kind {
+        Some("pr") => "PR",
+        Some("issue") => "Issue",
+        _ => "Link",
     }
 }
 
@@ -339,7 +389,14 @@ fn render(refs: Vec<SessionRef>) -> String {
     let mut issues = Vec::new();
     let mut links = Vec::new();
     for link in refs {
-        let entry = json!({ "label": link.label, "url": link.url });
+        // The cache is consulted, never filled: `status` is present only when
+        // this process already observed the link, and carries `unknown` when
+        // that observation failed. A cold cache omits the field entirely —
+        // "we did not look" is not the same claim as "we looked and failed".
+        let mut entry = json!({ "label": link.label, "url": link.url });
+        if let Some(status) = crate::link_status::cached_state(&link.kind, &link.url) {
+            entry["status"] = json!(status);
+        }
         match link.kind.as_str() {
             "pr" => prs.push(entry),
             "issue" => issues.push(entry),
@@ -1164,5 +1221,115 @@ mod tool_tests {
         ] {
             assert!(parse(invalid.clone()).is_err(), "{invalid}");
         }
+    }
+    /// The tool's status field is a CACHE READ, never a fetch. A cold cache
+    /// omits the field (no gh at all); a cached failure is `unknown`; a warm
+    /// token is the token. The shared `render` is used by all three verbs.
+    /// Adding a link asks for exactly one immediate status observation. The
+    /// test-only prewarm recorder proves the call happens once; the actual
+    /// one-fetch/warm-skip behavior lives in `link_status`'s seam test.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn adding_a_link_requests_exactly_one_immediate_observation() {
+        let store = in_memory_store().await;
+        let root = std::path::Path::new("/not-a-repo");
+        let url = "https://github.com/prewarm-call/widget/pull/303";
+        let before = crate::link_status::take_prewarm_urls_for_test();
+        let listed = execute(
+            "link_ref",
+            &store,
+            root,
+            None,
+            "s",
+            &json!({ "kind": "pr", "url": url }),
+        )
+        .await
+        .unwrap();
+        let after = crate::link_status::take_prewarm_urls_for_test();
+        let observation = format!("pr {url}");
+        assert_eq!(
+            after
+                .iter()
+                .filter(|recorded| *recorded == &observation)
+                .count(),
+            1,
+            "adding one link must request one observation, not zero or two: before={before:?} after={after:?}"
+        );
+        assert!(listed.contains(&format!("\"url\":\"{url}\"")));
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn link_views_only_report_an_existing_cached_observation() {
+        let store = in_memory_store().await;
+        let root = std::path::Path::new("/not-a-repo");
+        let ready = "https://github.com/status-probe/widget/pull/301";
+        let failed = "https://github.com/status-probe/widget/pull/302";
+        let plain = "https://example.com/status-probe/docs";
+        for (kind, url) in [("pr", ready), ("pr", failed), ("link", plain)] {
+            execute(
+                "link_ref",
+                &store,
+                root,
+                None,
+                "s",
+                &json!({ "kind": kind, "url": url }),
+            )
+            .await
+            .unwrap();
+        }
+        // Cold cache: no `status` key, and the tripwire proves no gh call.
+        let cold = {
+            let _no_gh = crate::link_status::NoGhGuard::arm();
+            execute("list_refs", &store, root, None, "s", &json!({}))
+                .await
+                .unwrap()
+        };
+        let cold: Value = serde_json::from_str(&cold).unwrap();
+        for entry in cold["prs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(cold["links"].as_array().unwrap())
+        {
+            assert!(
+                entry.get("status").is_none(),
+                "a cold cache must omit status entirely: {entry}"
+            );
+        }
+
+        // Warm observations: one token, one failed lookup.
+        crate::link_status::seed_for_test(
+            "pr",
+            ready,
+            crate::link_status::status_for_test(crate::link_status::READY, None, Vec::new(), None),
+        );
+        crate::link_status::seed_for_test("pr", failed, crate::link_status::LinkStatus::unknown());
+        let warm = execute("list_refs", &store, root, None, "s", &json!({}))
+            .await
+            .unwrap();
+        let warm: Value = serde_json::from_str(&warm).unwrap();
+        let find = |value: &Value, url: &str| {
+            value["prs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["url"] == url)
+                .and_then(|entry| entry.get("status"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        };
+        assert_eq!(find(&warm, ready).as_deref(), Some("ready"));
+        assert_eq!(find(&warm, failed).as_deref(), Some("unknown"));
+        assert!(
+            warm["links"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|entry| entry.get("status").is_none()),
+            "a plain link has no status"
+        );
+        crate::link_status::forget("pr", ready);
+        crate::link_status::forget("pr", failed);
     }
 }
