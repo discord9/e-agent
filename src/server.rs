@@ -622,6 +622,11 @@ fn status_string(status: &SessionStatus) -> &'static str {
 /// a client can answer them through `POST /api/sessions/{id}/prompt` with the
 /// corresponding `call_id`. The `WaitingInput` fields keep their existing
 /// shape (that is the blocking request, not an asynchronous one).
+///
+/// Both shapes carry the question's PUBLIC `call_id` verbatim, and that is the
+/// ONLY id an answer may name: for a `request_user_input` call it is the same
+/// digest its `ToolCall` / `ToolResult` events carry, so a frame and a call
+/// pair up. A provider wire id is never published here.
 fn status_json(
     status: &SessionStatus,
     pending_questions: &[UserInputRequest],

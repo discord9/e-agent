@@ -516,6 +516,90 @@ async fn discovery_failure_keeps_the_consumer_literal_and_the_turn_succeeds() {
     assert_eq!(requests[1].2["project"], PROJECT);
 }
 
+/// A TRANSIENT discovery failure is not a definitive answer, so it is never
+/// cached: a 503 leaves the shared cell unset, and the retry after a 401
+/// refresh discovers again — even though discovery has recovered — instead of
+/// reusing the fallback for this login.
+#[tokio::test]
+async fn transient_discovery_failure_is_rediscovered_after_a_bearer_refresh() {
+    let dir = tempfile::tempdir().unwrap();
+    // Its own refresh credential: the project cell is process-wide and keyed
+    // by (endpoint, login), so an unrelated discovery test must not share it.
+    let token_file = write_agy_token(
+        dir.path(),
+        "stale-token",
+        Utc::now() + ChronoDuration::hours(1),
+        "refresh-token-transient",
+    );
+    let body = sse_body(&[text_element("ok")]);
+    // Five requests: discovery 503 -> generation 401 -> refresh -> discovery
+    // (recovered) -> generation.
+    let fake = spawn_fake(5, move |index, path| {
+        if path.contains("loadCodeAssist") {
+            if index == 0 {
+                (503, json!({"error": {"code": 503}}).to_string())
+            } else {
+                (
+                    200,
+                    json!({"cloudaicompanionProject": "gcp-project-42"}).to_string(),
+                )
+            }
+        } else if path == "/token" {
+            (
+                200,
+                json!({"access_token": "fresh-token", "expires_in": 3599}).to_string(),
+            )
+        } else if index == 1 {
+            (
+                401,
+                json!([{"error": {"code": 401, "status": "UNAUTHENTICATED"}}]).to_string(),
+            )
+        } else {
+            (200, body.clone())
+        }
+    })
+    .await;
+    let mut model = model_for(&fake, token_file, dir.path().join("cache/token.json"));
+    model.load_assist_url = format!("http://{}/v1internal:loadCodeAssist", fake.address);
+    let (assistant, _) = model
+        .complete(
+            &[Message::User {
+                content: "say ok".into(),
+                images: Vec::new(),
+            }],
+            &[],
+            None,
+        )
+        .await
+        .expect("a failed discovery and one 401 do not fail the turn");
+    assert_eq!(assistant.content.as_deref(), Some("ok"));
+    let requests = fake.requests();
+    assert_eq!(
+        requests.len(),
+        5,
+        "discovery, generation, refresh, rediscovery, generation"
+    );
+    assert_eq!(requests[0].0, "/v1internal:loadCodeAssist");
+    assert_eq!(
+        requests[1].2["project"], PROJECT,
+        "the failed discovery falls back for THIS request only"
+    );
+    assert_eq!(requests[2].0, "/token");
+    // The 503 was not cached: the post-refresh call asks again, with the
+    // refreshed bearer...
+    assert_eq!(requests[3].0, "/v1internal:loadCodeAssist");
+    assert!(
+        requests[3]
+            .1
+            .to_ascii_lowercase()
+            .contains("authorization: bearer fresh-token"),
+        "the rediscovery spends the refreshed token: {}",
+        requests[3].1
+    );
+    // ...and the retried generation carries the REAL project.
+    assert_eq!(requests[4].2["project"], "gcp-project-42");
+}
+
 /// The project is looked up ONCE per model instance: two turns make one
 /// discovery POST, and both bodies carry the discovered id.
 #[tokio::test]

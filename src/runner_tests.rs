@@ -542,7 +542,7 @@ async fn request_user_input_waits_answers_and_resumes_same_turn() {
         }
     }
     assert!(matches!(
-        handle.submit_prompt_with_call_id(Some("call-input".into()), "Ada".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("call-input")), "Ada".into()),
         PromptSubmission::Answered
     ));
     assert_eq!(
@@ -701,6 +701,112 @@ fn ask_tool_agent(answer: Arc<Mutex<Option<Option<String>>>>) -> Agent {
             answer,
         })],
     )
+}
+
+/// The question status and the call's events name ONE public id.
+///
+/// A provider wire id (Antigravity's `call_AG_wire_1`, the same shape an ACP
+/// transcript carries) is private replay data: the `WaitingInput` /
+/// `pending_questions` frame advertises the SAME digest the call's `ToolCall` /
+/// `ToolResult` events carry, that digest is what routes an answer, and the
+/// persisted transcript keeps the wire id.
+#[tokio::test]
+async fn question_status_and_events_share_one_public_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let wire = "call_AG_wire_1";
+    let agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: VecDeque::from(vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: wire.into(),
+                        name: "request_user_input".into(),
+                        arguments: r#"{"questions":[{"id":"name","prompt":"Your name?"}]}"#.into(),
+                        provider_meta: Some("sig".into()),
+                    }],
+                    reasoning: None,
+                },
+                assistant_reply("hello Ada"),
+            ]),
+        }),
+        vec![
+            Box::new(crate::tools::user_input::RequestUserInput),
+            Box::new(KeepAliveTool { sender: None }),
+        ],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "public-question-id".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let runner = runner.with_user_input_allowed();
+    let (_, mut events, mut status) = handle.attach();
+    let task = runner.start(Some("start".into()));
+
+    let request = wait_for_question(&mut status).await;
+    let public = question_id(wire);
+    assert_eq!(
+        request.call_id, public,
+        "the frame names the call's public projection"
+    );
+    // Both status shapes serialize exactly this field (`WaitingInput.call_id`
+    // as itself, `pending_questions[].call_id` through the struct), so the
+    // wire payload cannot disagree with the event below.
+    assert_eq!(
+        serde_json::to_value(&request).unwrap()["call_id"],
+        serde_json::json!(public)
+    );
+    assert!(
+        !serde_json::to_string(&request).unwrap().contains(wire),
+        "the provider wire id never reaches a status frame: {:?}",
+        serde_json::to_string(&request).unwrap()
+    );
+    assert!(
+        handle.snapshot().iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolCall { name, call_id: Some(call_id), .. }
+                if name == "request_user_input" && call_id == &public
+        )),
+        "the tool event carries the same digest: {:?}",
+        handle.snapshot()
+    );
+
+    // The wire id is not an answer key; the public digest is.
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some(wire.into()), "Ada".into()),
+        PromptSubmission::Conflict,
+        "answering by the provider wire id must not claim the question"
+    );
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some(public.clone()), "Ada".into()),
+        PromptSubmission::Answered
+    );
+    wait_for_tool_result(&mut events, wire).await;
+    wait_for_log_event(
+        &handle,
+        |event| matches!(event, AgentEvent::AssistantText(text) if text == "hello Ada"),
+    )
+    .await;
+    drop(task);
+
+    // The transcript is the one place the wire id survives.
+    let entries = SessionStore::Jsonl
+        .load(temp.path(), "public-question-id")
+        .await
+        .unwrap()
+        .entries;
+    match tool_entries(&entries)[0] {
+        Message::Tool {
+            call_id, content, ..
+        } => {
+            assert_eq!(call_id, wire, "the persisted row keeps the wire id");
+            assert!(content.contains("Ada"), "{content}");
+        }
+        other => panic!("expected the tool result, got {other:?}"),
+    }
 }
 
 /// A tool's mid-call question parks the turn through the SAME frontend as
@@ -1034,22 +1140,22 @@ async fn blocking_option_question_answer_reaches_the_model_with_id_and_label() {
     .await;
     match waiting {
         SessionStatus::WaitingInput(request) => {
-            assert_eq!(request.call_id, "call-opt");
+            assert_eq!(request.call_id, question_id("call-opt"));
             assert_eq!(request.questions[0].options.len(), 2);
         }
         other => panic!("expected WaitingInput, got {other:?}"),
     }
     assert!(matches!(
-        handle.submit_prompt_with_call_id(Some("call-opt".into()), "allow".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("call-opt")), "allow".into()),
         PromptSubmission::Invalid(error) if error.contains("allow-once") && error.contains("deny")
     ));
     assert!(
-        matches!(&*status.borrow(), SessionStatus::WaitingInput(request) if request.call_id == "call-opt"),
+        matches!(&*status.borrow(), SessionStatus::WaitingInput(request) if request.call_id == question_id("call-opt")),
         "a rejected id leaves the turn parked: {:?}",
         *status.borrow()
     );
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("call-opt".into()), "deny".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("call-opt")), "deny".into()),
         PromptSubmission::Answered
     );
     wait_for_log_event(
@@ -1346,7 +1452,7 @@ async fn request_user_input_without_a_frontend_errors_and_never_waits() {
     // No WaitingInput claim was ever registered for that call id, so an
     // "answer" is rejected instead of being consumed by a parked turn.
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("call-input".into()), "Ada".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("call-input")), "Ada".into()),
         PromptSubmission::Conflict
     );
     let entries = SessionStore::Jsonl
@@ -1510,7 +1616,7 @@ async fn web_attach_while_waiting_input_returns_before_answer() {
     assert!(matches!(attach.status, SessionStatus::WaitingInput(_)));
     assert!(attach.entries.iter().any(|entry| matches!(entry, SessionEntry::Message { message: Message::User { content, .. } } if content == "start")));
     assert!(matches!(
-        handle.submit_prompt_with_call_id(Some("call-input".into()), "Ada".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("call-input")), "Ada".into()),
         PromptSubmission::Answered
     ));
     drop(task);
@@ -1539,7 +1645,7 @@ async fn request_user_input_twice_rejects_stale_first_call_id() {
     let mut status = handle.status();
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
-            if matches!(&*status.borrow(), SessionStatus::WaitingInput(request) if request.call_id == "call-a") {
+            if matches!(&*status.borrow(), SessionStatus::WaitingInput(request) if request.call_id == question_id("call-a")) {
                 break;
             }
             status.changed().await.unwrap();
@@ -1548,12 +1654,12 @@ async fn request_user_input_twice_rejects_stale_first_call_id() {
     .await
     .unwrap();
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("call-a".into()), "answer-a".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("call-a")), "answer-a".into()),
         PromptSubmission::Answered
     );
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
-            if matches!(&*status.borrow(), SessionStatus::WaitingInput(request) if request.call_id == "call-b") {
+            if matches!(&*status.borrow(), SessionStatus::WaitingInput(request) if request.call_id == question_id("call-b")) {
                 break;
             }
             status.changed().await.unwrap();
@@ -1562,15 +1668,15 @@ async fn request_user_input_twice_rejects_stale_first_call_id() {
     .await
     .unwrap();
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("call-a".into()), "stale-answer".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("call-a")), "stale-answer".into()),
         PromptSubmission::Conflict
     );
     assert!(matches!(
         &*status.borrow(),
-        SessionStatus::WaitingInput(request) if request.call_id == "call-b"
+        SessionStatus::WaitingInput(request) if request.call_id == question_id("call-b")
     ));
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("call-b".into()), "answer-b".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("call-b")), "answer-b".into()),
         PromptSubmission::Answered
     );
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -1662,7 +1768,7 @@ async fn request_user_input_answer_claim_wins_then_cancel_commits_once() {
         status.changed().await.unwrap();
     }
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("call-input".into()), "Ada".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("call-input")), "Ada".into()),
         PromptSubmission::Answered
     );
     handle.cancel();
@@ -1712,7 +1818,7 @@ async fn request_user_input_cancel_claim_wins_then_answer_conflicts() {
     }
     handle.cancel();
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("call-input".into()), "late".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("call-input")), "late".into()),
         PromptSubmission::Conflict
     );
     loop {
@@ -1773,7 +1879,7 @@ async fn request_user_input_cancel_discards_goal_continue_until_fresh_continue()
     handle.continue_goal(None);
     handle.cancel();
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("goal-input".into()), "late".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("goal-input")), "late".into()),
         PromptSubmission::Conflict
     );
     wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)).await;
@@ -1857,6 +1963,14 @@ fn async_receipt(call_id: &str) -> String {
 fn answer_notice(call_id: &str, prompt: &str, answer: &str) -> String {
     let call_id = crate::agent::public_call_id(call_id);
     format!("[question {call_id}]\nQuestion: {prompt}\n[answer]\n{answer}")
+}
+
+/// The PUBLIC id a `request_user_input` question is published and answered
+/// under: the wire call's projected digest, NOT the provider's wire id (that
+/// one stays in the persisted transcript). Written as a call, never as a
+/// literal, so a test cannot quietly keep answering by the wire id.
+fn question_id(wire_id: &str) -> String {
+    crate::agent::public_call_id(wire_id)
 }
 
 fn async_question_call(call_id: &str, question_id: &str, prompt: &str) -> AssistantMessage {
@@ -1975,7 +2089,7 @@ async fn async_request_user_input_receipts_and_keeps_the_turn_going() {
     assert_eq!(
         handle.pending_questions(),
         vec![UserInputRequest {
-            call_id: "call-async".into(),
+            call_id: question_id("call-async"),
             questions: vec![UserQuestion {
                 id: "name".into(),
                 prompt: "Your name?".into(),
@@ -2044,11 +2158,11 @@ async fn async_answer_while_the_turn_runs_lands_in_the_next_request() {
     // The turn is in flight (its tool batch is executing) when the answer
     // arrives, so this is the running-session path, not an idle new turn.
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("call-async".into()), "Ada".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("call-async")), "Ada".into()),
         PromptSubmission::Answered
     );
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("call-async".into()), "Ada".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("call-async")), "Ada".into()),
         PromptSubmission::Conflict
     );
     release.notify_one();
@@ -2136,7 +2250,7 @@ async fn async_answer_while_idle_opens_a_turn_with_the_notice() {
     wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)).await;
     assert_eq!(handle.pending_questions().len(), 1);
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("call-async".into()), "Ada".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("call-async")), "Ada".into()),
         PromptSubmission::Answered
     );
     // The start turn already used two provider calls (question + final
@@ -2154,7 +2268,7 @@ async fn async_answer_while_idle_opens_a_turn_with_the_notice() {
     );
     // The claim is one-shot: answering twice cannot commit a second Notice.
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("call-async".into()), "Ada".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("call-async")), "Ada".into()),
         PromptSubmission::Conflict
     );
     wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)).await;
@@ -2204,20 +2318,24 @@ async fn async_answers_arrive_out_of_order_without_cross_talk() {
     )
     .await;
     wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)).await;
+    // The frame is ordered by the published id, which is now a digest: the
+    // pair is what matters, not the wire ids' own ordering.
+    let mut expected = vec![question_id("call-a"), question_id("call-b")];
+    expected.sort();
     assert_eq!(
         handle
             .pending_questions()
             .iter()
-            .map(|request| request.call_id.as_str())
+            .map(|request| request.call_id.clone())
             .collect::<Vec<_>>(),
-        vec!["call-a", "call-b"]
+        expected
     );
     // Out of order: the second question is answered first. Each answer
     // commits its own Notice (the durable event is the sync point).
     let notice_b = answer_notice("call-b", "question b", "answer-b");
     let notice_a = answer_notice("call-a", "question a", "answer-a");
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("call-b".into()), "answer-b".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("call-b")), "answer-b".into()),
         PromptSubmission::Answered
     );
     wait_for_log_event(
@@ -2226,7 +2344,7 @@ async fn async_answers_arrive_out_of_order_without_cross_talk() {
     )
     .await;
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("call-a".into()), "answer-a".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("call-a")), "answer-a".into()),
         PromptSubmission::Answered
     );
     wait_for_log_event(
@@ -2293,7 +2411,7 @@ async fn async_answer_requires_the_open_call_id_and_commits_once() {
         PromptSubmission::Conflict
     );
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("call-async".into()), "  ".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("call-async")), "  ".into()),
         PromptSubmission::Conflict,
         "an empty answer leaves the question answerable"
     );
@@ -2304,11 +2422,11 @@ async fn async_answer_requires_the_open_call_id_and_commits_once() {
         "an absent call id is never an asynchronous answer"
     );
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("call-async".into()), "Ada".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("call-async")), "Ada".into()),
         PromptSubmission::Answered
     );
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("call-async".into()), "Ada".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("call-async")), "Ada".into()),
         PromptSubmission::Conflict
     );
     wait_for_log_event(&handle, |event| {
@@ -2379,7 +2497,7 @@ async fn async_request_user_input_without_a_frontend_registers_nothing() {
         "no frontend may register a question nobody can answer"
     );
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("call-async".into()), "Ada".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("call-async")), "Ada".into()),
         PromptSubmission::Conflict
     );
     wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)).await;
@@ -2460,7 +2578,7 @@ async fn async_questions_are_memory_only_across_restart() {
     );
     assert!(resumed.pending_questions().is_empty());
     assert_eq!(
-        resumed.submit_prompt_with_call_id(Some("call-async".into()), "Ada".into()),
+        resumed.submit_prompt_with_call_id(Some(question_id("call-async")), "Ada".into()),
         PromptSubmission::Conflict
     );
 }
@@ -2555,7 +2673,7 @@ async fn async_answer_during_requested_compaction_lands_in_the_next_request() {
     let task = runner.start(Some("start".into()));
     entered.notified().await;
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("ask1".into()), "A".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("ask1")), "A".into()),
         PromptSubmission::Answered
     );
     release.notify_one();
@@ -15114,7 +15232,7 @@ async fn exhausted_goal_input_answer_continues(usage: Option<Usage>, session: &s
     })
     .await;
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("input".into()), "yes".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("input")), "yes".into()),
         PromptSubmission::Answered
     );
     wait_for_log_event(
@@ -15401,7 +15519,7 @@ async fn oracle677_answer_requested_compaction_is_budget_exempt() {
     })
     .await;
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("input".into()), "yes".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("input")), "yes".into()),
         PromptSubmission::Answered
     );
     wait_for_log_event(
@@ -15524,7 +15642,7 @@ async fn oracle677_answer_manual_compact_preserves_resume_after_cap() {
     .await;
     handle.compact();
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("input".into()), "yes".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("input")), "yes".into()),
         PromptSubmission::Answered
     );
     wait_for_log_event(&handle, |event| matches!(event, AgentEvent::AssistantText(text) if text == "answer processed after manual")).await;
@@ -15621,7 +15739,7 @@ async fn oracle677_answer_manual_compact_missing_usage_preserves_resume() {
     .unwrap();
     handle.compact();
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("input".into()), "yes".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("input")), "yes".into()),
         PromptSubmission::Answered
     );
     tokio::time::timeout(std::time::Duration::from_secs(2), wait_for_log_event(&handle, |event| matches!(event, AgentEvent::AssistantText(text) if text == "answer after missing manual"))).await.unwrap_or_else(|_| panic!("status={:?} events={:?}", *status.borrow(), handle.snapshot()));
@@ -15715,7 +15833,7 @@ async fn oracle677_answer_auto_compaction_is_budget_exempt() {
     })
     .await;
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("input".into()), "yes".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("input")), "yes".into()),
         PromptSubmission::Answered
     );
     wait_for_log_event(&handle, |event| matches!(event, AgentEvent::Display(text) if text == "compacted: auto answer summary")).await;
@@ -15810,7 +15928,7 @@ async fn oracle677_answer_queued_goal_mutation_keeps_resume(
     .unwrap();
     assert!(handle.goal_command(GoalCommand::Action(action)));
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("input".into()), "yes".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("input")), "yes".into()),
         PromptSubmission::Answered
     );
     tokio::time::timeout(std::time::Duration::from_secs(2), wait_for_log_event(&handle, |event| matches!(event, AgentEvent::AssistantText(text) if text == "answer after mutation"))).await.unwrap();
@@ -15912,7 +16030,7 @@ async fn oracle677_answer_update_goal_sibling_keeps_resume() {
     .await
     .unwrap();
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("input".into()), "yes".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("input")), "yes".into()),
         PromptSubmission::Answered
     );
     tokio::time::timeout(std::time::Duration::from_secs(2), wait_for_log_event(&handle, |event| matches!(event, AgentEvent::AssistantText(text) if text == "answer after tool pause"))).await.unwrap();
@@ -16238,7 +16356,7 @@ async fn oracle677_positive_answer_compaction_keeps_goal_budget(
     .await
     .unwrap();
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("input".into()), "yes".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("input")), "yes".into()),
         PromptSubmission::Answered
     );
     tokio::time::timeout(std::time::Duration::from_secs(2), normal_entered.notified())
@@ -16358,7 +16476,7 @@ async fn oracle718_answer_pause_compact_resume_does_not_rearm_driver() {
     handle.compact();
     assert!(handle.goal_command(GoalCommand::Action(crate::agent::GoalAction::Resume)));
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("input".into()), "yes".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("input")), "yes".into()),
         PromptSubmission::Answered
     );
     tokio::time::timeout(std::time::Duration::from_secs(2), wait_for_log_event(&handle, |event| matches!(event, AgentEvent::AssistantText(text) if text == "answer after pause"))).await.unwrap();
@@ -16559,7 +16677,7 @@ async fn oracle718_background_during_answer_compact_keeps_resume(
     handle.compact();
     assert!(handle.goal_command(GoalCommand::Action(action)));
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("input".into()), "yes".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("input")), "yes".into()),
         PromptSubmission::Answered
     );
     tokio::time::timeout(
@@ -16701,7 +16819,7 @@ async fn oracle739_notice_during_answer_compact_active_continue_zero_keeps_resum
     handle.compact();
     assert_eq!(
         handle.submit_prompt_with_call_id(
-            Some("oracle739-answer".into()),
+            Some(question_id("oracle739-answer")),
             "oracle739 precise answer".into(),
         ),
         PromptSubmission::Answered
@@ -16848,7 +16966,7 @@ async fn oracle731_resumed_answer_pause_queued_resume_disarms_driver() {
     .unwrap();
     handle.compact();
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("input".into()), "yes".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("input")), "yes".into()),
         PromptSubmission::Answered
     );
     tokio::time::timeout(std::time::Duration::from_secs(2), gated.notified())
@@ -16984,7 +17102,7 @@ async fn oracle120_continue_preserves_accepted_input_resume() {
     assert!(handle.continue_goal(Some(10)));
     assert_eq!(
         handle.submit_prompt_with_call_id(
-            Some("oracle120-input".into()),
+            Some(question_id("oracle120-input")),
             "precise accepted answer".into()
         ),
         PromptSubmission::Answered
@@ -17524,7 +17642,7 @@ async fn agent_message_and_compaction_while_waiting_input_preserve_answer_turn()
         .unwrap();
     handle.compact();
     assert_eq!(
-        handle.submit_prompt_with_call_id(Some("input".into()), "yes".into()),
+        handle.submit_prompt_with_call_id(Some(question_id("input")), "yes".into()),
         PromptSubmission::Answered
     );
     wait_for_log_event(

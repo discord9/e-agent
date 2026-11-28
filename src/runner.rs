@@ -45,6 +45,15 @@ pub struct UserQuestion {
     pub options: Vec<UserOption>,
 }
 
+/// One question waiting for a human.
+///
+/// `call_id` is a PUBLIC id and the ONLY id an answer routes by, in both
+/// shapes this struct is published in (`WaitingInput` and `pending_questions`).
+/// For the `request_user_input` interception it is the call's public
+/// projection ([`crate::agent::public_call_id`]) — exactly what that call's
+/// `ToolCall` / `ToolResult` events carry — and never the provider's wire id,
+/// which stays in the persisted transcript. A tool-initiated ask (`ask_user`,
+/// the ACP permission bridge) supplies its own local id.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct UserInputRequest {
     pub call_id: String,
@@ -62,7 +71,7 @@ struct PendingQuestion {
 }
 
 /// The process-local asynchronous questions this session still awaits, in
-/// call-id order (deterministic for status payloads).
+/// public call-id order (deterministic for status payloads).
 fn pending_questions(shared: &Shared) -> Vec<UserInputRequest> {
     let mut requests: Vec<UserInputRequest> = shared
         .pending_questions
@@ -788,13 +797,12 @@ impl Shared {
             return None;
         }
         // The notice is PUBLIC text (persisted, model-facing, shown in the
-        // UI): it names the same local digest the call's projections carry,
-        // never the provider's wire id.
+        // UI): `request.call_id` is already the call's public projection, the
+        // same digest its events and the question frame carry — hashing it
+        // again here would name a third, unrelated id.
         Some(format!(
             "[question {}]\nQuestion: {}\n[answer]\n{}",
-            crate::agent::public_call_id(&pending.request.call_id),
-            question.prompt,
-            value
+            pending.request.call_id, question.prompt, value
         ))
     }
 
@@ -2558,7 +2566,7 @@ impl SessionRunner {
             match self.commands.recv().await {
                 Some(SessionCommand::Answer {
                     call_id, answers, ..
-                }) if call_id == call.id => {
+                }) if call_id == crate::agent::public_call_id(&call.id) => {
                     return WaitResult {
                         outcome: WaitOutcome::Completed(Ok(answers)),
                         pending,
@@ -4044,7 +4052,14 @@ impl SessionRunner {
                         };
                         let questions = vec![parsed.question];
                         let request = UserInputRequest {
-                            call_id: call.id.clone(),
+                            // The question's id is the call's PUBLIC projection
+                            // ([`crate::agent::public_call_id`]), the same value
+                            // its `ToolCall` / `ToolResult` events carry: one id
+                            // pairs the frame with the call for a client, and
+                            // answers route by it. The provider's wire id stays
+                            // private replay data (the persisted `Message::Tool`
+                            // row below keeps it).
+                            call_id: crate::agent::public_call_id(&call.id),
                             questions: questions.clone(),
                         };
                         if parsed.is_async {

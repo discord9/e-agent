@@ -33,9 +33,11 @@
 //! `loadCodeAssist` (once per process for one login, see `project_id`) names
 //! the account's `cloudaicompanionProject` — a real id for GCP/Workspace, the
 //! consumer literal [`PROJECT`] for `agy`'s own — and anything less falls back
-//! to that literal without failing the turn. A 401 refreshes the bearer and
-//! rediscovers the project with it, so the retried body cannot post a fallback
-//! project under a fresh token.
+//! to that literal without failing the turn. Only a DEFINITIVE discovery is
+//! cached (a project id, or a 200 that names none): a transient HTTP or
+//! transport failure caches nothing, so the next request rediscovers. A 401
+//! refreshes the bearer and rediscovers the project with it, so the retried
+//! body cannot post a fallback project under a fresh token.
 //! The body is repaired rather than refused where the wire tolerates it (empty
 //! parts, missing call/response ids, a drifted response name, a missing tool
 //! schema), and a 404 for a flash model is retried ONCE against that family's
@@ -367,14 +369,18 @@ impl AntigravityModel {
     /// cells are PROCESS-wide (see [`project_cell`]), so two separately
     /// constructed models of the same login cannot both discover, and a login
     /// switch selects another cell.
+    ///
+    /// ONLY a definitive answer is cached. `get_or_try_init` sets the cell on
+    /// `Ok` alone, so a transient failure leaves it unset and the very next
+    /// call — the one after a bearer refresh included — discovers again
+    /// instead of reusing a fallback that a recovered endpoint contradicts.
     async fn project_id(&self, credential: &Credential) -> String {
         let cell = project_cell(&self.load_assist_url, &credential.login);
         cell.get_or_try_init(|| async {
-            // A discovery that produced nothing is cached as the literal too:
-            // the project does not change within one login, and a definitive
-            // empty answer must not be retried on every turn. An authentication
-            // or transport failure is NOT cached: a later request may carry a
-            // refreshed token and discover the real project.
+            // A 200 that names no project IS definitive: the project does not
+            // change within one login, so the literal is cached rather than
+            // re-asked on every turn. Everything nondeterministic is an `Err`
+            // (see `discover_project`) and is therefore not cached at all.
             self.discover_project(&credential.token)
                 .await
                 .map(|project| project.unwrap_or_else(|| PROJECT.to_owned()))
@@ -387,10 +393,12 @@ impl AntigravityModel {
     /// Ask `loadCodeAssist` for `cloudaicompanionProject` (the TOP-LEVEL field
     /// of its body — no `response` envelope here, unlike the generation
     /// stream). NEVER a turn failure: `Ok(None)` caches [`PROJECT`] (a
-    /// definitive empty answer), while `Err` means the lookup was not
-    /// authoritative (401/transport) — this request uses [`PROJECT`] but the
-    /// next turn retries discovery. Only a generation error fails a turn. A
-    /// failed body is never read or logged.
+    /// DEFINITIVE empty answer, i.e. a readable 200 that names no project),
+    /// while `Err` means the lookup was not authoritative (401, any other
+    /// non-2xx such as 503, an unreadable body, transport) — this request uses
+    /// [`PROJECT`] but the shared cell stays UNSET, so the next call retries
+    /// discovery. Only a generation error fails a turn. A failed body is never
+    /// read or logged.
     async fn discover_project(&self, token: &str) -> anyhow::Result<Option<String>> {
         self.pace().await;
         let response = self
@@ -417,8 +425,17 @@ impl AntigravityModel {
             return Err(anyhow!("Antigravity project discovery was unauthorized"));
         }
         if !status.is_success() {
-            tracing::debug!("Antigravity project discovery: HTTP {status}; using {PROJECT}");
-            return Ok(None);
+            // NOT a definitive answer: a 5xx / 429 / other error says nothing
+            // about which project this login owns. `Err` keeps the shared cell
+            // UNSET, so the next call discovers again instead of freezing the
+            // fallback for the whole login (the post-401 retry is exactly such
+            // a call).
+            tracing::debug!(
+                "Antigravity project discovery: HTTP {status}; using {PROJECT} for this request only"
+            );
+            return Err(anyhow!(
+                "Antigravity project discovery failed with HTTP {status}"
+            ));
         }
         match response.json::<Value>().await {
             Ok(body) => Ok(body["cloudaicompanionProject"]
@@ -426,10 +443,13 @@ impl AntigravityModel {
                 .filter(|project| !project.trim().is_empty())
                 .map(|project| project.trim().to_owned())),
             Err(error) => {
+                // A 200 whose body cannot be read is not a definitive "no
+                // project" either: retry later instead of caching the literal.
                 tracing::debug!(
-                    "Antigravity project discovery unreadable: {error}; using {PROJECT}"
+                    "Antigravity project discovery unreadable: {error}; using {PROJECT} for this \
+                     request only"
                 );
-                Ok(None)
+                Err(anyhow!("Antigravity project discovery body was unreadable"))
             }
         }
     }
