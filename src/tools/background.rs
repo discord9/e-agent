@@ -598,7 +598,7 @@ impl BackgroundTasks {
     }
 
     #[cfg(test)]
-    pub(super) fn all_running_ids(&self) -> Vec<u64> {
+    pub(crate) fn all_running_ids(&self) -> Vec<u64> {
         self.registry
             .running
             .lock()
@@ -1235,6 +1235,35 @@ impl BackgroundTasks {
                 });
             },
         )
+    }
+
+    /// Register a long-lived background task that never delivers a
+    /// completion event and never blocks `FinishWhenIdle`: the PR watcher's
+    /// only output is the automatic turn it enqueues itself. The task is a
+    /// normal registry entry, so a session teardown aborts it exactly like a
+    /// cancelled bash task; it is hidden from the task panel because
+    /// it has no command/output to inspect.
+    pub(crate) fn spawn_silent<F, Fut>(&self, label: String, work: F) -> Result<u64, String>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = String> + Send + 'static,
+    {
+        let id = Arc::new(AtomicU64::new(0));
+        let allocated = id.clone();
+        self.spawn_inner(
+            label,
+            None,
+            None,
+            None,
+            None,
+            crate::tools::new_exit_slot(),
+            None,
+            false,
+            move |task_id| allocated.store(task_id, Ordering::Release),
+            work,
+            |_, _, _| {},
+        )?;
+        Ok(id.load(Ordering::Acquire))
     }
 
     /// Abort and join every task registered by exactly `owner`.

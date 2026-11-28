@@ -19687,3 +19687,392 @@ async fn cancelled_waiting_input_turn_touches_session_meta_once() {
     );
     drop(task);
 }
+
+/// The PR watcher's delivery path: one automatic notice is one durable
+/// `Notice` entry (rendered as a notice, never a user bubble) and exactly one
+/// ordinary model turn, whose context projects that same text as a user
+/// message carrying the automatic header and disclaimer.
+#[tokio::test]
+async fn an_automatic_notice_is_one_notice_entry_and_one_projected_user_message() {
+    use crate::ref_watch::{DISCLAIMER, HEADER};
+
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![(
+                AssistantMessage {
+                    content: Some("reacted".into()),
+                    tool_calls: Vec::new(),
+                    reasoning: None,
+                },
+                None,
+            )]
+            .into(),
+            calls: calls.clone(),
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        SessionStore::Jsonl,
+        temp.path().into(),
+        "auto-notice".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let (_, mut events, mut status) = handle.attach();
+    // No initial prompt: the automatic notice is the only reason this
+    // otherwise-idle session makes a provider request.
+    let task = runner.start(None);
+    wait_for_status(&mut status, |status| matches!(status, SessionStatus::Idle)).await;
+
+    let text = format!(
+        "{HEADER} PR #27 检查失败：build, test（2 项）\n\
+         discord9 · \"这版先别合，测试挂了\"\n\
+         {DISCLAIMER}"
+    );
+    handle
+        .commands
+        .send(SessionCommand::AutomaticNotice { text: text.clone() })
+        .unwrap();
+
+    let mut user_prompts = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match events.recv().await.unwrap() {
+                AgentEvent::UserPrompt(prompt) => user_prompts.push(prompt),
+                AgentEvent::AssistantText(answer) if answer == "reacted" => break,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the automatic notice must start a turn");
+
+    let contexts = calls.lock().unwrap().clone();
+    assert_eq!(contexts.len(), 1, "exactly one automatic turn");
+    let projected = contexts[0]
+        .iter()
+        .find_map(|message| match message {
+            Message::User { content, .. } if content == &text => Some(content.clone()),
+            _ => None,
+        })
+        .expect("the model sees the projected automatic message");
+    assert!(projected.starts_with(HEADER));
+    assert!(projected.ends_with(DISCLAIMER));
+
+    let loaded = SessionStore::Jsonl
+        .load(temp.path(), "auto-notice")
+        .await
+        .unwrap();
+    assert_eq!(
+        loaded
+            .entries
+            .iter()
+            .filter(
+                |entry| matches!(entry, SessionEntry::Notice { text: notice } if notice == &text)
+            )
+            .count(),
+        1,
+        "exactly one automatic notice entry"
+    );
+    assert!(
+        !loaded.entries.iter().any(|entry| matches!(
+            entry,
+            SessionEntry::Message {
+                message: Message::User { content, .. }
+            } if content.contains(HEADER)
+        )),
+        "an automatic message is never persisted as a user prompt"
+    );
+    assert!(
+        user_prompts
+            .iter()
+            .all(|prompt| !prompt.starts_with(HEADER)),
+        "an automatic message is never fanned out as a UserPrompt bubble: {user_prompts:?}"
+    );
+    drop(calls);
+    drop(task);
+}
+
+/// The watcher is an ordinary background-registry task: aborting the runner
+/// (the DELETE-session/cancel path) aborts it too, so it never outlives the
+/// runner.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn aborting_the_session_aborts_its_pr_watcher() {
+    let temp = tempfile::tempdir().unwrap();
+    let session = std::sync::Arc::new(tokio::sync::Mutex::new(
+        crate::session_sqlite::SqliteSession::connect(":memory:", "workspace", "watch-stop")
+            .await
+            .expect("in-memory SQLite"),
+    ));
+    let store = SessionStore::Sqlite {
+        session,
+        path: ":memory:".into(),
+    };
+    store
+        .add_ref(
+            temp.path(),
+            "watch-stop",
+            "pr",
+            "https://github.com/acme/widget/pull/27",
+        )
+        .await
+        .unwrap();
+    let (_, background) = crate::tools::builtins(
+        crate::workspace::Workspace::new(temp.path()).unwrap(),
+        SandboxPolicy::fixed(None),
+        false,
+        None,
+    );
+    let agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: VecDeque::new(),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    let (runner, _handle) = SessionRunner::new(
+        agent,
+        store,
+        temp.path().into(),
+        "watch-stop".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let runner = runner
+        .with_background_tasks(background.clone())
+        .with_ref_watch_interval(std::time::Duration::from_millis(50))
+        .with_ref_watch_program("/nonexistent/gh-for-e-agent-ref-watch".into());
+    let mut task = runner.start(None);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while background.all_running_ids().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the PR watcher was never registered"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    task.abort();
+    // Dropping the aborted runner (the DELETE-session path) cancels its
+    // registered watcher synchronously; the registry removal is immediate.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while !background.all_running_ids().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "aborting the runner must abort the PR watcher"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// End-to-end: a linked PR's real poll (through the `gh` command seam) turns a
+/// ready→failing transition into exactly one automatic turn, with a notice
+/// transcript entry and the documented header/disclaimer in the projection.
+#[cfg(all(unix, feature = "sqlite"))]
+#[tokio::test]
+async fn a_watched_pr_transition_starts_exactly_one_automatic_turn() {
+    use crate::ref_watch::{DISCLAIMER, HEADER};
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    // The fake GitHub CLI: one PR (#27) with two checks. The mode file is
+    // flipped by the test after the baseline poll; a request carrying the
+    // current ETag answers 304 so later polls stay silent.
+    let script = root.join("gh-fake");
+    std::fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+dir='{root}'
+path=''
+etag=''
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -H)
+      shift
+      case "$1" in
+        If-None-Match:*) etag=$(printf '%s' "$1" | sed 's/^If-None-Match: *//') ;;
+      esac
+      ;;
+    api|-i|--hostname|github.com|--method|GET) ;;
+    *) path="$1" ;;
+  esac
+  shift
+done
+printf '%s\n' "$path" >> "$dir/requests"
+mode=$(cat "$dir/mode")
+case "$path" in
+  repos/acme/widget/pulls/27)
+    case "$mode" in red) current=pr-red ;; *) current=pr-green ;; esac
+    body='{{"state":"OPEN","merged":false,"head":{{"sha":"abc123"}}}}'
+    ;;
+  repos/acme/widget/commits/abc123/check-runs)
+    current=checks
+    case "$mode" in
+      red) body='{{"check_runs":[{{"name":"build","status":"COMPLETED","conclusion":"FAILURE"}},{{"name":"test","status":"COMPLETED","conclusion":"FAILURE"}}]}}' ;;
+      *) body='{{"check_runs":[{{"name":"build","status":"COMPLETED","conclusion":"SUCCESS"}},{{"name":"test","status":"COMPLETED","conclusion":"SUCCESS"}}]}}' ;;
+    esac
+    ;;
+  repos/acme/widget/commits/abc123/status)
+    current=status
+    body='{{"statuses":[]}}'
+    ;;
+  repos/acme/widget/pulls/27/reviews*)
+    current=reviews
+    body='[]'
+    ;;
+  repos/acme/widget/issues/27/comments*|repos/acme/widget/pulls/27/comments*)
+    current=comments
+    body='[]'
+    ;;
+  *)
+    printf 'HTTP/2.0 404 Not Found\r\n\r\n'
+    exit 1
+    ;;
+esac
+if [ "$etag" = "$current" ]; then
+  printf 'HTTP/2.0 304 Not Modified\r\n\r\n'
+  exit 1
+fi
+printf 'HTTP/2.0 200 OK\r\nEtag: %s\r\n\r\n%s' "$current" "$body"
+"#,
+            root = root.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(root.join("mode"), "green").unwrap();
+
+    let session = std::sync::Arc::new(tokio::sync::Mutex::new(
+        crate::session_sqlite::SqliteSession::connect(":memory:", "workspace", "watch-e2e")
+            .await
+            .expect("in-memory SQLite"),
+    ));
+    let store = SessionStore::Sqlite {
+        session,
+        path: ":memory:".into(),
+    };
+    store
+        .add_ref(
+            root,
+            "watch-e2e",
+            "pr",
+            "https://github.com/acme/widget/pull/27",
+        )
+        .await
+        .unwrap();
+    let (_, background) = crate::tools::builtins(
+        crate::workspace::Workspace::new(root).unwrap(),
+        SandboxPolicy::fixed(None),
+        false,
+        None,
+    );
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::new(
+        Box::new(ScriptedContextCaptureModel {
+            replies: vec![(
+                AssistantMessage {
+                    content: Some("reacted".into()),
+                    tool_calls: Vec::new(),
+                    reasoning: None,
+                },
+                None,
+            )]
+            .into(),
+            calls: calls.clone(),
+        }),
+        vec![Box::new(KeepAliveTool { sender: None })],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        store.clone(),
+        root.into(),
+        "watch-e2e".into(),
+        IdlePolicy::WaitForInput,
+    );
+    let runner = runner
+        .with_background_tasks(background.clone())
+        .with_ref_watch_interval(std::time::Duration::from_millis(25))
+        .with_ref_watch_program(script.display().to_string());
+    let (_, mut events, _status) = handle.attach();
+    let mut task = runner.start(None);
+
+    // Baseline: the main document plus the PR's three nested reads.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let requests = || {
+        std::fs::read_to_string(root.join("requests"))
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    while requests() < 4 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the watcher never completed its baseline poll"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    std::fs::write(root.join("mode"), "red").unwrap();
+
+    let mut seen = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match events.recv().await.unwrap() {
+                AgentEvent::AssistantText(answer) if answer == "reacted" => break,
+                event => seen.push(format!("{event:?}")),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the PR transition must start an automatic turn: events={seen:?} requests={:?} mode={:?}",
+            std::fs::read_to_string(root.join("requests")).unwrap_or_default(),
+            std::fs::read_to_string(root.join("mode")).unwrap_or_default()
+        )
+    });
+
+    let contexts = calls.lock().unwrap().clone();
+    assert_eq!(contexts.len(), 1, "the transition is exactly one turn");
+    let projected = contexts[0]
+        .iter()
+        .find_map(|message| match message {
+            Message::User { content, .. } if content.starts_with(HEADER) => Some(content.clone()),
+            _ => None,
+        })
+        .expect("the model sees the automatic projection");
+    assert!(
+        projected.contains("PR #27 检查失败：build, test（2 项）"),
+        "{projected}"
+    );
+    assert!(projected.contains(DISCLAIMER), "{projected}");
+
+    let loaded = store.load(root, "watch-e2e").await.unwrap();
+    assert!(
+        loaded.entries.iter().any(|entry| matches!(
+            entry,
+            SessionEntry::Notice { text } if text.starts_with(HEADER) && text.contains(DISCLAIMER)
+        )),
+        "the transcript carries an automatic notice"
+    );
+    assert!(
+        !loaded.entries.iter().any(|entry| matches!(
+            entry,
+            SessionEntry::Message {
+                message: Message::User { content, .. }
+            } if content.contains(HEADER)
+        )),
+        "never persisted as a user prompt"
+    );
+
+    // Let a few more polls run: the now-304 main document produces no turn.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        1,
+        "the reaction turn consumed the only scripted reply and no second turn ran"
+    );
+    task.abort();
+}

@@ -9,6 +9,7 @@ pub mod mcp;
 pub mod model;
 pub mod output_receipt;
 pub mod quota;
+pub mod ref_watch;
 pub mod roles;
 pub mod runner;
 pub mod server;

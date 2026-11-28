@@ -95,6 +95,26 @@ pub(crate) struct Target {
 }
 
 impl Target {
+    /// `owner/repo` this target lives in.
+    pub(crate) fn repo(&self) -> &str {
+        &self.repo
+    }
+
+    /// The PR/issue number, as GitHub wrote it.
+    pub(crate) fn number(&self) -> &str {
+        &self.number
+    }
+
+    /// `true` for a pull request, `false` for an issue.
+    pub(crate) fn is_pr(&self) -> bool {
+        self.pr
+    }
+
+    /// The normalized link URL (the stored identity).
+    pub(crate) fn url(&self) -> &str {
+        &self.url
+    }
+
     /// The cache key: one entry per (repo, number, kind).
     fn key(&self) -> String {
         let kind = if self.pr { "pr" } else { "issue" };

@@ -400,9 +400,44 @@ status.
 Statuses are read from the `gh` CLI, cached in memory for 60 seconds per
 (repo, number), and never written to the session store. They are read when a
 frontend opens a session's links and when it explicitly refreshes them (adding
-or removing a link, or an agent-side `link_ref`); nothing polls GitHub. Any
-failure — no `gh`, no network, a rate limit, a non-GitHub URL — renders no dot
-and never removes the link.
+or removing a link, or an agent-side `link_ref`). Any failure — no `gh`, no
+network, a rate limit, a non-GitHub URL — renders no dot and never removes the
+link.
+
+#### PR/issue watcher
+
+While a session is live, its linked open PRs and issues are also watched
+independently of the web UI: one hidden task in the session's existing
+background registry polls every five minutes. The main document is requested
+with `If-None-Match`; a `304` ends that link's poll, so an unchanged link costs
+exactly one conditional request and produces nothing. A `200` opens the
+nested reads: check runs plus legacy commit statuses, reviews, and
+`issues/{n}/comments?since=` / review comments. A `403`/`429` pauses the whole
+watcher until `X-RateLimit-Reset`.
+
+Only transitions become a turn: checks going from all-passing (or pending) to
+failing, a review decision becoming changes-requested or approved, a merge, a
+close, and new comments/reviews. Several changes found in one poll coalesce
+into one message. Merged and closed links are dropped and never polled again.
+The first observation of a link (including every restart, and a link added
+later) is a silent baseline: the watcher records current state and the
+comment watermark, so it never reports the past.
+
+The message is delivered through the existing durable `Notice` projection, so
+the transcript renders a dim notice rather than a user bubble, while the model
+sees the same text as a user-shaped message:
+
+```text
+[自动检测 · 非用户消息] PR #27 检查失败：build, test（2 项）
+discord9 · "这版先别合，测试挂了"
+——本消息由 PR 监视自动生成，不是用户发言；请据此判断并采取必要行动。
+```
+
+There is no gate or confirmation: the notice is committed durably, arms one
+ordinary model turn, and the model acts under its normal rules. The watcher
+holds no persisted state, shares the session's lifetime (runner drop, session
+teardown/delete, and process exit all abort it), and never impersonates the
+human in the notice, a bubble, or `send_message`.
 
 ## MCP (local servers)
 
@@ -550,8 +585,11 @@ starts.
   background waits.
 - MCP is local stdio servers only; no remote HTTP/SSE, OAuth, resources,
   prompts, or server restart.
-- Session links have no webhooks, no background GitHub polling, and no
-  persisted status: a chip's state is a 60-second in-memory `gh` read, and
-  `unknown` whenever that read fails.
+- Session links have no webhooks, no dedicated scheduler or process, and no
+  persisted watcher state. The watcher is one task in the session's existing
+  background registry, polls only open PR/issue links every five minutes with
+  ETag/rate-limit handling, and drops merged/closed links. A chip's state stays
+  a 60-second in-memory `gh` read (`unknown` whenever that read fails), with no
+  status for plain links.
 - The web server has no multi-user model: one token, one workspace per process.
 - Windows support is narrower than Linux (see the sandbox notes above).

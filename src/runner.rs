@@ -2,9 +2,9 @@
 
 use crate::{
     agent::{
-        Agent, AgentEvent, BACKGROUND_REMINDER, CompactionOutput, GoalStatus, ImagePart, Message,
-        Model, POLL_GUARD_TERMINATION_NOTICE, RoundOutput, SessionEntry, ToolCall, ToolOutput,
-        ToolSpec, is_poll_guard_terminate, tool_error_content,
+        Agent, AgentEvent, BACKGROUND_REMINDER, CancellationSource, CompactionOutput, GoalStatus,
+        ImagePart, Message, Model, POLL_GUARD_TERMINATION_NOTICE, RoundOutput, SessionEntry,
+        ToolCall, ToolOutput, ToolSpec, is_poll_guard_terminate, tool_error_content,
     },
     model::{ImageRejection, image_rejection},
     session_store::{LocatedKey, SessionStore},
@@ -564,6 +564,13 @@ pub enum SessionCommand {
         source: String,
         body: String,
     },
+    /// A runner-owned automatic notice (the PR watcher). Committed as a
+    /// durable `SessionEntry::Notice`, then one ordinary reaction turn. The
+    /// text is projected to the model as a user-shaped message, but it is
+    /// never a human prompt and never rendered as a user bubble.
+    AutomaticNotice {
+        text: String,
+    },
     /// A tool asking the human mid-call (`SessionHandle::ask_user`). The
     /// runner surfaces `request` as this session's blocking question and
     /// answers `reply` with the chosen option id (`None` = cancelled), so a
@@ -841,6 +848,28 @@ impl WeakSessionHandle {
         }
         commands
             .send(SessionCommand::AgentMessage { source, body })
+            .map_err(|_| {
+                shared.commands_open = false;
+                "target session is no longer live".to_owned()
+            })
+    }
+
+    /// Queue one runner-owned automatic notice (PR watcher) only while the
+    /// runner state and command channel still exist. A dead session is a
+    /// normal stop condition for the producer.
+    pub(crate) fn send_automatic_notice(&self, text: String) -> Result<(), String> {
+        let Some(shared) = self.shared.upgrade() else {
+            return Err("target session is no longer live".into());
+        };
+        let Some(commands) = self.commands.upgrade() else {
+            return Err("target session is no longer live".into());
+        };
+        let mut shared = shared.lock().unwrap();
+        if !shared.commands_open || commands.is_closed() {
+            return Err("target session is no longer live".into());
+        }
+        commands
+            .send(SessionCommand::AutomaticNotice { text })
             .map_err(|_| {
                 shared.commands_open = false;
                 "target session is no longer live".to_owned()
@@ -1457,6 +1486,12 @@ enum PendingCommand {
         source: String,
         body: String,
     },
+    /// A runner-owned automatic notice (PR watcher). It is never a human
+    /// prompt: it commits as a durable `SessionEntry::Notice` and arms one
+    /// ordinary reaction turn.
+    AutomaticNotice {
+        text: String,
+    },
     Prompt {
         text: String,
         queued: bool,
@@ -1502,6 +1537,17 @@ pub struct SessionRunner {
     link_workspace: PathBuf,
     session: String,
     shared: Arc<Mutex<Shared>>,
+    /// Non-owning live endpoint used by runner-owned producers (the PR
+    /// watcher) to enqueue automatic notices without keeping the runner
+    /// alive.
+    live: WeakSessionHandle,
+    /// The PR watcher's background-registry id. It is aborted when this
+    /// runner goes away, so the watcher never outlives its session.
+    ref_watch: Option<u64>,
+    #[cfg(test)]
+    ref_watch_interval: Option<std::time::Duration>,
+    #[cfg(test)]
+    ref_watch_program: Option<String>,
     background: Option<crate::tools::BackgroundTasks>,
     projected_background: Option<Vec<crate::session_store::ProjectedBackgroundTask>>,
     bootstrap_projection_pending: bool,
@@ -1545,6 +1591,12 @@ pub struct SessionRunner {
 impl Drop for SessionRunner {
     fn drop(&mut self) {
         self.shared.lock().unwrap().commands_open = false;
+        // The PR watcher is a registry task, and the registry outlives one
+        // session (it is shared by the whole process). Its lifecycle is tied
+        // here: whatever ends the runner also ends the watcher.
+        if let (Some(background), Some(id)) = (self.background.as_ref(), self.ref_watch.take()) {
+            background.cancel_with_source(id, CancellationSource::System);
+        }
     }
 }
 
@@ -1639,6 +1691,20 @@ impl SessionRunner {
     /// waiting for an answer nobody can give.
     pub(crate) fn with_user_input_allowed(self) -> Self {
         self.shared.lock().unwrap().user_input_allowed = true;
+        self
+    }
+
+    /// Test-only cadence/executable seams for the PR watcher: production
+    /// uses five minutes and `gh`.
+    #[cfg(test)]
+    pub(crate) fn with_ref_watch_interval(mut self, interval: std::time::Duration) -> Self {
+        self.ref_watch_interval = Some(interval);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_ref_watch_program(mut self, program: String) -> Self {
+        self.ref_watch_program = Some(program);
         self
     }
 
@@ -1794,6 +1860,7 @@ impl SessionRunner {
             commands: tx,
         };
         agent.set_session_handle(&session, handle.clone());
+        let live = handle.downgrade();
         (
             Self {
                 agent,
@@ -1802,6 +1869,12 @@ impl SessionRunner {
                 root,
                 session,
                 shared,
+                live,
+                ref_watch: None,
+                #[cfg(test)]
+                ref_watch_interval: None,
+                #[cfg(test)]
+                ref_watch_program: None,
                 background: None,
                 projected_background: None,
                 bootstrap_projection_pending: true,
@@ -1892,12 +1965,51 @@ impl SessionRunner {
         Ok(())
     }
 
+    /// Tie one PR/issue watcher to this live runner. It is a normal
+    /// background-registry task with no completion event of its own: every
+    /// change it observes becomes one `AutomaticNotice` command.
+    fn start_ref_watch(&mut self) {
+        let Some(background) = self.background.clone() else {
+            return;
+        };
+        if !self.store.supports_session_refs() {
+            return;
+        }
+        #[cfg(test)]
+        let interval = self
+            .ref_watch_interval
+            .unwrap_or(crate::ref_watch::POLL_INTERVAL);
+        #[cfg(not(test))]
+        let interval = crate::ref_watch::POLL_INTERVAL;
+        #[cfg(test)]
+        let program = self
+            .ref_watch_program
+            .clone()
+            .unwrap_or_else(|| "gh".to_owned());
+        #[cfg(not(test))]
+        let program = "gh".to_owned();
+        let endpoint = self.live.clone();
+        match crate::ref_watch::spawn(
+            &background,
+            self.store.clone(),
+            self.root.clone(),
+            self.session.clone(),
+            interval,
+            program,
+            move |text| endpoint.send_automatic_notice(text).is_ok(),
+        ) {
+            Ok(id) => self.ref_watch = Some(id),
+            Err(error) => tracing::warn!("cannot start PR watcher: {error}"),
+        }
+    }
+
     pub fn start(mut self, initial_prompt: Option<String>) -> SessionTask {
         // A plain `new()` runner has no bootstrap reconciliation to perform.
         // Keep later projection hooks inert when its background registry is absent.
         if self.bootstrap.is_none() {
             self.bootstrap_projection_pending = false;
         }
+        self.start_ref_watch();
         if let Some(prompt) = initial_prompt {
             self.pending.push_back(PendingCommand::Prompt {
                 text: prompt,
@@ -2746,6 +2858,7 @@ impl SessionRunner {
                     // will never come, and nothing was promised durably.
                     Some(PendingCommand::Goal(_))
                     | Some(PendingCommand::Continue(_))
+                    | Some(PendingCommand::AutomaticNotice { .. })
                     | Some(PendingCommand::Answer { .. }) => {
                         self.pending.pop_front();
                     }
@@ -2766,6 +2879,11 @@ impl SessionRunner {
             SessionCommand::AgentMessage { source, body } => {
                 self.pending
                     .push_back(PendingCommand::AgentMessage { source, body });
+                Steering::None
+            }
+            SessionCommand::AutomaticNotice { text } => {
+                self.pending
+                    .push_back(PendingCommand::AutomaticNotice { text });
                 Steering::None
             }
             SessionCommand::Prompt(prompt) => {
@@ -3315,6 +3433,36 @@ impl SessionRunner {
             // below and the turn(s) started from it decide the end naturally.
             if steering == Steering::ReleasedIdle && self.release_after_preempt(steering) {
                 return;
+            }
+            // An automatic notice is durable ingress, never a prompt. Commit
+            // every notice already queued, arm exactly one ordinary reaction
+            // for the whole burst, and let the normal turn decision below
+            // (a queued human batch or a Background turn) consume it.
+            if self
+                .pending
+                .iter()
+                .any(|command| matches!(command, PendingCommand::AutomaticNotice { .. }))
+            {
+                let texts: Vec<String> = self
+                    .pending
+                    .iter()
+                    .filter_map(|command| match command {
+                        PendingCommand::AutomaticNotice { text } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                self.pending
+                    .retain(|command| !matches!(command, PendingCommand::AutomaticNotice { .. }));
+                for text in texts {
+                    if let Err(error) = self.commit(SessionEntry::Notice { text }).await {
+                        self.terminate(SessionResult::Failed(format!("{error:#}")), Vec::new())
+                            .await;
+                        return;
+                    }
+                }
+                self.pending_regular_reaction = true;
+                self.publish_web_attaches();
+                continue;
             }
             if matches!(
                 self.pending.front(),
