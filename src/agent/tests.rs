@@ -7852,3 +7852,23 @@ fn runtime_model_switch_replaces_window_and_invalidates_context_baseline() {
     );
     assert!(!agent.take_auto_compact_request());
 }
+
+/// The public projection of a wire call id is a local digest wide enough that
+/// distinct provider ids cannot share one answer key. These two strings
+/// collided under the old 32-bit prefix (`call-bb74105d`); at 128 bits they
+/// project to different ids, and neither leaks its wire id.
+#[test]
+fn public_call_id_is_a_128_bit_local_digest() {
+    let ids = ["call_52986", "call_92571"].map(public_call_id);
+    assert_ne!(ids[0], ids[1], "the old 32-bit prefix collided: {ids:?}");
+    for (id, wire) in ids.iter().zip(["call_52986", "call_92571"]) {
+        assert_eq!(id.len(), "call-".len() + 32, "{id}");
+        assert!(id.starts_with("call-"), "{id}");
+        assert!(
+            id["call-".len()..].chars().all(|c| c.is_ascii_hexdigit()),
+            "{id}"
+        );
+        assert!(!id.contains(wire), "the digest is not the wire id: {id}");
+    }
+    assert_eq!(ids[0], public_call_id("call_52986"), "stable per wire id");
+}

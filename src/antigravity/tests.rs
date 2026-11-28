@@ -488,6 +488,73 @@ async fn empty_discovered_project_keeps_the_consumer_literal() {
     }
 }
 
+/// A 202 is a lookup that has NOT completed, so an empty body is not a
+/// definitive "no project": the shared cell stays unset. The next turn
+/// discovers again, and the request after the readable 200 carries the real
+/// project instead of the fallback the 202 froze.
+#[tokio::test]
+async fn a_202_discovery_is_not_cached_and_the_next_turn_rediscovers() {
+    let dir = tempfile::tempdir().unwrap();
+    // Its own refresh credential: the project cell is process-wide and keyed
+    // by (endpoint, login).
+    let token_file = write_agy_token(
+        dir.path(),
+        "test-token",
+        Utc::now() + ChronoDuration::hours(1),
+        "refresh-token-202",
+    );
+    let body = sse_body(&[text_element("ok")]);
+    let fake = spawn_fake(4, move |index, path| {
+        if path.contains("loadCodeAssist") {
+            if index == 0 {
+                (202, json!({}).to_string())
+            } else {
+                (
+                    200,
+                    json!({"cloudaicompanionProject": "gcp-project-42"}).to_string(),
+                )
+            }
+        } else {
+            (200, body.clone())
+        }
+    })
+    .await;
+    let mut model = model_for(&fake, token_file, dir.path().join("cache/token.json"));
+    model.load_assist_url = format!("http://{}/v1internal:loadCodeAssist", fake.address);
+    for _ in 0..2 {
+        model
+            .complete(
+                &[Message::User {
+                    content: "say ok".into(),
+                    images: Vec::new(),
+                }],
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    let requests = fake.requests();
+    assert_eq!(
+        requests.len(),
+        4,
+        "discovery, generation, rediscovery, generation"
+    );
+    assert_eq!(requests[0].0, "/v1internal:loadCodeAssist");
+    assert_eq!(
+        requests[1].2["project"], PROJECT,
+        "a 202 falls back for THIS request only"
+    );
+    assert_eq!(
+        requests[2].0, "/v1internal:loadCodeAssist",
+        "the 202 was not cached: the next turn asks again"
+    );
+    assert_eq!(
+        requests[3].2["project"], "gcp-project-42",
+        "the request after the 200 carries the real project"
+    );
+}
+
 /// A FAILED discovery is not a failed turn: a 500 falls back to the literal and
 /// the generation goes ahead. Only a generation error fails a turn.
 #[tokio::test]

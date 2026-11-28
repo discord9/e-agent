@@ -487,18 +487,25 @@ pub struct ToolCall {
     pub provider_meta: Option<String>,
 }
 
-/// A stable, LOCAL correlation id for a tool call's public projection: a short
-/// SHA-256 of the provider wire id. The wire id itself is provider-controlled
-/// text, and a provider switch must not carry it into another model's tool
-/// output; the digest still pairs a `ToolCall` event with its `ToolResult`
-/// across live, late-attach, and history projections.
+/// A stable, LOCAL correlation id for a tool call's public projection: the
+/// first 128 bits of SHA-256 over the provider wire id, as 32 hex characters.
+/// The wire id itself is provider-controlled text, and a provider switch must
+/// not carry it into another model's tool output; the digest still pairs a
+/// `ToolCall` event with its `ToolResult` across live, late-attach, and history
+/// projections.
+///
+/// The width is deliberate: this id is also a live answer key for an
+/// asynchronous question, and a 32-bit prefix could project two distinct wire
+/// ids onto one key. 128 bits makes such a collision unreachable in practice;
+/// the runner's pending-question registry still refuses to reuse the id as a
+/// second defense.
 pub(crate) fn public_call_id(wire_id: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(wire_id.as_bytes());
-    format!(
-        "call-{:08x}",
-        u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]])
-    )
+    let prefix: [u8; 16] = digest[..16]
+        .try_into()
+        .expect("SHA-256 digest is longer than 16 bytes");
+    format!("call-{:032x}", u128::from_be_bytes(prefix))
 }
 
 /// Lifecycle status of the session's current goal. Serialized as the

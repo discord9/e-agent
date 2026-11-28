@@ -1322,6 +1322,120 @@ fn free_text_answer_still_accepts_any_non_empty_text() {
     }
 }
 
+/// Two asynchronous questions are two live answer keys: registering the
+/// second must never evict the first, each answers under the public id its
+/// client was shown (in either order), and the provider wire id stays private
+/// replay data — never an answer key.
+#[test]
+fn two_pending_async_questions_stay_answerable_under_their_public_ids() {
+    let (handle, emitter, mut commands) = crate::runner::session_test_channel();
+    let first = UserInputRequest {
+        call_id: question_id("wire-first"),
+        questions: vec![UserQuestion {
+            id: "first".into(),
+            prompt: "First?".into(),
+            options: Vec::new(),
+        }],
+    };
+    let second = UserInputRequest {
+        call_id: question_id("wire-second"),
+        questions: vec![UserQuestion {
+            id: "second".into(),
+            prompt: "Second?".into(),
+            options: Vec::new(),
+        }],
+    };
+    assert!(emitter.register_pending_question(first.clone()));
+    assert!(emitter.register_pending_question(second.clone()));
+    let pending = handle.pending_questions();
+    assert_eq!(pending.len(), 2, "{pending:?}");
+    assert!(pending.contains(&first) && pending.contains(&second));
+    // Answering with the wire id is refused in both shapes.
+    for wire in ["wire-first", "wire-second"] {
+        assert_eq!(
+            handle.submit_prompt_with_call_id(Some(wire.into()), "Ada".into()),
+            PromptSubmission::Conflict,
+            "{wire} must not be an answer key"
+        );
+    }
+    assert!(commands.try_recv().is_err());
+    // The FIRST question is still answerable after the second registered.
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some(first.call_id.clone()), "Ada".into()),
+        PromptSubmission::Answered
+    );
+    match commands.try_recv().unwrap() {
+        SessionCommand::Answer {
+            call_id,
+            answers,
+            option,
+        } => {
+            assert_eq!(call_id, first.call_id);
+            assert_eq!(option, None);
+            assert_eq!(answers, vec![("first".to_owned(), "Ada".to_owned())]);
+        }
+        _ => panic!("expected the first question's answer command"),
+    }
+    // The second keeps its own id and is answerable too.
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some(second.call_id.clone()), "Grace".into()),
+        PromptSubmission::Answered
+    );
+    match commands.try_recv().unwrap() {
+        SessionCommand::Answer {
+            call_id, answers, ..
+        } => {
+            assert_eq!(call_id, second.call_id);
+            assert_eq!(answers, vec![("second".to_owned(), "Grace".to_owned())]);
+        }
+        _ => panic!("expected the second question's answer command"),
+    }
+}
+
+/// A live answer key is never reassigned: registering another question under a
+/// public id that is already pending is refused, the map is untouched, and the
+/// id still answers the FIRST question a client is showing.
+#[test]
+fn registering_a_live_public_id_is_refused_and_keeps_the_first_question() {
+    let (handle, emitter, mut commands) = crate::runner::session_test_channel();
+    let public_id = question_id("wire-shared");
+    let first = UserInputRequest {
+        call_id: public_id.clone(),
+        questions: vec![UserQuestion {
+            id: "first".into(),
+            prompt: "First?".into(),
+            options: Vec::new(),
+        }],
+    };
+    let second = UserInputRequest {
+        call_id: public_id.clone(),
+        questions: vec![UserQuestion {
+            id: "second".into(),
+            prompt: "Second?".into(),
+            options: Vec::new(),
+        }],
+    };
+    assert!(emitter.register_pending_question(first.clone()));
+    assert!(
+        !emitter.register_pending_question(second),
+        "a pending public id must refuse a second question"
+    );
+    assert_eq!(handle.pending_questions(), vec![first.clone()]);
+    assert_eq!(
+        handle.submit_prompt_with_call_id(Some(public_id.clone()), "Ada".into()),
+        PromptSubmission::Answered
+    );
+    match commands.try_recv().unwrap() {
+        SessionCommand::Answer {
+            call_id, answers, ..
+        } => {
+            assert_eq!(call_id, public_id, "the id answers the first question");
+            assert_eq!(answers, vec![("first".to_owned(), "Ada".to_owned())]);
+        }
+        _ => panic!("expected the first question's answer command"),
+    }
+}
+
 /// A question with options serializes them; one without serializes exactly as
 /// before (no empty `options` key), which is what the frontends and the
 /// status payload rely on.

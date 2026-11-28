@@ -34,8 +34,9 @@
 //! the account's `cloudaicompanionProject` — a real id for GCP/Workspace, the
 //! consumer literal [`PROJECT`] for `agy`'s own — and anything less falls back
 //! to that literal without failing the turn. Only a DEFINITIVE discovery is
-//! cached (a project id, or a 200 that names none): a transient HTTP or
-//! transport failure caches nothing, so the next request rediscovers. A 401
+//! cached (an HTTP 200 that names a project or none at all): a transient HTTP
+//! failure — including a 202 whose lookup has not completed — or a transport
+//! failure caches nothing, so the next request rediscovers. A 401
 //! refreshes the bearer and rediscovers the project with it, so the retried
 //! body cannot post a fallback project under a fresh token.
 //! The body is repaired rather than refused where the wire tolerates it (empty
@@ -393,12 +394,12 @@ impl AntigravityModel {
     /// Ask `loadCodeAssist` for `cloudaicompanionProject` (the TOP-LEVEL field
     /// of its body — no `response` envelope here, unlike the generation
     /// stream). NEVER a turn failure: `Ok(None)` caches [`PROJECT`] (a
-    /// DEFINITIVE empty answer, i.e. a readable 200 that names no project),
-    /// while `Err` means the lookup was not authoritative (401, any other
-    /// non-2xx such as 503, an unreadable body, transport) — this request uses
-    /// [`PROJECT`] but the shared cell stays UNSET, so the next call retries
-    /// discovery. Only a generation error fails a turn. A failed body is never
-    /// read or logged.
+    /// DEFINITIVE empty answer, i.e. a readable HTTP 200 that names no
+    /// project), while `Err` means the lookup was not authoritative (401, any
+    /// other non-200 such as a 503 OR a 202 that carries no project yet, an
+    /// unreadable body, transport) — this request uses [`PROJECT`] but the
+    /// shared cell stays UNSET, so the next call retries discovery. Only a
+    /// generation error fails a turn. A failed body is never read or logged.
     async fn discover_project(&self, token: &str) -> anyhow::Result<Option<String>> {
         self.pace().await;
         let response = self
@@ -424,12 +425,14 @@ impl AntigravityModel {
             );
             return Err(anyhow!("Antigravity project discovery was unauthorized"));
         }
-        if !status.is_success() {
-            // NOT a definitive answer: a 5xx / 429 / other error says nothing
-            // about which project this login owns. `Err` keeps the shared cell
-            // UNSET, so the next call discovers again instead of freezing the
-            // fallback for the whole login (the post-401 retry is exactly such
-            // a call).
+        if status != reqwest::StatusCode::OK {
+            // ONLY a readable HTTP 200 is a definitive answer. Every other
+            // status says nothing about which project this login owns — a 5xx
+            // / 429 / 503 is an error, and a 202 (or any other non-200
+            // success) is a lookup that has not completed. `Err` keeps the
+            // shared cell UNSET, so the next call discovers again instead of
+            // freezing the fallback for the whole login (the post-401 retry is
+            // exactly such a call).
             tracing::debug!(
                 "Antigravity project discovery: HTTP {status}; using {PROJECT} for this request only"
             );

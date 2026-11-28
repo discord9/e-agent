@@ -772,7 +772,15 @@ impl Shared {
 
     /// Register one asynchronous question (`async: true`). Pure memory: the
     /// model already got its receipt, nothing here is persisted.
-    fn register_pending_question(&mut self, request: UserInputRequest) {
+    ///
+    /// `false` means the public id is already a live answer key: nothing is
+    /// inserted and the EXISTING question stays answerable under that id. A
+    /// second question never silently evicts the one a client is already
+    /// showing; the caller must treat that as a refused registration.
+    fn register_pending_question(&mut self, request: UserInputRequest) -> bool {
+        if self.pending_questions.contains_key(&request.call_id) {
+            return false;
+        }
         self.pending_questions.insert(
             request.call_id.clone(),
             PendingQuestion {
@@ -781,6 +789,7 @@ impl Shared {
             },
         );
         self.republish_status();
+        true
     }
 
     /// The user-shaped Notice an accepted answer commits. `None` means the id
@@ -1323,12 +1332,12 @@ impl TestSessionEmitter {
     }
     /// Test-only: register one process-local asynchronous question exactly as
     /// the runner does, so status/answer tests can exercise the map without
-    /// driving a full turn.
-    pub(crate) fn register_pending_question(&self, request: UserInputRequest) {
+    /// driving a full turn. `false` means the id was already live.
+    pub(crate) fn register_pending_question(&self, request: UserInputRequest) -> bool {
         self.shared
             .lock()
             .unwrap()
-            .register_pending_question(request);
+            .register_pending_question(request)
     }
     /// Test-only: mirror the runner's post-commit removal of an answered
     /// asynchronous question (the runner only removes it after the Notice is
@@ -2492,14 +2501,16 @@ impl SessionRunner {
         self.status(status);
     }
 
-    /// Register an asynchronous question (`request_user_input` with
+    /// Register one asynchronous question (`request_user_input` with
     /// `async: true`) and keep the turn going. Pure memory: a restart drops
     /// every unanswered question, while the model's receipt stays in history.
-    fn register_pending_question(&mut self, request: UserInputRequest) {
+    /// `false` means a live answer key already owns that public id; the
+    /// caller must refuse the NEW question, never replace the pending one.
+    fn register_pending_question(&mut self, request: UserInputRequest) -> bool {
         self.shared
             .lock()
             .unwrap()
-            .register_pending_question(request);
+            .register_pending_question(request)
     }
 
     /// Commit every queued asynchronous answer as exactly one durable,
@@ -4067,7 +4078,37 @@ impl SessionRunner {
                             // finish the call with a receipt. No WaitingInput,
                             // no suspension — the answer arrives later as a
                             // user-shaped Notice, and this turn keeps going.
-                            self.register_pending_question(request);
+                            //
+                            // A live answer key is never reassigned: if this
+                            // public id is already pending, refuse THIS
+                            // question instead of evicting the one a client
+                            // may already be showing. The first question keeps
+                            // its id and stays answerable.
+                            if !self.register_pending_question(request) {
+                                let error = format!(
+                                    "question {} is already pending; a live answer id is \
+                                     never reassigned. Ask again with a different call id.",
+                                    crate::agent::public_call_id(&call.id)
+                                );
+                                match self.finish_intercepted_tool(&call, Err(error)).await {
+                                    Ok(Steering::None) => {}
+                                    Ok(steering) => {
+                                        if self.release_after_preempt(steering) {
+                                            return;
+                                        }
+                                        break 'turn;
+                                    }
+                                    Err(error) => {
+                                        self.terminate(
+                                            SessionResult::Failed(format!("{error:#}")),
+                                            Vec::new(),
+                                        )
+                                        .await;
+                                        return;
+                                    }
+                                }
+                                continue;
+                            }
                             // Public text: the receipt names the LOCAL digest
                             // that this call's projections carry, so the model
                             // (and the UI) never thread a provider wire id.
