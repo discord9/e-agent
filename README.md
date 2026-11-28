@@ -371,6 +371,38 @@ The `/api` surface (JSON except for the SSE endpoint):
 | GET | `/api/tasks` | running background tasks, all sessions |
 | DELETE | `/api/sessions/{id}/tasks/{task_id}` | cancel one background task |
 | GET | `/api/sessions/{id}/tasks/{task_id}/output` | full output of a running bash task |
+| GET | `/api/sessions/{id}/refs/status` | per-link chip state + one-line detail, `gh`-backed, 60-second memory cache |
+
+### Session links
+
+A session can hold pull-request, issue, and plain links (`link_ref`,
+`list_refs`, `unlink_ref`; SQLite/Greptime backends only). In the web UI each
+link is a chip: the label stays the full identity (`owner/repo#27`), shortened
+to `#27` when the link lives in the session's own repository — that session's
+`origin` already names it — and the chip carries at most one small state dot:
+
+| Dot | Meaning |
+|-----|---------|
+| green | ready: open, merge clean, every check settled and green (or no checks), no changes requested |
+| blue | approved but not green yet, or simply open and in flight |
+| orange | needs you: a merge conflict, a failing check, or a review requesting changes |
+| grey | draft |
+| purple | merged |
+| dark red | closed without merging |
+| *(none)* | status unknown — a failed read never paints a dot or a word |
+
+Blockers win: conflict or failing check, then changes requested, then draft,
+then merged/closed, then approved, then ready. The chip is otherwise left
+alone; the tooltip carries `state · merge · review · checks · head · title`, and
+the editor shows the same one line per link. A plain link has no dot and no
+status.
+
+Statuses are read from the `gh` CLI, cached in memory for 60 seconds per
+(repo, number), and never written to the session store. They are read when a
+frontend opens a session's links and when it explicitly refreshes them (adding
+or removing a link, or an agent-side `link_ref`); nothing polls GitHub. Any
+failure — no `gh`, no network, a rate limit, a non-GitHub URL — renders no dot
+and never removes the link.
 
 ## MCP (local servers)
 
@@ -518,5 +550,8 @@ starts.
   background waits.
 - MCP is local stdio servers only; no remote HTTP/SSE, OAuth, resources,
   prompts, or server restart.
+- Session links have no webhooks, no background GitHub polling, and no
+  persisted status: a chip's state is a 60-second in-memory `gh` read, and
+  `unknown` whenever that read fails.
 - The web server has no multi-user model: one token, one workspace per process.
 - Windows support is narrower than Linux (see the sandbox notes above).

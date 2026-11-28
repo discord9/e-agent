@@ -447,6 +447,33 @@
   .chat-ref-chip.pr { border-color: var(--green); }
   .chat-ref-chip.issue { border-color: var(--blue); }
   .chat-ref-chip.link { border-color: var(--yellow); }
+  /* 链接状态：chip 上只允许一个小圆点（颜色即状态），文字细节只进 tooltip
+     / 展开行，绝不挤占 `owner/repo#N` 和 `×` 的位置。unknown 不画点。 */
+  .chat-ref-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--base1);
+    flex: none;
+  }
+  .chat-ref-dot.ready { background: var(--green); }        /* 可以合了 */
+  .chat-ref-dot.approved { background: var(--blue); }      /* 已批但还没绿 */
+  .chat-ref-dot.open { background: var(--blue); }          /* 开着、在推进 */
+  .chat-ref-dot.needs { background: var(--orange); }       /* 冲突/红检查/要求改 */
+  .chat-ref-dot.draft { background: var(--base1); }        /* 草稿：灰 */
+  .chat-ref-dot.merged { background: var(--violet); }      /* 已合并：紫 */
+  .chat-ref-dot.closed { background: var(--status-red); }  /* 关了没合：暗红 */
+  .chat-ref-details { display: block; flex-basis: 100%; }
+  .chat-ref-detail {
+    display: block;
+    font-size: 11px;
+    line-height: 1.5;
+    color: var(--base01);
+    max-width: 46vw;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   .chat-ref-chip a { color: var(--base02); text-decoration: none; }
   .chat-ref-chip a:hover { color: var(--blue); text-decoration: underline; }
   .chat-ref-remove {

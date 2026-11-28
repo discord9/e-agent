@@ -537,6 +537,16 @@ fn parse_origin_remote(remote: &str) -> Result<String, &'static str> {
     }
 }
 
+/// The `owner/repo` this workspace's `origin` names, when that mapping is
+/// known (a github.com remote). `None` means "cannot claim same repository":
+/// an unknown workspace, no repository, no origin, or a transport whose web
+/// endpoint we refuse to invent.
+pub(crate) async fn origin_repo(workspace: Option<&Path>) -> Option<String> {
+    let workspace = workspace?;
+    let remote = origin_remote(workspace).await.ok()?;
+    parse_origin_remote(&remote).ok()
+}
+
 #[cfg(test)]
 fn git_workspace(origin: Option<&str>) -> tempfile::TempDir {
     let temp = tempfile::tempdir().unwrap();

@@ -976,7 +976,7 @@ async function fetchChatRefs(id) {
   const wsId = state.workspace.id;
   const epoch = sessionOpenEpoch;
   state.sessionRefs = {
-    id, supported: null, refs: [], editorOpen: false, kind: "",
+    id, supported: null, refs: [], statuses: {}, editorOpen: false, kind: "",
     draft: "", error: "", busy: false,
   };
   renderChatRefs();
@@ -990,17 +990,40 @@ async function fetchChatRefs(id) {
       id,
       supported: data.supported !== false,
       refs: Array.isArray(data.refs) ? data.refs : [],
+      statuses: {},
       editorOpen: false, kind: "", draft: "", error: "", busy: false,
     };
   } catch (_e) {
     if (state.sessionId !== id || state.workspace.id !== wsId || epoch !== sessionOpenEpoch) return;
     // 读取失败不冒充「无链接」：隐藏编辑区，会话其余功能不受影响。
     state.sessionRefs = {
-      id, supported: null, refs: [], editorOpen: false, kind: "",
+      id, supported: null, refs: [], statuses: {}, editorOpen: false, kind: "",
       draft: "", error: "", busy: false,
     };
   }
   renderChatRefs();
+  fetchChatRefStatuses(id);
+}
+
+/* 链接状态的唯一来源：打开会话或显式刷新链接时问一次 /refs/status。
+   服务端按链接缓存 60 秒，前端不轮询 GitHub。请求本身失败时保留已有状态：
+   只有「服务端问了 GitHub 但没拿到」才显示 unknown，问不到不冒充。 */
+async function fetchChatRefStatuses(id) {
+  const st = state.sessionRefs;
+  if (!st || st.id !== id || st.supported !== true) return;
+  const wsId = state.workspace.id;
+  try {
+    const res = await api("/api/sessions/" + encodeURIComponent(id) + "/refs/status");
+    const text = await res.text();
+    if (!res.ok) return;
+    const data = text ? JSON.parse(text) : {};
+    if (state.sessionRefs !== st || state.sessionId !== id || state.workspace.id !== wsId) return;
+    if (data.supported === false) return;
+    st.statuses = data.statuses && typeof data.statuses === "object" ? data.statuses : {};
+    renderChatRefs();
+  } catch (_e) {
+    // 状态是附加信息：读不到就没有小圆点，链接本身照常可用。
+  }
 }
 
 /* agent 侧 link_ref/unlink_ref 成功后只刷新 chips：编辑器的打开状态、草稿、
@@ -1019,6 +1042,7 @@ async function refreshChatRefs(id) {
     if (state.sessionId !== id || state.workspace.id !== wsId) return;
     st.refs = Array.isArray(data.refs) ? data.refs : [];
     renderChatRefs();
+    fetchChatRefStatuses(id);
   } catch (_e) {
     // 后台刷新失败不打扰用户，也不破坏正在编辑的状态。
   }
@@ -1042,11 +1066,23 @@ function renderChatRefs() {
   for (const ref of st.refs) {
     const kindClass = ref.kind === "issue" ? "issue" : (ref.kind === "link" ? "link" : "pr");
     const chip = el("span", "chat-ref-chip " + kindClass);
-    const link = el("a", "chat-ref-link", ref.label || ref.url);
+    const status = st.statuses && st.statuses[ref.url];
+    // 简单视图只多一个小圆点：颜色即状态。unknown 和「没有状态」（普通链接、
+    // JSONL）都不画点 —— chip 上永远不出现占位词。
+    if (status && status.state && status.state !== "unknown") {
+      const dot = el("span", "chat-ref-dot " + status.state);
+      dot.setAttribute("aria-hidden", "true");
+      chip.append(dot);
+    }
+    // 本仓库的链接只印 `#27`（会话的 origin 已经说明是哪个仓库）；
+    // 别的仓库/主机仍用合格标签。tooltip 永远带完整身份，信息不丢。
+    const link = el("a", "chat-ref-link", ref.short || ref.label || ref.url);
     link.href = ref.url;
     link.target = "_blank";
     link.rel = "noreferrer";
-    link.title = ref.url;
+    link.title = ref.label && status && status.detail
+      ? ref.label + " · " + status.detail
+      : (ref.label || ref.url);
     chip.append(link);
     const remove = el("button", "chat-ref-remove", "×");
     remove.type = "button";
@@ -1070,7 +1106,28 @@ function renderChatRefs() {
     if (input) input.focus();
   });
   host.append(add);
-  if (st.editorOpen) host.append(buildChatRefEditor(st));
+  if (st.editorOpen) {
+    host.append(buildChatRefEditor(st));
+    const details = buildChatRefDetails(st);
+    if (details) host.append(details);
+  }
+}
+
+/* 展开（编辑）状态下的详情：每条链接一行 —— 状态、检查、review、head sha
+   和标题都在这一行里，不是一块多行面板。只有真拿到状态才印。 */
+function buildChatRefDetails(st) {
+  const lines = [];
+  for (const ref of st.refs) {
+    const status = st.statuses && st.statuses[ref.url];
+    if (!status || !status.detail) continue;
+    const line = el("span", "chat-ref-detail", (ref.label || ref.url) + " · " + status.detail);
+    line.title = ref.url;
+    lines.push(line);
+  }
+  if (!lines.length) return null;
+  const box = el("span", "chat-ref-details");
+  box.append(...lines);
+  return box;
 }
 
 function buildChatRefEditor(st) {
@@ -1172,6 +1229,7 @@ async function submitChatRef(kind, raw) {
     live.draft = "";
     live.error = "";
     renderChatRefs();
+    fetchChatRefStatuses(id);
   } catch (e) {
     if (state.sessionId !== id || state.workspace.id !== wsId) return;
     const live = current();
@@ -1204,6 +1262,7 @@ async function removeChatRef(ref) {
     st.refs = Array.isArray(data.refs) ? data.refs : [];
     st.busy = false;
     renderChatRefs();
+    fetchChatRefStatuses(id);
   } catch (e) {
     if (state.sessionId !== id || state.workspace.id !== wsId) return;
     st.busy = false;
