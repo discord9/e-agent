@@ -1669,6 +1669,21 @@ impl SessionRunner {
         self
     }
 
+    /// Start the PR/issue watcher for this session. Only the root/main
+    /// session construction calls it, next to the link tools it pairs with:
+    /// a watcher turns an observed change on a linked PR into an automatic
+    /// model turn, which is the main session's job. Delegate, btw and fork
+    /// runners are built by `delegate` and never call this, so a child is
+    /// structurally incapable of subscribing — there is no role check to
+    /// repeat, and no default to turn off.
+    ///
+    /// It starts HERE rather than in [`Self::start`] so the opt-in lives in
+    /// one place: `start` knows nothing about links.
+    pub(crate) fn with_ref_watch(mut self) -> Self {
+        self.start_ref_watch();
+        self
+    }
+
     /// Test-only view of the user-input gate above, so a test can assert which
     /// session classes may park in `WaitingInput` without driving the tool.
     #[cfg(test)]
@@ -1927,7 +1942,8 @@ impl SessionRunner {
     /// Tie one PR/issue watcher to this live runner. It is a normal
     /// background-registry task with no completion event of its own: every
     /// change it observes becomes one `AgentEvent::Notice` on this session's
-    /// existing background channel.
+    /// existing background channel. Called from [`Self::with_ref_watch`] only
+    /// — never from a constructor, and never from `start`.
     fn start_ref_watch(&mut self) {
         let Some(background) = self.background.clone() else {
             return;
@@ -1969,7 +1985,6 @@ impl SessionRunner {
         if self.bootstrap.is_none() {
             self.bootstrap_projection_pending = false;
         }
-        self.start_ref_watch();
         if let Some(prompt) = initial_prompt {
             self.pending.push_back(PendingCommand::Prompt {
                 text: prompt,

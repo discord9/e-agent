@@ -37,6 +37,27 @@ does not yet follow semantic versioning strictly.
   streams self-close on the shutdown signal so in-flight requests finish in
   milliseconds, and the process force-exits at the deadline instead of
   waiting on a hung connection; a second Ctrl-C still kills it outright.
+- **Session links and the PR/issue watcher** — a session can hold
+  pull-request, issue, and plain links (`link_ref`, `unlink_ref`,
+  `list_refs`, and the web UI's chips; SQLite/Greptime backends). A linked
+  open PR/issue is watched while the session is live: one hidden background
+  task revalidates it every five minutes and turns a REAL transition —
+  checks going failing, a review decision becoming changes-requested or
+  approved, a merge, a close, a new comment or review — into ONE dim notice
+  that starts exactly one model turn. What a user can rely on: the add
+  itself is never news and the add-time observation is the baseline (a later
+  chip refresh cannot move it, so a failure between the add and the first
+  poll is still reported); a restart replays nothing from before it; a burst
+  of changes in one poll is one message; a merged/closed link is never polled
+  again; two URLs that name one pull request (`#27` and
+  `#27#discussion_r1`) report one object once; an unlink ends that link's
+  baseline, so unlink → close → re-add never announces a close that happened
+  while it was unlinked; and a merge or close is delivered even when its
+  baseline observation was still in flight. Runs of unchanged polls cost one
+  conditional read per resource plus one unconditional GraphQL request per
+  pull request (GitHub publishes the aggregate review decision without a
+  validator), and produce no turn. Watchers stay MAIN SESSION ONLY: a
+  subagent is offered none of the three verbs and never watches anything.
 
 ### Changed
 
@@ -55,6 +76,15 @@ does not yet follow semantic versioning strictly.
   `[sandbox]` edit is rejected by the reload there and needs a restart.
   File-tool roots and `run_rust`'s forced policy stay startup-fixed (a process
   restart).
+- **Links are one session's state** — a link row is keyed by workspace +
+  session + URL and needs no `sessions` metadata row, so adding one over the
+  HTTP API no longer 404s for an id that has none (an id created by another
+  client, a store copied to a new root); the number form still refuses an id
+  with no live session, because there is no workspace whose `origin` could be
+  read. Unlinking a PR in one session leaves every other session's watch of
+  the same PR exactly as it was: the lifetime a watch compares itself against
+  is per session now, so one session's unlink cannot silently re-baseline
+  another's.
 - **Sandbox `/tmp` is the host's real `/tmp` again** — bubblewrap bash no
   longer mounts a private `/tmp` tmpfs, and the delegated-subagent
   read-only `/tmp` remount is gone: inside the sandbox `/tmp` is the host
@@ -76,6 +106,21 @@ does not yet follow semantic versioning strictly.
   never the scan — so matches older than 100 entries are found and paginated.
   Explicit foreign scopes, ID validation, and the existing empty/not-found
   behavior are unchanged.
+- **Watcher correctness (session links)** — the watcher now has a single
+  observation contract, so a few classes of missed or duplicated notice are
+  gone. Lists are read the way GitHub actually orders them (ascending,
+  paginated to the end, with an incomplete page treated as a failed read
+  instead of a short list), so a comment on page six of a busy PR is found;
+  a `304` only ever says "unchanged since the document we already parsed", so
+  a check or review that changed while a nested read failed is retried and
+  reported exactly once; and a review decision comes from GitHub's own
+  aggregate `reviewDecision` (and only from the document that actually
+  carries it), never from counting individual votes.
+- **Interrupted `session_refs` migration** — the one-time rebuild that made
+  the URL the link identity now runs as ONE transaction. Previously a crash
+  between its statements could leave every link in the old table while the
+  new-key table looked migrated, so those links were never read again; now an
+  interruption rolls back and the next start retries the whole rebuild.
 
 ## [0.1.1] — 2026-08-04
 

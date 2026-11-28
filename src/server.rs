@@ -2290,20 +2290,15 @@ async fn add_session_link(
     }
     let root = state.factory.root();
     let session = live(&state, &id).ok();
-    // A link belongs to a session that exists: an id nobody ever created must
-    // not leave an orphan `session_refs` row behind. A live session exists by
-    // definition (its meta row is written at build/spawn time).
-    if session.is_none()
-        && !store
-            .session_exists(root, &id)
-            .await
-            .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
-    {
-        return Err(error(
-            StatusCode::NOT_FOUND,
-            format!("no such session: {id}"),
-        ));
-    }
+    // No "does this session exist?" precondition: a link is a row keyed by
+    // (workspace, session, url), and the storage primitive needs no metadata
+    // row to hold one. Requiring `sessions` metadata here refused exactly the
+    // sessions that never write it (a session id created by another client, a
+    // session store copied to a new root) while buying nothing — the row can
+    // only be read back by naming the same id. What a session cannot do is
+    // resolve a bare NUMBER without a live handle: there is no known
+    // workspace, so `session_git_workspace` stays `None` and the number form
+    // asks for a full URL instead of guessing a repository.
     let workspace = session_git_workspace(&state, session.as_ref());
     let (kind, url) = match (body.kind, body.number, body.url) {
         (Some(kind), Some(_), None) if kind == "link" => {
@@ -2385,7 +2380,7 @@ async fn remove_session_link(
         .remove_ref(state.factory.root(), &id, &query.url)
         .await
         .map_err(|e| error(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    crate::link_status::forget(&query.kind, &query.url);
+    crate::link_status::forget(&id, &query.kind, &query.url);
     let workspace = session_git_workspace(&state, live(&state, &id).ok().as_ref());
     Ok(Json(SessionLinksView {
         supported: true,
@@ -7220,11 +7215,20 @@ model = "deepseek-chat"
         );
     }
 
-    /// Item 7: a link may not be attached to an id nobody ever created — an
-    /// orphan POST leaves no row behind on a SQL backend.
+    /// A link is a row keyed by (workspace, session, url), and the storage
+    /// primitive needs no `sessions` metadata row to hold one. The add
+    /// endpoint must therefore accept an id that has no live handle and no
+    /// metadata row (another client's session, a store copied to a new root):
+    /// refusing it made a link impossible to create for exactly the sessions
+    /// that never write that row, and bought nothing — the row is only ever
+    /// read back by naming the same id.
+    ///
+    /// What such a session really cannot do is resolve a bare NUMBER: with no
+    /// live handle there is no known workspace, so no `origin` may be read —
+    /// and guessing one would file the link against someone else's repo.
     #[cfg(feature = "sqlite")]
     #[tokio::test]
-    async fn refs_post_refuses_an_orphan_session_id() {
+    async fn refs_post_accepts_a_session_id_without_a_metadata_row() {
         use tower::util::ServiceExt;
         let temp = tempfile::tempdir().unwrap();
         let state = sqlite_app_state("sekrit", temp.path()).await;
@@ -7248,42 +7252,16 @@ model = "deepseek-chat"
                 .unwrap()
             }
         };
+        // No live handle, no metadata row: the URL form must still store it.
+        assert!(
+            !store
+                .session_exists(state.factory.root(), "never-existed")
+                .await
+                .unwrap(),
+            "the point of this test is an id with no metadata row"
+        );
         let response = post(
             "never-existed",
-            r#"{"kind":"pr","url":"https://github.com/acme/widget/pull/25"}"#,
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
-            .await
-            .unwrap();
-        assert_eq!(
-            String::from_utf8_lossy(&body),
-            "no such session: never-existed"
-        );
-        assert!(
-            store
-                .list_refs(state.factory.root(), "never-existed")
-                .await
-                .unwrap()
-                .is_empty(),
-            "the rejected POST must not create an orphan row"
-        );
-        // The same request succeeds once the session's meta row exists.
-        store
-            .create_meta(
-                state.factory.root(),
-                "known",
-                Some("m"),
-                None,
-                None,
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-        let response = post(
-            "known",
             r#"{"kind":"pr","url":"https://github.com/acme/widget/pull/25"}"#,
         )
         .await;
@@ -7295,6 +7273,38 @@ model = "deepseek-chat"
         assert_eq!(
             view["refs"][0]["url"],
             "https://github.com/acme/widget/pull/25"
+        );
+        assert_eq!(
+            store
+                .list_refs(state.factory.root(), "never-existed")
+                .await
+                .unwrap()
+                .iter()
+                .map(|link| link.url.clone())
+                .collect::<Vec<_>>(),
+            vec!["https://github.com/acme/widget/pull/25".to_owned()],
+            "the row is readable by the same session id, with or without metadata"
+        );
+
+        // The number form is the part that needs a workspace: refused with
+        // the reason, never resolved against some other session's `origin`.
+        let response = post("never-existed", r#"{"kind":"pr","number":25}"#).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "this session's workspace is unknown — pass a full URL instead"
+        );
+        assert_eq!(
+            store
+                .list_refs(state.factory.root(), "never-existed")
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the refused number POST adds nothing"
         );
     }
 

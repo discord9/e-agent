@@ -101,6 +101,39 @@ CREATE TABLE IF NOT EXISTS session_refs (
 )
 "#;
 
+/// The session_refs URL-identity rebuild, in order, as ONE unit: each
+/// statement is only correct together with the others. An interrupted run
+/// that kept the rename would leave every link in
+/// `session_refs_legacy_kind`, and the next `connect` — which creates the
+/// new-key table before it probes it — would find the right schema, skip the
+/// migration, and strand those links forever. See
+/// [`rebuild_session_refs_url_identity`].
+const MIGRATE_SESSION_REFS_URL_IDENTITY: [&str; 4] = [
+    "ALTER TABLE session_refs RENAME TO session_refs_legacy_kind",
+    CREATE_TABLE_SESSION_REFS,
+    "INSERT OR REPLACE INTO session_refs \
+     (workspace_id, session_id, url, kind, created_at_us) \
+     SELECT workspace_id, session_id, url, kind, created_at_us \
+     FROM session_refs_legacy_kind ORDER BY created_at_us ASC",
+    "DROP TABLE session_refs_legacy_kind",
+];
+
+// Test seam: the statement index after which
+// `rebuild_session_refs_url_identity` behaves as if the process died there, so
+// a test can prove an interrupted migration strands nothing. Thread-local so
+// parallel tests on other connections are unaffected.
+#[cfg(test)]
+thread_local! {
+    static MIGRATION_INTERRUPT_AFTER: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Set (or clear) the interruption point for THIS thread's next connect.
+#[cfg(test)]
+pub(crate) fn interrupt_refs_migration_after(statement: Option<usize>) {
+    MIGRATION_INTERRUPT_AFTER.with(|after| after.set(statement));
+}
+
 /// DDL for the sessions metadata table. Idempotent.
 ///
 /// Semantics: an append-only lifecycle AUDIT log, not a one-row-per-session
@@ -262,6 +295,58 @@ fn ensure_db_parent_dir(db_path: &str) -> Result<(), String> {
     }
 }
 
+/// Rebuild `session_refs` under the URL identity in ONE transaction.
+///
+/// The statements rename the legacy (kind-keyed) table away, create the
+/// URL-keyed one, copy every row across and drop the old table. Run
+/// separately, a crash between two of them is indistinguishable from success
+/// on the next start: the schema probe sees a URL-keyed `session_refs` and
+/// never looks for the leftover legacy table, so a rename-without-copy
+/// silently loses every link in the database. In one transaction those
+/// intermediate states are unobservable — a failure rolls the rebuild back,
+/// leaving the legacy table intact, and a process death leaves the write
+/// lock's transaction to SQLite's own recovery, which discards it the same
+/// way. The next `connect` then retries the whole rebuild from the top.
+async fn rebuild_session_refs_url_identity(conn: &mut turso::Connection) -> Result<(), String> {
+    // BEGIN IMMEDIATE, like `append_located`: reserve the write lock before
+    // the probe-and-copy window instead of upgrading a read snapshot in the
+    // middle of it.
+    let tx = conn
+        .transaction_with_behavior(turso::transaction::TransactionBehavior::Immediate)
+        .await
+        .map_err(|e| format!("cannot begin session_refs migration: {e}"))?;
+    let outcome: Result<(), String> = async {
+        for (index, sql) in MIGRATE_SESSION_REFS_URL_IDENTITY.iter().enumerate() {
+            tx.execute(sql, ())
+                .await
+                .map_err(|e| format!("cannot migrate session_refs to URL identity: {e}"))?;
+            #[cfg(not(test))]
+            let _ = index;
+            #[cfg(test)]
+            if MIGRATION_INTERRUPT_AFTER.with(std::cell::Cell::get) == Some(index) {
+                // Stand-in for the process dying here: the loop stops, no
+                // COMMIT is issued, and unwinding drops the connection.
+                panic!("simulated process death after session_refs migration statement {index}");
+            }
+        }
+        Ok(())
+    }
+    .await;
+    match outcome {
+        Ok(()) => tx
+            .commit()
+            .await
+            .map_err(|e| format!("cannot commit session_refs migration: {e}")),
+        Err(error) => {
+            // Explicit rollback: turso's Transaction drop defers the ROLLBACK
+            // to the connection's next operation, which would leave the write
+            // lock held across the error return.
+            let _ = tx.rollback().await;
+            Err(error)
+        }
+    }
+}
+
 impl SqliteSession {
     /// Connect to the SQLite/turso database file and ensure the tables
     /// exist. `db_path` is a path to a SQLite-compatible database file
@@ -284,7 +369,7 @@ impl SqliteSession {
             .build()
             .await
             .map_err(|e| format!("cannot open SQLite database '{db_path}': {e}"))?;
-        let conn = db
+        let mut conn = db
             .connect()
             .map_err(|e| format!("cannot connect to SQLite database '{db_path}': {e}"))?;
 
@@ -327,8 +412,9 @@ impl SqliteSession {
         // The URL is the link identity now. Databases created before that
         // change still key session_refs by (workspace, session, kind, url);
         // `CREATE TABLE IF NOT EXISTS` cannot change a primary key, so probe
-        // and rebuild once. `INSERT OR REPLACE` in ascending time order keeps
-        // the newest kind for a URL that used to appear twice.
+        // and rebuild once. The rebuild is ONE transaction, so an
+        // interruption cannot leave the links in the legacy table where
+        // nothing would ever read them again.
         {
             let mut rows = conn
                 .query("PRAGMA table_info(session_refs)", ())
@@ -357,19 +443,7 @@ impl SqliteSession {
                 }
             }
             if kind_is_key {
-                for sql in [
-                    "ALTER TABLE session_refs RENAME TO session_refs_legacy_kind",
-                    CREATE_TABLE_SESSION_REFS,
-                    "INSERT OR REPLACE INTO session_refs \
-                     (workspace_id, session_id, url, kind, created_at_us) \
-                     SELECT workspace_id, session_id, url, kind, created_at_us \
-                     FROM session_refs_legacy_kind ORDER BY created_at_us ASC",
-                    "DROP TABLE session_refs_legacy_kind",
-                ] {
-                    conn.execute(sql, ())
-                        .await
-                        .map_err(|e| format!("cannot migrate session_refs to URL identity: {e}"))?;
-                }
+                rebuild_session_refs_url_identity(&mut conn).await?;
             }
         }
 

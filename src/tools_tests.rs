@@ -242,6 +242,83 @@ fn request_user_input_is_not_in_common_builtins() {
     );
 }
 
+/// The session-link verbs are MAIN-AGENT ONLY, and they are installed by the
+/// root session construction, not by the common builtins: a link is what the
+/// PR watcher turns into an automatic model turn, so a writable subagent that
+/// could link a PR could schedule turns of its own. A read-only root keeps the
+/// read verb only.
+#[test]
+fn session_link_verbs_are_root_session_only() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(temp.path()).unwrap();
+    let names = |tools: &[Box<dyn Tool>]| -> Vec<String> {
+        tools.iter().map(|tool| tool.spec().name).collect()
+    };
+    let links = ["link_ref", "unlink_ref", "list_refs"];
+
+    // The child path: `delegate`/`btw`/`fork` build exactly this, and it
+    // carries none of the three — writable and read-only alike.
+    for read_only in [false, true] {
+        let background = BackgroundTasks::new(None, SandboxPolicy::fixed(None));
+        let tools = builtins_with_background(
+            workspace.clone(),
+            background,
+            SandboxPolicy::fixed(None),
+            read_only,
+            true,
+            Some("sub-refs".into()),
+        );
+        let names = names(&tools);
+        for link in links {
+            assert!(
+                !names.iter().any(|name| name == link),
+                "a subagent must never get {link}: {names:?}"
+            );
+        }
+    }
+
+    // The root construction installs them next to the other main-only tools.
+    let (mut tools, _) = builtins_with_web_search(
+        workspace.clone(),
+        None,
+        None,
+        SandboxPolicy::fixed(None),
+        false,
+        None,
+        None,
+    );
+    let common = names(&tools);
+    assert!(
+        !links
+            .iter()
+            .any(|link| common.iter().any(|name| name == link)),
+        "the common builtins must not carry a link verb: {common:?}"
+    );
+    add_root_ref_tools(&mut tools, false);
+    assert_eq!(
+        names(&tools)[common.len()..],
+        links,
+        "a writable root gets all three"
+    );
+
+    let (mut read_only, _) = builtins_with_web_search(
+        workspace,
+        None,
+        None,
+        SandboxPolicy::fixed(None),
+        true,
+        None,
+        None,
+    );
+    let common = names(&read_only).len();
+    add_root_ref_tools(&mut read_only, true);
+    assert_eq!(
+        names(&read_only)[common..],
+        ["list_refs"],
+        "a read-only root keeps the read verb only"
+    );
+}
+
 #[test]
 fn web_search_spec_exposes_only_query() {
     assert_eq!(
@@ -383,9 +460,6 @@ fn web_search_registration_requires_a_nonempty_key() {
         "get_context_usage".to_string(),
         "read_output".to_string(),
         "history".to_string(),
-        "link_ref".to_string(),
-        "unlink_ref".to_string(),
-        "list_refs".to_string(),
     ];
     // A blank search credential registers no web tool at all: the local
     // `web_fetch` rides the search opt-in and does not stand alone.
@@ -431,9 +505,6 @@ fn web_search_registration_requires_a_nonempty_key() {
             "get_context_usage",
             "read_output",
             "history",
-            "link_ref",
-            "unlink_ref",
-            "list_refs"
         ]
         .map(String::from)
     );
@@ -3107,8 +3178,6 @@ fn read_only_builtins_exclude_write_edit_and_bash_without_sandbox() {
             "get_context_usage",
             "read_output",
             "history",
-            // Read-only keeps the read verb only (see tools.rs).
-            "list_refs"
         ],
         "read-only without a sandbox: no write/edit and fail-closed no bash"
     );
@@ -3157,8 +3226,6 @@ fn read_only_builtins_keep_bash_with_a_narrowed_sandbox() {
             "get_context_usage",
             "read_output",
             "history",
-            // Read-only keeps the read verb only (see tools.rs).
-            "list_refs"
         ],
         "read-only with a sandbox keeps the shell and web_search"
     );
@@ -8056,8 +8123,6 @@ fn goal_specs_are_closed_and_generic_specs_stay_open() {
         // accepts exactly ref/offset/limit and nothing else.
         "read_output",
         "history",
-        // list_refs is deliberately CLOSED: it takes no arguments at all.
-        "list_refs",
     ];
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(temp.path()).unwrap();

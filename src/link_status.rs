@@ -167,8 +167,11 @@ pub(crate) struct Target {
 }
 
 impl Target {
-    /// The cache key: one entry per (repo, number, kind).
-    fn key(&self) -> String {
+    /// The canonical GitHub OBJECT this link names — one entry per (repo,
+    /// number, kind). Storage and chips are keyed by URL, but a watcher polls
+    /// and deduplicates by object: `…/pull/27` and `…/pull/27#discussion_r1`
+    /// are two URLs for one pull request.
+    pub(crate) fn key(&self) -> String {
         let kind = if self.pr { "pr" } else { "issue" };
         format!("{}#{} ({kind})", self.repo, self.number)
     }
@@ -592,10 +595,37 @@ impl StatusCache {
 /// link, and never replaced by a later display refresh — a refresh moves the
 /// chip, and if it could move this too, a failure that landed between the add
 /// and the watcher's first poll would silently become the baseline and never
-/// be reported. Process-local; bounded by a TTL on every put.
+/// be reported. Process-local; bounded by a TTL.
+///
+/// The entry is published when the ADD happens, before the `gh` observation
+/// exists, and the observation fills it in. That ordering is the point: a
+/// watcher that synchronizes while the observation is still in flight waits
+/// for it (see [`AddBaselines::take`]) instead of taking its own, later read
+/// as the baseline — which is how a close right after an add used to vanish.
 #[derive(Default)]
 struct AddBaselines {
-    entries: Mutex<HashMap<Added, (DateTime<Utc>, LinkStatus)>>,
+    entries: Mutex<HashMap<Added, AddPending>>,
+    /// How many times each session unlinked each GitHub OBJECT. A watch (or a
+    /// terminal marker) recorded under an older count describes a link that
+    /// no longer exists, so it must re-baseline from a fresh add rather than
+    /// compare against state it can no longer vouch for.
+    ///
+    /// Keyed by session AND object, never by the object alone: a link is one
+    /// session's row, and a process-wide count would make one session's
+    /// unlink re-baseline every other session watching the same pull request —
+    /// silently swallowing a change nobody asked that session to forget.
+    removed: Mutex<HashMap<Added, u64>>,
+}
+
+/// One announced add whose observation the watcher has not taken yet.
+struct AddPending {
+    /// When the row was published: the watcher's baseline boundary.
+    at: DateTime<Utc>,
+    /// When this entry was published, which is what bounds its lifetime —
+    /// `at` is the caller's add instant and nothing says it is "now".
+    announced: DateTime<Utc>,
+    /// The observation, once the prewarm answers.
+    answer: tokio::sync::watch::Receiver<Option<LinkStatus>>,
 }
 
 /// One link ADDED in one session. Two sessions adding the same link keep
@@ -620,26 +650,109 @@ impl Added {
 /// baseline forever would grow with every link this process ever saw.
 const BASELINE_TTL: chrono::TimeDelta = chrono::TimeDelta::minutes(60);
 
+/// How long the watcher waits for an add-time observation that is still in
+/// flight. Past it the link is baselined by the watcher's own read: a `gh`
+/// call that never answers must not freeze a whole session's watcher.
+const BASELINE_WAIT: Duration = Duration::from_secs(30);
+
 impl AddBaselines {
-    fn put(&self, session: &str, key: &str, status: LinkStatus) {
+    /// Publish one PENDING add and hand back the channel the prewarm fills.
+    /// The entry exists before the observation does, so an add whose `gh`
+    /// call is still running is never mistaken for a link the watcher has
+    /// simply never seen.
+    fn announce(&self, session: &str, key: &str) -> tokio::sync::watch::Sender<Option<LinkStatus>> {
+        self.announce_at(session, key, Utc::now())
+    }
+
+    fn announce_at(
+        &self,
+        session: &str,
+        key: &str,
+        at: DateTime<Utc>,
+    ) -> tokio::sync::watch::Sender<Option<LinkStatus>> {
         let now = Utc::now();
+        let (answer, pending) = tokio::sync::watch::channel(None);
         let mut entries = self
             .entries
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         // A link whose session ended or whose add is long past leaves an
         // entry nobody can use.
-        entries.retain(|_, (at, _)| now.signed_duration_since(*at) < BASELINE_TTL);
-        entries.insert(Added::new(session, key), (now, status));
+        entries.retain(|_, added| now.signed_duration_since(added.announced) < BASELINE_TTL);
+        entries.insert(
+            Added::new(session, key),
+            AddPending {
+                at,
+                announced: now,
+                answer: pending,
+            },
+        );
+        answer
     }
 
-    fn get(&self, session: &str, key: &str) -> Option<(DateTime<Utc>, LinkStatus)> {
-        self.entries
+    /// Consume one add's baseline. `None` when this session never announced
+    /// the link (a restart, whose rows all predate the watcher), when the
+    /// observation did not land within [`BASELINE_WAIT`], or when the add
+    /// itself failed: the watcher then takes its OWN silent read as the
+    /// baseline, at the moment it sees the link.
+    async fn take(&self, session: &str, key: &str) -> Option<(DateTime<Utc>, LinkStatus)> {
+        let added = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(&Added::new(session, key))?;
+        let status = wait_for_add(added.answer, BASELINE_WAIT).await?;
+        (status.watch.is_some()).then_some((added.at, status))
+    }
+
+    fn removed(&self, session: &str, key: &str) -> u64 {
+        self.removed
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .get(&Added::new(session, key))
-            .cloned()
+            .copied()
+            .unwrap_or_default()
     }
+
+    /// A removal invalidates everything THIS SESSION's link owned: the
+    /// pending add (it can never seed a re-add) and every watch seeded under
+    /// the previous lifetime (the count moved). Another session's link to the
+    /// same object is a different row, a different add, and a different
+    /// lifetime, so it keeps its baseline.
+    fn forget(&self, session: &str, key: &str) {
+        *self
+            .removed
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .entry(Added::new(session, key))
+            .or_insert(0) += 1;
+        self.entries
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .retain(|added, _| !(added.session == session && added.link == key));
+    }
+}
+
+/// Wait, bounded, for one add-time observation. A closed channel means the
+/// prewarm went away without answering — a failed add, not a baseline.
+async fn wait_for_add(
+    mut answer: tokio::sync::watch::Receiver<Option<LinkStatus>>,
+    limit: Duration,
+) -> Option<LinkStatus> {
+    if let Some(status) = (*answer.borrow()).clone() {
+        return Some(status);
+    }
+    let arrived = async {
+        loop {
+            if answer.changed().await.is_err() {
+                return None;
+            }
+            if let Some(status) = (*answer.borrow()).clone() {
+                return Some(status);
+            }
+        }
+    };
+    tokio::time::timeout(limit, arrived).await.ok().flatten()
 }
 
 fn baselines() -> &'static AddBaselines {
@@ -667,28 +780,41 @@ pub(crate) fn cached_state(kind: &str, url: &str) -> Option<&'static str> {
     cached(&target).map(|status| status.state)
 }
 
-/// The add-time baseline for one link in one session, with its wall-clock
-/// time. `None` means this session never observed the link when it was added,
-/// so the watcher starts from its own first poll instead. Used by the PR
-/// watcher only; the chip cache TTL does not apply. A DISPLAY refresh writes
-/// the chip cache, never this.
-pub(crate) fn add_baseline(
+/// Consume the add-time baseline for one link in one session, waiting
+/// (bounded) for the add-time observation if it is still in flight. `None`
+/// means this session never announced the link — a row that predates the
+/// watcher, i.e. a restart — or that the add itself failed, so the watcher
+/// takes its own silent read at the moment it first sees the link. Used by
+/// the PR watcher only; the chip cache TTL does not apply, and a DISPLAY
+/// refresh writes the chip cache, never this.
+pub(crate) async fn take_add(
     session: &str,
-    kind: &str,
-    url: &str,
+    target: &Target,
 ) -> Option<(DateTime<Utc>, LinkStatus)> {
-    let target = target(kind, url)?;
-    baselines().get(session, &target.key())
+    baselines().take(session, &target.key()).await
 }
 
-/// Drop every cached observation for one link (removal). An add-time baseline
-/// is left to its TTL: it belongs to one session's add, and a re-add in that
-/// session overwrites it.
-pub(crate) fn forget(kind: &str, url: &str) {
+/// How many times THIS SESSION has unlinked this object. A watch recorded
+/// under an older count was seeded for a link that has since been unlinked.
+pub(crate) fn removals(session: &str, target: &Target) -> u64 {
+    baselines().removed(session, &target.key())
+}
+
+/// Drop every cached observation for one link in one session (removal). The
+/// add-time baseline goes with it: it belongs to the lifetime that just ended,
+/// so a re-add must establish its own. That session's removal count moves,
+/// which is how its running watcher learns that its baseline no longer
+/// describes a live link.
+///
+/// The chip cache is process-wide (one link, one observation) and is cleared
+/// for everyone; only the LIFETIME below is per session, because only the
+/// lifetime describes one session's row.
+pub(crate) fn forget(session: &str, kind: &str, url: &str) {
     let Some(target) = target(kind, url) else {
         return;
     };
     cache().forget(&target.key());
+    baselines().forget(session, &target.key());
 }
 
 /// Status for one link at `now`: a fresh entry is reused, otherwise exactly
@@ -711,9 +837,10 @@ pub(crate) async fn refresh(cache: &StatusCache, target: &Target, now: Instant) 
 /// Capture one link's ADD-TIME observation in the background. This is the
 /// link-add path: it returns immediately (a `gh` timeout must never stall a
 /// tool result) and the result lands in the 60 s chip window AND as that
-/// session's baseline for the watcher. A display refresh never overwrites the
-/// baseline, and a cache hit older than the add is fetched again instead of
-/// reused: the baseline has to describe the link as it was ADDED.
+/// session's pending baseline for the watcher. A display refresh never
+/// overwrites the baseline, and a cache hit older than the add is fetched
+/// again instead of reused: the baseline has to describe the link as it was
+/// ADDED.
 pub(crate) fn prewarm(session: &str, kind: &str, url: &str) {
     #[cfg(test)]
     {
@@ -741,22 +868,31 @@ fn prewarm_live(session: &str, kind: &str, url: &str) {
     // The add instant: a hit stamped before it predates the add.
     let added = Instant::now();
     let session = session.to_owned();
+    // Announce BEFORE the fetch: the row is already visible to the watcher,
+    // so the pending slot (not the watcher's own later read) is what its
+    // baseline comes from.
+    let slot = baselines().announce(&session, &target.key());
     runtime.spawn(async move {
         let fetched = target.clone();
-        prewarm_with(&session, &target, added, || async move {
-            gh_status(&fetched).await
-        })
+        prewarm_with(
+            &target,
+            added,
+            slot,
+            || async move { gh_status(&fetched).await },
+        )
         .await;
     });
 }
 
 /// Capture one add-time baseline: reuse an observation that landed AT OR
 /// AFTER the add (a concurrent refresh's answer), otherwise fetch — a hit
-/// from before the add may describe a state the user never added.
+/// from before the add may describe a state the user never added. The answer
+/// (including a failure) always fills the announced slot, so a waiting
+/// watcher never waits for something that already happened.
 async fn prewarm_with<F, Fut>(
-    session: &str,
     target: &Target,
     added: Instant,
+    slot: tokio::sync::watch::Sender<Option<LinkStatus>>,
     fetch: F,
 ) -> LinkStatus
 where
@@ -768,7 +904,7 @@ where
         Some((stored_at, status)) if stored_at >= added => status,
         _ => status_force(cache(), target, Instant::now(), fetch).await,
     };
-    baselines().put(session, &key, status.clone());
+    let _ = slot.send(Some(status.clone()));
     status
 }
 
@@ -854,17 +990,32 @@ pub(crate) fn seed_for_test(kind: &str, url: &str, status: LinkStatus) {
 }
 
 /// Record an add-time baseline without a fetch, the way `prewarm` does for a
-/// session that added the link.
+/// session that added the link: the slot is announced and answered at once.
 #[cfg(test)]
 pub(crate) fn seed_baseline_for_test(session: &str, kind: &str, url: &str, status: LinkStatus) {
+    seed_baseline_at_for_test(session, kind, url, Utc::now(), status);
+}
+
+/// The same, with the ADD INSTANT spelled out: the baseline boundary is what
+/// decides which second's comments are history.
+#[cfg(test)]
+pub(crate) fn seed_baseline_at_for_test(
+    session: &str,
+    kind: &str,
+    url: &str,
+    at: DateTime<Utc>,
+    status: LinkStatus,
+) {
     let Some(target) = target(kind, url) else {
         return;
     };
-    baselines().put(session, &target.key(), status);
+    let slot = baselines().announce_at(session, &target.key(), at);
+    let _ = slot.send(Some(status));
 }
 
-/// The test seam for one add: `fetch` plays `gh`, and the result is this
-/// session's baseline.
+/// The test seam for one add: `fetch` plays `gh`, and the result fills this
+/// session's pending baseline. The slot is announced HERE, synchronously, so
+/// a watcher that runs before the spawned task does still sees a pending add.
 #[cfg(test)]
 pub(crate) fn prewarm_for_test<F, Fut>(
     session: &str,
@@ -878,10 +1029,10 @@ where
 {
     let target = target(kind, url)?;
     let added = Instant::now();
-    let session = session.to_owned();
+    let slot = baselines().announce(session, &target.key());
     let runtime = tokio::runtime::Handle::try_current().ok()?;
     Some(runtime.spawn(async move {
-        prewarm_with(&session, &target, added, fetch).await;
+        prewarm_with(&target, added, slot, fetch).await;
     }))
 }
 
@@ -1221,10 +1372,15 @@ mod tests {
             Some(UNKNOWN),
             "a failed observation is not a cold cache"
         );
-        forget("pr", url);
+        forget("cache-probe", "pr", url);
         assert_eq!(cached_state("pr", url), None, "removal drops the entry");
         assert!(
-            add_baseline("cache-probe", "pr", url).is_none(),
+            baselines()
+                .entries
+                .lock()
+                .unwrap()
+                .get(&Added::new("cache-probe", &target_of("pr", url).key()))
+                .is_none(),
             "a display observation is never an add-time baseline"
         );
         // A plain link can never have a status.
@@ -1251,10 +1407,6 @@ mod tests {
         handle.await.unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1, "one add, one fetch");
         assert_eq!(cached_state("pr", url), Some(READY));
-        assert_eq!(
-            add_baseline("s1", "pr", url).map(|(_, status)| status.state),
-            Some(READY)
-        );
 
         // A manual refresh (or an add from another session) stores the CHIP
         // value only: this session's baseline still says green.
@@ -1264,7 +1416,9 @@ mod tests {
         .await;
         assert_eq!(cached_state("pr", url), Some(NEEDS));
         assert_eq!(
-            add_baseline("s1", "pr", url).map(|(_, status)| status.state),
+            take_add("s1", &target)
+                .await
+                .map(|(_, status)| status.state),
             Some(READY),
             "a refresh never replaces the add-time baseline"
         );
@@ -1277,13 +1431,16 @@ mod tests {
         })
         .await;
         assert_eq!(refreshed.state, APPROVED);
-        let reused = prewarm_with("s2", &target, added, || async {
+        let slot = baselines().announce("s2", &target.key());
+        let reused = prewarm_with(&target, added, slot, || async {
             panic!("a hit stamped after the add is reused");
         })
         .await;
         assert_eq!(reused.state, APPROVED);
         assert_eq!(
-            add_baseline("s2", "pr", url).map(|(_, status)| status.state),
+            take_add("s2", &target)
+                .await
+                .map(|(_, status)| status.state),
             Some(APPROVED)
         );
 
@@ -1299,10 +1456,110 @@ mod tests {
             "the pre-add hit was replaced by a fresh observation"
         );
         assert_eq!(
-            add_baseline("s3", "pr", url).map(|(_, status)| status.state),
+            take_add("s3", &target)
+                .await
+                .map(|(_, status)| status.state),
             Some(OPEN)
         );
-        forget("pr", url);
+        forget("s3", "pr", url);
+    }
+
+    /// The add-time hand-off is a SLOT, not a value: the row is published
+    /// before `gh` answers, so the watcher must be able to wait for the
+    /// observation instead of baselining on its own later read. A pending add
+    /// that never answers falls back to "no baseline at all" (the watcher's
+    /// own read), and a removal invalidates everything the link owned.
+    #[tokio::test]
+    async fn a_pending_add_is_waited_for_and_a_removal_invalidates_it() {
+        let baselines = Arc::new(AddBaselines::default());
+        let key = "pending-probe/widget#27 (pr)";
+
+        // In flight: `take` waits for the answer instead of reporting none.
+        let slot = baselines.announce("s", key);
+        let waiter = baselines.clone();
+        let waiting = tokio::spawn(async move { waiter.take("s", key).await });
+        // The entry is gone from the map once taken, so this is the only
+        // reader; answering it is what unblocks the wait.
+        slot.send(Some(status_for_test(READY, None, Vec::new(), None)))
+            .unwrap();
+        let (at, status) = waiting
+            .await
+            .unwrap()
+            .expect("a pending add answers its baseline");
+        assert_eq!(status.state, READY);
+        assert!(at <= Utc::now());
+
+        // A restart (no announcement) has no baseline to take.
+        assert!(baselines.take("s", key).await.is_none());
+
+        // A FAILED add answers with `unknown`, which is not a baseline: the
+        // watcher takes its own silent read instead of seeding silence.
+        let slot = baselines.announce("s", key);
+        slot.send(Some(LinkStatus::unknown())).unwrap();
+        assert!(baselines.take("s", key).await.is_none());
+
+        // A removal drops the pending add and moves the lifetime counter that
+        // a watch compares itself against. This half uses the PROCESS-wide
+        // baseline store `forget` writes, on a URL no other test touches.
+        let url = "https://github.com/pending-probe/widget/pull/31";
+        let target = target_of("pr", url);
+        assert_eq!(removals("removed", &target), 0);
+        seed_baseline_for_test(
+            "removed",
+            "pr",
+            url,
+            status_for_test(READY, None, Vec::new(), None),
+        );
+        forget("removed", "pr", url);
+        assert_eq!(removals("removed", &target), 1, "removal moves the count");
+        assert!(
+            take_add("removed", &target).await.is_none(),
+            "a removed link can never seed a re-add"
+        );
+        let _ = &baselines;
+    }
+
+    /// One session's unlink is one session's row. The chip cache is shared
+    /// (one link, one observation), but the LIFETIME a watch compares itself
+    /// against belongs to the session that unlinked: unlinking in A must not
+    /// re-baseline B's watch for the same pull request, which is how a change
+    /// B never asked to forget used to disappear.
+    #[tokio::test]
+    async fn a_removal_in_one_session_leaves_another_sessions_link_alone() {
+        let url = "https://github.com/removal-scope/widget/pull/44";
+        let target = target_of("pr", url);
+        seed_baseline_for_test(
+            "session-a",
+            "pr",
+            url,
+            status_for_test(READY, None, Vec::new(), None),
+        );
+        seed_baseline_for_test(
+            "session-b",
+            "pr",
+            url,
+            status_for_test(READY, None, Vec::new(), None),
+        );
+        assert_eq!(removals("session-b", &target), 0);
+
+        forget("session-a", "pr", url);
+
+        assert_eq!(removals("session-a", &target), 1, "A's link ended");
+        assert_eq!(
+            removals("session-b", &target),
+            0,
+            "B's link is a different row and still runs"
+        );
+        assert!(
+            take_add("session-a", &target).await.is_none(),
+            "A's link was removed: it can never seed a re-add"
+        );
+        assert!(
+            take_add("session-b", &target).await.is_some(),
+            "B's own add-time baseline is untouched by A's unlink"
+        );
+        // The counter is per session: a third session never unlinked it.
+        assert_eq!(removals("session-c", &target), 0);
     }
 
     #[tokio::test]
@@ -1395,15 +1652,32 @@ mod tests {
         );
 
         let baselines = AddBaselines::default();
+        let (answer, pending) = tokio::sync::watch::channel(None);
         baselines.entries.lock().unwrap().insert(
             Added::new("s1", "acme/widget#1 (pr)"),
-            (
-                Utc::now() - chrono::TimeDelta::hours(2),
-                LinkStatus::unknown(),
-            ),
+            AddPending {
+                at: Utc::now(),
+                announced: Utc::now() - chrono::TimeDelta::hours(2),
+                answer: pending,
+            },
         );
-        baselines.put("s1", "acme/widget#2 (pr)", LinkStatus::unknown());
-        assert!(baselines.get("s1", "acme/widget#1 (pr)").is_none());
-        assert!(baselines.get("s1", "acme/widget#2 (pr)").is_some());
+        let _ = baselines.announce("s1", "acme/widget#2 (pr)");
+        assert!(
+            baselines
+                .entries
+                .lock()
+                .unwrap()
+                .get(&Added::new("s1", "acme/widget#1 (pr)"))
+                .is_none(),
+            "an add nobody can use any more is dropped on the next announce"
+        );
+        assert!(
+            baselines
+                .entries
+                .lock()
+                .unwrap()
+                .contains_key(&Added::new("s1", "acme/widget#2 (pr)"))
+        );
+        drop(answer);
     }
 }

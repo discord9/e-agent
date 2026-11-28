@@ -3550,9 +3550,9 @@ impl SessionStore {
         }
     }
 
-    /// Whether one session has a metadata row. A session link may only be
-    /// attached to a session that exists: an id nobody ever created must not
-    /// leave an orphan `session_refs` row behind.
+    /// Whether one session has a metadata row. This is a query, not an
+    /// authorization gate: session links are keyed rows and never needed one
+    /// (`add_ref` works for a session id with no metadata at all).
     pub async fn session_exists(&self, root: &Path, session: &str) -> Result<bool> {
         Ok(match self {
             SessionStore::Jsonl => jsonl_list_meta(root)?

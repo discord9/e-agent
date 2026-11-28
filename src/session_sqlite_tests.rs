@@ -361,6 +361,89 @@ async fn connect_migrates_legacy_sessions_table_missing_feature_columns() {
     drop((dir, session2));
 }
 
+/// The session_refs URL-identity rebuild is ONE transaction, so an
+/// interruption is invisible: after a process death right behind the rename,
+/// reopening the file must still find every link (and retry the rebuild from
+/// the top).
+///
+/// This is the regression guard for the split-statement version, where the
+/// rename and the copy were separate autocommits: a crash between them left
+/// the links in `session_refs_legacy_kind`, and the next `connect` created
+/// the new-key `session_refs` table, probed it, found the schema it expected
+/// and skipped the migration — silently stranding every link in that
+/// database.
+#[tokio::test]
+async fn interrupted_refs_migration_leaves_links_readable_after_reopen() {
+    let (_dir, path) = temp_db();
+    let wid = workspace_id();
+    let p = path.to_str().unwrap();
+    // A database from before the URL became the identity: `kind` is part of
+    // the primary key. This is exactly what `connect` has to migrate.
+    {
+        let db = turso::Builder::new_local(p)
+            .build()
+            .await
+            .expect("open legacy db");
+        let conn = db.connect().expect("connect legacy db");
+        conn.execute(
+            "CREATE TABLE session_refs ( \
+             workspace_id TEXT NOT NULL, session_id TEXT NOT NULL, \
+             url TEXT NOT NULL, kind TEXT NOT NULL, \
+             created_at_us INTEGER NOT NULL, \
+             PRIMARY KEY (workspace_id, session_id, kind, url))",
+            (),
+        )
+        .await
+        .expect("create the kind-keyed refs table");
+        conn.execute(
+            "INSERT INTO session_refs \
+             (workspace_id, session_id, url, kind, created_at_us) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            (
+                wid.as_str(),
+                "legacy-links",
+                "https://github.com/acme/widget/pull/27",
+                "pr",
+                1_700_000_000_000_000i64,
+            ),
+        )
+        .await
+        .expect("insert one legacy link");
+    }
+
+    // Die right after the rename — the statement that used to be the point of
+    // no return.
+    interrupt_refs_migration_after(Some(0));
+    let interrupted = tokio::spawn({
+        let wid = wid.clone();
+        let p = p.to_owned();
+        async move { SqliteSession::connect(&p, &wid, "legacy-links").await }
+    })
+    .await;
+    interrupt_refs_migration_after(None);
+    assert!(
+        interrupted.is_err_and(|error| error.is_panic()),
+        "the migration really was interrupted after the rename"
+    );
+
+    // The links are still readable: the file is exactly as it was before the
+    // rebuild started, so the next connect migrates them for real.
+    let session = SqliteSession::connect(p, &wid, "legacy-links")
+        .await
+        .expect("connect retries the interrupted migration");
+    assert_eq!(
+        session
+            .session_refs("legacy-links")
+            .await
+            .expect("links readable after the interruption"),
+        vec![(
+            "pr".to_owned(),
+            "https://github.com/acme/widget/pull/27".to_owned()
+        )],
+        "an interrupted rebuild must strand nothing"
+    );
+}
+
 /// The `sessions.acp_session_id` migration is the ONE feature column whose
 /// loss the caller must see. When it failed, every write omits the column:
 /// ordinary metadata writes must keep working (degrade that feature only),

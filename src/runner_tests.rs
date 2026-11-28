@@ -19963,7 +19963,8 @@ async fn aborting_the_session_kills_an_in_flight_gh_child() {
     let runner = runner
         .with_background_tasks(background.clone())
         .with_ref_watch_interval(std::time::Duration::from_millis(20))
-        .with_ref_watch_program(script.display().to_string());
+        .with_ref_watch_program(script.display().to_string())
+        .with_ref_watch();
     let mut task = runner.start(None);
 
     // Wait until the `gh` child is really alive.
@@ -20058,7 +20059,8 @@ async fn aborting_the_session_aborts_its_pr_watcher() {
     let runner = runner
         .with_background_tasks(background.clone())
         .with_ref_watch_interval(std::time::Duration::from_millis(50))
-        .with_ref_watch_program("/nonexistent/gh-for-e-agent-ref-watch".into());
+        .with_ref_watch_program("/nonexistent/gh-for-e-agent-ref-watch".into())
+        .with_ref_watch();
     let mut task = runner.start(None);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     while background.all_running_ids().is_empty() {
@@ -20111,6 +20113,11 @@ while [ $# -gt 0 ]; do
         If-None-Match:*) etag=$(printf '%s' "$1" | sed 's/^If-None-Match: *//') ;;
       esac
       ;;
+    -f)
+      # The one GraphQL read: its body is the query, so the endpoint that
+      # follows it names the request.
+      shift
+      ;;
     api|-i|--hostname|github.com|--method|GET) ;;
     *) path="$1" ;;
   esac
@@ -20140,6 +20147,12 @@ case "$path" in
   repos/acme/widget/issues/27/comments*|repos/acme/widget/pulls/27/comments*)
     current=comments
     body='[]'
+    ;;
+  graphql)
+    # The aggregate review decision, which GitHub publishes only here. It has
+    # no validator, so the request never carries an ETag.
+    current=decision
+    body='{{"data":{{"repository":{{"pullRequest":{{"reviewDecision":null}}}}}}}}'
     ;;
   *)
     printf 'HTTP/2.0 404 Not Found\r\n\r\n'
@@ -20209,11 +20222,13 @@ printf 'HTTP/2.0 200 OK\r\nEtag: %s\r\n\r\n%s' "$current" "$body"
     let runner = runner
         .with_background_tasks(background.clone())
         .with_ref_watch_interval(std::time::Duration::from_millis(25))
-        .with_ref_watch_program(script.display().to_string());
+        .with_ref_watch_program(script.display().to_string())
+        .with_ref_watch();
     let (_, mut events, _status) = handle.attach();
     let mut task = runner.start(None);
 
-    // Baseline: the main document plus the PR's three nested reads.
+    // Baseline: the main document, the aggregate decision, and the PR's
+    // reviews.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let requests = || {
         std::fs::read_to_string(root.join("requests"))
@@ -20221,7 +20236,7 @@ printf 'HTTP/2.0 200 OK\r\nEtag: %s\r\n\r\n%s' "$current" "$body"
             .lines()
             .count()
     };
-    while requests() < 4 {
+    while requests() < 5 {
         assert!(
             std::time::Instant::now() < deadline,
             "the watcher never completed its baseline poll"

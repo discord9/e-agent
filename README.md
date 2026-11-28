@@ -376,9 +376,12 @@ The `/api` surface (JSON except for the SSE endpoint):
 ### Session links
 
 A session can hold pull-request, issue, and plain links (`link_ref`,
-`list_refs`, `unlink_ref`; SQLite/Greptime backends only). In the web UI each
-link is a chip: the label stays the full identity (`owner/repo#27`), shortened
-to `#27` when the link lives in the session's own repository — that session's
+`list_refs`, `unlink_ref`; SQLite/Greptime backends only, and MAIN SESSION ONLY
+— a subagent is offered none of the three and never watches anything, because
+it exists to finish one delegated task and must not start turns of its own). In
+the web UI each link is a chip: the label stays the full identity
+(`owner/repo#27`), shortened to `#27` when the link lives in the session's own
+repository — that session's
 `origin` already names it — and the chip carries at most one small state dot:
 
 | Dot | Meaning |
@@ -426,9 +429,13 @@ background registry polls every five minutes. Each independently mutable
 resource revalidates with its own `If-None-Match` (the PR document, check runs,
 commit statuses, reviews), while comment lists are bounded by
 `issues/{n}/comments?since=` / review-comment watermarks. An unchanged poll
-therefore sends only conditional reads and produces nothing; a change reads
-the nested resources it needs. A `403`/`429` pauses the whole watcher until
-`X-RateLimit-Reset`.
+therefore sends only conditional reads for those REST resources — plus ONE
+unconditional request per pull request, the GraphQL read of GitHub's aggregate
+`reviewDecision`, which is not exposed by any REST resource and carries no
+validator to revalidate with. It produces nothing to report: a `304` on a
+resource and an unchanged answer to that one request are both "no change", and
+a change reads the nested resources it needs. A `403`/`429` pauses the whole
+watcher until `X-RateLimit-Reset`.
 
 Only transitions become a turn: checks going from all-passing (or pending) to
 failing, a review decision becoming changes-requested or approved, a merge, a

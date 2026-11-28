@@ -240,18 +240,31 @@ pub(crate) async fn execute(
             .remove_ref(root, session, &removal.url)
             .await
             .map_err(|e| format!("{e:#}"))?;
-        crate::link_status::forget(&kind, &removal.url);
+        crate::link_status::forget(session, &kind, &removal.url);
         return Ok(render(refs));
     }
     let resolved = resolve_selector(workspace, selector).await?;
+    // The stored set is the authority on whether this add CREATES the row —
+    // the same fact the backend's insert knows. An idempotent re-add of an
+    // already-linked URL must not publish a second baseline: the add-time one
+    // belongs to the lifetime that is still running, and replacing it would
+    // move the baseline past a change the watcher still has to report.
+    let already_linked = store
+        .list_refs(root, session)
+        .await
+        .map_err(|e| format!("{e:#}"))?
+        .iter()
+        .any(|link| link.url == resolved.url);
     let refs = store
         .add_ref(root, session, resolved.kind, &resolved.url)
         .await
         .map_err(|e| format!("{e:#}"))?;
-    // One observation right away, off the tool's critical path. It becomes
-    // this session's add-time baseline for the watcher, which no later
-    // display refresh can replace.
-    crate::link_status::prewarm(session, resolved.kind, &resolved.url);
+    if !already_linked {
+        // One observation right away, off the tool's critical path. It
+        // becomes this session's pending baseline for the watcher — a real
+        // re-insert seeds one, which no later display refresh can replace.
+        crate::link_status::prewarm(session, resolved.kind, &resolved.url);
+    }
     Ok(render(refs))
 }
 
@@ -1259,6 +1272,61 @@ mod tool_tests {
         assert!(listed.contains(&format!("\"url\":\"{url}\"")));
     }
 
+    /// An IDEMPOTENT re-add keeps the row (and its original position) and
+    /// must keep its original add-time baseline too: re-observing the link
+    /// would move the baseline past any change between the two adds, and the
+    /// watcher would never report it. Only a row the add actually CREATED
+    /// asks for an observation.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn readding_a_still_linked_url_keeps_its_original_baseline() {
+        let store = in_memory_store().await;
+        let root = std::path::Path::new("/not-a-repo");
+        let url = "https://github.com/readd-call/widget/pull/304";
+        let arguments = json!({ "kind": "pr", "url": url });
+        let _ = crate::link_status::take_prewarm_urls_for_test();
+        execute("link_ref", &store, root, None, "s", &arguments)
+            .await
+            .unwrap();
+        let observation = format!("pr {url}");
+        assert_eq!(
+            crate::link_status::take_prewarm_urls_for_test(),
+            vec![observation],
+            "a new row asks for exactly one observation"
+        );
+
+        // The same URL, again: the row already exists, so the ROW's baseline
+        // stays the one captured when it was added.
+        execute("link_ref", &store, root, None, "s", &arguments)
+            .await
+            .unwrap();
+        assert!(
+            crate::link_status::take_prewarm_urls_for_test().is_empty(),
+            "an idempotent re-add must not re-baseline a live link"
+        );
+
+        // Unlinked and re-added is a real re-insert: exactly one observation,
+        // and it is the baseline of the NEW lifetime.
+        execute(
+            "unlink_ref",
+            &store,
+            root,
+            None,
+            "s",
+            &json!({ "url": url }),
+        )
+        .await
+        .unwrap();
+        execute("link_ref", &store, root, None, "s", &arguments)
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::link_status::take_prewarm_urls_for_test(),
+            vec![format!("pr {url}")],
+            "a real re-insert seeds exactly one new baseline"
+        );
+    }
+
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn link_views_only_report_an_existing_cached_observation() {
@@ -1330,7 +1398,7 @@ mod tool_tests {
                 .all(|entry| entry.get("status").is_none()),
             "a plain link has no status"
         );
-        crate::link_status::forget("pr", ready);
-        crate::link_status::forget("pr", failed);
+        crate::link_status::forget("s", "pr", ready);
+        crate::link_status::forget("s", "pr", failed);
     }
 }
