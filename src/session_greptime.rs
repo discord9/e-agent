@@ -72,6 +72,24 @@ CREATE TABLE IF NOT EXISTS running_tasks (
 )
 "#;
 
+/// DDL for the session PR/issue link table. Idempotent. One row per
+/// (workspace, session, kind, url); `created_at_us` is the time index that
+/// orders the chips oldest-first. This is a separate row table on purpose:
+/// links are not session metadata, so writes never touch the `sessions`
+/// snapshot log.
+const CREATE_TABLE_SESSION_REFS: &str = r#"
+CREATE TABLE IF NOT EXISTS session_refs (
+    workspace_id STRING NOT NULL,
+    session_id STRING NOT NULL,
+    kind STRING NOT NULL,
+    url STRING NOT NULL,
+    created_at_us TIMESTAMP(9) NOT NULL TIME INDEX,
+    PRIMARY KEY (workspace_id, session_id, kind, url)
+) WITH (
+    sst_format = 'flat',
+)
+"#;
+
 /// DDL for the sessions metadata table. Idempotent. NOT `append_mode`
 /// (unlike `session_entries`) so `delete_meta` can DELETE rows.
 ///
@@ -234,6 +252,10 @@ impl GreptimeSession {
             .execute(CREATE_TABLE_RUNNING_TASKS, &[])
             .await
             .context("cannot create running_tasks table")?;
+        client
+            .execute(CREATE_TABLE_SESSION_REFS, &[])
+            .await
+            .context("cannot create session_refs table")?;
         client
             .execute(CREATE_TABLE_SESSIONS, &[])
             .await
@@ -2898,6 +2920,59 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             )
             .await
             .context("cannot clear background task")?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Session links (`session_refs` row table)
+    // ------------------------------------------------------------------
+    //
+    // Links are keyed by the session id passed explicitly (a workspace-
+    // scoped `meta_store` can serve historical sessions the same way).
+
+    /// Every (kind, url) link for one session, oldest first.
+    pub async fn session_refs(&self, session_id: &str) -> Result<Vec<(String, String)>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT kind, url FROM session_refs \
+                 WHERE workspace_id = $1 AND session_id = $2 \
+                 ORDER BY created_at_us, kind, url",
+                &[&self.workspace_id, &session_id],
+            )
+            .await
+            .context("cannot load session links")?;
+        Ok(rows
+            .iter()
+            .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+            .collect())
+    }
+
+    /// Insert one link. Re-adding an exact duplicate keeps a single row.
+    pub async fn add_session_ref(&self, session_id: &str, kind: &str, url: &str) -> Result<()> {
+        let created_at = us_to_datetime(next_event_time_us());
+        self.client
+            .execute(
+                "INSERT INTO session_refs \
+                 (workspace_id, session_id, kind, url, created_at_us) \
+                 VALUES ($1, $2, $3, $4, $5)",
+                &[&self.workspace_id, &session_id, &kind, &url, &created_at],
+            )
+            .await
+            .context("cannot record session link")?;
+        Ok(())
+    }
+
+    /// Delete one exact (kind, url) link. Absent rows are a no-op.
+    pub async fn remove_session_ref(&self, session_id: &str, kind: &str, url: &str) -> Result<()> {
+        self.client
+            .execute(
+                "DELETE FROM session_refs \
+                 WHERE workspace_id = $1 AND session_id = $2 AND kind = $3 AND url = $4",
+                &[&self.workspace_id, &session_id, &kind, &url],
+            )
+            .await
+            .context("cannot remove session link")?;
         Ok(())
     }
 

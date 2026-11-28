@@ -4227,7 +4227,10 @@ impl SessionRunner {
                         continue;
                     }
                     self.prepare_web_attach();
-                    let waited = if call.name == "history" || call.name == "read_output" {
+                    let waited = if call.name == "history"
+                        || call.name == "read_output"
+                        || call.name == "link_ref"
+                    {
                         #[cfg(test)]
                         if let Some(hook) = self.before_read_only_tool.take() {
                             hook();
@@ -4244,16 +4247,27 @@ impl SessionRunner {
                             let arguments: serde_json::Value =
                                 serde_json::from_str(&call.arguments)
                                     .map_err(|error| format!("invalid JSON arguments: {error}"))?;
-                            let text = if call.name == "history" {
-                                crate::tools::history::execute(&store, &root, &session, &arguments)
+                            let text = match call.name.as_str() {
+                                "history" => {
+                                    crate::tools::history::execute(
+                                        &store, &root, &session, &arguments,
+                                    )
                                     .await?
-                            } else {
-                                let (reference, offset, limit) =
-                                    crate::tools::output::parse_arguments(&arguments)?;
-                                crate::tools::output::execute(
-                                    &store, &root, &session, &reference, offset, limit,
-                                )
-                                .await?
+                                }
+                                "link_ref" => {
+                                    crate::tools::link_ref::execute(
+                                        &store, &root, &session, &arguments,
+                                    )
+                                    .await?
+                                }
+                                _ => {
+                                    let (reference, offset, limit) =
+                                        crate::tools::output::parse_arguments(&arguments)?;
+                                    crate::tools::output::execute(
+                                        &store, &root, &session, &reference, offset, limit,
+                                    )
+                                    .await?
+                                }
                             };
                             Ok::<ToolOutput, String>(ToolOutput::text(text))
                         });

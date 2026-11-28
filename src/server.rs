@@ -26,6 +26,9 @@
 //! | GET    | `/api/sessions/{id}/goal`         | current goal snapshot (or null)     |
 //! | POST   | `/api/sessions/{id}/goal`         | create / pause / resume / clear / continue the goal |
 //! | PUT    | `/api/sessions/{id}/title`        | rename a session                  |
+//! | GET    | `/api/sessions/{id}/refs`         | PR/issue links (`supported: false` on JSONL) |
+//! | POST   | `/api/sessions/{id}/refs`         | add one PR/issue link             |
+//! | DELETE | `/api/sessions/{id}/refs`         | remove one PR/issue link          |
 //! | DELETE | `/api/sessions/{id}`              | cancel + remove from the registry  |
 //! | GET    | `/api/tasks`                        | running background tasks, all sessions |
 //! | DELETE | `/api/sessions/{id}/tasks/{task_id}` | cancel one background task          |
@@ -284,6 +287,12 @@ fn router(state: Arc<AppState>) -> Router {
             get(session_goal_get).post(session_goal_post),
         )
         .route("/api/sessions/{id}/title", put(session_title))
+        .route(
+            "/api/sessions/{id}/refs",
+            get(session_links)
+                .post(add_session_link)
+                .delete(remove_session_link),
+        )
         .route("/api/sessions/{id}/pin", put(session_pin))
         .route("/api/sessions/{id}/archive", put(session_archive))
         .route("/api/sessions/{id}", delete(delete_session))
@@ -2065,6 +2074,126 @@ async fn session_goal_post(
         ));
     }
     Ok(StatusCode::ACCEPTED)
+}
+
+// ----------------------------------------------------------------------
+// Session PR/issue links
+// ----------------------------------------------------------------------
+
+/// One session's link list. `supported: false` is the JSONL answer — never
+/// an empty list pretending the backend worked.
+#[derive(Serialize)]
+struct SessionLinksView {
+    supported: bool,
+    refs: Vec<crate::session_store::SessionRef>,
+}
+
+/// The store that owns one session's rows: its live store when the session
+/// is running, otherwise the workspace-scoped meta store (the `session_refs`
+/// methods take the session id explicitly).
+async fn session_links_store(
+    state: &AppState,
+    id: &str,
+) -> Result<SessionStore, (StatusCode, String)> {
+    match live(state, id) {
+        Ok(SessionRef::Live(session)) => Ok(session.store.clone()),
+        Ok(SessionRef::Subagent { entry, .. }) => Ok(entry.store.clone()),
+        Err(_) => meta_store(state)
+            .await
+            .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))),
+    }
+}
+
+/// `GET /api/sessions/{id}/refs` — the session's chips, oldest first.
+async fn session_links(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<SessionLinksView>, (StatusCode, String)> {
+    let store = session_links_store(&state, &id).await?;
+    if !store.supports_session_refs() {
+        return Ok(Json(SessionLinksView {
+            supported: false,
+            refs: Vec::new(),
+        }));
+    }
+    let refs = store
+        .list_refs(state.factory.root(), &id)
+        .await
+        .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    Ok(Json(SessionLinksView {
+        supported: true,
+        refs,
+    }))
+}
+
+#[derive(Deserialize)]
+struct LinkBody {
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    number: Option<u64>,
+    #[serde(default)]
+    url: Option<String>,
+}
+
+/// `POST /api/sessions/{id}/refs` — add one link. A bare number is resolved
+/// through the workspace's `origin`; a URL's kind comes from its path.
+async fn add_session_link(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<LinkBody>,
+) -> Result<Json<SessionLinksView>, (StatusCode, String)> {
+    let store = session_links_store(&state, &id).await?;
+    let root = state.factory.root();
+    let (kind, url) = match (body.kind, body.number, body.url) {
+        (Some(kind), Some(number), None) => {
+            let url = crate::tools::link_ref::resolve_number(root, &kind, number)
+                .await
+                .map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
+            (kind, url)
+        }
+        (None, None, Some(url)) => (
+            crate::session_store::ref_kind_from_url(&url).to_owned(),
+            url,
+        ),
+        _ => {
+            return Err(error(
+                StatusCode::BAD_REQUEST,
+                "provide `kind` + `number`, or `url`".to_owned(),
+            ));
+        }
+    };
+    let refs = store
+        .add_ref(root, &id, &kind, &url)
+        .await
+        .map_err(|e| error(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    Ok(Json(SessionLinksView {
+        supported: true,
+        refs,
+    }))
+}
+
+#[derive(Deserialize)]
+struct LinkQuery {
+    kind: String,
+    url: String,
+}
+
+/// `DELETE /api/sessions/{id}/refs?kind=pr&url=…` — remove one exact link.
+async fn remove_session_link(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(query): Query<LinkQuery>,
+) -> Result<Json<SessionLinksView>, (StatusCode, String)> {
+    let store = session_links_store(&state, &id).await?;
+    let refs = store
+        .remove_ref(state.factory.root(), &id, &query.kind, &query.url)
+        .await
+        .map_err(|e| error(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    Ok(Json(SessionLinksView {
+        supported: true,
+        refs,
+    }))
 }
 
 /// Cap for user-assigned session titles: longer titles are truncated

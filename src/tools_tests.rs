@@ -383,6 +383,7 @@ fn web_search_registration_requires_a_nonempty_key() {
         "get_context_usage".to_string(),
         "read_output".to_string(),
         "history".to_string(),
+        "link_ref".to_string(),
     ];
     // A blank search credential registers no web tool at all: the local
     // `web_fetch` rides the search opt-in and does not stand alone.
@@ -427,7 +428,8 @@ fn web_search_registration_requires_a_nonempty_key() {
             "request_compaction",
             "get_context_usage",
             "read_output",
-            "history"
+            "history",
+            "link_ref"
         ]
         .map(String::from)
     );
@@ -3100,7 +3102,8 @@ fn read_only_builtins_exclude_write_edit_and_bash_without_sandbox() {
             "request_compaction",
             "get_context_usage",
             "read_output",
-            "history"
+            "history",
+            "link_ref"
         ],
         "read-only without a sandbox: no write/edit and fail-closed no bash"
     );
@@ -3148,7 +3151,8 @@ fn read_only_builtins_keep_bash_with_a_narrowed_sandbox() {
             "request_compaction",
             "get_context_usage",
             "read_output",
-            "history"
+            "history",
+            "link_ref"
         ],
         "read-only with a sandbox keeps the shell and web_search"
     );

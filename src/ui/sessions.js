@@ -967,6 +967,202 @@ function syncDocumentTitle() {
   document.title = (s && s.title ? String(s.title) : state.sessionId) + " · e-agent";
 }
 
+/* =====================================================================
+ * 会话 PR/issue 链接（顶部 chip + 内联编辑器）
+ * ===================================================================*/
+
+/* 打开会话时拉取；supported=false（JSONL）时整个编辑区隐藏。 */
+async function fetchChatRefs(id) {
+  const wsId = state.workspace.id;
+  const epoch = sessionOpenEpoch;
+  state.sessionRefs = {
+    id, supported: null, refs: [], editorOpen: false, kind: "pr",
+    draft: "", error: "", busy: false,
+  };
+  renderChatRefs();
+  try {
+    const res = await api("/api/sessions/" + encodeURIComponent(id) + "/refs");
+    const text = await res.text();
+    if (!res.ok) throw new Error(text || ("HTTP " + res.status));
+    const data = text ? JSON.parse(text) : {};
+    if (state.sessionId !== id || state.workspace.id !== wsId || epoch !== sessionOpenEpoch) return;
+    state.sessionRefs = {
+      id,
+      supported: data.supported !== false,
+      refs: Array.isArray(data.refs) ? data.refs : [],
+      editorOpen: false, kind: "pr", draft: "", error: "", busy: false,
+    };
+  } catch (_e) {
+    if (state.sessionId !== id || state.workspace.id !== wsId || epoch !== sessionOpenEpoch) return;
+    // 读取失败不冒充「无链接」：隐藏编辑区，会话其余功能不受影响。
+    state.sessionRefs = {
+      id, supported: null, refs: [], editorOpen: false, kind: "pr",
+      draft: "", error: "", busy: false,
+    };
+  }
+  renderChatRefs();
+}
+
+function clearChatRefs() {
+  state.sessionRefs = null;
+  renderChatRefs();
+}
+
+function renderChatRefs() {
+  const host = els.chatRefs;
+  if (!host) return;
+  const st = state.sessionRefs;
+  host.innerHTML = "";
+  if (!st || !state.sessionId || st.id !== state.sessionId || st.supported !== true) {
+    host.hidden = true;
+    return;
+  }
+  host.hidden = false;
+  for (const ref of st.refs) {
+    const chip = el("span", "chat-ref-chip " + (ref.kind === "issue" ? "issue" : "pr"));
+    const link = el("a", "chat-ref-link", ref.label || ref.url);
+    link.href = ref.url;
+    link.target = "_blank";
+    link.rel = "noreferrer";
+    link.title = ref.url;
+    chip.append(link);
+    const remove = el("button", "chat-ref-remove", "×");
+    remove.type = "button";
+    remove.title = "移除链接 " + (ref.label || ref.url);
+    remove.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      removeChatRef(ref);
+    });
+    chip.append(remove);
+    host.append(chip);
+  }
+  const add = el("button", "chat-ref-add", st.editorOpen ? "关闭" : "+ 链接");
+  add.type = "button";
+  add.title = "添加 PR / issue 链接";
+  add.addEventListener("click", () => {
+    st.editorOpen = !st.editorOpen;
+    st.error = "";
+    renderChatRefs();
+    const input = host.querySelector(".chat-ref-input");
+    if (input) input.focus();
+  });
+  host.append(add);
+  if (st.editorOpen) host.append(buildChatRefEditor(st));
+}
+
+function buildChatRefEditor(st) {
+  const form = el("span", "chat-ref-editor");
+  const select = document.createElement("select");
+  select.className = "chat-ref-kind";
+  for (const [value, label] of [["pr", "PR"], ["issue", "Issue"]]) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    select.append(option);
+  }
+  select.value = st.kind === "issue" ? "issue" : "pr";
+  select.addEventListener("change", () => { st.kind = select.value; });
+  const input = document.createElement("input");
+  input.className = "chat-ref-input";
+  input.type = "text";
+  input.placeholder = "25 或 https://github.com/owner/repo/pull/25";
+  input.value = st.draft || "";
+  input.addEventListener("input", () => { st.draft = input.value; });
+  const submit = el("button", "chat-ref-submit", st.busy ? "添加中…" : "添加");
+  submit.type = "button";
+  submit.disabled = !!st.busy;
+  const run = () => submitChatRef(select.value, input.value);
+  submit.addEventListener("click", run);
+  input.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") { ev.preventDefault(); run(); }
+  });
+  const cancel = el("button", "chat-ref-cancel", "取消");
+  cancel.type = "button";
+  cancel.addEventListener("click", () => {
+    st.editorOpen = false;
+    st.error = "";
+    st.draft = "";
+    renderChatRefs();
+  });
+  form.append(select, input, submit, cancel);
+  if (st.error) form.append(el("span", "chat-ref-error", st.error));
+  return form;
+}
+
+/* 输入 `25`（kind 由选择器决定）或完整 URL（kind 由 URL 路径推断）。
+   被拒绝的输入保留在输入框并就地显示原因。 */
+async function submitChatRef(kind, raw) {
+  const st = state.sessionRefs;
+  if (!st || st.busy) return;
+  const id = state.sessionId;
+  const wsId = state.workspace.id;
+  const text = String(raw == null ? "" : raw).trim();
+  st.kind = kind;
+  st.draft = raw == null ? "" : String(raw);
+  if (!text) {
+    st.error = "请输入 PR/issue 编号或完整 URL";
+    st.editorOpen = true;
+    renderChatRefs();
+    return;
+  }
+  st.busy = true;
+  st.error = "";
+  renderChatRefs();
+  const body = /^\d+$/.test(text) ? { kind, number: Number(text) } : { url: text };
+  try {
+    const res = await api("/api/sessions/" + encodeURIComponent(id) + "/refs", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    const responseText = await res.text();
+    if (!res.ok) throw new Error(responseText || ("HTTP " + res.status));
+    const data = responseText ? JSON.parse(responseText) : {};
+    if (state.sessionId !== id || state.workspace.id !== wsId) return;
+    st.refs = Array.isArray(data.refs) ? data.refs : [];
+    st.busy = false;
+    st.editorOpen = false;
+    st.draft = "";
+    st.error = "";
+    renderChatRefs();
+  } catch (e) {
+    if (state.sessionId !== id || state.workspace.id !== wsId) return;
+    st.busy = false;
+    st.editorOpen = true;
+    st.error = String((e && e.message) || e);
+    renderChatRefs();
+    const input = els.chatRefs && els.chatRefs.querySelector(".chat-ref-input");
+    if (input) {
+      input.focus();
+      input.setSelectionRange(input.value.length, input.value.length);
+    }
+  }
+}
+
+async function removeChatRef(ref) {
+  const st = state.sessionRefs;
+  if (!st || st.busy) return;
+  const id = state.sessionId;
+  const wsId = state.workspace.id;
+  st.busy = true;
+  try {
+    const query = "?kind=" + encodeURIComponent(ref.kind) + "&url=" + encodeURIComponent(ref.url);
+    const res = await api("/api/sessions/" + encodeURIComponent(id) + "/refs" + query, { method: "DELETE" });
+    const text = await res.text();
+    if (!res.ok) throw new Error(text || ("HTTP " + res.status));
+    const data = text ? JSON.parse(text) : {};
+    if (state.sessionId !== id || state.workspace.id !== wsId) return;
+    st.refs = Array.isArray(data.refs) ? data.refs : [];
+    st.busy = false;
+    renderChatRefs();
+  } catch (e) {
+    if (state.sessionId !== id || state.workspace.id !== wsId) return;
+    st.busy = false;
+    setBanner("移除链接失败：" + ((e && e.message) || e), true);
+    renderChatRefs();
+  }
+}
+
 function renderChatSessionId(id) {
   const el0 = els.chatSessionId;
   if (!el0) return;
@@ -1150,6 +1346,7 @@ function openSession(id, onReady, epoch, timeoutMs) {
     }
   }
   renderChatSessionId(id);
+  void fetchChatRefs(id);
   // Show this session's tasks immediately instead of waiting for the next tick.
   void pollTasks({ liveOnly: true });
   updateComposerMeta();          // 显示当前会话 model · role（缓存/首开/恢复共用）
@@ -2823,6 +3020,7 @@ function clearCurrentSession() {
   els.promptInput.value = "";
   els.backParentBtn.hidden = true;
   els.chatSessionId.textContent = "";
+  clearChatRefs();
   updateCurrentSessionBusy();
   els.usageInfo.textContent = "";
   syncDocumentTitle();

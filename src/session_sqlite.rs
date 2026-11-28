@@ -83,6 +83,21 @@ CREATE TABLE IF NOT EXISTS running_tasks (
 )
 "#;
 
+/// DDL for the session PR/issue link table. Idempotent. One row per
+/// (workspace, session, kind, url); `created_at_us` orders the chips
+/// oldest-first. This is a separate row table on purpose: links are not
+/// session metadata, so writes never touch the `sessions` snapshot log.
+const CREATE_TABLE_SESSION_REFS: &str = r#"
+CREATE TABLE IF NOT EXISTS session_refs (
+    workspace_id TEXT NOT NULL,
+    session_id   TEXT NOT NULL,
+    kind         TEXT NOT NULL,
+    url          TEXT NOT NULL,
+    created_at_us INTEGER NOT NULL,
+    PRIMARY KEY (workspace_id, session_id, kind, url)
+)
+"#;
+
 /// DDL for the sessions metadata table. Idempotent.
 ///
 /// Semantics: an append-only lifecycle AUDIT log, not a one-row-per-session
@@ -296,6 +311,9 @@ impl SqliteSession {
         conn.execute(CREATE_TABLE_RUNNING_TASKS, ())
             .await
             .map_err(|e| format!("cannot create running_tasks table: {e}"))?;
+        conn.execute(CREATE_TABLE_SESSION_REFS, ())
+            .await
+            .map_err(|e| format!("cannot create session_refs table: {e}"))?;
         conn.execute(CREATE_TABLE_SESSIONS, ())
             .await
             .map_err(|e| format!("cannot create sessions table: {e}"))?;
@@ -3022,6 +3040,92 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
         )
         .await
         .map_err(|e| format!("cannot clear background task: {e}"))?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Session links (`session_refs` row table)
+    // ------------------------------------------------------------------
+    //
+    // Links are keyed by the session id passed explicitly (a workspace-
+    // scoped `meta_store` can serve historical sessions the same way).
+
+    /// Every (kind, url) link for one session, oldest first.
+    pub async fn session_refs(&self, session_id: &str) -> Result<Vec<(String, String)>, String> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT kind, url FROM session_refs \
+                 WHERE workspace_id = ?1 AND session_id = ?2 \
+                 ORDER BY created_at_us, kind, url",
+                (self.workspace_id.as_str(), session_id),
+            )
+            .await
+            .map_err(|e| format!("cannot load session links: {e}"))?;
+        let mut links = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| format!("cannot load session links: {e}"))?
+        {
+            let kind = row
+                .get_value(0)
+                .map_err(|e| format!("cannot load session links: {e}"))?
+                .as_text()
+                .cloned()
+                .unwrap_or_default();
+            let url = row
+                .get_value(1)
+                .map_err(|e| format!("cannot load session links: {e}"))?
+                .as_text()
+                .cloned()
+                .unwrap_or_default();
+            links.push((kind, url));
+        }
+        Ok(links)
+    }
+
+    /// Insert one link. An exact duplicate stays a single row (its original
+    /// `created_at_us`, hence its position, is kept).
+    pub async fn add_session_ref(
+        &self,
+        session_id: &str,
+        kind: &str,
+        url: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT OR IGNORE INTO session_refs \
+             (workspace_id, session_id, kind, url, created_at_us) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            (
+                self.workspace_id.as_str(),
+                session_id,
+                kind,
+                url,
+                next_event_time_us(),
+            ),
+        )
+        .await
+        .map_err(|e| format!("cannot record session link: {e}"))?;
+        Ok(())
+    }
+
+    /// Delete one exact (kind, url) link. Absent rows are a no-op.
+    pub async fn remove_session_ref(
+        &self,
+        session_id: &str,
+        kind: &str,
+        url: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "DELETE FROM session_refs \
+             WHERE workspace_id = ?1 AND session_id = ?2 AND kind = ?3 AND url = ?4",
+            (self.workspace_id.as_str(), session_id, kind, url),
+        )
+        .await
+        .map_err(|e| format!("cannot remove session link: {e}"))?;
         Ok(())
     }
 

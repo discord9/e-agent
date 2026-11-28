@@ -6439,3 +6439,83 @@ async fn head_page_widening_respects_the_limit() {
     seen.sort_unstable();
     assert_eq!(seen, vec![0, 1, 2, 3, 4, 5, 6], "the chain loses no row");
 }
+
+// ----------------------------------------------------------------------
+// session_refs — PR/issue link row table
+// ----------------------------------------------------------------------
+
+#[tokio::test]
+async fn session_refs_lifecycle_orders_and_deduplicates() {
+    let (_dir, session, sid) = fresh_session().await;
+    let other = format!("test-sql-refs-other-{}", crate::session::new_id());
+
+    assert!(session.session_refs(&sid).await.unwrap().is_empty());
+    session
+        .add_session_ref(&sid, "pr", "https://github.com/acme/widget/pull/25")
+        .await
+        .unwrap();
+    session
+        .add_session_ref(&sid, "issue", "https://github.com/acme/widget/issues/22")
+        .await
+        .unwrap();
+    // Adding the same key twice keeps one row and its original position.
+    session
+        .add_session_ref(&sid, "pr", "https://github.com/acme/widget/pull/25")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        session.session_refs(&sid).await.unwrap(),
+        vec![
+            (
+                "pr".to_string(),
+                "https://github.com/acme/widget/pull/25".to_string()
+            ),
+            (
+                "issue".to_string(),
+                "https://github.com/acme/widget/issues/22".to_string()
+            ),
+        ]
+    );
+    // Scoped per session.
+    assert!(session.session_refs(&other).await.unwrap().is_empty());
+
+    session
+        .remove_session_ref(&sid, "pr", "https://github.com/acme/widget/pull/25")
+        .await
+        .unwrap();
+    assert_eq!(
+        session.session_refs(&sid).await.unwrap(),
+        vec![(
+            "issue".to_string(),
+            "https://github.com/acme/widget/issues/22".to_string()
+        )]
+    );
+    // Removing an absent row is a no-op.
+    session
+        .remove_session_ref(&sid, "pr", "https://github.com/acme/widget/pull/25")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn jsonl_session_refs_report_unsupported() {
+    let store = crate::session_store::SessionStore::Jsonl;
+    let root = Path::new("/tmp/e-agent-test-jsonl");
+    assert!(!store.supports_session_refs());
+    for error in [
+        store.list_refs(root, "s").await.unwrap_err().to_string(),
+        store
+            .add_ref(root, "s", "pr", "https://github.com/a/b/pull/1")
+            .await
+            .unwrap_err()
+            .to_string(),
+        store
+            .remove_ref(root, "s", "pr", "https://github.com/a/b/pull/1")
+            .await
+            .unwrap_err()
+            .to_string(),
+    ] {
+        assert_eq!(error, crate::session_store::SESSION_REFS_UNSUPPORTED);
+    }
+}

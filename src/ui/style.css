@@ -424,6 +424,70 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  /* 会话 PR/issue 链接 chips + 内联编辑器（头部一行，可换行） */
+  .chat-refs {
+    display: inline-flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 4px;
+    max-width: 46vw;
+    font-size: 12px;
+  }
+  .chat-ref-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    padding: 1px 4px 1px 7px;
+    border: 1px solid var(--base1);
+    border-radius: 10px;
+    background: var(--base3);
+    line-height: 1.5;
+    white-space: nowrap;
+  }
+  .chat-ref-chip.pr { border-color: var(--green); }
+  .chat-ref-chip.issue { border-color: var(--blue); }
+  .chat-ref-chip a { color: var(--base02); text-decoration: none; }
+  .chat-ref-chip a:hover { color: var(--blue); text-decoration: underline; }
+  .chat-ref-remove {
+    border: none;
+    background: transparent;
+    color: var(--base01);
+    cursor: pointer;
+    padding: 0 2px;
+    font-size: 13px;
+    line-height: 1;
+  }
+  .chat-ref-remove:hover { color: var(--red); }
+  .chat-ref-add, .chat-ref-editor button {
+    border: 1px dashed var(--base1);
+    background: transparent;
+    color: var(--base01);
+    border-radius: 10px;
+    padding: 1px 7px;
+    font-size: 11px;
+    cursor: pointer;
+  }
+  .chat-ref-add:hover, .chat-ref-editor button:hover { color: var(--blue); border-color: var(--blue); }
+  .chat-ref-editor {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    flex-wrap: wrap;
+  }
+  .chat-ref-editor select,
+  .chat-ref-editor input {
+    font-family: inherit;
+    font-size: 11px;
+    padding: 1px 5px;
+    color: var(--base02);
+    background: var(--base3);
+    border: 1px solid var(--base1);
+    border-radius: 4px;
+  }
+  .chat-ref-editor input { width: 22em; max-width: 40vw; }
+  .chat-ref-editor input:focus, .chat-ref-editor select:focus { outline: 1px solid var(--blue); }
+  .chat-ref-editor button { border-style: solid; }
+  .chat-ref-error { color: var(--red); font-size: 11px; }
   #usageInfo { margin-left: auto; white-space: nowrap; }
   #usageInfo .usage-pct,
   #usageInfo .usage-detail { white-space: nowrap; }

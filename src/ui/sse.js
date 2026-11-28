@@ -667,7 +667,11 @@ function applyLiveEvent(name, payload) {
       let content = p.content;
       if (content && typeof content === "object") content = JSON.stringify(content);
       else content = pickText(p, ["content", "text", "result", "error"]);
+      const pendingCard = acc && p.call_id ? acc.pendingByCall.get(p.call_id) : null;
+      const toolName = pendingCard ? cardToolName(pendingCard) : "";
       appendToolResult(isErr, content, acc, p.call_id, p.images);
+      // link_ref 成功后立即刷新顶部 chips（不必等下一次打开会话）。
+      if (!isErr && toolName === "link_ref") void fetchChatRefs(state.sessionId);
       break;
     }
     case "Display":

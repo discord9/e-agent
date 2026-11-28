@@ -11,6 +11,7 @@ mod bash;
 mod file;
 pub(crate) mod history;
 mod image_generation;
+pub(crate) mod link_ref;
 mod notes;
 pub mod output;
 #[cfg(target_os = "linux")]
@@ -495,6 +496,10 @@ fn tools_with_background_and_web_search(
     // History is runner-intercepted so it cannot select another workspace or
     // session; the runner binds the current store/root/session.
     tools.push(Box::new(History));
+    // Session links are runner-intercepted for the same reason: the row is
+    // keyed by the runner's workspace/session, and number resolution runs
+    // against its root.
+    tools.push(Box::new(link_ref::LinkRef));
     tools
 }
 
