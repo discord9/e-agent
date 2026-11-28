@@ -1494,6 +1494,12 @@ pub struct SessionRunner {
     agent: Agent,
     store: SessionStore,
     root: PathBuf,
+    /// The directory Git is read from for session links. It defaults to
+    /// `root` (a main session stores and works in the same workspace), but a
+    /// delegate's transcript/rows live under the parent's persistence root
+    /// while it works in its own workspace — and only THAT workspace's
+    /// `origin` may be resolved for a bare PR/issue number.
+    link_workspace: PathBuf,
     session: String,
     shared: Arc<Mutex<Shared>>,
     background: Option<crate::tools::BackgroundTasks>,
@@ -1608,6 +1614,14 @@ fn respond_web_attach_locked(shared: &Shared, reply: oneshot::Sender<WebAttach>)
 }
 
 impl SessionRunner {
+    /// Bind the workspace Git is read from for session links (see
+    /// [`Self::link_workspace`]). Only a delegate — whose persistence root is
+    /// not where it works — needs to call this.
+    pub(crate) fn with_link_workspace(mut self, workspace: PathBuf) -> Self {
+        self.link_workspace = workspace;
+        self
+    }
+
     pub(crate) fn with_background_tasks(
         mut self,
         background: crate::tools::BackgroundTasks,
@@ -1784,6 +1798,7 @@ impl SessionRunner {
             Self {
                 agent,
                 store,
+                link_workspace: root.clone(),
                 root,
                 session,
                 shared,
@@ -4241,6 +4256,7 @@ impl SessionRunner {
                         // runner while its command receiver is mutably borrowed.
                         let store = self.store.clone();
                         let root = self.root.clone();
+                        let link_workspace = self.link_workspace.clone();
                         let session = self.session.clone();
                         let call = &call;
                         let mut operation = Box::pin(async move {
@@ -4256,7 +4272,12 @@ impl SessionRunner {
                                 }
                                 "link_ref" | "unlink_ref" | "list_refs" => {
                                     crate::tools::link_ref::execute(
-                                        &call.name, &store, &root, &session, &arguments,
+                                        &call.name,
+                                        &store,
+                                        &root,
+                                        Some(&link_workspace),
+                                        &session,
+                                        &arguments,
                                     )
                                     .await?
                                 }

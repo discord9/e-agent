@@ -3107,8 +3107,7 @@ fn read_only_builtins_exclude_write_edit_and_bash_without_sandbox() {
             "get_context_usage",
             "read_output",
             "history",
-            "link_ref",
-            "unlink_ref",
+            // Read-only keeps the read verb only (see tools.rs).
             "list_refs"
         ],
         "read-only without a sandbox: no write/edit and fail-closed no bash"
@@ -3158,8 +3157,7 @@ fn read_only_builtins_keep_bash_with_a_narrowed_sandbox() {
             "get_context_usage",
             "read_output",
             "history",
-            "link_ref",
-            "unlink_ref",
+            // Read-only keeps the read verb only (see tools.rs).
             "list_refs"
         ],
         "read-only with a sandbox keeps the shell and web_search"

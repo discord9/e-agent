@@ -652,6 +652,9 @@ impl Delegate {
             .read_to_string("AGENTS.md")
             .ok()
             .filter(|content| !content.trim().is_empty());
+        // Captured before `workspace` moves into the tool set; session links
+        // resolve Git here, never in the parent's persistence root.
+        let link_workspace = workspace.root().to_path_buf();
         let mut tools = crate::tools::builtins_with_background(
             workspace,
             background.clone(),
@@ -757,6 +760,11 @@ impl Delegate {
         )
         .await
         .map_err(|e| format!("subagent bootstrap failed: {e:#}"))?;
+        // The child's transcript and rows live under the persistence root,
+        // but its Git resolution must read its own workspace: a child working
+        // in repo B must never record repo A's pull request because the
+        // parent's persistence root happens to be repo A.
+        let runner = runner.with_link_workspace(link_workspace);
         let runner = runner.with_background_tasks(background.clone());
         let runner_task = runner.start(Some(task.task));
         Ok((handle, runner_task))
@@ -946,6 +954,9 @@ impl Delegate {
         )
         .await
         .map_err(|e| format!("fork failed: {e:#}"))?;
+        // Same rule as a plain delegate: rows under the persistence root,
+        // Git resolution in the child's own workspace.
+        let runner = runner.with_link_workspace(workspace.root().to_path_buf());
         // The fork child's own background bash tasks are projected onto its
         // session by its runner (main's single writer), exactly like
         // `start_runner`/btw: the registry lives in the shared parent

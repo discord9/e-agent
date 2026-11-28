@@ -10884,6 +10884,87 @@ async fn history_runner_binds_only_its_current_session() {
     );
 }
 
+/// Blocker 4: the runner binds session links to the persistence root's
+/// store, but resolves Git in the session's EXECUTION workspace. A child
+/// working in repo B must never record repo A's pull request just because
+/// its transcript lives under A's persistence root.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn link_ref_runner_reads_the_execution_workspace_not_the_store_root() {
+    fn git_workspace(origin: &str) -> tempfile::TempDir {
+        let temp = tempfile::tempdir().unwrap();
+        for args in [vec!["init", "-q"], vec!["remote", "add", "origin", origin]] {
+            let status = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(temp.path())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        }
+        temp
+    }
+
+    let parent = git_workspace("git@github.com:acme/parent.git");
+    let child = git_workspace("git@github.com:acme/child.git");
+    let session_id = format!("refs-workspace-{}", crate::session::new_id());
+    let store = SessionStore::connect(
+        &crate::config::SessionBackend::Sqlite { path: None },
+        parent.path(),
+        &session_id,
+    )
+    .await
+    .unwrap();
+    let agent = Agent::new(
+        Box::new(ScriptedAssistantModel {
+            replies: VecDeque::from(vec![
+                AssistantMessage {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "refs-link".into(),
+                        name: "link_ref".into(),
+                        arguments: serde_json::json!({"kind": "pr", "number": 7}).to_string(),
+                    }],
+                    reasoning: None,
+                },
+                AssistantMessage {
+                    content: Some("done".into()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                },
+            ]),
+        }),
+        vec![Box::new(crate::tools::link_ref::LinkRef)],
+    );
+    let (runner, handle) = SessionRunner::new(
+        agent,
+        store.clone(),
+        parent.path().into(),
+        session_id.clone(),
+        IdlePolicy::FinishWhenIdle,
+    );
+    let runner = runner.with_link_workspace(child.path().to_path_buf());
+    let task = runner.start(Some("link a PR".into()));
+    let mut status = handle.status();
+    assert_eq!(
+        wait_for_status(&mut status, |status| matches!(
+            status,
+            SessionStatus::Finished(_)
+        ))
+        .await,
+        SessionStatus::Finished(SessionResult::Completed(Some("done".into())))
+    );
+    task.join().await.unwrap();
+
+    let refs = store.list_refs(parent.path(), &session_id).await.unwrap();
+    assert_eq!(
+        refs.iter()
+            .map(|link| link.url.as_str())
+            .collect::<Vec<_>>(),
+        ["https://github.com/acme/child/pull/7"],
+        "the child's own origin resolves, never the persistence root's"
+    );
+}
+
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn history_runner_global_search_attach_and_cancel_while_sqlite_read_pending() {

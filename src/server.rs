@@ -2104,7 +2104,8 @@ async fn session_links_store(
     }
 }
 
-/// `GET /api/sessions/{id}/refs` — the session's chips, oldest first.
+/// `GET /api/sessions/{id}/refs` — the session's chips in the backend's
+/// stable link order (see `SessionStore::list_refs`).
 async fn session_links(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -2136,16 +2137,54 @@ struct LinkBody {
     url: Option<String>,
 }
 
+/// The directory Git is read from for one session's links: a live main
+/// session works in the workspace root, a live subagent in its own `cwd`.
+/// A historical session has no known workspace, so `None` makes the number
+/// form require a full URL instead of resolving someone else's `origin`.
+fn session_git_workspace(state: &AppState, live: Option<&SessionRef>) -> Option<PathBuf> {
+    match live {
+        Some(SessionRef::Live(_)) => Some(state.factory.root().to_path_buf()),
+        Some(SessionRef::Subagent { entry, .. }) => Some(PathBuf::from(entry.cwd.as_str())),
+        None => None,
+    }
+}
+
 /// `POST /api/sessions/{id}/refs` — add one link. A bare number is resolved
-/// through the workspace's `origin`; a URL's kind comes from its path (or the
-/// explicit `kind`, which is how the editor records a plain `link`).
+/// through the session's own workspace `origin`; a URL's kind is the explicit
+/// `kind` when given (that is how the editor records the kind the user
+/// picked, including a plain `link`) and only falls back to the URL's path
+/// when no kind was sent.
 async fn add_session_link(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Json(body): Json<LinkBody>,
 ) -> Result<Json<SessionLinksView>, (StatusCode, String)> {
     let store = session_links_store(&state, &id).await?;
+    // Backend support comes first: on JSONL a number form must report the
+    // unsupported backend, never a git-resolution failure.
+    if !store.supports_session_refs() {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            crate::session_store::SESSION_REFS_UNSUPPORTED.to_owned(),
+        ));
+    }
     let root = state.factory.root();
+    let session = live(&state, &id).ok();
+    // A link belongs to a session that exists: an id nobody ever created must
+    // not leave an orphan `session_refs` row behind. A live session exists by
+    // definition (its meta row is written at build/spawn time).
+    if session.is_none()
+        && !store
+            .session_exists(root, &id)
+            .await
+            .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
+    {
+        return Err(error(
+            StatusCode::NOT_FOUND,
+            format!("no such session: {id}"),
+        ));
+    }
+    let workspace = session_git_workspace(&state, session.as_ref());
     let (kind, url) = match (body.kind, body.number, body.url) {
         (Some(kind), Some(_), None) if kind == "link" => {
             return Err(error(
@@ -2153,17 +2192,41 @@ async fn add_session_link(
                 "kind \"link\" requires a `url` — a plain link has no number form".to_owned(),
             ));
         }
-        (Some(kind), Some(number), None) => {
-            let url = crate::tools::link_ref::resolve_number(root, &kind, number, None)
-                .await
-                .map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
+        (Some(kind), Some(number), None) if kind == "pr" || kind == "issue" => {
+            let url =
+                crate::tools::link_ref::resolve_number(workspace.as_deref(), &kind, number, None)
+                    .await
+                    .map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
             (kind, url)
         }
+        (Some(kind), Some(_), None) => {
+            return Err(error(
+                StatusCode::BAD_REQUEST,
+                if kind.is_empty() {
+                    "a bare number needs a `kind`: pick \"pr\" or \"issue\", or paste a full URL"
+                        .to_owned()
+                } else {
+                    format!("`kind` must be \"pr\" or \"issue\" for a number, not {kind:?}")
+                },
+            ));
+        }
+        // An explicit kind is honoured verbatim (the editor always sends the
+        // kind the user selected). Without one, only a recognised PR/issue
+        // path may be inferred; anything else is refused with a reason
+        // instead of being filed as a PR by default.
         (Some(kind), None, Some(url)) => (kind, url),
-        (None, None, Some(url)) => (
-            crate::session_store::ref_kind_from_url(&url).to_owned(),
-            url,
-        ),
+        (None, None, Some(url)) => {
+            let kind = crate::session_store::ref_kind_from_url(&url).ok_or_else(|| {
+                error(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "{url} is not a pull-request or issue URL — send `kind`: \
+                         \"pr\", \"issue\", or \"link\""
+                    ),
+                )
+            })?;
+            (kind.to_owned(), url)
+        }
         _ => {
             return Err(error(
                 StatusCode::BAD_REQUEST,
@@ -6961,6 +7024,232 @@ model = "deepseek-chat"
                 "placeholder {placeholder} leaked into GET / body"
             );
         }
+    }
+
+    /// An `AppState` whose sessions live in a SQLite database under `root`,
+    /// with the matching meta store: the refs handlers need a backend that
+    /// supports links and a session row to attach one to.
+    #[cfg(feature = "sqlite")]
+    async fn sqlite_app_state(token: &str, root: &std::path::Path) -> Arc<AppState> {
+        let factory = crate::session_factory::SessionFactory::test_factory_with_backend(
+            root.to_path_buf(),
+            crate::config::SessionBackend::Sqlite {
+                path: Some(root.join("sessions.db").display().to_string()),
+            },
+        );
+        let meta_store = SessionStore::connect_meta(factory.backend(), factory.root())
+            .await
+            .unwrap();
+        Arc::new(AppState {
+            factory,
+            registry: Arc::new(SessionRegistry::default()),
+            token: token.to_owned(),
+            meta_store,
+            summaries: Arc::new(Mutex::new(HashMap::new())),
+            summary_pending: Arc::new(SummaryPending(Mutex::new(HashSet::new()))),
+            shutdown: watch::channel(()).0,
+        })
+    }
+
+    /// Item 6: on JSONL a number POST must report the unsupported backend,
+    /// never a git-resolution failure — the backend check comes first.
+    #[tokio::test]
+    async fn refs_post_on_jsonl_reports_unsupported_before_touching_git() {
+        use tower::util::ServiceExt;
+        let temp = tempfile::tempdir().unwrap(); // deliberately NOT a git repository
+        let factory =
+            crate::session_factory::SessionFactory::test_factory(temp.path().to_path_buf());
+        let state = Arc::new(AppState {
+            factory,
+            registry: Arc::new(SessionRegistry::default()),
+            token: "sekrit".to_owned(),
+            meta_store: SessionStore::Jsonl,
+            summaries: Arc::new(Mutex::new(HashMap::new())),
+            summary_pending: Arc::new(SummaryPending(Mutex::new(HashSet::new()))),
+            shutdown: watch::channel(()).0,
+        });
+        let (id, session) = live_session("jsonl-refs");
+        state.registry.insert(id, session);
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions/jsonl-refs/refs")
+                    .method("POST")
+                    .header(header::AUTHORIZATION, "Bearer sekrit")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"kind":"pr","number":25}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "this backend does not support session links",
+            "a JSONL number POST must not probe git first"
+        );
+    }
+
+    /// Item 7: a link may not be attached to an id nobody ever created — an
+    /// orphan POST leaves no row behind on a SQL backend.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn refs_post_refuses_an_orphan_session_id() {
+        use tower::util::ServiceExt;
+        let temp = tempfile::tempdir().unwrap();
+        let state = sqlite_app_state("sekrit", temp.path()).await;
+        let store = SessionStore::connect_meta(state.factory.backend(), state.factory.root())
+            .await
+            .unwrap();
+        let app = router(state.clone());
+        let post = |id: &'static str, body: &'static str| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .uri(format!("/api/sessions/{id}/refs"))
+                        .method("POST")
+                        .header(header::AUTHORIZATION, "Bearer sekrit")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let response = post(
+            "never-existed",
+            r#"{"kind":"pr","url":"https://github.com/acme/widget/pull/25"}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "no such session: never-existed"
+        );
+        assert!(
+            store
+                .list_refs(state.factory.root(), "never-existed")
+                .await
+                .unwrap()
+                .is_empty(),
+            "the rejected POST must not create an orphan row"
+        );
+        // The same request succeeds once the session's meta row exists.
+        store
+            .create_meta(
+                state.factory.root(),
+                "known",
+                Some("m"),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let response = post(
+            "known",
+            r#"{"kind":"pr","url":"https://github.com/acme/widget/pull/25"}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let view: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            view["refs"][0]["url"],
+            "https://github.com/acme/widget/pull/25"
+        );
+    }
+
+    /// Item 8 (and the inference rule): an explicit kind is honoured — Issue
+    /// + a non-issue URL stores an ISSUE — while a kind-less URL that is
+    /// neither a PR nor an issue is refused with a reason instead of being
+    /// filed as a PR.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn refs_post_honours_the_selected_kind_and_refuses_unknown_urls() {
+        use tower::util::ServiceExt;
+        let temp = tempfile::tempdir().unwrap();
+        let state = sqlite_app_state("sekrit", temp.path()).await;
+        let store = SessionStore::connect_meta(state.factory.backend(), state.factory.root())
+            .await
+            .unwrap();
+        store
+            .create_meta(
+                state.factory.root(),
+                "editor",
+                Some("m"),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let app = router(state);
+        let post = |body: &'static str| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .uri("/api/sessions/editor/refs")
+                        .method("POST")
+                        .header(header::AUTHORIZATION, "Bearer sekrit")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let response = post(r#"{"kind":"issue","url":"https://example.org/tracker/7"}"#).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let view: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            view["refs"][0]["kind"], "issue",
+            "the selected kind wins over the URL's shape"
+        );
+
+        let response = post(r#"{"url":"https://example.org/docs/x"}"#).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "https://example.org/docs/x is not a pull-request or issue URL — send `kind`: \
+             \"pr\", \"issue\", or \"link\""
+        );
+
+        // A recognised shape still infers without `kind`.
+        let response = post(r#"{"url":"https://example.org/own/repo/pull/9"}"#).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // A bare number needs a real kind.
+        let response = post(r#"{"kind":"","number":25}"#).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "a bare number needs a `kind`: pick \"pr\" or \"issue\", or paste a full URL"
+        );
     }
 
     fn live_session(id: &str) -> (String, Arc<LiveSession>) {

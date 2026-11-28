@@ -2307,8 +2307,12 @@ SELECT workspace_id,session_id,seq,event_time_us,payload FROM winner_rows wr WHE
 
     /// Latest metadata snapshot for one session, or `None` when the
     /// session has no row yet (brand-new session, or a subagent whose
-    /// parent has not written its row yet).
-    async fn load_meta_row(&self, session_id: &str) -> Result<Option<SessionMeta>, String> {
+    /// parent has not written its row yet). Also the existence check the
+    /// session-link write path uses.
+    pub(crate) async fn load_meta_row(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionMeta>, String> {
         let columns = if self.acp_available {
             META_COLUMNS
         } else {

@@ -73,10 +73,12 @@ CREATE TABLE IF NOT EXISTS running_tasks (
 "#;
 
 /// DDL for the session PR/issue link table. Idempotent. One row per
-/// (workspace, session, kind, url); `created_at_us` is the time index that
-/// orders the chips oldest-first. This is a separate row table on purpose:
-/// links are not session metadata, so writes never touch the `sessions`
-/// snapshot log.
+/// (workspace, session, kind, url). `created_at_us` is the TIME INDEX and is
+/// therefore part of the row identity, so it is DERIVED FROM THE KEY
+/// ([`session_ref_time_us`]) instead of the wall clock: the same link always
+/// maps to the same row, which is what makes a repeated add a no-op and a
+/// removal exact. This is a separate row table on purpose: links are not
+/// session metadata, so writes never touch the `sessions` snapshot log.
 const CREATE_TABLE_SESSION_REFS: &str = r#"
 CREATE TABLE IF NOT EXISTS session_refs (
     workspace_id STRING NOT NULL,
@@ -183,6 +185,29 @@ CREATE TABLE IF NOT EXISTS usage_entries (
 
 fn advance_cursor(cursor: &AtomicI64, next: i64) {
     cursor.fetch_max(next, Ordering::AcqRel);
+}
+
+/// Epoch of the derived link timestamps: 2020-01-01T00:00:00Z in µs.
+const SESSION_REF_EPOCH_US: i64 = 1_577_836_800_000_000;
+
+/// The stable TIME INDEX of one session link.
+///
+/// A Greptime row is identified by (primary key, time index), so a fresh
+/// wall-clock `created_at_us` per insert made two adds of the same
+/// (session, kind, url) two distinct rows. Deriving the time index from the
+/// key instead pins each logical link to one row: a repeated add rewrites the
+/// same row (one row survives), and the delete matches by key anyway. Link
+/// order is therefore the key order (`kind`, `url`), not creation order —
+/// links have no meaningful creation order.
+fn session_ref_time_us(kind: &str, url: &str) -> i64 {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(kind.as_bytes());
+    hasher.update([0]);
+    hasher.update(url.as_bytes());
+    let digest = hasher.finalize();
+    let offset = u64::from_be_bytes(digest[..8].try_into().expect("sha256 digest prefix"));
+    SESSION_REF_EPOCH_US + (offset % 1_000_000_000) as i64
 }
 
 pub struct GreptimeSession {
@@ -2228,8 +2253,9 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
 
     /// Latest metadata snapshot for one session, or `None` when the
     /// session has no row yet (brand-new session, or a subagent whose
-    /// parent has not written its row yet).
-    async fn load_meta_row(&self, session_id: &str) -> Result<Option<SessionMeta>> {
+    /// parent has not written its row yet). Also the existence check the
+    /// session-link write path uses.
+    pub(crate) async fn load_meta_row(&self, session_id: &str) -> Result<Option<SessionMeta>> {
         let row = self
             .client
             .query_opt(
@@ -2930,14 +2956,17 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
     // Links are keyed by the session id passed explicitly (a workspace-
     // scoped `meta_store` can serve historical sessions the same way).
 
-    /// Every (kind, url) link for one session, oldest first.
+    /// Every (kind, url) link for one session, in key order. `GROUP BY` makes
+    /// the read one row per logical link even if merge lag leaves same-key
+    /// rows in the table for a while.
     pub async fn session_refs(&self, session_id: &str) -> Result<Vec<(String, String)>> {
         let rows = self
             .client
             .query(
                 "SELECT kind, url FROM session_refs \
                  WHERE workspace_id = $1 AND session_id = $2 \
-                 ORDER BY created_at_us, kind, url",
+                 GROUP BY kind, url \
+                 ORDER BY kind, url",
                 &[&self.workspace_id, &session_id],
             )
             .await
@@ -2948,9 +2977,10 @@ ORDER BY event_time DESC LIMIT $3::bigint OFFSET $4::bigint"#
             .collect())
     }
 
-    /// Insert one link. Re-adding an exact duplicate keeps a single row.
+    /// Insert one link. The time index is derived from the key, so re-adding
+    /// an exact duplicate writes the SAME row and stays a single row.
     pub async fn add_session_ref(&self, session_id: &str, kind: &str, url: &str) -> Result<()> {
-        let created_at = us_to_datetime(next_event_time_us());
+        let created_at = us_to_datetime(session_ref_time_us(kind, url));
         self.client
             .execute(
                 "INSERT INTO session_refs \
@@ -3294,6 +3324,63 @@ mod tests {
         assert!(source.contains("ORDER BY seq DESC, event_time DESC LIMIT $5"));
         assert!(source.contains("ORDER BY seq DESC, event_time DESC LIMIT $4"));
         assert!(source.contains("pub async fn load_older_located"));
+    }
+
+    /// Blocker 1: the link time index is derived from the link key, so the
+    /// same (kind, url) always maps to the same (primary key, time index)
+    /// row — that is what makes a repeated add a no-op instead of a second
+    /// row. A fresh wall-clock stamp per insert was the bug.
+    #[test]
+    fn session_ref_time_index_is_derived_from_the_key() {
+        let first = session_ref_time_us("pr", "https://github.com/acme/widget/pull/25");
+        assert_eq!(
+            first,
+            session_ref_time_us("pr", "https://github.com/acme/widget/pull/25"),
+            "the same link must land on the same row"
+        );
+        assert!(first >= SESSION_REF_EPOCH_US);
+        assert!(first < SESSION_REF_EPOCH_US + 1_000_000_000);
+        // Different keys stay different timestamps (different kind or URL).
+        for (kind, url) in [
+            ("issue", "https://github.com/acme/widget/pull/25"),
+            ("pr", "https://github.com/acme/widget/pull/26"),
+            ("link", "https://example.com/docs/x"),
+        ] {
+            assert_ne!(first, session_ref_time_us(kind, url), "{kind} {url}");
+        }
+    }
+
+    /// Blocker 1 against a live database: two adds of the same
+    /// (session, kind, url) leave exactly ONE row, and one remove clears it.
+    #[tokio::test]
+    async fn session_ref_double_add_keeps_one_row() {
+        let conn = conn_str();
+        if conn == "skipped" {
+            eprintln!("skipping: GREPTIME_PG not set");
+            return;
+        }
+        let wid = workspace_id();
+        let sid = format!("test-gt-refs-{}", crate::session::new_id());
+        let session = GreptimeSession::connect(&conn, &wid, &sid).await.unwrap();
+        let url = "https://github.com/acme/widget/pull/25";
+        session.add_session_ref(&sid, "pr", url).await.unwrap();
+        session.add_session_ref(&sid, "pr", url).await.unwrap();
+        assert_eq!(
+            session.session_refs(&sid).await.unwrap(),
+            vec![("pr".to_string(), url.to_string())]
+        );
+        let rows = session
+            .client
+            .query(
+                "SELECT kind, url FROM session_refs \
+                 WHERE workspace_id = $1 AND session_id = $2",
+                &[&wid, &sid],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "one logical link = one physical row");
+        session.remove_session_ref(&sid, "pr", url).await.unwrap();
+        assert!(session.session_refs(&sid).await.unwrap().is_empty());
     }
 
     #[test]

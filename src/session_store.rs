@@ -1008,17 +1008,32 @@ fn pr_issue_label(parsed: &url::Url) -> String {
     plain_link_label(parsed)
 }
 
-/// Infer the kind for a full-URL escape-hatch link. Issue-shaped paths
-/// (`issues`, `issue`, GitLab `-issues`) are issues; everything else is a
-/// pull request.
-pub(crate) fn ref_kind_from_url(raw: &str) -> &'static str {
-    let Ok(parsed) = parse_ref_url(raw) else {
-        return "pr";
-    };
-    let is_issue = url_segments(&parsed)
-        .iter()
-        .any(|segment| matches!(*segment, "issue" | "issues") || segment.ends_with("-issues"));
-    if is_issue { "issue" } else { "pr" }
+/// Infer the kind of a full-URL link from its path — but only for a
+/// RECOGNISED PR/issue shape: `…/pull/N`, `…/pulls/N`,
+/// `…/pull-requests/N`, `…/merge_requests/N`, `…/issues/N`, `…/issue/N`
+/// (GitLab puts a `-` before the action, which does not change the marker).
+///
+/// `None` means the URL is neither a pull request nor an issue: a plain docs
+/// URL is NOT a pull request, so the caller requires an explicit `kind`
+/// (`link` for plain) instead of filing it as a PR by default.
+pub(crate) fn ref_kind_from_url(raw: &str) -> Option<&'static str> {
+    let parsed = parse_ref_url(raw).ok()?;
+    let segments = url_segments(&parsed);
+    let marker = segments.iter().position(|segment| {
+        matches!(
+            *segment,
+            "pull" | "pulls" | "pull-requests" | "merge_requests" | "issues" | "issue"
+        )
+    })?;
+    let number = segments.get(marker + 1)?;
+    if number.is_empty() || !number.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(if matches!(segments[marker], "issues" | "issue") {
+        "issue"
+    } else {
+        "pr"
+    })
 }
 
 #[derive(Clone)]
@@ -3532,6 +3547,29 @@ impl SessionStore {
         }
     }
 
+    /// Whether one session has a metadata row. A session link may only be
+    /// attached to a session that exists: an id nobody ever created must not
+    /// leave an orphan `session_refs` row behind.
+    pub async fn session_exists(&self, root: &Path, session: &str) -> Result<bool> {
+        Ok(match self {
+            SessionStore::Jsonl => jsonl_list_meta(root)?
+                .iter()
+                .any(|meta| meta.session_id == session),
+            #[cfg(feature = "greptime")]
+            SessionStore::Greptime { session: db, .. } => {
+                db.load_meta_row(session).await?.is_some()
+            }
+            #[cfg(feature = "sqlite")]
+            SessionStore::Sqlite { session: db, .. } => db
+                .lock()
+                .await
+                .load_meta_row(session)
+                .await
+                .map_err(anyhow::Error::msg)?
+                .is_some(),
+        })
+    }
+
     /// Find child sessions using each session's latest metadata snapshot.
     /// Greptime uses a targeted workspace-scoped query; other backends keep
     /// their existing list-and-filter behavior.
@@ -4262,7 +4300,9 @@ impl SessionStore {
         !matches!(self, SessionStore::Jsonl)
     }
 
-    /// Every link for one session, oldest first (`created_at_us` order).
+    /// Every link for one session, in the backend's stable link order
+    /// (SQLite: insertion order; Greptime: key order, because its time index
+    /// is derived from the key so an exact re-add stays one row).
     pub async fn list_refs(&self, _root: &Path, session: &str) -> Result<Vec<SessionRef>> {
         let rows = match self {
             SessionStore::Jsonl => anyhow::bail!(SESSION_REFS_UNSUPPORTED),
@@ -4287,7 +4327,9 @@ impl SessionStore {
     }
 
     /// Insert one link and return the session's list in stored order. Adding
-    /// an exact duplicate is a no-op (the primary key keeps one row).
+    /// an exact duplicate is a no-op on every backend that claims support
+    /// (SQLite `INSERT OR IGNORE` on the row key; Greptime's time index is
+    /// derived from the key, so the same insert lands on the same row).
     pub async fn add_ref(
         &self,
         root: &Path,
@@ -5484,16 +5526,34 @@ mod tests {
     }
 
     #[test]
-    fn ref_kind_comes_from_the_url_path() {
-        assert_eq!(ref_kind_from_url("https://github.com/a/b/pull/1"), "pr");
+    fn ref_kind_comes_from_a_recognised_url_path() {
+        assert_eq!(
+            ref_kind_from_url("https://github.com/a/b/pull/1"),
+            Some("pr")
+        );
         assert_eq!(
             ref_kind_from_url("https://github.com/a/b/issues/2"),
-            "issue"
+            Some("issue")
         );
         assert_eq!(
             ref_kind_from_url("https://gitlab.com/a/b/-/issues/2"),
-            "issue"
+            Some("issue")
         );
+        assert_eq!(
+            ref_kind_from_url("https://gitlab.com/a/b/-/merge_requests/2"),
+            Some("pr")
+        );
+        // Not a PR/issue shape: no kind is invented, the caller must ask for
+        // one (a docs URL is not a pull request).
+        for unknown in [
+            "https://example.com/docs/x",
+            "https://github.com/a/b/compare/main...dev",
+            "https://example.com/docs/issues",
+            "https://example.com/docs/pull/not-a-number",
+            "not a url",
+        ] {
+            assert_eq!(ref_kind_from_url(unknown), None, "{unknown}");
+        }
     }
 
     /// JSONL `load_older` pages by ABSOLUTE position (there is no seq

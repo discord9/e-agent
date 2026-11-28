@@ -670,9 +670,10 @@ function applyLiveEvent(name, payload) {
       const pendingCard = acc && p.call_id ? acc.pendingByCall.get(p.call_id) : null;
       const toolName = pendingCard ? cardToolName(pendingCard) : "";
       appendToolResult(isErr, content, acc, p.call_id, p.images);
-      // 链接增删成功后立即刷新顶部 chips（不必等下一次打开会话）。
+      // 链接增删成功后立即刷新顶部 chips（不必等下一次打开会话）。只换
+      // chips：正在编辑/提交的编辑器状态不能被这次刷新替换掉。
       if (!isErr && (toolName === "link_ref" || toolName === "unlink_ref")) {
-        void fetchChatRefs(state.sessionId);
+        void refreshChatRefs(state.sessionId);
       }
       break;
     }

@@ -976,7 +976,7 @@ async function fetchChatRefs(id) {
   const wsId = state.workspace.id;
   const epoch = sessionOpenEpoch;
   state.sessionRefs = {
-    id, supported: null, refs: [], editorOpen: false, kind: "pr",
+    id, supported: null, refs: [], editorOpen: false, kind: "",
     draft: "", error: "", busy: false,
   };
   renderChatRefs();
@@ -990,17 +990,38 @@ async function fetchChatRefs(id) {
       id,
       supported: data.supported !== false,
       refs: Array.isArray(data.refs) ? data.refs : [],
-      editorOpen: false, kind: "pr", draft: "", error: "", busy: false,
+      editorOpen: false, kind: "", draft: "", error: "", busy: false,
     };
   } catch (_e) {
     if (state.sessionId !== id || state.workspace.id !== wsId || epoch !== sessionOpenEpoch) return;
     // 读取失败不冒充「无链接」：隐藏编辑区，会话其余功能不受影响。
     state.sessionRefs = {
-      id, supported: null, refs: [], editorOpen: false, kind: "pr",
+      id, supported: null, refs: [], editorOpen: false, kind: "",
       draft: "", error: "", busy: false,
     };
   }
   renderChatRefs();
+}
+
+/* agent 侧 link_ref/unlink_ref 成功后只刷新 chips：编辑器的打开状态、草稿、
+   错误与提交中的 busy 都属于用户，不能被一次后台刷新替换掉（否则一次失败的
+   POST 会连原因都没地方显示）。读失败保持现状，同样不冒充「无链接」。 */
+async function refreshChatRefs(id) {
+  const st = state.sessionRefs;
+  if (!st || st.id !== id || st.supported !== true) return fetchChatRefs(id);
+  const wsId = state.workspace.id;
+  try {
+    const res = await api("/api/sessions/" + encodeURIComponent(id) + "/refs");
+    const text = await res.text();
+    if (!res.ok) return;
+    const data = text ? JSON.parse(text) : {};
+    if (state.sessionRefs !== st) return;
+    if (state.sessionId !== id || state.workspace.id !== wsId) return;
+    st.refs = Array.isArray(data.refs) ? data.refs : [];
+    renderChatRefs();
+  } catch (_e) {
+    // 后台刷新失败不打扰用户，也不破坏正在编辑的状态。
+  }
 }
 
 function clearChatRefs() {
@@ -1056,20 +1077,24 @@ function buildChatRefEditor(st) {
   const form = el("span", "chat-ref-editor");
   const select = document.createElement("select");
   select.className = "chat-ref-kind";
-  for (const [value, label] of [["pr", "PR"], ["issue", "Issue"], ["link", "链接"]]) {
+  // "自动"（空值）由 URL 路径推断 pr/issue；显式选中的类型一律照办——绝不
+  // 因为 URL 长得像另一类就改掉用户的选择。
+  for (const [value, label] of [["", "自动"], ["pr", "PR"], ["issue", "Issue"], ["link", "链接"]]) {
     const option = document.createElement("option");
     option.value = value;
     option.textContent = label;
     select.append(option);
   }
-  select.value = st.kind === "issue" ? "issue" : (st.kind === "link" ? "link" : "pr");
+  select.value = ["pr", "issue", "link"].includes(st.kind) ? st.kind : "";
   const input = document.createElement("input");
   input.className = "chat-ref-input";
   input.type = "text";
   const applyPlaceholder = () => {
     input.placeholder = select.value === "link"
       ? "https://example.com/docs/x（仅接受 URL）"
-      : "25 或 https://github.com/owner/repo/pull/25";
+      : (select.value === ""
+        ? "https://github.com/owner/repo/pull/25（编号请先选 PR / Issue）"
+        : "25 或 https://github.com/owner/repo/pull/25");
   };
   select.addEventListener("change", () => {
     st.kind = select.value;
@@ -1100,8 +1125,9 @@ function buildChatRefEditor(st) {
   return form;
 }
 
-/* 输入 `25`（kind 由选择器决定）或完整 URL（kind 由 URL 路径推断）。
-   被拒绝的输入保留在输入框并就地显示原因。 */
+/* 输入 `25`（类型必须由选择器指定）或完整 URL。选择器选中具体类型时一律
+   照办（选 Issue + 非标准 issue URL 也记录成 issue）；只有「自动」才由 URL
+   路径推断 pr/issue。被拒绝的输入保留在输入框并就地显示原因。 */
 async function submitChatRef(kind, raw) {
   const st = state.sessionRefs;
   if (!st || st.busy) return;
@@ -1116,19 +1142,19 @@ async function submitChatRef(kind, raw) {
     renderChatRefs();
     return;
   }
-  if (kind === "link" && /^\d+$/.test(text)) {
-    st.error = "纯链接需要完整的 http(s) URL，不能只填编号";
-    st.editorOpen = true;
-    st.busy = false;
-    renderChatRefs();
-    return;
-  }
+  // 编号/纯链接的合法性只有服务端一处权威校验（POST 会把原因原样回显到编辑器）：
+  // 前端不再重复一份可能漂移的规则。
   st.busy = true;
   st.error = "";
   renderChatRefs();
+  // URL 输入也带上选择器里的类型：「自动」才交给后端按 URL 路径推断。
   const body = /^\d+$/.test(text)
     ? { kind, number: Number(text) }
-    : (kind === "link" ? { kind: "link", url: text } : { url: text });
+    : (kind ? { kind, url: text } : { url: text });
+  // POST 期间 agent 侧可能新增/移除链接（refreshChatRefs 只换 chips，不换编辑
+  // 器状态），所以回来的结果写回当前的 state.sessionRefs，而不是闭包里可能
+  // 已经过期的对象。
+  const current = () => (state.sessionRefs && state.sessionRefs.id === id ? state.sessionRefs : null);
   try {
     const res = await api("/api/sessions/" + encodeURIComponent(id) + "/refs", {
       method: "POST",
@@ -1138,17 +1164,21 @@ async function submitChatRef(kind, raw) {
     if (!res.ok) throw new Error(responseText || ("HTTP " + res.status));
     const data = responseText ? JSON.parse(responseText) : {};
     if (state.sessionId !== id || state.workspace.id !== wsId) return;
-    st.refs = Array.isArray(data.refs) ? data.refs : [];
-    st.busy = false;
-    st.editorOpen = false;
-    st.draft = "";
-    st.error = "";
+    const live = current();
+    if (!live) return;
+    live.refs = Array.isArray(data.refs) ? data.refs : [];
+    live.busy = false;
+    live.editorOpen = false;
+    live.draft = "";
+    live.error = "";
     renderChatRefs();
   } catch (e) {
     if (state.sessionId !== id || state.workspace.id !== wsId) return;
-    st.busy = false;
-    st.editorOpen = true;
-    st.error = String((e && e.message) || e);
+    const live = current();
+    if (!live) return;
+    live.busy = false;
+    live.editorOpen = true;
+    live.error = String((e && e.message) || e);
     renderChatRefs();
     const input = els.chatRefs && els.chatRefs.querySelector(".chat-ref-input");
     if (input) {
